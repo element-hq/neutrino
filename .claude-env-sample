@@ -1,0 +1,6 @@
+MATRIX_HOMESERVER_URL=https://matrix.org
+MATRIX_ROOM_ID=!aaa:matrix.org
+MATRIX_USER_ID=@claude-you:matrix.org
+MATRIX_E2EE=true
+MATRIX_PASSWORD=abc1234
+ALLOWED_USERS=["@you:matrix.org","@me:element.io"]

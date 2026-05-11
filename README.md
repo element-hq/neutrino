@@ -61,3 +61,13 @@ Two of these are involved in actually building binaries of the server:
 - `neutrino` contains the host development binary definition.
 - `neutrino-ffi` contains bindings for Neutrino for use in Android, generated using UniFFI.
 >>>>>>> f095723 (Initial commit)
+
+
+## Running Claude
+
+To run Claude on your local machine, modify `.claude-env-sample` and move to `.claude-env`, then:
+```
+docker build -t claude-neutrino -f Claude.Dockerfile .
+docker run -it --rm -v /Users/kegan/github/neutrino:/workspace -v /Users/kegan/github/neutrino/.claude-matrix:/root/.claude --env-file ./.claude-env claude-neutrino
+```
+Add the MCP server then start claude with `--dangerously-load-development-channels`, the container will provide instructions.

@@ -55,3 +55,6 @@ google-services.json
 
 # Complement: tarball-extracted upstream checkouts (see scripts/complement.sh)
 /complement-*/
+
+.claude-matrix
+.claude-env
