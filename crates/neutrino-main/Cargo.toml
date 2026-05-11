@@ -1,0 +1,16 @@
+[package]
+name = "neutrino-main"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+neutrino-common = { path = "../neutrino-common" }
+neutrino-http = { path = "../neutrino-http" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+paranoid-android.workspace = true

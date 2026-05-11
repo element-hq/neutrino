@@ -1,0 +1,26 @@
+# Curated allowlist of complement CS-API tests run against neutrino.
+#
+# Each non-comment line becomes its own `go test -run <line>` invocation
+# (see scripts/complement.sh). One entry per line. Use the full slash-
+# separated test path; trailing `$` anchors the match where a name is a
+# prefix of a sibling.
+
+# Versions
+TestVersionStructure
+
+# Login: subtests that work against the fixed-credential /login stub.
+TestLogin/parallel/GET_/login_yields_a_set_of_flows$
+TestLogin/parallel/POST_/login_can_login_as_user$
+TestLogin/parallel/POST_/login_can_log_in_as_a_user_with_just_the_local_part_of_the_id$
+
+# Registration: subtests that work against the single-user /register stub.
+TestRegistration/parallel/POST_\{\}_returns_a_set_of_flows$
+TestRegistration/parallel/POST_/register_can_create_a_user$
+TestRegistration/parallel/POST_/register_returns_the_same_device_id_as_that_in_the_request$
+TestRegistration/parallel/POST_/register_allows_registration_of_usernames_with_$
+TestRegistration/parallel/Registration_accepts_non-ascii_passwords$
+
+# Room creation: basic public/private room flows.
+TestRoomCreate/Parallel/POST_/createRoom_makes_a_private_room$
+TestRoomCreate/Parallel/POST_/createRoom_makes_a_private_room_with_invites$
+TestRoomCreate/Parallel/POST_/createRoom_makes_a_public_room$

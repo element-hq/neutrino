@@ -1,0 +1,5 @@
+[bindings.kotlin]
+package_name = "io.element.neutrino"
+cdylib_name = "neutrino"
+android_cleaner = true
+omit_checksums = true
