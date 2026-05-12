@@ -50,10 +50,7 @@ pub fn router(config: Config) -> Router {
             "/_matrix/client/{version}/login",
             get(get_login).post(post_login),
         )
-        .route(
-            "/_matrix/client/{version}/register",
-            post(post_register),
-        )
+        .route("/_matrix/client/{version}/register", post(post_register))
         .route(
             "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync",
             post(sync),
@@ -122,10 +119,7 @@ async fn get_login() -> Json<Value> {
     }))
 }
 
-async fn post_register(
-    state: State<AppState>,
-    body: Json<Value>,
-) -> (StatusCode, Json<Value>) {
+async fn post_register(state: State<AppState>, body: Json<Value>) -> (StatusCode, Json<Value>) {
     // No `auth` block — initiate UIA so the client knows which flows to attempt.
     if body.0.get("auth").is_none() {
         return (
