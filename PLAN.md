@@ -29,7 +29,7 @@
 
 ## status
 - [x] project scaffold (Cargo.toml, main.rs, module structure)
-- [ ] Write a .gitlab-ci.yml to run cargo tests, complement, clippy, formatting, compile.sh script for uniffi, and to fail if any fail. Run linting in parallel.
+- [x] Write a .github/workflows/ci.yml to run cargo tests, complement, clippy, formatting, compile.sh script for uniffi, and to fail if any fail. Run linting in parallel.
 - [ ] StorageBackend trait defined
     - multiple developers will be relying on this not changing (one to implement the interface, the other using it). If it later turns out that the trait needs to change, prompt and add decision log immediately.
 - [ ] SQLite storage backend implementation
