@@ -92,6 +92,25 @@ pub trait EventStore: Send + Sync {
     ) -> Result<(), StorageError>;
 
     /// Pre:  none.
+    /// Post: if `(txn_id, user_id)` was previously recorded via `record_client_txn`,
+    ///       returns the associated `event_id`; otherwise returns `None`.
+    async fn get_client_txn(
+        &self,
+        txn_id: &str,
+        user_id: &UserId,
+    ) -> Result<Option<OwnedEventId>, StorageError>;
+
+    /// Pre:  none.
+    /// Post: records `(txn_id, user_id) → event_id` for future dedup lookups;
+    ///       idempotent — recording the same `(txn_id, user_id)` pair twice is a no-op.
+    async fn record_client_txn(
+        &self,
+        txn_id: &str,
+        user_id: &UserId,
+        event_id: &EventId,
+    ) -> Result<(), StorageError>;
+
+    /// Pre:  none.
     /// Post: returns one `StoredEvent` per ID that exists in the store; IDs with no
     ///       matching event are silently omitted (result length may be < `ids.len()`).
     async fn get_events(&self, ids: &[&EventId]) -> Result<Vec<StoredEvent>, StorageError>;
@@ -190,15 +209,14 @@ pub trait DagStore: Send + Sync {
 
     /// Pre:  all event IDs in `latest` and `earliest` must be valid; `room_id` must exist.
     /// Post: performs a BFS over `prev_events` starting from `latest`, skipping any event
-    ///       in `earliest` and any event with `depth < min_depth`; returns at most `limit`
-    ///       events; events in `earliest` are not included in the result.
+    ///       in `earliest`; returns at most `limit` events; events in `earliest` are not
+    ///       included in the result.
     async fn missing_events(
         &self,
         room_id: &RoomId,
         latest: &[&EventId],
         earliest: &[&EventId],
         limit: usize,
-        min_depth: u64,
     ) -> Result<Vec<StoredPdu>, StorageError>;
 }
 
@@ -232,13 +250,26 @@ pub trait FederationOutbox: Send + Sync {
     ) -> Result<(), StorageError>;
 }
 
+#[async_trait]
+pub trait FederationInbox: Send + Sync {
+    /// Pre:  none.
+    /// Post: records `(origin, txn_id)` as processed; returns `true` if it was already
+    ///       recorded (caller should return 200 immediately without reprocessing),
+    ///       `false` if this is the first time seeing this transaction.
+    async fn record_federation_txn(
+        &self,
+        origin: &ServerName,
+        txn_id: &str,
+    ) -> Result<bool, StorageError>;
+}
+
 /// Combined storage interface. Use as a generic bound: `S: StorageBackend`.
 pub trait StorageBackend:
-    RoomStore + EventStore + StateStore + DagStore + FederationOutbox
+    RoomStore + EventStore + StateStore + DagStore + FederationOutbox + FederationInbox
 {
 }
 
 impl<T> StorageBackend for T where
-    T: RoomStore + EventStore + StateStore + DagStore + FederationOutbox
+    T: RoomStore + EventStore + StateStore + DagStore + FederationOutbox + FederationInbox
 {
 }
