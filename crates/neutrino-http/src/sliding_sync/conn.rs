@@ -27,13 +27,13 @@ pub struct ConnKey {
 pub struct ListCfg {
     pub timeline_limit: usize,
     pub required_state: Vec<(StateEventType, String)>,
-    /// Parsed but not yet honoured. Phase 3 will use these to slice the
-    /// candidate-room set into the requested window.
+    /// TODO(phase-3): apply to slice the candidate-room set into the
+    /// requested window in `build::combined_room_configs`.
     #[allow(dead_code)]
     pub ranges: Vec<(usize, usize)>,
     /// Parsed for forward compatibility but always ignored. The embedded
     /// single-user server returns every candidate room regardless of filters
-    /// (per the design decision logged in PLAN.md on 2026-05-14).
+    /// (decision in PLAN.md 2026-05-14; not a phase TODO — intentional gap).
     #[allow(dead_code)]
     pub filters: Option<request::ListFilters>,
 }
@@ -51,13 +51,14 @@ pub struct SubCfg {
 /// `build::update_sent`). Future delta logic will consult this to avoid
 /// re-sending events the client already has.
 ///
-/// **Unbounded growth caveat**: `timeline_event_ids` currently grows by every
-/// emitted timeline event for the room's lifetime on this connection. For a
-/// long-lived sync that's a real leak. Phase 4/5 will either bound it (keep
-/// only the last N) or replace it with a single high-water mark since timeline
-/// is already strictly ordered by `room_messages`. `required_state_keys` is
-/// naturally bounded by the number of distinct `(event_type, state_key)`
-/// pairs in the room — finite, but document if a room can have unbounded state.
+/// TODO(phase-4): `timeline_event_ids` grows unbounded — one entry per emitted
+/// event for the room's lifetime on this connection. Bound it (keep only the
+/// last N) or replace with a single high-water mark, since timeline is already
+/// strictly ordered. `required_state_keys` is naturally bounded by the number
+/// of distinct `(event_type, state_key)` pairs in the room.
+/// TODO(phase-4): this is populated by `update_sent` but never consulted —
+/// `build_room` doesn't yet diff against it. Subsequent syncs currently re-send
+/// the same timeline window.
 #[derive(Debug, Default, Clone)]
 pub struct RoomSent {
     pub timeline_event_ids: Vec<OwnedEventId>,
@@ -66,13 +67,15 @@ pub struct RoomSent {
 
 /// One sliding-sync connection's state.
 ///
-/// `last_stream_pos` is misleadingly named — it is **not** an event-store
-/// `StreamPos`. It's a per-conn opaque pos token (a monotonically increasing
-/// counter we hand to the client and verify on the next request). Storage-layer
-/// stream positions are tracked separately when phase 5 wires long-poll wakeup.
+/// `pos` is an opaque-to-the-client monotonic counter we hand back as the
+/// response `pos` string. It is **not** an event-store `StreamPos`.
+///
+/// TODO(phase-5): add a separate `last_event_stream_pos: StreamPos` field for
+/// tracking where in the storage event stream we last looked, used by the
+/// long-poll path to subscribe to new events.
 #[derive(Debug, Default)]
 pub struct Conn {
-    pub last_stream_pos: u64,
+    pub pos: u64,
     pub lists: BTreeMap<String, ListCfg>,
     pub subs: BTreeMap<OwnedRoomId, SubCfg>,
     pub sent: HashMap<OwnedRoomId, RoomSent>,
@@ -95,7 +98,8 @@ impl Conn {
 /// expire. There is **no eviction**, **no idle timeout**, **no LRU**, no
 /// upper bound on the number of conns. For the embedded single-user server
 /// that's fine (in practice we expect 1–3 concurrent conns from one device);
-/// for a multi-user deployment this would need bounding before shipping.
+/// a multi-user deployment would need bounding before shipping — not currently
+/// in scope.
 ///
 /// **Persistence**: state is lost on server restart. Clients recover by
 /// receiving `M_UNKNOWN_POS` on their next request and reconnecting without a
