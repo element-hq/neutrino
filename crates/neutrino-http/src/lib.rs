@@ -19,6 +19,8 @@ use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+mod sliding_sync;
+
 #[derive(Debug)]
 struct App {
     store: Store,
