@@ -1,3 +1,8 @@
+// Module is built but not yet wired into the live router — handlers, state, and
+// helpers are exercised by `tests` (and will be reachable from the router once
+// the SQLite StorageBackend impl lands). Allow dead_code until then.
+#![allow(dead_code)]
+
 use std::sync::Arc;
 
 use neutrino_common::storage::{StorageBackend, StorageError};

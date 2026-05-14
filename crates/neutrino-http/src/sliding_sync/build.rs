@@ -221,10 +221,8 @@ fn required_state_matches(
 
 fn update_sent(sent: &mut RoomSent, room: &response::Room) {
     for ev in &room.timeline {
-        if let Ok(event_id) = ev.get_field::<ruma::OwnedEventId>("event_id") {
-            if let Some(id) = event_id {
-                sent.timeline_event_ids.push(id);
-            }
+        if let Ok(Some(id)) = ev.get_field::<ruma::OwnedEventId>("event_id") {
+            sent.timeline_event_ids.push(id);
         }
     }
     for ev in &room.required_state {
