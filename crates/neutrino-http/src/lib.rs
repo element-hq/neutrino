@@ -15,6 +15,7 @@ use neutrino_sqlite::Store;
 use rand::{Rng, distr::Alphanumeric};
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -39,7 +40,12 @@ impl AppState {
     }
 }
 
-pub fn router(config: Config) -> Router {
+pub async fn serve(listener: TcpListener, config: Config) -> Result<(), std::io::Error> {
+    axum::serve(listener, router(config)).await?;
+    Ok(())
+}
+
+fn router(config: Config) -> Router {
     let state = AppState::new(config.clone());
     let user_id = config.user_id();
 

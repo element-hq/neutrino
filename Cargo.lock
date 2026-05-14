@@ -902,7 +902,6 @@ dependencies = [
 name = "neutrino-main"
 version = "0.1.0"
 dependencies = [
- "axum",
  "neutrino-common",
  "neutrino-http",
  "paranoid-android",
