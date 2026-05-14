@@ -69,8 +69,10 @@ impl<S> SyncState<S> {
 /// `EventStore::subscribe()` *before* building the first response (TOCTOU per
 /// the trait's `subscribe()` docs), then `tokio::select!`s on `rx.changed()`
 /// vs. the request's `timeout` to decide whether to return early or wait.
+///
 /// TODO(phase-6): stub `req.extensions.e2ee` and `req.extensions.to_device`
 /// echoes here so clients that send them don't crash; ignore the rest.
+///
 /// TODO(phase-6): validate `req.conn_id.len() <= 16` and reject with
 /// `M_BAD_JSON` per MSC4186.
 pub async fn handle<S: StorageBackend>(

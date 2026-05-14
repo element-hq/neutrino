@@ -56,6 +56,7 @@ pub struct SubCfg {
 /// last N) or replace with a single high-water mark, since timeline is already
 /// strictly ordered. `required_state_keys` is naturally bounded by the number
 /// of distinct `(event_type, state_key)` pairs in the room.
+///
 /// TODO(phase-4): this is populated by `update_sent` but never consulted —
 /// `build_room` doesn't yet diff against it. Subsequent syncs currently re-send
 /// the same timeline window.

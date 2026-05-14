@@ -147,6 +147,7 @@ struct CombinedCfg {
 /// future range slicing.
 ///
 /// TODO(phase-3): sort by `bump_stamp` desc (recency) before range slicing.
+///
 /// TODO(phase-3): include kicked/banned rooms per MSC4186 §"Rooms included in
 /// the server list", and previously-joined left rooms if the conn already saw
 /// them.
@@ -210,16 +211,17 @@ fn combined_room_configs(conn: &Conn, rooms: &[OwnedRoomId]) -> BTreeMap<OwnedRo
 /// data flow obvious.
 ///
 /// TODO(phase-4): when `is_initial == false`, diff against `conn.sent`:
-///   - drop already-sent timeline events from the response
-///   - drop unchanged `required_state` entries (compare by event_id)
-///   - set `limited` correctly: true iff we elided older events the client
-///     hasn't seen; phase 5 also flips it when the long-poll wakes between
-///     batches.
+/// drop already-sent timeline events, drop unchanged `required_state` entries
+/// (compare by event_id), set `limited` correctly (true iff we elided older
+/// events the client hasn't seen; phase 5 also flips it when the long-poll
+/// wakes between batches).
+///
 /// TODO(phase-4): emit MSC4186 §StateStub `{type, state_key}` markers for
 /// state keys present in `conn.sent.required_state_keys` but absent from
-/// current state. (Blocked on ruma v5 — its `required_state` is typed as
+/// current state. Blocked on ruma v5 — its `required_state` is typed as
 /// `Vec<Raw<AnySyncStateEvent>>` with no stub variant; we'd serialise stubs
-/// as raw JSON and `cast_unchecked()`.)
+/// as raw JSON and `cast_unchecked()`.
+///
 /// TODO(phase-4): handle `expanded_timeline` — set when the conn's
 /// timeline_limit just grew and we're re-sending older events.
 async fn build_room<S: StorageBackend>(
