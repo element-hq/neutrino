@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rusqlite.workspace = true
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+
 serde_json.workspace = true

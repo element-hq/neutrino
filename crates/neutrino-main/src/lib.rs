@@ -8,9 +8,8 @@ pub async fn entrypoint() {
     let config = Config::from_env();
     let bind_addr = config.bind_addr.clone();
 
-    let app = neutrino_http::router(config);
-
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
-    tracing::debug!("listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+
+    tracing::info!("listening on {}", listener.local_addr().unwrap());
+    neutrino_http::serve(listener, config).await.unwrap();
 }

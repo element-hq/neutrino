@@ -8,7 +8,8 @@ crate-type = ["cdylib", "rlib"]
 name = "neutrino"
 
 [dependencies]
-async-compat.workspace = true
+async-compat = "0.2.5"
+
 tokio.workspace = true
 uniffi.workspace = true
 
