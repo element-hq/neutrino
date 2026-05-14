@@ -1,6 +1,17 @@
-// Module is built but not yet wired into the live router — handlers, state, and
-// helpers are exercised by `tests` (and will be reachable from the router once
-// the SQLite StorageBackend impl lands). Allow dead_code until then.
+//! MSC4186 simplified sliding sync — CSAPI handler.
+//!
+//! Endpoint: `POST /_matrix/client/unstable/org.matrix.simplified_msc3575/sync`.
+//! Generic over `S: StorageBackend` so this compiles against the trait alone;
+//! production wiring (mapping `SyncState<SqliteStore>` into the axum router)
+//! lands when the sqlite `StorageBackend` impl is finished.
+//!
+//! Per-connection state lives in `ConnRegistry`; see its docs for the lifecycle
+//! and persistence story (short version: in-memory, no expiry yet, lost on
+//! restart and recovered via `M_UNKNOWN_POS` → client reconnects).
+
+// Items here are reachable from `tests` but not from the live router yet, which
+// would normally trip dead_code. Re-evaluate this allow once the router wiring
+// lands.
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -22,12 +33,22 @@ use conn::ConnRegistry;
 
 #[derive(Debug, Error)]
 pub enum SyncError {
+    /// Returned as HTTP 400 with errcode `M_UNKNOWN_POS`. Client is expected to
+    /// retry without `pos`, which allocates a fresh connection. Triggered when:
+    /// the pos doesn't parse, the (user_id, conn_id) pair isn't in the registry
+    /// (e.g. server restarted), or the supplied pos isn't the one we last issued
+    /// for this conn (client is on a stale token).
     #[error("M_UNKNOWN_POS")]
     UnknownPos,
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
 }
 
+/// Per-process state for the sliding-sync handler.
+///
+/// Holds the shared `StorageBackend` plus the in-memory connection registry.
+/// `Arc<S>` because handlers run concurrently across axum tasks and need shared
+/// read access. One `SyncState` instance per server.
 pub struct SyncState<S> {
     pub store: Arc<S>,
     pub registry: ConnRegistry,
@@ -42,6 +63,7 @@ impl<S> SyncState<S> {
     }
 }
 
+/// Entry point used by the axum handler (when wired) and by tests.
 pub async fn handle<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,

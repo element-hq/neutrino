@@ -1,3 +1,26 @@
+//! Test-only in-memory `StorageBackend` impl for the sliding-sync handler.
+//!
+//! Scope: implements just enough of the trait surface to drive
+//! `sliding_sync::tests`. Methods the handler doesn't currently call are
+//! `todo!()` — touching one in a new test will panic loudly so we don't
+//! accidentally rely on unimplemented behaviour. Promote into a real testing
+//! crate (or behind a `testing` feature in `neutrino-common`) when other crates
+//! need it.
+//!
+//! Limitations vs. a real `StorageBackend` impl:
+//! - No `create_room`, `persist_event`, DAG walks, or federation outbox writes
+//!   — seed state via the `add_event`/`join_user`/`invite_user` helpers
+//!   instead. Those go straight to the underlying maps and bypass the
+//!   pre/post conditions in the trait contract.
+//! - `room_messages` ignores the `from` pagination token (returns the full
+//!   ordered window from one end). Fine for the current tests, will need fixing
+//!   when phase 4 exercises delta windows.
+//! - `subscribe()` works and fires on every `add_event`, but no other writes
+//!   (state changes, room creation) bump the watch. Adequate for phase 5's
+//!   long-poll tests, no more.
+//! - All locking is `std::sync::Mutex` (held briefly, never across `.await`)
+//!   — the trait methods are async only to satisfy the signature.
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -67,6 +90,9 @@ impl MockStore {
             .push(room_id.to_owned());
     }
 
+    /// Seed an event into the store. State events automatically update current
+    /// state (latest wins) — there is no proper resolution, so tests that need
+    /// state-event ordering semantics should add them in the right order.
     pub fn add_event(&self, event: StoredEvent) {
         let mut inner = self.inner.lock().unwrap();
         let pos = StreamPos(inner.next_pos);
@@ -82,6 +108,9 @@ impl MockStore {
         let _ = self.watch_tx.send(pos);
     }
 }
+
+/// `StoredEvent` doesn't derive `Clone` in `neutrino-common`. Hand-clone it
+/// here rather than touching the trait file from a test-only mock.
 
 fn dup(e: &StoredEvent) -> StoredEvent {
     StoredEvent {
@@ -322,6 +351,11 @@ impl FederationInbox for MockStore {
     }
 }
 
+/// Build a `StoredEvent` whose `json` field is a flat object with the standard
+/// PDU keys. Tests pass `content` separately so they don't have to construct
+/// the wrapper themselves. Bypasses room-version validation, signature checks,
+/// and any other pipeline the real persistence path would apply — only
+/// suitable for unit tests of the sync handler.
 pub fn make_event(
     event_id: &EventId,
     room_id: &RoomId,
