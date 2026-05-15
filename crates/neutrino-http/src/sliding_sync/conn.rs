@@ -27,10 +27,15 @@ pub struct ConnKey {
 pub struct ListCfg {
     pub timeline_limit: usize,
     pub required_state: Vec<(StateEventType, String)>,
-    /// TODO(phase-3): apply to slice the candidate-room set into the
-    /// requested window in `build::combined_room_configs`.
-    #[allow(dead_code)]
-    pub ranges: Vec<(usize, usize)>,
+    /// Inclusive window of the sorted candidate list this list cares about.
+    /// `None` means "no window requested" → treat as the full window.
+    ///
+    /// MSC3575 allowed multiple ranges per list (`ranges: [[a,b], [c,d]]`);
+    /// MSC4186 removed that and exposes only a single `range: [a,b]`. The
+    /// `apply_sticky` boundary already takes `list.ranges.first()` from the
+    /// ruma v5 request (ruma still types it as a `Vec` — its v5 module is
+    /// half-migrated), so this field's `Option` is the source of truth.
+    pub range: Option<(usize, usize)>,
     /// Parsed for forward compatibility but always ignored. The embedded
     /// single-user server returns every candidate room regardless of filters
     /// (decision in PLAN.md 2026-05-14; not a phase TODO — intentional gap).

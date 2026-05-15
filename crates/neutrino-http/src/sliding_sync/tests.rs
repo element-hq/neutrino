@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use ruma::api::client::sync::sync_events::v5::{Request, request};
 use ruma::events::StateEventType;
-use ruma::{OwnedRoomId, UInt, event_id, room_id, user_id};
+use ruma::{OwnedRoomId, RoomId, UInt, event_id, room_id, user_id};
 
 use super::mock::{MockStore, make_event};
 use super::{SyncError, SyncState, handle};
@@ -217,4 +217,201 @@ async fn invited_rooms_are_candidates() {
         resp.rooms.contains_key(&owned),
         "invited room appears in candidates"
     );
+}
+
+/// Seed N rooms named `!room-{i}:example.org` (i = 0..N) each with one message
+/// event at the given `ts[i]`. Returns the room IDs in seed order so tests can
+/// assert membership against ranking-derived subsets.
+fn seed_rooms_with_timestamps(
+    store: &MockStore,
+    user: &ruma::UserId,
+    timestamps: &[u64],
+) -> Vec<OwnedRoomId> {
+    let mut ids = Vec::with_capacity(timestamps.len());
+    for (i, ts) in timestamps.iter().enumerate() {
+        let room_id_str = format!("!room-{i}:example.org");
+        let room_id: &RoomId = (&*Box::leak(room_id_str.into_boxed_str()))
+            .try_into()
+            .unwrap();
+        store.join_user(user, room_id);
+        let event_id_str = format!("$ev-{i}:example.org");
+        let event_id: &ruma::EventId = (&*Box::leak(event_id_str.into_boxed_str()))
+            .try_into()
+            .unwrap();
+        let ev = make_event(
+            event_id,
+            room_id,
+            "m.room.message",
+            None,
+            user,
+            *ts,
+            serde_json::json!({"body": "x", "msgtype": "m.text"}),
+        );
+        store.add_event(ev);
+        ids.push(room_id.to_owned());
+    }
+    ids
+}
+
+#[tokio::test]
+async fn rooms_sorted_by_bump_stamp_desc() {
+    // 3 rooms with descending bump stamps assigned to ascending room IDs —
+    // room IDs sort opposite to bump_stamp, so any room_id-based ordering
+    // would give different results than bump_stamp-based ordering.
+    let store = Arc::new(MockStore::new());
+    let user = user_id!("@alice:example.org");
+    // !room-0 → ts 300 (most recent), !room-1 → 200, !room-2 → 100.
+    let ids = seed_rooms_with_timestamps(&store, user, &[300, 200, 100]);
+    let state = SyncState::new(store);
+
+    let mut req = Request::new();
+    let mut lists = BTreeMap::new();
+    // Request only the top 2 by recency.
+    let mut list = request::List::default();
+    list.ranges = vec![(UInt::from(0u32), UInt::from(1u32))];
+    list.room_details.timeline_limit = UInt::from(5u32);
+    lists.insert("top2".to_string(), list);
+    req.lists = lists;
+
+    let resp = handle(&state, user, req).await.unwrap();
+
+    assert_eq!(resp.rooms.len(), 2, "exactly the top 2 returned");
+    assert!(
+        resp.rooms.contains_key(&ids[0]),
+        "room with ts=300 included"
+    );
+    assert!(
+        resp.rooms.contains_key(&ids[1]),
+        "room with ts=200 included"
+    );
+    assert!(
+        !resp.rooms.contains_key(&ids[2]),
+        "room with ts=100 (rank 2) excluded by range [0,1]"
+    );
+
+    let list_result = resp.lists.get("top2").unwrap();
+    assert_eq!(
+        list_result.count,
+        UInt::from(3u32),
+        "count is full candidate set, not range size"
+    );
+}
+
+#[tokio::test]
+async fn range_slicing_returns_only_requested_indexes() {
+    // 10 rooms with strictly ascending bump stamps; request indexes [2,4].
+    let store = Arc::new(MockStore::new());
+    let user = user_id!("@alice:example.org");
+    let timestamps: Vec<u64> = (1..=10).map(|i| i * 100).collect();
+    let ids = seed_rooms_with_timestamps(&store, user, &timestamps);
+    // After sort: rank 0 = highest ts (!room-9, ts=1000); rank 9 = lowest.
+    let state = SyncState::new(store);
+
+    let mut req = Request::new();
+    let mut lists = BTreeMap::new();
+    let mut list = request::List::default();
+    list.ranges = vec![(UInt::from(2u32), UInt::from(4u32))];
+    list.room_details.timeline_limit = UInt::from(1u32);
+    lists.insert("slice".to_string(), list);
+    req.lists = lists;
+
+    let resp = handle(&state, user, req).await.unwrap();
+
+    assert_eq!(resp.rooms.len(), 3, "range [2,4] is inclusive on both ends");
+    // Ranks 2, 3, 4 correspond to the 8th-, 7th-, 6th-most-recent timestamps,
+    // i.e. !room-7 (ts=800), !room-6 (ts=700), !room-5 (ts=600).
+    assert!(resp.rooms.contains_key(&ids[7]));
+    assert!(resp.rooms.contains_key(&ids[6]));
+    assert!(resp.rooms.contains_key(&ids[5]));
+    assert!(!resp.rooms.contains_key(&ids[9]), "rank 0 excluded");
+    assert!(!resp.rooms.contains_key(&ids[4]), "rank 5 excluded");
+}
+
+#[tokio::test]
+async fn subscription_bypasses_list_range() {
+    // 3 rooms ranked 0, 1, 2 by recency. List asks for range [0,0] (top only).
+    // Subscription names the lowest-ranked room — should appear regardless.
+    let store = Arc::new(MockStore::new());
+    let user = user_id!("@alice:example.org");
+    let ids = seed_rooms_with_timestamps(&store, user, &[300, 200, 100]);
+    let state = SyncState::new(store);
+
+    let mut req = Request::new();
+    let mut lists = BTreeMap::new();
+    let mut list = request::List::default();
+    list.ranges = vec![(UInt::from(0u32), UInt::from(0u32))];
+    list.room_details.timeline_limit = UInt::from(1u32);
+    lists.insert("top1".to_string(), list);
+    req.lists = lists;
+    let mut subs = BTreeMap::new();
+    let mut sub = request::RoomSubscription::default();
+    sub.timeline_limit = UInt::from(1u32);
+    subs.insert(ids[2].clone(), sub);
+    req.room_subscriptions = subs;
+
+    let resp = handle(&state, user, req).await.unwrap();
+
+    assert!(
+        resp.rooms.contains_key(&ids[0]),
+        "list top includes rank-0 room"
+    );
+    assert!(
+        resp.rooms.contains_key(&ids[2]),
+        "subscription pulls in rank-2 room despite range [0,0]"
+    );
+    assert!(
+        !resp.rooms.contains_key(&ids[1]),
+        "rank-1 room not in list range and not subscribed"
+    );
+}
+
+#[tokio::test]
+async fn multi_range_request_only_honours_first() {
+    // MSC4186 removed MSC3575's multi-range support; ruma v5 still types
+    // `ranges: Vec` for compatibility. We honour only `ranges[0]` and silently
+    // drop the rest. This test asserts that with 5 rooms and a request that
+    // sends both [0,0] and [3,4], only the rank-0 room comes back.
+    let store = Arc::new(MockStore::new());
+    let user = user_id!("@alice:example.org");
+    let ids = seed_rooms_with_timestamps(&store, user, &[100, 200, 300, 400, 500]);
+    let state = SyncState::new(store);
+
+    let mut req = Request::new();
+    let mut lists = BTreeMap::new();
+    let mut list = request::List::default();
+    list.ranges = vec![
+        (UInt::from(0u32), UInt::from(0u32)),
+        (UInt::from(3u32), UInt::from(4u32)),
+    ];
+    list.room_details.timeline_limit = UInt::from(1u32);
+    lists.insert("multi".to_string(), list);
+    req.lists = lists;
+
+    let resp = handle(&state, user, req).await.unwrap();
+    assert_eq!(resp.rooms.len(), 1, "only the first range applied");
+    // rank 0 = highest ts = !room-4 (ts=500).
+    assert!(resp.rooms.contains_key(&ids[4]));
+}
+
+#[tokio::test]
+async fn list_count_independent_of_range_size() {
+    let store = Arc::new(MockStore::new());
+    let user = user_id!("@alice:example.org");
+    let _ids = seed_rooms_with_timestamps(&store, user, &[100, 200, 300, 400, 500]);
+    let state = SyncState::new(store);
+
+    let mut req = Request::new();
+    let mut lists = BTreeMap::new();
+    let mut list = request::List::default();
+    // Request only one slot, but `count` should still be the total candidates.
+    list.ranges = vec![(UInt::from(0u32), UInt::from(0u32))];
+    list.room_details.timeline_limit = UInt::from(1u32);
+    lists.insert("one".to_string(), list);
+    req.lists = lists;
+
+    let resp = handle(&state, user, req).await.unwrap();
+
+    assert_eq!(resp.rooms.len(), 1);
+    let list_result = resp.lists.get("one").unwrap();
+    assert_eq!(list_result.count, UInt::from(5u32));
 }

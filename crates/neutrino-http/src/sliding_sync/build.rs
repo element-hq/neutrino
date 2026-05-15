@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use neutrino_common::storage::{Direction, StorageBackend, StoredEvent};
@@ -7,7 +7,7 @@ use ruma::api::client::sync::sync_events::v5::response;
 use ruma::api::client::sync::sync_events::v5::{Request, Response};
 use ruma::events::{AnySyncStateEvent, AnySyncTimelineEvent, StateEventType};
 use ruma::serde::Raw;
-use ruma::{OwnedRoomId, UserId};
+use ruma::{OwnedRoomId, RoomId, UserId};
 use tokio::sync::Mutex;
 
 use super::conn::{Conn, ConnKey, ConnRegistry, ListCfg, RoomSent, SubCfg};
@@ -20,11 +20,13 @@ use super::{SyncError, SyncState};
 ///    new conn. Present `pos` → must match the conn's most-recently-issued
 ///    token, else `UnknownPos` (forces the client to reconnect).
 /// 2. Merge the request's list/sub configs into the conn (sticky update).
-/// 3. Enumerate candidate rooms (joined ∪ invited; no filtering).
-/// 4. For each room, fetch timeline + filtered current state and build a
-///    `response::Room`.
-/// 5. Record what we just sent in `conn.sent` so future deltas can diff.
-/// 6. Bump the conn's pos token and return it.
+/// 3. Rank candidate rooms (joined ∪ invited) by recency.
+/// 4. Apply each list's `ranges` to slice the ranked set; subscriptions bypass
+///    ranges.
+/// 5. For each selected room, fetch timeline + filtered current state and build
+///    a `response::Room`.
+/// 6. Record what we just sent in `conn.sent` so future deltas can diff.
+/// 7. Bump the conn's pos token and return it.
 pub(super) async fn build_response<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
@@ -39,8 +41,8 @@ pub(super) async fn build_response<S: StorageBackend>(
 
     apply_sticky(&mut conn, &req);
 
-    let candidate_rooms = candidate_rooms(state, user_id).await?;
-    let combined = combined_room_configs(&conn, &candidate_rooms);
+    let ranked = candidate_rooms(state, user_id).await?;
+    let combined = combined_room_configs(&conn, &ranked);
 
     let mut rooms_response = BTreeMap::new();
     for (room_id, combined_cfg) in &combined {
@@ -54,14 +56,14 @@ pub(super) async fn build_response<S: StorageBackend>(
         rooms_response.insert(room_id.clone(), room_result);
     }
 
-    // TODO(phase-3): once filters/ranges are honoured, `count` is the size of
-    // the *filtered* candidate set, not the raw candidate set.
+    // `count` is the size of the filtered candidate set (before slicing by
+    // range). Filters are no-ops in our impl, so it's just `ranked.len()`.
     let lists_response = conn
         .lists
         .keys()
         .map(|name| {
             let mut list = response::List::default();
-            list.count = UInt::try_from(candidate_rooms.len() as u64).unwrap_or(UInt::MIN);
+            list.count = UInt::try_from(ranked.len() as u64).unwrap_or(UInt::MIN);
             (name.clone(), list)
         })
         .collect();
@@ -107,14 +109,19 @@ async fn resolve_conn(
 /// require deletion semantics.
 fn apply_sticky(conn: &mut Conn, req: &Request) {
     for (name, list) in &req.lists {
+        // MSC4186 removed MSC3575's multi-range support; the wire field is now
+        // a singular `range`. Ruma v5's `ranges: Vec` is a half-migrated
+        // artefact — we honour only the first entry and silently drop any
+        // others. Going strict-with-400 would break clients that haven't fully
+        // migrated yet (see PLAN.md/MSC4186-gaps.md notes on ruma's dialect).
+        let range = list
+            .ranges
+            .first()
+            .map(|(a, b)| (u64::from(*a) as usize, u64::from(*b) as usize));
         let cfg = ListCfg {
             timeline_limit: u64::from(list.room_details.timeline_limit) as usize,
             required_state: list.room_details.required_state.clone(),
-            ranges: list
-                .ranges
-                .iter()
-                .map(|(a, b)| (u64::from(*a) as usize, u64::from(*b) as usize))
-                .collect(),
+            range,
             filters: list.filters.clone(),
         };
         conn.lists.insert(name.clone(), cfg);
@@ -129,58 +136,124 @@ fn apply_sticky(conn: &mut Conn, req: &Request) {
     }
 }
 
+/// One candidate room plus its server-computed sort key.
+///
+/// `bump_stamp` is the most recent `origin_server_ts` observed in the room.
+/// We use timestamp rather than stream position so that federation-backfilled
+/// old events don't bump the room to the top (PLAN.md 2026-05-14). Falls back
+/// to the `m.room.create` event's `origin_server_ts` for rooms with no other
+/// activity (e.g. fresh invites); rooms with truly no state get 0 and sort to
+/// the bottom.
+struct RankedRoom {
+    room_id: OwnedRoomId,
+    bump_stamp: u64,
+}
+
 /// Resolved per-room request after merging every rule that mentions it.
 /// MSC4186 §"Room Config Combination": when a room matches multiple lists or
 /// is also a direct subscription, the server unions the required_state and
-/// takes the max timeline_limit.
+/// takes the max timeline_limit. We also carry the pre-computed `bump_stamp`
+/// so `build_room` doesn't recompute it.
 struct CombinedCfg {
     timeline_limit: usize,
     required_state: Vec<(StateEventType, String)>,
+    bump_stamp: u64,
 }
 
-/// Every room the user can see for sync purposes.
+/// Rank every room the user can see by recency.
 ///
-/// Joined rooms come from current state; invited rooms from invite events. We
-/// don't apply any of MSC4186's `is_dm`/`is_encrypted`/`spaces`/`tags`/etc.
-/// filters — the embedded single-user server returns the full set (see PLAN.md
-/// 2026-05-14). Sorting/dedup keeps the output deterministic for tests and for
-/// future range slicing.
+/// Joined rooms come from current state; invited rooms from invite events.
+/// We don't apply MSC4186's `is_dm`/`is_encrypted`/`spaces`/`tags`/etc.
+/// filters — the embedded single-user server returns the full set (PLAN.md
+/// 2026-05-14). Sorted by `bump_stamp` desc, tiebroken by `room_id` asc so
+/// tests are deterministic.
 ///
-/// TODO(phase-3): sort by `bump_stamp` desc (recency) before range slicing.
-///
-/// TODO(phase-3): include kicked/banned rooms per MSC4186 §"Rooms included in
+/// TODO(phase-3+): include kicked/banned rooms per MSC4186 §"Rooms included in
 /// the server list", and previously-joined left rooms if the conn already saw
-/// them.
+/// them. Blocked on a new `StateStore` method like `rooms_with_membership` —
+/// trait change, ask first.
 async fn candidate_rooms<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
-) -> Result<Vec<OwnedRoomId>, SyncError> {
-    let mut rooms = state.store.joined_rooms(user_id).await?;
-    rooms.extend(state.store.invited_rooms(user_id).await?);
-    rooms.sort();
-    rooms.dedup();
-    Ok(rooms)
+) -> Result<Vec<RankedRoom>, SyncError> {
+    let mut all = state.store.joined_rooms(user_id).await?;
+    all.extend(state.store.invited_rooms(user_id).await?);
+    all.sort();
+    all.dedup();
+
+    let mut ranked: Vec<RankedRoom> = Vec::with_capacity(all.len());
+    for room_id in all {
+        let bump_stamp = compute_bump_stamp(state, &room_id).await?;
+        ranked.push(RankedRoom {
+            room_id,
+            bump_stamp,
+        });
+    }
+
+    ranked.sort_by(|a, b| {
+        b.bump_stamp
+            .cmp(&a.bump_stamp)
+            .then_with(|| a.room_id.cmp(&b.room_id))
+    });
+    Ok(ranked)
 }
 
-/// For each candidate room, compute the effective request config by unioning
-/// every list/subscription rule that applies to it.
+/// Best-available recency stamp for a room. Peek the most recent event
+/// (Backward, limit 1), else fall back to the create event. Returns 0 if
+/// neither exists — that room sorts to the bottom.
 ///
-/// Since filters are ignored, every list applies to every candidate (and so
-/// has the same effect as one big list for now). The union/max logic still
-/// matters once explicit subscriptions are mixed in.
+/// **Cost:** called once per candidate room from `candidate_rooms` on every
+/// sync request, so this is `O(n)` storage round-trips where `n` is the
+/// user's joined+invited room count. Acceptable for the embedded single-user
+/// case (small `n`, no concurrency). Future optimisations if it becomes a
+/// problem: (a) cache `(room_id → bump_stamp)` in `SyncState` and update on
+/// `EventStore::subscribe()` wakeups; (b) add a batched
+/// `StateStore::room_bump_stamps(rooms)` trait method; (c) maintain a
+/// `bump_stamp` column on the rooms table updated transactionally on every
+/// `persist_event`. (c) is the cleanest long-term; (a) is cheapest if storage
+/// stays single-process. All are out of scope for phase 3.
+async fn compute_bump_stamp<S: StorageBackend>(
+    state: &SyncState<S>,
+    room_id: &RoomId,
+) -> Result<u64, SyncError> {
+    let (events, _) = state
+        .store
+        .room_messages(room_id, None, Direction::Backward, 1)
+        .await?;
+    if let Some(ev) = events.first() {
+        return Ok(ev.origin_server_ts);
+    }
+    let create = state
+        .store
+        .current_state_event(room_id, "m.room.create", "")
+        .await?;
+    Ok(create.map(|e| e.origin_server_ts).unwrap_or(0))
+}
+
+/// Slice the ranked candidates by each list's `ranges`, union in subscriptions,
+/// and merge per-room timeline/required_state configs.
 ///
-/// TODO(phase-3): apply each list's `ranges` to slice the candidate set
-/// before mapping to configs.
-fn combined_room_configs(conn: &Conn, rooms: &[OwnedRoomId]) -> BTreeMap<OwnedRoomId, CombinedCfg> {
+/// Subscriptions bypass ranges: an explicitly subscribed room shows up even if
+/// it's not in any list's window (MSC4186 §"Subscriptions"). A subscribed room
+/// not in `ranked` (shouldn't happen with joined ∪ invited candidates, but
+/// could once we add kicked/banned) gets `bump_stamp = 0`.
+///
+/// An empty `ranges` array means "no slice requested" — we treat that as the
+/// full set `[0, len-1]` (defensive: ruma's `List` defaults to empty ranges).
+fn combined_room_configs(conn: &Conn, ranked: &[RankedRoom]) -> BTreeMap<OwnedRoomId, CombinedCfg> {
     let mut out: BTreeMap<OwnedRoomId, CombinedCfg> = BTreeMap::new();
+    let bump_by_room: HashMap<&OwnedRoomId, u64> =
+        ranked.iter().map(|r| (&r.room_id, r.bump_stamp)).collect();
 
     let apply = |out: &mut BTreeMap<OwnedRoomId, CombinedCfg>,
                  room_id: &OwnedRoomId,
+                 bump_stamp: u64,
                  timeline_limit: usize,
                  required_state: &[(StateEventType, String)]| {
         let entry = out.entry(room_id.clone()).or_insert(CombinedCfg {
             timeline_limit: 0,
             required_state: Vec::new(),
+            bump_stamp,
         });
         entry.timeline_limit = entry.timeline_limit.max(timeline_limit);
         for pair in required_state {
@@ -191,15 +264,52 @@ fn combined_room_configs(conn: &Conn, rooms: &[OwnedRoomId]) -> BTreeMap<OwnedRo
     };
 
     for cfg in conn.lists.values() {
-        for room_id in rooms {
-            apply(&mut out, room_id, cfg.timeline_limit, &cfg.required_state);
+        let Some((lo, hi)) = effective_range(cfg.range, ranked.len()) else {
+            continue;
+        };
+        for room in ranked.iter().take(hi + 1).skip(lo) {
+            apply(
+                &mut out,
+                &room.room_id,
+                room.bump_stamp,
+                cfg.timeline_limit,
+                &cfg.required_state,
+            );
         }
     }
     for (room_id, cfg) in &conn.subs {
-        apply(&mut out, room_id, cfg.timeline_limit, &cfg.required_state);
+        let bump_stamp = bump_by_room.get(room_id).copied().unwrap_or(0);
+        apply(
+            &mut out,
+            room_id,
+            bump_stamp,
+            cfg.timeline_limit,
+            &cfg.required_state,
+        );
     }
 
     out
+}
+
+/// Normalise a list's `range` against the actual candidate count: clamp the
+/// upper bound to `total - 1` and drop the range entirely if it starts past
+/// the end. `None` input (no `range` field on the request) becomes the full
+/// window `[0, total-1]`. Zero candidates → `None` (caller iterates zero
+/// times anyway).
+///
+/// Only one range is honoured per list (MSC4186 removed MSC3575's multi-range
+/// support; see `apply_sticky`).
+fn effective_range(range: Option<(usize, usize)>, total: usize) -> Option<(usize, usize)> {
+    if total == 0 {
+        return None;
+    }
+    let Some((a, b)) = range else {
+        return Some((0, total - 1));
+    };
+    if a >= total {
+        return None;
+    }
+    Some((a, b.min(total - 1)))
 }
 
 /// Produce one room's slice of the sync response.
@@ -209,6 +319,9 @@ fn combined_room_configs(conn: &Conn, rooms: &[OwnedRoomId]) -> BTreeMap<OwnedRo
 /// emitted without re-parsing the JSON. We clone the events into the response
 /// as `Raw<...>` and again into the sent-tracking vecs; cheap and keeps the
 /// data flow obvious.
+///
+/// `cfg.bump_stamp` is already computed in `candidate_rooms`; we use it
+/// directly rather than re-deriving it from the timeline window.
 ///
 /// TODO(phase-4): when `is_initial == false`, diff against `conn.sent`:
 /// drop already-sent timeline events, drop unchanged `required_state` entries
@@ -272,17 +385,8 @@ async fn build_room<S: StorageBackend>(
             .collect();
     }
 
-    // bump_stamp = max origin_server_ts across the returned timeline. Opaque
-    // to the client per MSC4186 (just sortable); using origin_server_ts means
-    // federation-backfilled-old events don't bump the room. See PLAN.md
-    // 2026-05-14.
-    //
-    // TODO(phase-4): fall back to the room's create-event ts (or another
-    // stable value) when the timeline is empty — currently fresh joins and
-    // invites get `bump_stamp = None` and sort to the bottom.
-    let max_ts = timeline_events.iter().map(|e| e.origin_server_ts).max();
-    if let Some(ts) = max_ts {
-        room.bump_stamp = UInt::try_from(ts).ok();
+    if cfg.bump_stamp > 0 {
+        room.bump_stamp = UInt::try_from(cfg.bump_stamp).ok();
     }
 
     // TODO(phase-4): populate `name` and `avatar` from the m.room.name /
@@ -335,5 +439,32 @@ fn update_sent(sent: &mut RoomSent, timeline_events: &[StoredEvent], state_event
                 ev.event_id.clone(),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::effective_range;
+
+    #[test]
+    fn effective_range_none_input_full_window() {
+        assert_eq!(effective_range(None, 5), Some((0, 4)));
+    }
+
+    #[test]
+    fn effective_range_zero_total_returns_none() {
+        assert_eq!(effective_range(Some((0, 4)), 0), None);
+        assert_eq!(effective_range(None, 0), None);
+    }
+
+    #[test]
+    fn effective_range_clamps_upper_bound() {
+        assert_eq!(effective_range(Some((0, 99)), 3), Some((0, 2)));
+    }
+
+    #[test]
+    fn effective_range_drops_fully_out_of_range() {
+        // start ≥ total → drop.
+        assert_eq!(effective_range(Some((10, 20)), 5), None);
     }
 }
