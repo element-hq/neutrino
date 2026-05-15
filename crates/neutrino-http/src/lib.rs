@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -8,33 +8,42 @@ use axum::{
     Json, Router,
     extract::{Query, State},
     http::StatusCode,
+    response::IntoResponse,
     routing::{get, post, put},
 };
 use neutrino_common::Config;
-use neutrino_sqlite::Store;
 use rand::{Rng, distr::Alphanumeric};
-use serde::Serialize;
+use ruma::OwnedRoomId;
+use ruma::api::client::sync::sync_events::v5;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+pub mod in_memory_store;
 mod sliding_sync;
 
-#[derive(Debug)]
+use in_memory_store::InMemoryStore;
+use sliding_sync::{SyncError, SyncState};
+
 struct App {
-    store: Store,
+    store: Arc<InMemoryStore>,
+    sync_state: Arc<SyncState<InMemoryStore>>,
     keys: Option<Value>,
     config: Config,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppState(Arc<Mutex<App>>);
 
 impl AppState {
     fn new(config: Config) -> Self {
+        let store = Arc::new(InMemoryStore::new());
+        let sync_state = Arc::new(SyncState::new(store.clone()));
         let app = App {
-            store: Store::open_in_memory(),
+            store,
+            sync_state,
             keys: None,
             config,
         };
@@ -47,7 +56,7 @@ pub async fn serve(listener: TcpListener, config: Config) -> Result<(), std::io:
     Ok(())
 }
 
-fn router(config: Config) -> Router {
+pub fn router(config: Config) -> Router {
     let state = AppState::new(config.clone());
     let user_id = config.user_id();
 
@@ -174,158 +183,148 @@ async fn post_login(state: State<AppState>) -> Json<Value> {
     }))
 }
 
-#[derive(Serialize)]
-struct SyncRoom {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    initial: Option<bool>,
-    required_state: Vec<Value>,
-    timeline: Vec<Value>,
-    membership: String,
-}
-
+/// MSC4186 sliding-sync entrypoint. The actual work is in
+/// `sliding_sync::handle`; this wrapper handles the HTTP/JSON edge:
+/// - assembles a `v5::Request` from the JSON body plus query string (`pos`,
+///   `timeout` live on the URL per ruma's annotations);
+/// - clones the `Arc<SyncState>` out from under the std-mutex'd `AppState`
+///   so we don't hold a `!Send` lock across `.await`;
+/// - maps `SyncError` to the spec's HTTP / errcode shape.
 async fn sync(
     state: State<AppState>,
     query: Query<HashMap<String, String>>,
     body: Json<Value>,
-) -> Json<Value> {
-    let pos: i64 = query.get("pos").map(|s| s.parse().unwrap()).unwrap_or(0);
-    let timeout: i64 = query
-        .get("timeout")
-        .map(|s| s.parse().unwrap())
-        .unwrap_or(0);
-
-    info!("Received sync with pos: {}, {:?}", pos, body.0);
-
-    let mut lists = HashMap::<String, Value>::new();
-    if let Some(lists_json) = body.0.pointer("/lists").and_then(|v| v.as_object()) {
+) -> axum::response::Response {
+    let body_value = body.0;
+    let (sync_state, user_id_str) = {
         let app = state.0.0.lock().unwrap();
-        let count = app.store.count_distinct_rooms();
-        for list_name in lists_json.keys() {
-            lists.insert(list_name.clone(), json!({"count": count}));
+        (app.sync_state.clone(), app.config.user_id())
+    };
+
+    let user_id: ruma::OwnedUserId = match user_id_str.as_str().try_into() {
+        Ok(u) => u,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            );
+        }
+    };
+
+    let req = match build_sync_request(&query.0, body_value) {
+        Ok(r) => r,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, "M_BAD_JSON", &e.to_string()),
+    };
+
+    match sliding_sync::handle(&sync_state, &user_id, req).await {
+        Ok(resp) => (StatusCode::OK, Json(SyncResponseWire::from(resp))).into_response(),
+        Err(SyncError::UnknownPos) => {
+            error_response(StatusCode::BAD_REQUEST, "M_UNKNOWN_POS", "Unknown position")
+        }
+        Err(SyncError::BadRequest(msg)) => {
+            error_response(StatusCode::BAD_REQUEST, "M_BAD_JSON", msg)
+        }
+        Err(SyncError::Storage(e)) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &e.to_string(),
+        ),
+    }
+}
+
+/// Build a `v5::Request` from the JSON body plus the `pos` and `timeout`
+/// query parameters. The body fields (`conn_id`, `txn_id`, `lists`,
+/// `room_subscriptions`, `extensions`) come from JSON; the query fields
+/// override whatever was in the body.
+///
+/// Ruma's `#[request]` macro doesn't derive plain `Deserialize` on
+/// `v5::Request` (it generates an `IncomingRequest` impl meant for
+/// reconstructing the full HTTP request shape). The inner field types DO
+/// derive `Deserialize`, so we go through a thin wrapper that mirrors only
+/// the body-side fields and copy them onto a fresh `v5::Request`.
+fn build_sync_request(
+    query: &HashMap<String, String>,
+    body: Value,
+) -> Result<v5::Request, serde_json::Error> {
+    let body_typed: SyncRequestBody =
+        if body.is_null() || matches!(&body, Value::Object(m) if m.is_empty()) {
+            SyncRequestBody::default()
+        } else {
+            serde_json::from_value(body)?
+        };
+
+    let mut req = v5::Request::new();
+    req.conn_id = body_typed.conn_id;
+    req.txn_id = body_typed.txn_id;
+    req.lists = body_typed.lists;
+    req.room_subscriptions = body_typed.room_subscriptions;
+    req.extensions = body_typed.extensions;
+
+    if let Some(p) = query.get("pos") {
+        req.pos = Some(p.clone());
+    }
+    if let Some(t) = query.get("timeout")
+        && let Ok(ms) = t.parse::<u64>()
+    {
+        req.timeout = Some(Duration::from_millis(ms));
+    }
+    Ok(req)
+}
+
+/// Deserializable mirror of the *body* half of `v5::Request`. The query
+/// fields (`pos`, `timeout`, `set_presence`) are handled separately.
+#[derive(Default, Deserialize)]
+struct SyncRequestBody {
+    #[serde(default)]
+    conn_id: Option<String>,
+    #[serde(default)]
+    txn_id: Option<String>,
+    #[serde(default)]
+    lists: BTreeMap<String, v5::request::List>,
+    #[serde(default)]
+    room_subscriptions: BTreeMap<OwnedRoomId, v5::request::RoomSubscription>,
+    #[serde(default)]
+    extensions: v5::request::Extensions,
+}
+
+/// Serializable mirror of `v5::Response`. Same trick — ruma's `#[response]`
+/// macro doesn't derive plain `Serialize` on the outer type, but its inner
+/// field types do.
+#[derive(Serialize)]
+struct SyncResponseWire {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    txn_id: Option<String>,
+    pos: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    lists: BTreeMap<String, v5::response::List>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    rooms: BTreeMap<OwnedRoomId, v5::response::Room>,
+    #[serde(skip_serializing_if = "extensions_is_empty")]
+    extensions: v5::response::Extensions,
+}
+
+impl From<v5::Response> for SyncResponseWire {
+    fn from(r: v5::Response) -> Self {
+        Self {
+            txn_id: r.txn_id,
+            pos: r.pos,
+            lists: r.lists,
+            rooms: r.rooms,
+            extensions: r.extensions,
         }
     }
+}
 
-    let user_id = state.0.0.lock().unwrap().config.user_id();
+fn extensions_is_empty(e: &v5::response::Extensions) -> bool {
+    e.to_device.is_none()
+        && e.e2ee.device_lists.is_empty()
+        && e.e2ee.device_one_time_keys_count.is_empty()
+        && e.e2ee.device_unused_fallback_key_types.is_none()
+}
 
-    if !query.contains_key("pos") {
-        return Json(json!({
-            "pos": pos.to_string(),
-            "lists": lists,
-            "rooms": {},
-            "extensions": {
-                "e2ee": {
-                    "device_one_time_keys_count": {
-                        "signed_curve25519": 100
-                    },
-                    "device_lists": {
-                        "changed": [user_id],
-                        "left": []
-                    },
-                    "device_unused_fallback_key_types": [
-                        "signed_curve25519"
-                    ]
-                },
-                "to_device": {"next_batch": "12345"}
-            }
-        }));
-    }
-
-    loop {
-        if !lists.is_empty() {
-            let app = state.0.0.lock().unwrap();
-            let rows = app.store.events_after(pos);
-
-            let mut max_pos = pos;
-            let mut events_by_room: HashMap<String, Vec<Value>> = HashMap::new();
-            for (stream_ordering, room_id, event) in rows {
-                max_pos = stream_ordering;
-                events_by_room.entry(room_id).or_default().push(event);
-            }
-
-            if !events_by_room.is_empty() {
-                info!(
-                    "Returning {} rooms with events up to pos {}",
-                    events_by_room.len(),
-                    max_pos
-                );
-
-                let mut rooms_json = HashMap::new();
-                for (room_id, events) in events_by_room {
-                    let mut entry = SyncRoom {
-                        name: None,
-                        initial: None,
-                        required_state: vec![],
-                        timeline: vec![],
-                        membership: "join".to_string(),
-                    };
-
-                    for event in events {
-                        if event.get("type") == Some(&Value::String("m.room.create".to_string())) {
-                            entry.initial = Some(true);
-                        }
-
-                        if event.get("type") == Some(&Value::String("m.room.name".to_string())) {
-                            entry.name = event
-                                .pointer("/content/name")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                        }
-
-                        if event.get("state_key").is_some() {
-                            entry.required_state.push(event.clone());
-                        }
-
-                        entry.timeline.push(event);
-                    }
-
-                    rooms_json.insert(room_id, entry);
-                }
-
-                let room_count = app.store.count_distinct_rooms();
-
-                for list in lists.values_mut() {
-                    list.as_object_mut()
-                        .unwrap()
-                        .insert("count".to_string(), json!(room_count));
-                }
-
-                return Json(json!({
-                    "pos": max_pos.to_string(),
-                    "lists": lists,
-                    "rooms": rooms_json,
-                    "extensions": {
-                        "e2ee": {
-                            "device_one_time_keys_count": {
-                                "signed_curve25519": 100
-                            },
-                        },
-                        "to_device": {"next_batch": "12345"}
-                    }
-                }));
-            }
-        }
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        if timeout == 0 {
-            info!("No new events, returning empty sync");
-            return Json(json!({
-                "pos": pos.to_string(),
-                "lists": lists,
-                "rooms": {},
-                "extensions": {
-                    "e2ee": {
-                        "device_one_time_keys_count": {
-                            "signed_curve25519": 100
-                        },
-                    },
-                    "to_device": {"next_batch": "12345"}
-                }
-            }));
-        }
-    }
+fn error_response(status: StatusCode, errcode: &str, error: &str) -> axum::response::Response {
+    (status, Json(json!({"errcode": errcode, "error": error}))).into_response()
 }
 
 async fn keys_query(state: State<AppState>, body: Json<Value>) -> Json<Value> {
@@ -440,9 +439,12 @@ async fn get_room_keys() -> (StatusCode, Json<Value>) {
 }
 
 async fn create_room(state: State<AppState>, body: Json<Value>) -> Json<Value> {
-    let mut app = state.0.0.lock().unwrap();
+    let app = state.0.0.lock().unwrap();
+    let store = app.store.clone();
     let server_name = app.config.server_name.clone();
     let user_id = app.config.user_id();
+    drop(app);
+
     let room_id = mint_id('!', &server_name, 7);
 
     let create_event = json!({
@@ -488,7 +490,9 @@ async fn create_room(state: State<AppState>, body: Json<Value>) -> Json<Value> {
         events.push(name_event);
     }
 
-    app.store.insert_events(&events);
+    for ev in &events {
+        let _ = store.insert_event_from_json(ev);
+    }
 
     Json(json!({
         "room_id": room_id,
@@ -499,12 +503,12 @@ async fn members(
     state: State<AppState>,
     axum::extract::Path(room_id): axum::extract::Path<String>,
 ) -> Json<Value> {
-    let app = state.0.0.lock().unwrap();
-    let members = app.store.members_of(&room_id);
-
-    Json(json!({
-        "chunk": members
-    }))
+    let store = state.0.0.lock().unwrap().store.clone();
+    let chunk = match ruma::OwnedRoomId::try_from(room_id.as_str()) {
+        Ok(rid) => store.members_of(&rid),
+        Err(_) => Vec::new(),
+    };
+    Json(json!({"chunk": chunk}))
 }
 
 async fn put_event(
@@ -516,20 +520,23 @@ async fn put_event(
     )>,
     body: Json<Value>,
 ) -> Json<Value> {
-    let mut app = state.0.0.lock().unwrap();
+    let app = state.0.0.lock().unwrap();
+    let store = app.store.clone();
     let server_name = app.config.server_name.clone();
     let user_id = app.config.user_id();
+    drop(app);
 
     let event_id = mint_id('$', &server_name, 10);
 
-    app.store.insert_events(&[json!({
+    let pdu = json!({
         "room_id": room_id,
         "type": event_type,
         "sender": user_id,
         "event_id": event_id,
         "content": body.0,
         "origin_server_ts": 0,
-    })]);
+    });
+    let _ = store.insert_event_from_json(&pdu);
 
     Json(json!({
         "event_id": event_id,

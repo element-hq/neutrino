@@ -31,8 +31,6 @@ mod build;
 mod conn;
 
 #[cfg(test)]
-mod mock;
-#[cfg(test)]
 mod tests;
 
 use conn::{Conn, ConnKey, ConnRegistry};
