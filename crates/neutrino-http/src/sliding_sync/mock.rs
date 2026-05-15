@@ -234,8 +234,17 @@ impl EventStore for MockStore {
         if matches!(dir, Direction::Backward) {
             room_events.reverse();
         }
+        let total = room_events.len();
         let truncated: Vec<StoredEvent> = room_events.into_iter().take(limit).map(dup).collect();
-        Ok((truncated, None))
+        // Trait contract: token is `Some` iff there are more events to walk
+        // further in the requested direction. The token value itself is a
+        // placeholder — this mock doesn't actually paginate through it.
+        let prev_batch = if total > truncated.len() {
+            Some(PaginationToken(truncated.len() as u64))
+        } else {
+            None
+        };
+        Ok((truncated, prev_batch))
     }
 
     fn subscribe(&self) -> watch::Receiver<StreamPos> {
