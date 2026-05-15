@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use ruma::api::client::sync::sync_events::v5;
 use ruma::api::client::sync::sync_events::v5::request;
 use ruma::events::StateEventType;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
@@ -92,6 +93,24 @@ pub struct Conn {
     /// field, so we can't actually surface it on the wire — kept tracked for
     /// when ruma catches up. See MSC4186-gaps.md.
     pub prev_list_timeline_limits: BTreeMap<String, usize>,
+    /// Idempotency cache: the `pos` value the client sent on the most
+    /// recently *processed* request (i.e. the input pos, not the output). If
+    /// the next request arrives with the same value, we return
+    /// `last_response` verbatim rather than re-processing — MSC4186
+    /// §"Pagination and Tokens" permits clients to retry by re-using the
+    /// same `pos`.
+    ///
+    /// `None` on a freshly-created conn (the initial sync was the most
+    /// recent processed request, which has no pos input).
+    pub last_request_pos: Option<u64>,
+    /// Companion to `last_request_pos` — the full response we returned for
+    /// that input pos. On a retry hit (`req.pos == last_request_pos`) we
+    /// clone this and return immediately, without re-running `build_response`
+    /// or advancing any conn state.
+    ///
+    /// Includes the post-processing extension stubs so the cached response
+    /// matches exactly what the client got the first time, byte-for-byte.
+    pub last_response: Option<v5::Response>,
 }
 
 impl Conn {

@@ -938,3 +938,282 @@ async fn extensions_not_echoed_when_not_requested() {
     assert!(resp.extensions.e2ee.device_one_time_keys_count.is_empty());
     assert!(resp.extensions.to_device.is_none());
 }
+
+// ----------------------------------------------------------------------------
+// Phase 5 — long-poll loop + retry idempotency.
+// ----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn initial_sync_ignores_timeout() {
+    // pos=None always short-circuits the long-poll loop: a client doing an
+    // initial sync wants the snapshot, not to wait for new events. The
+    // generous timeout here would otherwise make the test hang forever.
+    let store = Arc::new(MockStore::new());
+    let state = SyncState::new(store);
+    let user = user_id!("@alice:example.org");
+
+    let mut req = Request::new();
+    req.timeout = Some(std::time::Duration::from_secs(10));
+
+    let start = std::time::Instant::now();
+    let _resp = handle(&state, user, req).await.unwrap();
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(500),
+        "initial sync should return immediately"
+    );
+}
+
+#[tokio::test]
+async fn long_poll_returns_empty_after_timeout() {
+    // Subsequent sync with no new events and a short timeout: should wait
+    // approximately `timeout` and then return with no rooms.
+    let store = Arc::new(MockStore::new());
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!room:example.org");
+    store.join_user(user, room);
+    // Seed one event so the initial sync has rooms.
+    store.add_event(make_event(
+        event_id!("$seed:example.org"),
+        room,
+        "m.room.message",
+        None,
+        user,
+        100,
+        serde_json::json!({"body": "seed", "msgtype": "m.text"}),
+    ));
+    let state = SyncState::new(store);
+
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+
+    let mut req1 = Request::new();
+    req1.lists = lists.clone();
+    let resp1 = handle(&state, user, req1).await.unwrap();
+
+    let mut req2 = Request::new();
+    req2.pos = Some(resp1.pos);
+    req2.lists = lists;
+    req2.timeout = Some(std::time::Duration::from_millis(80));
+
+    let start = std::time::Instant::now();
+    let resp2 = handle(&state, user, req2).await.unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed >= std::time::Duration::from_millis(60),
+        "should have waited the full timeout, got {elapsed:?}"
+    );
+    assert!(resp2.rooms.is_empty(), "no rooms when nothing changed");
+}
+
+#[tokio::test]
+async fn long_poll_wakes_on_new_event() {
+    // Subsequent sync with timeout=300ms. Add a new event ~50ms in. Assert
+    // the sync returns the event well before the timeout expires.
+    let store = Arc::new(MockStore::new());
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!room:example.org");
+    store.join_user(user, room);
+    store.add_event(make_event(
+        event_id!("$seed:example.org"),
+        room,
+        "m.room.message",
+        None,
+        user,
+        100,
+        serde_json::json!({"body": "seed", "msgtype": "m.text"}),
+    ));
+    let state_arc = Arc::new(SyncState::new(store.clone()));
+
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+
+    let mut req1 = Request::new();
+    req1.lists = lists.clone();
+    let resp1 = handle(&state_arc, user, req1).await.unwrap();
+
+    // Schedule an event to land 50ms after the long-poll begins.
+    let store_for_task = store.clone();
+    let waker_user = user.to_owned();
+    let waker_room = room.to_owned();
+    let waker = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        store_for_task.add_event(make_event(
+            event_id!("$late:example.org"),
+            &waker_room,
+            "m.room.message",
+            None,
+            &waker_user,
+            200,
+            serde_json::json!({"body": "late", "msgtype": "m.text"}),
+        ));
+    });
+
+    let mut req2 = Request::new();
+    req2.pos = Some(resp1.pos);
+    req2.lists = lists;
+    req2.timeout = Some(std::time::Duration::from_millis(300));
+
+    let start = std::time::Instant::now();
+    let resp2 = handle(&state_arc, user, req2).await.unwrap();
+    let elapsed = start.elapsed();
+    waker.await.unwrap();
+
+    assert!(
+        elapsed < std::time::Duration::from_millis(250),
+        "should return promptly after the event arrives, got {elapsed:?}"
+    );
+    assert_eq!(
+        resp2.rooms.get(room).unwrap().timeline.len(),
+        1,
+        "the late event is in the timeline"
+    );
+}
+
+#[tokio::test]
+async fn retry_with_same_pos_returns_cached_response() {
+    // MSC4186 §"Pagination and Tokens": clients may retry by re-sending the
+    // same pos. The server returns the exact same response (same rooms,
+    // same pos, same lists) without re-processing or advancing state.
+    let store = Arc::new(MockStore::new());
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!room:example.org");
+    store.join_user(user, room);
+    store.add_event(make_event(
+        event_id!("$ev:example.org"),
+        room,
+        "m.room.message",
+        None,
+        user,
+        100,
+        serde_json::json!({"body": "a", "msgtype": "m.text"}),
+    ));
+    let state = SyncState::new(store);
+
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+
+    let mut req1 = Request::new();
+    req1.lists = lists.clone();
+    let resp1 = handle(&state, user, req1).await.unwrap();
+
+    // Second request with the pos that was returned — processes normally
+    // and produces a new response. Cache `last_request_pos = "1"`.
+    let mut req2 = Request::new();
+    req2.pos = Some(resp1.pos.clone());
+    req2.lists = lists.clone();
+    let resp2 = handle(&state, user, req2).await.unwrap();
+    let pos_after_second = resp2.pos.clone();
+
+    // Retry of the second request with the same pos — must return cached
+    // bytes byte-for-byte.
+    let mut retry = Request::new();
+    retry.pos = Some(resp1.pos.clone());
+    retry.lists = lists;
+    let retry_resp = handle(&state, user, retry).await.unwrap();
+
+    assert_eq!(
+        retry_resp.pos, pos_after_second,
+        "retry returns the same pos as the original"
+    );
+    assert_eq!(
+        retry_resp.rooms.len(),
+        resp2.rooms.len(),
+        "retry returns the same set of rooms"
+    );
+}
+
+#[tokio::test]
+async fn stale_pos_returns_unknown_pos_after_advancing() {
+    // Once the client has advanced past pos="1" by sending pos="1" and then
+    // pos="2", retrying with pos="1" must fail: the cache only remembers
+    // the *most recent* processed input pos.
+    let store = Arc::new(MockStore::new());
+    let user = user_id!("@alice:example.org");
+    let state = SyncState::new(store);
+
+    let resp1 = handle(&state, user, Request::new()).await.unwrap();
+
+    let mut req2 = Request::new();
+    req2.pos = Some(resp1.pos.clone()); // sends "1"
+    let resp2 = handle(&state, user, req2).await.unwrap();
+
+    let mut req3 = Request::new();
+    req3.pos = Some(resp2.pos.clone()); // sends "2", processed
+    let _resp3 = handle(&state, user, req3).await.unwrap();
+
+    // Now stale retry of req2's input.
+    let mut stale = Request::new();
+    stale.pos = Some(resp1.pos);
+    let res = handle(&state, user, stale).await;
+    assert!(
+        matches!(res, Err(SyncError::UnknownPos)),
+        "stale pos returns UnknownPos once we've moved past the cached request"
+    );
+}
+
+#[tokio::test]
+async fn retry_does_not_consume_pending_events() {
+    // The retry path is purely a cache replay — it must NOT drain
+    // `events_after` or otherwise advance conn state. A real delta sync
+    // immediately after the retry should still see the same new events as
+    // if the retry never happened.
+    let store = Arc::new(MockStore::new());
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!room:example.org");
+    store.join_user(user, room);
+    store.add_event(make_event(
+        event_id!("$first:example.org"),
+        room,
+        "m.room.message",
+        None,
+        user,
+        100,
+        serde_json::json!({"body": "first", "msgtype": "m.text"}),
+    ));
+    let state = SyncState::new(store.clone());
+
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let mut req1 = Request::new();
+    req1.lists = lists.clone();
+    let resp1 = handle(&state, user, req1).await.unwrap();
+
+    // Process the second sync, then add a new event, then RETRY the second
+    // sync (with its original input pos). The retry must return the cached
+    // (pre-event) response and leave the new event for the third sync.
+    let mut req2 = Request::new();
+    req2.pos = Some(resp1.pos.clone());
+    req2.lists = lists.clone();
+    let resp2 = handle(&state, user, req2).await.unwrap();
+
+    store.add_event(make_event(
+        event_id!("$second:example.org"),
+        room,
+        "m.room.message",
+        None,
+        user,
+        200,
+        serde_json::json!({"body": "second", "msgtype": "m.text"}),
+    ));
+
+    let mut retry = Request::new();
+    retry.pos = Some(resp1.pos.clone());
+    retry.lists = lists.clone();
+    let retry_resp = handle(&state, user, retry).await.unwrap();
+    assert_eq!(
+        retry_resp.rooms.get(room).map(|r| r.timeline.len()),
+        resp2.rooms.get(room).map(|r| r.timeline.len()),
+        "retry mirrors the cached response — no late event leakage"
+    );
+
+    let mut req3 = Request::new();
+    req3.pos = Some(resp2.pos.clone());
+    req3.lists = lists;
+    let resp3 = handle(&state, user, req3).await.unwrap();
+    assert_eq!(
+        resp3.rooms.get(room).unwrap().timeline.len(),
+        1,
+        "the late event is still available on the proper next sync"
+    );
+}

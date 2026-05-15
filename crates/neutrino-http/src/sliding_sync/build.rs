@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
 
 use neutrino_common::storage::{Direction, StorageBackend, StoredEvent, StreamPos};
 use ruma::api::client::sync::sync_events::v5::response;
@@ -10,9 +9,8 @@ use ruma::events::{
 use ruma::serde::Raw;
 use ruma::{OwnedRoomId, RoomId, UInt, UserId};
 use serde_json::value::RawValue;
-use tokio::sync::Mutex;
 
-use super::conn::{Conn, ConnKey, ConnRegistry, ListCfg, RoomSent, SubCfg};
+use super::conn::{Conn, ListCfg, RoomSent, SubCfg};
 use super::{SyncError, SyncState};
 
 /// How many globally-new events we drain from the store per sync request.
@@ -36,35 +34,33 @@ const EVENTS_PER_SYNC_LIMIT: usize = 1000;
 /// Flip when we have a confirmed need from a target client.
 const EMIT_STATE_STUBS: bool = false;
 
-/// Build one sliding-sync response.
+/// Build one sliding-sync response into the supplied connection.
+///
+/// The caller is responsible for resolving the `Conn` (see
+/// `mod::handle::resolve_conn`) and holding its lock for the duration of the
+/// call. This split exists so that the long-poll loop in `handle` can call
+/// `build_response` multiple times against the same locked conn, and so that
+/// the idempotency-cache check can short-circuit before we ever enter this
+/// path.
 ///
 /// Flow:
-/// 1. Resolve or create the `Conn` for `(user_id, conn_id)`. Absent `pos` →
-///    new conn (initial sync). Present `pos` → must match the conn's
-///    most-recently-issued token, else `UnknownPos`.
-/// 2. Merge the request's list/sub configs into the conn (sticky update).
-/// 3. Fetch globally-new events via `events_after(last_event_stream_pos)`,
+/// 1. Merge the request's list/sub configs into the conn (sticky update).
+/// 2. Fetch globally-new events via `events_after(last_event_stream_pos)`,
 ///    group by room. This drives the timeline delta path.
-/// 4. Rank candidate rooms (joined ∪ invited) by recency, slice by ranges.
-/// 5. For each selected room, build a `response::Room` — initial syncs get a
+/// 3. Rank candidate rooms (joined ∪ invited) by recency, slice by ranges.
+/// 4. For each selected room, build a `response::Room` — initial syncs get a
 ///    full snapshot via `room_messages`, deltas get only the new events.
 ///    Rooms with no updates (and already known) are omitted entirely.
-/// 6. Record what we just sent in `conn.sent` so future deltas can diff.
-/// 7. Bump `conn.pos` and `conn.last_event_stream_pos`, return.
+/// 5. Record what we just sent in `conn.sent` so future deltas can diff.
+/// 6. Bump `conn.pos` and `conn.last_event_stream_pos`, return.
 pub(super) async fn build_response<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
-    req: Request,
+    req: &Request,
+    conn: &mut Conn,
 ) -> Result<Response, SyncError> {
-    let key = ConnKey {
-        user_id: user_id.to_owned(),
-        conn_id: req.conn_id.clone().unwrap_or_default(),
-    };
-    let conn_arc = resolve_conn(&state.registry, key, req.pos.as_deref()).await?;
-    let mut conn = conn_arc.lock().await;
-
     let initial_sync = req.pos.is_none();
-    apply_sticky(&mut conn, &req);
+    apply_sticky(conn, req);
 
     // Drain new events since our high-water mark and group them by room.
     // On initial sync we still drain so the conn's `last_event_stream_pos`
@@ -77,7 +73,7 @@ pub(super) async fn build_response<S: StorageBackend>(
     }
 
     let ranked = candidate_rooms(state, user_id).await?;
-    let combined = combined_room_configs(&conn, &ranked);
+    let combined = combined_room_configs(conn, &ranked);
 
     let mut rooms_response = BTreeMap::new();
     for (room_id, combined_cfg) in &combined {
@@ -137,32 +133,10 @@ pub(super) async fn build_response<S: StorageBackend>(
     let pos_token = conn.pos.to_string();
 
     let mut resp = Response::new(pos_token);
-    resp.txn_id = req.txn_id;
+    resp.txn_id = req.txn_id.clone();
     resp.lists = lists_response;
     resp.rooms = rooms_response;
     Ok(resp)
-}
-
-/// Either look up an existing connection (validating its pos) or allocate a
-/// fresh one. Encapsulates the "is this a new sync or a continuation?" check
-/// so `build_response` reads top-down.
-async fn resolve_conn(
-    registry: &ConnRegistry,
-    key: ConnKey,
-    req_pos: Option<&str>,
-) -> Result<Arc<Mutex<Conn>>, SyncError> {
-    let Some(pos_str) = req_pos else {
-        return Ok(registry.create(key).await);
-    };
-    let pos: u64 = pos_str.parse().map_err(|_| SyncError::UnknownPos)?;
-    let conn = registry.get(&key).await.ok_or(SyncError::UnknownPos)?;
-    // Reject stale tokens. Each response advances pos by one, and the client
-    // must echo the most recent value back — anything else means the client
-    // missed a response or is replaying an old one.
-    if conn.lock().await.pos != pos {
-        return Err(SyncError::UnknownPos);
-    }
-    Ok(conn)
 }
 
 /// Merge per-request sticky params into the connection's stored state.
