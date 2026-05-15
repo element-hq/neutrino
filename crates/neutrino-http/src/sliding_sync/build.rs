@@ -324,11 +324,7 @@ fn required_state_matches(
 /// TODO(phase-4): this populates `RoomSent` but `build_room` never reads it.
 /// Once the delta path is implemented, this is the input that lets us suppress
 /// already-sent events.
-fn update_sent(
-    sent: &mut RoomSent,
-    timeline_events: &[StoredEvent],
-    state_events: &[StoredEvent],
-) {
+fn update_sent(sent: &mut RoomSent, timeline_events: &[StoredEvent], state_events: &[StoredEvent]) {
     for ev in timeline_events {
         sent.timeline_event_ids.push(ev.event_id.clone());
     }

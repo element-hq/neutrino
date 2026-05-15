@@ -111,7 +111,6 @@ impl MockStore {
 
 /// `StoredEvent` doesn't derive `Clone` in `neutrino-common`. Hand-clone it
 /// here rather than touching the trait file from a test-only mock.
-
 fn dup(e: &StoredEvent) -> StoredEvent {
     StoredEvent {
         event_id: e.event_id.clone(),
