@@ -1,16 +1,45 @@
 //! Shared test fixtures for in-crate unit tests.
 
 use deadpool_sqlite::rusqlite::params;
+use lazy_static::lazy_static;
 use neutrino_store::StoredEvent;
-use ruma::{EventId, RoomId, UserId};
+use ruma::{EventId, RoomId, UserId, event_id, room_id, user_id};
 use serde_json::{Value, json, value::RawValue};
 
 use crate::SqliteStore;
 use crate::error::Error;
 use crate::row::EventRow;
 
+// Canonical IDs.
+
+lazy_static! {
+    pub(crate) static ref ALICE_ROOM_ID: &'static RoomId = room_id!("!r1:example.com");
+    pub(crate) static ref BOB_ROOM_ID: &'static RoomId = room_id!("!r2:example.com");
+    pub(crate) static ref ALICE_USER_ID: &'static UserId = user_id!("@alice:example.com");
+    pub(crate) static ref BOB_USER_ID: &'static UserId = user_id!("@bob:example.com");
+    pub(crate) static ref CREATE_EVENT_ID: &'static EventId = event_id!("$create:example.com");
+}
+// Ruma-typed-reference wrappers.
+
+// Store fixtures.
+
 pub(crate) async fn store() -> SqliteStore {
     SqliteStore::open_in_memory().await.unwrap()
+}
+
+/// Open a fresh in-memory store and create [`ALICE_ROOM_ID`] with a single
+/// create event ([`CREATE_EVENT_ID`]) owned by [`ALICE_USER_ID`]. Convenience
+/// for tests that need a room to exist but don't care about its contents.
+pub(crate) async fn store_with_room() -> SqliteStore {
+    use neutrino_store::RoomStore;
+    let s = store().await;
+    s.create_room(
+        &create_event(*CREATE_EVENT_ID, *ALICE_ROOM_ID, *ALICE_USER_ID),
+        &[],
+    )
+    .await
+    .unwrap();
+    s
 }
 
 /// Build a `StoredEvent` from a JSON value supplied by the caller. The

@@ -253,22 +253,16 @@ impl DagStore for SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use lazy_static::lazy_static;
     use neutrino_store::{DagStore, EventStore, RoomStore};
-    use ruma::{EventId, OwnedEventId, RoomId, UserId, event_id, room_id, user_id};
+    use ruma::{EventId, OwnedEventId, event_id, room_id};
 
     use crate::SqliteStore;
-    use crate::tests::{create_event, message_with_prev, store};
-
-    lazy_static! {
-        static ref ALICE_ROOM_ID: &'static RoomId = room_id!("!r1:example.com");
-        static ref ALICE_ID: &'static UserId = user_id!("@alice:example.com");
-    }
+    use crate::tests::{ALICE_ROOM_ID, ALICE_USER_ID, create_event, message_with_prev, store};
 
     async fn store_with_room() -> SqliteStore {
         let s = store().await;
         s.create_room(
-            &create_event(event_id!("$create:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &create_event(event_id!("$create:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
             &[],
         )
         .await
@@ -289,7 +283,7 @@ mod tests {
     async fn events_before_walks_prev_events_chain() {
         let s = store_with_room().await;
         s.persist_event(
-            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_ID, "a", &[]),
+            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]),
             &[],
         )
         .await
@@ -298,7 +292,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$b:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "b",
                 &[event_id!("$a:e")],
             ),
@@ -310,7 +304,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$c:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "c",
                 &[event_id!("$b:e")],
             ),
@@ -345,7 +339,7 @@ mod tests {
                 vec![chain_ids[i - 1]]
             };
             s.persist_event(
-                &message_with_prev(eid, *ALICE_ROOM_ID, *ALICE_ID, "x", &prevs),
+                &message_with_prev(eid, *ALICE_ROOM_ID, *ALICE_USER_ID, "x", &prevs),
                 &[],
             )
             .await
@@ -366,13 +360,13 @@ mod tests {
     async fn events_before_handles_branching() {
         let s = store_with_room().await;
         s.persist_event(
-            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_ID, "a", &[]),
+            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]),
             &[],
         )
         .await
         .unwrap();
         s.persist_event(
-            &message_with_prev(event_id!("$b:e"), *ALICE_ROOM_ID, *ALICE_ID, "b", &[]),
+            &message_with_prev(event_id!("$b:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "b", &[]),
             &[],
         )
         .await
@@ -381,7 +375,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$c:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "c",
                 &[event_id!("$a:e"), event_id!("$b:e")],
             ),
@@ -410,7 +404,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$a:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "a",
                 &[event_id!("$ghost:e")],
             ),
@@ -437,7 +431,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$a:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "a",
                 &[event_id!("$a:e")],
             ),
@@ -459,7 +453,7 @@ mod tests {
     async fn missing_events_excludes_earliest() {
         let s = store_with_room().await;
         s.persist_event(
-            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_ID, "a", &[]),
+            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]),
             &[],
         )
         .await
@@ -468,7 +462,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$b:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "b",
                 &[event_id!("$a:e")],
             ),
@@ -480,7 +474,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$c:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "c",
                 &[event_id!("$b:e")],
             ),
@@ -524,13 +518,13 @@ mod tests {
         let s = store_with_room().await; // room A = *ALICE_ROOM_ID
         let other_room = room_id!("!r2:example.com");
         s.create_room(
-            &create_event(event_id!("$c2:e"), other_room, *ALICE_ID),
+            &create_event(event_id!("$c2:e"), other_room, *ALICE_USER_ID),
             &[],
         )
         .await
         .unwrap();
         s.persist_event(
-            &message_with_prev(event_id!("$other:e"), other_room, *ALICE_ID, "x", &[]),
+            &message_with_prev(event_id!("$other:e"), other_room, *ALICE_USER_ID, "x", &[]),
             &[],
         )
         .await
@@ -561,7 +555,7 @@ mod tests {
         let s = store_with_room().await; // room A = *ALICE_ROOM_ID
         let other_room = room_id!("!r2:example.com");
         s.create_room(
-            &create_event(event_id!("$cR2:e"), other_room, *ALICE_ID),
+            &create_event(event_id!("$cR2:e"), other_room, *ALICE_USER_ID),
             &[],
         )
         .await
@@ -569,7 +563,7 @@ mod tests {
         // $b is a real persisted event in R2 — so the edge actually
         // resolves; the cross-room filter is the only thing stopping it.
         s.persist_event(
-            &message_with_prev(event_id!("$b:e"), other_room, *ALICE_ID, "b", &[]),
+            &message_with_prev(event_id!("$b:e"), other_room, *ALICE_USER_ID, "b", &[]),
             &[],
         )
         .await
@@ -581,7 +575,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$a:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "a",
                 &[event_id!("$b:e")],
             ),
@@ -617,7 +611,7 @@ mod tests {
     async fn events_before_limit_zero_returns_empty() {
         let s = store_with_room().await;
         s.persist_event(
-            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_ID, "a", &[]),
+            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]),
             &[],
         )
         .await
@@ -638,7 +632,7 @@ mod tests {
         let s = store_with_room().await;
         for id in [event_id!("$a:e"), event_id!("$b:e")] {
             s.persist_event(
-                &message_with_prev(id, *ALICE_ROOM_ID, *ALICE_ID, "x", &[]),
+                &message_with_prev(id, *ALICE_ROOM_ID, *ALICE_USER_ID, "x", &[]),
                 &[],
             )
             .await
@@ -648,7 +642,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$c:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "c",
                 &[event_id!("$a:e")],
             ),
@@ -660,7 +654,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$d:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "d",
                 &[event_id!("$b:e")],
             ),
@@ -685,7 +679,7 @@ mod tests {
     async fn events_before_dedups_shared_ancestors_in_diamond() {
         let s = store_with_room().await;
         s.persist_event(
-            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_ID, "a", &[]),
+            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]),
             &[],
         )
         .await
@@ -694,7 +688,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$b:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "b",
                 &[event_id!("$a:e")],
             ),
@@ -706,7 +700,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$c:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "c",
                 &[event_id!("$a:e")],
             ),
@@ -718,7 +712,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$d:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "d",
                 &[event_id!("$b:e"), event_id!("$c:e")],
             ),
@@ -747,7 +741,7 @@ mod tests {
         let s = store_with_room().await;
         for id in [event_id!("$g1:e"), event_id!("$g2:e")] {
             s.persist_event(
-                &message_with_prev(id, *ALICE_ROOM_ID, *ALICE_ID, "x", &[]),
+                &message_with_prev(id, *ALICE_ROOM_ID, *ALICE_USER_ID, "x", &[]),
                 &[],
             )
             .await
@@ -761,7 +755,7 @@ mod tests {
                 &message_with_prev(
                     id,
                     *ALICE_ROOM_ID,
-                    *ALICE_ID,
+                    *ALICE_USER_ID,
                     "x",
                     &[event_id!("$g2:e"), event_id!("$g1:e")],
                 ),
@@ -775,7 +769,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$c:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "x",
                 &[event_id!("$p2:e"), event_id!("$p1:e")],
             ),
@@ -812,7 +806,7 @@ mod tests {
         let json_val = json!({
             "event_id": "$msg:e",
             "room_id": ALICE_ROOM_ID.as_str(),
-            "sender": ALICE_ID.as_str(),
+            "sender": ALICE_USER_ID.as_str(),
             "type": "m.room.message",
             "state_key": Option::<String>::None,
             "content": {"body": "msg", "msgtype": "m.text"},
@@ -827,7 +821,7 @@ mod tests {
             room_id: ALICE_ROOM_ID.to_owned(),
             event_type: "m.room.message".to_owned(),
             state_key: None,
-            sender: ALICE_ID.to_owned(),
+            sender: ALICE_USER_ID.to_owned(),
             origin_server_ts: 0,
             json,
         };
@@ -853,7 +847,7 @@ mod tests {
     async fn missing_events_limit_zero_returns_empty() {
         let s = store_with_room().await;
         s.persist_event(
-            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_ID, "a", &[]),
+            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]),
             &[],
         )
         .await
@@ -939,7 +933,7 @@ mod tests {
             .collect();
         for id in &owned_ids {
             s.persist_event(
-                &message_with_prev(id, *ALICE_ROOM_ID, *ALICE_ID, "x", &[]),
+                &message_with_prev(id, *ALICE_ROOM_ID, *ALICE_USER_ID, "x", &[]),
                 &[],
             )
             .await
@@ -969,7 +963,7 @@ mod tests {
             .collect();
         for id in &owned_ids {
             s.persist_event(
-                &message_with_prev(id, *ALICE_ROOM_ID, *ALICE_ID, "x", &[]),
+                &message_with_prev(id, *ALICE_ROOM_ID, *ALICE_USER_ID, "x", &[]),
                 &[],
             )
             .await
@@ -995,7 +989,7 @@ mod tests {
     async fn missing_events_missing_earliest_returns_invalid_input() {
         let s = store_with_room().await;
         s.persist_event(
-            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_ID, "a", &[]),
+            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]),
             &[],
         )
         .await
@@ -1023,7 +1017,7 @@ mod tests {
         let s = store_with_room().await;
         for id in [event_id!("$a:e"), event_id!("$b:e")] {
             s.persist_event(
-                &message_with_prev(id, *ALICE_ROOM_ID, *ALICE_ID, "x", &[]),
+                &message_with_prev(id, *ALICE_ROOM_ID, *ALICE_USER_ID, "x", &[]),
                 &[],
             )
             .await
@@ -1033,7 +1027,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$c:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "c",
                 &[event_id!("$a:e")],
             ),
@@ -1045,7 +1039,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$d:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "d",
                 &[event_id!("$b:e")],
             ),

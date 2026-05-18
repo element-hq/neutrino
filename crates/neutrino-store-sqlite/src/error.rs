@@ -13,7 +13,6 @@ use thiserror::Error;
 /// `From<rusqlite::Error> for StorageError` there, so this local enum is the
 /// only place those `From` impls can live.
 #[derive(Debug, Error)]
-#[allow(dead_code)] // `InvalidInput` and `Json` variants are wired for tasks #4 / #5.
 pub(crate) enum Error {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),

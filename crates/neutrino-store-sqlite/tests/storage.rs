@@ -4,18 +4,12 @@
 
 mod common;
 
-use lazy_static::lazy_static;
 use neutrino_store::{EventStore, FederationOutbox, RoomStore, StateStore, StreamPos};
-use ruma::{RoomId, UserId, event_id, room_id, server_name, user_id};
+use ruma::{event_id, server_name};
 
 use common::{create_event, member_join, member_leave, message, name_event, store};
 
-lazy_static! {
-    static ref ALICE_ROOM_ID: &'static RoomId = room_id!("!r1:example.com");
-    static ref BOB_ROOM_ID: &'static RoomId = room_id!("!r2:example.com");
-    static ref ALICE_ID: &'static UserId = user_id!("@alice:example.com");
-    static ref BOB_ID: &'static UserId = user_id!("@bob:example.com");
-}
+use crate::common::{ALICE_ROOM_ID, ALICE_USER_ID, BOB_ROOM_ID, BOB_USER_ID};
 
 // R1: create_room with a single create event → all observable surfaces agree.
 #[tokio::test]
@@ -23,7 +17,7 @@ async fn create_room_with_create_only() {
     let s = store().await;
     assert_eq!(s.room_count().await.unwrap(), 0);
 
-    let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+    let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
     s.create_room(&ce, &[]).await.unwrap();
 
     assert_eq!(s.room_count().await.unwrap(), 1);
@@ -40,8 +34,8 @@ async fn create_room_with_create_only() {
 #[tokio::test]
 async fn create_room_with_initial_events() {
     let s = store().await;
-    let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
-    let join = member_join(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+    let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
+    let join = member_join(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
     s.create_room(&ce, &[join]).await.unwrap();
 
     let events = s.events_after(StreamPos(0), 10).await.unwrap();
@@ -60,8 +54,8 @@ async fn create_room_fires_watch_once() {
     let mut receiver = s.subscribe();
     assert_eq!(*receiver.borrow(), StreamPos(0));
 
-    let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
-    let join = member_join(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+    let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
+    let join = member_join(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
     s.create_room(&ce, &[join]).await.unwrap();
 
     // Wait for the first change notification.
@@ -81,7 +75,7 @@ async fn create_room_fires_watch_once() {
 async fn persist_event_visible_after_create_room() {
     let s = store().await;
     s.create_room(
-        &create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID),
+        &create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID),
         &[],
     )
     .await
@@ -89,7 +83,7 @@ async fn persist_event_visible_after_create_room() {
     let msg = message(
         event_id!("$msg1:example.com"),
         *ALICE_ROOM_ID,
-        *ALICE_ID,
+        *ALICE_USER_ID,
         "hello",
     );
     s.persist_event(&msg, &[]).await.unwrap();
@@ -107,7 +101,7 @@ async fn persist_event_visible_after_create_room() {
 async fn persist_event_advances_watch() {
     let s = store().await;
     s.create_room(
-        &create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID),
+        &create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID),
         &[],
     )
     .await
@@ -119,7 +113,7 @@ async fn persist_event_advances_watch() {
     let msg = message(
         event_id!("$msg1:example.com"),
         *ALICE_ROOM_ID,
-        *ALICE_ID,
+        *ALICE_USER_ID,
         "hello",
     );
     s.persist_event(&msg, &[]).await.unwrap();
@@ -140,7 +134,7 @@ async fn persist_event_advances_watch() {
 async fn persist_event_watch_monotonic() {
     let s = store().await;
     s.create_room(
-        &create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID),
+        &create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID),
         &[],
     )
     .await
@@ -152,7 +146,7 @@ async fn persist_event_watch_monotonic() {
         let m = message(
             event_id!("$msg1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "a",
         );
         s1.persist_event(&m, &[]).await.unwrap();
@@ -161,7 +155,7 @@ async fn persist_event_watch_monotonic() {
         let m = message(
             event_id!("$msg2:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "b",
         );
         s2.persist_event(&m, &[]).await.unwrap();
@@ -183,13 +177,18 @@ async fn persist_event_watch_monotonic() {
 async fn persist_state_event_updates_current_state() {
     let s = store().await;
     s.create_room(
-        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_ID),
+        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
         &[],
     )
     .await
     .unwrap();
     s.persist_event(
-        &name_event(event_id!("$n:e"), *ALICE_ROOM_ID, *ALICE_ID, "Test Room"),
+        &name_event(
+            event_id!("$n:e"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "Test Room",
+        ),
         &[],
     )
     .await
@@ -208,7 +207,7 @@ async fn persist_state_event_updates_current_state() {
 async fn persist_non_state_event_leaves_state_untouched() {
     let s = store().await;
     s.create_room(
-        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_ID),
+        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
         &[],
     )
     .await
@@ -216,7 +215,7 @@ async fn persist_non_state_event_leaves_state_untouched() {
     let before = s.current_room_state(*ALICE_ROOM_ID).await.unwrap();
 
     s.persist_event(
-        &message(event_id!("$m:e"), *ALICE_ROOM_ID, *ALICE_ID, "hi"),
+        &message(event_id!("$m:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "hi"),
         &[],
     )
     .await
@@ -235,18 +234,18 @@ async fn persist_non_state_event_leaves_state_untouched() {
 async fn persist_supersedes_prior_state() {
     let s = store().await;
     s.create_room(
-        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_ID),
+        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
         &[name_event(
             event_id!("$n1:e"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "first",
         )],
     )
     .await
     .unwrap();
     s.persist_event(
-        &name_event(event_id!("$n2:e"), *ALICE_ROOM_ID, *ALICE_ID, "second"),
+        &name_event(event_id!("$n2:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "second"),
         &[],
     )
     .await
@@ -265,13 +264,17 @@ async fn persist_supersedes_prior_state() {
 async fn persist_member_join_appears_in_joined_members() {
     let s = store().await;
     s.create_room(
-        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_ID),
-        &[member_join(event_id!("$mja:e"), *ALICE_ROOM_ID, *ALICE_ID)],
+        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
+        &[member_join(
+            event_id!("$mja:e"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+        )],
     )
     .await
     .unwrap();
     s.persist_event(
-        &member_join(event_id!("$mjb:e"), *ALICE_ROOM_ID, *BOB_ID),
+        &member_join(event_id!("$mjb:e"), *ALICE_ROOM_ID, *BOB_USER_ID),
         &[],
     )
     .await
@@ -279,8 +282,8 @@ async fn persist_member_join_appears_in_joined_members() {
 
     let members = s.joined_members(*ALICE_ROOM_ID).await.unwrap();
     assert_eq!(members.len(), 2);
-    assert!(members.contains_key(*ALICE_ID));
-    assert!(members.contains_key(*BOB_ID));
+    assert!(members.contains_key(*ALICE_USER_ID));
+    assert!(members.contains_key(*BOB_USER_ID));
 }
 
 // X5: persist_event with N destinations populates N outbox rows visible via
@@ -289,7 +292,7 @@ async fn persist_member_join_appears_in_joined_members() {
 async fn persist_event_with_destinations_appears_in_outbox() {
     let s = store().await;
     s.create_room(
-        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_ID),
+        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
         &[],
     )
     .await
@@ -300,7 +303,7 @@ async fn persist_event_with_destinations_appears_in_outbox() {
     let d3 = server_name!("c.example.com");
 
     s.persist_event(
-        &message(event_id!("$m:e"), *ALICE_ROOM_ID, *ALICE_ID, "hi"),
+        &message(event_id!("$m:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "hi"),
         &[d1, d2, d3],
     )
     .await
@@ -327,8 +330,12 @@ async fn persist_event_with_destinations_appears_in_outbox() {
 async fn create_room_creates_no_outbox_entries() {
     let s = store().await;
     s.create_room(
-        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_ID),
-        &[member_join(event_id!("$mj:e"), *ALICE_ROOM_ID, *ALICE_ID)],
+        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
+        &[member_join(
+            event_id!("$mj:e"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+        )],
     )
     .await
     .unwrap();
@@ -341,14 +348,18 @@ async fn create_room_creates_no_outbox_entries() {
 async fn create_room_initial_join_appears_in_joined_members() {
     let s = store().await;
     s.create_room(
-        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_ID),
-        &[member_join(event_id!("$mj:e"), *ALICE_ROOM_ID, *ALICE_ID)],
+        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
+        &[member_join(
+            event_id!("$mj:e"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+        )],
     )
     .await
     .unwrap();
     let members = s.joined_members(*ALICE_ROOM_ID).await.unwrap();
     assert_eq!(members.len(), 1);
-    assert!(members.contains_key(*ALICE_ID));
+    assert!(members.contains_key(*ALICE_USER_ID));
 }
 
 // X8: alice joined to two distinct rooms → joined_rooms returns both.
@@ -356,19 +367,27 @@ async fn create_room_initial_join_appears_in_joined_members() {
 async fn joined_rooms_after_multiple_creates() {
     let s = store().await;
     s.create_room(
-        &create_event(event_id!("$c1:e"), *ALICE_ROOM_ID, *ALICE_ID),
-        &[member_join(event_id!("$mj1:e"), *ALICE_ROOM_ID, *ALICE_ID)],
+        &create_event(event_id!("$c1:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
+        &[member_join(
+            event_id!("$mj1:e"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+        )],
     )
     .await
     .unwrap();
     s.create_room(
-        &create_event(event_id!("$c2:e"), *BOB_ROOM_ID, *ALICE_ID),
-        &[member_join(event_id!("$mj2:e"), *BOB_ROOM_ID, *ALICE_ID)],
+        &create_event(event_id!("$c2:e"), *BOB_ROOM_ID, *ALICE_USER_ID),
+        &[member_join(
+            event_id!("$mj2:e"),
+            *BOB_ROOM_ID,
+            *ALICE_USER_ID,
+        )],
     )
     .await
     .unwrap();
 
-    let mut rooms = s.joined_rooms(*ALICE_ID).await.unwrap();
+    let mut rooms = s.joined_rooms(*ALICE_USER_ID).await.unwrap();
     rooms.sort_by_key(|r| r.as_str().to_owned());
     assert_eq!(rooms.len(), 2);
     assert_eq!(rooms[0].as_str(), ALICE_ROOM_ID.as_str());
@@ -381,7 +400,7 @@ async fn joined_rooms_after_multiple_creates() {
 async fn remove_pdus_makes_destination_disappear() {
     let s = store().await;
     s.create_room(
-        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_ID),
+        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
         &[],
     )
     .await
@@ -389,7 +408,7 @@ async fn remove_pdus_makes_destination_disappear() {
 
     let d = server_name!("a.example.com");
     s.persist_event(
-        &message(event_id!("$m:e"), *ALICE_ROOM_ID, *ALICE_ID, "hi"),
+        &message(event_id!("$m:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "hi"),
         &[d],
     )
     .await
@@ -405,18 +424,22 @@ async fn remove_pdus_makes_destination_disappear() {
 async fn member_left_no_longer_in_joined_rooms() {
     let s = store().await;
     s.create_room(
-        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_ID),
-        &[member_join(event_id!("$mj:e"), *ALICE_ROOM_ID, *ALICE_ID)],
+        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
+        &[member_join(
+            event_id!("$mj:e"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+        )],
     )
     .await
     .unwrap();
-    assert_eq!(s.joined_rooms(*ALICE_ID).await.unwrap().len(), 1);
+    assert_eq!(s.joined_rooms(*ALICE_USER_ID).await.unwrap().len(), 1);
 
     s.persist_event(
-        &member_leave(event_id!("$ml:e"), *ALICE_ROOM_ID, *ALICE_ID),
+        &member_leave(event_id!("$ml:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
         &[],
     )
     .await
     .unwrap();
-    assert!(s.joined_rooms(*ALICE_ID).await.unwrap().is_empty());
+    assert!(s.joined_rooms(*ALICE_USER_ID).await.unwrap().is_empty());
 }

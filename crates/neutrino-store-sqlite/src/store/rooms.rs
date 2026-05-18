@@ -145,22 +145,16 @@ impl RoomStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use deadpool_sqlite::rusqlite::params;
-    use lazy_static::lazy_static;
     use neutrino_store::{EventStore, RoomStore, StorageError, StreamPos};
-    use ruma::{RoomId, RoomVersionId, UserId, event_id, room_id, user_id};
+    use ruma::{RoomVersionId, event_id, room_id};
     use serde_json::json;
 
-    use crate::error::Error;
-    use crate::tests::{create_event, make_event, member_join, store};
-
-    // ruma's `room_id!` / `user_id!` aren't const-fn, so `const` is out
-    // (E0015). `lazy_static!` runs the macro on first access and caches.
-    // Call sites deref with `*` to get `&'static T`.
-    lazy_static! {
-        static ref ALICE_ROOM_ID: &'static RoomId = room_id!("!r1:example.com");
-        static ref BOB_ROOM_ID: &'static RoomId = room_id!("!r2:example.com");
-        static ref ALICE_ID: &'static UserId = user_id!("@alice:example.com");
-    }
+    use crate::{
+        error::Error,
+        tests::{
+            ALICE_ROOM_ID, ALICE_USER_ID, BOB_ROOM_ID, create_event, make_event, member_join, store,
+        },
+    };
 
     // R3: missing content.room_version
     #[tokio::test]
@@ -169,10 +163,10 @@ mod tests {
         let bad = make_event(
             event_id!("$c1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "m.room.create",
             Some(""),
-            json!({"creator": ALICE_ID.as_str()}),
+            json!({"creator": ALICE_USER_ID.as_str()}),
         );
         let result = store.create_room(&bad, &[]).await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
@@ -185,10 +179,10 @@ mod tests {
         let bad = make_event(
             event_id!("$c1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "m.room.create",
             Some(""),
-            json!({"creator": ALICE_ID.as_str(), "room_version": 12}),
+            json!({"creator": ALICE_USER_ID.as_str(), "room_version": 12}),
         );
         let result = store.create_room(&bad, &[]).await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
@@ -203,10 +197,10 @@ mod tests {
         let bad = make_event(
             event_id!("$c1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "m.room.create",
             Some(""),
-            json!({"creator": ALICE_ID.as_str(), "room_version": ""}),
+            json!({"creator": ALICE_USER_ID.as_str(), "room_version": ""}),
         );
         let result = store.create_room(&bad, &[]).await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
@@ -221,10 +215,10 @@ mod tests {
         let bad = make_event(
             event_id!("$c1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "m.room.create",
             Some(""),
-            json!({"creator": ALICE_ID.as_str(), "room_version": "11"}),
+            json!({"creator": ALICE_USER_ID.as_str(), "room_version": "11"}),
         );
         let result = store.create_room(&bad, &[]).await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
@@ -238,7 +232,7 @@ mod tests {
         let bad = make_event_with_raw_json(
             event_id!("$c1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "m.room.create",
             Some(""),
             "\"hello\"",
@@ -251,11 +245,11 @@ mod tests {
     #[tokio::test]
     async fn create_room_rejects_duplicate_room_id() {
         let store = store().await;
-        let ce1 = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        let ce1 = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
         store.create_room(&ce1, &[]).await.unwrap();
 
         // same room_id
-        let ce2 = create_event(event_id!("$c2:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        let ce2 = create_event(event_id!("$c2:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
         let result = store.create_room(&ce2, &[]).await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
@@ -264,9 +258,9 @@ mod tests {
     #[tokio::test]
     async fn create_room_rejects_initial_event_with_wrong_room_id() {
         let store = store().await;
-        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
         // member event for a different room
-        let bad_member = member_join(event_id!("$m1:example.com"), *BOB_ROOM_ID, *ALICE_ID);
+        let bad_member = member_join(event_id!("$m1:example.com"), *BOB_ROOM_ID, *ALICE_USER_ID);
         let result = store.create_room(&ce, &[bad_member]).await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
@@ -287,7 +281,7 @@ mod tests {
 
         store
             .create_room(
-                &create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID),
+                &create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID),
                 &[],
             )
             .await
@@ -296,7 +290,7 @@ mod tests {
 
         store
             .create_room(
-                &create_event(event_id!("$c2:example.com"), *BOB_ROOM_ID, *ALICE_ID),
+                &create_event(event_id!("$c2:example.com"), *BOB_ROOM_ID, *ALICE_USER_ID),
                 &[],
             )
             .await
@@ -308,7 +302,7 @@ mod tests {
     #[tokio::test]
     async fn create_room_empty_initial_events_ok() {
         let store = store().await;
-        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
         store.create_room(&ce, &[]).await.unwrap();
         assert_eq!(store.room_count().await.unwrap(), 1);
     }
@@ -322,10 +316,10 @@ mod tests {
         let bad = make_event(
             event_id!("$c1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "m.room.member",
             Some(""),
-            json!({"creator": ALICE_ID.as_str(), "room_version": "12"}),
+            json!({"creator": ALICE_USER_ID.as_str(), "room_version": "12"}),
         );
         let result = store.create_room(&bad, &[]).await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
@@ -340,10 +334,10 @@ mod tests {
         let bad = make_event(
             event_id!("$c1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "m.room.create",
             None,
-            json!({"creator": ALICE_ID.as_str(), "room_version": "12"}),
+            json!({"creator": ALICE_USER_ID.as_str(), "room_version": "12"}),
         );
         let result = store.create_room(&bad, &[]).await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
@@ -357,10 +351,10 @@ mod tests {
         let bad = make_event(
             event_id!("$c1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "m.room.create",
             Some("not-empty"),
-            json!({"creator": ALICE_ID.as_str(), "room_version": "12"}),
+            json!({"creator": ALICE_USER_ID.as_str(), "room_version": "12"}),
         );
         let result = store.create_room(&bad, &[]).await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
@@ -379,8 +373,8 @@ mod tests {
         let store = store().await;
         let create_id = event_id!("$c1:example.com");
         let member_id = event_id!("$m1:example.com");
-        let ce = create_event(create_id, *ALICE_ROOM_ID, *ALICE_ID);
-        let initial_member = member_join(member_id, *ALICE_ROOM_ID, *ALICE_ID);
+        let ce = create_event(create_id, *ALICE_ROOM_ID, *ALICE_USER_ID);
+        let initial_member = member_join(member_id, *ALICE_ROOM_ID, *ALICE_USER_ID);
         store.create_room(&ce, &[initial_member]).await.unwrap();
 
         // (a) room version round-trips as V12.
@@ -413,16 +407,16 @@ mod tests {
     #[tokio::test]
     async fn create_room_rolls_back_on_mid_batch_failure() {
         let store = store().await;
-        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
-        let good = member_join(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
+        let good = member_join(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
         // `current_state.membership` CHECK rejects anything outside the
         // enum, so this fails the upsert from inside `write_into_tx`.
         let bad = make_event(
             event_id!("$m2:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "m.room.member",
-            Some(ALICE_ID.as_str()),
+            Some(ALICE_USER_ID.as_str()),
             json!({"membership": "garbage"}),
         );
 
@@ -453,8 +447,8 @@ mod tests {
         let initial = *rx.borrow_and_update();
         assert_eq!(initial, StreamPos(0));
 
-        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
-        let m1 = member_join(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
+        let m1 = member_join(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
         store.create_room(&ce, &[m1]).await.unwrap();
 
         // Two events written → AUTOINCREMENT assigned stream_pos 1 and 2;
@@ -473,13 +467,13 @@ mod tests {
         let mut rx = store.subscribe();
         let initial = *rx.borrow_and_update();
 
-        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
         let bad = make_event(
             event_id!("$m1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "m.room.member",
-            Some(ALICE_ID.as_str()),
+            Some(ALICE_USER_ID.as_str()),
             json!({"membership": "garbage"}),
         );
         let result = store.create_room(&ce, &[bad]).await;
@@ -499,12 +493,12 @@ mod tests {
         let store = store().await;
         let ce_id = event_id!("$c1:example.com");
         let m_id = event_id!("$m1:example.com");
-        let ce = create_event(ce_id, *ALICE_ROOM_ID, *ALICE_ID);
-        let m = member_join(m_id, *ALICE_ROOM_ID, *ALICE_ID);
+        let ce = create_event(ce_id, *ALICE_ROOM_ID, *ALICE_USER_ID);
+        let m = member_join(m_id, *ALICE_ROOM_ID, *ALICE_USER_ID);
         store.create_room(&ce, &[m]).await.unwrap();
 
         let room = ALICE_ROOM_ID.to_owned();
-        let user = ALICE_ID.to_owned();
+        let user = ALICE_USER_ID.to_owned();
         let rows: Vec<(String, String, String, Option<String>)> = store
             .run_read(move |conn| {
                 let mut stmt = conn.prepare(
@@ -550,8 +544,8 @@ mod tests {
     #[tokio::test]
     async fn create_room_creates_no_outbox_entries() {
         let store = store().await;
-        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
-        let m = member_join(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
+        let m = member_join(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
         store.create_room(&ce, &[m]).await.unwrap();
 
         let outbox_count: i64 = store
@@ -575,12 +569,12 @@ mod tests {
         let e1_id = event_id!("$m1:example.com");
         let e2_id = event_id!("$n1:example.com");
         let e3_id = event_id!("$m2:example.com");
-        let ce = create_event(ce_id, *ALICE_ROOM_ID, *ALICE_ID);
-        let e1 = member_join(e1_id, *ALICE_ROOM_ID, *ALICE_ID);
+        let ce = create_event(ce_id, *ALICE_ROOM_ID, *ALICE_USER_ID);
+        let e1 = member_join(e1_id, *ALICE_ROOM_ID, *ALICE_USER_ID);
         let e2 = make_event(
             e2_id,
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "m.room.name",
             Some(""),
             json!({"name": "Test"}),
@@ -588,7 +582,7 @@ mod tests {
         let e3 = make_event(
             e3_id,
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "m.room.member",
             Some("@bob:example.com"),
             json!({"membership": "join"}),
@@ -617,13 +611,13 @@ mod tests {
     #[tokio::test]
     async fn create_room_rejects_duplicate_event_id_in_batch() {
         let store = store().await;
-        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
         let dup_id = event_id!("$dup:example.com");
-        let e1 = member_join(dup_id, *ALICE_ROOM_ID, *ALICE_ID);
+        let e1 = member_join(dup_id, *ALICE_ROOM_ID, *ALICE_USER_ID);
         let e2 = make_event(
             dup_id,
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "m.room.name",
             Some(""),
             json!({"name": "Collide"}),
@@ -645,7 +639,7 @@ mod tests {
     #[tokio::test]
     async fn get_room_version_internal_for_malformed_db_row() {
         let store = store().await;
-        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
         store.create_room(&ce, &[]).await.unwrap();
 
         let room = ALICE_ROOM_ID.to_owned();

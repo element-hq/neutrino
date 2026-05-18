@@ -88,22 +88,20 @@ impl FederationOutbox for SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use lazy_static::lazy_static;
     use neutrino_store::{EventStore, FederationOutbox, RoomStore};
-    use ruma::{OwnedEventId, RoomId, UserId, event_id, room_id, server_name, user_id};
+    use ruma::{OwnedEventId, event_id, server_name};
 
     use crate::SqliteStore;
-    use crate::tests::{create_event, message, store};
-
-    lazy_static! {
-        static ref ALICE_ROOM_ID: &'static RoomId = room_id!("!r1:example.com");
-        static ref ALICE_ID: &'static UserId = user_id!("@alice:example.com");
-    }
+    use crate::tests::{ALICE_ROOM_ID, ALICE_USER_ID, create_event, message, store};
 
     async fn store_with_room() -> SqliteStore {
         let s = store().await;
         s.create_room(
-            &create_event(event_id!("$create:example.com"), *ALICE_ROOM_ID, *ALICE_ID),
+            &create_event(
+                event_id!("$create:example.com"),
+                *ALICE_ROOM_ID,
+                *ALICE_USER_ID,
+            ),
             &[],
         )
         .await
@@ -137,13 +135,23 @@ mod tests {
         let dest = server_name!("matrix.org");
 
         s.persist_event(
-            &message(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "a"),
+            &message(
+                event_id!("$m1:example.com"),
+                *ALICE_ROOM_ID,
+                *ALICE_USER_ID,
+                "a",
+            ),
             &[dest],
         )
         .await
         .unwrap();
         s.persist_event(
-            &message(event_id!("$m2:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "b"),
+            &message(
+                event_id!("$m2:example.com"),
+                *ALICE_ROOM_ID,
+                *ALICE_USER_ID,
+                "b",
+            ),
             &[dest],
         )
         .await
@@ -162,7 +170,7 @@ mod tests {
 
         for i in 0..3 {
             let id: OwnedEventId = format!("$m{i}:example.com").try_into().unwrap();
-            s.persist_event(&message(&id, *ALICE_ROOM_ID, *ALICE_ID, "x"), &[dest])
+            s.persist_event(&message(&id, *ALICE_ROOM_ID, *ALICE_USER_ID, "x"), &[dest])
                 .await
                 .unwrap();
         }
@@ -182,13 +190,23 @@ mod tests {
         let dest = server_name!("matrix.org");
 
         s.persist_event(
-            &message(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "a"),
+            &message(
+                event_id!("$m1:example.com"),
+                *ALICE_ROOM_ID,
+                *ALICE_USER_ID,
+                "a",
+            ),
             &[dest],
         )
         .await
         .unwrap();
         s.persist_event(
-            &message(event_id!("$m2:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "b"),
+            &message(
+                event_id!("$m2:example.com"),
+                *ALICE_ROOM_ID,
+                *ALICE_USER_ID,
+                "b",
+            ),
             &[dest],
         )
         .await
@@ -210,7 +228,12 @@ mod tests {
         let dest = server_name!("matrix.org");
 
         s.persist_event(
-            &message(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "a"),
+            &message(
+                event_id!("$m1:example.com"),
+                *ALICE_ROOM_ID,
+                *ALICE_USER_ID,
+                "a",
+            ),
             &[dest],
         )
         .await
