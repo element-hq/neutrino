@@ -28,7 +28,7 @@ pub struct StoredEvent {
     pub json: Box<RawValue>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StoredPdu {
     pub event: StoredEvent,
     pub prev_events: Vec<OwnedEventId>,
