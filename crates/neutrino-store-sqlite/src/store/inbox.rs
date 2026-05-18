@@ -30,3 +30,71 @@ impl FederationInbox for SqliteStore {
         .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use neutrino_store::FederationInbox;
+    use ruma::server_name;
+
+    use crate::tests::store;
+
+    // I1: first record returns false (was not recorded).
+    #[tokio::test]
+    async fn record_federation_txn_first_returns_false() {
+        let s = store().await;
+        let already = s
+            .record_federation_txn(server_name!("matrix.org"), "txn1")
+            .await
+            .unwrap();
+        assert!(!already);
+    }
+
+    // I2: second record with the same key returns true (was recorded).
+    #[tokio::test]
+    async fn record_federation_txn_second_returns_true() {
+        let s = store().await;
+        s.record_federation_txn(server_name!("matrix.org"), "txn1")
+            .await
+            .unwrap();
+        let already = s
+            .record_federation_txn(server_name!("matrix.org"), "txn1")
+            .await
+            .unwrap();
+        assert!(already);
+    }
+
+    // I3: independent (origin, txn_id) pairs don't interfere.
+    #[tokio::test]
+    async fn record_federation_txn_independent_keys() {
+        let s = store().await;
+        let origin_a = server_name!("a.example.com");
+        let origin_b = server_name!("b.example.com");
+
+        // First time for each pair → all three return false.
+        assert!(!s.record_federation_txn(origin_a, "txn1").await.unwrap());
+        assert!(!s.record_federation_txn(origin_b, "txn1").await.unwrap()); // diff origin, same txn
+        assert!(!s.record_federation_txn(origin_a, "txn2").await.unwrap()); // same origin, diff txn
+
+        // Repeat → all three return true.
+        assert!(s.record_federation_txn(origin_a, "txn1").await.unwrap());
+        assert!(s.record_federation_txn(origin_b, "txn1").await.unwrap());
+        assert!(s.record_federation_txn(origin_a, "txn2").await.unwrap());
+    }
+
+    // I4: SQL injection defence. A malicious txn_id is stored verbatim
+    // (not interpreted), so the literal string is dedup'd on retry and
+    // the `federation_txns` table is intact afterwards.
+    #[tokio::test]
+    async fn record_federation_txn_sql_injection_safe() {
+        let s = store().await;
+        let origin = server_name!("matrix.org");
+        let malicious = "'; DROP TABLE federation_txns; --";
+
+        // First call — stored verbatim.
+        assert!(!s.record_federation_txn(origin, malicious).await.unwrap());
+        // Second call — table still exists, the literal string round-trips.
+        assert!(s.record_federation_txn(origin, malicious).await.unwrap());
+        // An unrelated txn_id still works — table was not dropped.
+        assert!(!s.record_federation_txn(origin, "normal_txn").await.unwrap());
+    }
+}
