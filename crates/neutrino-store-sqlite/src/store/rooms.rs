@@ -102,3 +102,137 @@ impl RoomStore for SqliteStore {
         .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use lazy_static::lazy_static;
+    use neutrino_store::{RoomStore, StorageError};
+    use ruma::{RoomId, UserId, event_id, room_id, user_id};
+    use serde_json::json;
+
+    use crate::tests::{create_event, make_event, member_join, store};
+
+    // ruma's `room_id!` / `user_id!` aren't const-fn, so `const` is out
+    // (E0015). `lazy_static!` runs the macro on first access and caches.
+    // Call sites deref with `*` to get `&'static T`.
+    lazy_static! {
+        static ref ALICE_ROOM_ID: &'static RoomId = room_id!("!r1:example.com");
+        static ref BOB_ROOM_ID: &'static RoomId = room_id!("!r2:example.com");
+        static ref ALICE_ID: &'static UserId = user_id!("@alice:example.com");
+    }
+
+    // R3: missing content.room_version
+    #[tokio::test]
+    async fn create_room_rejects_missing_room_version() {
+        let store = store().await;
+        let bad = make_event(
+            event_id!("$c1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "m.room.create",
+            Some(""),
+            json!({"creator": ALICE_ID.as_str()}),
+        );
+        let result = store.create_room(&bad, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    // R3a: content.room_version is a JSON number, not a string
+    #[tokio::test]
+    async fn create_room_rejects_non_string_room_version() {
+        let store = store().await;
+        let bad = make_event(
+            event_id!("$c1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "m.room.create",
+            Some(""),
+            json!({"creator": ALICE_ID.as_str(), "room_version": 12}),
+        );
+        let result = store.create_room(&bad, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    // R4: top-level JSON is a string, not an object
+    #[tokio::test]
+    async fn create_room_rejects_invalid_json_shape() {
+        use crate::tests::make_event_with_raw_json;
+        let store = store().await;
+        let bad = make_event_with_raw_json(
+            event_id!("$c1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "m.room.create",
+            Some(""),
+            "\"hello\"",
+        );
+        let result = store.create_room(&bad, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    // R5: duplicate room_id rejected on second create
+    #[tokio::test]
+    async fn create_room_rejects_duplicate_room_id() {
+        let store = store().await;
+        let ce1 = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        store.create_room(&ce1, &[]).await.unwrap();
+
+        // same room_id
+        let ce2 = create_event(event_id!("$c2:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        let result = store.create_room(&ce2, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    // R10: initial_event with mismatched room_id rejected (FK)
+    #[tokio::test]
+    async fn create_room_rejects_initial_event_with_wrong_room_id() {
+        let store = store().await;
+        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        // member event for a different room
+        let bad_member = member_join(event_id!("$m1:example.com"), *BOB_ROOM_ID, *ALICE_ID);
+        let result = store.create_room(&ce, &[bad_member]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    // R8: get_room_version on unknown room → None
+    #[tokio::test]
+    async fn get_room_version_none_for_unknown() {
+        let store = store().await;
+        let unknown = room_id!("!nope:example.com");
+        assert!(store.get_room_version(unknown).await.unwrap().is_none());
+    }
+
+    // R9: room_count starts at 0 and increments per create_room
+    #[tokio::test]
+    async fn room_count_zero_then_increments() {
+        let store = store().await;
+        assert_eq!(store.room_count().await.unwrap(), 0);
+
+        store
+            .create_room(
+                &create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.room_count().await.unwrap(), 1);
+
+        store
+            .create_room(
+                &create_event(event_id!("$c2:example.com"), *BOB_ROOM_ID, *ALICE_ID),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.room_count().await.unwrap(), 2);
+    }
+
+    // R11: empty initial_events slice is allowed
+    #[tokio::test]
+    async fn create_room_empty_initial_events_ok() {
+        let store = store().await;
+        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        store.create_room(&ce, &[]).await.unwrap();
+        assert_eq!(store.room_count().await.unwrap(), 1);
+    }
+}
