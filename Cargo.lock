@@ -986,7 +986,13 @@ dependencies = [
 name = "neutrino-store-sqlite"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "deadpool-sqlite",
+ "neutrino-store",
+ "ruma",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
