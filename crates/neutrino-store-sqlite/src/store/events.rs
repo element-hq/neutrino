@@ -134,8 +134,10 @@ impl EventStore for SqliteStore {
         pos: StreamPos,
         limit: usize,
     ) -> Result<Vec<(StreamPos, StoredEvent)>, StorageError> {
-        let pos = pos.0 as i64;
-        let limit_i64 = limit as i64;
+        let pos = i64::try_from(pos.0)
+            .map_err(|_| Error::InvalidInput(format!("StreamPos {} exceeds i64::MAX", pos.0)))?;
+        let limit_i64 = i64::try_from(limit)
+            .map_err(|_| Error::InvalidInput(format!("limit {limit} exceeds i64::MAX")))?;
 
         self.run_read(
             move |conn| -> Result<Vec<(StreamPos, StoredEvent)>, Error> {
@@ -168,18 +170,23 @@ impl EventStore for SqliteStore {
         limit: usize,
     ) -> Result<(Vec<StoredEvent>, Option<PaginationToken>), StorageError> {
         let room_id = room_id.to_owned();
-        let limit_i64 = limit as i64;
+        let limit_i64 = i64::try_from(limit)
+            .map_err(|_| Error::InvalidInput(format!("limit {limit} exceeds i64::MAX")))?;
+        // Default `from` per direction. Forward starts at 0
+        // (events with stream_pos > 0); backward starts at i64::MAX
+        // (events with stream_pos < MAX).
+        let from_pos: i64 = match from {
+            Some(t) => i64::try_from(t.0).map_err(|_| {
+                Error::InvalidInput(format!("PaginationToken {} exceeds i64::MAX", t.0))
+            })?,
+            None => match dir {
+                Direction::Forward => 0,
+                Direction::Backward => i64::MAX,
+            },
+        };
 
         self.run_read(
             move |conn| -> Result<(Vec<StoredEvent>, Option<PaginationToken>), Error> {
-                // Default `from` per direction. Forward starts at 0
-                // (events with stream_pos > 0); backward starts at i64::MAX
-                // (events with stream_pos < MAX).
-                let from_pos: i64 = from.map(|t| t.0 as i64).unwrap_or(match dir {
-                    Direction::Forward => 0,
-                    Direction::Backward => i64::MAX,
-                });
-
                 let (cmp, order) = match dir {
                     Direction::Forward => (">", "ASC"),
                     Direction::Backward => ("<", "DESC"),
@@ -220,5 +227,454 @@ impl EventStore for SqliteStore {
 
     fn subscribe(&self) -> watch::Receiver<StreamPos> {
         SqliteStore::subscribe(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lazy_static::lazy_static;
+    use neutrino_store::{Direction, EventStore, StorageError, StreamPos};
+    use ruma::{OwnedEventId, RoomId, UserId, event_id, room_id, user_id};
+
+    use crate::SqliteStore;
+    use crate::tests::{make_event_with_raw_json, message, name_event, setup_room, store};
+
+    lazy_static! {
+        static ref ALICE_ROOM_ID: &'static RoomId = room_id!("!r1:example.com");
+        static ref BOB_ROOM_ID: &'static RoomId = room_id!("!r2:example.com");
+        static ref ALICE_ID: &'static UserId = user_id!("@alice:example.com");
+        static ref BOB_ID: &'static UserId = user_id!("@bob:example.com");
+    }
+
+    /// Open an in-memory store with a single create event in `*ALICE_ROOM_ID` —
+    /// many tests share this setup.
+    async fn store_with_room() -> SqliteStore {
+        let s = store().await;
+        setup_room(
+            &s,
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            event_id!("$create:example.com"),
+        )
+        .await;
+        s
+    }
+
+    // E2: persist_event for unknown room → InvalidInput (FK violation)
+    #[tokio::test]
+    async fn persist_event_rejects_unknown_room() {
+        let s = store().await;
+        let msg = message(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "hi",
+        );
+        let result = s.persist_event(&msg, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    // E3: duplicate event_id → InvalidInput (UNIQUE violation)
+    #[tokio::test]
+    async fn persist_event_rejects_duplicate_event_id() {
+        let s = store_with_room().await;
+        let msg = message(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "hi",
+        );
+        s.persist_event(&msg, &[]).await.unwrap();
+        let dup = message(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "again",
+        );
+        let result = s.persist_event(&dup, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    // E4: malformed JSON shape (top-level is a string)
+    #[tokio::test]
+    async fn persist_event_rejects_invalid_json() {
+        let s = store_with_room().await;
+        let bad = make_event_with_raw_json(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "m.room.message",
+            None,
+            "\"not an object\"",
+        );
+        let result = s.persist_event(&bad, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    // E12: get_client_txn on unrecorded → None
+    #[tokio::test]
+    async fn get_client_txn_none_for_unrecorded() {
+        let s = store().await;
+        assert!(s.get_client_txn("txn1", *ALICE_ID).await.unwrap().is_none());
+    }
+
+    // E13: record then get round-trip
+    #[tokio::test]
+    async fn record_then_get_client_txn() {
+        let s = store_with_room().await;
+        let msg = message(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "hi",
+        );
+        s.persist_event(&msg, &[]).await.unwrap();
+
+        let user = *ALICE_ID;
+        let evt_id = event_id!("$m1:example.com");
+        s.record_client_txn("txn1", user, evt_id).await.unwrap();
+
+        let got = s.get_client_txn("txn1", user).await.unwrap();
+        assert_eq!(got.as_deref(), Some(evt_id));
+    }
+
+    // E14: second record with same (txn_id, user_id) is a no-op (idempotent)
+    #[tokio::test]
+    async fn record_client_txn_idempotent() {
+        let s = store_with_room().await;
+        let m1 = message(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "first",
+        );
+        let m2 = message(
+            event_id!("$m2:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "second",
+        );
+        s.persist_event(&m1, &[]).await.unwrap();
+        s.persist_event(&m2, &[]).await.unwrap();
+
+        let user = *ALICE_ID;
+        let id1 = event_id!("$m1:example.com");
+        s.record_client_txn("txn1", user, id1).await.unwrap();
+        // Second record with same key should be a no-op — original wins.
+        s.record_client_txn("txn1", user, event_id!("$m2:example.com"))
+            .await
+            .unwrap();
+
+        let got = s.get_client_txn("txn1", user).await.unwrap();
+        assert_eq!(got.as_deref(), Some(id1));
+    }
+
+    // E15: same txn_id, different user_id → independent
+    #[tokio::test]
+    async fn record_client_txn_isolated_per_user() {
+        let s = store_with_room().await;
+        // Bob sends a message too, so we have a second user available.
+        let m1 = message(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "from alice",
+        );
+        let m2 = message(
+            event_id!("$m2:example.com"),
+            *ALICE_ROOM_ID,
+            *BOB_ID,
+            "from bob",
+        );
+        s.persist_event(&m1, &[]).await.unwrap();
+        s.persist_event(&m2, &[]).await.unwrap();
+
+        let alice = *ALICE_ID;
+        let bob = *BOB_ID;
+        let id1 = event_id!("$m1:example.com");
+        let id2 = event_id!("$m2:example.com");
+        s.record_client_txn("shared", alice, id1).await.unwrap();
+        s.record_client_txn("shared", bob, id2).await.unwrap();
+
+        assert_eq!(
+            s.get_client_txn("shared", alice).await.unwrap().as_deref(),
+            Some(id1)
+        );
+        assert_eq!(
+            s.get_client_txn("shared", bob).await.unwrap().as_deref(),
+            Some(id2)
+        );
+    }
+
+    // E16: record_client_txn with unknown event_id → InvalidInput (FK)
+    #[tokio::test]
+    async fn record_client_txn_rejects_unknown_event_id() {
+        let s = store_with_room().await;
+        let unknown = event_id!("$nope:example.com");
+        let result = s.record_client_txn("txn1", *ALICE_ID, unknown).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    // E31: empty txn_id / user_id strings allowed by schema
+    #[tokio::test]
+    async fn record_client_txn_empty_strings_ok() {
+        let s = store_with_room().await;
+        // Schema allows empty strings (TEXT NOT NULL ≠ disallow ""), but
+        // user_id parsing in ruma would reject "". So we test empty txn_id
+        // only — empty user_id can't be constructed as a UserId.
+        let user = *ALICE_ID;
+        let evt = event_id!("$create:example.com");
+        s.record_client_txn("", user, evt).await.unwrap();
+        assert_eq!(
+            s.get_client_txn("", user).await.unwrap().as_deref(),
+            Some(evt)
+        );
+    }
+
+    // E17: empty ids → empty result, no SQL run
+    #[tokio::test]
+    async fn get_events_empty_ids_returns_empty() {
+        let s = store().await;
+        assert!(s.get_events(&[]).await.unwrap().is_empty());
+    }
+
+    // E18: unknown ids → empty result
+    #[tokio::test]
+    async fn get_events_unknown_returns_empty() {
+        let s = store().await;
+        let id = event_id!("$nope:example.com");
+        assert!(s.get_events(&[id]).await.unwrap().is_empty());
+    }
+
+    // E19: mix of known + unknown returns only known
+    #[tokio::test]
+    async fn get_events_partial_match_returns_subset() {
+        let s = store_with_room().await;
+        let msg = message(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "hi",
+        );
+        s.persist_event(&msg, &[]).await.unwrap();
+
+        let known = event_id!("$m1:example.com");
+        let unknown = event_id!("$nope:example.com");
+        let result = s.get_events(&[known, unknown]).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].event_id.as_str(), "$m1:example.com");
+    }
+
+    // E20: StreamPos(0) returns all events
+    #[tokio::test]
+    async fn events_after_zero_returns_all() {
+        let s = store_with_room().await;
+        let m1 = message(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "a");
+        let m2 = message(event_id!("$m2:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "b");
+        s.persist_event(&m1, &[]).await.unwrap();
+        s.persist_event(&m2, &[]).await.unwrap();
+
+        let result = s.events_after(StreamPos(0), 100).await.unwrap();
+        assert_eq!(result.len(), 3); // create + 2 messages
+    }
+
+    // E21: limit honored
+    #[tokio::test]
+    async fn events_after_respects_limit() {
+        let s = store_with_room().await;
+        for i in 0..5 {
+            let id: OwnedEventId = format!("$m{i}:example.com").try_into().unwrap();
+            let m = message(&id, *ALICE_ROOM_ID, *ALICE_ID, "x");
+            s.persist_event(&m, &[]).await.unwrap();
+        }
+        let result = s.events_after(StreamPos(0), 3).await.unwrap();
+        assert_eq!(result.len(), 3);
+    }
+
+    // E22: strictly ascending stream_pos
+    #[tokio::test]
+    async fn events_after_ascending() {
+        let s = store_with_room().await;
+        for i in 0..3 {
+            let id: OwnedEventId = format!("$m{i}:example.com").try_into().unwrap();
+            let m = message(&id, *ALICE_ROOM_ID, *ALICE_ID, "x");
+            s.persist_event(&m, &[]).await.unwrap();
+        }
+        let result = s.events_after(StreamPos(0), 100).await.unwrap();
+        for w in result.windows(2) {
+            assert!(w[0].0 < w[1].0);
+        }
+    }
+
+    // E33: huge starting pos → empty
+    #[tokio::test]
+    async fn events_after_high_pos_returns_empty() {
+        let s = store_with_room().await;
+        let result = s
+            .events_after(StreamPos(i64::MAX as u64), 100)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    // E23: Forward, from=None → ascending from earliest
+    #[tokio::test]
+    async fn room_messages_forward_default_from() {
+        let s = store_with_room().await;
+        let m1 = message(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "a");
+        let m2 = message(event_id!("$m2:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "b");
+        s.persist_event(&m1, &[]).await.unwrap();
+        s.persist_event(&m2, &[]).await.unwrap();
+
+        let (events, _next) = s
+            .room_messages(*ALICE_ROOM_ID, None, Direction::Forward, 10)
+            .await
+            .unwrap();
+        let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+        assert_eq!(types, ["m.room.create", "m.room.message", "m.room.message"]);
+    }
+
+    // E24: Backward, from=None → descending from latest
+    #[tokio::test]
+    async fn room_messages_backward_default_from() {
+        let s = store_with_room().await;
+        let m1 = message(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "a");
+        let m2 = message(event_id!("$m2:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "b");
+        s.persist_event(&m1, &[]).await.unwrap();
+        s.persist_event(&m2, &[]).await.unwrap();
+
+        let (events, _next) = s
+            .room_messages(*ALICE_ROOM_ID, None, Direction::Backward, 10)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = events.iter().map(|e| e.event_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["$m2:example.com", "$m1:example.com", "$create:example.com"]
+        );
+    }
+
+    // E25: short page → no next token
+    #[tokio::test]
+    async fn room_messages_short_page_returns_no_token() {
+        let s = store_with_room().await;
+        // One create event total. Asking for 10 → page is 1 item → no token.
+        let (events, next) = s
+            .room_messages(*ALICE_ROOM_ID, None, Direction::Forward, 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(next.is_none());
+    }
+
+    // E26: pagination round-trip — page, then continue
+    #[tokio::test]
+    async fn room_messages_pagination_roundtrip() {
+        let s = store_with_room().await;
+        for i in 0..4 {
+            let id: OwnedEventId = format!("$m{i}:example.com").try_into().unwrap();
+            let m = message(&id, *ALICE_ROOM_ID, *ALICE_ID, "x");
+            s.persist_event(&m, &[]).await.unwrap();
+        }
+        let room = *ALICE_ROOM_ID;
+
+        // First page of 2 events (forward).
+        let (page1, next1) = s
+            .room_messages(room, None, Direction::Forward, 2)
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 2);
+        let token = next1.unwrap();
+
+        // Second page using the token.
+        let (page2, next2) = s
+            .room_messages(room, Some(token.clone()), Direction::Forward, 2)
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 2);
+
+        // No event_id appears in both pages.
+        let p1_ids: Vec<&str> = page1.iter().map(|e| e.event_id.as_str()).collect();
+        for ev in &page2 {
+            assert!(!p1_ids.contains(&ev.event_id.as_str()));
+        }
+
+        // Third page should be empty (5 total events, 2+2 consumed → 1 left,
+        // but we asked for 2 — third call returns the last one with no token).
+        let (page3, next3) = s
+            .room_messages(room, next2, Direction::Forward, 2)
+            .await
+            .unwrap();
+        assert_eq!(page3.len(), 1);
+        assert!(next3.is_none());
+    }
+
+    // E27: events from a different room not returned
+    #[tokio::test]
+    async fn room_messages_filters_by_room_id() {
+        let s = store_with_room().await;
+        // Set up a second room via raw SQL (bypassing RoomStore).
+        setup_room(&s, *BOB_ROOM_ID, *ALICE_ID, event_id!("$c2:example.com")).await;
+        let m_r1 = message(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "in r1",
+        );
+        let m_r2 = message(
+            event_id!("$m2:example.com"),
+            *BOB_ROOM_ID,
+            *ALICE_ID,
+            "in r2",
+        );
+        s.persist_event(&m_r1, &[]).await.unwrap();
+        s.persist_event(&m_r2, &[]).await.unwrap();
+
+        let (events, _) = s
+            .room_messages(*ALICE_ROOM_ID, None, Direction::Forward, 10)
+            .await
+            .unwrap();
+        for ev in &events {
+            assert_eq!(ev.room_id.as_str(), ALICE_ROOM_ID.as_str());
+        }
+    }
+
+    // E32: room_messages for unknown room → Ok(empty), not error
+    #[tokio::test]
+    async fn room_messages_unknown_room_returns_empty() {
+        let s = store().await;
+        let unknown = room_id!("!nope:example.com");
+        let (events, next) = s
+            .room_messages(unknown, None, Direction::Forward, 10)
+            .await
+            .unwrap();
+        assert!(events.is_empty());
+        assert!(next.is_none());
+    }
+
+    // E28: empty store → subscribe initial value is StreamPos(0)
+    #[tokio::test]
+    async fn subscribe_initial_zero_for_empty_store() {
+        let s = store().await;
+        let receiver = s.subscribe();
+        assert_eq!(*receiver.borrow(), StreamPos(0));
+    }
+
+    // E30: empty string state_key is valid (e.g. m.room.name, m.room.create)
+    #[tokio::test]
+    async fn persist_event_with_empty_state_key_ok() {
+        let s = store_with_room().await;
+        let evt = name_event(
+            event_id!("$n1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "Test Room",
+        );
+        s.persist_event(&evt, &[]).await.unwrap();
+        // Verify it landed in events.
+        let id = event_id!("$n1:example.com");
+        let got = s.get_events(&[id]).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].state_key.as_deref(), Some(""));
     }
 }

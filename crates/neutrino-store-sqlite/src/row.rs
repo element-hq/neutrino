@@ -75,6 +75,14 @@ impl TryFrom<&Row<'_>> for EventRow<'static> {
             .map_err(|e| Error::Internal(format!("malformed sender in DB row: {e}")))?;
         let json = RawValue::from_string(json)
             .map_err(|e| Error::Internal(format!("malformed json in DB row: {e}")))?;
+        // SQLite stores INTEGER (i64). The write side rejects values
+        // outside `0..=i64::MAX`, so any negative we see here is DB
+        // corruption / a manual SQL edit — `Internal`, not `InvalidInput`.
+        let origin_server_ts = u64::try_from(origin_server_ts).map_err(|_| {
+            Error::Internal(format!(
+                "negative origin_server_ts in DB row: {origin_server_ts}"
+            ))
+        })?;
 
         Ok(EventRow(Cow::Owned(StoredEvent {
             event_id,
@@ -82,7 +90,7 @@ impl TryFrom<&Row<'_>> for EventRow<'static> {
             event_type,
             state_key,
             sender,
-            origin_server_ts: origin_server_ts as u64,
+            origin_server_ts,
             json,
         })))
     }
@@ -141,6 +149,12 @@ impl<'a> EventRow<'a> {
             None
         };
 
+        let origin_server_ts = i64::try_from(self.origin_server_ts).map_err(|_| {
+            Error::InvalidInput(format!(
+                "origin_server_ts {} exceeds i64::MAX",
+                self.origin_server_ts
+            ))
+        })?;
         tx.execute(
             "INSERT INTO events \
              (event_id, room_id, event_type, state_key, sender, origin_server_ts, json) \
@@ -151,7 +165,7 @@ impl<'a> EventRow<'a> {
                 self.event_type,
                 self.state_key,
                 self.sender.as_str(),
-                self.origin_server_ts as i64,
+                origin_server_ts,
                 self.json.get(),
             ],
         )?;

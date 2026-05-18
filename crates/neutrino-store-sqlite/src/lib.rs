@@ -21,6 +21,9 @@ mod row;
 mod schema;
 mod store;
 
+#[cfg(test)]
+mod tests;
+
 use crate::error::Error;
 
 /// SQLite-backed `StorageBackend`.
