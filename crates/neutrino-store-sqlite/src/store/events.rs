@@ -249,19 +249,14 @@ impl EventStore for SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use lazy_static::lazy_static;
     use neutrino_store::{Direction, EventStore, StorageError, StreamPos};
-    use ruma::{OwnedEventId, RoomId, UserId, event_id, room_id, user_id};
+    use ruma::{OwnedEventId, event_id, room_id};
 
     use crate::SqliteStore;
-    use crate::tests::{make_event_with_raw_json, message, name_event, setup_room, store};
-
-    lazy_static! {
-        static ref ALICE_ROOM_ID: &'static RoomId = room_id!("!r1:example.com");
-        static ref BOB_ROOM_ID: &'static RoomId = room_id!("!r2:example.com");
-        static ref ALICE_ID: &'static UserId = user_id!("@alice:example.com");
-        static ref BOB_ID: &'static UserId = user_id!("@bob:example.com");
-    }
+    use crate::tests::{
+        ALICE_ROOM_ID, ALICE_USER_ID, BOB_ROOM_ID, BOB_USER_ID, make_event_with_raw_json, message,
+        name_event, setup_room, store,
+    };
 
     /// Open an in-memory store with a single create event in `*ALICE_ROOM_ID` —
     /// many tests share this setup.
@@ -270,7 +265,7 @@ mod tests {
         setup_room(
             &s,
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             event_id!("$create:example.com"),
         )
         .await;
@@ -284,7 +279,7 @@ mod tests {
         let msg = message(
             event_id!("$m1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "hi",
         );
         let result = s.persist_event(&msg, &[]).await;
@@ -298,14 +293,14 @@ mod tests {
         let msg = message(
             event_id!("$m1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "hi",
         );
         s.persist_event(&msg, &[]).await.unwrap();
         let dup = message(
             event_id!("$m1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "again",
         );
         let result = s.persist_event(&dup, &[]).await;
@@ -319,7 +314,7 @@ mod tests {
         let bad = make_event_with_raw_json(
             event_id!("$m1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "m.room.message",
             None,
             "\"not an object\"",
@@ -332,7 +327,12 @@ mod tests {
     #[tokio::test]
     async fn get_client_txn_none_for_unrecorded() {
         let s = store().await;
-        assert!(s.get_client_txn("txn1", *ALICE_ID).await.unwrap().is_none());
+        assert!(
+            s.get_client_txn("txn1", *ALICE_USER_ID)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     // E13: record then get round-trip
@@ -342,12 +342,12 @@ mod tests {
         let msg = message(
             event_id!("$m1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "hi",
         );
         s.persist_event(&msg, &[]).await.unwrap();
 
-        let user = *ALICE_ID;
+        let user = *ALICE_USER_ID;
         let evt_id = event_id!("$m1:example.com");
         s.record_client_txn("txn1", user, evt_id).await.unwrap();
 
@@ -362,19 +362,19 @@ mod tests {
         let m1 = message(
             event_id!("$m1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "first",
         );
         let m2 = message(
             event_id!("$m2:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "second",
         );
         s.persist_event(&m1, &[]).await.unwrap();
         s.persist_event(&m2, &[]).await.unwrap();
 
-        let user = *ALICE_ID;
+        let user = *ALICE_USER_ID;
         let id1 = event_id!("$m1:example.com");
         s.record_client_txn("txn1", user, id1).await.unwrap();
         // Second record with same key should be a no-op — original wins.
@@ -394,20 +394,20 @@ mod tests {
         let m1 = message(
             event_id!("$m1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "from alice",
         );
         let m2 = message(
             event_id!("$m2:example.com"),
             *ALICE_ROOM_ID,
-            *BOB_ID,
+            *BOB_USER_ID,
             "from bob",
         );
         s.persist_event(&m1, &[]).await.unwrap();
         s.persist_event(&m2, &[]).await.unwrap();
 
-        let alice = *ALICE_ID;
-        let bob = *BOB_ID;
+        let alice = *ALICE_USER_ID;
+        let bob = *BOB_USER_ID;
         let id1 = event_id!("$m1:example.com");
         let id2 = event_id!("$m2:example.com");
         s.record_client_txn("shared", alice, id1).await.unwrap();
@@ -428,7 +428,7 @@ mod tests {
     async fn record_client_txn_rejects_unknown_event_id() {
         let s = store_with_room().await;
         let unknown = event_id!("$nope:example.com");
-        let result = s.record_client_txn("txn1", *ALICE_ID, unknown).await;
+        let result = s.record_client_txn("txn1", *ALICE_USER_ID, unknown).await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
 
@@ -439,7 +439,7 @@ mod tests {
         // Schema allows empty strings (TEXT NOT NULL ≠ disallow ""), but
         // user_id parsing in ruma would reject "". So we test empty txn_id
         // only — empty user_id can't be constructed as a UserId.
-        let user = *ALICE_ID;
+        let user = *ALICE_USER_ID;
         let evt = event_id!("$create:example.com");
         s.record_client_txn("", user, evt).await.unwrap();
         assert_eq!(
@@ -470,7 +470,7 @@ mod tests {
         let msg = message(
             event_id!("$m1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "hi",
         );
         s.persist_event(&msg, &[]).await.unwrap();
@@ -486,8 +486,18 @@ mod tests {
     #[tokio::test]
     async fn events_after_zero_returns_all() {
         let s = store_with_room().await;
-        let m1 = message(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "a");
-        let m2 = message(event_id!("$m2:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "b");
+        let m1 = message(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "a",
+        );
+        let m2 = message(
+            event_id!("$m2:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "b",
+        );
         s.persist_event(&m1, &[]).await.unwrap();
         s.persist_event(&m2, &[]).await.unwrap();
 
@@ -501,7 +511,7 @@ mod tests {
         let s = store_with_room().await;
         for i in 0..5 {
             let id: OwnedEventId = format!("$m{i}:example.com").try_into().unwrap();
-            let m = message(&id, *ALICE_ROOM_ID, *ALICE_ID, "x");
+            let m = message(&id, *ALICE_ROOM_ID, *ALICE_USER_ID, "x");
             s.persist_event(&m, &[]).await.unwrap();
         }
         let result = s.events_after(StreamPos(0), 3).await.unwrap();
@@ -514,7 +524,7 @@ mod tests {
         let s = store_with_room().await;
         for i in 0..3 {
             let id: OwnedEventId = format!("$m{i}:example.com").try_into().unwrap();
-            let m = message(&id, *ALICE_ROOM_ID, *ALICE_ID, "x");
+            let m = message(&id, *ALICE_ROOM_ID, *ALICE_USER_ID, "x");
             s.persist_event(&m, &[]).await.unwrap();
         }
         let result = s.events_after(StreamPos(0), 100).await.unwrap();
@@ -538,8 +548,18 @@ mod tests {
     #[tokio::test]
     async fn room_messages_forward_default_from() {
         let s = store_with_room().await;
-        let m1 = message(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "a");
-        let m2 = message(event_id!("$m2:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "b");
+        let m1 = message(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "a",
+        );
+        let m2 = message(
+            event_id!("$m2:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "b",
+        );
         s.persist_event(&m1, &[]).await.unwrap();
         s.persist_event(&m2, &[]).await.unwrap();
 
@@ -555,8 +575,18 @@ mod tests {
     #[tokio::test]
     async fn room_messages_backward_default_from() {
         let s = store_with_room().await;
-        let m1 = message(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "a");
-        let m2 = message(event_id!("$m2:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "b");
+        let m1 = message(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "a",
+        );
+        let m2 = message(
+            event_id!("$m2:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "b",
+        );
         s.persist_event(&m1, &[]).await.unwrap();
         s.persist_event(&m2, &[]).await.unwrap();
 
@@ -590,7 +620,7 @@ mod tests {
         let s = store_with_room().await;
         for i in 0..4 {
             let id: OwnedEventId = format!("$m{i}:example.com").try_into().unwrap();
-            let m = message(&id, *ALICE_ROOM_ID, *ALICE_ID, "x");
+            let m = message(&id, *ALICE_ROOM_ID, *ALICE_USER_ID, "x");
             s.persist_event(&m, &[]).await.unwrap();
         }
         let room = *ALICE_ROOM_ID;
@@ -631,17 +661,23 @@ mod tests {
     async fn room_messages_filters_by_room_id() {
         let s = store_with_room().await;
         // Set up a second room via raw SQL (bypassing RoomStore).
-        setup_room(&s, *BOB_ROOM_ID, *ALICE_ID, event_id!("$c2:example.com")).await;
+        setup_room(
+            &s,
+            *BOB_ROOM_ID,
+            *ALICE_USER_ID,
+            event_id!("$c2:example.com"),
+        )
+        .await;
         let m_r1 = message(
             event_id!("$m1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "in r1",
         );
         let m_r2 = message(
             event_id!("$m2:example.com"),
             *BOB_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "in r2",
         );
         s.persist_event(&m_r1, &[]).await.unwrap();
@@ -680,7 +716,7 @@ mod tests {
         let evt = name_event(
             event_id!("$n1:example.com"),
             *ALICE_ROOM_ID,
-            *ALICE_ID,
+            *ALICE_USER_ID,
             "Test Room",
         );
         s.persist_event(&evt, &[]).await.unwrap();

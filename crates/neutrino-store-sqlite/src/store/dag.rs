@@ -138,22 +138,16 @@ impl DagStore for SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use lazy_static::lazy_static;
     use neutrino_store::{DagStore, EventStore, RoomStore};
-    use ruma::{EventId, RoomId, UserId, event_id, room_id, user_id};
+    use ruma::{EventId, event_id};
 
     use crate::SqliteStore;
-    use crate::tests::{create_event, message_with_prev, store};
-
-    lazy_static! {
-        static ref ALICE_ROOM_ID: &'static RoomId = room_id!("!r1:example.com");
-        static ref ALICE_ID: &'static UserId = user_id!("@alice:example.com");
-    }
+    use crate::tests::{ALICE_ROOM_ID, ALICE_USER_ID, create_event, message_with_prev, store};
 
     async fn store_with_room() -> SqliteStore {
         let s = store().await;
         s.create_room(
-            &create_event(event_id!("$create:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &create_event(event_id!("$create:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
             &[],
         )
         .await
@@ -174,7 +168,7 @@ mod tests {
     async fn events_before_walks_prev_events_chain() {
         let s = store_with_room().await;
         s.persist_event(
-            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_ID, "a", &[]),
+            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]),
             &[],
         )
         .await
@@ -183,7 +177,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$b:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "b",
                 &[event_id!("$a:e")],
             ),
@@ -195,7 +189,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$c:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "c",
                 &[event_id!("$b:e")],
             ),
@@ -230,7 +224,7 @@ mod tests {
                 vec![chain_ids[i - 1]]
             };
             s.persist_event(
-                &message_with_prev(eid, *ALICE_ROOM_ID, *ALICE_ID, "x", &prevs),
+                &message_with_prev(eid, *ALICE_ROOM_ID, *ALICE_USER_ID, "x", &prevs),
                 &[],
             )
             .await
@@ -251,13 +245,13 @@ mod tests {
     async fn events_before_handles_branching() {
         let s = store_with_room().await;
         s.persist_event(
-            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_ID, "a", &[]),
+            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]),
             &[],
         )
         .await
         .unwrap();
         s.persist_event(
-            &message_with_prev(event_id!("$b:e"), *ALICE_ROOM_ID, *ALICE_ID, "b", &[]),
+            &message_with_prev(event_id!("$b:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "b", &[]),
             &[],
         )
         .await
@@ -266,7 +260,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$c:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "c",
                 &[event_id!("$a:e"), event_id!("$b:e")],
             ),
@@ -296,7 +290,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$a:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "a",
                 &[event_id!("$ghost:e")],
             ),
@@ -323,7 +317,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$a:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "a",
                 &[event_id!("$a:e")],
             ),
@@ -345,7 +339,7 @@ mod tests {
     async fn missing_events_excludes_earliest() {
         let s = store_with_room().await;
         s.persist_event(
-            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_ID, "a", &[]),
+            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]),
             &[],
         )
         .await
@@ -354,7 +348,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$b:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "b",
                 &[event_id!("$a:e")],
             ),
@@ -366,7 +360,7 @@ mod tests {
             &message_with_prev(
                 event_id!("$c:e"),
                 *ALICE_ROOM_ID,
-                *ALICE_ID,
+                *ALICE_USER_ID,
                 "c",
                 &[event_id!("$b:e")],
             ),
