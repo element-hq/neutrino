@@ -223,3 +223,329 @@ impl StateStore for SqliteStore {
         .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use lazy_static::lazy_static;
+    use neutrino_store::{EventStore, RoomStore, StateStore};
+    use ruma::{RoomId, UserId, event_id, room_id, user_id};
+
+    use crate::tests::{create_event, member_join, member_leave, name_event, store};
+
+    // ruma's `room_id!` / `user_id!` aren't const-fn, so `const` is out
+    // (E0015). `lazy_static!` runs the macro on first access and caches.
+    lazy_static! {
+        static ref ALICE_ROOM_ID: &'static RoomId = room_id!("!r1:example.com");
+        static ref BOB_ROOM_ID: &'static RoomId = room_id!("!r2:example.com");
+        static ref ALICE_ID: &'static UserId = user_id!("@alice:example.com");
+        static ref BOB_ID: &'static UserId = user_id!("@bob:example.com");
+    }
+
+    // S1
+    #[tokio::test]
+    async fn current_room_state_empty_for_unknown_room() {
+        let s = store().await;
+        let got = s.current_room_state(*ALICE_ROOM_ID).await.unwrap();
+        assert!(got.is_empty());
+    }
+
+    // S2
+    #[tokio::test]
+    async fn current_room_state_returns_all_state_events() {
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[
+                member_join(event_id!("$mj:e"), *ALICE_ROOM_ID, *ALICE_ID),
+                name_event(event_id!("$n:e"), *ALICE_ROOM_ID, *ALICE_ID, "room"),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let got = s.current_room_state(*ALICE_ROOM_ID).await.unwrap();
+        // Three state events: create, member, name
+        assert_eq!(got.len(), 3);
+        assert!(got.contains_key(&("m.room.create".to_owned(), "".to_owned())));
+        assert!(got.contains_key(&("m.room.member".to_owned(), ALICE_ID.as_str().to_owned())));
+        assert!(got.contains_key(&("m.room.name".to_owned(), "".to_owned())));
+    }
+
+    // S3
+    #[tokio::test]
+    async fn current_state_event_none_for_missing_key() {
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[],
+        )
+        .await
+        .unwrap();
+        let got = s
+            .current_state_event(*ALICE_ROOM_ID, "m.room.name", "")
+            .await
+            .unwrap();
+        assert!(got.is_none());
+    }
+
+    // S4
+    #[tokio::test]
+    async fn current_state_event_returns_specific() {
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[name_event(
+                event_id!("$n:e"),
+                *ALICE_ROOM_ID,
+                *ALICE_ID,
+                "Test Room",
+            )],
+        )
+        .await
+        .unwrap();
+        let got = s
+            .current_state_event(*ALICE_ROOM_ID, "m.room.name", "")
+            .await
+            .unwrap()
+            .expect("name event should be present");
+        assert_eq!(got.event_id.as_str(), "$n:e");
+    }
+
+    // S5
+    #[tokio::test]
+    async fn current_state_events_of_type_returns_subset() {
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[
+                member_join(event_id!("$mj1:e"), *ALICE_ROOM_ID, *ALICE_ID),
+                member_join(event_id!("$mj2:e"), *ALICE_ROOM_ID, *BOB_ID),
+                name_event(event_id!("$n:e"), *ALICE_ROOM_ID, *ALICE_ID, "room"),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let got = s
+            .current_state_events_of_type(*ALICE_ROOM_ID, "m.room.member")
+            .await
+            .unwrap();
+        // Both members, but no create / name.
+        assert_eq!(got.len(), 2);
+        assert!(got.contains_key(ALICE_ID.as_str()));
+        assert!(got.contains_key(BOB_ID.as_str()));
+    }
+
+    // S6
+    #[tokio::test]
+    async fn joined_rooms_empty_for_unknown_user() {
+        let s = store().await;
+        assert!(s.joined_rooms(*ALICE_ID).await.unwrap().is_empty());
+    }
+
+    // S7
+    #[tokio::test]
+    async fn joined_rooms_returns_user_rooms() {
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$c1:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[member_join(event_id!("$mj1:e"), *ALICE_ROOM_ID, *ALICE_ID)],
+        )
+        .await
+        .unwrap();
+        s.create_room(
+            &create_event(event_id!("$c2:e"), *BOB_ROOM_ID, *ALICE_ID),
+            &[member_join(event_id!("$mj2:e"), *BOB_ROOM_ID, *ALICE_ID)],
+        )
+        .await
+        .unwrap();
+
+        let mut rooms = s.joined_rooms(*ALICE_ID).await.unwrap();
+        rooms.sort_by_key(|r| r.as_str().to_owned());
+        assert_eq!(rooms.len(), 2);
+        assert_eq!(rooms[0].as_str(), ALICE_ROOM_ID.as_str());
+        assert_eq!(rooms[1].as_str(), BOB_ROOM_ID.as_str());
+    }
+
+    // S8
+    #[tokio::test]
+    async fn joined_rooms_excludes_non_join_membership() {
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$c1:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[member_join(event_id!("$mj:e"), *ALICE_ROOM_ID, *ALICE_ID)],
+        )
+        .await
+        .unwrap();
+        // alice leaves *ALICE_ROOM_ID
+        let leave = member_leave(event_id!("$ml:e"), *ALICE_ROOM_ID, *ALICE_ID);
+        s.persist_event(&leave, &[]).await.unwrap();
+
+        assert!(s.joined_rooms(*ALICE_ID).await.unwrap().is_empty());
+    }
+
+    // S9
+    #[tokio::test]
+    async fn joined_members_returns_joined_users() {
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[
+                member_join(event_id!("$mj1:e"), *ALICE_ROOM_ID, *ALICE_ID),
+                member_join(event_id!("$mj2:e"), *ALICE_ROOM_ID, *BOB_ID),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let got = s.joined_members(*ALICE_ROOM_ID).await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(got.contains_key(*ALICE_ID));
+        assert!(got.contains_key(*BOB_ID));
+    }
+
+    // S10
+    #[tokio::test]
+    async fn joined_members_excludes_non_joined() {
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[
+                member_join(event_id!("$mj1:e"), *ALICE_ROOM_ID, *ALICE_ID),
+                member_join(event_id!("$mj2:e"), *ALICE_ROOM_ID, *BOB_ID),
+            ],
+        )
+        .await
+        .unwrap();
+        // bob leaves
+        s.persist_event(
+            &member_leave(event_id!("$ml:e"), *ALICE_ROOM_ID, *BOB_ID),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let got = s.joined_members(*ALICE_ROOM_ID).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got.contains_key(*ALICE_ID));
+        assert!(!got.contains_key(*BOB_ID));
+    }
+
+    // S11
+    #[tokio::test]
+    async fn rooms_with_membership_empty_memberships_returns_empty() {
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[member_join(event_id!("$mj:e"), *ALICE_ROOM_ID, *ALICE_ID)],
+        )
+        .await
+        .unwrap();
+        let got = s.rooms_with_membership(*ALICE_ID, &[]).await.unwrap();
+        assert!(got.is_empty());
+    }
+
+    // S12
+    #[tokio::test]
+    async fn rooms_with_membership_returns_matching_pairs() {
+        let s = store().await;
+        // *ALICE_ROOM_ID: alice joined
+        s.create_room(
+            &create_event(event_id!("$c1:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[member_join(event_id!("$mj1:e"), *ALICE_ROOM_ID, *ALICE_ID)],
+        )
+        .await
+        .unwrap();
+        // *BOB_ROOM_ID: alice joined then left
+        s.create_room(
+            &create_event(event_id!("$c2:e"), *BOB_ROOM_ID, *ALICE_ID),
+            &[member_join(event_id!("$mj2:e"), *BOB_ROOM_ID, *ALICE_ID)],
+        )
+        .await
+        .unwrap();
+        s.persist_event(
+            &member_leave(event_id!("$ml:e"), *BOB_ROOM_ID, *ALICE_ID),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let mut got = s
+            .rooms_with_membership(*ALICE_ID, &["join", "leave"])
+            .await
+            .unwrap();
+        got.sort_by_key(|(r, _)| r.as_str().to_owned());
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            (got[0].0.as_str(), got[0].1.as_str()),
+            (ALICE_ROOM_ID.as_str(), "join")
+        );
+        assert_eq!(
+            (got[1].0.as_str(), got[1].1.as_str()),
+            (BOB_ROOM_ID.as_str(), "leave")
+        );
+    }
+
+    // S13
+    #[tokio::test]
+    async fn rooms_with_membership_filters_by_value() {
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$c1:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[member_join(event_id!("$mj1:e"), *ALICE_ROOM_ID, *ALICE_ID)],
+        )
+        .await
+        .unwrap();
+        s.create_room(
+            &create_event(event_id!("$c2:e"), *BOB_ROOM_ID, *ALICE_ID),
+            &[member_join(event_id!("$mj2:e"), *BOB_ROOM_ID, *ALICE_ID)],
+        )
+        .await
+        .unwrap();
+        s.persist_event(
+            &member_leave(event_id!("$ml:e"), *BOB_ROOM_ID, *ALICE_ID),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        // Only ask for "leave"
+        let got = s
+            .rooms_with_membership(*ALICE_ID, &["leave"])
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0.as_str(), BOB_ROOM_ID.as_str());
+        assert_eq!(got[0].1, "leave");
+    }
+
+    // S14: unknown membership strings in slice silently ignored
+    #[tokio::test]
+    async fn rooms_with_membership_unknown_memberships_silently_ignored() {
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[member_join(event_id!("$mj:e"), *ALICE_ROOM_ID, *ALICE_ID)],
+        )
+        .await
+        .unwrap();
+        let got = s
+            .rooms_with_membership(*ALICE_ID, &["join", "bogus_value"])
+            .await
+            .unwrap();
+        // "bogus_value" doesn't match any row; "join" matches one.
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, "join");
+    }
+
+    // S15
+    #[tokio::test]
+    async fn rooms_with_membership_empty_for_unknown_user() {
+        let s = store().await;
+        let got = s
+            .rooms_with_membership(*ALICE_ID, &["join", "leave"])
+            .await
+            .unwrap();
+        assert!(got.is_empty());
+    }
+}

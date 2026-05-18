@@ -135,3 +135,268 @@ impl DagStore for SqliteStore {
         .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use lazy_static::lazy_static;
+    use neutrino_store::{DagStore, EventStore, RoomStore};
+    use ruma::{EventId, RoomId, UserId, event_id, room_id, user_id};
+
+    use crate::SqliteStore;
+    use crate::tests::{create_event, message_with_prev, store};
+
+    lazy_static! {
+        static ref ALICE_ROOM_ID: &'static RoomId = room_id!("!r1:example.com");
+        static ref ALICE_ID: &'static UserId = user_id!("@alice:example.com");
+    }
+
+    async fn store_with_room() -> SqliteStore {
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$create:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[],
+        )
+        .await
+        .unwrap();
+        s
+    }
+
+    // D1: empty `from` → empty result.
+    #[tokio::test]
+    async fn events_before_empty_from_returns_empty() {
+        let s = store_with_room().await;
+        let got = s.events_before(*ALICE_ROOM_ID, &[], 10).await.unwrap();
+        assert!(got.is_empty());
+    }
+
+    // D2: chain a → b → c; walk from [c] returns [c, b, a].
+    #[tokio::test]
+    async fn events_before_walks_prev_events_chain() {
+        let s = store_with_room().await;
+        s.persist_event(
+            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_ID, "a", &[]),
+            &[],
+        )
+        .await
+        .unwrap();
+        s.persist_event(
+            &message_with_prev(
+                event_id!("$b:e"),
+                *ALICE_ROOM_ID,
+                *ALICE_ID,
+                "b",
+                &[event_id!("$a:e")],
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+        s.persist_event(
+            &message_with_prev(
+                event_id!("$c:e"),
+                *ALICE_ROOM_ID,
+                *ALICE_ID,
+                "c",
+                &[event_id!("$b:e")],
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let got = s
+            .events_before(*ALICE_ROOM_ID, &[event_id!("$c:e")], 10)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = got.iter().map(|p| p.event.event_id.as_str()).collect();
+        assert_eq!(ids, ["$c:e", "$b:e", "$a:e"]);
+    }
+
+    // D3: chain of 5, limit=3 → first 3 returned.
+    #[tokio::test]
+    async fn events_before_respects_limit() {
+        let s = store_with_room().await;
+        let chain_ids: [&EventId; 5] = [
+            event_id!("$e0:e"),
+            event_id!("$e1:e"),
+            event_id!("$e2:e"),
+            event_id!("$e3:e"),
+            event_id!("$e4:e"),
+        ];
+        for (i, eid) in chain_ids.iter().enumerate() {
+            let prevs: Vec<&EventId> = if i == 0 {
+                Vec::new()
+            } else {
+                vec![chain_ids[i - 1]]
+            };
+            s.persist_event(
+                &message_with_prev(eid, *ALICE_ROOM_ID, *ALICE_ID, "x", &prevs),
+                &[],
+            )
+            .await
+            .unwrap();
+        }
+
+        let got = s
+            .events_before(*ALICE_ROOM_ID, &[event_id!("$e4:e")], 3)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 3);
+        let ids: Vec<&str> = got.iter().map(|p| p.event.event_id.as_str()).collect();
+        assert_eq!(ids, ["$e4:e", "$e3:e", "$e2:e"]);
+    }
+
+    // D4: event with two `prev_events` → BFS visits both parents.
+    #[tokio::test]
+    async fn events_before_handles_branching() {
+        let s = store_with_room().await;
+        s.persist_event(
+            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_ID, "a", &[]),
+            &[],
+        )
+        .await
+        .unwrap();
+        s.persist_event(
+            &message_with_prev(event_id!("$b:e"), *ALICE_ROOM_ID, *ALICE_ID, "b", &[]),
+            &[],
+        )
+        .await
+        .unwrap();
+        s.persist_event(
+            &message_with_prev(
+                event_id!("$c:e"),
+                *ALICE_ROOM_ID,
+                *ALICE_ID,
+                "c",
+                &[event_id!("$a:e"), event_id!("$b:e")],
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let got = s
+            .events_before(*ALICE_ROOM_ID, &[event_id!("$c:e")], 10)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 3);
+        let ids: std::collections::HashSet<&str> =
+            got.iter().map(|p| p.event.event_id.as_str()).collect();
+        assert!(ids.contains("$c:e"));
+        assert!(ids.contains("$a:e"));
+        assert!(ids.contains("$b:e"));
+    }
+
+    // D5: event's prev_events references an ID not in the local store →
+    // walker hits the federation-backfill boundary, doesn't error.
+    #[tokio::test]
+    async fn events_before_skips_missing_parents() {
+        let s = store_with_room().await;
+        s.persist_event(
+            &message_with_prev(
+                event_id!("$a:e"),
+                *ALICE_ROOM_ID,
+                *ALICE_ID,
+                "a",
+                &[event_id!("$ghost:e")],
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let got = s
+            .events_before(*ALICE_ROOM_ID, &[event_id!("$a:e")], 10)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].event.event_id.as_str(), "$a:e");
+    }
+
+    // D6: storage-corruption defence — event with self-loop in `prev_events`
+    // doesn't trap the walker in an infinite loop. See module docstring on
+    // why federation-supplied cycles aren't constructable in practice.
+    #[tokio::test]
+    async fn events_before_cycle_handling() {
+        let s = store_with_room().await;
+        s.persist_event(
+            &message_with_prev(
+                event_id!("$a:e"),
+                *ALICE_ROOM_ID,
+                *ALICE_ID,
+                "a",
+                &[event_id!("$a:e")],
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let got = s
+            .events_before(*ALICE_ROOM_ID, &[event_id!("$a:e")], 10)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].event.event_id.as_str(), "$a:e");
+    }
+
+    // D7: missing_events excludes IDs listed in `earliest`.
+    #[tokio::test]
+    async fn missing_events_excludes_earliest() {
+        let s = store_with_room().await;
+        s.persist_event(
+            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_ID, "a", &[]),
+            &[],
+        )
+        .await
+        .unwrap();
+        s.persist_event(
+            &message_with_prev(
+                event_id!("$b:e"),
+                *ALICE_ROOM_ID,
+                *ALICE_ID,
+                "b",
+                &[event_id!("$a:e")],
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+        s.persist_event(
+            &message_with_prev(
+                event_id!("$c:e"),
+                *ALICE_ROOM_ID,
+                *ALICE_ID,
+                "c",
+                &[event_id!("$b:e")],
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let got = s
+            .missing_events(
+                *ALICE_ROOM_ID,
+                &[event_id!("$c:e")],
+                &[event_id!("$a:e")],
+                10,
+            )
+            .await
+            .unwrap();
+        let ids: Vec<&str> = got.iter().map(|p| p.event.event_id.as_str()).collect();
+        // a is in `earliest`; walker skips it. c and b returned.
+        assert_eq!(ids, ["$c:e", "$b:e"]);
+    }
+
+    // D8: empty `latest` → empty result.
+    #[tokio::test]
+    async fn missing_events_empty_latest_returns_empty() {
+        let s = store_with_room().await;
+        let got = s
+            .missing_events(*ALICE_ROOM_ID, &[], &[], 10)
+            .await
+            .unwrap();
+        assert!(got.is_empty());
+    }
+}
