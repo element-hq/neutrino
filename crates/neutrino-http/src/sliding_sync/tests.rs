@@ -1858,3 +1858,232 @@ async fn invited_room_emits_name_and_avatar_from_stripped_state() {
     assert_eq!(room_res.joined_count, None);
     assert_eq!(room_res.invited_count, None);
 }
+
+// ----------------------------------------------------------------------------
+// MSC4186 §"Rooms included in the server list" — kicked / banned / left /
+// knocked. See `build::include_room_per_msc4186` and the storage trait
+// change to `StateStore::rooms_with_membership`.
+// ----------------------------------------------------------------------------
+
+/// Helper for the membership inclusion tests. Seeds an `m.room.member` event
+/// for `target` whose sender is `sender` — exposed so tests can differentiate
+/// kick (sender ≠ target) from self-leave (sender == target).
+fn seed_member_event(
+    store: &InMemoryStore,
+    event_id: &ruma::EventId,
+    room: &RoomId,
+    target: &ruma::UserId,
+    sender: &ruma::UserId,
+    membership: &str,
+    ts: u64,
+) {
+    let stored = StoredEvent {
+        event_id: event_id.to_owned(),
+        room_id: room.to_owned(),
+        event_type: "m.room.member".to_string(),
+        state_key: Some(target.as_str().to_string()),
+        sender: sender.to_owned(),
+        origin_server_ts: ts,
+        json: serde_json::value::to_raw_value(&serde_json::json!({
+            "event_id": event_id.as_str(),
+            "room_id": room.as_str(),
+            "type": "m.room.member",
+            "state_key": target.as_str(),
+            "sender": sender.as_str(),
+            "origin_server_ts": ts,
+            "content": {"membership": membership}
+        }))
+        .unwrap(),
+    };
+    store.add_event(stored);
+}
+
+#[tokio::test]
+async fn knocked_room_appears_in_candidates() {
+    let store = Arc::new(InMemoryStore::new());
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!knock:example.org");
+    store.set_membership(user, room, "knock");
+
+    let state = SyncState::new(store);
+
+    let mut req = Request::new();
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    req.lists = lists;
+    let resp = handle(&state, user, req).await.unwrap();
+
+    assert!(
+        resp.rooms.contains_key(room),
+        "knocked rooms are always included per MSC4186"
+    );
+}
+
+#[tokio::test]
+async fn kicked_room_appears_in_candidates_even_on_fresh_connection() {
+    let store = Arc::new(InMemoryStore::new());
+    let user = user_id!("@alice:example.org");
+    let kicker = user_id!("@bob:example.org");
+    let room = room_id!("!kicked:example.org");
+
+    store.set_membership(user, room, "leave");
+    // Member event with sender != target — that's a kick.
+    seed_member_event(
+        &store,
+        event_id!("$kick:example.org"),
+        room,
+        user,
+        kicker,
+        "leave",
+        100,
+    );
+
+    let state = SyncState::new(store);
+    let mut req = Request::new();
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    req.lists = lists;
+    let resp = handle(&state, user, req).await.unwrap();
+
+    assert!(
+        resp.rooms.contains_key(room),
+        "kick (sender ≠ user) → always included, even on first sync"
+    );
+}
+
+#[tokio::test]
+async fn self_left_room_only_appears_if_previously_emitted() {
+    let store = Arc::new(InMemoryStore::new());
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!leave:example.org");
+
+    // Step 1: user is joined. Sync once to put the room into conn.sent.
+    store.set_membership(user, room, "join");
+    seed_member_event(
+        &store,
+        event_id!("$join:example.org"),
+        room,
+        user,
+        user,
+        "join",
+        100,
+    );
+    let state = SyncState::new(store.clone());
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let mut req1 = Request::new();
+    req1.lists = lists.clone();
+    let resp1 = handle(&state, user, req1).await.unwrap();
+    assert!(resp1.rooms.contains_key(room), "join is included initially");
+
+    // Step 2: user self-leaves. They should still see the room because the
+    // conn previously emitted it.
+    store.set_membership(user, room, "leave");
+    seed_member_event(
+        &store,
+        event_id!("$self-leave:example.org"),
+        room,
+        user,
+        user,
+        "leave",
+        200,
+    );
+    let mut req2 = Request::new();
+    req2.pos = Some(resp1.pos);
+    req2.lists = lists;
+    let resp2 = handle(&state, user, req2).await.unwrap();
+    assert!(
+        resp2.rooms.contains_key(room),
+        "self-leave keeps the room visible because it was previously emitted"
+    );
+
+    // Step 3: a brand-new connection (no `pos`) does NOT see the
+    // self-leave-only room — it was never emitted on this conn.
+    let new_state = SyncState::new(store);
+    let mut req3 = Request::new();
+    let mut lists2 = BTreeMap::new();
+    lists2.insert("all".to_string(), list_with(5, vec![]));
+    req3.lists = lists2;
+    let resp3 = handle(&new_state, user, req3).await.unwrap();
+    assert!(
+        !resp3.rooms.contains_key(room),
+        "fresh connection skips self-left rooms with no prior emission"
+    );
+}
+
+#[tokio::test]
+async fn banned_room_only_appears_if_previously_emitted() {
+    let store = Arc::new(InMemoryStore::new());
+    let user = user_id!("@alice:example.org");
+    let banner = user_id!("@bob:example.org");
+    let room = room_id!("!ban:example.org");
+
+    // Without prior emission: not included.
+    store.set_membership(user, room, "ban");
+    seed_member_event(
+        &store,
+        event_id!("$ban:example.org"),
+        room,
+        user,
+        banner,
+        "ban",
+        100,
+    );
+    let state = SyncState::new(store.clone());
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let mut req1 = Request::new();
+    req1.lists = lists.clone();
+    let resp1 = handle(&state, user, req1).await.unwrap();
+    assert!(
+        !resp1.rooms.contains_key(room),
+        "ban with no prior emission is not included (we can't prove previous-join)"
+    );
+}
+
+#[tokio::test]
+async fn banned_room_remains_visible_after_being_emitted_while_joined() {
+    let store = Arc::new(InMemoryStore::new());
+    let user = user_id!("@alice:example.org");
+    let banner = user_id!("@bob:example.org");
+    let room = room_id!("!ban:example.org");
+
+    // Join → sync to register the room with the conn → get banned → next sync
+    // must still show the room because conn.sent recorded it.
+    store.set_membership(user, room, "join");
+    seed_member_event(
+        &store,
+        event_id!("$join:example.org"),
+        room,
+        user,
+        user,
+        "join",
+        100,
+    );
+    let state = SyncState::new(store.clone());
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let mut req1 = Request::new();
+    req1.lists = lists.clone();
+    let resp1 = handle(&state, user, req1).await.unwrap();
+    assert!(resp1.rooms.contains_key(room));
+
+    store.set_membership(user, room, "ban");
+    seed_member_event(
+        &store,
+        event_id!("$ban:example.org"),
+        room,
+        user,
+        banner,
+        "ban",
+        200,
+    );
+    let mut req2 = Request::new();
+    req2.pos = Some(resp1.pos);
+    req2.lists = lists;
+    let resp2 = handle(&state, user, req2).await.unwrap();
+    assert!(
+        resp2.rooms.contains_key(room),
+        "ban after a prior emission stays visible (approximates MSC4186's 'previously joined')"
+    );
+}
