@@ -8,6 +8,7 @@ deadpool-sqlite = { version = "0.13.0", features = ["bundled"] }
 
 async-trait.workspace = true
 ruma.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

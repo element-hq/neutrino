@@ -990,6 +990,7 @@ dependencies = [
  "deadpool-sqlite",
  "neutrino-store",
  "ruma",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

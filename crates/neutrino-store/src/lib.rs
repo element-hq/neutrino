@@ -17,7 +17,7 @@ pub enum StorageError {
     Internal(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StoredEvent {
     pub event_id: OwnedEventId,
     pub room_id: OwnedRoomId,
