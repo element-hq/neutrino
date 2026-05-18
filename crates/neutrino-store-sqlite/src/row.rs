@@ -213,3 +213,22 @@ impl<'a> EventRow<'a> {
         Ok(stream_pos)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{EVENT_COLUMNS, EVENT_COLUMNS_PREFIXED};
+
+    // C1: drift guard between the two column-list consts. If someone edits
+    // one and forgets the other, this test catches it. The two consts are
+    // intentionally hand-written (clearer at the query call sites) rather
+    // than macro-generated; this is the cost of that choice.
+    #[test]
+    fn event_columns_prefix_matches() {
+        let expected = EVENT_COLUMNS
+            .split(", ")
+            .map(|c| format!("e.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(EVENT_COLUMNS_PREFIXED, expected);
+    }
+}
