@@ -80,16 +80,21 @@ CREATE TABLE current_state (
     PRIMARY KEY (room_id, event_type, state_key)
 ) STRICT, WITHOUT ROWID;
 
--- joined_rooms(user): direct lookup by state_key; partial so only joined
--- membership rows live in the index.
-CREATE INDEX ix_current_state_member_joined
-    ON current_state(state_key, room_id)
-    WHERE event_type = 'm.room.member' AND membership = 'join';
+-- joined_rooms(user) and rooms_with_membership(user, memberships): direct
+-- lookup by state_key. Partial on `event_type = 'm.room.member'` only —
+-- broadened from the prior `membership = 'join'` constraint so the same
+-- index serves any membership filter (sliding sync enumerates rooms across
+-- the full MSC4186-eligible membership set in one shot).
+CREATE INDEX ix_current_state_member
+    ON current_state(state_key, room_id, membership)
+    WHERE event_type = 'm.room.member';
 
--- joined_members(room): direct lookup by room_id; same partial filter.
-CREATE INDEX ix_current_state_room_joined
-    ON current_state(room_id, state_key)
-    WHERE event_type = 'm.room.member' AND membership = 'join';
+-- joined_members(room): direct lookup by room_id. Same broadening — the
+-- caller filters by membership in the WHERE clause and SQLite uses the
+-- (room_id, …) prefix.
+CREATE INDEX ix_current_state_room_member
+    ON current_state(room_id, state_key, membership)
+    WHERE event_type = 'm.room.member';
 
 -- ----------------------------------------------------------------------------
 -- client_txns — EventStore::{record_client_txn, get_client_txn}
