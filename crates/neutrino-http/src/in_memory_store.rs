@@ -55,11 +55,13 @@ struct Inner {
     events: Vec<(StreamPos, StoredEvent)>,
     next_pos: u64,
     current_state: HashMap<OwnedRoomId, HashMap<(String, String), StoredEvent>>,
-    /// Reverse index: per-user lists of rooms they're joined / invited to.
+    /// Per-user membership index: `user → (room → current membership)`.
     /// Updated by `persist_event` when it sees an `m.room.member` event, and
-    /// by the `join_user` / `invite_user` test helpers directly.
-    joined: HashMap<OwnedUserId, Vec<OwnedRoomId>>,
-    invited: HashMap<OwnedUserId, Vec<OwnedRoomId>>,
+    /// by the test helpers (`join_user`, `invite_user`, `set_membership`)
+    /// directly. Captures all five Matrix membership strings — join, invite,
+    /// knock, leave, ban — so `rooms_with_membership` can answer queries
+    /// across the full set in one walk.
+    memberships: HashMap<OwnedUserId, HashMap<OwnedRoomId, String>>,
 }
 
 impl InMemoryStore {
@@ -71,8 +73,7 @@ impl InMemoryStore {
                 events: Vec::new(),
                 next_pos: 1,
                 current_state: HashMap::new(),
-                joined: HashMap::new(),
-                invited: HashMap::new(),
+                memberships: HashMap::new(),
             }),
             watch_tx: tx,
         }
@@ -84,26 +85,30 @@ impl InMemoryStore {
         inner.rooms.insert(room_id.to_owned(), version);
     }
 
-    /// Test helper: directly add `user` to the joined-rooms index without
-    /// going through `persist_event`. Real production paths get this via
-    /// `persist_event` on an `m.room.member` event.
+    /// Test helper: directly set `user`'s membership in `room_id` to `join`
+    /// without going through `persist_event`. Real production paths get this
+    /// via `persist_event` on an `m.room.member` event.
     pub fn join_user(&self, user_id: &UserId, room_id: &RoomId) {
-        let mut inner = self.inner.lock().unwrap();
-        inner
-            .joined
-            .entry(user_id.to_owned())
-            .or_default()
-            .push(room_id.to_owned());
+        self.set_membership(user_id, room_id, "join");
     }
 
-    /// Test helper: directly add `user` to the invited-rooms index.
+    /// Test helper: directly set `user`'s membership in `room_id` to `invite`.
     pub fn invite_user(&self, user_id: &UserId, room_id: &RoomId) {
+        self.set_membership(user_id, room_id, "invite");
+    }
+
+    /// Test helper: set `user`'s current membership in `room_id` to the
+    /// given string. Use this from tests when you want to assert
+    /// behaviour for `leave` / `ban` / `knock` without seeding a full
+    /// `m.room.member` event. State-event-driven tests should still go
+    /// through `add_event` so they exercise the parsing path too.
+    pub fn set_membership(&self, user_id: &UserId, room_id: &RoomId, membership: &str) {
         let mut inner = self.inner.lock().unwrap();
         inner
-            .invited
+            .memberships
             .entry(user_id.to_owned())
             .or_default()
-            .push(room_id.to_owned());
+            .insert(room_id.to_owned(), membership.to_string());
     }
 
     /// Test helper: insert an event into the log + current state without the
@@ -214,9 +219,33 @@ fn insert_event_locked(
     let _ = watch_tx.send(pos);
 }
 
-/// Apply an `m.room.member` event to the joined/invited indices.
+/// Walk the per-user membership index and return `(room, current_membership)`
+/// for rooms whose current membership matches one of `memberships`. Shared
+/// backing for `joined_rooms`, `invited_rooms`, and `rooms_with_membership`
+/// so the three trait methods agree on the source of truth.
+fn rooms_for_user_with(
+    store: &InMemoryStore,
+    user_id: &UserId,
+    memberships: &[&str],
+) -> Vec<(OwnedRoomId, String)> {
+    let inner = store.inner.lock().unwrap();
+    let Some(room_map) = inner.memberships.get(user_id) else {
+        return Vec::new();
+    };
+    let want: std::collections::HashSet<&str> = memberships.iter().copied().collect();
+    room_map
+        .iter()
+        .filter(|(_, v)| want.contains(v.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Apply an `m.room.member` event to the per-user membership map.
 /// `state_key` is the user the membership is for; the JSON's
-/// `content.membership` is the new state.
+/// `content.membership` is the new state. We store all five canonical
+/// strings (join, invite, knock, leave, ban) — sliding sync's
+/// `rooms_with_membership` query needs to see them all to apply
+/// MSC4186's "rooms included in the server list" rules.
 fn track_membership_from_event(inner: &mut Inner, event: &StoredEvent) {
     let Some(state_key) = &event.state_key else {
         return;
@@ -231,26 +260,16 @@ fn track_membership_from_event(inner: &mut Inner, event: &StoredEvent) {
                 .and_then(|m| m.as_str())
                 .map(String::from)
         });
-    // Always strip the user from both indices first, then re-add to the
-    // correct one based on the new membership. Simpler than diffing.
-    if let Some(rooms) = inner.joined.get_mut(&user) {
-        rooms.retain(|r| r != &event.room_id);
-    }
-    if let Some(rooms) = inner.invited.get_mut(&user) {
-        rooms.retain(|r| r != &event.room_id);
-    }
-    match membership.as_deref() {
-        Some("join") => inner
-            .joined
-            .entry(user)
-            .or_default()
-            .push(event.room_id.clone()),
-        Some("invite") => inner
-            .invited
-            .entry(user)
-            .or_default()
-            .push(event.room_id.clone()),
-        _ => {} // leave / ban / knock — already removed above
+    let room_map = inner.memberships.entry(user).or_default();
+    match membership {
+        Some(m) => {
+            room_map.insert(event.room_id.clone(), m);
+        }
+        None => {
+            // No membership in content → can't reason about state; drop
+            // any prior entry rather than leave it stale.
+            room_map.remove(&event.room_id);
+        }
     }
 }
 
@@ -468,13 +487,25 @@ impl StateStore for InMemoryStore {
     }
 
     async fn joined_rooms(&self, user_id: &UserId) -> Result<Vec<OwnedRoomId>, StorageError> {
-        let inner = self.inner.lock().unwrap();
-        Ok(inner.joined.get(user_id).cloned().unwrap_or_default())
+        Ok(rooms_for_user_with(self, user_id, &["join"])
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect())
     }
 
     async fn invited_rooms(&self, user_id: &UserId) -> Result<Vec<OwnedRoomId>, StorageError> {
-        let inner = self.inner.lock().unwrap();
-        Ok(inner.invited.get(user_id).cloned().unwrap_or_default())
+        Ok(rooms_for_user_with(self, user_id, &["invite"])
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect())
+    }
+
+    async fn rooms_with_membership(
+        &self,
+        user_id: &UserId,
+        memberships: &[&str],
+    ) -> Result<Vec<(OwnedRoomId, String)>, StorageError> {
+        Ok(rooms_for_user_with(self, user_id, memberships))
     }
 
     async fn joined_members(
