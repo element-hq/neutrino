@@ -32,7 +32,7 @@ impl StateStore for SqliteStore {
                     "SELECT cs.event_type AS map_event_type, cs.state_key AS map_state_key, \
                             {EVENT_COLUMNS_PREFIXED} \
                      FROM current_state cs \
-                     JOIN events e ON cs.event_id = e.event_id \
+                     JOIN events e ON cs.event_id = e.event_id AND e.room_id = cs.room_id \
                      WHERE cs.room_id = ?"
                 );
                 let mut stmt = conn.prepare(&query)?;
@@ -67,7 +67,7 @@ impl StateStore for SqliteStore {
             let query = format!(
                 "SELECT {EVENT_COLUMNS_PREFIXED} \
                  FROM current_state cs \
-                 JOIN events e ON cs.event_id = e.event_id \
+                 JOIN events e ON cs.event_id = e.event_id AND e.room_id = cs.room_id \
                  WHERE cs.room_id = ? AND cs.event_type = ? AND cs.state_key = ?"
             );
             let result = conn
@@ -97,7 +97,7 @@ impl StateStore for SqliteStore {
             let query = format!(
                 "SELECT cs.state_key AS map_state_key, {EVENT_COLUMNS_PREFIXED} \
                  FROM current_state cs \
-                 JOIN events e ON cs.event_id = e.event_id \
+                 JOIN events e ON cs.event_id = e.event_id AND e.room_id = cs.room_id \
                  WHERE cs.room_id = ? AND cs.event_type = ?"
             );
             let mut stmt = conn.prepare(&query)?;
@@ -200,7 +200,7 @@ impl StateStore for SqliteStore {
                 let query = format!(
                     "SELECT cs.state_key AS user_id, {EVENT_COLUMNS_PREFIXED} \
                      FROM current_state cs \
-                     JOIN events e ON cs.event_id = e.event_id \
+                     JOIN events e ON cs.event_id = e.event_id AND e.room_id = cs.room_id \
                      WHERE cs.room_id = ? AND cs.event_type = 'm.room.member' \
                        AND cs.membership = 'join'"
                 );
@@ -547,5 +547,250 @@ mod tests {
             .await
             .unwrap();
         assert!(got.is_empty());
+    }
+    // S16
+    #[tokio::test]
+    async fn current_room_state_isolates_by_room_id() {
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[name_event(
+                event_id!("$nA:e"),
+                *ALICE_ROOM_ID,
+                *ALICE_ID,
+                "A",
+            )],
+        )
+        .await
+        .unwrap();
+        s.create_room(
+            &create_event(event_id!("$cB:e"), *BOB_ROOM_ID, *ALICE_ID),
+            &[name_event(event_id!("$nB:e"), *BOB_ROOM_ID, *ALICE_ID, "B")],
+        )
+        .await
+        .unwrap();
+
+        let got = s.current_room_state(*ALICE_ROOM_ID).await.unwrap();
+        // Exactly room A's create + name — none of room B's state.
+        assert_eq!(got.len(), 2);
+        let create = got
+            .get(&("m.room.create".to_owned(), "".to_owned()))
+            .expect("room A create event present");
+        assert_eq!(create.event_id.as_str(), "$cA:e");
+        let name = got
+            .get(&("m.room.name".to_owned(), "".to_owned()))
+            .expect("room A name event present");
+        assert_eq!(name.event_id.as_str(), "$nA:e");
+    }
+
+    // S17
+    #[tokio::test]
+    async fn current_state_event_isolates_by_room_id() {
+        let s = store().await;
+        // Room A has no name; room B does. Same (event_type, state_key)
+        // pair on both sides, so a missing room-scoping filter would
+        // surface B's name event when querying A.
+        s.create_room(
+            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[],
+        )
+        .await
+        .unwrap();
+        s.create_room(
+            &create_event(event_id!("$cB:e"), *BOB_ROOM_ID, *ALICE_ID),
+            &[name_event(event_id!("$nB:e"), *BOB_ROOM_ID, *ALICE_ID, "B")],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            s.current_state_event(*ALICE_ROOM_ID, "m.room.name", "")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let got = s
+            .current_state_event(*BOB_ROOM_ID, "m.room.name", "")
+            .await
+            .unwrap()
+            .expect("room B name event present");
+        assert_eq!(got.event_id.as_str(), "$nB:e");
+    }
+
+    // S18
+    #[tokio::test]
+    async fn current_state_events_of_type_isolates_by_room_id() {
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[member_join(event_id!("$mjA:e"), *ALICE_ROOM_ID, *ALICE_ID)],
+        )
+        .await
+        .unwrap();
+        s.create_room(
+            &create_event(event_id!("$cB:e"), *BOB_ROOM_ID, *BOB_ID),
+            &[member_join(event_id!("$mjB:e"), *BOB_ROOM_ID, *BOB_ID)],
+        )
+        .await
+        .unwrap();
+
+        let got = s
+            .current_state_events_of_type(*ALICE_ROOM_ID, "m.room.member")
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        let alice = got
+            .get(ALICE_ID.as_str())
+            .expect("alice's member event present in room A");
+        assert_eq!(alice.event_id.as_str(), "$mjA:e");
+        assert!(!got.contains_key(BOB_ID.as_str()));
+    }
+
+    // S19
+    #[tokio::test]
+    async fn joined_members_isolates_by_room_id() {
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[member_join(event_id!("$mjA:e"), *ALICE_ROOM_ID, *ALICE_ID)],
+        )
+        .await
+        .unwrap();
+        s.create_room(
+            &create_event(event_id!("$cB:e"), *BOB_ROOM_ID, *BOB_ID),
+            &[member_join(event_id!("$mjB:e"), *BOB_ROOM_ID, *BOB_ID)],
+        )
+        .await
+        .unwrap();
+
+        let got = s.joined_members(*ALICE_ROOM_ID).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got.contains_key(*ALICE_ID));
+        assert!(!got.contains_key(*BOB_ID));
+    }
+
+    // S20: `joined_rooms` doesn't JOIN events, but the existing S7 test
+    // happened to have only one user in the DB, so the query would have
+    // passed even with no user filter. Force the user filter to do work
+    // by giving each user their own room.
+    #[tokio::test]
+    async fn joined_rooms_filters_by_user_id() {
+        let s = store().await;
+        // Alice is in room A.
+        s.create_room(
+            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[member_join(event_id!("$mjA:e"), *ALICE_ROOM_ID, *ALICE_ID)],
+        )
+        .await
+        .unwrap();
+        // Bob is in room B; alice is NOT.
+        s.create_room(
+            &create_event(event_id!("$cB:e"), *BOB_ROOM_ID, *BOB_ID),
+            &[member_join(event_id!("$mjB:e"), *BOB_ROOM_ID, *BOB_ID)],
+        )
+        .await
+        .unwrap();
+
+        let rooms = s.joined_rooms(*ALICE_ID).await.unwrap();
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].as_str(), ALICE_ROOM_ID.as_str());
+    }
+
+    // S21: corruption-defence. The schema's lack of a composite FK
+    // `(room_id, event_id) → events(room_id, event_id)` lets a buggy
+    // write put a `current_state` row in room A pointing at an event
+    // that actually belongs to room B. The four JOIN-based read paths
+    // must treat that row as absent rather than surfacing the foreign
+    // event. Drives the `e.room_id = cs.room_id` guard documented at
+    // the top of this module.
+    #[tokio::test]
+    async fn state_queries_reject_cross_room_event_id() {
+        use deadpool_sqlite::rusqlite::params;
+
+        use crate::error::Error;
+
+        let s = store().await;
+        // Room A: nothing but the create event.
+        s.create_room(
+            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[],
+        )
+        .await
+        .unwrap();
+        // Room B: real name event and a real bob-join, so the
+        // event_id FK target exists when we inject the bad rows below.
+        s.create_room(
+            &create_event(event_id!("$cB:e"), *BOB_ROOM_ID, *BOB_ID),
+            &[
+                name_event(event_id!("$nB:e"), *BOB_ROOM_ID, *BOB_ID, "B"),
+                member_join(event_id!("$mjB:e"), *BOB_ROOM_ID, *BOB_ID),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // Inject inconsistent rows: room_id says A, event_id resolves
+        // to events in room B. FK on event_id passes; no schema check
+        // on room agreement.
+        let alice_room = ALICE_ROOM_ID.as_str().to_owned();
+        let bob_id = BOB_ID.as_str().to_owned();
+        s.run_write(move |conn| -> Result<(), Error> {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT INTO current_state \
+                 (room_id, event_type, state_key, event_id, membership) \
+                 VALUES (?, ?, ?, ?, ?)",
+                params![alice_room, "m.room.name", "", "$nB:e", None::<&str>],
+            )?;
+            tx.execute(
+                "INSERT INTO current_state \
+                 (room_id, event_type, state_key, event_id, membership) \
+                 VALUES (?, ?, ?, ?, ?)",
+                params![alice_room, "m.room.member", bob_id, "$mjB:e", "join"],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // current_state_event: cross-room row hidden.
+        assert!(
+            s.current_state_event(*ALICE_ROOM_ID, "m.room.name", "")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // current_room_state: only the legitimate create event from A.
+        let got = s.current_room_state(*ALICE_ROOM_ID).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got.contains_key(&("m.room.create".to_owned(), "".to_owned())));
+
+        // current_state_events_of_type: corrupted types return empty.
+        assert!(
+            s.current_state_events_of_type(*ALICE_ROOM_ID, "m.room.name")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            s.current_state_events_of_type(*ALICE_ROOM_ID, "m.room.member")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // joined_members: bob's cross-room row in A is filtered out.
+        let got = s.joined_members(*ALICE_ROOM_ID).await.unwrap();
+        assert!(got.is_empty());
+
+        // Room B's real state is untouched by the corruption.
+        let b_name = s
+            .current_state_event(*BOB_ROOM_ID, "m.room.name", "")
+            .await
+            .unwrap()
+            .expect("room B name event still present");
+        assert_eq!(b_name.event_id.as_str(), "$nB:e");
     }
 }
