@@ -19,7 +19,6 @@ lazy_static! {
     pub(crate) static ref BOB_USER_ID: &'static UserId = user_id!("@bob:example.com");
     pub(crate) static ref CREATE_EVENT_ID: &'static EventId = event_id!("$create:example.com");
 }
-// Ruma-typed-reference wrappers.
 
 // Store fixtures.
 
