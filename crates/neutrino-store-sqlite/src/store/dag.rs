@@ -30,8 +30,7 @@ fn hydrate_pdu(
     event_id: &EventId,
     room_id: &RoomId,
 ) -> Result<Option<StoredPdu>, Error> {
-    let query =
-        format!("SELECT {EVENT_COLUMNS} FROM events WHERE event_id = ? AND room_id = ?");
+    let query = format!("SELECT {EVENT_COLUMNS} FROM events WHERE event_id = ? AND room_id = ?");
     let event_result: Option<Result<StoredEvent, Error>> = conn
         .query_row(
             &query,
@@ -144,8 +143,7 @@ impl DagStore for SqliteStore {
     ) -> Result<Vec<StoredPdu>, StorageError> {
         let room_id = room_id.to_owned();
         let latest: Vec<OwnedEventId> = latest.iter().map(|&e| e.to_owned()).collect();
-        let earliest: HashSet<OwnedEventId> =
-            earliest.iter().map(|&e| e.to_owned()).collect();
+        let earliest: HashSet<OwnedEventId> = earliest.iter().map(|&e| e.to_owned()).collect();
 
         self.run_read(move |conn| -> Result<Vec<StoredPdu>, Error> {
             walk_prev_events(conn, &room_id, latest, &earliest, limit)
