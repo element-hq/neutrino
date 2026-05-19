@@ -9,7 +9,7 @@
 use std::collections::{HashSet, VecDeque};
 
 use async_trait::async_trait;
-use deadpool_sqlite::rusqlite::{Connection, OptionalExtension, params};
+use deadpool_sqlite::rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use neutrino_store::{DagStore, StorageError, StoredEvent, StoredPdu};
 use ruma::{EventId, OwnedEventId, RoomId};
 
@@ -124,6 +124,84 @@ fn walk_prev_events(
     Ok(results)
 }
 
+/// IN-clause chunk size used by [`validate_inputs`]. Stays well below
+/// `SQLITE_LIMIT_VARIABLE_NUMBER` on every SQLite build (the default is
+/// 999 pre-3.32, 32766 since), and small enough that the prepared-
+/// statement compile cost stays bounded even on pathological inputs.
+///
+/// Tests override to a tiny value so the chunk boundary is reachable
+/// from the test suite without persisting hundreds of events per case.
+#[cfg(not(test))]
+const VALIDATE_INPUTS_CHUNK: usize = 256;
+#[cfg(test)]
+const VALIDATE_INPUTS_CHUNK: usize = 4;
+
+/// Enforce the precondition documented on `DagStore::events_before` /
+/// `DagStore::missing_events`: `room_id` exists in `rooms`, and every ID
+/// in `event_ids` exists in `events`. Whether each event is in `room_id`
+/// is intentionally *not* checked here — the walk is scoped to `room_id`
+/// via [`hydrate_pdu`], so a cross-room seed naturally produces an empty
+/// result rather than an error. All queries share the read connection
+/// holding the snapshot the subsequent walk runs against, so a concurrent
+/// writer can't sneak rows out from under us between validate and walk.
+fn validate_inputs(
+    conn: &Connection,
+    room_id: &RoomId,
+    event_ids: &[&OwnedEventId],
+) -> Result<(), Error> {
+    let room_exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM rooms WHERE room_id = ?",
+            params![room_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if room_exists.is_none() {
+        return Err(Error::InvalidInput(format!(
+            "room {room_id} does not exist"
+        )));
+    }
+    if event_ids.is_empty() {
+        return Ok(());
+    }
+    // Dedupe before chunking so a caller passing the same ID in both
+    // `latest` and `earliest` (or any other duplication) doesn't
+    // multiply the round-trip count.
+    let unique: Vec<&str> = {
+        let mut set: HashSet<&str> = HashSet::with_capacity(event_ids.len());
+        for id in event_ids {
+            set.insert(id.as_str());
+        }
+        set.into_iter().collect()
+    };
+
+    let mut found: HashSet<String> = HashSet::with_capacity(unique.len());
+    for window in unique.chunks(VALIDATE_INPUTS_CHUNK) {
+        let placeholders = vec!["?"; window.len()].join(",");
+        let query =
+            format!("SELECT event_id FROM events WHERE event_id IN ({placeholders})");
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(params_from_iter(window.iter()), |row| {
+            row.get::<_, String>(0)
+        })?;
+        for row in rows {
+            found.insert(row?);
+        }
+    }
+
+    // Iterate the original input (not `unique`) so the error message
+    // reports the first missing ID in caller order, which is the most
+    // useful thing for the caller to see.
+    for id in event_ids {
+        if !found.contains(id.as_str()) {
+            return Err(Error::InvalidInput(format!(
+                "event {id} does not exist in the store"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl DagStore for SqliteStore {
     async fn events_before(
@@ -136,6 +214,8 @@ impl DagStore for SqliteStore {
         let from: Vec<OwnedEventId> = from.iter().map(|&e| e.to_owned()).collect();
 
         self.run_read(move |conn| -> Result<Vec<StoredPdu>, Error> {
+            let id_refs: Vec<&OwnedEventId> = from.iter().collect();
+            validate_inputs(conn, &room_id, &id_refs)?;
             walk_prev_events(conn, &room_id, from, &HashSet::new(), limit)
         })
         .await
@@ -150,10 +230,13 @@ impl DagStore for SqliteStore {
     ) -> Result<Vec<StoredPdu>, StorageError> {
         let room_id = room_id.to_owned();
         let latest: Vec<OwnedEventId> = latest.iter().map(|&e| e.to_owned()).collect();
-        let earliest: HashSet<OwnedEventId> = earliest.iter().map(|&e| e.to_owned()).collect();
+        let earliest: Vec<OwnedEventId> = earliest.iter().map(|&e| e.to_owned()).collect();
 
         self.run_read(move |conn| -> Result<Vec<StoredPdu>, Error> {
-            walk_prev_events(conn, &room_id, latest, &earliest, limit)
+            let id_refs: Vec<&OwnedEventId> = latest.iter().chain(earliest.iter()).collect();
+            validate_inputs(conn, &room_id, &id_refs)?;
+            let earliest_set: HashSet<OwnedEventId> = earliest.into_iter().collect();
+            walk_prev_events(conn, &room_id, latest, &earliest_set, limit)
         })
         .await
     }
@@ -163,7 +246,7 @@ impl DagStore for SqliteStore {
 mod tests {
     use lazy_static::lazy_static;
     use neutrino_store::{DagStore, EventStore, RoomStore};
-    use ruma::{EventId, RoomId, UserId, event_id, room_id, user_id};
+    use ruma::{EventId, OwnedEventId, RoomId, UserId, event_id, room_id, user_id};
 
     use crate::SqliteStore;
     use crate::tests::{create_event, message_with_prev, store};
@@ -776,5 +859,207 @@ mod tests {
             .await
             .unwrap();
         assert!(got.is_empty());
+    }
+
+    // D18: unknown room_id → InvalidInput on events_before.
+    #[tokio::test]
+    async fn events_before_unknown_room_returns_invalid_input() {
+        let s = store().await; // no rooms set up
+        let err = s
+            .events_before(*ALICE_ROOM_ID, &[], 10)
+            .await
+            .expect_err("unknown room must reject");
+        assert!(
+            matches!(err, neutrino_store::StorageError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+    }
+
+    // D19: seed ID that isn't in the events table → InvalidInput.
+    // Distinct from D5 (the federation-backfill case): in D5 the seed
+    // exists and only its `prev_events` are missing. Here the seed
+    // itself is bogus.
+    #[tokio::test]
+    async fn events_before_missing_seed_returns_invalid_input() {
+        let s = store_with_room().await;
+        let err = s
+            .events_before(*ALICE_ROOM_ID, &[event_id!("$nope:e")], 10)
+            .await
+            .expect_err("missing seed must reject");
+        assert!(
+            matches!(err, neutrino_store::StorageError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+    }
+
+    // D20: unknown room_id → InvalidInput on missing_events.
+    #[tokio::test]
+    async fn missing_events_unknown_room_returns_invalid_input() {
+        let s = store().await;
+        let err = s
+            .missing_events(*ALICE_ROOM_ID, &[], &[], 10)
+            .await
+            .expect_err("unknown room must reject");
+        assert!(
+            matches!(err, neutrino_store::StorageError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+    }
+
+    // D21: missing ID in `latest` → InvalidInput. The `earliest` slice
+    // is empty so this isolates the latest-side check.
+    #[tokio::test]
+    async fn missing_events_missing_latest_returns_invalid_input() {
+        let s = store_with_room().await;
+        let err = s
+            .missing_events(*ALICE_ROOM_ID, &[event_id!("$nope:e")], &[], 10)
+            .await
+            .expect_err("missing latest must reject");
+        assert!(
+            matches!(err, neutrino_store::StorageError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+    }
+
+    // D23: validator chunks the IN-clause. With VALIDATE_INPUTS_CHUNK=4
+    // under cfg(test), six inputs cross at least two chunks; all six
+    // resolve, so validation passes and the BFS runs normally. Catches
+    // a regression where the chunk loop only writes results from the
+    // last window into the `found` set (or only checks the first).
+    #[tokio::test]
+    async fn events_before_validates_inputs_in_chunks() {
+        let s = store_with_room().await;
+        let count = 6;
+        let owned_ids: Vec<OwnedEventId> = (0..count)
+            .map(|i| OwnedEventId::try_from(format!("$e{i}:e")).unwrap())
+            .collect();
+        for id in &owned_ids {
+            s.persist_event(
+                &message_with_prev(id, *ALICE_ROOM_ID, *ALICE_ID, "x", &[]),
+                &[],
+            )
+            .await
+            .unwrap();
+        }
+        let id_refs: Vec<&EventId> = owned_ids.iter().map(|id| id.as_ref()).collect();
+        let got = s
+            .events_before(*ALICE_ROOM_ID, &id_refs, 100)
+            .await
+            .unwrap();
+        // Each seed has no prev_events, so the result is just the seeds
+        // themselves — order doesn't matter, just cardinality.
+        assert_eq!(got.len(), count);
+    }
+
+    // D24: a missing ID anywhere across multiple chunks still produces
+    // InvalidInput. With CHUNK=4 and 6 inputs, the missing ID lands in
+    // some chunk depending on HashSet iteration order — the validator
+    // must aggregate `found` across chunks and only report a miss when
+    // *no* chunk surfaced the ID.
+    #[tokio::test]
+    async fn events_before_chunked_validation_rejects_missing() {
+        let s = store_with_room().await;
+        let count = 5;
+        let owned_ids: Vec<OwnedEventId> = (0..count)
+            .map(|i| OwnedEventId::try_from(format!("$e{i}:e")).unwrap())
+            .collect();
+        for id in &owned_ids {
+            s.persist_event(
+                &message_with_prev(id, *ALICE_ROOM_ID, *ALICE_ID, "x", &[]),
+                &[],
+            )
+            .await
+            .unwrap();
+        }
+        let fake = OwnedEventId::try_from("$nope:e".to_owned()).unwrap();
+        let mut all_ids: Vec<&EventId> = owned_ids.iter().map(|id| id.as_ref()).collect();
+        all_ids.push(fake.as_ref());
+
+        let err = s
+            .events_before(*ALICE_ROOM_ID, &all_ids, 100)
+            .await
+            .expect_err("missing seed must reject across chunks");
+        assert!(
+            matches!(err, neutrino_store::StorageError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+    }
+
+    // D22: missing ID in `earliest` → InvalidInput. `latest` resolves
+    // to a real event so the validation only fails on the earliest side.
+    #[tokio::test]
+    async fn missing_events_missing_earliest_returns_invalid_input() {
+        let s = store_with_room().await;
+        s.persist_event(
+            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_ID, "a", &[]),
+            &[],
+        )
+        .await
+        .unwrap();
+        let err = s
+            .missing_events(
+                *ALICE_ROOM_ID,
+                &[event_id!("$a:e")],
+                &[event_id!("$nope:e")],
+                10,
+            )
+            .await
+            .expect_err("missing earliest must reject");
+        assert!(
+            matches!(err, neutrino_store::StorageError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+    }
+
+    // D17: multi-seed `latest` mirrors D12 for missing_events. The
+    // `earliest` set is empty so the result must match the events_before
+    // shape exactly — same interleaved BFS order from both seeds.
+    #[tokio::test]
+    async fn missing_events_handles_multiple_latest() {
+        let s = store_with_room().await;
+        for id in [event_id!("$a:e"), event_id!("$b:e")] {
+            s.persist_event(
+                &message_with_prev(id, *ALICE_ROOM_ID, *ALICE_ID, "x", &[]),
+                &[],
+            )
+            .await
+            .unwrap();
+        }
+        s.persist_event(
+            &message_with_prev(
+                event_id!("$c:e"),
+                *ALICE_ROOM_ID,
+                *ALICE_ID,
+                "c",
+                &[event_id!("$a:e")],
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+        s.persist_event(
+            &message_with_prev(
+                event_id!("$d:e"),
+                *ALICE_ROOM_ID,
+                *ALICE_ID,
+                "d",
+                &[event_id!("$b:e")],
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let got = s
+            .missing_events(
+                *ALICE_ROOM_ID,
+                &[event_id!("$c:e"), event_id!("$d:e")],
+                &[],
+                10,
+            )
+            .await
+            .unwrap();
+        let ids: Vec<&str> = got.iter().map(|p| p.event.event_id.as_str()).collect();
+        assert_eq!(ids, ["$c:e", "$d:e", "$a:e", "$b:e"]);
     }
 }
