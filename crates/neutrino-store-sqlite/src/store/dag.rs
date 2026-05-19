@@ -27,15 +27,17 @@ use crate::{
 /// or callers passing event IDs from the wrong room).
 fn hydrate_pdu(
     conn: &Connection,
-    event_id: &str,
-    room_id: &str,
+    event_id: &EventId,
+    room_id: &RoomId,
 ) -> Result<Option<StoredPdu>, Error> {
     let query =
         format!("SELECT {EVENT_COLUMNS} FROM events WHERE event_id = ? AND room_id = ?");
     let event_result: Option<Result<StoredEvent, Error>> = conn
-        .query_row(&query, params![event_id, room_id], |row| {
-            Ok(EventRow::try_from(row).map(EventRow::into_event))
-        })
+        .query_row(
+            &query,
+            params![event_id.as_str(), room_id.as_str()],
+            |row| Ok(EventRow::try_from(row).map(EventRow::into_event)),
+        )
         .optional()?;
 
     let Some(inner) = event_result else {
@@ -55,14 +57,14 @@ fn hydrate_pdu(
 
 fn fetch_edges(
     conn: &Connection,
-    child_event_id: &str,
+    child_event_id: &EventId,
     edge_type: &str,
 ) -> Result<Vec<OwnedEventId>, Error> {
     let mut stmt = conn.prepare(
         "SELECT parent_event_id FROM event_edges \
          WHERE child_event_id = ? AND edge_type = ?",
     )?;
-    let rows = stmt.query_map(params![child_event_id, edge_type], |row| {
+    let rows = stmt.query_map(params![child_event_id.as_str(), edge_type], |row| {
         row.get::<_, String>(0)
     })?;
     let mut out = Vec::new();
@@ -84,13 +86,13 @@ fn fetch_edges(
 /// (reverse-chronological).
 fn walk_prev_events(
     conn: &Connection,
-    room_id: &str,
-    start: Vec<String>,
-    excluded: &HashSet<String>,
+    room_id: &RoomId,
+    start: Vec<OwnedEventId>,
+    excluded: &HashSet<OwnedEventId>,
     limit: usize,
 ) -> Result<Vec<StoredPdu>, Error> {
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut frontier: VecDeque<String> = start.into_iter().collect();
+    let mut visited: HashSet<OwnedEventId> = HashSet::new();
+    let mut frontier: VecDeque<OwnedEventId> = start.into_iter().collect();
     let mut results = Vec::new();
 
     while let Some(id) = frontier.pop_front() {
@@ -109,7 +111,7 @@ fn walk_prev_events(
             continue;
         };
         for parent in &pdu.prev_events {
-            frontier.push_back(parent.as_str().to_owned());
+            frontier.push_back(parent.clone());
         }
         results.push(pdu);
     }
@@ -124,8 +126,8 @@ impl DagStore for SqliteStore {
         from: &[&EventId],
         limit: usize,
     ) -> Result<Vec<StoredPdu>, StorageError> {
-        let room_id = room_id.as_str().to_owned();
-        let from: Vec<String> = from.iter().map(|e| e.as_str().to_owned()).collect();
+        let room_id = room_id.to_owned();
+        let from: Vec<OwnedEventId> = from.iter().map(|&e| e.to_owned()).collect();
 
         self.run_read(move |conn| -> Result<Vec<StoredPdu>, Error> {
             walk_prev_events(conn, &room_id, from, &HashSet::new(), limit)
@@ -140,9 +142,10 @@ impl DagStore for SqliteStore {
         earliest: &[&EventId],
         limit: usize,
     ) -> Result<Vec<StoredPdu>, StorageError> {
-        let room_id = room_id.as_str().to_owned();
-        let latest: Vec<String> = latest.iter().map(|e| e.as_str().to_owned()).collect();
-        let earliest: HashSet<String> = earliest.iter().map(|e| e.as_str().to_owned()).collect();
+        let room_id = room_id.to_owned();
+        let latest: Vec<OwnedEventId> = latest.iter().map(|&e| e.to_owned()).collect();
+        let earliest: HashSet<OwnedEventId> =
+            earliest.iter().map(|&e| e.to_owned()).collect();
 
         self.run_read(move |conn| -> Result<Vec<StoredPdu>, Error> {
             walk_prev_events(conn, &room_id, latest, &earliest, limit)
