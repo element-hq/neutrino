@@ -132,13 +132,25 @@ See `PLAN.md` for the live checkboxes. Order:
 
 0. **types** — `RoomVersion::V12`, `StateMap`, `Event`, `FormatError`,
    `AuthError`, `CoreError`. **Done.**
-1. **format validation** — pure fn over `Event`. Variants of
-   `FormatError` added here as needed.
+1a. **format validation** — `validate::parse_event`. Pure-JSON wire
+    format only, no I/O. **Done.**
+1b. **reference validation** — `validate::validate_references(event,
+    provider)`. Existential checks that need provider lookups:
+    - v12 rule 2: room_id corresponds to an accepted `m.room.create`
+      event.
+    - MSC4242 prev_state_events triad: each entry must exist, belong to
+      the same room, have a `state_key`, and not be rejected.
+    Lives in the `validate` module — orchestration (Phase 6) only
+    *calls* it. **Done** — a minimal `StateProvider` trait (`get_event`)
+    was introduced up front to land this without waiting on Phase 5;
+    Phase 5 will extend the same trait with state-after lookups,
+    auth-chain difference, and power-level auth ancestor.
 2. **auth events selection** — pure fn
    `expected_auth_events(event, state) -> Vec<OwnedEventId>`.
 3. **auth rules v12** — pure fn
    `check_auth_rules(event, state, room_version) -> Result<(), AuthError>`.
-   Uses #2 for rule 3.2. Variants of `AuthError` added here.
+   Rule 4 onwards (rule 2 moves to 1b — it's existential, not auth).
+   Variants of `AuthError` added here.
 4a. **separate + auth_chain_difference** — port `_separate` and
     `_get_auth_chain_difference` from synapse `state/v2.py`. Include the
     v2.1 conflicted subgraph.
@@ -153,8 +165,10 @@ See `PLAN.md` for the live checkboxes. Order:
     `resolve_state(state_sets, &dyn StateProvider) -> StateMap`.
 5. **in-memory StateProvider** — HashMap-backed. Pure CPU. Enables
    end-to-end testing without storage.
-6. **`RoomCore::apply`** — full orchestration. End: testable
-   "given events E1..En, resolved current state = X".
+6. **`RoomCore::apply`** — full orchestration. Calls:
+   1a → 1b → state-res → 3 → update → effects. Never implements
+   validation itself. End: testable "given events E1..En, resolved
+   current state = X".
 
 ## Phase 1 hints (v12-specific format checks to land here)
 

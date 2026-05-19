@@ -36,14 +36,15 @@
     - cannibalise existing neutrino-sqlite crate, then prompt user to clean crate up
 - [ ] Room state machine (v12 auth + state-res v2.1, MSC4242)
     - [x] Phase 0: types (`neutrino-state` crate: `RoomVersion`, `Event`, `StateMap`, `FormatError`, `AuthError`, `CoreError`)
-    - [ ] Phase 1: format validation
+    - [x] Phase 1a: format validation (`validate::parse_event`, 40 tests)
+    - [x] Phase 1b: reference validation (`validate::validate_references`, 10 tests). Introduced a minimal `StateProvider` trait (one method, `get_event`) ahead of Phase 5 so 1b could land independently.
     - [ ] Phase 2: auth events selection
-    - [ ] Phase 3: auth rules v12
+    - [ ] Phase 3: auth rules v12 (rule 4 onwards; rule 2 moves to Phase 1b)
     - [ ] Phase 4a: separate + auth_chain_difference
     - [ ] Phase 4b: reverse-topo power sort + IAC pass 1
     - [ ] Phase 4c: mainline + IAC pass 2 + unconflicted merge → `resolve_state`
     - [ ] Phase 5: in-memory `StateProvider`
-    - [ ] Phase 6: `RoomCore::apply`
+    - [ ] Phase 6: `RoomCore::apply` (orchestrates: 1a → 1b → state-res → 3 → update → effects)
 - [ ] Client-Server Sliding Sync MSC4186 implementation
     - Does not need to be performant as it’s all local to the device.
 - [ ] Client-Server write endpoints (PUT/POST) implementation
@@ -91,3 +92,9 @@ Decided to use Claude.
 2026-05-13: StorageBackend extended to six sub-traits. EventStore gains get_client_txn/record_client_txn for CSAPI txnId deduplication across restarts. New FederationInbox sub-trait with record_federation_txn(origin, txn_id) for inbound federation txnId deduplication (returns true if already seen). DagStore::missing_events drops min_depth parameter — depth tracking not implemented. Backfill cursor is implicit: derive frontier from events whose prev_events reference IDs absent from the store; no explicit cursor storage needed. Room IDs must be derived from the reference hash of the create event (room version 12), not randomly generated. Outbox startup wiring (enumerate pending_destinations on boot, spawn sender per destination) goes in neutrino-main.
 
 2026-05-19: Room state machine lives in a new `neutrino-state` crate (deps: ruma, serde, serde_json, thiserror — no async, no tokio). `StateProvider` will be a sync trait. Provider returns **state-before-event** (the new event sits on top of state-before; state-after doesn't expose that hinge). `prev_state_events` (MSC4242) is read directly off the event, not via the provider. State groups deferred. Soft-fail does not gate current-state updates (matches Synapse: `_check_for_soft_fail` only sets the flag; state-res runs over the DAG unaware of it; the flag gates client relay and `_get_prevs_before_rejected` only). Phase order: 0 types → 1 format → 2 auth_events selection → 3 auth rules → 4a separate+auth_chain_diff → 4b reverse-topo+IAC1 → 4c mainline+IAC2+merge → 5 in-memory provider → 6 RoomCore::apply. IAC pass 1 starts from **empty** state per v12 (not unconflicted).
+
+2026-05-19: MSC4242 removes `auth_events` from the wire (events carry `prev_state_events` instead). Servers calculate `auth_events` server-side from state-before via the selection algorithm. State-res algorithm itself is unchanged from synapse `state/v2.py`; only the input source changes (calculated, not on-wire). `Event` struct does not carry `auth_events`. Phase 1 rejects any incoming event that includes `auth_events` on the wire (cross-ref synapse `events/__init__.py` `assert "auth_events" not in event_dict`). `signatures` field is ignored entirely (trusted-network policy). `hashes` field is required and shape-validated even though we don't verify the values (content hashes are independent of signatures/keys). v12 rule 5.8 (membership ∈ {join,leave,invite,ban,knock}) lives in Phase 3's switch/case, not as an upfront assertion in Phase 1, to avoid sync drift between the assertion and the per-arm handlers. Room ID for `m.room.create` events is derived inline from the caller-provided `event_id` via `$ → !` sigil swap; full reference-hash event_id computation is out of Phase 1 scope.
+
+2026-05-19: Phase 1 split into 1a (pure-JSON wire format) and 1b (referential validation). 1b is `validate::validate_references(event, provider)` and owns: v12 rule 2 (room_id corresponds to an accepted create event) and the MSC4242 `prev_state_events` triad (same-room, has-state-key, not-rejected). Rule 2 moves out of Phase 3 — it's existential, not authorisation. Phase 3 keeps rule 4+ (rules that make decisions on content, not just existence). `apply` orchestration calls 1a → 1b → state-res → 3, never implements validation itself. 1b initially looked blocked on Phase 5 (no provider yet), but was unblocked by introducing a minimal `StateProvider` trait (one method, `get_event`) up front; both 1a and 1b are complete.
+
+2026-05-19: `StateProvider` trait introduced in `neutrino-state/src/provider.rs` ahead of Phase 5 to unblock Phase 1b. Today it carries one method: `get_event(id) -> Option<EventInfo>` where `EventInfo { event: Arc<Event>, rejected: bool }`. The trait grows as later phases land (state-after lookups, auth-chain difference, power-level auth ancestor). Rejection is bundled into `EventInfo` rather than a separate `is_rejected` call to keep lookups single-shot. `ReferenceError` lives in `lib.rs` as a sibling of `FormatError`/`AuthError` (not folded into FormatError — different failure mode: provider lookup vs. wire shape). Create events bypass `validate_references` entirely (no room_id, no prev_state_events to check).
