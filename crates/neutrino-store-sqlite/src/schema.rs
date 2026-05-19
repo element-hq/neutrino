@@ -42,14 +42,28 @@ pub(crate) fn ensure_schema(conn: &mut Connection) -> Result<(), Error> {
 ///
 /// `journal_mode = WAL` is NOT applied here — it's persisted in the DB
 /// file and only needs setting once at open time (via `schema.sql`).
-pub(crate) fn apply_connection_pragmas(conn: &Connection) -> Result<(), Error> {
+///
+/// `query_only` flips between reader (ON) and writer (OFF) per the
+/// read/write pool split doc §1 — runtime enforcement that a mis-routed
+/// write on a reader connection fails fast with `SQLITE_READONLY`.
+pub(crate) fn apply_connection_pragmas(conn: &Connection, query_only: bool) -> Result<(), Error> {
+    // Tuning values (journal_size_limit / mmap_size / cache_size) adapted
+    // from https://fractaledmind.com/2023/09/07/enhancing-rails-sqlite-fine-tuning/
+    // — embedded workload so values are conservative; revisit if profiling
+    // shows memory pressure or page-cache thrash.
     conn.execute_batch(
         "
-        PRAGMA foreign_keys   = ON;
-        PRAGMA synchronous    = NORMAL;
-        PRAGMA busy_timeout   = 5000;
-        PRAGMA trusted_schema = OFF;
+        PRAGMA foreign_keys       = ON;
+        PRAGMA synchronous        = NORMAL;
+        PRAGMA busy_timeout       = 5000;
+        PRAGMA trusted_schema     = OFF;
+        PRAGMA journal_size_limit = 67108864;
+        PRAGMA mmap_size          = 134217728;
+        PRAGMA cache_size         = 2000;
         ",
     )?;
+    if query_only {
+        conn.execute_batch("PRAGMA query_only = ON;")?;
+    }
     Ok(())
 }
