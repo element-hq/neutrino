@@ -178,8 +178,7 @@ fn validate_inputs(
     let mut found: HashSet<String> = HashSet::with_capacity(unique.len());
     for window in unique.chunks(VALIDATE_INPUTS_CHUNK) {
         let placeholders = vec!["?"; window.len()].join(",");
-        let query =
-            format!("SELECT event_id FROM events WHERE event_id IN ({placeholders})");
+        let query = format!("SELECT event_id FROM events WHERE event_id IN ({placeholders})");
         let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map(params_from_iter(window.iter()), |row| {
             row.get::<_, String>(0)
@@ -661,11 +660,7 @@ mod tests {
         .unwrap();
 
         let got = s
-            .events_before(
-                *ALICE_ROOM_ID,
-                &[event_id!("$c:e"), event_id!("$d:e")],
-                10,
-            )
+            .events_before(*ALICE_ROOM_ID, &[event_id!("$c:e"), event_id!("$d:e")], 10)
             .await
             .unwrap();
         let ids: Vec<&str> = got.iter().map(|p| p.event.event_id.as_str()).collect();
@@ -835,8 +830,7 @@ mod tests {
         assert_eq!(got.len(), 1);
         let pdu = &got[0];
         let prev_ids: Vec<&str> = pdu.prev_events.iter().map(|e| e.as_str()).collect();
-        let prev_state_ids: Vec<&str> =
-            pdu.prev_state_events.iter().map(|e| e.as_str()).collect();
+        let prev_state_ids: Vec<&str> = pdu.prev_state_events.iter().map(|e| e.as_str()).collect();
         assert_eq!(prev_ids, ["$create:e"]);
         assert_eq!(prev_state_ids, ["$create:e"]);
     }
