@@ -972,6 +972,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "neutrino-state"
+version = "0.1.0"
+dependencies = [
+ "ruma",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "neutrino-store"
 version = "0.1.0"
 dependencies = [

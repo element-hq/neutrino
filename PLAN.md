@@ -34,6 +34,16 @@
     - multiple developers will be relying on this not changing (one to implement the interface, the other using it). If it later turns out that the trait needs to change, prompt and add decision log immediately.
 - [ ] SQLite storage backend implementation
     - cannibalise existing neutrino-sqlite crate, then prompt user to clean crate up
+- [ ] Room state machine (v12 auth + state-res v2.1, MSC4242)
+    - [x] Phase 0: types (`neutrino-state` crate: `RoomVersion`, `Event`, `StateMap`, `FormatError`, `AuthError`, `CoreError`)
+    - [ ] Phase 1: format validation
+    - [ ] Phase 2: auth events selection
+    - [ ] Phase 3: auth rules v12
+    - [ ] Phase 4a: separate + auth_chain_difference
+    - [ ] Phase 4b: reverse-topo power sort + IAC pass 1
+    - [ ] Phase 4c: mainline + IAC pass 2 + unconflicted merge → `resolve_state`
+    - [ ] Phase 5: in-memory `StateProvider`
+    - [ ] Phase 6: `RoomCore::apply`
 - [ ] Client-Server Sliding Sync MSC4186 implementation
     - Does not need to be performant as it’s all local to the device.
 - [ ] Client-Server write endpoints (PUT/POST) implementation
@@ -79,3 +89,5 @@ Decided to use Claude.
 2026-05-12: StorageBackend split into five sub-traits (RoomStore, EventStore, StateStore, DagStore, FederationOutbox) combined via a StorageBackend supertrait. StoredEvent pre-parses event_id, room_id, event_type, state_key, sender, origin_server_ts alongside raw JSON. StoredPdu extends this with prev_events and prev_state_events (MSC4242). Traits live in neutrino-common::storage. Usage pattern is generic bounds (S: StorageBackend), not dyn StorageBackend. insert_events replaced with persist_event(event, destinations) for atomic event+outbox write. create_room takes all initial events atomically. EventStore::subscribe() returns a watch::Receiver<StreamPos> for push-based sync and federation wakeup (subscribe before querying to avoid TOCTOU). StateStore gains joined_rooms(user_id) and joined_members(room_id) with membership=join filtering.
 
 2026-05-13: StorageBackend extended to six sub-traits. EventStore gains get_client_txn/record_client_txn for CSAPI txnId deduplication across restarts. New FederationInbox sub-trait with record_federation_txn(origin, txn_id) for inbound federation txnId deduplication (returns true if already seen). DagStore::missing_events drops min_depth parameter — depth tracking not implemented. Backfill cursor is implicit: derive frontier from events whose prev_events reference IDs absent from the store; no explicit cursor storage needed. Room IDs must be derived from the reference hash of the create event (room version 12), not randomly generated. Outbox startup wiring (enumerate pending_destinations on boot, spawn sender per destination) goes in neutrino-main.
+
+2026-05-19: Room state machine lives in a new `neutrino-state` crate (deps: ruma, serde, serde_json, thiserror — no async, no tokio). `StateProvider` will be a sync trait. Provider returns **state-before-event** (the new event sits on top of state-before; state-after doesn't expose that hinge). `prev_state_events` (MSC4242) is read directly off the event, not via the provider. State groups deferred. Soft-fail does not gate current-state updates (matches Synapse: `_check_for_soft_fail` only sets the flag; state-res runs over the DAG unaware of it; the flag gates client relay and `_get_prevs_before_rejected` only). Phase order: 0 types → 1 format → 2 auth_events selection → 3 auth rules → 4a separate+auth_chain_diff → 4b reverse-topo+IAC1 → 4c mainline+IAC2+merge → 5 in-memory provider → 6 RoomCore::apply. IAC pass 1 starts from **empty** state per v12 (not unconflicted).
