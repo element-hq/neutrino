@@ -17,6 +17,27 @@ impl RoomStore for SqliteStore {
         create_event: &StoredEvent,
         initial_events: &[StoredEvent],
     ) -> Result<(), StorageError> {
+        // The schema is structurally agnostic to which (event_type,
+        // state_key) lands in `events` / `current_state`. A non-create
+        // or wrong-state-key event would still INSERT cleanly but leave
+        // the room without a proper `("m.room.create", "")` state row —
+        // silent corruption that downstream auth / state resolution
+        // assumes can't happen. Fail fast at the trait boundary.
+        if create_event.event_type != "m.room.create" {
+            return Err(Error::InvalidInput(format!(
+                "create_event has event_type {:?}, expected \"m.room.create\"",
+                create_event.event_type
+            ))
+            .into());
+        }
+        if create_event.state_key.as_deref() != Some("") {
+            return Err(Error::InvalidInput(format!(
+                "create_event state_key must be Some(\"\"), got {:?}",
+                create_event.state_key
+            ))
+            .into());
+        }
+
         // Pull `content.room_version` out of the create event JSON before
         // crossing the closure boundary. Caller-supplied JSON, so a
         // missing/malformed field is `InvalidInput`. Round-trip through
@@ -288,6 +309,60 @@ mod tests {
         let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
         store.create_room(&ce, &[]).await.unwrap();
         assert_eq!(store.room_count().await.unwrap(), 1);
+    }
+
+    // R6: event_type must be exactly "m.room.create". Schema doesn't
+    // constrain which event_type lands as the create event, so this is
+    // enforced at the trait boundary.
+    #[tokio::test]
+    async fn create_room_rejects_wrong_event_type() {
+        let store = store().await;
+        let bad = make_event(
+            event_id!("$c1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "m.room.member",
+            Some(""),
+            json!({"creator": ALICE_ID.as_str(), "room_version": "12"}),
+        );
+        let result = store.create_room(&bad, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+        assert_eq!(store.room_count().await.unwrap(), 0);
+    }
+
+    // R7a: state_key = None is rejected — v12 m.room.create must have
+    // an empty-string state key, not a missing one.
+    #[tokio::test]
+    async fn create_room_rejects_none_state_key() {
+        let store = store().await;
+        let bad = make_event(
+            event_id!("$c1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "m.room.create",
+            None,
+            json!({"creator": ALICE_ID.as_str(), "room_version": "12"}),
+        );
+        let result = store.create_room(&bad, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+        assert_eq!(store.room_count().await.unwrap(), 0);
+    }
+
+    // R7b: non-empty state_key is rejected.
+    #[tokio::test]
+    async fn create_room_rejects_nonempty_state_key() {
+        let store = store().await;
+        let bad = make_event(
+            event_id!("$c1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "m.room.create",
+            Some("not-empty"),
+            json!({"creator": ALICE_ID.as_str(), "room_version": "12"}),
+        );
+        let result = store.create_room(&bad, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+        assert_eq!(store.room_count().await.unwrap(), 0);
     }
 
     // R12: success path — `create_room` with a valid create event plus
