@@ -140,11 +140,27 @@ impl<'a> EventRow<'a> {
         let cracked: CrackedEvent = serde_json::from_str(self.json.get())
             .map_err(|e| Error::InvalidInput(format!("event json: {e}")))?;
 
-        // Filter `membership` to member events only — the schema's
-        // `CHECK(membership IS NULL OR …)` allows the value on any state
-        // row, but semantically it only belongs to `m.room.member`.
+        // `membership` is non-NULL exactly for `m.room.member` rows per
+        // the schema comment; that invariant is what makes
+        // `joined_members` / `joined_rooms` filterable via the partial
+        // indexes. If a member event arrives without
+        // `content.membership` *or* without a `state_key` (the user_id),
+        // writing it would either leave `current_state.membership` NULL
+        // (invisible to member filters) or skip the `current_state`
+        // upsert entirely — both silently break the invariant. Reject
+        // at the write boundary instead.
         let membership = if self.event_type == "m.room.member" {
-            cracked.content.membership.as_deref()
+            let m = cracked.content.membership.as_deref().ok_or_else(|| {
+                Error::InvalidInput(
+                    "m.room.member event missing content.membership".into(),
+                )
+            })?;
+            if self.state_key.is_none() {
+                return Err(Error::InvalidInput(
+                    "m.room.member event missing state_key".into(),
+                ));
+            }
+            Some(m)
         } else {
             None
         };
