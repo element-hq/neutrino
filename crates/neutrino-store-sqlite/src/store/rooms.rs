@@ -144,11 +144,13 @@ impl RoomStore for SqliteStore {
 
 #[cfg(test)]
 mod tests {
+    use deadpool_sqlite::rusqlite::params;
     use lazy_static::lazy_static;
     use neutrino_store::{EventStore, RoomStore, StorageError, StreamPos};
     use ruma::{RoomId, RoomVersionId, UserId, event_id, room_id, user_id};
     use serde_json::json;
 
+    use crate::error::Error;
     use crate::tests::{create_event, make_event, member_join, store};
 
     // ruma's `room_id!` / `user_id!` aren't const-fn, so `const` is out
@@ -400,5 +402,265 @@ mod tests {
             stream.iter().map(|(_, e)| e.event_id.as_str()).collect();
         assert!(stream_ids.contains("$c1:example.com"));
         assert!(stream_ids.contains("$m1:example.com"));
+    }
+
+    // R13: atomic rollback on mid-batch failure. A bad initial event
+    // (membership value the `current_state` CHECK rejects) fires inside
+    // the transaction *after* the rooms INSERT, the create event, and
+    // an earlier good initial event have already executed. Every one of
+    // those must be rolled back — the whole point of the single-txn
+    // contract.
+    #[tokio::test]
+    async fn create_room_rolls_back_on_mid_batch_failure() {
+        let store = store().await;
+        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        let good = member_join(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        // `current_state.membership` CHECK rejects anything outside the
+        // enum, so this fails the upsert from inside `write_into_tx`.
+        let bad = make_event(
+            event_id!("$m2:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "m.room.member",
+            Some(ALICE_ID.as_str()),
+            json!({"membership": "garbage"}),
+        );
+
+        let result = store.create_room(&ce, &[good, bad]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+
+        // No room, no events, no current_state survived.
+        assert_eq!(store.room_count().await.unwrap(), 0);
+        let stream = store.events_after(StreamPos(0), 100).await.unwrap();
+        assert!(stream.is_empty(), "events table not rolled back");
+        let cs_count: i64 = store
+            .run_read(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM current_state", [], |r| r.get(0))
+                    .map_err(Error::from)
+            })
+            .await
+            .unwrap();
+        assert_eq!(cs_count, 0, "current_state not rolled back");
+    }
+
+    // R14: subscribe-before-create receives the watch advance. Exercises
+    // the "one watch advance for the whole batch" path. Receiver value
+    // after the call must equal the last event's `stream_pos`.
+    #[tokio::test]
+    async fn create_room_advances_subscribe_watch() {
+        let store = store().await;
+        let mut rx = store.subscribe();
+        let initial = *rx.borrow_and_update();
+        assert_eq!(initial, StreamPos(0));
+
+        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        let m1 = member_join(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        store.create_room(&ce, &[m1]).await.unwrap();
+
+        // Two events written → AUTOINCREMENT assigned stream_pos 1 and 2;
+        // the batch advance carries the final pos.
+        assert_eq!(*rx.borrow(), StreamPos(2));
+        assert!(rx.has_changed().unwrap());
+    }
+
+    // R15: a failed `create_room` must NOT advance the watch. The notify
+    // call sits after `tx.commit()?` so this is structurally safe, but
+    // the regression test guards against someone moving the notify
+    // earlier.
+    #[tokio::test]
+    async fn create_room_does_not_advance_watch_on_failure() {
+        let store = store().await;
+        let mut rx = store.subscribe();
+        let initial = *rx.borrow_and_update();
+
+        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        let bad = make_event(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "m.room.member",
+            Some(ALICE_ID.as_str()),
+            json!({"membership": "garbage"}),
+        );
+        let result = store.create_room(&ce, &[bad]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+
+        assert_eq!(*rx.borrow(), initial);
+        assert!(!rx.has_changed().unwrap());
+    }
+
+    // R16: every initial state event lands in `current_state`. Trait
+    // postcondition: "current state reflects all initial state events."
+    // StateStore is not yet implemented on `SqliteStore`, so this test
+    // reads `current_state` directly rather than going through the
+    // (stubbed) trait surface.
+    #[tokio::test]
+    async fn create_room_persists_initial_state_to_current_state() {
+        let store = store().await;
+        let ce_id = event_id!("$c1:example.com");
+        let m_id = event_id!("$m1:example.com");
+        let ce = create_event(ce_id, *ALICE_ROOM_ID, *ALICE_ID);
+        let m = member_join(m_id, *ALICE_ROOM_ID, *ALICE_ID);
+        store.create_room(&ce, &[m]).await.unwrap();
+
+        let room = ALICE_ROOM_ID.to_owned();
+        let user = ALICE_ID.to_owned();
+        let rows: Vec<(String, String, String, Option<String>)> = store
+            .run_read(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT event_type, state_key, event_id, membership \
+                     FROM current_state WHERE room_id = ?",
+                )?;
+                let rows = stmt
+                    .query_map(params![room.as_str()], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok::<_, Error>(rows)
+            })
+            .await
+            .unwrap();
+
+        // Create event lands as ("m.room.create", "") → membership NULL.
+        // Member event lands as ("m.room.member", "<alice>") → "join".
+        let mut by_key: std::collections::HashMap<(String, String), (String, Option<String>)> =
+            rows.into_iter()
+                .map(|(t, sk, eid, m)| ((t, sk), (eid, m)))
+                .collect();
+        let create_row = by_key
+            .remove(&("m.room.create".into(), "".into()))
+            .expect("create state row missing");
+        assert_eq!(create_row.0, "$c1:example.com");
+        assert_eq!(create_row.1, None);
+        let member_row = by_key
+            .remove(&("m.room.member".into(), user.as_str().to_owned()))
+            .expect("member state row missing");
+        assert_eq!(member_row.0, "$m1:example.com");
+        assert_eq!(member_row.1.as_deref(), Some("join"));
+    }
+
+    // R17: `create_room` must not create outbox entries — there are no
+    // remote members on a fresh room. FederationOutbox isn't implemented
+    // yet, so query the outbox table directly.
+    #[tokio::test]
+    async fn create_room_creates_no_outbox_entries() {
+        let store = store().await;
+        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        let m = member_join(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        store.create_room(&ce, &[m]).await.unwrap();
+
+        let outbox_count: i64 = store
+            .run_read(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0))
+                    .map_err(Error::from)
+            })
+            .await
+            .unwrap();
+        assert_eq!(outbox_count, 0);
+    }
+
+    // R18: initial_events land in `events` in input order and that order
+    // is the ascending `stream_pos` order. The contract for `events_after`
+    // is "ascending stream order"; this asserts that ordering matches
+    // the input slice for the create-room batch.
+    #[tokio::test]
+    async fn create_room_preserves_initial_events_stream_order() {
+        let store = store().await;
+        let ce_id = event_id!("$c1:example.com");
+        let e1_id = event_id!("$m1:example.com");
+        let e2_id = event_id!("$n1:example.com");
+        let e3_id = event_id!("$m2:example.com");
+        let ce = create_event(ce_id, *ALICE_ROOM_ID, *ALICE_ID);
+        let e1 = member_join(e1_id, *ALICE_ROOM_ID, *ALICE_ID);
+        let e2 = make_event(
+            e2_id,
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "m.room.name",
+            Some(""),
+            json!({"name": "Test"}),
+        );
+        let e3 = make_event(
+            e3_id,
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "m.room.member",
+            Some("@bob:example.com"),
+            json!({"membership": "join"}),
+        );
+        store.create_room(&ce, &[e1, e2, e3]).await.unwrap();
+
+        let stream = store.events_after(StreamPos(0), 100).await.unwrap();
+        let ids: Vec<&str> = stream.iter().map(|(_, e)| e.event_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "$c1:example.com",
+                "$m1:example.com",
+                "$n1:example.com",
+                "$m2:example.com"
+            ]
+        );
+        // And the stream positions are strictly ascending.
+        let positions: Vec<StreamPos> = stream.iter().map(|(p, _)| *p).collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    // R19: duplicate event_id within the `initial_events` batch is
+    // rejected (UNIQUE on events.event_id) and the whole batch rolls
+    // back. Covers both the rejection (InvalidInput) and the atomicity.
+    #[tokio::test]
+    async fn create_room_rejects_duplicate_event_id_in_batch() {
+        let store = store().await;
+        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        let dup_id = event_id!("$dup:example.com");
+        let e1 = member_join(dup_id, *ALICE_ROOM_ID, *ALICE_ID);
+        let e2 = make_event(
+            dup_id,
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "m.room.name",
+            Some(""),
+            json!({"name": "Collide"}),
+        );
+        let result = store.create_room(&ce, &[e1, e2]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+
+        assert_eq!(store.room_count().await.unwrap(), 0);
+        let stream = store.events_after(StreamPos(0), 100).await.unwrap();
+        assert!(stream.is_empty());
+    }
+
+    // R20: malformed `room_version` in a DB row surfaces from
+    // `get_room_version` as `Internal`, not `InvalidInput`. The schema
+    // doesn't `CHECK` the column, so a future bug or manual SQL edit
+    // could put garbage there; this asserts the mapping. Bypasses
+    // `create_room`'s validation gate by overwriting after a successful
+    // create.
+    #[tokio::test]
+    async fn get_room_version_internal_for_malformed_db_row() {
+        let store = store().await;
+        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
+        store.create_room(&ce, &[]).await.unwrap();
+
+        let room = ALICE_ROOM_ID.to_owned();
+        store
+            .run_write(move |conn| -> Result<(), Error> {
+                conn.execute(
+                    "UPDATE rooms SET room_version = ? WHERE room_id = ?",
+                    params!["", room.as_str()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let result = store.get_room_version(*ALICE_ROOM_ID).await;
+        assert!(matches!(result, Err(StorageError::Internal(_))));
     }
 }
