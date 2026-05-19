@@ -154,7 +154,10 @@ impl EventStore for SqliteStore {
                 let mut out = Vec::new();
                 for r in rows {
                     let (sp, ev) = r?;
-                    out.push((StreamPos(sp as u64), ev?.into_event()));
+                    let sp = u64::try_from(sp).map_err(|_| {
+                        Error::Internal(format!("Invalid negative stream_pos {sp} in events table"))
+                    })?;
+                    out.push((StreamPos(sp), ev?.into_event()));
                 }
                 Ok(out)
             },
@@ -259,7 +262,15 @@ impl EventStore for SqliteStore {
                 // exists. A "full but final" page (events.len() == limit
                 // with no overflow row) terminates the stream cleanly.
                 let next = if overflow_seen {
-                    last_in_page.map(|p| PaginationToken(p as u64))
+                    match last_in_page {
+                        Some(p) => Some(PaginationToken(u64::try_from(p).map_err(|_| {
+                            Error::Internal(format!(
+                                "negative stream_pos encountered while building pagination token: {}",
+                                p
+                            ))
+                        })?)),
+                        None => None,
+                    }
                 } else {
                     None
                 };
