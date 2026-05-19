@@ -686,7 +686,12 @@ mod tests {
     async fn room_messages_zero_limit_returns_empty() {
         let s = store_with_room().await;
         s.persist_event(
-            &message(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "hi"),
+            &message(
+                event_id!("$m1:example.com"),
+                *ALICE_ROOM_ID,
+                *ALICE_ID,
+                "hi",
+            ),
             &[],
         )
         .await
