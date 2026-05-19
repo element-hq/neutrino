@@ -1,5 +1,6 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 //! SQLite implementation of the `neutrino-store::StorageBackend` trait.
 //!
@@ -16,9 +17,12 @@ use neutrino_store::{StorageError, StreamPos};
 use tokio::sync::watch;
 
 mod error;
-mod hydrate;
+mod row;
 mod schema;
 mod store;
+
+#[cfg(test)]
+mod tests;
 
 use crate::error::Error;
 
@@ -115,13 +119,30 @@ impl SqliteStore {
         self.watch_tx.subscribe()
     }
 
+    /// Advance the stream watch under the max-guard. Called *inside* the
+    /// `spawn_blocking` closure after `tx.commit()?` per design doc §2 —
+    /// `spawn_blocking` closures are non-cancellable, so a committed event
+    /// can never be stranded without notification. Associated function
+    /// (not `&self`) because the calling closure must be `'static` and
+    /// cannot borrow the store.
+    pub(crate) fn notify_watch(watch_tx: &watch::Sender<StreamPos>, new_pos: i64) {
+        let new_pos = StreamPos(new_pos as u64);
+        watch_tx.send_if_modified(|cur| {
+            if new_pos > *cur {
+                *cur = new_pos;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
     /// Run a read-only closure on a connection from the reader pool.
     /// Mis-routed writes (any `INSERT`/`UPDATE`/`DELETE`/`CREATE`/`DROP`)
     /// fail with `SQLITE_READONLY` because the reader pool sets
     /// `PRAGMA query_only = ON` on every connection — this is the
     /// enforcement primitive that catches a method silently bypassing
     /// the writer-serialisation point.
-    #[allow(dead_code)]
     pub(crate) async fn run_read<F, T>(&self, f: F) -> Result<T, StorageError>
     where
         F: FnOnce(&mut Connection) -> Result<T, Error> + Send + 'static,
@@ -137,7 +158,6 @@ impl SqliteStore {
     /// queue here rather than racing the SQLite write lock. Read-
     /// modify-write closures stay on this connection so they see their
     /// own uncommitted state inside the transaction.
-    #[allow(dead_code)]
     pub(crate) async fn run_write<F, T>(&self, f: F) -> Result<T, StorageError>
     where
         F: FnOnce(&mut Connection) -> Result<T, Error> + Send + 'static,
