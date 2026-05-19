@@ -300,8 +300,8 @@ impl EventStore for SqliteStore {
 mod tests {
     use deadpool_sqlite::rusqlite::params;
     use lazy_static::lazy_static;
-    use neutrino_store::{Direction, EventStore, StorageError, StreamPos};
-    use ruma::{OwnedEventId, RoomId, UserId, event_id, room_id, server_name, user_id};
+    use neutrino_store::{Direction, EventStore, PaginationToken, StorageError, StreamPos};
+    use ruma::{EventId, OwnedEventId, RoomId, UserId, event_id, room_id, server_name, user_id};
 
     use serde_json::json;
 
@@ -892,5 +892,145 @@ mod tests {
             after > initial,
             "watch did not advance after persist_event: {initial:?} -> {after:?}"
         );
+    }
+
+    // E39: `get_events` chunks `IN (?, …)` at MAX_PARAMS = 900 so it can
+    // accept any `ids.len()` without hitting SQLite's host-parameter cap.
+    // Persist > MAX_PARAMS events, request all of them, and verify every
+    // event makes it back out. Single-chunk paths are covered by E18/E19;
+    // this is the explicit multi-chunk witness.
+    #[tokio::test]
+    async fn get_events_chunks_above_max_params() {
+        let s = store_with_room().await;
+        let n: usize = 950;
+        let mut ids: Vec<OwnedEventId> = Vec::with_capacity(n);
+        for i in 0..n {
+            let id: OwnedEventId = format!("$m{i}:example.com").try_into().unwrap();
+            let m = message(&id, *ALICE_ROOM_ID, *ALICE_ID, "x");
+            s.persist_event(&m, &[]).await.unwrap();
+            ids.push(id);
+        }
+        let refs: Vec<&EventId> = ids.iter().map(|i| i.as_ref()).collect();
+        let result = s.get_events(&refs).await.unwrap();
+        assert_eq!(result.len(), n);
+    }
+
+    // E40: a duplicate event ID that straddles two chunks currently
+    // surfaces twice in the result — SQL `IN (…)` dedupes within a chunk
+    // but the impl concatenates per-chunk results without further dedup.
+    // Trait post-condition is silent on duplicates ("result length may be
+    // < ids.len()"), so this pins current behavior rather than asserting
+    // a tighter contract. If the trait gains a "result is a set" promise,
+    // this test should flip to `count == 1`.
+    #[tokio::test]
+    async fn get_events_duplicate_id_across_chunks_returns_twice() {
+        let s = store_with_room().await;
+        // Need at least MAX_PARAMS (900) IDs in the request to force a
+        // second chunk. Persist 900 events; ID at index 0 will appear in
+        // both chunks of the request.
+        let n: usize = 900;
+        let mut ids: Vec<OwnedEventId> = Vec::with_capacity(n);
+        for i in 0..n {
+            let id: OwnedEventId = format!("$m{i}:example.com").try_into().unwrap();
+            let m = message(&id, *ALICE_ROOM_ID, *ALICE_ID, "x");
+            s.persist_event(&m, &[]).await.unwrap();
+            ids.push(id);
+        }
+        // Construct a request with the first ID duplicated into chunk #2:
+        // [id0, id1, …, id899, id0]. Length 901 → chunks of 900 + 1.
+        let dup = ids[0].clone();
+        let mut req: Vec<&EventId> = ids.iter().map(|i| i.as_ref()).collect();
+        req.push(dup.as_ref());
+
+        let result = s.get_events(&req).await.unwrap();
+        // 900 distinct events + the cross-chunk duplicate of id0 = 901
+        // rows. If a future change adds cross-chunk dedup, this number
+        // drops to 900.
+        assert_eq!(result.len(), 901);
+        let dup_str = dup.as_str();
+        let dup_count = result
+            .iter()
+            .filter(|e| e.event_id.as_str() == dup_str)
+            .count();
+        assert_eq!(dup_count, 2);
+    }
+
+    // E41: `events_after` honors `limit == 0` — empty page even when
+    // events exist past `pos`. The bounded SELECT receives `LIMIT 0` and
+    // returns no rows; the surrounding code does no post-filtering.
+    #[tokio::test]
+    async fn events_after_zero_limit_returns_empty() {
+        let s = store_with_room().await;
+        s.persist_event(
+            &message(
+                event_id!("$m1:example.com"),
+                *ALICE_ROOM_ID,
+                *ALICE_ID,
+                "hi",
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+        let result = s.events_after(StreamPos(0), 0).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    // E42: `room_messages` Backward with `from = Some(PaginationToken(0))`
+    // is the natural start-of-stream terminator: cursor 0 with `<` cmp
+    // matches nothing. Empty page, no next token. Mirrors the boundary
+    // a paginating client hits after consuming the earliest event.
+    #[tokio::test]
+    async fn room_messages_backward_from_zero_token_returns_empty() {
+        let s = store_with_room().await;
+        s.persist_event(
+            &message(
+                event_id!("$m1:example.com"),
+                *ALICE_ROOM_ID,
+                *ALICE_ID,
+                "hi",
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+        let (events, next) = s
+            .room_messages(
+                *ALICE_ROOM_ID,
+                Some(PaginationToken(0)),
+                Direction::Backward,
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(events.is_empty());
+        assert!(next.is_none());
+    }
+
+    // E43: `room_messages` Backward, page size matches remaining exactly
+    // → no next token. Mirrors E33 (Forward) for the backward direction;
+    // the `limit + 1` sentinel fetch must not be misclassified as
+    // "more data exists" when the sentinel row simply doesn't exist.
+    #[tokio::test]
+    async fn room_messages_backward_exact_remaining_returns_no_token() {
+        let s = store_with_room().await;
+        // store_with_room has 1 create event; add 1 more so total = 2.
+        s.persist_event(
+            &message(
+                event_id!("$m1:example.com"),
+                *ALICE_ROOM_ID,
+                *ALICE_ID,
+                "hi",
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+        let (events, next) = s
+            .room_messages(*ALICE_ROOM_ID, None, Direction::Backward, 2)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(next.is_none());
     }
 }
