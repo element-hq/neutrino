@@ -4,6 +4,7 @@ use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 use serde_json::value::RawValue;
 use thiserror::Error;
 
+pub mod provider;
 pub mod validate;
 
 /// Room version supported by this state machine.
@@ -145,11 +146,55 @@ pub enum FormatError {
 #[derive(Debug, Error)]
 pub enum AuthError {}
 
+/// Errors raised by reference validation (phase 1b) — the event's references
+/// (room, `prev_state_events`) must exist in the store and meet their
+/// preconditions.
+#[derive(Debug, Error)]
+pub enum ReferenceError {
+    /// v12 rule 2: the event's `room_id` does not correspond to any known
+    /// `m.room.create` event.
+    #[error("room not known: no create event with id derived from {0}")]
+    UnknownRoom(OwnedRoomId),
+
+    /// v12 rule 2: the referenced create event exists but is rejected.
+    #[error("room's create event is rejected: {0}")]
+    RoomRejected(OwnedRoomId),
+
+    /// v12 rule 2 (defensive): the event found at the derived create-event ID
+    /// is not actually an `m.room.create` event. Should be impossible for a
+    /// well-formed store but worth the explicit reject path.
+    #[error("event at derived create id is not m.room.create: {0}")]
+    RoomTypeMismatch(OwnedEventId),
+
+    /// MSC4242: "If there are entries which were themselves rejected under
+    /// the checks performed on receipt of a PDU, reject."
+    #[error("prev_state_event is rejected: {0}")]
+    PrevStateRejected(OwnedEventId),
+
+    /// MSC4242: a `prev_state_events` entry is not present in the store.
+    /// Synapse's recovery path is `/get_missing_events` with `state_dag: true`;
+    /// here we surface a typed error and let the caller decide.
+    #[error("prev_state_event not in store: {0}")]
+    PrevStateNotFound(OwnedEventId),
+
+    /// MSC4242: "If there are entries which do not have a `state_key`,
+    /// reject." (i.e. the referenced event is not a state event)
+    #[error("prev_state_event is not a state event: {0}")]
+    PrevStateNotStateEvent(OwnedEventId),
+
+    /// MSC4242: "If there are entries which do not belong in the same room,
+    /// reject."
+    #[error("prev_state_event belongs to a different room: {0}")]
+    PrevStateDifferentRoom(OwnedEventId),
+}
+
 /// Top-level error type returned by the state machine.
 #[derive(Debug, Error)]
 pub enum CoreError {
     #[error(transparent)]
     Format(#[from] FormatError),
+    #[error(transparent)]
+    Reference(#[from] ReferenceError),
     #[error(transparent)]
     Auth(#[from] AuthError),
 }
