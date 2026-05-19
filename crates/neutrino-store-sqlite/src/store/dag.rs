@@ -59,9 +59,16 @@ fn fetch_edges(
     child_event_id: &EventId,
     edge_type: &str,
 ) -> Result<Vec<OwnedEventId>, Error> {
+    // `ORDER BY parent_event_id` pins the BFS sibling-visit order so
+    // `events_before` / `missing_events` results are deterministic.
+    // `event_edges` is `WITHOUT ROWID PRIMARY KEY (child_event_id,
+    // edge_type, parent_event_id)`, so the explicit sort matches the
+    // natural PK scan — free at runtime, contractual at the spec
+    // boundary.
     let mut stmt = conn.prepare(
         "SELECT parent_event_id FROM event_edges \
-         WHERE child_event_id = ? AND edge_type = ?",
+         WHERE child_event_id = ? AND edge_type = ? \
+         ORDER BY parent_event_id",
     )?;
     let rows = stmt.query_map(params![child_event_id.as_str(), edge_type], |row| {
         row.get::<_, String>(0)
@@ -295,12 +302,11 @@ mod tests {
             .events_before(*ALICE_ROOM_ID, &[event_id!("$c:e")], 10)
             .await
             .unwrap();
-        assert_eq!(got.len(), 3);
-        let ids: std::collections::HashSet<&str> =
-            got.iter().map(|p| p.event.event_id.as_str()).collect();
-        assert!(ids.contains("$c:e"));
-        assert!(ids.contains("$a:e"));
-        assert!(ids.contains("$b:e"));
+        let ids: Vec<&str> = got.iter().map(|p| p.event.event_id.as_str()).collect();
+        // Deterministic order: c is the seed; its prev_events come back
+        // from `fetch_edges` sorted by `parent_event_id`, so the BFS
+        // pushes `$a:e` before `$b:e` and pops in FIFO order.
+        assert_eq!(ids, ["$c:e", "$a:e", "$b:e"]);
     }
 
     // D5: event's prev_events references an ID not in the local store →
