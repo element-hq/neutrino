@@ -124,8 +124,8 @@ impl RoomStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use lazy_static::lazy_static;
-    use neutrino_store::{RoomStore, StorageError};
-    use ruma::{RoomId, UserId, event_id, room_id, user_id};
+    use neutrino_store::{EventStore, RoomStore, StorageError, StreamPos};
+    use ruma::{RoomId, RoomVersionId, UserId, event_id, room_id, user_id};
     use serde_json::json;
 
     use crate::tests::{create_event, make_event, member_join, store};
@@ -288,5 +288,45 @@ mod tests {
         let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_ID);
         store.create_room(&ce, &[]).await.unwrap();
         assert_eq!(store.room_count().await.unwrap(), 1);
+    }
+
+    // R12: success path — `create_room` with a valid create event plus
+    // initial events makes (a) `get_room_version` return
+    // `Some(V12)` and (b) every persisted event observable via the
+    // EventStore read surface. Covers the rooms INSERT, the room-version
+    // encoding round-trip through `RoomVersionId`, and the
+    // `EventRow::write_into_tx` path for both the create event and the
+    // initial-event batch.
+    #[tokio::test]
+    async fn create_room_persists_create_and_initial_events() {
+        let store = store().await;
+        let create_id = event_id!("$c1:example.com");
+        let member_id = event_id!("$m1:example.com");
+        let ce = create_event(create_id, *ALICE_ROOM_ID, *ALICE_ID);
+        let initial_member = member_join(member_id, *ALICE_ROOM_ID, *ALICE_ID);
+        store.create_room(&ce, &[initial_member]).await.unwrap();
+
+        // (a) room version round-trips as V12.
+        let v = store.get_room_version(*ALICE_ROOM_ID).await.unwrap();
+        assert_eq!(v, Some(RoomVersionId::V12));
+
+        // (b) both events observable via `get_events`.
+        let got = store.get_events(&[create_id, member_id]).await.unwrap();
+        let ids: std::collections::HashSet<&str> =
+            got.iter().map(|e| e.event_id.as_str()).collect();
+        assert!(ids.contains("$c1:example.com"));
+        assert!(ids.contains("$m1:example.com"));
+
+        // (c) both also visible via `events_after` — sanity-checks
+        // stream_pos got assigned (AUTOINCREMENT path through
+        // `write_into_tx`).
+        let stream = store
+            .events_after(StreamPos(0), 100)
+            .await
+            .unwrap();
+        let stream_ids: std::collections::HashSet<&str> =
+            stream.iter().map(|(_, e)| e.event_id.as_str()).collect();
+        assert!(stream_ids.contains("$c1:example.com"));
+        assert!(stream_ids.contains("$m1:example.com"));
     }
 }
