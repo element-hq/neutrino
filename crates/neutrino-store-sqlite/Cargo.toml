@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 deadpool-sqlite = { version = "0.13.0", features = ["bundled"] }
-lazy_static = "1.5.0"
 
 async-trait.workspace = true
 ruma.workspace = true
@@ -16,3 +15,6 @@ tokio.workspace = true
 
 neutrino-store = { path = "../neutrino-store" }
 uuid = { version = "1.23.1", features = ["v4"] }
+
+[dev-dependencies]
+lazy_static = "1.5.0"
