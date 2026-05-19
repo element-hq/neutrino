@@ -45,7 +45,7 @@ pub struct Event {
 #[derive(Debug, Error)]
 pub enum FormatError {
     #[error("invalid JSON: {0}")]
-    InvalidJson(String),
+    InvalidJson(#[from] serde_json::Error),
 }
 
 /// Errors raised by the v12 authorization rules (phase 3).
