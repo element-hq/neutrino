@@ -307,7 +307,9 @@ mod tests {
 
     use crate::SqliteStore;
     use crate::error::Error;
-    use crate::tests::{make_event, make_event_with_raw_json, message, name_event, setup_room, store};
+    use crate::tests::{
+        make_event, make_event_with_raw_json, message, name_event, setup_room, store,
+    };
 
     lazy_static! {
         static ref ALICE_ROOM_ID: &'static RoomId = room_id!("!r1:example.com");

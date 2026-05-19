@@ -151,9 +151,7 @@ impl<'a> EventRow<'a> {
         // at the write boundary instead.
         let membership = if self.event_type == "m.room.member" {
             let m = cracked.content.membership.as_deref().ok_or_else(|| {
-                Error::InvalidInput(
-                    "m.room.member event missing content.membership".into(),
-                )
+                Error::InvalidInput("m.room.member event missing content.membership".into())
             })?;
             if self.state_key.is_none() {
                 return Err(Error::InvalidInput(
