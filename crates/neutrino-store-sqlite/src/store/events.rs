@@ -109,20 +109,30 @@ impl EventStore for SqliteStore {
         let ids: Vec<String> = ids.iter().map(|e| e.as_str().to_owned()).collect();
 
         self.run_read(move |conn| -> Result<Vec<StoredEvent>, Error> {
-            let placeholders = vec!["?"; ids.len()].join(",");
-            let query =
-                format!("SELECT {EVENT_COLUMNS} FROM events WHERE event_id IN ({placeholders})");
-            let mut stmt = conn.prepare(&query)?;
-            // Wrap the `TryFrom<&Row>` so its `Result<_, Error>` becomes a
-            // `rusqlite::Result<Result<_, Error>>` that `query_map` accepts;
-            // we peel both layers in the loop below.
-            let rows = stmt.query_map(params_from_iter(ids.iter()), |row| {
-                Ok(EventRow::try_from(row))
-            })?;
-
+            // SQLite caps host parameters per statement (default 999 on
+            // older builds, 32766 on 3.32+; the bundled rusqlite tracks
+            // this). Chunk the `IN (?, …)` query so callers can pass any
+            // size of `ids` without hitting a `too many SQL variables`
+            // error from the driver. Trait post-condition doesn't
+            // promise ordering, so concatenating per-chunk results is
+            // fine.
+            const MAX_PARAMS: usize = 900;
             let mut out = Vec::with_capacity(ids.len());
-            for row in rows {
-                out.push(row??.into_event());
+            for chunk in ids.chunks(MAX_PARAMS) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let query = format!(
+                    "SELECT {EVENT_COLUMNS} FROM events WHERE event_id IN ({placeholders})"
+                );
+                let mut stmt = conn.prepare(&query)?;
+                // Wrap the `TryFrom<&Row>` so its `Result<_, Error>` becomes
+                // a `rusqlite::Result<Result<_, Error>>` that `query_map`
+                // accepts; we peel both layers in the loop below.
+                let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
+                    Ok(EventRow::try_from(row))
+                })?;
+                for row in rows {
+                    out.push(row??.into_event());
+                }
             }
             Ok(out)
         })
