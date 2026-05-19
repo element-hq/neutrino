@@ -4,6 +4,7 @@ use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 use serde_json::value::RawValue;
 use thiserror::Error;
 
+pub mod auth_events;
 pub mod provider;
 pub mod validate;
 

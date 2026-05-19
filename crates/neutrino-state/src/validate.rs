@@ -167,7 +167,14 @@ pub fn parse_event(
 
     // v12 rule 9: "If the event has a `state_key` that starts with an `@` and
     // does not match the `sender`, reject."
-    if let Some(sk) = &state_key
+    //
+    // Rule 5 (m.room.member) is terminal for membership events and has its
+    // own rules about sender / state_key (the state_key is the *target* user,
+    // not the sender — that's how invites and kicks work). So rule 9 must
+    // not apply to m.room.member events. Synapse's `event_auth.py` does the
+    // same exclusion.
+    if event_type != "m.room.member"
+        && let Some(sk) = &state_key
         && sk.starts_with('@')
         && sk != sender.as_str()
     {
@@ -661,6 +668,19 @@ mod tests {
         v["type"] = json!("m.room.topic");
         v["state_key"] = json!("");
         parse_event(raw(v), eid("$e:example.org"), RoomVersion::V12).expect("empty state_key ok");
+    }
+
+    #[test]
+    fn rule_9_does_not_apply_to_m_room_member() {
+        // Invite of @bob by @alice: state_key=@bob, sender=@alice — normal
+        // membership operation. Rule 9 would reject naively; rule 5 owns
+        // m.room.member end-to-end so rule 9 must skip it.
+        let mut v = base_event();
+        v["type"] = json!("m.room.member");
+        v["state_key"] = json!("@bob:example.org");
+        v["content"] = json!({ "membership": "invite" });
+        parse_event(raw(v), eid("$e:example.org"), RoomVersion::V12)
+            .expect("m.room.member with different state_key/sender is valid");
     }
 
     // ---------- F11 / F12 / F13: power_levels content ----------
