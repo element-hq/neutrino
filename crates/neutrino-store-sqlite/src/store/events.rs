@@ -298,12 +298,16 @@ impl EventStore for SqliteStore {
 
 #[cfg(test)]
 mod tests {
+    use deadpool_sqlite::rusqlite::params;
     use lazy_static::lazy_static;
     use neutrino_store::{Direction, EventStore, StorageError, StreamPos};
-    use ruma::{OwnedEventId, RoomId, UserId, event_id, room_id, user_id};
+    use ruma::{OwnedEventId, RoomId, UserId, event_id, room_id, server_name, user_id};
+
+    use serde_json::json;
 
     use crate::SqliteStore;
-    use crate::tests::{make_event_with_raw_json, message, name_event, setup_room, store};
+    use crate::error::Error;
+    use crate::tests::{make_event, make_event_with_raw_json, message, name_event, setup_room, store};
 
     lazy_static! {
         static ref ALICE_ROOM_ID: &'static RoomId = room_id!("!r1:example.com");
@@ -788,5 +792,105 @@ mod tests {
         let got = s.get_events(&[id]).await.unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].state_key.as_deref(), Some(""));
+    }
+
+    // E35: m.room.member event without `content.membership` → InvalidInput.
+    // Writing it would leave `current_state.membership` NULL, which makes
+    // the row invisible to `joined_members` / `joined_rooms` filtering.
+    // Reject at the write boundary (`EventRow::write_into_tx`).
+    #[tokio::test]
+    async fn persist_event_rejects_member_without_membership() {
+        let s = store_with_room().await;
+        let bad = make_event(
+            event_id!("$m:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "m.room.member",
+            Some(ALICE_ID.as_str()),
+            json!({}), // no `membership` key
+        );
+        let result = s.persist_event(&bad, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    // E36: m.room.member event without state_key → InvalidInput. State
+    // key carries the user_id for member rows; missing it would silently
+    // skip the `current_state` upsert and leave the membership invisible.
+    #[tokio::test]
+    async fn persist_event_rejects_member_without_state_key() {
+        let s = store_with_room().await;
+        let bad = make_event(
+            event_id!("$m:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "m.room.member",
+            None, // missing state_key
+            json!({"membership": "join"}),
+        );
+        let result = s.persist_event(&bad, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    // E37: `persist_event` writes one `outbox` row per destination
+    // (idempotent via `UNIQUE(destination, event_id)`). `FederationOutbox`
+    // isn't implemented on this branch yet, so this test peeks at the
+    // table directly via `run_read`; swap to the trait once it lands.
+    #[tokio::test]
+    async fn persist_event_writes_outbox_rows_per_destination() {
+        let s = store_with_room().await;
+        let msg = message(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "hi",
+        );
+        let dest_a = server_name!("a.example.com");
+        let dest_b = server_name!("b.example.com");
+        s.persist_event(&msg, &[dest_a, dest_b]).await.unwrap();
+
+        let rows: Vec<String> = s
+            .run_read(|conn| -> Result<Vec<String>, Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT destination FROM outbox WHERE event_id = ? \
+                     ORDER BY destination",
+                )?;
+                let it =
+                    stmt.query_map(params!["$m1:example.com"], |row| row.get::<_, String>(0))?;
+                let mut out = Vec::new();
+                for r in it {
+                    out.push(r?);
+                }
+                Ok(out)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec!["a.example.com".to_string(), "b.example.com".to_string()]
+        );
+    }
+
+    // E38: `subscribe()` receiver observes a value advance after
+    // `persist_event` commits — covers the post-condition that
+    // notification fires from inside the `spawn_blocking` closure after
+    // `tx.commit()?`.
+    #[tokio::test]
+    async fn subscribe_advances_after_persist_event() {
+        let s = store_with_room().await;
+        let mut rx = s.subscribe();
+        let initial = *rx.borrow();
+        let msg = message(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "hi",
+        );
+        s.persist_event(&msg, &[]).await.unwrap();
+        rx.changed().await.unwrap();
+        let after = *rx.borrow();
+        assert!(
+            after > initial,
+            "watch did not advance after persist_event: {initial:?} -> {after:?}"
+        );
     }
 }
