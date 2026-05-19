@@ -140,8 +140,11 @@ See `PLAN.md` for the live checkboxes. Order:
       event.
     - MSC4242 prev_state_events triad: each entry must exist, belong to
       the same room, have a `state_key`, and not be rejected.
-    Blocked on Phase 5 (needs a provider to test against). Lives in the
-    `validate` module — orchestration (Phase 6) only *calls* it.
+    Lives in the `validate` module — orchestration (Phase 6) only
+    *calls* it. **Done** — a minimal `StateProvider` trait (`get_event`)
+    was introduced up front to land this without waiting on Phase 5;
+    Phase 5 will extend the same trait with state-after lookups,
+    auth-chain difference, and power-level auth ancestor.
 2. **auth events selection** — pure fn
    `expected_auth_events(event, state) -> Vec<OwnedEventId>`.
 3. **auth rules v12** — pure fn

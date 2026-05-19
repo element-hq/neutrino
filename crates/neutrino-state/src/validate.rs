@@ -18,7 +18,9 @@ const MAX_PREV_EVENTS: usize = 20;
 const MAX_PREV_STATE_EVENTS: usize = 20;
 const DEPTH_LIMIT: u64 = (1u64 << 53) - 1;
 
-/// Parse a raw event JSON into an `Event`, applying every phase-1 check.
+/// Parse a raw event JSON into an `Event`, applying every phase-1a check
+/// (wire-format only; no provider lookups). Reference validation —
+/// `prev_state_events` lookup, room-exists check — is `validate_references`.
 ///
 /// `event_id` is provided by the caller: under v12 it derives from the event's
 /// reference hash, which is computed by a separate event-building step. This
@@ -56,20 +58,8 @@ pub fn parse_event(
         value: sender_str.to_owned(),
     })?;
 
-    let origin_server_ts = map.get("origin_server_ts").and_then(Value::as_u64).ok_or(
-        FormatError::InvalidFieldType {
-            field: "origin_server_ts",
-            expected: "unsigned integer",
-        },
-    )?;
-
-    let depth = map
-        .get("depth")
-        .and_then(Value::as_u64)
-        .ok_or(FormatError::InvalidFieldType {
-            field: "depth",
-            expected: "unsigned integer",
-        })?;
+    let origin_server_ts = required_u64(&map, "origin_server_ts")?;
+    let depth = required_u64(&map, "depth")?;
     // v12 PDU schema: depth "Must be less than the maximum value for an
     // integer (2^53 - 1)."
     if depth >= DEPTH_LIMIT {
@@ -161,8 +151,10 @@ pub fn parse_event(
     };
 
     // state_key (optional in PDU schema, required by some auth rules below).
+    // Absent => None. Present must be a string — `null` is a wire-format
+    // error, not equivalent to absent.
     let state_key = match map.get("state_key") {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(v) => Some(
             v.as_str()
                 .ok_or(FormatError::InvalidFieldType {
@@ -214,6 +206,16 @@ fn required_string<'a>(
         .ok_or(FormatError::InvalidFieldType {
             field,
             expected: "string",
+        })
+}
+
+fn required_u64(map: &Map<String, Value>, field: &'static str) -> Result<u64, FormatError> {
+    map.get(field)
+        .ok_or(FormatError::MissingField(field))?
+        .as_u64()
+        .ok_or(FormatError::InvalidFieldType {
+            field,
+            expected: "unsigned integer",
         })
 }
 
@@ -807,6 +809,16 @@ mod tests {
         v.as_object_mut().unwrap().remove("depth");
         assert!(matches!(
             parse_event(raw(v), eid("$e:example.org"), RoomVersion::V12),
+            Err(FormatError::MissingField("depth"))
+        ));
+    }
+
+    #[test]
+    fn rejects_non_integer_depth() {
+        let mut v = base_event();
+        v["depth"] = json!("not a number");
+        assert!(matches!(
+            parse_event(raw(v), eid("$e:example.org"), RoomVersion::V12),
             Err(FormatError::InvalidFieldType { field: "depth", .. })
         ));
     }
@@ -857,8 +869,33 @@ mod tests {
         v.as_object_mut().unwrap().remove("origin_server_ts");
         assert!(matches!(
             parse_event(raw(v), eid("$e:example.org"), RoomVersion::V12),
+            Err(FormatError::MissingField("origin_server_ts"))
+        ));
+    }
+
+    #[test]
+    fn rejects_non_integer_origin_server_ts() {
+        let mut v = base_event();
+        v["origin_server_ts"] = json!("yesterday");
+        assert!(matches!(
+            parse_event(raw(v), eid("$e:example.org"), RoomVersion::V12),
             Err(FormatError::InvalidFieldType {
                 field: "origin_server_ts",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_state_key_null() {
+        // null state_key is a wire-format error, not absent.
+        let mut v = base_event();
+        v["type"] = json!("m.room.topic");
+        v["state_key"] = json!(null);
+        assert!(matches!(
+            parse_event(raw(v), eid("$e:example.org"), RoomVersion::V12),
+            Err(FormatError::InvalidFieldType {
+                field: "state_key",
                 ..
             })
         ));
