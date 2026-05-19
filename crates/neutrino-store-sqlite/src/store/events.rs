@@ -187,6 +187,23 @@ impl EventStore for SqliteStore {
 
         self.run_read(
             move |conn| -> Result<(Vec<StoredEvent>, Option<PaginationToken>), Error> {
+                // Pre-condition (trait: "the room must exist"). Surface a
+                // violation rather than silently returning empty — caller
+                // wants a fault, not a successful no-op.
+                let exists: Option<i64> = conn
+                    .query_row(
+                        "SELECT 1 FROM rooms WHERE room_id = ?",
+                        params![room_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if exists.is_none() {
+                    return Err(Error::InvalidInput(format!(
+                        "unknown room: {}",
+                        room_id.as_str()
+                    )));
+                }
+
                 let (cmp, order) = match dir {
                     Direction::Forward => (">", "ASC"),
                     Direction::Backward => ("<", "DESC"),
@@ -639,17 +656,13 @@ mod tests {
         }
     }
 
-    // E32: room_messages for unknown room → Ok(empty), not error
+    // E32: room_messages for unknown room → InvalidInput (precondition violation)
     #[tokio::test]
-    async fn room_messages_unknown_room_returns_empty() {
+    async fn room_messages_unknown_room_errors() {
         let s = store().await;
         let unknown = room_id!("!nope:example.com");
-        let (events, next) = s
-            .room_messages(unknown, None, Direction::Forward, 10)
-            .await
-            .unwrap();
-        assert!(events.is_empty());
-        assert!(next.is_none());
+        let result = s.room_messages(unknown, None, Direction::Forward, 10).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
 
     // E28: empty store → subscribe initial value is StreamPos(0)
