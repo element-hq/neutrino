@@ -19,13 +19,21 @@ use crate::{
     row::{EVENT_COLUMNS, EventRow},
 };
 
-/// Fetch an event + its `prev_events` / `prev_state_events` from the DB.
-/// Returns `Ok(None)` if the event is not in `events` — federation
-/// backfill may reference parents we haven't yet seen.
-fn hydrate_pdu(conn: &Connection, event_id: &str) -> Result<Option<StoredPdu>, Error> {
-    let query = format!("SELECT {EVENT_COLUMNS} FROM events WHERE event_id = ?");
+/// Fetch an event + its `prev_events` / `prev_state_events` from the DB,
+/// constrained to a specific room. Returns `Ok(None)` if the event is
+/// not in `events` (federation backfill may reference parents we haven't
+/// yet seen) *or* if the event exists but belongs to a different room
+/// (defence against cross-room edges from a corrupt `event_edges` row,
+/// or callers passing event IDs from the wrong room).
+fn hydrate_pdu(
+    conn: &Connection,
+    event_id: &str,
+    room_id: &str,
+) -> Result<Option<StoredPdu>, Error> {
+    let query =
+        format!("SELECT {EVENT_COLUMNS} FROM events WHERE event_id = ? AND room_id = ?");
     let event_result: Option<Result<StoredEvent, Error>> = conn
-        .query_row(&query, params![event_id], |row| {
+        .query_row(&query, params![event_id, room_id], |row| {
             Ok(EventRow::try_from(row).map(EventRow::into_event))
         })
         .optional()?;
@@ -69,10 +77,14 @@ fn fetch_edges(
 
 /// BFS over `prev_events` edges from `start`, stopping at `limit` or when
 /// no more parents resolve in the local store. `excluded` IDs are skipped
-/// (and don't seed traversal). The result preserves traversal order
+/// (and don't seed traversal). The walk is scoped to `room_id` — events
+/// from any other room are treated as if they don't exist, so a corrupt
+/// cross-room `event_edges` row terminates the walk rather than leaking
+/// PDUs from a different room. The result preserves traversal order
 /// (reverse-chronological).
 fn walk_prev_events(
     conn: &Connection,
+    room_id: &str,
     start: Vec<String>,
     excluded: &HashSet<String>,
     limit: usize,
@@ -91,8 +103,9 @@ fn walk_prev_events(
         if excluded.contains(&id) {
             continue;
         }
-        let Some(pdu) = hydrate_pdu(conn, &id)? else {
-            // Event not in local store — federation-backfill boundary.
+        let Some(pdu) = hydrate_pdu(conn, &id, room_id)? else {
+            // Event not in local store, or in a different room — either
+            // way, federation-backfill / wrong-room boundary.
             continue;
         };
         for parent in &pdu.prev_events {
@@ -107,30 +120,32 @@ fn walk_prev_events(
 impl DagStore for SqliteStore {
     async fn events_before(
         &self,
-        _room_id: &RoomId,
+        room_id: &RoomId,
         from: &[&EventId],
         limit: usize,
     ) -> Result<Vec<StoredPdu>, StorageError> {
+        let room_id = room_id.as_str().to_owned();
         let from: Vec<String> = from.iter().map(|e| e.as_str().to_owned()).collect();
 
         self.run_read(move |conn| -> Result<Vec<StoredPdu>, Error> {
-            walk_prev_events(conn, from, &HashSet::new(), limit)
+            walk_prev_events(conn, &room_id, from, &HashSet::new(), limit)
         })
         .await
     }
 
     async fn missing_events(
         &self,
-        _room_id: &RoomId,
+        room_id: &RoomId,
         latest: &[&EventId],
         earliest: &[&EventId],
         limit: usize,
     ) -> Result<Vec<StoredPdu>, StorageError> {
+        let room_id = room_id.as_str().to_owned();
         let latest: Vec<String> = latest.iter().map(|e| e.as_str().to_owned()).collect();
         let earliest: HashSet<String> = earliest.iter().map(|e| e.as_str().to_owned()).collect();
 
         self.run_read(move |conn| -> Result<Vec<StoredPdu>, Error> {
-            walk_prev_events(conn, latest, &earliest, limit)
+            walk_prev_events(conn, &room_id, latest, &earliest, limit)
         })
         .await
     }
@@ -398,5 +413,41 @@ mod tests {
             .await
             .unwrap();
         assert!(got.is_empty());
+    }
+
+    // D9: events_before / missing_events are scoped to the requested
+    // room. Passing an event ID that exists in a *different* room
+    // (or following a corrupt cross-room edge) must not leak PDUs from
+    // outside `room_id` — caller's mistake or DB corruption should
+    // terminate the walk, not surface unrelated history.
+    #[tokio::test]
+    async fn dag_queries_scoped_to_room_id() {
+        let s = store_with_room().await; // room A = *ALICE_ROOM_ID
+        let other_room = room_id!("!r2:example.com");
+        s.create_room(
+            &create_event(event_id!("$c2:e"), other_room, *ALICE_ID),
+            &[],
+        )
+        .await
+        .unwrap();
+        s.persist_event(
+            &message_with_prev(event_id!("$other:e"), other_room, *ALICE_ID, "x", &[]),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        // Seed exists, but in the *other* room.
+        let got = s
+            .events_before(*ALICE_ROOM_ID, &[event_id!("$other:e")], 10)
+            .await
+            .unwrap();
+        assert!(got.is_empty(), "events_before leaked cross-room PDU");
+
+        let got = s
+            .missing_events(*ALICE_ROOM_ID, &[event_id!("$other:e")], &[], 10)
+            .await
+            .unwrap();
+        assert!(got.is_empty(), "missing_events leaked cross-room PDU");
     }
 }
