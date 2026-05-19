@@ -170,7 +170,13 @@ impl EventStore for SqliteStore {
         limit: usize,
     ) -> Result<(Vec<StoredEvent>, Option<PaginationToken>), StorageError> {
         let room_id = room_id.to_owned();
-        let limit_i64 = i64::try_from(limit)
+        // Fetch one extra row so we can distinguish "exactly `limit`
+        // events remain" (post-condition: return `None` token) from
+        // "more than `limit` events remain" (return a `Some` token).
+        // `events.len() < limit` alone can't tell those cases apart;
+        // see trait post-condition "token is None when no further
+        // events exist".
+        let fetch_limit_i64 = i64::try_from(limit.saturating_add(1))
             .map_err(|_| Error::InvalidInput(format!("limit {limit} exceeds i64::MAX")))?;
         // Default `from` per direction. Forward starts at 0
         // (events with stream_pos > 0); backward starts at i64::MAX
@@ -204,6 +210,16 @@ impl EventStore for SqliteStore {
                     )));
                 }
 
+                // `limit == 0` is degenerate: there's no row we can hang
+                // a "more exists past this position" token on, so the
+                // overflow detection below can't satisfy the trait
+                // post-condition. Short-circuit explicitly rather than
+                // returning a possibly-misleading `None` token. Room
+                // pre-condition has already been enforced above.
+                if limit == 0 {
+                    return Ok((Vec::new(), None));
+                }
+
                 let (cmp, order) = match dir {
                     Direction::Forward => (">", "ASC"),
                     Direction::Backward => ("<", "DESC"),
@@ -215,25 +231,37 @@ impl EventStore for SqliteStore {
                      ORDER BY stream_pos {order} LIMIT ?"
                 );
                 let mut stmt = conn.prepare(&query)?;
-                let rows =
-                    stmt.query_map(params![room_id.as_str(), from_pos, limit_i64], |row| {
+                let rows = stmt.query_map(
+                    params![room_id.as_str(), from_pos, fetch_limit_i64],
+                    |row| {
                         let stream_pos: i64 = row.get("stream_pos")?;
                         Ok((stream_pos, EventRow::try_from(row)))
-                    })?;
+                    },
+                )?;
 
-                let mut events = Vec::new();
-                let mut last_pos: Option<i64> = None;
+                let mut events = Vec::with_capacity(limit);
+                let mut last_in_page: Option<i64> = None;
+                let mut overflow_seen = false;
                 for r in rows {
                     let (sp, ev) = r?;
-                    last_pos = Some(sp);
+                    if events.len() == limit {
+                        // Sentinel (limit+1)-th row materialised — there
+                        // is more data past `last_in_page`. Don't include
+                        // it in the page itself.
+                        overflow_seen = true;
+                        break;
+                    }
+                    last_in_page = Some(sp);
                     events.push(ev?.into_event());
                 }
 
-                // Short page ⇒ no further events in that direction.
-                let next = if events.len() < limit {
-                    None
+                // Only emit a token when the sentinel proved more data
+                // exists. A "full but final" page (events.len() == limit
+                // with no overflow row) terminates the stream cleanly.
+                let next = if overflow_seen {
+                    last_in_page.map(|p| PaginationToken(p as u64))
                 } else {
-                    last_pos.map(|p| PaginationToken(p as u64))
+                    None
                 };
 
                 Ok((events, next))
@@ -624,6 +652,51 @@ mod tests {
             .unwrap();
         assert_eq!(page3.len(), 1);
         assert!(next3.is_none());
+    }
+
+    // E33: page size matches remaining exactly → no next token (trait
+    // post-condition: "token is None when no further events exist").
+    // Distinguishes "full page + more" from "full page + nothing past it".
+    #[tokio::test]
+    async fn room_messages_exact_remaining_returns_no_token() {
+        let s = store_with_room().await;
+        // store_with_room has 1 create event; add 1 more so total = 2.
+        s.persist_event(
+            &message(
+                event_id!("$m1:example.com"),
+                *ALICE_ROOM_ID,
+                *ALICE_ID,
+                "hi",
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+        let (events, next) = s
+            .room_messages(*ALICE_ROOM_ID, None, Direction::Forward, 2)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(next.is_none());
+    }
+
+    // E34: limit == 0 short-circuits — empty page, no token, even
+    // when more events exist. Degenerate caller input but defined.
+    #[tokio::test]
+    async fn room_messages_zero_limit_returns_empty() {
+        let s = store_with_room().await;
+        s.persist_event(
+            &message(event_id!("$m1:example.com"), *ALICE_ROOM_ID, *ALICE_ID, "hi"),
+            &[],
+        )
+        .await
+        .unwrap();
+        let (events, next) = s
+            .room_messages(*ALICE_ROOM_ID, None, Direction::Forward, 0)
+            .await
+            .unwrap();
+        assert!(events.is_empty());
+        assert!(next.is_none());
     }
 
     // E27: events from a different room not returned
