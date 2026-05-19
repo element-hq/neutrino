@@ -320,10 +320,7 @@ mod tests {
         // (c) both also visible via `events_after` — sanity-checks
         // stream_pos got assigned (AUTOINCREMENT path through
         // `write_into_tx`).
-        let stream = store
-            .events_after(StreamPos(0), 100)
-            .await
-            .unwrap();
+        let stream = store.events_after(StreamPos(0), 100).await.unwrap();
         let stream_ids: std::collections::HashSet<&str> =
             stream.iter().map(|(_, e)| e.event_id.as_str()).collect();
         assert!(stream_ids.contains("$c1:example.com"));
