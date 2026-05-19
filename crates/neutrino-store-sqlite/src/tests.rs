@@ -10,6 +10,7 @@ use serde_json::{Value, json, value::RawValue};
 
 use crate::SqliteStore;
 use crate::error::Error;
+use crate::row::EventRow;
 
 pub(crate) async fn store() -> SqliteStore {
     SqliteStore::open_in_memory().await.unwrap()
@@ -126,12 +127,18 @@ pub(crate) fn message(
     )
 }
 
-/// Insert a room + its `m.room.create` event via raw SQL, bypassing the
-/// `RoomStore` trait. Useful when a test wants the room (FK target) to
-/// exist but doesn't want — or doesn't have access to — a working
-/// `RoomStore` impl. The inserted create event uses the JSON shape from
-/// [`create_event`] so observable surfaces (`events_after`,
-/// `room_messages`, etc.) stay consistent with a real `create_room` call.
+/// Insert a room + its `m.room.create` event, bypassing the `RoomStore`
+/// trait's JSON validation. Useful when a test wants the room (FK target)
+/// to exist but doesn't want — or doesn't have access to — a working
+/// `RoomStore` impl.
+///
+/// The create event goes through [`EventRow::write_into_tx`], the same
+/// path `RoomStore::create_room` uses, so observable surfaces consistent
+/// with a real `create_room` call include `events_after`, `room_messages`,
+/// `event_edges`, and `current_state` (the create event lands as the
+/// `(room, "m.room.create", "")` state row). The watch is NOT advanced —
+/// tests subscribe-after-setup, and never rely on the watch for the
+/// create event.
 pub(crate) async fn setup_room(
     s: &SqliteStore,
     room_id: &RoomId,
@@ -139,10 +146,8 @@ pub(crate) async fn setup_room(
     create_event_id: &EventId,
 ) {
     let ce = create_event(create_event_id, room_id, user_id);
+    let row = EventRow::from(&ce).to_owned();
     let room_id = room_id.to_owned();
-    let user_id = user_id.to_owned();
-    let create_event_id = create_event_id.to_owned();
-    let json = ce.json.get().to_owned();
 
     s.run_write(move |conn| -> Result<(), Error> {
         let tx = conn.transaction()?;
@@ -150,20 +155,7 @@ pub(crate) async fn setup_room(
             "INSERT INTO rooms (room_id, room_version) VALUES (?, ?)",
             params![room_id.as_str(), "12"],
         )?;
-        tx.execute(
-            "INSERT INTO events \
-             (event_id, room_id, event_type, state_key, sender, origin_server_ts, json) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-            params![
-                create_event_id.as_str(),
-                room_id.as_str(),
-                "m.room.create",
-                "",
-                user_id.as_str(),
-                0_i64,
-                json,
-            ],
-        )?;
+        row.write_into_tx(&tx)?;
         tx.commit()?;
         Ok(())
     })
