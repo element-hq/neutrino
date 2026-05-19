@@ -116,7 +116,11 @@ async fn concurrent_writes_produce_unique_stream_positions() {
     let events = s.events_after(StreamPos(0), n + 100).await.unwrap();
     assert_eq!(events.len(), n + 1, "lost commits under contention");
     let positions: HashSet<u64> = events.iter().map(|(sp, _)| sp.0).collect();
-    assert_eq!(positions.len(), n + 1, "duplicate stream_pos under contention");
+    assert_eq!(
+        positions.len(),
+        n + 1,
+        "duplicate stream_pos under contention"
+    );
     let max = positions.iter().copied().max().unwrap();
     let min = positions.iter().copied().min().unwrap();
     assert_eq!(min, 1, "stream_pos doesn't start at 1");
@@ -218,7 +222,11 @@ async fn mixed_reads_and_writes_make_progress() {
 
     // Sanity check: every writer's commit is observable post-settle.
     let events = s.events_after(StreamPos(0), 100).await.unwrap();
-    assert_eq!(events.len(), n_writers + 1, "writes lost during mixed contention");
+    assert_eq!(
+        events.len(),
+        n_writers + 1,
+        "writes lost during mixed contention"
+    );
 }
 
 /// C5: re-`persist_event` of the same `event_id` is rejected (the
@@ -258,7 +266,12 @@ async fn duplicate_persist_event_under_contention_is_unique() {
         }
     }
     assert_eq!(ok, 1, "expected exactly one successful insert; got {ok}");
-    assert_eq!(invalid, n - 1, "expected {} InvalidInputs; got {invalid}", n - 1);
+    assert_eq!(
+        invalid,
+        n - 1,
+        "expected {} InvalidInputs; got {invalid}",
+        n - 1
+    );
 
     // Exactly one row landed.
     let events = s.events_after(StreamPos(0), 100).await.unwrap();
