@@ -1,7 +1,4 @@
 //! Shared test fixtures for in-crate unit tests.
-//!
-//! Mirror copy lives in `tests/common/mod.rs` for the integration tests
-//! (they're a separate crate and can't access `pub(crate)` items).
 
 use deadpool_sqlite::rusqlite::params;
 use neutrino_store::StoredEvent;
