@@ -61,13 +61,17 @@ CREATE UNIQUE INDEX ix_events_id_room_type_key
 
 -- ----------------------------------------------------------------------------
 -- event_edges — DagStore (events_before, missing_events)
--- Single table with edge_type (design Decision §6). No FK to events:
--- federation backfill may insert children referencing parents we haven't yet
--- seen. PK ordering (child, edge_type, parent) supports both "parents of
+-- Single table with edge_type (design Decision §6). No FK on
+-- `parent_event_id`: federation backfill may insert children referencing
+-- parents we haven't yet seen. There IS a FK on `child_event_id` —
+-- `write_into_tx` always inserts the child into `events` first within
+-- the same transaction, so a satisfiable FK on the child column is free
+-- correctness for any future write path that writes edges directly.
+-- PK ordering (child, edge_type, parent) supports both "parents of
 -- child" and "parents of child for a given edge_type" via PK prefix scans.
 -- ----------------------------------------------------------------------------
 CREATE TABLE event_edges (
-    child_event_id   TEXT NOT NULL,
+    child_event_id   TEXT NOT NULL REFERENCES events(event_id),
     edge_type        TEXT NOT NULL
         CHECK (edge_type IN ('prev', 'prev_state')),
     parent_event_id  TEXT NOT NULL,
