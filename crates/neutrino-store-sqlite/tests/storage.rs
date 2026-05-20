@@ -447,19 +447,11 @@ async fn member_left_no_longer_in_joined_rooms() {
 // X11: a forward-extension `persist_event` for the same
 // `(room, type, state_key)` as one of `create_room`'s `initial_events`
 // overwrites `current_state` — the unconditional UPSERT in
-// `row::write_into_tx` is last-writer-wins. Sequential test: the
-// writer pool is size-1, so awaiting `create_room` to completion
-// before issuing `persist_event` gives a deterministic "persist_event
-// committed *after* create_room" ordering without any concurrency
-// primitives. Complements X13, which pins the inverse for
-// `persist_historical_event` (doesn't regress current_state).
-//
-// An earlier version of this test spawned both writes concurrently
-// and retried on first-arriver collisions, but tokio scheduling
-// reliably gives `persist_event` (less pre-await work) the writer
-// slot first, so retries never converged. The race framing wasn't
-// load-bearing for what the test actually claims — sequential
-// awaits suffice.
+// `row::write_into_tx` is last-writer-wins. The two writes are
+// sequenced via `await`, which is sufficient to pin commit order
+// regardless of writer-pool shape. Complements X13, which pins the
+// inverse for `persist_historical_event` (doesn't regress
+// current_state).
 #[tokio::test]
 async fn persist_event_after_create_room_overwrites_initial_state() {
     let s = store().await;

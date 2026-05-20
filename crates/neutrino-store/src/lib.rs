@@ -158,10 +158,11 @@ pub trait EventStore: Send + Sync {
 
     /// Pre:  none.
     /// Post: returns a receiver whose value is the `StreamPos` of the most recently
-    ///       committed `persist_event`. Callers must subscribe *before* performing an
-    ///       initial DB query to avoid TOCTOU: any `persist_event` that commits during
-    ///       the query will have advanced the watch, so the first `changed()` call will
-    ///       resolve immediately and the follow-up query will see the new event.
+    ///       committed event — advanced by both `persist_event` and
+    ///       `persist_historical_event`. Callers must subscribe *before* performing
+    ///       an initial DB query to avoid TOCTOU: any persist that commits during
+    ///       the query will have advanced the watch, so the first `changed()` call
+    ///       will resolve immediately and the follow-up query will see the new event.
     fn subscribe(&self) -> watch::Receiver<StreamPos>;
 }
 
