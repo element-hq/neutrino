@@ -67,6 +67,31 @@ impl RoomStore for SqliteStore {
             .into());
         }
 
+        // v12 m.room.create is the genesis event — it has no parents.
+        // A create event that declares `prev_events` or `prev_state_events`
+        // would otherwise land silently and write orphan `event_edges` rows
+        // pointing at non-existent ancestors, which would then show up as
+        // federation-backfill boundaries on every DAG walk. Reject at the
+        // create boundary; arrays must be either absent or empty.
+        let prev_events_empty = parsed
+            .get("prev_events")
+            .is_none_or(|v| v.as_array().is_some_and(|a| a.is_empty()));
+        let prev_state_events_empty = parsed
+            .get("prev_state_events")
+            .is_none_or(|v| v.as_array().is_some_and(|a| a.is_empty()));
+        if !prev_events_empty {
+            return Err(Error::InvalidInput(
+                "create_event must not declare prev_events".into(),
+            )
+            .into());
+        }
+        if !prev_state_events_empty {
+            return Err(Error::InvalidInput(
+                "create_event must not declare prev_state_events".into(),
+            )
+            .into());
+        }
+
         let room_version = room_version.to_string();
 
         // Wrap borrowed events into `'static` `EventRow`s for the closure.
@@ -222,6 +247,65 @@ mod tests {
         );
         let result = store.create_room(&bad, &[]).await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    // R3d: m.room.create with non-empty prev_events is rejected. v12 spec:
+    // create is the genesis event, no parents. Without the gate, the
+    // create event lands and writes orphan event_edges rows that show up
+    // as federation-backfill boundaries on every subsequent DAG walk.
+    #[tokio::test]
+    async fn create_room_rejects_create_event_with_prev_events() {
+        use crate::tests::make_event_with_raw_json;
+        let store = store().await;
+        let bad = make_event_with_raw_json(
+            event_id!("$c1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.create",
+            Some(""),
+            r#"{
+                "content": {"creator": "@alice:example.com", "room_version": "12"},
+                "prev_events": ["$ghost:example.com"],
+                "prev_state_events": []
+            }"#,
+        );
+        let result = store.create_room(&bad, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+        assert_eq!(store.room_count().await.unwrap(), 0);
+    }
+
+    // R3e: same as R3d but for prev_state_events — the MSC4242 state-DAG
+    // genesis case. The create event itself bootstraps state, so it can't
+    // claim prior state ancestors.
+    #[tokio::test]
+    async fn create_room_rejects_create_event_with_prev_state_events() {
+        use crate::tests::make_event_with_raw_json;
+        let store = store().await;
+        let bad = make_event_with_raw_json(
+            event_id!("$c1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.create",
+            Some(""),
+            r#"{
+                "content": {"creator": "@alice:example.com", "room_version": "12"},
+                "prev_events": [],
+                "prev_state_events": ["$ghost:example.com"]
+            }"#,
+        );
+        let result = store.create_room(&bad, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+        assert_eq!(store.room_count().await.unwrap(), 0);
+    }
+
+    // R3f: arrays present but empty — accepted (this is the JSON shape
+    // our own test helpers emit for the create event).
+    #[tokio::test]
+    async fn create_room_accepts_empty_prev_arrays() {
+        let store = store().await;
+        let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
+        store.create_room(&ce, &[]).await.unwrap();
+        assert_eq!(store.room_count().await.unwrap(), 1);
     }
 
     // R4: top-level JSON is a string, not an object
