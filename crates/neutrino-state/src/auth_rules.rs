@@ -757,51 +757,49 @@ fn check_rule_10_power_levels(
 
     // 10.7 / 10.8: events and notifications maps.
     //
-    // Comparisons run on *effective* values, not raw `Option<i64>` presence.
-    // An entry absent from the map takes the spec-defined default for that
-    // map: `events_default` for `events`, and 50 for `notifications` (the
-    // only documented `notifications` default is `notifications.room = 50`;
-    // we apply it as the map-wide default for entries the spec doesn't name
-    // explicitly). Setting an entry explicitly to the prevailing default is
-    // therefore a no-op and does not trip 10.7 / 10.8.
-    for (property, cur_map, new_map, cur_default, new_default) in [
-        (
-            "events",
-            &cur_pl.events,
-            &new_pl.events,
-            cur_pl.events_default,
-            new_pl.events_default,
-        ),
+    // Raw-presence comparison, matching synapse `event_auth.py` —
+    // `_check_power_levels` only treats an entry as unchanged when both the
+    // old and new sides have it present AND equal. Adding an entry from
+    // absent to explicit-anything (including the spec default) counts as
+    // an addition under 10.8; removing one counts as a change under 10.7.
+    // No map-wide default is applied for `notifications`; the spec only
+    // documents `notifications.room = 50` and does not generalise.
+    for (property, cur_map, new_map) in [
+        ("events", &cur_pl.events, &new_pl.events),
         (
             "notifications",
             &cur_pl.notifications,
             &new_pl.notifications,
-            50,
-            50,
         ),
     ] {
         let mut all_keys: HashSet<&String> = HashSet::new();
         all_keys.extend(cur_map.keys());
         all_keys.extend(new_map.keys());
         for key in all_keys {
-            let cur_eff = cur_map.get(key).copied().unwrap_or(cur_default);
-            let new_eff = new_map.get(key).copied().unwrap_or(new_default);
-            if cur_eff == new_eff {
+            let cur_val = cur_map.get(key);
+            let new_val = new_map.get(key);
+            if let (Some(cv), Some(nv)) = (cur_val, new_val)
+                && cv == nv
+            {
                 continue;
             }
-            if cur_eff > sender_power {
+            if let Some(cv) = cur_val
+                && *cv > sender_power
+            {
                 return Err(AuthError::Rule10_7_CurrentEventEntryAboveSender {
                     property: property.to_string(),
                     key: key.clone(),
-                    value: cur_eff,
+                    value: *cv,
                     sender: sender_power,
                 });
             }
-            if new_eff > sender_power {
+            if let Some(nv) = new_val
+                && *nv > sender_power
+            {
                 return Err(AuthError::Rule10_8_NewEventEntryAboveSender {
                     property: property.to_string(),
                     key: key.clone(),
-                    value: new_eff,
+                    value: *nv,
                     sender: sender_power,
                 });
             }
@@ -2042,11 +2040,14 @@ mod tests {
     }
 
     #[test]
-    fn rule_10_7_8_explicit_at_default_is_noop() {
-        // Old PL has events_default=30 and no events["m.room.message"] entry
-        // (effective: 30). New PL adds events["m.room.message"]=30 explicitly.
-        // Effective values match — must NOT trip 10.7 / 10.8 even though raw
-        // Option<i64> presence differs.
+    fn rule_10_8_explicit_at_default_is_an_addition_synapse_parity() {
+        // Old PL has events_default=30 and no `events["m.room.message"]`
+        // entry. New PL adds `events["m.room.message"] = 30`.
+        //
+        // Synapse `event_auth.py::_check_power_levels` uses raw-presence
+        // comparison: old=None, new=Some(30) is *not* unchanged, so it falls
+        // through to the 10.8 power check — new (30) > sender (25) → reject.
+        // We match.
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
             "@alice:example.org",
@@ -2064,9 +2065,8 @@ mod tests {
             &[],
             json!({}),
         );
-        // Bob is at power 25 — below 30. If absent-vs-explicit-at-default
-        // were treated as a change, 10.8 would fire (new value 30 > 25).
-        // `state_default=0` so Bob can clear rule 8 to even reach rule 10.
+        // Bob at power 25, below the events_default of 30. `state_default=0`
+        // so Bob clears rule 8 to even reach rule 10.
         let pl1 = power_levels_event(
             "@alice:example.org",
             json!({
@@ -2087,7 +2087,10 @@ mod tests {
             }),
             "$pl2:example.org",
         );
-        check_auth_rules(&pl2, &st).expect("explicit-at-default is a no-op");
+        assert!(matches!(
+            check_auth_rules(&pl2, &st),
+            Err(AuthError::Rule10_8_NewEventEntryAboveSender { .. })
+        ));
     }
 
     // ---------- creator-vs-creator interactions ----------
