@@ -2,9 +2,19 @@
 //!
 //! Both methods do a BFS over `event_edges` (`edge_type = 'prev'`). The
 //! BFS frontier is queue-based; a `visited` set defends against malformed
-//! cycles (MSC4242 says the DAG is acyclic, but we don't trust it). Walks
-//! stop on `limit`, on missing parents (federation-backfill boundary), or
-//! on the `earliest` exclusion set in `missing_events`.
+//! cycles (MSC4242 says the DAG is acyclic, but we don't trust it). The
+//! walk as a whole terminates only on `limit` or an empty frontier;
+//! individual branches are *pruned* (not terminated) when:
+//!
+//! - a parent isn't in the local store, or sits in a different room
+//!   (federation-backfill boundary — [`hydrate_pdu`] returns `None` and
+//!   the walker keeps draining the rest of the frontier); or
+//! - the parent is in the `earliest` exclusion set passed to
+//!   `missing_events` (marked visited, skipped, its own parents are
+//!   never enqueued).
+//!
+//! So a missing parent in one subtree doesn't stop the BFS — siblings
+//! and the rest of the frontier still get walked.
 
 use std::collections::{HashSet, VecDeque};
 

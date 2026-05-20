@@ -1,16 +1,31 @@
 //! `StateStore` impl on `SqliteStore`.
 //!
-//! All queries JOIN `current_state` with `events` to project the
-//! [`crate::row::EVENT_COLUMNS_PREFIXED`] columns. The schema-level
-//! composite FK
-//! `current_state(event_id, room_id, event_type, state_key) →
-//! events(event_id, room_id, event_type, state_key)` (see `schema.sql`)
-//! guarantees that the two rows agree on all four columns, so a
-//! single-column JOIN on `cs.event_id = e.event_id` is sufficient — any
-//! desync between `current_state` and `events` is rejected at write
-//! time, not papered over at read time. The `joined_rooms` /
-//! `joined_members` queries match the partial-index `WHERE` clauses
-//! from `schema.sql` exactly so SQLite picks the indexes.
+//! Two query shapes, split by what the caller actually needs:
+//!
+//! - **State-event returns** (`current_room_state`,
+//!   `current_state_event`, `current_state_events_of_type`,
+//!   `joined_members`) JOIN `current_state` with `events` to project the
+//!   [`crate::row::EVENT_COLUMNS_PREFIXED`] columns. The schema-level
+//!   composite FK
+//!   `current_state(event_id, room_id, event_type, state_key) →
+//!   events(event_id, room_id, event_type, state_key)` (see
+//!   `schema.sql`) guarantees that the two rows agree on all four
+//!   columns, so a single-column JOIN on `cs.event_id = e.event_id` is
+//!   sufficient — any desync between `current_state` and `events` is
+//!   rejected at write time, not papered over at read time.
+//! - **Membership lookups** (`joined_rooms`, `rooms_with_membership`)
+//!   read from `current_state` only, filtering on the indexed
+//!   `membership` column. They deliberately don't JOIN `events` —
+//!   sliding sync calls these on every connect and we don't want to
+//!   load member-event JSON when the only fact the caller needs is "is
+//!   this user in this room with this membership". `joined_members`
+//!   *does* need the event row (it returns full `StoredEvent`s), so it
+//!   pays the JOIN; the partial index `ix_current_state_room_member`
+//!   still lets the planner narrow before the JOIN.
+//!
+//! The `joined_rooms` / `joined_members` / `rooms_with_membership`
+//! queries match the partial-index `WHERE` clauses from `schema.sql`
+//! exactly so SQLite picks the indexes.
 
 use std::collections::HashMap;
 
