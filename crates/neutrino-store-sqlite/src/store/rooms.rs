@@ -80,10 +80,9 @@ impl RoomStore for SqliteStore {
             .get("prev_state_events")
             .is_none_or(|v| v.as_array().is_some_and(|a| a.is_empty()));
         if !prev_events_empty {
-            return Err(Error::InvalidInput(
-                "create_event must not declare prev_events".into(),
-            )
-            .into());
+            return Err(
+                Error::InvalidInput("create_event must not declare prev_events".into()).into(),
+            );
         }
         if !prev_state_events_empty {
             return Err(Error::InvalidInput(
