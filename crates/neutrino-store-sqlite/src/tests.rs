@@ -92,6 +92,17 @@ pub(crate) fn member_join(event_id: &EventId, room_id: &RoomId, user_id: &UserId
     )
 }
 
+pub(crate) fn member_leave(event_id: &EventId, room_id: &RoomId, user_id: &UserId) -> StoredEvent {
+    make_event(
+        event_id,
+        room_id,
+        user_id,
+        "m.room.member",
+        Some(user_id.as_str()),
+        json!({"membership": "leave"}),
+    )
+}
+
 pub(crate) fn name_event(
     event_id: &EventId,
     room_id: &RoomId,
@@ -158,4 +169,39 @@ pub(crate) async fn setup_room(
     })
     .await
     .unwrap();
+}
+
+/// Message event with caller-supplied `prev_events`. Used by the DAG
+/// tests to build specific chain / branch / cycle shapes.
+pub(crate) fn message_with_prev(
+    event_id: &EventId,
+    room_id: &RoomId,
+    sender: &UserId,
+    body: &str,
+    prev_events: &[&EventId],
+) -> StoredEvent {
+    let prev_event_strs: Vec<&str> = prev_events.iter().map(|e| e.as_str()).collect();
+    let json_val = json!({
+        "event_id": event_id.as_str(),
+        "room_id": room_id.as_str(),
+        "sender": sender.as_str(),
+        "type": "m.room.message",
+        "state_key": Option::<String>::None,
+        "content": {"body": body, "msgtype": "m.text"},
+        "origin_server_ts": 0,
+        "prev_events": prev_event_strs,
+        "prev_state_events": [],
+    });
+    let json_str = serde_json::to_string(&json_val).unwrap();
+    let json = RawValue::from_string(json_str).unwrap();
+
+    StoredEvent {
+        event_id: event_id.to_owned(),
+        room_id: room_id.to_owned(),
+        event_type: "m.room.message".to_owned(),
+        state_key: None,
+        sender: sender.to_owned(),
+        origin_server_ts: 0,
+        json,
+    }
 }
