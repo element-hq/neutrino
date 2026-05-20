@@ -468,7 +468,11 @@ async fn persist_event_after_create_room_overwrites_initial_state() {
 
     s.create_room(
         &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-        &[member_join(initial_member_id, *ALICE_ROOM_ID, *ALICE_USER_ID)],
+        &[member_join(
+            initial_member_id,
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+        )],
     )
     .await
     .unwrap();
@@ -593,10 +597,7 @@ async fn persist_historical_event_does_not_regress_current_state() {
 
     // And the historical event itself is in the events table for the
     // backfill / DAG-walk surface.
-    let got = s
-        .get_events(&[event_id!("$old_leave:e")])
-        .await
-        .unwrap();
+    let got = s.get_events(&[event_id!("$old_leave:e")]).await.unwrap();
     assert_eq!(
         got.len(),
         1,
