@@ -131,8 +131,30 @@ impl<'a> EventRow<'a> {
     /// remote members and the initial-event batch advances the watch
     /// once at the end).
     pub fn write_into_tx(&self, tx: &Transaction<'_>) -> Result<i64, Error> {
+        // Inline cracker for the JSON fields we need *and* the ones we
+        // cross-check against the `StoredEvent` columns. A caller that
+        // passes a `StoredEvent` whose column values disagree with the
+        // raw JSON (different `type`, `room_id`, `sender`, or
+        // `state_key`) could otherwise silently desync the two tables:
+        // every read path projects the columns, but federation re-emits
+        // the raw JSON, so a downstream consumer would see one shape via
+        // the trait and another via the wire. Reject at the write
+        // boundary instead — defence-in-depth against a buggy upstream
+        // caller; the trust boundary still nominally lives at the
+        // handler.
         #[derive(Deserialize)]
         struct CrackedEvent {
+            #[serde(rename = "type", default)]
+            event_type: Option<String>,
+            #[serde(default)]
+            room_id: Option<String>,
+            #[serde(default)]
+            sender: Option<String>,
+            // Outer-None = field absent in JSON (skip cross-check);
+            // outer-Some(inner) = field present (inner is the actual
+            // state_key, which may itself be JSON `null` → Rust None).
+            #[serde(default)]
+            state_key: Option<Option<String>>,
             #[serde(default)]
             prev_events: Vec<String>,
             #[serde(default)]
@@ -147,6 +169,49 @@ impl<'a> EventRow<'a> {
 
         let cracked: CrackedEvent = serde_json::from_str(self.json.get())
             .map_err(|e| Error::InvalidInput(format!("event json: {e}")))?;
+
+        // Cross-check every column against the JSON copy. A `None` on
+        // the JSON side means "field absent"; we treat that as agreement
+        // since the column is the canonical value (callers building a
+        // `StoredEvent` may legitimately omit redundant fields from the
+        // JSON, though the test helpers always emit them). A `Some`
+        // that disagrees with the column is a hard reject. For
+        // `state_key` the JSON value is `Option<Option<String>>`:
+        // outer-None = field absent (skip check), outer-Some = present
+        // (inner is the actual state_key, which may itself be JSON
+        // null → Rust None).
+        if let Some(t) = cracked.event_type.as_deref()
+            && t != self.event_type
+        {
+            return Err(Error::InvalidInput(format!(
+                "event.json `type` ({t:?}) disagrees with column `event_type` ({:?})",
+                self.event_type
+            )));
+        }
+        if let Some(r) = cracked.room_id.as_deref()
+            && r != self.room_id.as_str()
+        {
+            return Err(Error::InvalidInput(format!(
+                "event.json `room_id` ({r:?}) disagrees with column `room_id` ({:?})",
+                self.room_id.as_str()
+            )));
+        }
+        if let Some(s) = cracked.sender.as_deref()
+            && s != self.sender.as_str()
+        {
+            return Err(Error::InvalidInput(format!(
+                "event.json `sender` ({s:?}) disagrees with column `sender` ({:?})",
+                self.sender.as_str()
+            )));
+        }
+        if let Some(json_state_key) = cracked.state_key.as_ref()
+            && json_state_key.as_deref() != self.state_key.as_deref()
+        {
+            return Err(Error::InvalidInput(format!(
+                "event.json `state_key` ({:?}) disagrees with column `state_key` ({:?})",
+                json_state_key, self.state_key
+            )));
+        }
 
         // `membership` is non-NULL exactly for `m.room.member` rows per
         // the schema comment; that invariant is what makes

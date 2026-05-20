@@ -11,10 +11,29 @@
 //! in `docs/2026-05-18-read-write-pool-split.md`.
 
 use std::path::Path;
+use std::time::Duration;
 
 use deadpool_sqlite::{Config, Hook, HookError, Pool, Runtime, rusqlite::Connection};
 use neutrino_store::{StorageError, StreamPos};
 use tokio::sync::watch;
+
+/// Wall-clock ceiling for any single `run_write` call. The writer pool is
+/// size-1 and the underlying `spawn_blocking` thread cannot be cancelled,
+/// so a hung closure would otherwise stall every subsequent writer for
+/// the lifetime of the process (pool-split doc §6). The timeout doesn't
+/// *unstall* the writer — the blocking thread keeps running and the
+/// connection is still held — but it surfaces the failure to the caller
+/// as `Internal("write timed out")` instead of letting the await hang
+/// forever. 30 s is well past any expected SQLite write under embedded
+/// load while still being short enough to catch a genuine deadlock /
+/// runaway loop in development.
+///
+/// Tests override to a short duration so the timeout arm is reachable
+/// without burning 30 s of CI time per case.
+#[cfg(not(test))]
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 mod error;
 mod row;
@@ -63,6 +82,21 @@ impl SqliteStore {
     /// readers would never observe writes. Use the shared-cache URI with
     /// a per-store UUID so both pools attach to the same in-memory DB
     /// while staying isolated across tests.
+    ///
+    /// # Concurrency caveat
+    ///
+    /// The shared-cache backing engages SQLite's in-process shared-cache
+    /// lock manager, which serialises reader/writer transactions and
+    /// *does not* invoke `busy_handler` (sqlite.org/sharedcache.html).
+    /// `SQLITE_LOCKED_SHAREDCACHE` therefore surfaces past
+    /// `PRAGMA busy_timeout = 5000` and shows up as panics on the
+    /// reader side when a writer holds an in-flight transaction.
+    /// **Safe for single-task and single-worker tests; not safe for
+    /// concurrent reader+writer workloads.** Use file-backed
+    /// [`SqliteStore::open`] on a `tempfile::NamedTempFile` for any test
+    /// that exercises the concurrent reader/writer surface. See
+    /// `docs/2026-05-18-read-write-pool-split.md` §5 for the full
+    /// rationale.
     pub async fn open_in_memory() -> Result<Self, StorageError> {
         let name = uuid::Uuid::new_v4();
         let uri = format!("file:neutrino-store-{name}?mode=memory&cache=shared");
@@ -158,14 +192,28 @@ impl SqliteStore {
     /// queue here rather than racing the SQLite write lock. Read-
     /// modify-write closures stay on this connection so they see their
     /// own uncommitted state inside the transaction.
+    ///
+    /// Bounded by [`WRITE_TIMEOUT`]: a hung closure surfaces as
+    /// `Internal("write timed out")` instead of an indefinite hang on
+    /// the await. The timeout covers the *entire* call — both the FIFO
+    /// queue wait and the blocking closure — so a writer queued behind
+    /// a hung one will also surface a timeout rather than wait forever.
     pub(crate) async fn run_write<F, T>(&self, f: F) -> Result<T, StorageError>
     where
         F: FnOnce(&mut Connection) -> Result<T, Error> + Send + 'static,
         T: Send + 'static,
     {
-        let obj = self.writer_pool.get().await.map_err(Error::Pool)?;
-        let inner = obj.interact(f).await.map_err(Error::Interact)?;
-        inner.map_err(StorageError::from)
+        let fut = async {
+            let obj = self.writer_pool.get().await.map_err(Error::Pool)?;
+            let inner = obj.interact(f).await.map_err(Error::Interact)?;
+            inner.map_err(StorageError::from)
+        };
+        match tokio::time::timeout(WRITE_TIMEOUT, fut).await {
+            Ok(res) => res,
+            Err(_) => Err(StorageError::Internal(format!(
+                "write timed out after {WRITE_TIMEOUT:?}"
+            ))),
+        }
     }
 }
 
@@ -191,4 +239,41 @@ fn build_pool(cfg: Config, max_size: usize, query_only: bool) -> Result<Pool, Er
         }))
         .build()
         .map_err(Error::Build)
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use std::time::{Duration, Instant};
+
+    use neutrino_store::StorageError;
+
+    use crate::{SqliteStore, WRITE_TIMEOUT, error::Error};
+
+    /// A `run_write` closure that exceeds [`WRITE_TIMEOUT`] surfaces as
+    /// `Internal("write timed out")` instead of hanging the caller
+    /// indefinitely. Sleeps inside `spawn_blocking` (legal — that's its
+    /// whole point), bypassing the pool's recycle path; the test asserts
+    /// the wall-clock cost is bounded by the timeout, not the closure's
+    /// sleep duration.
+    #[tokio::test]
+    async fn run_write_times_out_on_long_closure() {
+        let s = SqliteStore::open_in_memory().await.unwrap();
+        let sleep_for = WRITE_TIMEOUT * 3;
+        let start = Instant::now();
+        let result: Result<(), StorageError> = s
+            .run_write(move |_conn| -> Result<(), Error> {
+                std::thread::sleep(sleep_for);
+                Ok(())
+            })
+            .await;
+        let elapsed = start.elapsed();
+        match result {
+            Err(StorageError::Internal(msg)) if msg.contains("write timed out") => {}
+            other => panic!("expected Internal(\"write timed out\"); got {other:?}"),
+        }
+        assert!(
+            elapsed < WRITE_TIMEOUT + Duration::from_secs(1),
+            "run_write returned after {elapsed:?}; expected ≈ {WRITE_TIMEOUT:?}"
+        );
+    }
 }

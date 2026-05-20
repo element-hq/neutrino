@@ -1009,6 +1009,39 @@ mod tests {
         );
     }
 
+    // D25: schema-level — the FK `event_edges.child_event_id REFERENCES
+    // events(event_id)` rejects orphan-child edges. `write_into_tx`
+    // always INSERTs the child event before any edges within the same
+    // transaction (so the FK is naturally satisfied on the canonical
+    // write path); this test exercises the schema directly to pin the
+    // constraint, against a future write path that tries to insert
+    // edges first.
+    #[tokio::test]
+    async fn event_edges_rejects_orphan_child() {
+        use deadpool_sqlite::rusqlite::params;
+
+        use crate::error::Error;
+
+        let s = store_with_room().await;
+        let err = s
+            .run_write(|conn| -> Result<(), Error> {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "INSERT INTO event_edges (child_event_id, edge_type, parent_event_id) \
+                     VALUES (?, ?, ?)",
+                    params!["$orphan_child:e", "prev", "$create:e"],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .expect_err("FK on child_event_id must reject orphan-child edge");
+        assert!(
+            matches!(err, neutrino_store::StorageError::InvalidInput(_)),
+            "expected InvalidInput from FK violation, got {err:?}"
+        );
+    }
+
     // D17: multi-seed `latest` mirrors D12 for missing_events. The
     // `earliest` set is empty so the result must match the events_before
     // shape exactly — same interleaved BFS order from both seeds.

@@ -375,6 +375,133 @@ mod tests {
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
 
+    // E4a-d: `StoredEvent` columns must agree with the raw JSON copy on
+    // every axis where both are present. Defence-in-depth at the storage
+    // write boundary — a buggy caller (or a future code path) that
+    // builds a `StoredEvent` with column values disagreeing with the
+    // JSON would otherwise silently desync the two surfaces (column
+    // reads vs. wire re-emission).
+    #[tokio::test]
+    async fn persist_event_rejects_event_type_column_json_mismatch() {
+        let s = store_with_room().await;
+        // Column says `m.room.message`; JSON says `m.room.member`.
+        let bad = make_event_with_raw_json(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.message",
+            None,
+            r#"{
+                "type": "m.room.member",
+                "room_id": "!r1:example.com",
+                "sender": "@alice:example.com",
+                "state_key": null,
+                "content": {},
+                "origin_server_ts": 0,
+                "prev_events": [],
+                "prev_state_events": []
+            }"#,
+        );
+        let result = s.persist_event(&bad, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn persist_event_rejects_room_id_column_json_mismatch() {
+        let s = store_with_room().await;
+        let bad = make_event_with_raw_json(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.message",
+            None,
+            r#"{
+                "type": "m.room.message",
+                "room_id": "!r2:example.com",
+                "sender": "@alice:example.com",
+                "state_key": null,
+                "content": {},
+                "origin_server_ts": 0,
+                "prev_events": [],
+                "prev_state_events": []
+            }"#,
+        );
+        let result = s.persist_event(&bad, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn persist_event_rejects_sender_column_json_mismatch() {
+        let s = store_with_room().await;
+        let bad = make_event_with_raw_json(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.message",
+            None,
+            r#"{
+                "type": "m.room.message",
+                "room_id": "!r1:example.com",
+                "sender": "@bob:example.com",
+                "state_key": null,
+                "content": {},
+                "origin_server_ts": 0,
+                "prev_events": [],
+                "prev_state_events": []
+            }"#,
+        );
+        let result = s.persist_event(&bad, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn persist_event_rejects_state_key_column_json_mismatch() {
+        let s = store_with_room().await;
+        // Column says state_key = Some(""); JSON says state_key = "wrong".
+        let bad = make_event_with_raw_json(
+            event_id!("$n1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.name",
+            Some(""),
+            r#"{
+                "type": "m.room.name",
+                "room_id": "!r1:example.com",
+                "sender": "@alice:example.com",
+                "state_key": "wrong",
+                "content": {"name": "X"},
+                "origin_server_ts": 0,
+                "prev_events": [],
+                "prev_state_events": []
+            }"#,
+        );
+        let result = s.persist_event(&bad, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    // E4e: JSON omitting any of the cross-checked fields is allowed — the
+    // column is the canonical value, and a caller is free to elide
+    // redundant fields from the JSON copy. (Today's test helpers always
+    // emit them, but the trait surface doesn't require it.)
+    #[tokio::test]
+    async fn persist_event_accepts_json_missing_cross_check_fields() {
+        let s = store_with_room().await;
+        let ok = make_event_with_raw_json(
+            event_id!("$m1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.message",
+            None,
+            r#"{
+                "content": {"body": "hi", "msgtype": "m.text"},
+                "origin_server_ts": 0,
+                "prev_events": [],
+                "prev_state_events": []
+            }"#,
+        );
+        s.persist_event(&ok, &[]).await.unwrap();
+    }
+
     // E12: get_client_txn on unrecorded → None
     #[tokio::test]
     async fn get_client_txn_none_for_unrecorded() {
@@ -583,6 +710,70 @@ mod tests {
         for w in result.windows(2) {
             assert!(w[0].0 < w[1].0);
         }
+    }
+
+    // E22b: `events_after` is intentionally global — no `room_id` filter.
+    // Sliding sync's per-connection state walks the cross-room stream and
+    // post-filters in the handler, so the trait surface returns events
+    // from every room interleaved in commit order. Pin the behaviour with
+    // a multi-room test so a future change that adds room-scoping (or
+    // drops it) is flagged.
+    #[tokio::test]
+    async fn events_after_returns_events_across_rooms() {
+        let s = store().await;
+        setup_room(
+            &s,
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            event_id!("$cA:example.com"),
+        )
+        .await;
+        setup_room(
+            &s,
+            *BOB_ROOM_ID,
+            *ALICE_USER_ID,
+            event_id!("$cB:example.com"),
+        )
+        .await;
+        s.persist_event(
+            &message(
+                event_id!("$mA:example.com"),
+                *ALICE_ROOM_ID,
+                *ALICE_USER_ID,
+                "in A",
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+        s.persist_event(
+            &message(
+                event_id!("$mB:example.com"),
+                *BOB_ROOM_ID,
+                *ALICE_USER_ID,
+                "in B",
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let result = s.events_after(StreamPos(0), 100).await.unwrap();
+        let rooms: std::collections::HashSet<&str> =
+            result.iter().map(|(_, e)| e.room_id.as_str()).collect();
+        assert!(
+            rooms.contains(ALICE_ROOM_ID.as_str()),
+            "events_after must surface room A events"
+        );
+        assert!(
+            rooms.contains(BOB_ROOM_ID.as_str()),
+            "events_after must surface room B events"
+        );
+        assert_eq!(
+            result.len(),
+            4,
+            "expected 2 creates + 2 messages across both rooms"
+        );
     }
 
     // E33: huge starting pos → empty
