@@ -5,6 +5,7 @@ use serde_json::value::RawValue;
 use thiserror::Error;
 
 pub mod auth_events;
+pub mod auth_rules;
 pub mod provider;
 pub mod validate;
 
@@ -143,9 +144,157 @@ pub enum FormatError {
 
 /// Errors raised by the v12 authorization rules (phase 3).
 ///
-/// Variants are added by the phase that produces them.
+/// Variant names track the spec rule number (e.g. `Rule5_3_2_SenderMismatch`
+/// names the 5.3.2 reject path). Cross-phase rules (1, 2, 9, 10.1–10.3) are
+/// not here — they raise `FormatError` / `ReferenceError` instead.
+#[allow(non_camel_case_types)] // variant names track v12 spec rule numbers
 #[derive(Debug, Error)]
-pub enum AuthError {}
+pub enum AuthError {
+    /// Internal: state-before-event lacks `m.room.create`. Should be
+    /// impossible — `validate::validate_references` already verified the
+    /// room exists — but the type is needed so auth checks can return
+    /// rather than panic.
+    #[error("internal: state-before-event missing m.room.create")]
+    CreateMissing,
+
+    /// Rule 4: federation cross-domain mismatch with `m.federate: false`.
+    #[error(
+        "rule 4: m.federate=false but sender domain `{sender_domain}` ≠ create domain `{create_domain}`"
+    )]
+    Rule4FederationDisallowed {
+        sender_domain: String,
+        create_domain: String,
+    },
+
+    /// Rule 5.3.2: join with `sender` ≠ `state_key`.
+    #[error("rule 5.3.2: join sender does not match state_key")]
+    Rule5_3_2_JoinSenderMismatch,
+    /// Rule 5.3.3: join while banned.
+    #[error("rule 5.3.3: join attempted while sender is banned")]
+    Rule5_3_3_JoinWhileBanned,
+    /// Rule 5.3.4: invite/knock join_rule but sender not invited or already in
+    /// a state that permits join.
+    #[error("rule 5.3.4: invite/knock join_rule disallows join from current membership")]
+    Rule5_3_4_JoinNotInvited,
+    /// Rule 5.3.5: restricted/knock_restricted join_rule and authoriser is
+    /// invalid (not a joined member or lacks invite power).
+    #[error("rule 5.3.5: restricted-join authoriser is invalid")]
+    Rule5_3_5_RestrictedAuthoriserInvalid,
+    /// Rule 5.3.7: catch-all for `join` rejection.
+    #[error("rule 5.3.7: join not allowed by current join_rule")]
+    Rule5_3_7_JoinNotAllowed,
+
+    /// Rule 5.4.1.*: third-party invite path failed validation.
+    #[error("rule 5.4.1: third-party invite invalid: {0}")]
+    Rule5_4_1_ThirdPartyInviteInvalid(&'static str),
+    /// Rule 5.4.2: invite sender not joined.
+    #[error("rule 5.4.2: invite sender is not joined")]
+    Rule5_4_2_InviteSenderNotJoined,
+    /// Rule 5.4.3: invite target already joined or banned.
+    #[error("rule 5.4.3: invite target is already joined or banned")]
+    Rule5_4_3_InviteTargetJoinedOrBanned,
+    /// Rule 5.4.5: invite sender power below the invite level.
+    #[error("rule 5.4.5: invite sender power {sender} below invite level {needed}")]
+    Rule5_4_5_InvitePowerInsufficient { sender: i64, needed: i64 },
+
+    /// Rule 5.5.1: self-leave from a membership that isn't invite/join/knock.
+    #[error("rule 5.5.1: self-leave from invalid current membership")]
+    Rule5_5_1_SelfLeaveInvalid,
+    /// Rule 5.5.2: leave (kick) sender not joined.
+    #[error("rule 5.5.2: leave sender is not joined")]
+    Rule5_5_2_LeaveSenderNotJoined,
+    /// Rule 5.5.3: unban attempted but sender's power below ban level.
+    #[error("rule 5.5.3: unban requires power {needed}, sender has {sender}")]
+    Rule5_5_3_UnbanInsufficient { sender: i64, needed: i64 },
+    /// Rule 5.5.5: kick not permitted.
+    #[error("rule 5.5.5: kick not permitted (insufficient power or target outranks sender)")]
+    Rule5_5_5_KickNotAllowed,
+
+    /// Rule 5.6.1: ban sender not joined.
+    #[error("rule 5.6.1: ban sender is not joined")]
+    Rule5_6_1_BanSenderNotJoined,
+    /// Rule 5.6.3: ban not permitted.
+    #[error("rule 5.6.3: ban not permitted (insufficient power or target outranks sender)")]
+    Rule5_6_3_BanNotAllowed,
+
+    /// Rule 5.7.1: knock attempted on a non-knockable room.
+    #[error("rule 5.7.1: knock attempted on a non-knockable room")]
+    Rule5_7_1_KnockNotKnockable,
+    /// Rule 5.7.2: knock sender ≠ state_key.
+    #[error("rule 5.7.2: knock sender does not match state_key")]
+    Rule5_7_2_KnockSenderMismatch,
+    /// Rule 5.7.4: knock from an invalid current membership (ban / invite / join).
+    #[error("rule 5.7.4: knock from invalid current membership")]
+    Rule5_7_4_KnockFromInvalidMembership,
+
+    /// Rule 5.8: membership is not one of the recognised values.
+    #[error("rule 5.8: unknown membership `{0}`")]
+    Rule5_8_UnknownMembership(String),
+
+    /// Rule 6: non-member event from a non-joined sender.
+    #[error("rule 6: sender is not joined")]
+    Rule6_SenderNotJoined,
+
+    /// Rule 7: third-party invite below invite level.
+    #[error("rule 7: third_party_invite below invite level (sender {sender}, needed {needed})")]
+    Rule7_ThirdPartyInviteInsufficient { sender: i64, needed: i64 },
+
+    /// Rule 8: sender lacks required power for this event type.
+    #[error("rule 8: event `{event_type}` requires power {required}, sender has {sender}")]
+    Rule8_RequiredPowerInsufficient {
+        event_type: String,
+        required: i64,
+        sender: i64,
+    },
+
+    /// Rule 10.4: power_levels lists a creator in `users`.
+    #[error("rule 10.4: power_levels.users names a creator (`{0}`)")]
+    Rule10_4_CreatorInUsers(OwnedUserId),
+    /// Rule 10.6.1: default-level current value above sender.
+    #[error("rule 10.6.1: default `{property}` current value {value} above sender power {sender}")]
+    Rule10_6_1_CurrentDefaultAboveSender {
+        property: String,
+        value: i64,
+        sender: i64,
+    },
+    /// Rule 10.6.2: default-level new value above sender.
+    #[error("rule 10.6.2: default `{property}` new value {value} above sender power {sender}")]
+    Rule10_6_2_NewDefaultAboveSender {
+        property: String,
+        value: i64,
+        sender: i64,
+    },
+    /// Rule 10.7: events/notifications entry change/removal above sender.
+    #[error("rule 10.7: `{property}.{key}` current value {value} above sender power {sender}")]
+    Rule10_7_CurrentEventEntryAboveSender {
+        property: String,
+        key: String,
+        value: i64,
+        sender: i64,
+    },
+    /// Rule 10.8: events/notifications entry addition/change above sender.
+    #[error("rule 10.8: `{property}.{key}` new value {value} above sender power {sender}")]
+    Rule10_8_NewEventEntryAboveSender {
+        property: String,
+        key: String,
+        value: i64,
+        sender: i64,
+    },
+    /// Rule 10.9: users entry change/removal at or above sender (non-self).
+    #[error("rule 10.9: `users.{user}` current value {value} ≥ sender power {sender}")]
+    Rule10_9_CurrentUsersEntryAtOrAboveSender {
+        user: OwnedUserId,
+        value: i64,
+        sender: i64,
+    },
+    /// Rule 10.10: users entry addition/change above sender.
+    #[error("rule 10.10: `users.{user}` new value {value} above sender power {sender}")]
+    Rule10_10_NewUsersEntryAboveSender {
+        user: OwnedUserId,
+        value: i64,
+        sender: i64,
+    },
+}
 
 /// Errors raised by reference validation (phase 1b) — the event's references
 /// (room, `prev_state_events`) must exist in the store and meet their

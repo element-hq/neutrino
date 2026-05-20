@@ -1,8 +1,9 @@
 //! Read-side interface the state machine uses to look up events.
 //!
 //! Implementations are expected to be `Sync` and cheap to query. The trait
-//! grows as later phases land; today it carries only what Phase 1b
-//! (`validate::validate_references`) needs.
+//! grows as later phases land; today it carries only what
+//! `validate::validate_references` (Phase 1b) needs. Phase 5 (in-memory
+//! provider) will extend it for state resolution.
 
 use std::sync::Arc;
 

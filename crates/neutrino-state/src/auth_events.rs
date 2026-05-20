@@ -331,7 +331,8 @@ mod tests {
     #[test]
     fn unrecognised_membership_excludes_join_rules() {
         // Defensive: an unknown membership value (not in {join, invite,
-        // knock}) doesn't pull in join_rules. Phase 3 rejects via rule 5.8.
+        // knock}) doesn't pull in join_rules. `auth_rules::check_rule_5_member`
+        // rejects unknown values via rule 5.8 (`Rule5_8_UnknownMembership`).
         let ev = member(
             "@alice:example.org",
             "@bob:example.org",
