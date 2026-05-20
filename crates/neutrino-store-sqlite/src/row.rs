@@ -121,9 +121,9 @@ impl<'a> EventRow<'a> {
         EventRow::from(self.0.as_ref().clone())
     }
 
-    /// One-shot event write: crack JSON, INSERT into `events`, INSERT
-    /// edges, upsert current state if it's a state event. Returns the new
-    /// `stream_pos`. Shared between `persist_event` and `create_room`.
+    /// Forward-extension write: crack JSON, INSERT into `events`, INSERT
+    /// edges, upsert `current_state` if it's a state event. Returns the
+    /// new `stream_pos`. Used by `persist_event` and `create_room`.
     ///
     /// Does NOT touch the outbox or fire the watch — those are the
     /// caller's responsibility (`persist_event` writes outbox rows + fires
@@ -131,6 +131,27 @@ impl<'a> EventRow<'a> {
     /// remote members and the initial-event batch advances the watch
     /// once at the end).
     pub fn write_into_tx(&self, tx: &Transaction<'_>) -> Result<i64, Error> {
+        self.write_into_tx_inner(tx, /* update_current_state */ true)
+    }
+
+    /// Historical-backfill write: crack JSON, INSERT into `events`,
+    /// INSERT edges. Does NOT upsert `current_state` — used by
+    /// `persist_historical_event` for events older than the current head
+    /// (`/backfill`, `/get_missing_events`). Current state already
+    /// reflects the room's resolved head; backfilled state events feed
+    /// history (`events_before`, `room_messages`) but must not regress
+    /// the current-state view. JSON cracking, column ↔ JSON cross-
+    /// checks, and member-event validation still fire — historical
+    /// events have to be well-formed for the read paths to function.
+    pub fn write_into_tx_historical(&self, tx: &Transaction<'_>) -> Result<i64, Error> {
+        self.write_into_tx_inner(tx, /* update_current_state */ false)
+    }
+
+    fn write_into_tx_inner(
+        &self,
+        tx: &Transaction<'_>,
+        update_current_state: bool,
+    ) -> Result<i64, Error> {
         // Inline cracker for the JSON fields we need *and* the ones we
         // cross-check against the `StoredEvent` columns. A caller that
         // passes a `StoredEvent` whose column values disagree with the
@@ -271,7 +292,7 @@ impl<'a> EventRow<'a> {
             }
         }
 
-        if let Some(sk) = self.state_key.as_deref() {
+        if update_current_state && let Some(sk) = self.state_key.as_deref() {
             tx.execute(
                 "INSERT INTO current_state \
                  (room_id, event_type, state_key, event_id, membership) \
