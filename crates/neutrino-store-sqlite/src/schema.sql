@@ -44,6 +44,14 @@ CREATE TABLE events (
 
 CREATE INDEX ix_events_room_stream ON events(room_id, stream_pos);
 
+-- Supporting UNIQUE index for the composite FK on `current_state` below.
+-- `event_id` alone is already UNIQUE, so any superset of columns including
+-- it is also unique — but SQLite needs an index whose column list matches
+-- the FK's parent-key column list verbatim. Without this, the FK on
+-- `current_state(event_id, room_id, event_type, state_key)` won't compile.
+CREATE UNIQUE INDEX ix_events_id_room_type_key
+    ON events(event_id, room_id, event_type, state_key);
+
 -- ----------------------------------------------------------------------------
 -- event_edges — DagStore (events_before, missing_events)
 -- Single table with edge_type (design Decision §6). No FK to events:
@@ -65,31 +73,81 @@ CREATE TABLE event_edges (
 -- state. Superseded historical events live in `events` only.
 -- state_key is TEXT NOT NULL — the empty string is a valid state key
 -- (m.room.create, m.room.power_levels, etc.), only SQL NULL is disallowed.
--- `membership` is non-NULL exactly for m.room.member rows; carries the
--- canonical value so joined_rooms / joined_members can filter via an
--- indexed column without loading event JSON (per the post-condition).
+-- `membership` is non-NULL exactly for m.room.member rows, enforced by
+-- the CHECK below — m.room.member must hold a canonical value, every
+-- other event_type must be NULL. This catches the case where a malformed
+-- m.room.member event with no `content.membership` would otherwise have
+-- been silently persisted with NULL membership and then quietly filtered
+-- out of joined_rooms / joined_members.
+--
+-- The composite FK on (event_id, room_id, event_type, state_key) enforces
+-- that every current_state row references an `events` row that agrees on
+-- all four columns — not just `event_id`. A single-column FK would let a
+-- buggy or corrupted write desync the two tables (cs row points at an
+-- event in another room, or at an event with a different event_type /
+-- state_key, or at a non-state event whose state_key IS NULL), which
+-- would leak through every StateStore read path. With the composite FK
+-- the schema rejects those writes outright. SQL three-valued logic
+-- handles the non-state case naturally: `events.state_key IS NULL` makes
+-- the FK equality UNKNOWN, so the FK match never resolves to TRUE.
+-- See state.rs module docstring for the read-side consequence (JOINs
+-- only need `cs.event_id = e.event_id`).
 -- ----------------------------------------------------------------------------
 CREATE TABLE current_state (
     room_id      TEXT NOT NULL,
     event_type   TEXT NOT NULL,
     state_key    TEXT NOT NULL,
-    event_id     TEXT NOT NULL REFERENCES events(event_id),
-    membership   TEXT
-        CHECK (membership IS NULL
-               OR membership IN ('join','leave','ban','invite','knock')),
-    PRIMARY KEY (room_id, event_type, state_key)
+    event_id     TEXT NOT NULL,
+    membership   TEXT,
+    PRIMARY KEY (room_id, event_type, state_key),
+    -- `membership` ⇔ `event_type = 'm.room.member'`. The two-branch CHECK
+    -- bundles the existing "valid-value-or-NULL" restriction with the
+    -- new structural invariant: member rows must carry one of the five
+    -- canonical membership values, non-member rows must be NULL.
+    --
+    -- The `membership IS NOT NULL` guard on the first branch is
+    -- load-bearing under SQL three-valued logic. Without it, a
+    -- m.room.member row with NULL membership evaluates the first branch
+    -- as `TRUE AND (NULL IN (…))` → `TRUE AND UNKNOWN` → UNKNOWN, and
+    -- SQLite treats an UNKNOWN CHECK result as *satisfied* (only FALSE
+    -- rejects). The explicit IS NOT NULL collapses the branch to FALSE
+    -- so the constraint actually fires for the NULL-membership case.
+    CHECK (
+        (event_type = 'm.room.member'
+            AND membership IS NOT NULL
+            AND membership IN ('join','leave','ban','invite','knock'))
+        OR
+        (event_type <> 'm.room.member' AND membership IS NULL)
+    ),
+    FOREIGN KEY (event_id, room_id, event_type, state_key)
+        REFERENCES events(event_id, room_id, event_type, state_key)
 ) STRICT, WITHOUT ROWID;
 
--- joined_rooms(user): direct lookup by state_key; partial so only joined
--- membership rows live in the index.
-CREATE INDEX ix_current_state_member_joined
-    ON current_state(state_key, room_id)
-    WHERE event_type = 'm.room.member' AND membership = 'join';
+-- joined_rooms(user) and rooms_with_membership(user, memberships): direct
+-- lookup by state_key, then filter by membership. `membership` sits
+-- immediately after the leading equality column so SQLite can push the
+-- `membership = 'join'` / `membership IN (…)` predicate into the index
+-- seek; with `room_id` between them (the prior shape) the planner could
+-- only seek by `state_key` and then filter `membership` post-scan,
+-- because constraints on a trailing index column aren't pushable past
+-- an unconstrained intermediate column. `room_id` trails so the index
+-- still covers both projected columns (`SELECT room_id, membership`).
+-- Partial on `event_type = 'm.room.member'` only — broadened from the
+-- prior `membership = 'join'` constraint so the same index serves any
+-- membership filter (sliding sync enumerates rooms across the full
+-- MSC4186-eligible membership set in one shot).
+CREATE INDEX ix_current_state_member
+    ON current_state(state_key, membership, room_id)
+    WHERE event_type = 'm.room.member';
 
--- joined_members(room): direct lookup by room_id; same partial filter.
-CREATE INDEX ix_current_state_room_joined
-    ON current_state(room_id, state_key)
-    WHERE event_type = 'm.room.member' AND membership = 'join';
+-- joined_members(room): direct lookup by room_id, then filter by
+-- membership. Same column-ordering rule: `membership` directly after
+-- the leading equality column so the seek covers both. `state_key`
+-- (the user_id) trails so the index can produce the SELECT projection
+-- before the JOIN to `events` for full event JSON.
+CREATE INDEX ix_current_state_room_member
+    ON current_state(room_id, membership, state_key)
+    WHERE event_type = 'm.room.member';
 
 -- ----------------------------------------------------------------------------
 -- client_txns — EventStore::{record_client_txn, get_client_txn}

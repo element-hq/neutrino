@@ -6,8 +6,9 @@
 //!
 //! Column access on the SELECT side is by *name*, not by position. Any
 //! query feeding [`EventRow::try_from`] only needs to project the seven
-//! [`EVENT_COLUMNS`]; their position in the row (and any extra leading
-//! columns like `stream_pos`) is irrelevant.
+//! [`EVENT_COLUMNS`] (or [`EVENT_COLUMNS_PREFIXED`] when JOINing with an
+//! `e` alias); their position in the row (and any extra leading columns
+//! like `stream_pos`) is irrelevant.
 
 use std::{borrow::Cow, ops::Deref};
 
@@ -24,6 +25,13 @@ use crate::error::Error;
 /// extra columns are allowed and ignored).
 pub(crate) const EVENT_COLUMNS: &str =
     "event_id, room_id, event_type, state_key, sender, origin_server_ts, json";
+
+/// Same as [`EVENT_COLUMNS`] but with an `e.` prefix on each column, for
+/// SELECTs that JOIN `events` aliased as `e` (state, outbox, etc.). Keep
+/// in sync with [`EVENT_COLUMNS`] — one is just the prefixed sibling of
+/// the other.
+pub(crate) const EVENT_COLUMNS_PREFIXED: &str =
+    "e.event_id, e.room_id, e.event_type, e.state_key, e.sender, e.origin_server_ts, e.json";
 
 /// Row-shape wrapper around a [`StoredEvent`].
 ///

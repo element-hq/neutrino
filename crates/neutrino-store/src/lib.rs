@@ -191,6 +191,28 @@ pub trait StateStore: Send + Sync {
         &self,
         room_id: &RoomId,
     ) -> Result<HashMap<OwnedUserId, StoredEvent>, StorageError>;
+
+    /// Pre:  none. `memberships` is a slice of the canonical Matrix membership
+    ///       strings: `"join"`, `"invite"`, `"knock"`, `"leave"`, `"ban"`.
+    ///       Unknown strings are silently ignored; an empty slice returns an
+    ///       empty vec.
+    /// Post: returns one `(room_id, current_membership)` pair for every room
+    ///       in which `user_id`'s current `m.room.member` event has a
+    ///       `content.membership` matching one of the requested values. The
+    ///       `current_membership` is the actual string from the event (one
+    ///       of the values from `memberships`), so the caller can branch on
+    ///       it without a second lookup. The caller can pass multiple
+    ///       memberships to get the union in one round-trip (used by
+    ///       sliding sync to enumerate candidate rooms across all the
+    ///       MSC4186-eligible memberships at once). Result order is
+    ///       unspecified — callers sort/dedup as needed. Implementations
+    ///       should answer this from an indexed lookup rather than a full
+    ///       table scan.
+    async fn rooms_with_membership(
+        &self,
+        user_id: &UserId,
+        memberships: &[&str],
+    ) -> Result<Vec<(OwnedRoomId, String)>, StorageError>;
 }
 
 #[async_trait]
