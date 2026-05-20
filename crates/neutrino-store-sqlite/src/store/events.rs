@@ -1285,4 +1285,101 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(next.is_none());
     }
+
+    // E44-E49: `persist_historical_event` — backfill-class persistence
+    // that writes events + edges but deliberately does *not* update
+    // `current_state` or the outbox. Resolves the unconditional-UPSERT
+    // ambiguity flagged in the SQLite-store review by giving the
+    // backfill handler a separate code path; `persist_event` keeps its
+    // forward-extension semantics.
+
+    // E44: a historical event is visible via `get_events` and
+    // `events_after` — same observability as a forward-extension write.
+    #[tokio::test]
+    async fn persist_historical_event_visible_via_reads() {
+        let s = store_with_room().await;
+        let msg = message(
+            event_id!("$h1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "history",
+        );
+        s.persist_historical_event(&msg).await.unwrap();
+
+        let id = event_id!("$h1:example.com");
+        let got = s.get_events(&[id]).await.unwrap();
+        assert_eq!(got.len(), 1);
+        let stream = s.events_after(StreamPos(0), 100).await.unwrap();
+        assert!(
+            stream
+                .iter()
+                .any(|(_, e)| e.event_id.as_str() == id.as_str()),
+            "historical event must appear in the stream"
+        );
+    }
+
+    // (`does_not_update_current_state` and `does_not_regress_current_state`
+    // are cross-trait scenarios — they live in `tests/storage.rs` as
+    // X12 / X13 to keep this in-crate suite scoped to the EventStore
+    // trait surface.)
+
+    // E47: `persist_historical_event` does not write any outbox rows —
+    // backfill is purely the read direction, no federation traffic
+    // originates from a historical insert.
+    #[tokio::test]
+    async fn persist_historical_event_writes_no_outbox_rows() {
+        let s = store_with_room().await;
+        let msg = message(event_id!("$h:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "history");
+        s.persist_historical_event(&msg).await.unwrap();
+
+        let count: i64 = s
+            .run_read(|conn| -> Result<i64, Error> {
+                Ok(conn.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "persist_historical_event must not write outbox rows"
+        );
+    }
+
+    // E48: validation still fires for malformed events — a member
+    // event missing `content.membership` is rejected even on the
+    // historical path. The cross-checks, FK, etc. still apply: the
+    // events table has to be queryable, so well-formedness is a
+    // hard requirement regardless of which path wrote the row.
+    #[tokio::test]
+    async fn persist_historical_event_rejects_malformed_member() {
+        let s = store_with_room().await;
+        let bad = make_event(
+            event_id!("$m:e"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.member",
+            Some(ALICE_USER_ID.as_str()),
+            json!({}), // no `membership`
+        );
+        let result = s.persist_historical_event(&bad).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    // E49: `persist_historical_event` advances the `subscribe()` watch
+    // so subscribers wake and discover the new history. Same wake-up
+    // contract as `persist_event` — only the current_state and outbox
+    // sides differ.
+    #[tokio::test]
+    async fn persist_historical_event_advances_watch() {
+        let s = store_with_room().await;
+        let mut rx = s.subscribe();
+        let initial = *rx.borrow();
+        let msg = message(event_id!("$h:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "history");
+        s.persist_historical_event(&msg).await.unwrap();
+        rx.changed().await.unwrap();
+        let after = *rx.borrow();
+        assert!(
+            after > initial,
+            "watch did not advance after persist_historical_event: {initial:?} -> {after:?}"
+        );
+    }
 }

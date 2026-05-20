@@ -443,3 +443,163 @@ async fn member_left_no_longer_in_joined_rooms() {
     .unwrap();
     assert!(s.joined_rooms(*ALICE_USER_ID).await.unwrap().is_empty());
 }
+
+// X11: a forward-extension `persist_event` for the same
+// `(room, type, state_key)` as one of `create_room`'s `initial_events`
+// overwrites `current_state` — the unconditional UPSERT in
+// `row::write_into_tx` is last-writer-wins. Sequential test: the
+// writer pool is size-1, so awaiting `create_room` to completion
+// before issuing `persist_event` gives a deterministic "persist_event
+// committed *after* create_room" ordering without any concurrency
+// primitives. Complements X13, which pins the inverse for
+// `persist_historical_event` (doesn't regress current_state).
+//
+// An earlier version of this test spawned both writes concurrently
+// and retried on first-arriver collisions, but tokio scheduling
+// reliably gives `persist_event` (less pre-await work) the writer
+// slot first, so retries never converged. The race framing wasn't
+// load-bearing for what the test actually claims — sequential
+// awaits suffice.
+#[tokio::test]
+async fn persist_event_after_create_room_overwrites_initial_state() {
+    let s = store().await;
+    let initial_member_id = event_id!("$mj_initial:e");
+    let later_member_id = event_id!("$mj_later:e");
+
+    s.create_room(
+        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
+        &[member_join(initial_member_id, *ALICE_ROOM_ID, *ALICE_USER_ID)],
+    )
+    .await
+    .unwrap();
+
+    // Sanity: current_state reflects the initial join.
+    let initial = s
+        .current_state_event(*ALICE_ROOM_ID, "m.room.member", ALICE_USER_ID.as_str())
+        .await
+        .unwrap()
+        .expect("initial member state present after create_room");
+    assert_eq!(initial.event_id.as_str(), initial_member_id.as_str());
+
+    // Forward persist_event for the same state key — UPSERT overwrites.
+    s.persist_event(
+        &member_leave(later_member_id, *ALICE_ROOM_ID, *ALICE_USER_ID),
+        &[],
+    )
+    .await
+    .unwrap();
+
+    let after = s
+        .current_state_event(*ALICE_ROOM_ID, "m.room.member", ALICE_USER_ID.as_str())
+        .await
+        .unwrap()
+        .expect("member state still present");
+    assert_eq!(
+        after.event_id.as_str(),
+        later_member_id.as_str(),
+        "forward persist_event must overwrite create_room's initial state row"
+    );
+}
+
+// X12: `persist_historical_event` writes a state event without
+// touching `current_state`. The trait post-condition is explicit on
+// this — historical events feed history (`events`, `event_edges`,
+// `room_messages`) but must not regress the resolved current state.
+//
+// Cross-trait scenario (EventStore writes ↔ StateStore reads), so it
+// lives in `tests/storage.rs` rather than the per-trait unit suite.
+#[tokio::test]
+async fn persist_historical_event_does_not_update_current_state() {
+    let s = store().await;
+    s.create_room(
+        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
+        &[],
+    )
+    .await
+    .unwrap();
+
+    // No name state event yet → current_state for that key is empty.
+    assert!(
+        s.current_state_event(*ALICE_ROOM_ID, "m.room.name", "")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let n = name_event(
+        event_id!("$n_hist:e"),
+        *ALICE_ROOM_ID,
+        *ALICE_USER_ID,
+        "historical",
+    );
+    s.persist_historical_event(&n).await.unwrap();
+
+    // Event is in the store …
+    let got = s.get_events(&[event_id!("$n_hist:e")]).await.unwrap();
+    assert_eq!(got.len(), 1, "historical event must be in events table");
+
+    // … but current_state remains empty.
+    assert!(
+        s.current_state_event(*ALICE_ROOM_ID, "m.room.name", "")
+            .await
+            .unwrap()
+            .is_none(),
+        "persist_historical_event must not upsert current_state"
+    );
+}
+
+// X13: cardinal regression test for the persist split. A forward-
+// extension `persist_event` sets `current_state`; a subsequent
+// `persist_historical_event` for the *same* `(room, type, state_key)`
+// must NOT regress it. This is the test that flags any future change
+// that re-conflates the two paths or revives the unconditional
+// UPSERT.
+#[tokio::test]
+async fn persist_historical_event_does_not_regress_current_state() {
+    let s = store().await;
+    s.create_room(
+        &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
+        &[],
+    )
+    .await
+    .unwrap();
+
+    // Forward extension: alice joins.
+    let join = member_join(event_id!("$join:e"), *ALICE_ROOM_ID, *ALICE_USER_ID);
+    s.persist_event(&join, &[]).await.unwrap();
+
+    let before = s
+        .current_state_event(*ALICE_ROOM_ID, "m.room.member", ALICE_USER_ID.as_str())
+        .await
+        .unwrap()
+        .expect("current state should be the join event");
+    assert_eq!(before.event_id.as_str(), "$join:e");
+
+    // Historical write: an older leave event arrives via backfill.
+    let leave = member_leave(event_id!("$old_leave:e"), *ALICE_ROOM_ID, *ALICE_USER_ID);
+    s.persist_historical_event(&leave).await.unwrap();
+
+    // current_state still points at the forward join — not regressed.
+    let after = s
+        .current_state_event(*ALICE_ROOM_ID, "m.room.member", ALICE_USER_ID.as_str())
+        .await
+        .unwrap()
+        .expect("current state still present");
+    assert_eq!(
+        after.event_id.as_str(),
+        "$join:e",
+        "historical leave must not regress current_state from the forward join"
+    );
+
+    // And the historical event itself is in the events table for the
+    // backfill / DAG-walk surface.
+    let got = s
+        .get_events(&[event_id!("$old_leave:e")])
+        .await
+        .unwrap();
+    assert_eq!(
+        got.len(),
+        1,
+        "historical leave should be in events for backfill / DAG walks"
+    );
+}
