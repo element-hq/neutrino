@@ -44,6 +44,14 @@ CREATE TABLE events (
 
 CREATE INDEX ix_events_room_stream ON events(room_id, stream_pos);
 
+-- Supporting UNIQUE index for the composite FK on `current_state` below.
+-- `event_id` alone is already UNIQUE, so any superset of columns including
+-- it is also unique — but SQLite needs an index whose column list matches
+-- the FK's parent-key column list verbatim. Without this, the FK on
+-- `current_state(event_id, room_id, event_type, state_key)` won't compile.
+CREATE UNIQUE INDEX ix_events_id_room_type_key
+    ON events(event_id, room_id, event_type, state_key);
+
 -- ----------------------------------------------------------------------------
 -- event_edges — DagStore (events_before, missing_events)
 -- Single table with edge_type (design Decision §6). No FK to events:
@@ -68,16 +76,31 @@ CREATE TABLE event_edges (
 -- `membership` is non-NULL exactly for m.room.member rows; carries the
 -- canonical value so joined_rooms / joined_members can filter via an
 -- indexed column without loading event JSON (per the post-condition).
+--
+-- The composite FK on (event_id, room_id, event_type, state_key) enforces
+-- that every current_state row references an `events` row that agrees on
+-- all four columns — not just `event_id`. A single-column FK would let a
+-- buggy or corrupted write desync the two tables (cs row points at an
+-- event in another room, or at an event with a different event_type /
+-- state_key, or at a non-state event whose state_key IS NULL), which
+-- would leak through every StateStore read path. With the composite FK
+-- the schema rejects those writes outright. SQL three-valued logic
+-- handles the non-state case naturally: `events.state_key IS NULL` makes
+-- the FK equality UNKNOWN, so the FK match never resolves to TRUE.
+-- See state.rs module docstring for the read-side consequence (JOINs
+-- only need `cs.event_id = e.event_id`).
 -- ----------------------------------------------------------------------------
 CREATE TABLE current_state (
     room_id      TEXT NOT NULL,
     event_type   TEXT NOT NULL,
     state_key    TEXT NOT NULL,
-    event_id     TEXT NOT NULL REFERENCES events(event_id),
+    event_id     TEXT NOT NULL,
     membership   TEXT
         CHECK (membership IS NULL
                OR membership IN ('join','leave','ban','invite','knock')),
-    PRIMARY KEY (room_id, event_type, state_key)
+    PRIMARY KEY (room_id, event_type, state_key),
+    FOREIGN KEY (event_id, room_id, event_type, state_key)
+        REFERENCES events(event_id, room_id, event_type, state_key)
 ) STRICT, WITHOUT ROWID;
 
 -- joined_rooms(user) and rooms_with_membership(user, memberships): direct

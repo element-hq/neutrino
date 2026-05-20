@@ -1,9 +1,16 @@
 //! `StateStore` impl on `SqliteStore`.
 //!
 //! All queries JOIN `current_state` with `events` to project the
-//! [`crate::row::EVENT_COLUMNS_PREFIXED`] columns. The `joined_rooms` /
-//! `joined_members` queries match the partial-index `WHERE` clauses from
-//! `schema.sql` exactly so SQLite picks the indexes.
+//! [`crate::row::EVENT_COLUMNS_PREFIXED`] columns. The schema-level
+//! composite FK
+//! `current_state(event_id, room_id, event_type, state_key) →
+//! events(event_id, room_id, event_type, state_key)` (see `schema.sql`)
+//! guarantees that the two rows agree on all four columns, so a
+//! single-column JOIN on `cs.event_id = e.event_id` is sufficient — any
+//! desync between `current_state` and `events` is rejected at write
+//! time, not papered over at read time. The `joined_rooms` /
+//! `joined_members` queries match the partial-index `WHERE` clauses
+//! from `schema.sql` exactly so SQLite picks the indexes.
 
 use std::collections::HashMap;
 
@@ -32,7 +39,7 @@ impl StateStore for SqliteStore {
                     "SELECT cs.event_type AS map_event_type, cs.state_key AS map_state_key, \
                             {EVENT_COLUMNS_PREFIXED} \
                      FROM current_state cs \
-                     JOIN events e ON cs.event_id = e.event_id AND e.room_id = cs.room_id \
+                     JOIN events e ON cs.event_id = e.event_id \
                      WHERE cs.room_id = ?"
                 );
                 let mut stmt = conn.prepare(&query)?;
@@ -67,7 +74,7 @@ impl StateStore for SqliteStore {
             let query = format!(
                 "SELECT {EVENT_COLUMNS_PREFIXED} \
                  FROM current_state cs \
-                 JOIN events e ON cs.event_id = e.event_id AND e.room_id = cs.room_id \
+                 JOIN events e ON cs.event_id = e.event_id \
                  WHERE cs.room_id = ? AND cs.event_type = ? AND cs.state_key = ?"
             );
             let result = conn
@@ -97,7 +104,7 @@ impl StateStore for SqliteStore {
             let query = format!(
                 "SELECT cs.state_key AS map_state_key, {EVENT_COLUMNS_PREFIXED} \
                  FROM current_state cs \
-                 JOIN events e ON cs.event_id = e.event_id AND e.room_id = cs.room_id \
+                 JOIN events e ON cs.event_id = e.event_id \
                  WHERE cs.room_id = ? AND cs.event_type = ?"
             );
             let mut stmt = conn.prepare(&query)?;
@@ -200,7 +207,7 @@ impl StateStore for SqliteStore {
                 let query = format!(
                     "SELECT cs.state_key AS user_id, {EVENT_COLUMNS_PREFIXED} \
                      FROM current_state cs \
-                     JOIN events e ON cs.event_id = e.event_id AND e.room_id = cs.room_id \
+                     JOIN events e ON cs.event_id = e.event_id \
                      WHERE cs.room_id = ? AND cs.event_type = 'm.room.member' \
                        AND cs.membership = 'join'"
                 );
@@ -230,7 +237,7 @@ mod tests {
     use neutrino_store::{EventStore, RoomStore, StateStore};
     use ruma::{RoomId, UserId, event_id, room_id, user_id};
 
-    use crate::tests::{create_event, member_join, member_leave, name_event, store};
+    use crate::tests::{create_event, member_join, member_leave, message, name_event, store};
 
     // ruma's `room_id!` / `user_id!` aren't const-fn, so `const` is out
     // (E0015). `lazy_static!` runs the macro on first access and caches.
@@ -696,101 +703,145 @@ mod tests {
         assert_eq!(rooms[0].as_str(), ALICE_ROOM_ID.as_str());
     }
 
-    // S21: corruption-defence. The schema's lack of a composite FK
-    // `(room_id, event_id) → events(room_id, event_id)` lets a buggy
-    // write put a `current_state` row in room A pointing at an event
-    // that actually belongs to room B. The four JOIN-based read paths
-    // must treat that row as absent rather than surfacing the foreign
-    // event. Drives the `e.room_id = cs.room_id` guard documented at
-    // the top of this module.
+    // S21: schema-level — composite FK rejects a current_state row
+    // whose event_id resolves to an event in a *different* room. The
+    // FK is defined as
+    // `current_state(event_id, room_id, event_type, state_key) →
+    //  events(event_id, room_id, event_type, state_key)`,
+    // so a (room_A, event_in_room_B) write doesn't satisfy any tuple in
+    // the parent table and the INSERT itself fails. Maps through
+    // `Error::Sqlite(ConstraintViolation)` → `StorageError::InvalidInput`
+    // per `error.rs`.
     #[tokio::test]
-    async fn state_queries_reject_cross_room_event_id() {
+    async fn current_state_rejects_cross_room_event_id() {
         use deadpool_sqlite::rusqlite::params;
 
         use crate::error::Error;
 
         let s = store().await;
-        // Room A: nothing but the create event.
         s.create_room(
             &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_ID),
             &[],
         )
         .await
         .unwrap();
-        // Room B: real name event and a real bob-join, so the
-        // event_id FK target exists when we inject the bad rows below.
+        // Room B holds the real $nB:e — without it, the FK would fail
+        // on event_id alone and we wouldn't be testing the room-axis.
         s.create_room(
             &create_event(event_id!("$cB:e"), *BOB_ROOM_ID, *BOB_ID),
-            &[
-                name_event(event_id!("$nB:e"), *BOB_ROOM_ID, *BOB_ID, "B"),
-                member_join(event_id!("$mjB:e"), *BOB_ROOM_ID, *BOB_ID),
-            ],
+            &[name_event(event_id!("$nB:e"), *BOB_ROOM_ID, *BOB_ID, "B")],
         )
         .await
         .unwrap();
 
-        // Inject inconsistent rows: room_id says A, event_id resolves
-        // to events in room B. FK on event_id passes; no schema check
-        // on room agreement.
         let alice_room = ALICE_ROOM_ID.as_str().to_owned();
-        let bob_id = BOB_ID.as_str().to_owned();
-        s.run_write(move |conn| -> Result<(), Error> {
-            let tx = conn.transaction()?;
-            tx.execute(
-                "INSERT INTO current_state \
-                 (room_id, event_type, state_key, event_id, membership) \
-                 VALUES (?, ?, ?, ?, ?)",
-                params![alice_room, "m.room.name", "", "$nB:e", None::<&str>],
-            )?;
-            tx.execute(
-                "INSERT INTO current_state \
-                 (room_id, event_type, state_key, event_id, membership) \
-                 VALUES (?, ?, ?, ?, ?)",
-                params![alice_room, "m.room.member", bob_id, "$mjB:e", "join"],
-            )?;
-            tx.commit()?;
-            Ok(())
-        })
+        let err = s
+            .run_write(move |conn| -> Result<(), Error> {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "INSERT INTO current_state \
+                     (room_id, event_type, state_key, event_id, membership) \
+                     VALUES (?, ?, ?, ?, ?)",
+                    params![alice_room, "m.room.name", "", "$nB:e", None::<&str>],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .expect_err("composite FK must reject cross-room event_id");
+        assert!(
+            matches!(err, neutrino_store::StorageError::InvalidInput(_)),
+            "expected InvalidInput from FK violation, got {err:?}"
+        );
+    }
+
+    // S22: schema-level — composite FK rejects a current_state row
+    // whose claimed (event_type, state_key) differ from the referenced
+    // events row, even when the room_id agrees.
+    #[tokio::test]
+    async fn current_state_rejects_mismatched_event_type_or_state_key() {
+        use deadpool_sqlite::rusqlite::params;
+
+        use crate::error::Error;
+
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[name_event(
+                event_id!("$name:e"),
+                *ALICE_ROOM_ID,
+                *ALICE_ID,
+                "A",
+            )],
+        )
         .await
         .unwrap();
 
-        // current_state_event: cross-room row hidden.
-        assert!(
-            s.current_state_event(*ALICE_ROOM_ID, "m.room.name", "")
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        // current_room_state: only the legitimate create event from A.
-        let got = s.current_room_state(*ALICE_ROOM_ID).await.unwrap();
-        assert_eq!(got.len(), 1);
-        assert!(got.contains_key(&("m.room.create".to_owned(), "".to_owned())));
-
-        // current_state_events_of_type: corrupted types return empty.
-        assert!(
-            s.current_state_events_of_type(*ALICE_ROOM_ID, "m.room.name")
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            s.current_state_events_of_type(*ALICE_ROOM_ID, "m.room.member")
-                .await
-                .unwrap()
-                .is_empty()
-        );
-
-        // joined_members: bob's cross-room row in A is filtered out.
-        let got = s.joined_members(*ALICE_ROOM_ID).await.unwrap();
-        assert!(got.is_empty());
-
-        // Room B's real state is untouched by the corruption.
-        let b_name = s
-            .current_state_event(*BOB_ROOM_ID, "m.room.name", "")
+        let alice_room = ALICE_ROOM_ID.as_str().to_owned();
+        let alice_id = ALICE_ID.as_str().to_owned();
+        let err = s
+            .run_write(move |conn| -> Result<(), Error> {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "INSERT INTO current_state \
+                     (room_id, event_type, state_key, event_id, membership) \
+                     VALUES (?, ?, ?, ?, ?)",
+                    params![alice_room, "m.room.member", alice_id, "$name:e", "join"],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
             .await
-            .unwrap()
-            .expect("room B name event still present");
-        assert_eq!(b_name.event_id.as_str(), "$nB:e");
+            .expect_err("composite FK must reject (event_type, state_key) mismatch");
+        assert!(
+            matches!(err, neutrino_store::StorageError::InvalidInput(_)),
+            "expected InvalidInput from FK violation, got {err:?}"
+        );
+    }
+
+    // S23: schema-level — composite FK rejects a current_state row
+    // pointing at a *non-state* event. `events.state_key IS NULL` for
+    // non-state events, so the FK's `events.state_key = cs.state_key`
+    // comparison resolves to SQL UNKNOWN against `cs.state_key`'s NOT
+    // NULL value — no parent-key tuple matches, INSERT fails.
+    #[tokio::test]
+    async fn current_state_rejects_pointing_at_non_state_event() {
+        use deadpool_sqlite::rusqlite::params;
+
+        use crate::error::Error;
+
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[],
+        )
+        .await
+        .unwrap();
+        s.persist_event(
+            &message(event_id!("$msg:e"), *ALICE_ROOM_ID, *ALICE_ID, "hi"),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let alice_room = ALICE_ROOM_ID.as_str().to_owned();
+        let err = s
+            .run_write(move |conn| -> Result<(), Error> {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "INSERT INTO current_state \
+                     (room_id, event_type, state_key, event_id, membership) \
+                     VALUES (?, ?, ?, ?, ?)",
+                    params![alice_room, "m.room.name", "", "$msg:e", None::<&str>],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .expect_err("composite FK must reject non-state event reference");
+        assert!(
+            matches!(err, neutrino_store::StorageError::InvalidInput(_)),
+            "expected InvalidInput from FK violation, got {err:?}"
+        );
     }
 }
