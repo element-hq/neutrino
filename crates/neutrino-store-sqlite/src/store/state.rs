@@ -905,7 +905,12 @@ mod tests {
         let s = store().await;
         s.create_room(
             &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_ID),
-            &[name_event(event_id!("$n:e"), *ALICE_ROOM_ID, *ALICE_ID, "A")],
+            &[name_event(
+                event_id!("$n:e"),
+                *ALICE_ROOM_ID,
+                *ALICE_ID,
+                "A",
+            )],
         )
         .await
         .unwrap();
