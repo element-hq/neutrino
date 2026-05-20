@@ -72,7 +72,7 @@ pub fn check_auth_rules(event: &Event, state: &StateMap<Arc<Event>>) -> Result<(
     // validate::parse_event (AuthEventsPresent); state-res uses
     // auth_events::calculate_auth_events instead.
 
-    let ctx = AuthContext::new(state)?;
+    let ctx = AuthContext::new(state);
 
     check_rule_4_federation(event, &ctx)?;
 
@@ -120,13 +120,24 @@ struct AuthContext<'a> {
     /// `true` if state-before-event has an `m.room.power_levels` event.
     /// Used by rule 10.5 ("no previous power_levels → allow").
     present_power_levels: bool,
+    /// `m.federate` from the create event's content, defaulting to `true`
+    /// when absent. Pre-parsed so rule 4 doesn't re-walk the create content.
+    federate: bool,
+    /// `create_event.sender.server_name()` — used by rule 4 to compare
+    /// against `event.sender.server_name()`.
+    create_domain: String,
 }
 
 impl<'a> AuthContext<'a> {
-    fn new(state: &'a StateMap<Arc<Event>>) -> Result<Self, AuthError> {
+    fn new(state: &'a StateMap<Arc<Event>>) -> Self {
+        // `validate::validate_references` (phase 1b) has already verified
+        // that this room's create event is in state; reaching auth without
+        // it is a state-machine invariant violation by the caller.
         let create_event = state
             .get(&("m.room.create".to_string(), String::new()))
-            .ok_or(AuthError::CreateMissing)?;
+            .expect(
+                "validate::validate_references guarantees m.room.create is in state-before-event",
+            );
 
         let create_content = parse_content(create_event);
         let mut creators: HashSet<OwnedUserId> = HashSet::new();
@@ -136,25 +147,37 @@ impl<'a> AuthContext<'a> {
             .and_then(Value::as_array)
         {
             for entry in arr {
-                if let Some(s) = entry.as_str()
-                    && let Ok(uid) = s.parse::<OwnedUserId>()
-                {
-                    creators.insert(uid);
-                }
+                let s = entry
+                    .as_str()
+                    .expect("validate::check_create guarantees additional_creators is [string]");
+                let uid: OwnedUserId = s.parse().expect(
+                    "validate::check_create guarantees additional_creators entries are user ids",
+                );
+                creators.insert(uid);
             }
         }
+
+        let federate = create_content
+            .get("m.federate")
+            .and_then(Value::as_bool)
+            // `m.federate` "Defaults to true if key does not exist." per
+            // <https://spec.matrix.org/v1.18/client-server-api/#mroomcreate>.
+            .unwrap_or(true);
+        let create_domain = create_event.sender.server_name().as_str().to_owned();
 
         let pl_event = state.get(&("m.room.power_levels".to_string(), String::new()));
         let present_power_levels = pl_event.is_some();
         let power_levels = PowerLevels::parse(pl_event.map(Arc::as_ref));
 
-        Ok(Self {
+        Self {
             state,
             create_event,
             creators,
             power_levels,
             present_power_levels,
-        })
+            federate,
+            create_domain,
+        }
     }
 
     /// User's effective power level. Creators have `i64::MAX` ("cannot be
@@ -253,37 +276,41 @@ impl PowerLevels {
         };
         let Some(ev) = event else { return out };
         let content = parse_content(ev);
-        if let Some(n) = content.get("users_default").and_then(Value::as_i64) {
-            out.users_default = n;
-        }
-        if let Some(n) = content.get("events_default").and_then(Value::as_i64) {
-            out.events_default = n;
-        }
-        if let Some(n) = content.get("state_default").and_then(Value::as_i64) {
-            out.state_default = n;
-        }
-        if let Some(n) = content.get("ban").and_then(Value::as_i64) {
-            out.ban = n;
-        }
-        if let Some(n) = content.get("redact").and_then(Value::as_i64) {
-            out.redact = n;
-        }
-        if let Some(n) = content.get("kick").and_then(Value::as_i64) {
-            out.kick = n;
-        }
-        if let Some(n) = content.get("invite").and_then(Value::as_i64) {
-            out.invite = n;
-        }
+        // Phase 1a (`validate::check_power_levels`) has rejected non-integer
+        // scalars (`PowerLevelsBadIntField`) and non-`{string: int}` objects
+        // (`PowerLevelsBadObjectField` / `PowerLevelsBadUsers`) — so every
+        // value below either matches its expected shape or the field is
+        // absent. The `.expect`s exist to convert a future Phase 1a
+        // regression into a hard panic at the parse site rather than
+        // silently substituting defaults.
+        let take_scalar = |field: &'static str, slot: &mut i64| {
+            if let Some(v) = content.get(field) {
+                *slot = v
+                    .as_i64()
+                    .expect("validate::check_power_levels guarantees integer scalar");
+            }
+        };
+        take_scalar("users_default", &mut out.users_default);
+        take_scalar("events_default", &mut out.events_default);
+        take_scalar("state_default", &mut out.state_default);
+        take_scalar("ban", &mut out.ban);
+        take_scalar("redact", &mut out.redact);
+        take_scalar("kick", &mut out.kick);
+        take_scalar("invite", &mut out.invite);
         for (target, key) in [
             (&mut out.users, "users"),
             (&mut out.events, "events"),
             (&mut out.notifications, "notifications"),
         ] {
-            if let Some(obj) = content.get(key).and_then(Value::as_object) {
+            if let Some(obj) = content.get(key) {
+                let obj = obj
+                    .as_object()
+                    .expect("validate::check_power_levels guarantees map shape");
                 for (k, v) in obj {
-                    if let Some(n) = v.as_i64() {
-                        target.insert(k.clone(), n);
-                    }
+                    let n = v
+                        .as_i64()
+                        .expect("validate::check_power_levels guarantees integer map values");
+                    target.insert(k.clone(), n);
                 }
             }
         }
@@ -292,7 +319,10 @@ impl PowerLevels {
 }
 
 fn parse_content(event: &Event) -> Value {
-    serde_json::from_str(event.content.get()).unwrap_or(Value::Null)
+    // `validate::parse_event` parsed this same raw JSON to land an Event;
+    // round-tripping it here cannot fail.
+    serde_json::from_str(event.content.get())
+        .expect("validate::parse_event guarantees event.content is valid JSON")
 }
 
 // ----------------- rule 4 -----------------
@@ -301,24 +331,16 @@ fn check_rule_4_federation(event: &Event, ctx: &AuthContext) -> Result<(), AuthE
     // "If the content of the m.room.create event in the room state has the
     // property m.federate set to false, and the sender domain of the event
     // does not match the sender domain of the create event, reject."
-    //
-    // `m.federate` "Defaults to true if key does not exist." per
-    // https://spec.matrix.org/v1.18/client-server-api/#mroomcreate
-    let federate = parse_content(ctx.create_event)
-        .get("m.federate")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    if federate {
+    if ctx.federate {
         return Ok(());
     }
     let sender_domain = event.sender.server_name().as_str();
-    let create_domain = ctx.create_event.sender.server_name().as_str();
-    if sender_domain == create_domain {
+    if sender_domain == ctx.create_domain {
         return Ok(());
     }
     Err(AuthError::Rule4FederationDisallowed {
         sender_domain: sender_domain.to_owned(),
-        create_domain: create_domain.to_owned(),
+        create_domain: ctx.create_domain.clone(),
     })
 }
 
@@ -429,7 +451,9 @@ fn check_rule_5_4_invite(
 ) -> Result<(), AuthError> {
     let target: OwnedUserId = state_key
         .parse()
-        .map_err(|_| AuthError::Rule5_4_1_ThirdPartyInviteInvalid("invalid target user id"))?;
+        .map_err(|_| AuthError::InvalidMemberStateKey {
+            state_key: state_key.to_owned(),
+        })?;
 
     // 5.4.1: third_party_invite path
     if let Some(tpi) = content.get("third_party_invite") {
@@ -527,7 +551,9 @@ fn check_rule_5_5_leave(
 
     let target: OwnedUserId = state_key
         .parse()
-        .map_err(|_| AuthError::Rule5_5_5_KickNotAllowed)?;
+        .map_err(|_| AuthError::InvalidMemberStateKey {
+            state_key: state_key.to_owned(),
+        })?;
 
     // 5.5.2: kick sender must be joined
     if ctx.membership(member_event.sender.as_ref()).as_deref() != Some("join") {
@@ -549,7 +575,11 @@ fn check_rule_5_5_leave(
     if sender_power >= ctx.power_levels.kick && target_power < sender_power {
         return Ok(());
     }
-    Err(AuthError::Rule5_5_5_KickNotAllowed)
+    Err(AuthError::Rule5_5_5_KickNotAllowed {
+        sender: sender_power,
+        target: target_power,
+        kick_level: ctx.power_levels.kick,
+    })
 }
 
 fn check_rule_5_6_ban(
@@ -559,7 +589,9 @@ fn check_rule_5_6_ban(
 ) -> Result<(), AuthError> {
     let target: OwnedUserId = state_key
         .parse()
-        .map_err(|_| AuthError::Rule5_6_3_BanNotAllowed)?;
+        .map_err(|_| AuthError::InvalidMemberStateKey {
+            state_key: state_key.to_owned(),
+        })?;
 
     // 5.6.1: sender joined
     if ctx.membership(member_event.sender.as_ref()).as_deref() != Some("join") {
@@ -573,7 +605,11 @@ fn check_rule_5_6_ban(
     if sender_power >= ctx.power_levels.ban && target_power < sender_power {
         return Ok(());
     }
-    Err(AuthError::Rule5_6_3_BanNotAllowed)
+    Err(AuthError::Rule5_6_3_BanNotAllowed {
+        sender: sender_power,
+        target: target_power,
+        ban_level: ctx.power_levels.ban,
+    })
 }
 
 fn check_rule_5_7_knock(
@@ -720,40 +756,52 @@ fn check_rule_10_power_levels(
     }
 
     // 10.7 / 10.8: events and notifications maps.
-    for (property, cur_map, new_map) in [
-        ("events", &cur_pl.events, &new_pl.events),
+    //
+    // Comparisons run on *effective* values, not raw `Option<i64>` presence.
+    // An entry absent from the map takes the spec-defined default for that
+    // map: `events_default` for `events`, and 50 for `notifications` (the
+    // only documented `notifications` default is `notifications.room = 50`;
+    // we apply it as the map-wide default for entries the spec doesn't name
+    // explicitly). Setting an entry explicitly to the prevailing default is
+    // therefore a no-op and does not trip 10.7 / 10.8.
+    for (property, cur_map, new_map, cur_default, new_default) in [
+        (
+            "events",
+            &cur_pl.events,
+            &new_pl.events,
+            cur_pl.events_default,
+            new_pl.events_default,
+        ),
         (
             "notifications",
             &cur_pl.notifications,
             &new_pl.notifications,
+            50,
+            50,
         ),
     ] {
         let mut all_keys: HashSet<&String> = HashSet::new();
         all_keys.extend(cur_map.keys());
         all_keys.extend(new_map.keys());
         for key in all_keys {
-            let cur_val = cur_map.get(key);
-            let new_val = new_map.get(key);
-            if cur_val == new_val {
+            let cur_eff = cur_map.get(key).copied().unwrap_or(cur_default);
+            let new_eff = new_map.get(key).copied().unwrap_or(new_default);
+            if cur_eff == new_eff {
                 continue;
             }
-            if let Some(cv) = cur_val
-                && *cv > sender_power
-            {
+            if cur_eff > sender_power {
                 return Err(AuthError::Rule10_7_CurrentEventEntryAboveSender {
                     property: property.to_string(),
                     key: key.clone(),
-                    value: *cv,
+                    value: cur_eff,
                     sender: sender_power,
                 });
             }
-            if let Some(nv) = new_val
-                && *nv > sender_power
-            {
+            if new_eff > sender_power {
                 return Err(AuthError::Rule10_8_NewEventEntryAboveSender {
                     property: property.to_string(),
                     key: key.clone(),
-                    value: *nv,
+                    value: new_eff,
                     sender: sender_power,
                 });
             }
@@ -1515,13 +1563,709 @@ mod tests {
             json!({ "users": { "@alice:example.org": 100 } }),
             "$pl:example.org",
         );
-        // 10.5 fires before 10.4 isn't right — 10.4 fires regardless of 10.5.
-        // Wait — actually 10.4 (creator-in-users) is the first check; the
-        // initial power_levels above just has alice in users which is alice
-        // who IS a creator. So this should be rejected with Rule10_4.
+        // 10.4 (creator-in-users) is checked before 10.5 (first-PL allow),
+        // so this rejects even with no prior power_levels event in state.
         assert!(matches!(
             check_auth_rules(&pl, &st),
             Err(AuthError::Rule10_4_CreatorInUsers(_))
+        ));
+    }
+
+    // ---------- rule 5.3.5: restricted joins ----------
+
+    /// Build a `m.room.join_rules` event of type `restricted` (no `allow`
+    /// entries — auth checks only verify the authoriser, not allow rules,
+    /// matching synapse's `event_auth.py`).
+    fn restricted_join_rules(id: &str) -> Arc<Event> {
+        state_event(
+            "m.room.join_rules",
+            "",
+            "@alice:example.org",
+            json!({ "join_rule": "restricted", "allow": [] }),
+            id,
+        )
+    }
+
+    #[test]
+    fn rule_5_3_5_restricted_join_with_valid_authoriser_allowed() {
+        let create = create_event("@alice:example.org", &[]);
+        let alice_join = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            "$aj:example.org",
+            &[],
+            json!({}),
+        );
+        let jr = restricted_join_rules("$jr:example.org");
+        let st = state_map([create, alice_join, jr]);
+        // Alice (creator → infinite power, joined) authorises bob's join.
+        let join = member_event(
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            "$bj:example.org",
+            &[],
+            json!({ "join_authorised_via_users_server": "@alice:example.org" }),
+        );
+        check_auth_rules(&join, &st).expect("restricted join with valid authoriser");
+    }
+
+    #[test]
+    fn rule_5_3_5_restricted_join_missing_authoriser_field_rejected() {
+        let create = create_event("@alice:example.org", &[]);
+        let jr = restricted_join_rules("$jr:example.org");
+        let st = state_map([create, jr]);
+        let join = member_event(
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            "$bj:example.org",
+            &[],
+            // No `join_authorised_via_users_server` field.
+            json!({}),
+        );
+        assert!(matches!(
+            check_auth_rules(&join, &st),
+            Err(AuthError::Rule5_3_5_RestrictedAuthoriserInvalid)
+        ));
+    }
+
+    #[test]
+    fn rule_5_3_5_restricted_join_authoriser_not_joined_rejected() {
+        let create = create_event("@alice:example.org", &[]);
+        let jr = restricted_join_rules("$jr:example.org");
+        let st = state_map([create, jr]);
+        let join = member_event(
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            "$bj:example.org",
+            &[],
+            // Carol exists in user-id-space but has no member event in state.
+            json!({ "join_authorised_via_users_server": "@carol:example.org" }),
+        );
+        assert!(matches!(
+            check_auth_rules(&join, &st),
+            Err(AuthError::Rule5_3_5_RestrictedAuthoriserInvalid)
+        ));
+    }
+
+    #[test]
+    fn rule_5_3_5_restricted_join_authoriser_below_invite_level_rejected() {
+        let create = create_event("@alice:example.org", &[]);
+        let alice_join = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            "$aj:example.org",
+            &[],
+            json!({}),
+        );
+        let carol_join = member_event(
+            "@alice:example.org",
+            "@carol:example.org",
+            "join",
+            "$cj:example.org",
+            &[],
+            json!({}),
+        );
+        let jr = restricted_join_rules("$jr:example.org");
+        // Carol joined (users_default=0) but invite level is 50.
+        let pl = power_levels_event(
+            "@alice:example.org",
+            json!({ "invite": 50, "users_default": 0 }),
+            "$pl:example.org",
+        );
+        let st = state_map([create, alice_join, carol_join, jr, pl]);
+        let join = member_event(
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            "$bj:example.org",
+            &[],
+            json!({ "join_authorised_via_users_server": "@carol:example.org" }),
+        );
+        assert!(matches!(
+            check_auth_rules(&join, &st),
+            Err(AuthError::Rule5_3_5_RestrictedAuthoriserInvalid)
+        ));
+    }
+
+    // ---------- rule 5.4.1: third-party invite path ----------
+
+    /// Build a stored `m.room.third_party_invite` state event with the given
+    /// token, optionally carrying a `public_key`. Sender is alice for these
+    /// fixtures so the rule 5.4.1 sender-match check succeeds against an
+    /// alice-sent invite.
+    fn third_party_invite_state_event(token: &str, with_public_key: bool, id: &str) -> Arc<Event> {
+        let mut content = json!({ "display_name": "example" });
+        if with_public_key {
+            content["public_key"] = json!("base64-key-here");
+        }
+        state_event(
+            "m.room.third_party_invite",
+            token,
+            "@alice:example.org",
+            content,
+            id,
+        )
+    }
+
+    fn tpi_member_invite(sender: &str, target: &str, token: &str, id: &str) -> Arc<Event> {
+        member_event(
+            sender,
+            target,
+            "invite",
+            id,
+            &[],
+            json!({
+                "third_party_invite": {
+                    "display_name": "example",
+                    "signed": {
+                        "mxid": target,
+                        "token": token,
+                        // signatures omitted per trusted-network policy.
+                    }
+                }
+            }),
+        )
+    }
+
+    #[test]
+    fn rule_5_4_1_third_party_invite_with_matching_invite_allowed() {
+        let create = create_event("@alice:example.org", &[]);
+        let alice_join = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            "$aj:example.org",
+            &[],
+            json!({}),
+        );
+        let tpi = third_party_invite_state_event("token-abc", true, "$tpi:example.org");
+        let st = state_map([create, alice_join, tpi]);
+        let invite = tpi_member_invite(
+            "@alice:example.org",
+            "@bob:example.org",
+            "token-abc",
+            "$inv:example.org",
+        );
+        check_auth_rules(&invite, &st).expect("third-party invite with matching tpi allowed");
+    }
+
+    #[test]
+    fn rule_5_4_1_third_party_invite_missing_tpi_event_rejected() {
+        let create = create_event("@alice:example.org", &[]);
+        let alice_join = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            "$aj:example.org",
+            &[],
+            json!({}),
+        );
+        // No m.room.third_party_invite event in state.
+        let st = state_map([create, alice_join]);
+        let invite = tpi_member_invite(
+            "@alice:example.org",
+            "@bob:example.org",
+            "token-missing",
+            "$inv:example.org",
+        );
+        assert!(matches!(
+            check_auth_rules(&invite, &st),
+            Err(AuthError::Rule5_4_1_ThirdPartyInviteInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn rule_5_4_1_third_party_invite_mxid_mismatch_rejected() {
+        let create = create_event("@alice:example.org", &[]);
+        let alice_join = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            "$aj:example.org",
+            &[],
+            json!({}),
+        );
+        let tpi = third_party_invite_state_event("token-abc", true, "$tpi:example.org");
+        let st = state_map([create, alice_join, tpi]);
+        // Member event's state_key (target) is bob, but `signed.mxid` is carol.
+        let invite = member_event(
+            "@alice:example.org",
+            "@bob:example.org",
+            "invite",
+            "$inv:example.org",
+            &[],
+            json!({
+                "third_party_invite": {
+                    "signed": {
+                        "mxid": "@carol:example.org",
+                        "token": "token-abc",
+                    }
+                }
+            }),
+        );
+        assert!(matches!(
+            check_auth_rules(&invite, &st),
+            Err(AuthError::Rule5_4_1_ThirdPartyInviteInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn rule_5_4_1_third_party_invite_no_public_key_rejected() {
+        let create = create_event("@alice:example.org", &[]);
+        let alice_join = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            "$aj:example.org",
+            &[],
+            json!({}),
+        );
+        let tpi = third_party_invite_state_event("token-abc", false, "$tpi:example.org");
+        let st = state_map([create, alice_join, tpi]);
+        let invite = tpi_member_invite(
+            "@alice:example.org",
+            "@bob:example.org",
+            "token-abc",
+            "$inv:example.org",
+        );
+        assert!(matches!(
+            check_auth_rules(&invite, &st),
+            Err(AuthError::Rule5_4_1_ThirdPartyInviteInvalid(_))
+        ));
+    }
+
+    // ---------- rule 7: m.room.third_party_invite event ----------
+
+    #[test]
+    fn rule_7_creator_can_send_third_party_invite() {
+        let create = create_event("@alice:example.org", &[]);
+        let alice_join = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            "$aj:example.org",
+            &[],
+            json!({}),
+        );
+        let st = state_map([create, alice_join]);
+        let tpi_event = state_event(
+            "m.room.third_party_invite",
+            "token-xyz",
+            "@alice:example.org",
+            json!({ "display_name": "example", "public_key": "base64" }),
+            "$tpi:example.org",
+        );
+        check_auth_rules(&tpi_event, &st).expect("creator (infinite power) ≥ invite level");
+    }
+
+    #[test]
+    fn rule_7_low_power_sender_rejected() {
+        let create = create_event("@alice:example.org", &[]);
+        let alice_join = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            "$aj:example.org",
+            &[],
+            json!({}),
+        );
+        let bob_join = member_event(
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            "$bj:example.org",
+            &[],
+            json!({}),
+        );
+        // Bob has users_default=0, invite level=50.
+        let pl = power_levels_event(
+            "@alice:example.org",
+            json!({ "invite": 50, "users_default": 0 }),
+            "$pl:example.org",
+        );
+        let st = state_map([create, alice_join, bob_join, pl]);
+        let tpi_event = state_event(
+            "m.room.third_party_invite",
+            "token-xyz",
+            "@bob:example.org",
+            json!({ "display_name": "example", "public_key": "base64" }),
+            "$tpi:example.org",
+        );
+        assert!(matches!(
+            check_auth_rules(&tpi_event, &st),
+            Err(AuthError::Rule7_ThirdPartyInviteInsufficient { .. })
+        ));
+    }
+
+    // ---------- rule 10: non-creator PL sender reject paths ----------
+
+    #[test]
+    fn rule_10_6_1_lowering_default_above_sender_rejected() {
+        // Old PL has `ban=80` and `state_default=0` so Bob (power 50) can
+        // send a PL event in the first place (rule 8). Bob tries to lower
+        // `ban` to 40 — current value (80) > sender (50) → 10.6.1.
+        let create = create_event("@alice:example.org", &[]);
+        let alice_join = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            "$aj:example.org",
+            &[],
+            json!({}),
+        );
+        let bob_join = member_event(
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            "$bj:example.org",
+            &[],
+            json!({}),
+        );
+        let pl1 = power_levels_event(
+            "@alice:example.org",
+            json!({
+                "users": { "@bob:example.org": 50 },
+                "ban": 80,
+                "state_default": 0,
+            }),
+            "$pl1:example.org",
+        );
+        let st = state_map([create, alice_join, bob_join, pl1]);
+        let pl2 = power_levels_event(
+            "@bob:example.org",
+            json!({
+                "users": { "@bob:example.org": 50 },
+                "ban": 40,
+                "state_default": 0,
+            }),
+            "$pl2:example.org",
+        );
+        assert!(matches!(
+            check_auth_rules(&pl2, &st),
+            Err(AuthError::Rule10_6_1_CurrentDefaultAboveSender { .. })
+        ));
+    }
+
+    #[test]
+    fn rule_10_7_altering_event_entry_above_sender_rejected() {
+        // events["m.room.tombstone"] = 100 in old PL; Bob (power 50) tries to
+        // lower it to 50. Current (100) > sender (50) → 10.7.
+        let create = create_event("@alice:example.org", &[]);
+        let alice_join = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            "$aj:example.org",
+            &[],
+            json!({}),
+        );
+        let bob_join = member_event(
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            "$bj:example.org",
+            &[],
+            json!({}),
+        );
+        let pl1 = power_levels_event(
+            "@alice:example.org",
+            json!({
+                "users": { "@bob:example.org": 50 },
+                "events": { "m.room.tombstone": 100 },
+                "state_default": 0,
+            }),
+            "$pl1:example.org",
+        );
+        let st = state_map([create, alice_join, bob_join, pl1]);
+        let pl2 = power_levels_event(
+            "@bob:example.org",
+            json!({
+                "users": { "@bob:example.org": 50 },
+                "events": { "m.room.tombstone": 50 },
+                "state_default": 0,
+            }),
+            "$pl2:example.org",
+        );
+        assert!(matches!(
+            check_auth_rules(&pl2, &st),
+            Err(AuthError::Rule10_7_CurrentEventEntryAboveSender { .. })
+        ));
+    }
+
+    #[test]
+    fn rule_10_9_demoting_peer_at_sender_power_rejected() {
+        // Bob at 50 tries to demote Carol (also at 50) to 0. Rule 10.9
+        // requires current value < sender (strict) for non-self entries.
+        let create = create_event("@alice:example.org", &[]);
+        let alice_join = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            "$aj:example.org",
+            &[],
+            json!({}),
+        );
+        let bob_join = member_event(
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            "$bj:example.org",
+            &[],
+            json!({}),
+        );
+        let pl1 = power_levels_event(
+            "@alice:example.org",
+            json!({
+                "users": { "@bob:example.org": 50, "@carol:example.org": 50 },
+                "state_default": 0,
+            }),
+            "$pl1:example.org",
+        );
+        let st = state_map([create, alice_join, bob_join, pl1]);
+        let pl2 = power_levels_event(
+            "@bob:example.org",
+            json!({
+                "users": { "@bob:example.org": 50, "@carol:example.org": 0 },
+                "state_default": 0,
+            }),
+            "$pl2:example.org",
+        );
+        assert!(matches!(
+            check_auth_rules(&pl2, &st),
+            Err(AuthError::Rule10_9_CurrentUsersEntryAtOrAboveSender { .. })
+        ));
+    }
+
+    #[test]
+    fn rule_10_7_8_explicit_at_default_is_noop() {
+        // Old PL has events_default=30 and no events["m.room.message"] entry
+        // (effective: 30). New PL adds events["m.room.message"]=30 explicitly.
+        // Effective values match — must NOT trip 10.7 / 10.8 even though raw
+        // Option<i64> presence differs.
+        let create = create_event("@alice:example.org", &[]);
+        let alice_join = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            "$aj:example.org",
+            &[],
+            json!({}),
+        );
+        let bob_join = member_event(
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            "$bj:example.org",
+            &[],
+            json!({}),
+        );
+        // Bob is at power 25 — below 30. If absent-vs-explicit-at-default
+        // were treated as a change, 10.8 would fire (new value 30 > 25).
+        // `state_default=0` so Bob can clear rule 8 to even reach rule 10.
+        let pl1 = power_levels_event(
+            "@alice:example.org",
+            json!({
+                "users": { "@bob:example.org": 25 },
+                "events_default": 30,
+                "state_default": 0,
+            }),
+            "$pl1:example.org",
+        );
+        let st = state_map([create, alice_join, bob_join, pl1]);
+        let pl2 = power_levels_event(
+            "@bob:example.org",
+            json!({
+                "users": { "@bob:example.org": 25 },
+                "events_default": 30,
+                "state_default": 0,
+                "events": { "m.room.message": 30 },
+            }),
+            "$pl2:example.org",
+        );
+        check_auth_rules(&pl2, &st).expect("explicit-at-default is a no-op");
+    }
+
+    // ---------- creator-vs-creator interactions ----------
+
+    #[test]
+    fn rule_10_4_additional_creator_in_users_rejected() {
+        // Bob is an additional creator. Alice's PL event listing Bob in
+        // `users` must trip 10.4 just like listing Alice (the sender-creator)
+        // does — additional creators are treated identically by the rule.
+        let create = create_event("@alice:example.org", &["@bob:example.org"]);
+        let alice_join = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            "$aj:example.org",
+            &[],
+            json!({}),
+        );
+        let st = state_map([create, alice_join]);
+        let pl = power_levels_event(
+            "@alice:example.org",
+            json!({ "users": { "@bob:example.org": 100 } }),
+            "$pl:example.org",
+        );
+        let err = check_auth_rules(&pl, &st).expect_err("10.4 fires on additional creator");
+        match err {
+            AuthError::Rule10_4_CreatorInUsers(uid) => {
+                assert_eq!(uid.as_str(), "@bob:example.org");
+            }
+            other => panic!("expected Rule10_4_CreatorInUsers(@bob), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn creator_cannot_kick_another_creator() {
+        // Both Alice and Bob are creators (Bob via additional_creators);
+        // both have i64::MAX power. Rule 5.5.4 requires target < sender —
+        // i64::MAX < i64::MAX is false, so the kick falls through to 5.5.5.
+        let create = create_event("@alice:example.org", &["@bob:example.org"]);
+        let alice_join = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            "$aj:example.org",
+            &[],
+            json!({}),
+        );
+        let bob_join = member_event(
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            "$bj:example.org",
+            &[],
+            json!({}),
+        );
+        let st = state_map([create, alice_join, bob_join]);
+        let kick = member_event(
+            "@alice:example.org",
+            "@bob:example.org",
+            "leave",
+            "$kick:example.org",
+            &[],
+            json!({}),
+        );
+        assert!(matches!(
+            check_auth_rules(&kick, &st),
+            Err(AuthError::Rule5_5_5_KickNotAllowed { .. })
+        ));
+    }
+
+    #[test]
+    fn creator_can_invite_another_creator() {
+        // Inviting an additional creator is fine — invite has no
+        // target-outranks-sender check, only sender ≥ invite_level.
+        let create = create_event("@alice:example.org", &["@bob:example.org"]);
+        let alice_join = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            "$aj:example.org",
+            &[],
+            json!({}),
+        );
+        let st = state_map([create, alice_join]);
+        let invite = member_event(
+            "@alice:example.org",
+            "@bob:example.org",
+            "invite",
+            "$inv:example.org",
+            &[],
+            json!({}),
+        );
+        check_auth_rules(&invite, &st).expect("creator can invite additional creator");
+    }
+
+    #[test]
+    fn rule_5_5_5_carries_diagnostic_payload() {
+        // Bob (power 0) tries to kick Carol (power 0) — sender < kick_level
+        // and target == sender; both conjuncts fail. The payload must
+        // surface both values plus the level.
+        let create = create_event("@alice:example.org", &[]);
+        let alice_join = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            "$aj:example.org",
+            &[],
+            json!({}),
+        );
+        let bob_join = member_event(
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            "$bj:example.org",
+            &[],
+            json!({}),
+        );
+        let carol_join = member_event(
+            "@alice:example.org",
+            "@carol:example.org",
+            "join",
+            "$cj:example.org",
+            &[],
+            json!({}),
+        );
+        let pl = power_levels_event(
+            "@alice:example.org",
+            json!({ "kick": 50, "users_default": 0 }),
+            "$pl:example.org",
+        );
+        let st = state_map([create, alice_join, bob_join, carol_join, pl]);
+        let kick = member_event(
+            "@bob:example.org",
+            "@carol:example.org",
+            "leave",
+            "$kick:example.org",
+            &[],
+            json!({}),
+        );
+        match check_auth_rules(&kick, &st) {
+            Err(AuthError::Rule5_5_5_KickNotAllowed {
+                sender,
+                target,
+                kick_level,
+            }) => {
+                assert_eq!(sender, 0);
+                assert_eq!(target, 0);
+                assert_eq!(kick_level, 50);
+            }
+            other => panic!("expected Rule5_5_5_KickNotAllowed with payload, got {other:?}"),
+        }
+    }
+
+    // ---------- InvalidMemberStateKey ----------
+
+    #[test]
+    fn invalid_member_state_key_on_invite_rejected() {
+        let create = create_event("@alice:example.org", &[]);
+        let alice_join = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            "$aj:example.org",
+            &[],
+            json!({}),
+        );
+        let st = state_map([create, alice_join]);
+        let invite = member_event(
+            "@alice:example.org",
+            "not-a-user-id",
+            "invite",
+            "$inv:example.org",
+            &[],
+            json!({}),
+        );
+        assert!(matches!(
+            check_auth_rules(&invite, &st),
+            Err(AuthError::InvalidMemberStateKey { .. })
         ));
     }
 

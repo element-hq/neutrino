@@ -150,12 +150,11 @@ pub enum FormatError {
 #[allow(non_camel_case_types)] // variant names track v12 spec rule numbers
 #[derive(Debug, Error)]
 pub enum AuthError {
-    /// Internal: state-before-event lacks `m.room.create`. Should be
-    /// impossible — `validate::validate_references` already verified the
-    /// room exists — but the type is needed so auth checks can return
-    /// rather than panic.
-    #[error("internal: state-before-event missing m.room.create")]
-    CreateMissing,
+    /// `m.room.member` state_key did not parse as a Matrix user id (rule 9
+    /// exempts `m.room.member` from the `@`-state_key format check, so rule 5
+    /// is the first place this is detected). Raised by 5.4 / 5.5 / 5.6.
+    #[error("m.room.member state_key `{state_key}` is not a valid user id")]
+    InvalidMemberStateKey { state_key: String },
 
     /// Rule 4: federation cross-domain mismatch with `m.federate: false`.
     #[error(
@@ -206,16 +205,30 @@ pub enum AuthError {
     /// Rule 5.5.3: unban attempted but sender's power below ban level.
     #[error("rule 5.5.3: unban requires power {needed}, sender has {sender}")]
     Rule5_5_3_UnbanInsufficient { sender: i64, needed: i64 },
-    /// Rule 5.5.5: kick not permitted.
-    #[error("rule 5.5.5: kick not permitted (insufficient power or target outranks sender)")]
-    Rule5_5_5_KickNotAllowed,
+    /// Rule 5.5.5: kick not permitted — sender lacks kick power or target
+    /// outranks sender. Payload distinguishes the two conjuncts.
+    #[error(
+        "rule 5.5.5: kick not permitted (sender power {sender}, target power {target}, kick level {kick_level})"
+    )]
+    Rule5_5_5_KickNotAllowed {
+        sender: i64,
+        target: i64,
+        kick_level: i64,
+    },
 
     /// Rule 5.6.1: ban sender not joined.
     #[error("rule 5.6.1: ban sender is not joined")]
     Rule5_6_1_BanSenderNotJoined,
-    /// Rule 5.6.3: ban not permitted.
-    #[error("rule 5.6.3: ban not permitted (insufficient power or target outranks sender)")]
-    Rule5_6_3_BanNotAllowed,
+    /// Rule 5.6.3: ban not permitted — sender lacks ban power or target
+    /// outranks sender. Payload distinguishes the two conjuncts.
+    #[error(
+        "rule 5.6.3: ban not permitted (sender power {sender}, target power {target}, ban level {ban_level})"
+    )]
+    Rule5_6_3_BanNotAllowed {
+        sender: i64,
+        target: i64,
+        ban_level: i64,
+    },
 
     /// Rule 5.7.1: knock attempted on a non-knockable room.
     #[error("rule 5.7.1: knock attempted on a non-knockable room")]
