@@ -124,19 +124,29 @@ CREATE TABLE current_state (
 ) STRICT, WITHOUT ROWID;
 
 -- joined_rooms(user) and rooms_with_membership(user, memberships): direct
--- lookup by state_key. Partial on `event_type = 'm.room.member'` only —
--- broadened from the prior `membership = 'join'` constraint so the same
--- index serves any membership filter (sliding sync enumerates rooms across
--- the full MSC4186-eligible membership set in one shot).
+-- lookup by state_key, then filter by membership. `membership` sits
+-- immediately after the leading equality column so SQLite can push the
+-- `membership = 'join'` / `membership IN (…)` predicate into the index
+-- seek; with `room_id` between them (the prior shape) the planner could
+-- only seek by `state_key` and then filter `membership` post-scan,
+-- because constraints on a trailing index column aren't pushable past
+-- an unconstrained intermediate column. `room_id` trails so the index
+-- still covers both projected columns (`SELECT room_id, membership`).
+-- Partial on `event_type = 'm.room.member'` only — broadened from the
+-- prior `membership = 'join'` constraint so the same index serves any
+-- membership filter (sliding sync enumerates rooms across the full
+-- MSC4186-eligible membership set in one shot).
 CREATE INDEX ix_current_state_member
-    ON current_state(state_key, room_id, membership)
+    ON current_state(state_key, membership, room_id)
     WHERE event_type = 'm.room.member';
 
--- joined_members(room): direct lookup by room_id. Same broadening — the
--- caller filters by membership in the WHERE clause and SQLite uses the
--- (room_id, …) prefix.
+-- joined_members(room): direct lookup by room_id, then filter by
+-- membership. Same column-ordering rule: `membership` directly after
+-- the leading equality column so the seek covers both. `state_key`
+-- (the user_id) trails so the index can produce the SELECT projection
+-- before the JOIN to `events` for full event JSON.
 CREATE INDEX ix_current_state_room_member
-    ON current_state(room_id, state_key, membership)
+    ON current_state(room_id, membership, state_key)
     WHERE event_type = 'm.room.member';
 
 -- ----------------------------------------------------------------------------
