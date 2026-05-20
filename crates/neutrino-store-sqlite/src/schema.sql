@@ -103,13 +103,18 @@ CREATE TABLE current_state (
     -- `membership` ⇔ `event_type = 'm.room.member'`. The two-branch CHECK
     -- bundles the existing "valid-value-or-NULL" restriction with the
     -- new structural invariant: member rows must carry one of the five
-    -- canonical membership values, non-member rows must be NULL. SQL
-    -- three-valued logic does the right thing for the NULL case — a
-    -- m.room.member row with NULL membership fails the first branch
-    -- (NULL IN (…) is UNKNOWN) and the second (event_type matches), so
-    -- the CHECK rejects.
+    -- canonical membership values, non-member rows must be NULL.
+    --
+    -- The `membership IS NOT NULL` guard on the first branch is
+    -- load-bearing under SQL three-valued logic. Without it, a
+    -- m.room.member row with NULL membership evaluates the first branch
+    -- as `TRUE AND (NULL IN (…))` → `TRUE AND UNKNOWN` → UNKNOWN, and
+    -- SQLite treats an UNKNOWN CHECK result as *satisfied* (only FALSE
+    -- rejects). The explicit IS NOT NULL collapses the branch to FALSE
+    -- so the constraint actually fires for the NULL-membership case.
     CHECK (
         (event_type = 'm.room.member'
+            AND membership IS NOT NULL
             AND membership IN ('join','leave','ban','invite','knock'))
         OR
         (event_type <> 'm.room.member' AND membership IS NULL)
