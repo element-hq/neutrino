@@ -54,6 +54,32 @@ impl EventStore for SqliteStore {
         .await
     }
 
+    async fn persist_historical_event(&self, event: &StoredEvent) -> Result<(), StorageError> {
+        let event = EventRow::from(event).to_owned();
+        let watch_tx = self.watch_tx.clone();
+
+        self.run_write(move |conn| -> Result<(), Error> {
+            let tx = conn.transaction()?;
+
+            // `write_into_tx_historical` skips the `current_state`
+            // upsert — see `row::EventRow::write_into_tx_historical`
+            // for the rationale. No outbox writes either: backfill is
+            // strictly the read direction, no federation traffic
+            // originates from a historical insert.
+            let stream_pos = event.write_into_tx_historical(&tx)?;
+
+            tx.commit()?;
+
+            // Watch still advances so subscribers waiting on stream
+            // changes can discover the new history (e.g. a paginating
+            // client refetching `room_messages`).
+            SqliteStore::notify_watch(&watch_tx, stream_pos);
+
+            Ok(())
+        })
+        .await
+    }
+
     async fn get_client_txn(
         &self,
         txn_id: &str,
