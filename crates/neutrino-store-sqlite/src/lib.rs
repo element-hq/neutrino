@@ -31,7 +31,7 @@ use crate::error::Error;
 /// Constructed via [`SqliteStore::open`] (file-backed) or
 /// [`SqliteStore::open_in_memory`] (tests). Cheap to clone — both inner
 /// pools are `Arc`-shared.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SqliteStore {
     /// Reader pool — multiple concurrent readers, each with
     /// `PRAGMA query_only = ON`. WAL gives readers consistent snapshots

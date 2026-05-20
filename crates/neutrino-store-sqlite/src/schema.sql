@@ -6,15 +6,22 @@
 -- `PRAGMA user_version` before executing it. See "Open path: version gate
 -- & schema bundle" in the design doc.
 --
+-- Surrounding PRAGMAs are owned by `schema::ensure_schema`, not by this
+-- file:
+--   * `journal_mode = WAL` is set against the bare connection before
+--     the bundle runs (SQLite forbids journal-mode changes inside a
+--     transaction).
+--   * `user_version = 1` is stamped inside the same transaction that
+--     wraps this file's DDL, immediately before commit. That keeps
+--     "schema present" and "version stamp set" atomic — a mid-bundle
+--     failure rolls back both together, leaving `user_version` at 0
+--     so the next open re-runs the (non-`IF NOT EXISTS`) bundle.
+--
 -- Per-connection PRAGMAs (foreign_keys=ON, synchronous=NORMAL,
 -- busy_timeout=5000, trusted_schema=OFF) are applied by the deadpool init
 -- hook on every connection check-out, NOT here — they don't persist in
 -- the DB file.
 -- ============================================================================
-
--- One-time, persistent in the DB file.
-PRAGMA journal_mode = WAL;
-PRAGMA user_version = 1;
 
 -- ----------------------------------------------------------------------------
 -- rooms — RoomStore
