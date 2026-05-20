@@ -237,7 +237,10 @@ mod tests {
     use neutrino_store::{EventStore, RoomStore, StateStore};
     use ruma::{RoomId, UserId, event_id, room_id, user_id};
 
-    use crate::tests::{create_event, member_join, member_leave, message, name_event, store};
+    use crate::tests::{
+        create_event, make_event_with_raw_json, member_join, member_leave, message, name_event,
+        store,
+    };
 
     // ruma's `room_id!` / `user_id!` aren't const-fn, so `const` is out
     // (E0015). `lazy_static!` runs the macro on first access and caches.
@@ -842,6 +845,126 @@ mod tests {
         assert!(
             matches!(err, neutrino_store::StorageError::InvalidInput(_)),
             "expected InvalidInput from FK violation, got {err:?}"
+        );
+    }
+
+    // S24: schema CHECK rejects an m.room.member row with NULL
+    // membership. Without the CHECK, a malformed member event (no
+    // `content.membership`) would land in current_state with
+    // membership=NULL and be silently excluded from joined_rooms /
+    // joined_members. The CHECK turns that into a write-time error.
+    #[tokio::test]
+    async fn current_state_rejects_member_with_null_membership() {
+        use deadpool_sqlite::rusqlite::params;
+
+        use crate::error::Error;
+
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[member_join(event_id!("$mj:e"), *ALICE_ROOM_ID, *ALICE_ID)],
+        )
+        .await
+        .unwrap();
+
+        // Persist wrote (member, alice, $mj:e, membership='join').
+        // Now try to UPDATE membership to NULL on that same row —
+        // schema CHECK rejects.
+        let alice_room = ALICE_ROOM_ID.as_str().to_owned();
+        let alice_id = ALICE_ID.as_str().to_owned();
+        let err = s
+            .run_write(move |conn| -> Result<(), Error> {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "UPDATE current_state SET membership = NULL \
+                     WHERE room_id = ? AND event_type = 'm.room.member' AND state_key = ?",
+                    params![alice_room, alice_id],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .expect_err("CHECK must reject NULL membership on member row");
+        assert!(
+            matches!(err, neutrino_store::StorageError::InvalidInput(_)),
+            "expected InvalidInput from CHECK violation, got {err:?}"
+        );
+    }
+
+    // S25: schema CHECK rejects a non-member row with a non-NULL
+    // membership. The membership column is only meaningful for
+    // m.room.member rows; pinning the inverse direction means no future
+    // write path can accidentally stamp 'join' onto, say, an m.room.name
+    // row and have it leak into the membership-indexed lookups.
+    #[tokio::test]
+    async fn current_state_rejects_non_member_with_non_null_membership() {
+        use deadpool_sqlite::rusqlite::params;
+
+        use crate::error::Error;
+
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[name_event(event_id!("$n:e"), *ALICE_ROOM_ID, *ALICE_ID, "A")],
+        )
+        .await
+        .unwrap();
+
+        let alice_room = ALICE_ROOM_ID.as_str().to_owned();
+        let err = s
+            .run_write(move |conn| -> Result<(), Error> {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "UPDATE current_state SET membership = 'join' \
+                     WHERE room_id = ? AND event_type = 'm.room.name' AND state_key = ''",
+                    params![alice_room],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .expect_err("CHECK must reject non-NULL membership on non-member row");
+        assert!(
+            matches!(err, neutrino_store::StorageError::InvalidInput(_)),
+            "expected InvalidInput from CHECK violation, got {err:?}"
+        );
+    }
+
+    // S26: end-to-end — persist_event on an m.room.member whose JSON
+    // lacks `content.membership` surfaces InvalidInput rather than
+    // silently writing a NULL-membership current_state row. This pins
+    // the new persist_event behaviour at the trait boundary; previously
+    // the malformed event landed silently and only manifested as
+    // missing rows on the read side.
+    #[tokio::test]
+    async fn persist_event_rejects_member_without_membership() {
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_ID),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        // write_into_tx only inspects `prev_events`, `prev_state_events`
+        // and `content.membership` from the raw JSON, so the minimal
+        // body below is enough to drive the code path.
+        let event = make_event_with_raw_json(
+            event_id!("$bad:e"),
+            *ALICE_ROOM_ID,
+            *ALICE_ID,
+            "m.room.member",
+            Some(ALICE_ID.as_str()),
+            r#"{"prev_events":[],"prev_state_events":[],"content":{}}"#,
+        );
+
+        let err = s
+            .persist_event(&event, &[])
+            .await
+            .expect_err("malformed member event must surface InvalidInput");
+        assert!(
+            matches!(err, neutrino_store::StorageError::InvalidInput(_)),
+            "expected InvalidInput from CHECK violation, got {err:?}"
         );
     }
 }

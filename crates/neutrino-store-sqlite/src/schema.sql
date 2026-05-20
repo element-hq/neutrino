@@ -73,9 +73,12 @@ CREATE TABLE event_edges (
 -- state. Superseded historical events live in `events` only.
 -- state_key is TEXT NOT NULL — the empty string is a valid state key
 -- (m.room.create, m.room.power_levels, etc.), only SQL NULL is disallowed.
--- `membership` is non-NULL exactly for m.room.member rows; carries the
--- canonical value so joined_rooms / joined_members can filter via an
--- indexed column without loading event JSON (per the post-condition).
+-- `membership` is non-NULL exactly for m.room.member rows, enforced by
+-- the CHECK below — m.room.member must hold a canonical value, every
+-- other event_type must be NULL. This catches the case where a malformed
+-- m.room.member event with no `content.membership` would otherwise have
+-- been silently persisted with NULL membership and then quietly filtered
+-- out of joined_rooms / joined_members.
 --
 -- The composite FK on (event_id, room_id, event_type, state_key) enforces
 -- that every current_state row references an `events` row that agrees on
@@ -95,10 +98,22 @@ CREATE TABLE current_state (
     event_type   TEXT NOT NULL,
     state_key    TEXT NOT NULL,
     event_id     TEXT NOT NULL,
-    membership   TEXT
-        CHECK (membership IS NULL
-               OR membership IN ('join','leave','ban','invite','knock')),
+    membership   TEXT,
     PRIMARY KEY (room_id, event_type, state_key),
+    -- `membership` ⇔ `event_type = 'm.room.member'`. The two-branch CHECK
+    -- bundles the existing "valid-value-or-NULL" restriction with the
+    -- new structural invariant: member rows must carry one of the five
+    -- canonical membership values, non-member rows must be NULL. SQL
+    -- three-valued logic does the right thing for the NULL case — a
+    -- m.room.member row with NULL membership fails the first branch
+    -- (NULL IN (…) is UNKNOWN) and the second (event_type matches), so
+    -- the CHECK rejects.
+    CHECK (
+        (event_type = 'm.room.member'
+            AND membership IN ('join','leave','ban','invite','knock'))
+        OR
+        (event_type <> 'm.room.member' AND membership IS NULL)
+    ),
     FOREIGN KEY (event_id, room_id, event_type, state_key)
         REFERENCES events(event_id, room_id, event_type, state_key)
 ) STRICT, WITHOUT ROWID;
