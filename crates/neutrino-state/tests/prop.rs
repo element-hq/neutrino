@@ -19,8 +19,10 @@
 //! doesn't need proptest entropy.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use neutrino_state::auth_events::{auth_event_keys, calculate_auth_events};
+use neutrino_state::auth_rules::check_auth_rules;
 use neutrino_state::validate::parse_event;
 use neutrino_state::{Event, FormatError, RoomVersion, StateMap};
 use proptest::prelude::*;
@@ -259,5 +261,69 @@ proptest! {
             !result.contains(&create_id),
             "v12 must exclude m.room.create from auth_events even when present in state"
         );
+    }
+}
+
+// ---------- auth_rules sanity floor ----------
+
+/// Synthetic `m.room.create` event for state-map fixtures.
+fn arb_create_arc() -> impl Strategy<Value = Arc<Event>> {
+    arb_user_id().prop_map(|sender| {
+        let v = json!({
+            "type": "m.room.create",
+            "sender": sender,
+            "content": { "room_version": "12" },
+            "prev_events": [],
+            "depth": 0,
+            "origin_server_ts": 1_700_000_000_000_u64,
+            "hashes": { "sha256": "abc" },
+            "state_key": ""
+        });
+        Arc::new(
+            parse_event(raw(v), eid("$create:example.org"), RoomVersion::V12)
+                .expect("create event valid"),
+        )
+    })
+}
+
+/// Arbitrary `StateMap<Arc<Event>>` for auth-rule fuzz tests. Maybe contains
+/// a create event, plus 0..10 arbitrary state events keyed by their own
+/// `(type, state_key)`. Both branches (create present / absent) are
+/// exercised — the absent path should produce `AuthError::CreateMissing`,
+/// not a panic.
+fn arb_event_state_map() -> impl Strategy<Value = StateMap<Arc<Event>>> {
+    (
+        proptest::option::of(arb_create_arc()),
+        prop::collection::vec(arb_event().prop_map(Arc::new), 0..10),
+    )
+        .prop_map(|(maybe_create, events)| {
+            let mut state: StateMap<Arc<Event>> = StateMap::new();
+            if let Some(create) = maybe_create {
+                state.insert(("m.room.create".to_string(), String::new()), create);
+            }
+            for ev in events {
+                let key = (
+                    ev.event_type.clone(),
+                    ev.state_key.clone().unwrap_or_default(),
+                );
+                state.insert(key, ev);
+            }
+            state
+        })
+}
+
+proptest! {
+    /// Sanity floor: `check_auth_rules` must not panic for any combination of
+    /// an arbitrary event and an arbitrary state map. The function should
+    /// always return a `Result<(), AuthError>`. Guards the `.expect()`s
+    /// inside `check_rule_5_member` against future drift of Phase 1a's
+    /// state_key / content.membership invariants, and any future panics
+    /// introduced elsewhere in the dispatcher.
+    #[test]
+    fn check_auth_rules_never_panics(
+        event in arb_event(),
+        state in arb_event_state_map(),
+    ) {
+        let _ = check_auth_rules(&event, &state);
     }
 }
