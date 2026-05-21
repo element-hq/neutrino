@@ -974,25 +974,14 @@ mod tests {
     // =====================================================================
 
     use crate::ReferenceError;
-    use crate::provider::{EventInfo, StateProvider};
-    use std::collections::HashMap;
+    use crate::provider::{EventInfo, InMemoryStateProvider};
     use std::sync::Arc;
 
-    #[derive(Default)]
-    struct MockProvider {
-        events: HashMap<OwnedEventId, EventInfo>,
-    }
-
-    impl MockProvider {
-        fn insert(&mut self, info: EventInfo) {
-            self.events.insert(info.event.event_id.clone(), info);
-        }
-    }
-
-    impl StateProvider for MockProvider {
-        fn get_event(&self, id: &ruma::EventId) -> Option<EventInfo> {
-            self.events.get(id).cloned()
-        }
+    /// Helper around `InMemoryStateProvider::insert` for the validate tests,
+    /// which don't care about `auth_event_ids` — `validate_references` only
+    /// calls `get_event`. Pass an empty `auth_events` vec.
+    fn insert_event(provider: &mut InMemoryStateProvider, info: EventInfo) {
+        provider.insert(info, Vec::new());
     }
 
     fn make_event(json: Value, event_id: &str) -> Arc<Event> {
@@ -1028,17 +1017,20 @@ mod tests {
     #[test]
     fn refs_create_event_skips_all_checks() {
         let create = make_create("$create:example.org");
-        let provider = MockProvider::default();
+        let provider = InMemoryStateProvider::new();
         validate_references(&create, &provider).expect("create event bypasses ref checks");
     }
 
     #[test]
     fn refs_happy_path_known_room() {
-        let mut provider = MockProvider::default();
-        provider.insert(EventInfo {
-            event: make_create("$create:example.org"),
-            rejected: false,
-        });
+        let mut provider = InMemoryStateProvider::new();
+        insert_event(
+            &mut provider,
+            EventInfo {
+                event: make_create("$create:example.org"),
+                rejected: false,
+            },
+        );
         let msg = make_message("!create:example.org", vec![], "$msg:example.org");
         validate_references(&msg, &provider).expect("known room");
     }
@@ -1046,7 +1038,7 @@ mod tests {
     // v12 rule 2: unknown room
     #[test]
     fn refs_unknown_room_rejected() {
-        let provider = MockProvider::default();
+        let provider = InMemoryStateProvider::new();
         let msg = make_message("!doesnotexist:example.org", vec![], "$msg:example.org");
         assert!(matches!(
             validate_references(&msg, &provider),
@@ -1057,11 +1049,14 @@ mod tests {
     // v12 rule 2: create event is rejected
     #[test]
     fn refs_rejected_create_rejects_event() {
-        let mut provider = MockProvider::default();
-        provider.insert(EventInfo {
-            event: make_create("$create:example.org"),
-            rejected: true,
-        });
+        let mut provider = InMemoryStateProvider::new();
+        insert_event(
+            &mut provider,
+            EventInfo {
+                event: make_create("$create:example.org"),
+                rejected: true,
+            },
+        );
         let msg = make_message("!create:example.org", vec![], "$msg:example.org");
         assert!(matches!(
             validate_references(&msg, &provider),
@@ -1072,12 +1067,15 @@ mod tests {
     // v12 rule 2 defensive: derived id resolves to a non-create event.
     #[test]
     fn refs_non_create_at_derived_id_rejected() {
-        let mut provider = MockProvider::default();
+        let mut provider = InMemoryStateProvider::new();
         // Store a non-create event at id "$create:example.org".
-        provider.insert(EventInfo {
-            event: make_state_event("!somewhere:example.org", "$create:example.org"),
-            rejected: false,
-        });
+        insert_event(
+            &mut provider,
+            EventInfo {
+                event: make_state_event("!somewhere:example.org", "$create:example.org"),
+                rejected: false,
+            },
+        );
         let msg = make_message("!create:example.org", vec![], "$msg:example.org");
         assert!(matches!(
             validate_references(&msg, &provider),
@@ -1088,11 +1086,14 @@ mod tests {
     // MSC4242 triad: prev_state_event not in store
     #[test]
     fn refs_prev_state_not_found_rejected() {
-        let mut provider = MockProvider::default();
-        provider.insert(EventInfo {
-            event: make_create("$create:example.org"),
-            rejected: false,
-        });
+        let mut provider = InMemoryStateProvider::new();
+        insert_event(
+            &mut provider,
+            EventInfo {
+                event: make_create("$create:example.org"),
+                rejected: false,
+            },
+        );
         let msg = make_message(
             "!create:example.org",
             vec!["$missing:example.org"],
@@ -1107,15 +1108,21 @@ mod tests {
     // MSC4242 triad: prev_state_event is rejected
     #[test]
     fn refs_prev_state_rejected_rejects_event() {
-        let mut provider = MockProvider::default();
-        provider.insert(EventInfo {
-            event: make_create("$create:example.org"),
-            rejected: false,
-        });
-        provider.insert(EventInfo {
-            event: make_state_event("!create:example.org", "$rejected:example.org"),
-            rejected: true,
-        });
+        let mut provider = InMemoryStateProvider::new();
+        insert_event(
+            &mut provider,
+            EventInfo {
+                event: make_create("$create:example.org"),
+                rejected: false,
+            },
+        );
+        insert_event(
+            &mut provider,
+            EventInfo {
+                event: make_state_event("!create:example.org", "$rejected:example.org"),
+                rejected: true,
+            },
+        );
         let msg = make_message(
             "!create:example.org",
             vec!["$rejected:example.org"],
@@ -1130,17 +1137,23 @@ mod tests {
     // MSC4242 triad: prev_state_event has no state_key (i.e. not a state event)
     #[test]
     fn refs_prev_state_non_state_event_rejected() {
-        let mut provider = MockProvider::default();
-        provider.insert(EventInfo {
-            event: make_create("$create:example.org"),
-            rejected: false,
-        });
+        let mut provider = InMemoryStateProvider::new();
+        insert_event(
+            &mut provider,
+            EventInfo {
+                event: make_create("$create:example.org"),
+                rejected: false,
+            },
+        );
         // make_message() produces an m.room.message without state_key.
         let non_state = make_message("!create:example.org", vec![], "$msg-ref:example.org");
-        provider.insert(EventInfo {
-            event: non_state,
-            rejected: false,
-        });
+        insert_event(
+            &mut provider,
+            EventInfo {
+                event: non_state,
+                rejected: false,
+            },
+        );
         let msg = make_message(
             "!create:example.org",
             vec!["$msg-ref:example.org"],
@@ -1155,16 +1168,22 @@ mod tests {
     // MSC4242 triad: prev_state_event belongs to a different room
     #[test]
     fn refs_prev_state_different_room_rejected() {
-        let mut provider = MockProvider::default();
-        provider.insert(EventInfo {
-            event: make_create("$create:example.org"),
-            rejected: false,
-        });
+        let mut provider = InMemoryStateProvider::new();
+        insert_event(
+            &mut provider,
+            EventInfo {
+                event: make_create("$create:example.org"),
+                rejected: false,
+            },
+        );
         // A state event whose room_id is a different room.
-        provider.insert(EventInfo {
-            event: make_state_event("!other:example.org", "$other-state:example.org"),
-            rejected: false,
-        });
+        insert_event(
+            &mut provider,
+            EventInfo {
+                event: make_state_event("!other:example.org", "$other-state:example.org"),
+                rejected: false,
+            },
+        );
         let msg = make_message(
             "!create:example.org",
             vec!["$other-state:example.org"],
@@ -1178,19 +1197,28 @@ mod tests {
 
     #[test]
     fn refs_multiple_prev_state_all_valid() {
-        let mut provider = MockProvider::default();
-        provider.insert(EventInfo {
-            event: make_create("$create:example.org"),
-            rejected: false,
-        });
-        provider.insert(EventInfo {
-            event: make_state_event("!create:example.org", "$state1:example.org"),
-            rejected: false,
-        });
-        provider.insert(EventInfo {
-            event: make_state_event("!create:example.org", "$state2:example.org"),
-            rejected: false,
-        });
+        let mut provider = InMemoryStateProvider::new();
+        insert_event(
+            &mut provider,
+            EventInfo {
+                event: make_create("$create:example.org"),
+                rejected: false,
+            },
+        );
+        insert_event(
+            &mut provider,
+            EventInfo {
+                event: make_state_event("!create:example.org", "$state1:example.org"),
+                rejected: false,
+            },
+        );
+        insert_event(
+            &mut provider,
+            EventInfo {
+                event: make_state_event("!create:example.org", "$state2:example.org"),
+                rejected: false,
+            },
+        );
         let msg = make_message(
             "!create:example.org",
             vec!["$state1:example.org", "$state2:example.org"],

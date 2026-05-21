@@ -7,6 +7,7 @@ use thiserror::Error;
 pub mod auth_events;
 pub mod auth_rules;
 pub mod provider;
+pub mod state_res;
 pub mod validate;
 
 /// Room version supported by this state machine.
