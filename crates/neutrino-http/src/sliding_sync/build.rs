@@ -72,7 +72,7 @@ pub(super) async fn build_response<S: StorageBackend>(
         conn.last_event_stream_pos = max_stream_pos;
     }
 
-    let ranked = candidate_rooms(state, user_id).await?;
+    let ranked = candidate_rooms(state, user_id, conn).await?;
     let combined = combined_room_configs(conn, &ranked);
 
     let mut rooms_response = BTreeMap::new();
@@ -224,27 +224,49 @@ struct CombinedCfg {
 
 /// Rank every room the user can see by recency.
 ///
-/// Joined rooms come from current state; invited rooms from invite events.
+/// Applies MSC4186 §"Rooms included in the server list":
+/// - **Join / invite / knock:** always included.
+/// - **Kick** (`m.room.member.content.membership == "leave"`, `sender != user`):
+///   always included so the client can render the notification.
+/// - **Self-leave** (`membership == "leave"`, `sender == user`): included
+///   only if we've previously emitted the room on this connection
+///   (`conn.sent.contains_key`). MSC4186: "Left rooms, unless previously
+///   sent to this connection".
+/// - **Ban** (`membership == "ban"`): included if previously emitted on
+///   this connection. The spec says "previously joined"; we approximate
+///   with "previously emitted" because we don't keep a separate
+///   per-conn history of historical join events. False negatives are
+///   possible after a restart (the conn is fresh, so prior emissions are
+///   lost) — documented in MSC4186-gaps.md.
+///
 /// We don't apply MSC4186's `is_dm`/`is_encrypted`/`spaces`/`tags`/etc.
 /// filters — the embedded single-user server returns the full set (PLAN.md
 /// 2026-05-14). Sorted by `bump_stamp` desc, tiebroken by `room_id` asc so
 /// tests are deterministic.
-///
-/// TODO(phase-3+): include kicked/banned rooms per MSC4186 §"Rooms included in
-/// the server list", and previously-joined left rooms if the conn already saw
-/// them. Blocked on a new `StateStore` method like `rooms_with_membership` —
-/// trait change, ask first.
 async fn candidate_rooms<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
+    conn: &Conn,
 ) -> Result<Vec<RankedRoom>, SyncError> {
-    let mut all = state.store.joined_rooms(user_id).await?;
-    all.extend(state.store.invited_rooms(user_id).await?);
-    all.sort();
-    all.dedup();
+    // One round-trip for the union across all five MSC4186-eligible
+    // memberships. The store hands back `(room, current_membership)`
+    // pairs so we can branch on membership without a second lookup.
+    let pairs = state
+        .store
+        .rooms_with_membership(user_id, &["join", "invite", "knock", "leave", "ban"])
+        .await?;
 
-    let mut ranked: Vec<RankedRoom> = Vec::with_capacity(all.len());
-    for room_id in all {
+    let mut included: Vec<OwnedRoomId> = Vec::with_capacity(pairs.len());
+    for (room_id, membership) in pairs {
+        if include_room_per_msc4186(state, user_id, &room_id, &membership, conn).await? {
+            included.push(room_id);
+        }
+    }
+    included.sort();
+    included.dedup();
+
+    let mut ranked: Vec<RankedRoom> = Vec::with_capacity(included.len());
+    for room_id in included {
         let bump_stamp = compute_bump_stamp(state, &room_id).await?;
         ranked.push(RankedRoom {
             room_id,
@@ -258,6 +280,63 @@ async fn candidate_rooms<S: StorageBackend>(
             .then_with(|| a.room_id.cmp(&b.room_id))
     });
     Ok(ranked)
+}
+
+/// Decide whether to include a room with the given current membership,
+/// per MSC4186 §"Rooms included in the server list". For `leave` we have
+/// to look at the member event itself to distinguish a kick (always
+/// include) from a self-leave (only if previously emitted on this conn).
+async fn include_room_per_msc4186<S: StorageBackend>(
+    state: &SyncState<S>,
+    user_id: &UserId,
+    room_id: &RoomId,
+    membership: &str,
+    conn: &Conn,
+) -> Result<bool, SyncError> {
+    match membership {
+        "join" | "invite" | "knock" => Ok(true),
+        "leave" => {
+            let kicked = is_kick(state, room_id, user_id).await?;
+            Ok(kicked || conn.sent.contains_key(room_id))
+        }
+        "ban" => Ok(conn.sent.contains_key(room_id)),
+        _ => Ok(false),
+    }
+}
+
+/// True iff the current `m.room.member` event for `user_id` in `room_id`
+/// represents a kick: `content.membership == "leave"` AND
+/// `sender != user_id` (somebody else flipped us to "leave"). The
+/// membership check matters — an invite event also has `sender ≠ target`,
+/// so leaving it out would mis-classify invites as kicks if a caller ever
+/// invoked this helper outside the `"leave"` branch of
+/// `include_room_per_msc4186`.
+async fn is_kick<S: StorageBackend>(
+    state: &SyncState<S>,
+    room_id: &RoomId,
+    user_id: &UserId,
+) -> Result<bool, SyncError> {
+    let Some(ev) = state
+        .store
+        .current_state_event(room_id, "m.room.member", user_id.as_str())
+        .await?
+    else {
+        return Ok(false);
+    };
+    let parsed: serde_json::Value = serde_json::from_str(ev.json.get()).map_err(|e| {
+        SyncError::Storage(neutrino_common::storage::StorageError::Internal(
+            e.to_string(),
+        ))
+    })?;
+    let membership = parsed
+        .pointer("/content/membership")
+        .and_then(|m| m.as_str())
+        .unwrap_or("");
+    if membership != "leave" {
+        return Ok(false);
+    }
+    let sender = parsed.get("sender").and_then(|s| s.as_str()).unwrap_or("");
+    Ok(!sender.is_empty() && sender != user_id.as_str())
 }
 
 /// Best-available recency stamp for a room. Peek the most recent event

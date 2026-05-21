@@ -56,9 +56,6 @@ MSC4186 addition. Ruma v5 doesn't model it. **Blocked on ruma v5.**
 ### `membership` field on `response::Room` not emitted
 Same — MSC4186 addition that ruma v5 doesn't model. **Blocked on ruma v5.**
 
-### Kicked / banned / previously-left rooms not included
-MSC4186 §"Rooms included in the server list": kicked and banned rooms always; left rooms if already sent to this connection. `candidate_rooms` only returns joined ∪ invited. Cheapest fix is a new `StateStore::rooms_with_membership(user_id, &[membership_str])` trait method — **trait change, must be discussed and added to the decisions log first.** Single-user embedded use rarely hits this, but worth keeping flagged.
-
 ---
 
 ## Known caveats
@@ -85,6 +82,13 @@ Synapse's `bump_event_types` excludes reactions/redactions; we bump on any event
 
 ### `invite_state` not re-emitted across syncs
 `build_invite_room` only emits the stripped state on the first sync after an invite arrives (and never again until the user accepts/rejects). If the inviter renames the room or changes the avatar after sending the invite, the invitee won't see the update until they accept. The `invite_room_state` blob is fixed at invite time on the federation side so this matches the canonical S2S model.
+
+### Ban / self-leave inclusion uses a "previously emitted" approximation
+MSC4186 §"Rooms included in the server list" wants:
+- self-leave: include if previously sent to this connection,
+- ban: include if the user previously joined the room.
+
+We approximate "previously joined" with "previously emitted on this conn" (`conn.sent.contains_key`) because we don't keep a separate per-conn record of historical join events. The approximation is exact within a single connection's lifetime; a fresh conn after a server restart will not include rooms the user was banned from before the restart. For an embedded single-user server this trade-off is acceptable. Covered by `banned_room_only_appears_if_previously_emitted` (negative) and `banned_room_remains_visible_after_being_emitted_while_joined` (positive).
 
 ### `joined_count` accuracy depends on the storage backend
 `populate_room_metadata` derives `joined_count` from `StateStore::joined_members(room).len()`. The current live backend (`InMemoryStore`) computes this from the in-memory current state and is accurate. A future SQLite backend must populate this correctly — that's load-bearing for any client that sorts/groups by room size.
