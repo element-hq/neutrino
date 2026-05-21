@@ -19,12 +19,14 @@
 //! doesn't need proptest entropy.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use neutrino_state::auth_events::{auth_event_keys, calculate_auth_events};
+use neutrino_state::auth_rules::check_auth_rules;
 use neutrino_state::validate::parse_event;
 use neutrino_state::{Event, FormatError, RoomVersion, StateMap};
 use proptest::prelude::*;
-use ruma::OwnedEventId;
+use ruma::{OwnedEventId, OwnedUserId};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
@@ -259,5 +261,137 @@ proptest! {
             !result.contains(&create_id),
             "v12 must exclude m.room.create from auth_events even when present in state"
         );
+    }
+}
+
+// ---------- auth_rules sanity floor ----------
+
+/// Combined strategy: a create event_id, the create event built around it,
+/// and 0..10 other state events with arbitrary keys. The create_id and
+/// create event are coupled inside one `prop_filter_map` so the proptest
+/// shrinker can't desynchronise them — without this coupling, shrinking
+/// `create_id` independently would leave the `Event` carrying its original
+/// id, and the 5.3.1 property below would never see matching ancestry.
+///
+/// Returning the `create_id` lets call-site strategies thread it into
+/// `prev_events` / `prev_state_events` of the event-under-test, so rule
+/// 5.3.1 (self-join immediately after create) is actually reachable.
+fn arb_state_with_create()
+-> impl Strategy<Value = (OwnedEventId, OwnedUserId, StateMap<Arc<Event>>)> {
+    (
+        arb_event_id(),
+        arb_user_id(),
+        prop::collection::vec(arb_event().prop_map(Arc::new), 0..10),
+    )
+        .prop_filter_map("valid create + state", |(create_id, sender_str, events)| {
+            let v = json!({
+                "type": "m.room.create",
+                "sender": sender_str,
+                "content": { "room_version": "12" },
+                "prev_events": [],
+                "depth": 0,
+                "origin_server_ts": 1_700_000_000_000_u64,
+                "hashes": { "sha256": "abc" },
+                "state_key": ""
+            });
+            let create_event = parse_event(raw(v), create_id.clone(), RoomVersion::V12).ok()?;
+            let creator_uid = create_event.sender.clone();
+            let create = Arc::new(create_event);
+            let mut state: StateMap<Arc<Event>> = StateMap::new();
+            // Extras first; explicit create wins at `("m.room.create", "")`
+            // so the strategy can't desynchronise create_id from the
+            // state's create event when `arb_event` samples another
+            // `m.room.create` into the extras.
+            for ev in events {
+                let key = (
+                    ev.event_type.clone(),
+                    ev.state_key.clone().unwrap_or_default(),
+                );
+                state.insert(key, ev);
+            }
+            state.insert(("m.room.create".to_string(), String::new()), create);
+            Some((create_id, creator_uid, state))
+        })
+}
+
+proptest! {
+    /// Sanity floor: `check_auth_rules` must not panic for any combination of
+    /// an arbitrary event and a state map carrying a valid `m.room.create`.
+    /// (`AuthContext::new` enforces the create-event invariant via panic per
+    /// the post-`validate_references` contract, so a create-absent state map
+    /// is out of scope.) Guards the `.expect()`s inside `check_rule_5_member`
+    /// against future drift of Phase 1a's state_key / content.membership
+    /// invariants, and any future panics elsewhere in the dispatcher.
+    #[test]
+    fn check_auth_rules_never_panics(
+        event in arb_event(),
+        (_, _, state) in arb_state_with_create(),
+    ) {
+        let _ = check_auth_rules(&event, &state);
+    }
+
+    /// Rule 5.3.1: a self-join event whose only ancestry (in both DAGs) is
+    /// the create event is always allowed, regardless of additional state.
+    /// Everything is built inside the test body from primitive inputs so the
+    /// shrinker can't desynchronise the create_id from the create event's
+    /// stored `event_id`.
+    #[test]
+    fn rule_5_3_1_self_join_after_create_always_allowed(
+        create_id in arb_event_id(),
+        sender_str in arb_user_id(),
+        extras in prop::collection::vec(arb_event().prop_map(Arc::new), 0..10),
+        join_id in arb_event_id(),
+    ) {
+        prop_assume!(create_id != join_id);
+
+        let create_v = json!({
+            "type": "m.room.create",
+            "sender": sender_str,
+            "content": { "room_version": "12" },
+            "prev_events": [],
+            "depth": 0,
+            "origin_server_ts": 1_700_000_000_000_u64,
+            "hashes": { "sha256": "abc" },
+            "state_key": ""
+        });
+        let create_event = parse_event(raw(create_v), create_id.clone(), RoomVersion::V12)
+            .expect("create event valid wire format");
+        let creator_uid: OwnedUserId = create_event.sender.clone();
+        let mut state: StateMap<Arc<Event>> = StateMap::new();
+        // Insert extras first; the explicit create below must win at
+        // `("m.room.create", "")` so the proptest can't desynchronise the
+        // create_id from the state's create event by sampling another
+        // `m.room.create` into `extras`.
+        for ev in extras {
+            let key = (
+                ev.event_type.clone(),
+                ev.state_key.clone().unwrap_or_default(),
+            );
+            state.insert(key, ev);
+        }
+        state.insert(
+            ("m.room.create".to_string(), String::new()),
+            Arc::new(create_event),
+        );
+
+        // `Event::room_id` is derived inline by `parse_event` from the
+        // create event's id (`$X...` → `!X...`), so the join must carry the
+        // matching `room_id` to pass phase 1a.
+        let derived_room_id = format!("!{}", &create_id.as_str()[1..]);
+        let join_v = json!({
+            "type": "m.room.member",
+            "sender": creator_uid.as_str(),
+            "state_key": creator_uid.as_str(),
+            "room_id": derived_room_id,
+            "content": { "membership": "join" },
+            "prev_events": [create_id.as_str()],
+            "prev_state_events": [create_id.as_str()],
+            "depth": 1,
+            "origin_server_ts": 1_700_000_000_000_u64,
+            "hashes": { "sha256": "abc" }
+        });
+        let join = parse_event(raw(join_v), join_id, RoomVersion::V12)
+            .expect("self-join event valid wire format");
+        prop_assert!(check_auth_rules(&join, &state).is_ok());
     }
 }

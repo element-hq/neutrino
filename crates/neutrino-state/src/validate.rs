@@ -314,9 +314,11 @@ fn check_member(content: &Map<String, Value>, state_key: Option<&str>) -> Result
         return Err(FormatError::MemberMissingMembership);
     }
     // Per-value validation (membership ∈ {join, leave, invite, ban, knock})
-    // intentionally NOT done here — see PLAN.md decisions log: rule 5.8 lives
-    // in phase 3's switch/case to avoid the upfront-assert / per-arm-handler
-    // sync risk.
+    // intentionally NOT done here — `auth_rules::check_rule_5_member`'s
+    // switch/case owns the value enumeration (rule 5.8 = catch-all reject as
+    // `AuthError::Rule5_8_UnknownMembership`). Keeping it in one place avoids
+    // an upfront-assert/per-arm-handler sync drift. See PLAN.md decisions
+    // log for the rationale.
     Ok(())
 }
 
