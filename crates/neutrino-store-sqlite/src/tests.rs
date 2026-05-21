@@ -1,4 +1,10 @@
 //! Shared test fixtures for in-crate unit tests.
+//!
+//! Not every fixture is used by every submodule's tests, so individual
+//! helpers can look "unused" to dead-code analysis. The allow below covers
+//! that — these are shared helpers across multiple `mod tests` blocks.
+
+#![allow(dead_code)]
 
 use deadpool_sqlite::rusqlite::params;
 use lazy_static::lazy_static;

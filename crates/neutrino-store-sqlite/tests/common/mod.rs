@@ -4,6 +4,13 @@
 //! Helpers take ruma's typed reference types (`&EventId`, `&RoomId`,
 //! `&UserId`) so callers must produce a valid ID at compile time via the
 //! `event_id!` / `room_id!` / `user_id!` macros.
+//!
+//! Each integration-test binary that includes this module via `mod common`
+//! only links the helpers it actually calls, so unused warnings fire for the
+//! ones it doesn't. The allow below covers that — these helpers are shared
+//! across multiple test files.
+
+#![allow(dead_code)]
 
 use lazy_static::lazy_static;
 use neutrino_store::StoredEvent;
