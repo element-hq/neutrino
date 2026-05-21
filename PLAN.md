@@ -34,10 +34,13 @@
     - multiple developers will be relying on this not changing (one to implement the interface, the other using it). If it later turns out that the trait needs to change, prompt and add decision log immediately.
 - [ ] SQLite storage backend implementation
     - cannibalise existing neutrino-sqlite crate, then prompt user to clean crate up
-- [ ] Client-Server Sliding Sync MSC4186 implementation
-    - Does not need to be performant as it’s all local to the device.
-- [ ] Client-Server write endpoints (PUT/POST) implementation
-    - Must be persisted via the storage backend.
+    - currently an in-memory `InMemoryStore` in `neutrino-http` provides the live `StorageBackend` impl; replace with sqlite when this lands. `neutrino-sqlite` is no longer a dependency of `neutrino-http`.
+- [x] Client-Server Sliding Sync MSC4186 implementation
+    - wired into the live axum router at `POST /_matrix/client/unstable/org.matrix.simplified_msc3575/sync`
+    - 44 unit tests + 9 end-to-end HTTP tests
+    - filters, lazy members, heroes, `expanded_timeline`, kicked/banned rooms, state-stub emission are intentional gaps — see MSC4186-gaps.md
+- [x] Client-Server write endpoints (PUT/POST) implementation
+    - `/_matrix/client/v3/createRoom` and `/_matrix/client/v3/rooms/{room}/send/{type}/{txn}` route through `RoomStore::create_room` and `EventStore::persist_event` on `InMemoryStore`. Membership tracking is automatic from `m.room.member` events.
 - [ ] Server-Server /send implementation
     - MUST handle retrying on restart, MUST NOT lose events. Events MUST eventually be sent over federation.
 - [ ] Server-Server invite/join/leave implementation
@@ -48,7 +51,7 @@ All status points MUST have tests.
 
 ## in progress
 
-- [ ] SQLite storage backend implementation
+- [ ] SQLite storage backend implementation (sliding sync wiring uses the in-memory backend in the meantime)
 
 ## open questions
 - how should low bandwidth CBOR/CoAP integrate with HTTP/JSON? As a separate crate/proxy or baked into the Event / Request / Response types? How does this affect working with Ruma?
@@ -81,3 +84,5 @@ Decided to use Claude.
 2026-05-13: StorageBackend extended to six sub-traits. EventStore gains get_client_txn/record_client_txn for CSAPI txnId deduplication across restarts. New FederationInbox sub-trait with record_federation_txn(origin, txn_id) for inbound federation txnId deduplication (returns true if already seen). DagStore::missing_events drops min_depth parameter — depth tracking not implemented. Backfill cursor is implicit: derive frontier from events whose prev_events reference IDs absent from the store; no explicit cursor storage needed. Room IDs must be derived from the reference hash of the create event (room version 12), not randomly generated. Outbox startup wiring (enumerate pending_destinations on boot, spawn sender per destination) goes in neutrino-main.
 
 2026-05-14: StateStore gains invited_rooms(user_id). Kept separate from joined_rooms to keep the trait append-only; may be folded into a single method with a membership filter parameter in the future. Sliding sync (MSC4186) uses ruma::api::client::sync::sync_events::v5 types directly (requires `client-api-s` + `unstable-msc4186` features on ruma); filters (is_dm/is_encrypted/is_invite/room_types/not_room_types) are parsed but ignored — every candidate room is returned (embedded single-user server). bump_stamp = max(origin_server_ts) of timeline events in the room (MSC4186 says "not a timestamp" but field is opaque to the client, so this satisfies sortable-activity semantics and means backfilled-old events don't bump rooms). Lazy members, heroes, expanded_timeline, and state stubs are deferred. Connection state lives in an in-memory ConnRegistry; lost on restart → client gets M_UNKNOWN_POS and re-syncs. Pos token is a per-conn sequence counter, not an event stream position.
+
+2026-05-15: Sliding sync wired into the live router. `InMemoryStore` (in `neutrino-http/src/in_memory_store.rs`) provides the `StorageBackend` impl for production until the SQLite trait impl lands. `neutrino-http` no longer depends on `neutrino-sqlite`. Per-conn idempotency cache (`Conn::last_request_pos`, `Conn::last_response`) lets clients safely retry the same `pos`. State-stub emission is gated behind a hardcoded `EMIT_STATE_STUBS: bool` in `build.rs` (default `false`) — clients keep their stale view of removed state until it's re-set. Tower 0.5 added as a dev-dependency of `neutrino-http` only, for `Router::oneshot` in `tests/e2e_sliding_sync.rs`.

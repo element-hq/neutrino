@@ -6,7 +6,8 @@ use ruma::api::client::sync::sync_events::v5::{Request, request};
 use ruma::events::StateEventType;
 use ruma::{OwnedRoomId, RoomId, UInt, event_id, room_id, user_id};
 
-use super::mock::{MockStore, make_event};
+use crate::in_memory_store::{InMemoryStore, make_event};
+
 use super::{SyncError, SyncState, handle};
 
 fn list_with(timeline_limit: u32, required: Vec<(StateEventType, &str)>) -> request::List {
@@ -22,7 +23,7 @@ fn list_with(timeline_limit: u32, required: Vec<(StateEventType, &str)>) -> requ
 
 #[tokio::test]
 async fn initial_sync_with_no_lists_returns_empty_rooms_and_fresh_pos() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let state = SyncState::new(store);
     let user = user_id!("@alice:example.org");
 
@@ -37,7 +38,7 @@ async fn initial_sync_with_no_lists_returns_empty_rooms_and_fresh_pos() {
 
 #[tokio::test]
 async fn initial_sync_with_list_returns_joined_rooms_and_calls_storage() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room_a = room_id!("!room-a:example.org");
     let room_b = room_id!("!room-b:example.org");
@@ -101,7 +102,7 @@ async fn initial_sync_with_list_returns_joined_rooms_and_calls_storage() {
 
 #[tokio::test]
 async fn required_state_filters_current_state() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -172,7 +173,7 @@ async fn required_state_filters_current_state() {
 
 #[tokio::test]
 async fn unknown_pos_returns_error() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let state = SyncState::new(store);
     let user = user_id!("@alice:example.org");
 
@@ -184,7 +185,7 @@ async fn unknown_pos_returns_error() {
 
 #[tokio::test]
 async fn second_sync_with_correct_pos_succeeds() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let state = SyncState::new(store);
     let user = user_id!("@alice:example.org");
 
@@ -199,7 +200,7 @@ async fn second_sync_with_correct_pos_succeeds() {
 
 #[tokio::test]
 async fn invited_rooms_are_candidates() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let invited_room: &ruma::RoomId = room_id!("!invited:example.org");
     store.invite_user(user, invited_room);
@@ -224,7 +225,7 @@ async fn invited_rooms_are_candidates() {
 /// event at the given `ts[i]`. Returns the room IDs in seed order so tests can
 /// assert membership against ranking-derived subsets.
 fn seed_rooms_with_timestamps(
-    store: &MockStore,
+    store: &InMemoryStore,
     user: &ruma::UserId,
     timestamps: &[u64],
 ) -> Vec<OwnedRoomId> {
@@ -259,7 +260,7 @@ async fn rooms_sorted_by_bump_stamp_desc() {
     // 3 rooms with descending bump stamps assigned to ascending room IDs —
     // room IDs sort opposite to bump_stamp, so any room_id-based ordering
     // would give different results than bump_stamp-based ordering.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     // !room-0 → ts 300 (most recent), !room-1 → 200, !room-2 → 100.
     let ids = seed_rooms_with_timestamps(&store, user, &[300, 200, 100]);
@@ -301,7 +302,7 @@ async fn rooms_sorted_by_bump_stamp_desc() {
 #[tokio::test]
 async fn range_slicing_returns_only_requested_indexes() {
     // 10 rooms with strictly ascending bump stamps; request indexes [2,4].
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let timestamps: Vec<u64> = (1..=10).map(|i| i * 100).collect();
     let ids = seed_rooms_with_timestamps(&store, user, &timestamps);
@@ -332,7 +333,7 @@ async fn range_slicing_returns_only_requested_indexes() {
 async fn subscription_bypasses_list_range() {
     // 3 rooms ranked 0, 1, 2 by recency. List asks for range [0,0] (top only).
     // Subscription names the lowest-ranked room — should appear regardless.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let ids = seed_rooms_with_timestamps(&store, user, &[300, 200, 100]);
     let state = SyncState::new(store);
@@ -372,7 +373,7 @@ async fn multi_range_request_only_honours_first() {
     // `ranges: Vec` for compatibility. We honour only `ranges[0]` and silently
     // drop the rest. This test asserts that with 5 rooms and a request that
     // sends both [0,0] and [3,4], only the rank-0 room comes back.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let ids = seed_rooms_with_timestamps(&store, user, &[100, 200, 300, 400, 500]);
     let state = SyncState::new(store);
@@ -396,7 +397,7 @@ async fn multi_range_request_only_honours_first() {
 
 #[tokio::test]
 async fn list_count_independent_of_range_size() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let _ids = seed_rooms_with_timestamps(&store, user, &[100, 200, 300, 400, 500]);
     let state = SyncState::new(store);
@@ -423,7 +424,7 @@ async fn list_count_independent_of_range_size() {
 
 #[tokio::test]
 async fn second_sync_returns_only_new_events() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -487,7 +488,7 @@ async fn third_sync_with_no_new_events_omits_room() {
     // After an initial emission and a subsequent sync that captures nothing
     // new, the room should drop out of the response entirely (MSC4186
     // §"Room Matching Rules").
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -522,7 +523,7 @@ async fn third_sync_with_no_new_events_omits_room() {
 
 #[tokio::test]
 async fn limited_set_when_timeline_truncated() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -574,7 +575,7 @@ async fn limited_set_when_timeline_truncated() {
 
 #[tokio::test]
 async fn required_state_not_re_sent_when_unchanged() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -631,7 +632,7 @@ async fn deleted_state_not_surfaced_with_stubs_disabled() {
     // next sync — the client is intentionally left with its stale view
     // until the state is re-set. The deletion-detection logic itself is
     // covered separately by a unit test on `diff_required_state`.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -688,9 +689,66 @@ async fn deleted_state_not_surfaced_with_stubs_disabled() {
     );
 }
 
+/// Seed an invited-room scenario: an `m.room.member` event with
+/// `membership = "invite"` for `user`, carrying the canonical pieces of
+/// stripped state inside `unsigned.invite_room_state`. Mirrors what would
+/// come in from a federation `/invite` call.
+fn seed_invite(
+    store: &InMemoryStore,
+    room: &RoomId,
+    user: &ruma::UserId,
+    inviter: &ruma::UserId,
+    invite_event_id: &ruma::EventId,
+    room_name: &str,
+    ts: u64,
+) {
+    store.invite_user(user, room);
+    let invite_json = serde_json::json!({
+        "event_id": invite_event_id.as_str(),
+        "room_id": room.as_str(),
+        "type": "m.room.member",
+        "state_key": user.as_str(),
+        "sender": inviter.as_str(),
+        "origin_server_ts": ts,
+        "content": {"membership": "invite"},
+        "unsigned": {
+            "invite_room_state": [
+                {
+                    "type": "m.room.create",
+                    "state_key": "",
+                    "sender": inviter.as_str(),
+                    "content": {"creator": inviter.as_str(), "room_version": "12"}
+                },
+                {
+                    "type": "m.room.name",
+                    "state_key": "",
+                    "sender": inviter.as_str(),
+                    "content": {"name": room_name}
+                },
+                {
+                    "type": "m.room.member",
+                    "state_key": inviter.as_str(),
+                    "sender": inviter.as_str(),
+                    "content": {"membership": "join"}
+                }
+            ]
+        }
+    });
+    let invite_event = StoredEvent {
+        event_id: invite_event_id.to_owned(),
+        room_id: room.to_owned(),
+        event_type: "m.room.member".to_string(),
+        state_key: Some(user.as_str().to_string()),
+        sender: inviter.to_owned(),
+        origin_server_ts: ts,
+        json: serde_json::value::to_raw_value(&invite_json).unwrap(),
+    };
+    store.add_event(invite_event);
+}
+
 #[tokio::test]
 async fn invited_room_emits_invite_state() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let inviter = user_id!("@bob:example.org");
     let room = room_id!("!invite:example.org");
@@ -776,9 +834,98 @@ async fn invited_room_emits_invite_state() {
     assert_eq!(member_count, 2);
 }
 
+/// Ported from Synapse's `test_get_invited_banned_knocked_room` (invited
+/// slice only — banned/knocked are out of scope until the kicked/banned
+/// trait change). Exercises the case where a new invite arrives while a
+/// previously-emitted invite is still pending: the new invite must come
+/// down with `invite_state`, while the old invite stays omitted (we already
+/// sent its stripped state on the first emission and don't re-send).
+#[tokio::test]
+async fn fresh_invite_emitted_while_existing_invite_pending() {
+    let store = Arc::new(InMemoryStore::new());
+    let user = user_id!("@alice:example.org");
+    let inviter = user_id!("@bob:example.org");
+    let room_a = room_id!("!a:example.org");
+    let room_b = room_id!("!b:example.org");
+
+    seed_invite(
+        &store,
+        room_a,
+        user,
+        inviter,
+        event_id!("$invite-a:example.org"),
+        "Room A",
+        100,
+    );
+    let state = SyncState::new(store.clone());
+
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+
+    // First sync: A appears with stripped state.
+    let mut req1 = Request::new();
+    req1.lists = lists.clone();
+    let resp1 = handle(&state, user, req1).await.unwrap();
+    let a_first = resp1
+        .rooms
+        .get(room_a)
+        .expect("A in first response")
+        .invite_state
+        .as_ref()
+        .expect("invite_state populated on first emission");
+    assert!(!a_first.is_empty());
+
+    // Second sync: A omitted entirely (`build_invite_room` returns None on
+    // non-initial-for-room emissions; invite_state doesn't get re-sent).
+    let mut req2 = Request::new();
+    req2.pos = Some(resp1.pos);
+    req2.lists = lists.clone();
+    let resp2 = handle(&state, user, req2).await.unwrap();
+    assert!(
+        !resp2.rooms.contains_key(room_a),
+        "A no longer in response — invite_state already delivered"
+    );
+
+    // A new invite arrives for room B.
+    seed_invite(
+        &store,
+        room_b,
+        user,
+        inviter,
+        event_id!("$invite-b:example.org"),
+        "Room B",
+        200,
+    );
+
+    // Third sync: B carries the fresh invite_state, A stays omitted.
+    let mut req3 = Request::new();
+    req3.pos = Some(resp2.pos);
+    req3.lists = lists;
+    let resp3 = handle(&state, user, req3).await.unwrap();
+
+    let b_invite_state = resp3
+        .rooms
+        .get(room_b)
+        .expect("B in third response")
+        .invite_state
+        .as_ref()
+        .expect("invite_state populated for the new invite");
+    let b_types: Vec<String> = b_invite_state
+        .iter()
+        .map(|raw| raw.get_field::<String>("type").unwrap().unwrap())
+        .collect();
+    assert!(b_types.contains(&"m.room.name".to_string()));
+    assert!(b_types.iter().any(|t| t == "m.room.member"));
+
+    assert!(
+        !resp3.rooms.contains_key(room_a),
+        "A's invite is still pending but not re-emitted"
+    );
+}
+
 #[tokio::test]
 async fn name_avatar_and_counts_emitted() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let bob = user_id!("@bob:example.org");
     let carol = user_id!("@carol:example.org");
@@ -844,10 +991,8 @@ async fn name_avatar_and_counts_emitted() {
         ruma::JsOption::Some(uri) => assert_eq!(uri.as_str(), "mxc://example.org/abc"),
         _ => panic!("avatar should be Some"),
     }
-    // The mock's `joined_members` returns empty (StateStore stub), so
-    // joined_count comes back as 0 / Some(0). Acceptable for a mock-only
-    // test; the real sqlite impl will populate this properly.
-    assert_eq!(room_res.joined_count, Some(UInt::from(0u32)));
+    // Alice + Bob joined → count 2. Carol is invited, not joined.
+    assert_eq!(room_res.joined_count, Some(UInt::from(2u32)));
     assert_eq!(
         room_res.invited_count,
         Some(UInt::from(1u32)),
@@ -861,7 +1006,7 @@ async fn name_avatar_and_counts_emitted() {
 
 #[tokio::test]
 async fn conn_id_over_16_chars_rejected() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let state = SyncState::new(store);
     let user = user_id!("@alice:example.org");
 
@@ -873,7 +1018,7 @@ async fn conn_id_over_16_chars_rejected() {
 
 #[tokio::test]
 async fn too_many_lists_rejected() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let state = SyncState::new(store);
     let user = user_id!("@alice:example.org");
 
@@ -889,7 +1034,7 @@ async fn too_many_lists_rejected() {
 
 #[tokio::test]
 async fn e2ee_extension_echoed_when_enabled() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let state = SyncState::new(store);
     let user = user_id!("@alice:example.org");
 
@@ -911,7 +1056,7 @@ async fn e2ee_extension_echoed_when_enabled() {
 
 #[tokio::test]
 async fn to_device_extension_echoed_when_enabled() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let state = SyncState::new(store);
     let user = user_id!("@alice:example.org");
 
@@ -930,7 +1075,7 @@ async fn to_device_extension_echoed_when_enabled() {
 
 #[tokio::test]
 async fn extensions_not_echoed_when_not_requested() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let state = SyncState::new(store);
     let user = user_id!("@alice:example.org");
 
@@ -948,7 +1093,7 @@ async fn initial_sync_ignores_timeout() {
     // pos=None always short-circuits the long-poll loop: a client doing an
     // initial sync wants the snapshot, not to wait for new events. The
     // generous timeout here would otherwise make the test hang forever.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let state = SyncState::new(store);
     let user = user_id!("@alice:example.org");
 
@@ -967,7 +1112,7 @@ async fn initial_sync_ignores_timeout() {
 async fn long_poll_returns_empty_after_timeout() {
     // Subsequent sync with no new events and a short timeout: should wait
     // approximately `timeout` and then return with no rooms.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -1010,7 +1155,7 @@ async fn long_poll_returns_empty_after_timeout() {
 async fn long_poll_wakes_on_new_event() {
     // Subsequent sync with timeout=300ms. Add a new event ~50ms in. Assert
     // the sync returns the event well before the timeout expires.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -1075,7 +1220,7 @@ async fn retry_with_same_pos_returns_cached_response() {
     // MSC4186 §"Pagination and Tokens": clients may retry by re-sending the
     // same pos. The server returns the exact same response (same rooms,
     // same pos, same lists) without re-processing or advancing state.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -1128,7 +1273,7 @@ async fn stale_pos_returns_unknown_pos_after_advancing() {
     // Once the client has advanced past pos="1" by sending pos="1" and then
     // pos="2", retrying with pos="1" must fail: the cache only remembers
     // the *most recent* processed input pos.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let state = SyncState::new(store);
 
@@ -1158,7 +1303,7 @@ async fn retry_does_not_consume_pending_events() {
     // `events_after` or otherwise advance conn state. A real delta sync
     // immediately after the retry should still see the same new events as
     // if the retry never happened.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -1216,4 +1361,500 @@ async fn retry_does_not_consume_pending_events() {
         1,
         "the late event is still available on the proper next sync"
     );
+}
+
+// ----------------------------------------------------------------------------
+// Phase 7 — ported from Synapse `tests/rest/client/sliding_sync/`.
+// Selection criteria: tests that target behaviour we actually implement.
+// Out-of-scope features (filters, lazy_members, kicked/banned, ignored users,
+// state resets, forgotten rooms, etc.) are skipped — see MSC4186-gaps.md.
+// ----------------------------------------------------------------------------
+
+/// Ported from `test_rooms_required_state_wildcard`. `required_state =
+/// [("*", "*")]` is the spec-defined "all current state" pattern.
+#[tokio::test]
+async fn required_state_wildcard_matches_everything() {
+    let store = Arc::new(InMemoryStore::new());
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!room:example.org");
+    store.join_user(user, room);
+    store.add_event(make_event(
+        event_id!("$create:example.org"),
+        room,
+        "m.room.create",
+        Some(""),
+        user,
+        100,
+        serde_json::json!({"creator": user.as_str(), "room_version": "12"}),
+    ));
+    store.add_event(make_event(
+        event_id!("$name:example.org"),
+        room,
+        "m.room.name",
+        Some(""),
+        user,
+        110,
+        serde_json::json!({"name": "X"}),
+    ));
+    store.add_event(make_event(
+        event_id!("$member:example.org"),
+        room,
+        "m.room.member",
+        Some(user.as_str()),
+        user,
+        120,
+        serde_json::json!({"membership": "join"}),
+    ));
+    let state = SyncState::new(store);
+
+    let mut lists = BTreeMap::new();
+    // StateEventType: ruma stringifies anything we don't recognise as the
+    // raw string we pass to its From impl. Use a custom event type whose
+    // string form is "*" so `required_state_matches` treats it as wildcard.
+    let mut list = request::List::default();
+    list.ranges = vec![(UInt::from(0u32), UInt::from(0u32))];
+    list.room_details.timeline_limit = UInt::from(5u32);
+    list.room_details.required_state = vec![(StateEventType::from("*"), "*".to_string())];
+    lists.insert("all".to_string(), list);
+    let mut req = Request::new();
+    req.lists = lists;
+
+    let resp = handle(&state, user, req).await.unwrap();
+    let types: Vec<String> = resp
+        .rooms
+        .get(room)
+        .unwrap()
+        .required_state
+        .iter()
+        .map(|raw| raw.get_field::<String>("type").unwrap().unwrap())
+        .collect();
+    assert_eq!(types.len(), 3, "all 3 state events emitted");
+    assert!(types.contains(&"m.room.create".to_string()));
+    assert!(types.contains(&"m.room.name".to_string()));
+    assert!(types.contains(&"m.room.member".to_string()));
+}
+
+/// Ported from `test_rooms_required_state_wildcard_state_key`. `(type, "*")`
+/// returns every variant of the given event type.
+#[tokio::test]
+async fn required_state_wildcard_state_key_returns_all_keys_of_type() {
+    let store = Arc::new(InMemoryStore::new());
+    let user = user_id!("@alice:example.org");
+    let bob = user_id!("@bob:example.org");
+    let room = room_id!("!room:example.org");
+    store.join_user(user, room);
+    store.add_event(make_event(
+        event_id!("$alice:example.org"),
+        room,
+        "m.room.member",
+        Some(user.as_str()),
+        user,
+        100,
+        serde_json::json!({"membership": "join"}),
+    ));
+    store.add_event(make_event(
+        event_id!("$bob:example.org"),
+        room,
+        "m.room.member",
+        Some(bob.as_str()),
+        bob,
+        110,
+        serde_json::json!({"membership": "join"}),
+    ));
+    // Different event type — must NOT come back.
+    store.add_event(make_event(
+        event_id!("$name:example.org"),
+        room,
+        "m.room.name",
+        Some(""),
+        user,
+        120,
+        serde_json::json!({"name": "X"}),
+    ));
+    let state = SyncState::new(store);
+
+    let mut list = request::List::default();
+    list.ranges = vec![(UInt::from(0u32), UInt::from(0u32))];
+    list.room_details.timeline_limit = UInt::from(5u32);
+    list.room_details.required_state = vec![(StateEventType::RoomMember, "*".to_string())];
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list);
+    let mut req = Request::new();
+    req.lists = lists;
+
+    let resp = handle(&state, user, req).await.unwrap();
+    let raws = &resp.rooms.get(room).unwrap().required_state;
+    assert_eq!(raws.len(), 2, "both members emitted, name skipped");
+    for raw in raws {
+        assert_eq!(
+            raw.get_field::<String>("type").unwrap().unwrap(),
+            "m.room.member"
+        );
+    }
+}
+
+/// Ported from `test_rooms_required_state_wildcard_event_type`.
+/// `("*", state_key)` returns every type at that specific state_key.
+#[tokio::test]
+async fn required_state_wildcard_event_type_matches_specific_state_key() {
+    let store = Arc::new(InMemoryStore::new());
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!room:example.org");
+    store.join_user(user, room);
+    // Two events with state_key="" (different types).
+    store.add_event(make_event(
+        event_id!("$create:example.org"),
+        room,
+        "m.room.create",
+        Some(""),
+        user,
+        100,
+        serde_json::json!({"creator": user.as_str(), "room_version": "12"}),
+    ));
+    store.add_event(make_event(
+        event_id!("$name:example.org"),
+        room,
+        "m.room.name",
+        Some(""),
+        user,
+        110,
+        serde_json::json!({"name": "X"}),
+    ));
+    // One event with state_key=user.as_str() — must NOT come back.
+    store.add_event(make_event(
+        event_id!("$member:example.org"),
+        room,
+        "m.room.member",
+        Some(user.as_str()),
+        user,
+        120,
+        serde_json::json!({"membership": "join"}),
+    ));
+    let state = SyncState::new(store);
+
+    let mut list = request::List::default();
+    list.ranges = vec![(UInt::from(0u32), UInt::from(0u32))];
+    list.room_details.timeline_limit = UInt::from(5u32);
+    list.room_details.required_state = vec![(StateEventType::from("*"), String::new())];
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list);
+    let mut req = Request::new();
+    req.lists = lists;
+
+    let resp = handle(&state, user, req).await.unwrap();
+    let raws = &resp.rooms.get(room).unwrap().required_state;
+    assert_eq!(raws.len(), 2, "create + name (both state_key=\"\")");
+    let types: Vec<String> = raws
+        .iter()
+        .map(|raw| raw.get_field::<String>("type").unwrap().unwrap())
+        .collect();
+    assert!(types.contains(&"m.room.create".to_string()));
+    assert!(types.contains(&"m.room.name".to_string()));
+    assert!(
+        !types.contains(&"m.room.member".to_string()),
+        "member has non-empty state_key"
+    );
+}
+
+/// Ported from `test_rooms_limited_initial_sync`. Initial sync against a
+/// room with more events than `timeline_limit` reports `limited = true` so
+/// the client knows there's older history beyond the window.
+#[tokio::test]
+async fn initial_sync_sets_limited_true_when_room_has_more_events_than_limit() {
+    let store = Arc::new(InMemoryStore::new());
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!room:example.org");
+    store.join_user(user, room);
+    for i in 0..5 {
+        let id_str = format!("$ev-{i}:example.org");
+        let id: &ruma::EventId = (&*Box::leak(id_str.into_boxed_str())).try_into().unwrap();
+        store.add_event(make_event(
+            id,
+            room,
+            "m.room.message",
+            None,
+            user,
+            (i + 1) * 100,
+            serde_json::json!({"body": "x", "msgtype": "m.text"}),
+        ));
+    }
+    let state = SyncState::new(store);
+
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(2, vec![]));
+    let mut req = Request::new();
+    req.lists = lists;
+    let resp = handle(&state, user, req).await.unwrap();
+
+    let room_res = resp.rooms.get(room).unwrap();
+    assert_eq!(room_res.timeline.len(), 2);
+    assert!(
+        room_res.limited,
+        "limited=true: more history exists beyond the timeline window"
+    );
+    assert!(
+        room_res.prev_batch.is_some(),
+        "prev_batch token issued for backpagination"
+    );
+}
+
+/// Ported from `test_rooms_not_limited_initial_sync`. When the timeline fits
+/// entirely inside the window, `limited` is false and there's nothing older
+/// to backpaginate to.
+#[tokio::test]
+async fn initial_sync_sets_limited_false_when_all_events_fit() {
+    let store = Arc::new(InMemoryStore::new());
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!room:example.org");
+    store.join_user(user, room);
+    store.add_event(make_event(
+        event_id!("$only:example.org"),
+        room,
+        "m.room.message",
+        None,
+        user,
+        100,
+        serde_json::json!({"body": "x", "msgtype": "m.text"}),
+    ));
+    let state = SyncState::new(store);
+
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(10, vec![]));
+    let mut req = Request::new();
+    req.lists = lists;
+    let resp = handle(&state, user, req).await.unwrap();
+
+    let room_res = resp.rooms.get(room).unwrap();
+    assert_eq!(room_res.timeline.len(), 1);
+    assert!(
+        !room_res.limited,
+        "limited=false: every event in the room fits the window"
+    );
+}
+
+/// Ported from `test_rooms_timeline_incremental_sync_NEVER` /
+/// `test_rooms_newly_joined_incremental_sync`. A room joined between syncs
+/// must be emitted on the next sync with `initial = true` and a snapshot of
+/// its recent timeline (not a delta — the client has never seen it).
+#[tokio::test]
+async fn newly_joined_room_emits_initial_snapshot_on_incremental_sync() {
+    let store = Arc::new(InMemoryStore::new());
+    let user = user_id!("@alice:example.org");
+    let existing = room_id!("!existing:example.org");
+    let fresh = room_id!("!fresh:example.org");
+    store.join_user(user, existing);
+    store.add_event(make_event(
+        event_id!("$existing:example.org"),
+        existing,
+        "m.room.message",
+        None,
+        user,
+        50,
+        serde_json::json!({"body": "old", "msgtype": "m.text"}),
+    ));
+    let state = SyncState::new(store.clone());
+
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let mut req1 = Request::new();
+    req1.lists = lists.clone();
+    let resp1 = handle(&state, user, req1).await.unwrap();
+    assert!(resp1.rooms.contains_key(existing));
+    assert!(!resp1.rooms.contains_key(fresh));
+
+    // Join the new room and add a couple of pre-existing events to it.
+    store.join_user(user, fresh);
+    store.add_event(make_event(
+        event_id!("$f1:example.org"),
+        fresh,
+        "m.room.message",
+        None,
+        user,
+        100,
+        serde_json::json!({"body": "a", "msgtype": "m.text"}),
+    ));
+    store.add_event(make_event(
+        event_id!("$f2:example.org"),
+        fresh,
+        "m.room.message",
+        None,
+        user,
+        110,
+        serde_json::json!({"body": "b", "msgtype": "m.text"}),
+    ));
+
+    let mut req2 = Request::new();
+    req2.pos = Some(resp1.pos);
+    req2.lists = lists;
+    let resp2 = handle(&state, user, req2).await.unwrap();
+
+    let fresh_room = resp2
+        .rooms
+        .get(fresh)
+        .expect("freshly-joined room appears in delta sync");
+    assert_eq!(
+        fresh_room.initial,
+        Some(true),
+        "initial=true on first emission"
+    );
+    assert_eq!(
+        fresh_room.timeline.len(),
+        2,
+        "full snapshot of timeline, not just the delta"
+    );
+}
+
+/// Ported from `test_empty_initial_room_comes_down_sync`. A room with no
+/// events still appears on initial sync (e.g. just created, no messages
+/// yet) — the client needs to see it exists.
+#[tokio::test]
+async fn empty_room_still_emitted_on_initial_sync() {
+    let store = Arc::new(InMemoryStore::new());
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!empty:example.org");
+    store.join_user(user, room);
+    // No events at all in the room. compute_bump_stamp returns 0,
+    // current_room_state is empty, room_messages returns empty.
+    let state = SyncState::new(store);
+
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let mut req = Request::new();
+    req.lists = lists;
+    let resp = handle(&state, user, req).await.unwrap();
+
+    let room_res = resp
+        .rooms
+        .get(room)
+        .expect("empty room still appears so the client knows about it");
+    assert_eq!(room_res.initial, Some(true));
+    assert!(room_res.timeline.is_empty());
+}
+
+/// Ported from `test_rooms_meta_when_joined_incremental_with_state_change`.
+/// A room name change between syncs must surface in the next sync's
+/// `required_state` (state diff) and update the top-level `room.name`.
+#[tokio::test]
+async fn name_change_propagates_on_incremental_sync() {
+    let store = Arc::new(InMemoryStore::new());
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!room:example.org");
+    store.join_user(user, room);
+    store.add_event(make_event(
+        event_id!("$name-1:example.org"),
+        room,
+        "m.room.name",
+        Some(""),
+        user,
+        100,
+        serde_json::json!({"name": "Old Name"}),
+    ));
+    let state = SyncState::new(store.clone());
+
+    let mut lists = BTreeMap::new();
+    lists.insert(
+        "all".to_string(),
+        list_with(5, vec![(StateEventType::RoomName, "")]),
+    );
+    let mut req1 = Request::new();
+    req1.lists = lists.clone();
+    let resp1 = handle(&state, user, req1).await.unwrap();
+    assert_eq!(
+        resp1.rooms.get(room).unwrap().name.as_deref(),
+        Some("Old Name")
+    );
+
+    // Rename the room.
+    store.add_event(make_event(
+        event_id!("$name-2:example.org"),
+        room,
+        "m.room.name",
+        Some(""),
+        user,
+        200,
+        serde_json::json!({"name": "New Name"}),
+    ));
+
+    let mut req2 = Request::new();
+    req2.pos = Some(resp1.pos);
+    req2.lists = lists;
+    let resp2 = handle(&state, user, req2).await.unwrap();
+    let room_res = resp2
+        .rooms
+        .get(room)
+        .expect("room emitted because its state changed");
+    assert_eq!(room_res.name.as_deref(), Some("New Name"));
+    assert_eq!(
+        room_res.required_state.len(),
+        1,
+        "single state diff: the new m.room.name"
+    );
+}
+
+/// Ported from `test_rooms_meta_when_invited`. Invited rooms must expose
+/// `room.name` (and `room.avatar` when set), derived from the stripped
+/// state inside `unsigned.invite_room_state` — clients shouldn't have to
+/// parse the invite_state array to render the invite list.
+#[tokio::test]
+async fn invited_room_emits_name_and_avatar_from_stripped_state() {
+    let store = Arc::new(InMemoryStore::new());
+    let user = user_id!("@alice:example.org");
+    let inviter = user_id!("@bob:example.org");
+    let room = room_id!("!invite:example.org");
+
+    store.invite_user(user, room);
+    let invite_json = serde_json::json!({
+        "event_id": "$invite:example.org",
+        "room_id": room.as_str(),
+        "type": "m.room.member",
+        "state_key": user.as_str(),
+        "sender": inviter.as_str(),
+        "origin_server_ts": 100,
+        "content": {"membership": "invite"},
+        "unsigned": {
+            "invite_room_state": [
+                {
+                    "type": "m.room.name",
+                    "state_key": "",
+                    "sender": inviter.as_str(),
+                    "content": {"name": "Bob's Place"}
+                },
+                {
+                    "type": "m.room.avatar",
+                    "state_key": "",
+                    "sender": inviter.as_str(),
+                    "content": {"url": "mxc://example.org/avatar"}
+                }
+            ]
+        }
+    });
+    let invite_event = StoredEvent {
+        event_id: event_id!("$invite:example.org").to_owned(),
+        room_id: room.to_owned(),
+        event_type: "m.room.member".to_string(),
+        state_key: Some(user.as_str().to_string()),
+        sender: inviter.to_owned(),
+        origin_server_ts: 100,
+        json: serde_json::value::to_raw_value(&invite_json).unwrap(),
+    };
+    store.add_event(invite_event);
+
+    let state = SyncState::new(store);
+
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let mut req = Request::new();
+    req.lists = lists;
+    let resp = handle(&state, user, req).await.unwrap();
+
+    let room_res = resp.rooms.get(room).unwrap();
+    assert_eq!(room_res.name.as_deref(), Some("Bob's Place"));
+    match &room_res.avatar {
+        ruma::JsOption::Some(uri) => assert_eq!(uri.as_str(), "mxc://example.org/avatar"),
+        _ => panic!("avatar should be populated from the stripped state"),
+    }
+    // Per Synapse-parity: member counts NOT populated for invited rooms (no
+    // leaking room size before accept).
+    assert_eq!(room_res.joined_count, None);
+    assert_eq!(room_res.invited_count, None);
 }

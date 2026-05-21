@@ -564,6 +564,10 @@ async fn build_invite_room<S: StorageBackend>(
         // Include the invite membership itself so the client can render the
         // "you've been invited by …" preview without parsing the array.
         stripped.push(strip_state_event(ev)?);
+        // Mirror name/avatar from the stripped state up to the top-level
+        // `room.name` / `room.avatar` fields. Synapse-parity: clients
+        // shouldn't have to walk `invite_state` to render the invite UI.
+        populate_invite_room_meta(ev, &mut room)?;
     }
     room.invite_state = Some(stripped);
 
@@ -574,6 +578,49 @@ async fn build_invite_room<S: StorageBackend>(
     // Tracking-wise: report no `state_events` (we used stripped_state, which
     // doesn't feed the required_state diff path) and no deletions.
     Ok(Some((room, Vec::new(), Vec::new())))
+}
+
+/// Read `m.room.name`/`m.room.avatar` out of `unsigned.invite_room_state`
+/// (with `state_key = ""`) and set the top-level `room.name`/`room.avatar`
+/// fields. Member counts deliberately not populated — Synapse doesn't expose
+/// them on invites either (no leakage of room size pre-accept).
+fn populate_invite_room_meta(
+    invite_event: &StoredEvent,
+    room: &mut response::Room,
+) -> Result<(), SyncError> {
+    let parsed: serde_json::Value = serde_json::from_str(invite_event.json.get()).map_err(|e| {
+        SyncError::Storage(neutrino_common::storage::StorageError::Internal(
+            e.to_string(),
+        ))
+    })?;
+    let Some(arr) = parsed
+        .pointer("/unsigned/invite_room_state")
+        .and_then(|v| v.as_array())
+    else {
+        return Ok(());
+    };
+    for v in arr {
+        let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        let sk = v.get("state_key").and_then(|x| x.as_str()).unwrap_or("");
+        if !sk.is_empty() {
+            continue;
+        }
+        match ty {
+            "m.room.name" => {
+                if let Some(n) = v.pointer("/content/name").and_then(|x| x.as_str()) {
+                    room.name = Some(n.to_string());
+                }
+            }
+            "m.room.avatar" => {
+                if let Some(u) = v.pointer("/content/url").and_then(|x| x.as_str()) {
+                    let uri: ruma::OwnedMxcUri = u.into();
+                    room.avatar = ruma::JsOption::Some(uri);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Pull stripped state out of `unsigned.invite_room_state` on an
