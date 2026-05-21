@@ -93,24 +93,37 @@ mod tests {
     /// gate. Open the store once to install the schema, mutate
     /// `user_version` on the bare file to a value the gate doesn't
     /// recognise, then re-open and assert the refusal.
+    ///
+    /// Raw `Connection::open` / `pragma_update` / `query_row` calls are
+    /// wrapped in `tokio::task::spawn_blocking` so the
+    /// `#[tokio::test]` current-thread runtime stays free to poll
+    /// deadpool's pool-drop cleanup tasks that fire when the previous
+    /// `SqliteStore` went out of scope. Calling rusqlite synchronously
+    /// on the worker thread blocked the runtime in CI (the `Connection`
+    /// drops scheduled via Pool drop couldn't make progress while the
+    /// worker was inside `Connection::open`), surfacing as an indefinite
+    /// hang on the two schema tests.
     #[tokio::test]
     async fn ensure_schema_refuses_unknown_user_version() {
         let file = NamedTempFile::new().expect("tempfile");
-        let path = file.path();
+        let path = file.path().to_path_buf();
 
         // First open installs the schema, leaving user_version = 1.
         {
-            let _ = SqliteStore::open(path).await.expect("first open");
+            let _ = SqliteStore::open(&path).await.expect("first open");
         }
 
         // Bypass the store and rewrite user_version directly.
-        {
-            let conn = Connection::open(path).expect("raw open");
+        let path_for_bump = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&path_for_bump).expect("raw open");
             conn.pragma_update(None, "user_version", 999_i64)
                 .expect("bump user_version");
-        }
+        })
+        .await
+        .expect("blocking task panicked");
 
-        let err = SqliteStore::open(path)
+        let err = SqliteStore::open(&path)
             .await
             .expect_err("second open must refuse unknown schema version");
         assert!(
@@ -129,18 +142,21 @@ mod tests {
     #[tokio::test]
     async fn ensure_schema_rolls_back_on_mid_bundle_failure() {
         let file = NamedTempFile::new().expect("tempfile");
-        let path = file.path();
+        let path = file.path().to_path_buf();
 
         // Pre-existing colliding `rooms` table. `CREATE TABLE rooms (…)`
         // in the bundle will fail with "table rooms already exists",
         // aborting the bundle's transaction.
-        {
-            let conn = Connection::open(path).expect("raw open");
+        let path_for_seed = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&path_for_seed).expect("raw open");
             conn.execute_batch("CREATE TABLE rooms (junk TEXT)")
                 .expect("pre-seed colliding table");
-        }
+        })
+        .await
+        .expect("blocking task panicked");
 
-        let err = SqliteStore::open(path)
+        let err = SqliteStore::open(&path)
             .await
             .expect_err("schema bundle must fail on the colliding table");
         // "table already exists" is SQLITE_ERROR, not a constraint
@@ -151,28 +167,36 @@ mod tests {
         );
 
         // Version stamp is part of the rolled-back txn, so the
-        // file must still be at user_version = 0.
-        let conn = Connection::open(path).expect("raw reopen");
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .expect("read user_version");
+        // file must still be at user_version = 0. The pre-existing
+        // table survives (the txn rolled back, it didn't drop anything
+        // that was there before). Both checks run on a single
+        // `Connection` inside one `spawn_blocking` task — same
+        // rationale as the doc-comment on the test above.
+        let path_for_check = path.clone();
+        let (version, rooms_count): (i64, i64) = tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&path_for_check).expect("raw reopen");
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .expect("read user_version");
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema \
+                     WHERE type = 'table' AND name = 'rooms'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("check rooms table");
+            (version, exists)
+        })
+        .await
+        .expect("blocking task panicked");
         assert_eq!(
             version, 0,
             "user_version must roll back to 0 on bundle failure"
         );
-        // The pre-existing table survives (the txn rolled back, it
-        // didn't drop anything that was there before). Its presence is
-        // *also* what makes the next open re-fail — exactly the
-        // "fails loudly on the colliding table" property the design
-        // doc calls out.
-        let exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_schema \
-                 WHERE type = 'table' AND name = 'rooms'",
-                [],
-                |r| r.get(0),
-            )
-            .expect("check rooms table");
-        assert_eq!(exists, 1, "pre-existing rooms table must survive rollback");
+        assert_eq!(
+            rooms_count, 1,
+            "pre-existing rooms table must survive rollback"
+        );
     }
 }
