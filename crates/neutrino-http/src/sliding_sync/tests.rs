@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use ruma::api::client::sync::sync_events::v5::{Request, request};
 use ruma::events::StateEventType;
-use ruma::{OwnedRoomId, RoomId, UInt, event_id, room_id, user_id};
+use ruma::{OwnedEventId, OwnedRoomId, UInt, event_id, room_id, user_id};
 
 use super::mock::{MockStore, make_event};
 use super::{SyncError, SyncState, handle};
@@ -229,18 +229,12 @@ fn seed_rooms_with_timestamps(
 ) -> Vec<OwnedRoomId> {
     let mut ids = Vec::with_capacity(timestamps.len());
     for (i, ts) in timestamps.iter().enumerate() {
-        let room_id_str = format!("!room-{i}:example.org");
-        let room_id: &RoomId = (&*Box::leak(room_id_str.into_boxed_str()))
-            .try_into()
-            .unwrap();
-        store.join_user(user, room_id);
-        let event_id_str = format!("$ev-{i}:example.org");
-        let event_id: &ruma::EventId = (&*Box::leak(event_id_str.into_boxed_str()))
-            .try_into()
-            .unwrap();
+        let room_id: OwnedRoomId = format!("!room-{i}:example.org").try_into().unwrap();
+        store.join_user(user, &room_id);
+        let event_id: OwnedEventId = format!("$ev-{i}:example.org").try_into().unwrap();
         let ev = make_event(
-            event_id,
-            room_id,
+            &event_id,
+            &room_id,
             "m.room.message",
             None,
             user,
@@ -248,7 +242,7 @@ fn seed_rooms_with_timestamps(
             serde_json::json!({"body": "x", "msgtype": "m.text"}),
         );
         store.add_event(ev);
-        ids.push(room_id.to_owned());
+        ids.push(room_id);
     }
     ids
 }
@@ -391,6 +385,61 @@ async fn multi_range_request_only_honours_first() {
     assert_eq!(resp.rooms.len(), 1, "only the first range applied");
     // rank 0 = highest ts = !room-4 (ts=500).
     assert!(resp.rooms.contains_key(&ids[4]));
+}
+
+#[tokio::test]
+async fn invited_room_bump_stamp_uses_invitee_member_event() {
+    // For an invited room we don't take the latest event in the room — we use
+    // the invitee's own `m.room.member` event ts. Seed an invited room where
+    // the latest event in the room is NOT the invitee's member event, so the
+    // pre-fix code (which peeked room_messages) and the post-fix code (which
+    // looks up the invitee's member event specifically) disagree.
+    let store = Arc::new(MockStore::new());
+    let user = user_id!("@alice:example.org");
+    let inviter = user_id!("@bob:example.org");
+    let invited = room_id!("!invited:example.org");
+    store.invite_user(user, invited);
+
+    let invite_member = make_event(
+        event_id!("$invite:example.org"),
+        invited,
+        "m.room.member",
+        Some(user.as_str()),
+        inviter,
+        500,
+        serde_json::json!({"membership": "invite"}),
+    );
+    store.add_event(invite_member);
+
+    // A later event in the same room — the inviter's own joined-member state,
+    // visible to us via the invite's stripped state. With the previous impl
+    // this would inflate `bump_stamp` to 1000.
+    let inviter_member = make_event(
+        event_id!("$inviter:example.org"),
+        invited,
+        "m.room.member",
+        Some(inviter.as_str()),
+        inviter,
+        1000,
+        serde_json::json!({"membership": "join"}),
+    );
+    store.add_event(inviter_member);
+
+    let state = SyncState::new(store);
+    let mut req = Request::new();
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    req.lists = lists;
+
+    let resp = handle(&state, user, req).await.unwrap();
+    let owned: OwnedRoomId = invited.to_owned();
+    let room = resp.rooms.get(&owned).expect("invited room emitted");
+    assert_eq!(
+        room.bump_stamp,
+        Some(UInt::from(500u32)),
+        "bump_stamp comes from the invitee's m.room.member event ts (500), \
+         not the room's most recent event (1000)"
+    );
 }
 
 #[tokio::test]

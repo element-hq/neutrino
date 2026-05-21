@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use neutrino_store::{Direction, StorageBackend, StoredEvent};
@@ -138,12 +138,17 @@ fn apply_sticky(conn: &mut Conn, req: &Request) {
 
 /// One candidate room plus its server-computed sort key.
 ///
-/// `bump_stamp` is the most recent `origin_server_ts` observed in the room.
-/// We use timestamp rather than stream position so that federation-backfilled
-/// old events don't bump the room to the top (PLAN.md 2026-05-14). Falls back
-/// to the `m.room.create` event's `origin_server_ts` for rooms with no other
-/// activity (e.g. fresh invites); rooms with truly no state get 0 and sort to
-/// the bottom.
+/// `bump_stamp` uses `origin_server_ts` rather than stream position so that
+/// federation-backfilled old events don't bump the room to the top (PLAN.md
+/// 2026-05-14). The source depends on the user's membership:
+/// - **Joined**: most recent event in the room (via `room_messages` Backward
+///   limit 1), falling back to the `m.room.create` event ts.
+/// - **Invited**: the invitee's own `m.room.member` event ts (i.e. the invite
+///   itself) — we deliberately don't peek into the room's full timeline since
+///   the user only cares about their own invite for sort purposes, and in
+///   practice we may not have the rest of the room's events anyway.
+///
+/// Rooms with no resolvable source get 0 and sort to the bottom by room_id.
 struct RankedRoom {
     room_id: OwnedRoomId,
     bump_stamp: u64,
@@ -176,14 +181,27 @@ async fn candidate_rooms<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
 ) -> Result<Vec<RankedRoom>, SyncError> {
-    let mut all = state.store.joined_rooms(user_id).await?;
-    all.extend(state.store.invited_rooms(user_id).await?);
-    all.sort();
-    all.dedup();
+    let joined = state.store.joined_rooms(user_id).await?;
+    let invited = state.store.invited_rooms(user_id).await?;
 
-    let mut ranked: Vec<RankedRoom> = Vec::with_capacity(all.len());
-    for room_id in all {
-        let bump_stamp = compute_bump_stamp(state, &room_id).await?;
+    let mut seen: HashSet<OwnedRoomId> = HashSet::with_capacity(joined.len() + invited.len());
+    let mut ranked: Vec<RankedRoom> = Vec::with_capacity(joined.len() + invited.len());
+
+    for room_id in joined {
+        if !seen.insert(room_id.clone()) {
+            continue;
+        }
+        let bump_stamp = bump_stamp_for_joined(state, &room_id).await?;
+        ranked.push(RankedRoom {
+            room_id,
+            bump_stamp,
+        });
+    }
+    for room_id in invited {
+        if !seen.insert(room_id.clone()) {
+            continue;
+        }
+        let bump_stamp = bump_stamp_for_invited(state, &room_id, user_id).await?;
         ranked.push(RankedRoom {
             room_id,
             bump_stamp,
@@ -198,9 +216,9 @@ async fn candidate_rooms<S: StorageBackend>(
     Ok(ranked)
 }
 
-/// Best-available recency stamp for a room. Peek the most recent event
-/// (Backward, limit 1), else fall back to the create event. Returns 0 if
-/// neither exists — that room sorts to the bottom.
+/// Best-available recency stamp for a **joined** room. Peek the most recent
+/// event (Backward, limit 1), else fall back to the create event. Returns 0
+/// if neither exists — that room sorts to the bottom by room_id.
 ///
 /// **Cost:** called once per candidate room from `candidate_rooms` on every
 /// sync request, so this is `O(n)` storage round-trips where `n` is the
@@ -212,7 +230,7 @@ async fn candidate_rooms<S: StorageBackend>(
 /// `bump_stamp` column on the rooms table updated transactionally on every
 /// `persist_event`. (c) is the cleanest long-term; (a) is cheapest if storage
 /// stays single-process. All are out of scope for phase 3.
-async fn compute_bump_stamp<S: StorageBackend>(
+async fn bump_stamp_for_joined<S: StorageBackend>(
     state: &SyncState<S>,
     room_id: &RoomId,
 ) -> Result<u64, SyncError> {
@@ -228,6 +246,24 @@ async fn compute_bump_stamp<S: StorageBackend>(
         .current_state_event(room_id, "m.room.create", "")
         .await?;
     Ok(create.map(|e| e.origin_server_ts).unwrap_or(0))
+}
+
+/// Best-available recency stamp for an **invited** room. For invited rooms we
+/// haven't joined yet, the timeline and full room state aren't (necessarily)
+/// replicated to us, but the invitee's own `m.room.member` event always is —
+/// it's how we knew to add the room to the invited set in the first place.
+/// Use its `origin_server_ts` as the bump stamp; that's "when this room
+/// changed in a way relevant to the user".
+async fn bump_stamp_for_invited<S: StorageBackend>(
+    state: &SyncState<S>,
+    room_id: &RoomId,
+    user_id: &UserId,
+) -> Result<u64, SyncError> {
+    let member = state
+        .store
+        .current_state_event(room_id, "m.room.member", user_id.as_str())
+        .await?;
+    Ok(member.map(|e| e.origin_server_ts).unwrap_or(0))
 }
 
 /// Slice the ranked candidates by each list's `ranges`, union in subscriptions,
@@ -292,10 +328,14 @@ fn combined_room_configs(conn: &Conn, ranked: &[RankedRoom]) -> BTreeMap<OwnedRo
 }
 
 /// Normalise a list's `range` against the actual candidate count: clamp the
-/// upper bound to `total - 1` and drop the range entirely if it starts past
-/// the end. `None` input (no `range` field on the request) becomes the full
-/// window `[0, total-1]`. Zero candidates → `None` (caller iterates zero
-/// times anyway).
+/// upper bound to `total - 1`, drop the range if it starts past the end, and
+/// drop inverted ranges (`a > b`) since they describe an empty interval that
+/// the slicing iterator would silently zero-out. `None` input (no `range`
+/// field on the request) becomes the full window `[0, total-1]`. Zero
+/// candidates → `None` (caller iterates zero times anyway).
+///
+/// We *drop* malformed ranges rather than 400'ing because phase 3 has no
+/// request-validation step yet; phase 6 may upgrade this to a `BadRequest`.
 ///
 /// Only one range is honoured per list (MSC4186 removed MSC3575's multi-range
 /// support; see `apply_sticky`).
@@ -306,7 +346,7 @@ fn effective_range(range: Option<(usize, usize)>, total: usize) -> Option<(usize
     let Some((a, b)) = range else {
         return Some((0, total - 1));
     };
-    if a >= total {
+    if a >= total || a > b {
         return None;
     }
     Some((a, b.min(total - 1)))
@@ -467,5 +507,14 @@ mod unit_tests {
     fn effective_range_drops_fully_out_of_range() {
         // start ≥ total → drop.
         assert_eq!(effective_range(Some((10, 20)), 5), None);
+    }
+
+    #[test]
+    fn effective_range_drops_inverted_range() {
+        // a > b describes an empty interval; the slicing iterator would
+        // silently zero-out. Drop explicitly so the malformed case is visible.
+        assert_eq!(effective_range(Some((5, 2)), 10), None);
+        // a == b is a valid single-element range, not inverted.
+        assert_eq!(effective_range(Some((3, 3)), 10), Some((3, 3)));
     }
 }
