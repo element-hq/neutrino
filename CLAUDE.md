@@ -80,3 +80,12 @@ If there are no relevant tests in either repository, ask for suggestions.
 if a task is ambiguous or conflicts with these rules, stop and ask.
 do not make assumptions about intent and proceed silently.
 one clarifying question is better than a wrong implementation.
+
+## Code Review
+
+Report every issue you find, including ones you are uncertain about or consider low-severity.
+Do not filter for importance or confidence at this stage - a separate verification step will do that.
+Your goal here is coverage: it is better to surface a finding that later gets filtered out than to silently drop a real bug.
+For each finding, include your confidence level and an estimated severity so a downstream filter can rank them.
+
+Reviewing code may be supplied via patch/diff files.
