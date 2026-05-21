@@ -105,7 +105,18 @@ impl MockStore {
             room_state.insert((event.event_type.clone(), state_key), dup(&event));
         }
         inner.events.push((pos, event));
-        let _ = self.watch_tx.send(pos);
+        // `send_if_modified` always updates the stored value; plain `send`
+        // returns Err and no-ops the update when there are no live
+        // receivers, and the mock's constructor drops the initial receiver.
+        // Matches the production store's `notify_watch` pattern.
+        self.watch_tx.send_if_modified(|cur| {
+            if pos > *cur {
+                *cur = pos;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// Remove a `(event_type, state_key)` entry from current state. The

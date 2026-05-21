@@ -775,6 +775,12 @@ async fn invited_room_emits_invite_state() {
                     "content": {"name": "Bob's invite"}
                 },
                 {
+                    "type": "m.room.avatar",
+                    "state_key": "",
+                    "sender": inviter.as_str(),
+                    "content": {"url": "mxc://example.org/invite-avatar"}
+                },
+                {
                     "type": "m.room.member",
                     "state_key": inviter.as_str(),
                     "sender": inviter.as_str(),
@@ -816,6 +822,7 @@ async fn invited_room_emits_invite_state() {
         .collect();
     assert!(types.contains(&"m.room.create".to_string()));
     assert!(types.contains(&"m.room.name".to_string()));
+    assert!(types.contains(&"m.room.avatar".to_string()));
     // Two membership events: the inviter's join (from `invite_room_state`)
     // and the invitee's own invite event (stripped from the stored PDU).
     let member_count = types
@@ -823,6 +830,18 @@ async fn invited_room_emits_invite_state() {
         .filter(|t| t.as_str() == "m.room.member")
         .count();
     assert_eq!(member_count, 2);
+
+    // Name and avatar lifted from `invite_room_state` up to top-level so the
+    // client can render the invite preview without parsing `invite_state`.
+    assert_eq!(
+        room_res.name.as_deref(),
+        Some("Bob's invite"),
+        "name lifted from invite_room_state"
+    );
+    match &room_res.avatar {
+        ruma::JsOption::Some(uri) => assert_eq!(uri.as_str(), "mxc://example.org/invite-avatar"),
+        _ => panic!("avatar should be Some, lifted from invite_room_state"),
+    }
 }
 
 #[tokio::test]
@@ -986,4 +1005,56 @@ async fn extensions_not_echoed_when_not_requested() {
     let resp = handle(&state, user, Request::new()).await.unwrap();
     assert!(resp.extensions.e2ee.device_one_time_keys_count.is_empty());
     assert!(resp.extensions.to_device.is_none());
+}
+
+#[tokio::test]
+async fn initial_sync_anchors_high_water_at_store_head() {
+    // Regression: previously the initial-sync drain capped at
+    // EVENTS_PER_SYNC_LIMIT events and `last_event_stream_pos` advanced only
+    // to the drained max. On a store with > EVENTS_PER_SYNC_LIMIT events the
+    // second sync would then re-emit positions past the cap as "new" deltas
+    // even though the client already saw them in the snapshot. Fix anchors
+    // the high-water at the store's current head on initial sync. To trigger
+    // the bug we need > 1000 events in the store before the initial sync —
+    // seeding 1100 is plenty.
+    let store = Arc::new(MockStore::new());
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!room:example.org");
+    store.join_user(user, room);
+    for i in 0..1100u64 {
+        let id: OwnedEventId = format!("$e{i}:example.org").try_into().unwrap();
+        store.add_event(make_event(
+            &id,
+            room,
+            "m.room.message",
+            None,
+            user,
+            100 + i,
+            serde_json::json!({"body": "x", "msgtype": "m.text"}),
+        ));
+    }
+    let state = SyncState::new(store);
+
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+
+    let mut req1 = Request::new();
+    req1.lists = lists.clone();
+    let resp1 = handle(&state, user, req1).await.unwrap();
+    assert!(
+        resp1.rooms.contains_key(room),
+        "initial sync emits the room"
+    );
+
+    // No new events between syncs → second sync must omit the room.
+    // Pre-fix this fails: high-water sat at 1000, so the delta path on the
+    // second sync surfaces events 1001..1100 and emits a non-empty timeline.
+    let mut req2 = Request::new();
+    req2.pos = Some(resp1.pos);
+    req2.lists = lists;
+    let resp2 = handle(&state, user, req2).await.unwrap();
+    assert!(
+        !resp2.rooms.contains_key(room),
+        "second sync with no new events omits room — high-water is at store head"
+    );
 }

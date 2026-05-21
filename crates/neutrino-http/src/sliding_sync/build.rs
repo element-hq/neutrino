@@ -68,11 +68,19 @@ pub(super) async fn build_response<S: StorageBackend>(
     apply_sticky(&mut conn, &req);
 
     // Drain new events since our high-water mark and group them by room.
-    // On initial sync we still drain so the conn's `last_event_stream_pos`
-    // advances past any events the store already has — otherwise the next
-    // sync would re-emit them as "new".
-    let (new_events_by_room, max_stream_pos) =
-        fetch_event_deltas(state, conn.last_event_stream_pos).await?;
+    // On initial sync we skip the drain entirely — the per-room snapshot
+    // comes from `room_messages`, not from `events_after` — and instead
+    // anchor `last_event_stream_pos` at the store's current head via the
+    // watch's borrowed value. Previously we drained up to
+    // `EVENTS_PER_SYNC_LIMIT` and advanced only that far, which on a store
+    // holding > 1000 events would have the next sync re-emit positions
+    // 1001+ as "new" deltas the client already received in the snapshot.
+    let (new_events_by_room, max_stream_pos) = if initial_sync {
+        let head = state.store.subscribe().borrow().0;
+        (HashMap::new(), head)
+    } else {
+        fetch_event_deltas(state, conn.last_event_stream_pos).await?
+    };
     if max_stream_pos > conn.last_event_stream_pos {
         conn.last_event_stream_pos = max_stream_pos;
     }
@@ -565,6 +573,9 @@ async fn build_room<S: StorageBackend>(
 }
 
 /// Whether `user_id`'s current `m.room.member` event in `room_id` is `invite`.
+/// A malformed event (parse failure, missing/typed-wrong `content.membership`)
+/// degrades to `false` — a single bad row shouldn't take the whole sync down
+/// with a 500.
 async fn is_invited<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
@@ -575,8 +586,9 @@ async fn is_invited<S: StorageBackend>(
         .current_state_event(room_id, "m.room.member", user_id.as_str())
         .await?;
     let Some(ev) = ev else { return Ok(false) };
-    let parsed: serde_json::Value = serde_json::from_str(ev.json.get())
-        .map_err(|e| SyncError::Storage(neutrino_store::StorageError::Internal(e.to_string())))?;
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(ev.json.get()) else {
+        return Ok(false);
+    };
     Ok(parsed
         .pointer("/content/membership")
         .and_then(|v| v.as_str())
@@ -628,6 +640,18 @@ async fn build_invite_room<S: StorageBackend>(
         // Include the invite membership itself so the client can render the
         // "you've been invited by …" preview without parsing the array.
         stripped.push(strip_state_event(ev)?);
+        // Lift `m.room.name` / `m.room.avatar` out of `invite_room_state` to
+        // the top-level fields. Without this the client sees only the
+        // stripped array and falls back to heroes (unimplemented, PLAN.md)
+        // → renders the raw room id. Member counts are intentionally left
+        // `None` for invites (Synapse-parity, no pre-accept room-size leak).
+        let (name, avatar) = lift_invite_metadata(ev);
+        if let Some(n) = name {
+            room.name = Some(n);
+        }
+        if let Some(url) = avatar {
+            room.avatar = ruma::JsOption::Some(url.into());
+        }
     }
     room.invite_state = Some(stripped);
 
@@ -638,6 +662,49 @@ async fn build_invite_room<S: StorageBackend>(
     // Tracking-wise: report no `state_events` (we used stripped_state, which
     // doesn't feed the required_state diff path) and no deletions.
     Ok(Some((room, Vec::new(), Vec::new())))
+}
+
+/// Scan an invite event's `unsigned.invite_room_state` for the stripped
+/// `m.room.name` / `m.room.avatar` entries (state_key="") and return their
+/// `content.name` / `content.url` strings. Either or both may be absent if
+/// the federating server didn't include them. A malformed
+/// `invite_room_state` (parse failure or non-array) silently yields
+/// `(None, None)` — better to render a name-less invite than to surface a
+/// "couldn't read invite" error for what's basically a presentation
+/// fallback.
+fn lift_invite_metadata(invite_event: &StoredEvent) -> (Option<String>, Option<String>) {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(invite_event.json.get()) else {
+        return (None, None);
+    };
+    let Some(arr) = parsed
+        .pointer("/unsigned/invite_room_state")
+        .and_then(|v| v.as_array())
+    else {
+        return (None, None);
+    };
+    let mut name = None;
+    let mut avatar = None;
+    for v in arr {
+        let event_type = v.pointer("/type").and_then(|x| x.as_str());
+        let state_key = v.pointer("/state_key").and_then(|x| x.as_str());
+        if state_key != Some("") {
+            continue;
+        }
+        match event_type {
+            Some("m.room.name") if name.is_none() => {
+                if let Some(n) = v.pointer("/content/name").and_then(|x| x.as_str()) {
+                    name = Some(n.to_string());
+                }
+            }
+            Some("m.room.avatar") if avatar.is_none() => {
+                if let Some(u) = v.pointer("/content/url").and_then(|x| x.as_str()) {
+                    avatar = Some(u.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    (name, avatar)
 }
 
 /// Pull stripped state out of `unsigned.invite_room_state` on an
