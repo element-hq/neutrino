@@ -163,6 +163,31 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn invited_rooms(&self, user_id: &UserId) -> Result<Vec<OwnedRoomId>, StorageError> {
+        let user_id = user_id.to_owned();
+
+        self.run_read(move |conn| -> Result<Vec<OwnedRoomId>, Error> {
+            // `state_key`-prefix + `event_type` matches the partial index
+            // `ix_current_state_member`; `membership` filter narrows within
+            // the index.
+            let mut stmt = conn.prepare(
+                "SELECT room_id FROM current_state \
+                 WHERE state_key = ? AND event_type = 'm.room.member' AND membership = 'invite'",
+            )?;
+            let rows = stmt.query_map(params![user_id.as_str()], |row| row.get::<_, String>(0))?;
+
+            let mut out = Vec::new();
+            for r in rows {
+                let s = r?;
+                let id = OwnedRoomId::try_from(s)
+                    .map_err(|e| Error::Internal(format!("malformed room_id in DB: {e}")))?;
+                out.push(id);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     async fn rooms_with_membership(
         &self,
         user_id: &UserId,

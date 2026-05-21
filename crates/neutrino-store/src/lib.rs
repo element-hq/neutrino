@@ -201,6 +201,14 @@ pub trait StateStore: Send + Sync {
     ///       user has left, been banned, or is only invited are excluded.
     async fn joined_rooms(&self, user_id: &UserId) -> Result<Vec<OwnedRoomId>, StorageError>;
 
+    /// Pre:  none.
+    /// Post: returns the `room_id` of every room in which `user_id` has a current
+    ///       `m.room.member` event with `content.membership = "invite"`; rooms where
+    ///       the user has joined, left, or been banned are excluded. Kept separate
+    ///       from `joined_rooms` so the trait stays append-only; may be folded into
+    ///       a single method with a membership filter in the future.
+    async fn invited_rooms(&self, user_id: &UserId) -> Result<Vec<OwnedRoomId>, StorageError>;
+
     /// Pre:  none (returns empty map if the room does not exist).
     /// Post: returns one member event per `user_id` (state_key) whose current
     ///       `m.room.member` event has `content.membership = "join"`; left, banned, and

@@ -157,19 +157,14 @@ async fn watch_monotonic_under_concurrent_writes() {
     // Drain any remaining watch updates. `tokio::watch` collapses
     // multiple updates between observations, so we may see fewer than
     // N changes — but every observed change must be `>= last`.
-    loop {
-        match tokio::time::timeout(Duration::from_millis(100), rx.changed()).await {
-            Ok(Ok(())) => {
-                let cur = *rx.borrow();
-                assert!(
-                    cur >= last,
-                    "watch went backwards under contention: {last:?} -> {cur:?}"
-                );
-                last = cur;
-            }
-            // Settled (timed out with no new value) or sender dropped.
-            _ => break,
-        }
+    // Settled (timed out with no new value) or sender dropped → loop exits.
+    while let Ok(Ok(())) = tokio::time::timeout(Duration::from_millis(100), rx.changed()).await {
+        let cur = *rx.borrow();
+        assert!(
+            cur >= last,
+            "watch went backwards under contention: {last:?} -> {cur:?}"
+        );
+        last = cur;
     }
     // Final value must reflect every committed write — `n` new events
     // on top of the create event = StreamPos(n + 1).
