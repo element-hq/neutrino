@@ -6,7 +6,8 @@ use ruma::api::client::sync::sync_events::v5::{Request, request};
 use ruma::events::StateEventType;
 use ruma::{OwnedRoomId, RoomId, UInt, event_id, room_id, user_id};
 
-use super::mock::{MockStore, make_event};
+use crate::in_memory_store::{InMemoryStore, make_event};
+
 use super::{SyncError, SyncState, handle};
 
 fn list_with(timeline_limit: u32, required: Vec<(StateEventType, &str)>) -> request::List {
@@ -22,7 +23,7 @@ fn list_with(timeline_limit: u32, required: Vec<(StateEventType, &str)>) -> requ
 
 #[tokio::test]
 async fn initial_sync_with_no_lists_returns_empty_rooms_and_fresh_pos() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let state = SyncState::new(store);
     let user = user_id!("@alice:example.org");
 
@@ -37,7 +38,7 @@ async fn initial_sync_with_no_lists_returns_empty_rooms_and_fresh_pos() {
 
 #[tokio::test]
 async fn initial_sync_with_list_returns_joined_rooms_and_calls_storage() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room_a = room_id!("!room-a:example.org");
     let room_b = room_id!("!room-b:example.org");
@@ -101,7 +102,7 @@ async fn initial_sync_with_list_returns_joined_rooms_and_calls_storage() {
 
 #[tokio::test]
 async fn required_state_filters_current_state() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -172,7 +173,7 @@ async fn required_state_filters_current_state() {
 
 #[tokio::test]
 async fn unknown_pos_returns_error() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let state = SyncState::new(store);
     let user = user_id!("@alice:example.org");
 
@@ -184,7 +185,7 @@ async fn unknown_pos_returns_error() {
 
 #[tokio::test]
 async fn second_sync_with_correct_pos_succeeds() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let state = SyncState::new(store);
     let user = user_id!("@alice:example.org");
 
@@ -199,7 +200,7 @@ async fn second_sync_with_correct_pos_succeeds() {
 
 #[tokio::test]
 async fn invited_rooms_are_candidates() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let invited_room: &ruma::RoomId = room_id!("!invited:example.org");
     store.invite_user(user, invited_room);
@@ -224,7 +225,7 @@ async fn invited_rooms_are_candidates() {
 /// event at the given `ts[i]`. Returns the room IDs in seed order so tests can
 /// assert membership against ranking-derived subsets.
 fn seed_rooms_with_timestamps(
-    store: &MockStore,
+    store: &InMemoryStore,
     user: &ruma::UserId,
     timestamps: &[u64],
 ) -> Vec<OwnedRoomId> {
@@ -259,7 +260,7 @@ async fn rooms_sorted_by_bump_stamp_desc() {
     // 3 rooms with descending bump stamps assigned to ascending room IDs —
     // room IDs sort opposite to bump_stamp, so any room_id-based ordering
     // would give different results than bump_stamp-based ordering.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     // !room-0 → ts 300 (most recent), !room-1 → 200, !room-2 → 100.
     let ids = seed_rooms_with_timestamps(&store, user, &[300, 200, 100]);
@@ -301,7 +302,7 @@ async fn rooms_sorted_by_bump_stamp_desc() {
 #[tokio::test]
 async fn range_slicing_returns_only_requested_indexes() {
     // 10 rooms with strictly ascending bump stamps; request indexes [2,4].
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let timestamps: Vec<u64> = (1..=10).map(|i| i * 100).collect();
     let ids = seed_rooms_with_timestamps(&store, user, &timestamps);
@@ -332,7 +333,7 @@ async fn range_slicing_returns_only_requested_indexes() {
 async fn subscription_bypasses_list_range() {
     // 3 rooms ranked 0, 1, 2 by recency. List asks for range [0,0] (top only).
     // Subscription names the lowest-ranked room — should appear regardless.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let ids = seed_rooms_with_timestamps(&store, user, &[300, 200, 100]);
     let state = SyncState::new(store);
@@ -372,7 +373,7 @@ async fn multi_range_request_only_honours_first() {
     // `ranges: Vec` for compatibility. We honour only `ranges[0]` and silently
     // drop the rest. This test asserts that with 5 rooms and a request that
     // sends both [0,0] and [3,4], only the rank-0 room comes back.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let ids = seed_rooms_with_timestamps(&store, user, &[100, 200, 300, 400, 500]);
     let state = SyncState::new(store);
@@ -396,7 +397,7 @@ async fn multi_range_request_only_honours_first() {
 
 #[tokio::test]
 async fn list_count_independent_of_range_size() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let _ids = seed_rooms_with_timestamps(&store, user, &[100, 200, 300, 400, 500]);
     let state = SyncState::new(store);
@@ -423,7 +424,7 @@ async fn list_count_independent_of_range_size() {
 
 #[tokio::test]
 async fn second_sync_returns_only_new_events() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -487,7 +488,7 @@ async fn third_sync_with_no_new_events_omits_room() {
     // After an initial emission and a subsequent sync that captures nothing
     // new, the room should drop out of the response entirely (MSC4186
     // §"Room Matching Rules").
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -522,7 +523,7 @@ async fn third_sync_with_no_new_events_omits_room() {
 
 #[tokio::test]
 async fn limited_set_when_timeline_truncated() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -574,7 +575,7 @@ async fn limited_set_when_timeline_truncated() {
 
 #[tokio::test]
 async fn required_state_not_re_sent_when_unchanged() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -631,7 +632,7 @@ async fn deleted_state_not_surfaced_with_stubs_disabled() {
     // next sync — the client is intentionally left with its stale view
     // until the state is re-set. The deletion-detection logic itself is
     // covered separately by a unit test on `diff_required_state`.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -693,7 +694,7 @@ async fn deleted_state_not_surfaced_with_stubs_disabled() {
 /// stripped state inside `unsigned.invite_room_state`. Mirrors what would
 /// come in from a federation `/invite` call.
 fn seed_invite(
-    store: &MockStore,
+    store: &InMemoryStore,
     room: &RoomId,
     user: &ruma::UserId,
     inviter: &ruma::UserId,
@@ -747,7 +748,7 @@ fn seed_invite(
 
 #[tokio::test]
 async fn invited_room_emits_invite_state() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let inviter = user_id!("@bob:example.org");
     let room = room_id!("!invite:example.org");
@@ -841,7 +842,7 @@ async fn invited_room_emits_invite_state() {
 /// sent its stripped state on the first emission and don't re-send).
 #[tokio::test]
 async fn fresh_invite_emitted_while_existing_invite_pending() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let inviter = user_id!("@bob:example.org");
     let room_a = room_id!("!a:example.org");
@@ -924,7 +925,7 @@ async fn fresh_invite_emitted_while_existing_invite_pending() {
 
 #[tokio::test]
 async fn name_avatar_and_counts_emitted() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let bob = user_id!("@bob:example.org");
     let carol = user_id!("@carol:example.org");
@@ -990,10 +991,8 @@ async fn name_avatar_and_counts_emitted() {
         ruma::JsOption::Some(uri) => assert_eq!(uri.as_str(), "mxc://example.org/abc"),
         _ => panic!("avatar should be Some"),
     }
-    // The mock's `joined_members` returns empty (StateStore stub), so
-    // joined_count comes back as 0 / Some(0). Acceptable for a mock-only
-    // test; the real sqlite impl will populate this properly.
-    assert_eq!(room_res.joined_count, Some(UInt::from(0u32)));
+    // Alice + Bob joined → count 2. Carol is invited, not joined.
+    assert_eq!(room_res.joined_count, Some(UInt::from(2u32)));
     assert_eq!(
         room_res.invited_count,
         Some(UInt::from(1u32)),
@@ -1007,7 +1006,7 @@ async fn name_avatar_and_counts_emitted() {
 
 #[tokio::test]
 async fn conn_id_over_16_chars_rejected() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let state = SyncState::new(store);
     let user = user_id!("@alice:example.org");
 
@@ -1019,7 +1018,7 @@ async fn conn_id_over_16_chars_rejected() {
 
 #[tokio::test]
 async fn too_many_lists_rejected() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let state = SyncState::new(store);
     let user = user_id!("@alice:example.org");
 
@@ -1035,7 +1034,7 @@ async fn too_many_lists_rejected() {
 
 #[tokio::test]
 async fn e2ee_extension_echoed_when_enabled() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let state = SyncState::new(store);
     let user = user_id!("@alice:example.org");
 
@@ -1057,7 +1056,7 @@ async fn e2ee_extension_echoed_when_enabled() {
 
 #[tokio::test]
 async fn to_device_extension_echoed_when_enabled() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let state = SyncState::new(store);
     let user = user_id!("@alice:example.org");
 
@@ -1076,7 +1075,7 @@ async fn to_device_extension_echoed_when_enabled() {
 
 #[tokio::test]
 async fn extensions_not_echoed_when_not_requested() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let state = SyncState::new(store);
     let user = user_id!("@alice:example.org");
 
@@ -1094,7 +1093,7 @@ async fn initial_sync_ignores_timeout() {
     // pos=None always short-circuits the long-poll loop: a client doing an
     // initial sync wants the snapshot, not to wait for new events. The
     // generous timeout here would otherwise make the test hang forever.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let state = SyncState::new(store);
     let user = user_id!("@alice:example.org");
 
@@ -1113,7 +1112,7 @@ async fn initial_sync_ignores_timeout() {
 async fn long_poll_returns_empty_after_timeout() {
     // Subsequent sync with no new events and a short timeout: should wait
     // approximately `timeout` and then return with no rooms.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -1156,7 +1155,7 @@ async fn long_poll_returns_empty_after_timeout() {
 async fn long_poll_wakes_on_new_event() {
     // Subsequent sync with timeout=300ms. Add a new event ~50ms in. Assert
     // the sync returns the event well before the timeout expires.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -1221,7 +1220,7 @@ async fn retry_with_same_pos_returns_cached_response() {
     // MSC4186 §"Pagination and Tokens": clients may retry by re-sending the
     // same pos. The server returns the exact same response (same rooms,
     // same pos, same lists) without re-processing or advancing state.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -1274,7 +1273,7 @@ async fn stale_pos_returns_unknown_pos_after_advancing() {
     // Once the client has advanced past pos="1" by sending pos="1" and then
     // pos="2", retrying with pos="1" must fail: the cache only remembers
     // the *most recent* processed input pos.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let state = SyncState::new(store);
 
@@ -1304,7 +1303,7 @@ async fn retry_does_not_consume_pending_events() {
     // `events_after` or otherwise advance conn state. A real delta sync
     // immediately after the retry should still see the same new events as
     // if the retry never happened.
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -1375,7 +1374,7 @@ async fn retry_does_not_consume_pending_events() {
 /// [("*", "*")]` is the spec-defined "all current state" pattern.
 #[tokio::test]
 async fn required_state_wildcard_matches_everything() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -1439,7 +1438,7 @@ async fn required_state_wildcard_matches_everything() {
 /// returns every variant of the given event type.
 #[tokio::test]
 async fn required_state_wildcard_state_key_returns_all_keys_of_type() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let bob = user_id!("@bob:example.org");
     let room = room_id!("!room:example.org");
@@ -1498,7 +1497,7 @@ async fn required_state_wildcard_state_key_returns_all_keys_of_type() {
 /// `("*", state_key)` returns every type at that specific state_key.
 #[tokio::test]
 async fn required_state_wildcard_event_type_matches_specific_state_key() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -1562,7 +1561,7 @@ async fn required_state_wildcard_event_type_matches_specific_state_key() {
 /// the client knows there's older history beyond the window.
 #[tokio::test]
 async fn initial_sync_sets_limited_true_when_room_has_more_events_than_limit() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -1604,7 +1603,7 @@ async fn initial_sync_sets_limited_true_when_room_has_more_events_than_limit() {
 /// to backpaginate to.
 #[tokio::test]
 async fn initial_sync_sets_limited_false_when_all_events_fit() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -1639,7 +1638,7 @@ async fn initial_sync_sets_limited_false_when_all_events_fit() {
 /// its recent timeline (not a delta — the client has never seen it).
 #[tokio::test]
 async fn newly_joined_room_emits_initial_snapshot_on_incremental_sync() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let existing = room_id!("!existing:example.org");
     let fresh = room_id!("!fresh:example.org");
@@ -1710,7 +1709,7 @@ async fn newly_joined_room_emits_initial_snapshot_on_incremental_sync() {
 /// yet) — the client needs to see it exists.
 #[tokio::test]
 async fn empty_room_still_emitted_on_initial_sync() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!empty:example.org");
     store.join_user(user, room);
@@ -1737,7 +1736,7 @@ async fn empty_room_still_emitted_on_initial_sync() {
 /// `required_state` (state diff) and update the top-level `room.name`.
 #[tokio::test]
 async fn name_change_propagates_on_incremental_sync() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     store.join_user(user, room);
@@ -1798,7 +1797,7 @@ async fn name_change_propagates_on_incremental_sync() {
 /// parse the invite_state array to render the invite list.
 #[tokio::test]
 async fn invited_room_emits_name_and_avatar_from_stripped_state() {
-    let store = Arc::new(MockStore::new());
+    let store = Arc::new(InMemoryStore::new());
     let user = user_id!("@alice:example.org");
     let inviter = user_id!("@bob:example.org");
     let room = room_id!("!invite:example.org");
