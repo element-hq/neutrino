@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use neutrino_common::storage::{Direction, StorageBackend, StoredEvent};
+use neutrino_store::{Direction, StorageBackend, StoredEvent};
 use ruma::UInt;
 use ruma::api::client::sync::sync_events::v5::response;
 use ruma::api::client::sync::sync_events::v5::{Request, Response};
@@ -410,7 +410,8 @@ fn required_state_matches(
     state_key: &str,
 ) -> bool {
     for (rule_type, rule_key) in rules {
-        let type_match = rule_type.to_string() == "*" || rule_type.to_string() == evt_type;
+        let rule_type = rule_type.to_string();
+        let type_match = rule_type == "*" || rule_type == evt_type;
         let key_match = rule_key == "*" || rule_key == state_key;
         if type_match && key_match {
             return true;

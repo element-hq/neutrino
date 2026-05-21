@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use neutrino_common::storage::{
+use neutrino_store::{
     DagStore, Direction, EventStore, FederationInbox, FederationOutbox, PaginationToken, RoomStore,
     StateStore, StorageError, StoredEvent, StoredPdu, StreamPos,
 };
@@ -155,6 +155,10 @@ impl EventStore for MockStore {
         _destinations: &[&ServerName],
     ) -> Result<(), StorageError> {
         todo!("MockStore::persist_event not used in current tests")
+    }
+
+    async fn persist_historical_event(&self, _event: &StoredEvent) -> Result<(), StorageError> {
+        todo!("MockStore::persist_historical_event not used in current tests")
     }
 
     async fn get_client_txn(
@@ -292,6 +296,14 @@ impl StateStore for MockStore {
         _room_id: &RoomId,
     ) -> Result<HashMap<OwnedUserId, StoredEvent>, StorageError> {
         Ok(HashMap::new())
+    }
+
+    async fn rooms_with_membership(
+        &self,
+        _user_id: &UserId,
+        _memberships: &[&str],
+    ) -> Result<Vec<(OwnedRoomId, String)>, StorageError> {
+        todo!("MockStore::rooms_with_membership not used in current tests")
     }
 }
 
