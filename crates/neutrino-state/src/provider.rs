@@ -9,6 +9,7 @@
 //!   precomputed auth chain. Under MSC4242 these are calculated server-side
 //!   at insert time (by `auth_events::calculate_auth_events`) and stored.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -36,8 +37,16 @@ pub trait StateProvider {
     /// Precomputed auth_events of `id` — under MSC4242, `auth_events` is not
     /// on the wire; the server calculates it once at insert time via
     /// `auth_events::calculate_auth_events` and stores it alongside the
-    /// event. Returns the empty vec if `id` is unknown.
-    fn auth_event_ids(&self, id: &EventId) -> Vec<OwnedEventId>;
+    /// event.
+    ///
+    /// Returns an empty slice if `id` is unknown **or** if `id` is known to
+    /// be an `m.room.create` event (which legitimately has zero auth_events).
+    /// Callers that need to distinguish the two cases should `get_event(id)`
+    /// first.
+    ///
+    /// Returning `Cow` lets in-memory impls borrow their stored vec while
+    /// DB-backed impls return an owned vec materialised from a row scan.
+    fn auth_event_ids(&self, id: &EventId) -> Cow<'_, [OwnedEventId]>;
 }
 
 /// In-memory `StateProvider`. Public (not test-cfg) — Phase 6 `apply` uses
@@ -71,7 +80,10 @@ impl StateProvider for InMemoryStateProvider {
         self.events.get(id).cloned()
     }
 
-    fn auth_event_ids(&self, id: &EventId) -> Vec<OwnedEventId> {
-        self.auth_event_ids.get(id).cloned().unwrap_or_default()
+    fn auth_event_ids(&self, id: &EventId) -> Cow<'_, [OwnedEventId]> {
+        self.auth_event_ids
+            .get(id)
+            .map(|v| Cow::Borrowed(v.as_slice()))
+            .unwrap_or(Cow::Borrowed(&[]))
     }
 }

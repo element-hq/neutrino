@@ -98,9 +98,9 @@ pub fn conflicted_subgraph(
     let mut stack: Vec<OwnedEventId> = seeds.iter().cloned().collect();
     while let Some(id) = stack.pop() {
         if visited.insert(id.clone()) {
-            for parent in provider.auth_event_ids(&id) {
-                if !visited.contains(&parent) {
-                    stack.push(parent);
+            for parent in provider.auth_event_ids(&id).iter() {
+                if !visited.contains(parent) {
+                    stack.push(parent.clone());
                 }
             }
         }
@@ -136,9 +136,9 @@ pub fn auth_chain_difference(
             let mut stack: Vec<OwnedEventId> = set.values().cloned().collect();
             while let Some(id) = stack.pop() {
                 if chain.insert(id.clone()) {
-                    for parent in provider.auth_event_ids(&id) {
-                        if !chain.contains(&parent) {
-                            stack.push(parent);
+                    for parent in provider.auth_event_ids(&id).iter() {
+                        if !chain.contains(parent) {
+                            stack.push(parent.clone());
                         }
                     }
                 }
@@ -324,6 +324,23 @@ mod tests {
         assert!(auth_chain_difference(&[], &provider).is_empty());
         let s1 = state(&[("m.room.name", "", "$n:example.org")]);
         assert!(auth_chain_difference(&[&s1], &provider).is_empty());
+    }
+
+    #[test]
+    fn auth_chain_difference_empty_state_set_returns_other_chain() {
+        // [empty, non_empty] → diff = full chain of non_empty.
+        // Empty state set's chain is empty; intersection with empty = empty;
+        // difference = union of all other chains.
+        let mut provider = InMemoryStateProvider::new();
+        insert(&mut provider, "$a:example.org", &["$b:example.org"]);
+        insert(&mut provider, "$b:example.org", &[]);
+        let empty = StateMap::<OwnedEventId>::new();
+        let s2 = state(&[("m.room.name", "", "$a:example.org")]);
+        let diff = auth_chain_difference(&[&empty, &s2], &provider);
+        let expected: HashSet<_> = [eid("$a:example.org"), eid("$b:example.org")]
+            .into_iter()
+            .collect();
+        assert_eq!(diff, expected);
     }
 
     #[test]

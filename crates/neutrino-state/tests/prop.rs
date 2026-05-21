@@ -463,9 +463,9 @@ fn auth_chain_of(seed: &OwnedEventId, provider: &dyn StateProvider) -> HashSet<O
     let mut stack = vec![seed.clone()];
     while let Some(id) = stack.pop() {
         if chain.insert(id.clone()) {
-            for parent in provider.auth_event_ids(&id) {
-                if !chain.contains(&parent) {
-                    stack.push(parent);
+            for parent in provider.auth_event_ids(&id).iter() {
+                if !chain.contains(parent) {
+                    stack.push(parent.clone());
                 }
             }
         }
@@ -682,9 +682,9 @@ proptest! {
     ) {
         let sg = conflicted_subgraph(&seeds, &provider);
         for id in &sg {
-            for parent in provider.auth_event_ids(id) {
+            for parent in provider.auth_event_ids(id).iter() {
                 prop_assert!(
-                    sg.contains(&parent),
+                    sg.contains(parent),
                     "subgraph missing parent {} of {}",
                     parent,
                     id
@@ -736,17 +736,17 @@ proptest! {
         prop_assert!(auth_chain_difference(&refs, &provider).is_empty());
     }
 
-    /// Output is disjoint from the intersection of all per-set chains. (The
-    /// difference is union minus intersection — by construction it can't
-    /// contain anything in the intersection.)
+    /// `diff == union(chains) \ intersection(chains)`. Both sides computed
+    /// externally and compared as sets — this single equality subsumes the
+    /// earlier subset-of-union and disjoint-from-intersection properties,
+    /// which together did not pin equality.
     #[test]
-    fn acd_disjoint_from_intersection(
+    fn acd_equals_union_minus_intersection(
         state_sets in prop::collection::vec(arb_state_set(), 2..5),
         provider in arb_provider(),
     ) {
         let refs: Vec<&StateMap<OwnedEventId>> = state_sets.iter().collect();
         let diff = auth_chain_difference(&refs, &provider);
-        // Compute the intersection of all per-set auth chains externally.
         let chains: Vec<HashSet<OwnedEventId>> = refs
             .iter()
             .map(|s| {
@@ -757,41 +757,16 @@ proptest! {
                 chain
             })
             .collect();
-        let intersection: HashSet<OwnedEventId> = if chains.is_empty() {
-            HashSet::new()
-        } else {
-            chains.iter().skip(1).fold(chains[0].clone(), |acc, c| {
-                acc.intersection(c).cloned().collect()
-            })
-        };
-        for id in &diff {
-            prop_assert!(
-                !intersection.contains(id),
-                "{} was in every chain (intersection) yet appears in the difference",
-                id
-            );
-        }
-    }
-
-    /// Output is contained in the union of all per-set chains.
-    #[test]
-    fn acd_subset_of_union(
-        state_sets in prop::collection::vec(arb_state_set(), 2..5),
-        provider in arb_provider(),
-    ) {
-        let refs: Vec<&StateMap<OwnedEventId>> = state_sets.iter().collect();
-        let diff = auth_chain_difference(&refs, &provider);
-        let union: HashSet<OwnedEventId> = refs
+        let union: HashSet<OwnedEventId> = chains.iter().flatten().cloned().collect();
+        let intersection: HashSet<OwnedEventId> = chains
             .iter()
-            .flat_map(|s| s.values().flat_map(|v| auth_chain_of(v, &provider)))
-            .collect();
-        for id in &diff {
-            prop_assert!(
-                union.contains(id),
-                "{} appeared in the difference but not in the union of chains",
-                id
-            );
-        }
+            .skip(1)
+            .fold(chains[0].clone(), |acc, c| {
+                acc.intersection(c).cloned().collect()
+            });
+        let expected: HashSet<OwnedEventId> =
+            union.difference(&intersection).cloned().collect();
+        prop_assert_eq!(diff, expected);
     }
 
     /// Order-independence: reversing the state-sets vec yields the same
@@ -959,7 +934,7 @@ proptest! {
                     event: placeholder_arc_event(id),
                     rejected: false,
                 },
-                provider_a.auth_event_ids(id),
+                provider_a.auth_event_ids(id).into_owned(),
             );
         }
         for id in &ids_b {
@@ -968,7 +943,7 @@ proptest! {
                     event: placeholder_arc_event(id),
                     rejected: false,
                 },
-                provider_b.auth_event_ids(id),
+                provider_b.auth_event_ids(id).into_owned(),
             );
         }
 
