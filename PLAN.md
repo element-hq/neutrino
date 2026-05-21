@@ -40,10 +40,10 @@
     - [x] Phase 1b: reference validation (`validate::validate_references`, 10 tests). Introduced a minimal `StateProvider` trait (one method, `get_event`) ahead of Phase 5 so 1b could land independently.
     - [x] Phase 2: auth events selection (`auth_events::auth_event_keys` + `calculate_auth_events`, 15 tests)
     - [x] Phase 3: auth rules v12 (`auth_rules::check_auth_rules`, 24 tests; rules 4–11 in spec order)
-    - [ ] Phase 4a: separate + auth_chain_difference
+    - [x] Phase 4a: `separate` + `conflicted_subgraph` + `auth_chain_difference` (`state_res` module, 13 tests). Also landed the public `InMemoryStateProvider` (Phase 5) here since the provider gained `auth_event_ids` and 4a wanted to test against a real impl.
     - [ ] Phase 4b: reverse-topo power sort + IAC pass 1
     - [ ] Phase 4c: mainline + IAC pass 2 + unconflicted merge → `resolve_state`
-    - [ ] Phase 5: in-memory `StateProvider`
+    - [x] Phase 5: in-memory `StateProvider` (landed alongside Phase 4a)
     - [ ] Phase 6: `RoomCore::apply` (orchestrates: 1a → 1b → state-res → 3 → update → effects)
 - [ ] Client-Server Sliding Sync MSC4186 implementation
     - Does not need to be performant as it’s all local to the device.
