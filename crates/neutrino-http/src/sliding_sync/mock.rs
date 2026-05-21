@@ -105,7 +105,30 @@ impl MockStore {
             room_state.insert((event.event_type.clone(), state_key), dup(&event));
         }
         inner.events.push((pos, event));
-        let _ = self.watch_tx.send(pos);
+        // `send_if_modified` always updates the stored value; plain `send`
+        // returns Err and no-ops the update when there are no live
+        // receivers, and the mock's constructor drops the initial receiver.
+        // Matches the production store's `notify_watch` pattern.
+        self.watch_tx.send_if_modified(|cur| {
+            if pos > *cur {
+                *cur = pos;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Remove a `(event_type, state_key)` entry from current state. The
+    /// underlying events stay in the event log (mirroring how a real store
+    /// behaves when a state event is overwritten by something that *deletes*
+    /// state — e.g. an `m.room.member` with `membership: leave` is the actual
+    /// deletion of the join). Tests use this to exercise the state-stub path.
+    pub fn remove_state(&self, room_id: &RoomId, event_type: &str, state_key: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(state) = inner.current_state.get_mut(room_id) {
+            state.remove(&(event_type.to_string(), state_key.to_string()));
+        }
     }
 }
 

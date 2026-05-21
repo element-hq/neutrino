@@ -51,23 +51,20 @@ pub struct SubCfg {
 
 /// What the server has previously sent to *this connection* about a given room.
 ///
-/// Used to compute deltas: on each response the handler appends to
-/// `timeline_event_ids` and updates `required_state_keys` (see
-/// `build::update_sent`). Future delta logic will consult this to avoid
-/// re-sending events the client already has.
+/// Used to compute deltas:
+/// - Timeline delivery is tracked via `Conn::last_event_stream_pos` (a single
+///   global high-water mark, since `events_after` returns events in stream
+///   order across all rooms). We don't need per-room timeline tracking.
+/// - State delivery is tracked here per `(event_type, state_key)` → the event
+///   id we last sent for that key. `build_room` compares against this to skip
+///   unchanged state and to emit MSC4186 §StateStub markers for keys that
+///   were sent before but no longer match current state.
 ///
-/// TODO(phase-4): `timeline_event_ids` grows unbounded — one entry per emitted
-/// event for the room's lifetime on this connection. Bound it (keep only the
-/// last N) or replace with a single high-water mark, since timeline is already
-/// strictly ordered. `required_state_keys` is naturally bounded by the number
-/// of distinct `(event_type, state_key)` pairs in the room.
-///
-/// TODO(phase-4): this is populated by `update_sent` but never consulted —
-/// `build_room` doesn't yet diff against it. Subsequent syncs currently re-send
-/// the same timeline window.
+/// The presence of an entry in `Conn::sent` for a given room also signals
+/// "this room has been emitted at least once" → next emission is a delta, not
+/// initial.
 #[derive(Debug, Default, Clone)]
 pub struct RoomSent {
-    pub timeline_event_ids: Vec<OwnedEventId>,
     pub required_state_keys: HashMap<(String, String), OwnedEventId>,
 }
 
@@ -76,15 +73,25 @@ pub struct RoomSent {
 /// `pos` is an opaque-to-the-client monotonic counter we hand back as the
 /// response `pos` string. It is **not** an event-store `StreamPos`.
 ///
-/// TODO(phase-5): add a separate `last_event_stream_pos: StreamPos` field for
-/// tracking where in the storage event stream we last looked, used by the
-/// long-poll path to subscribe to new events.
+/// `last_event_stream_pos` is the highest `StreamPos` we've consumed from the
+/// event stream when building responses on this connection. The next sync
+/// queries `events_after(last_event_stream_pos)` to find what's new. On a
+/// fresh connection it starts at 0; after the first response it's bumped to
+/// whatever the event store's current head is, so subsequent syncs only see
+/// events arriving *after* the initial snapshot.
 #[derive(Debug, Default)]
 pub struct Conn {
     pub pos: u64,
+    pub last_event_stream_pos: u64,
     pub lists: BTreeMap<String, ListCfg>,
     pub subs: BTreeMap<OwnedRoomId, SubCfg>,
     pub sent: HashMap<OwnedRoomId, RoomSent>,
+    /// Per-list previously-seen `timeline_limit` so `build_room` can detect a
+    /// limit-grew situation and resend older events. MSC4186 calls this
+    /// `expanded_timeline`. Ruma v5's `response::Room` doesn't carry that
+    /// field, so we can't actually surface it on the wire — kept tracked for
+    /// when ruma catches up. See MSC4186-gaps.md.
+    pub prev_list_timeline_limits: BTreeMap<String, usize>,
 }
 
 impl Conn {
