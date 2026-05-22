@@ -13,7 +13,7 @@ use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 
 use crate::provider::StateProvider;
-use crate::{Event, FormatError, ReferenceError, RoomVersion};
+use crate::{Event, FormatError, ReferenceError};
 
 const MAX_PREV_EVENTS: usize = 20;
 const MAX_PREV_STATE_EVENTS: usize = 20;
@@ -37,12 +37,7 @@ pub fn parse_event(
     raw: Box<RawValue>,
     event_id: OwnedEventId,
     auth_events: Vec<OwnedEventId>,
-    room_version: RoomVersion,
 ) -> Result<Event, FormatError> {
-    // Only v12 is supported (see lib.rs `RoomVersion`). Argument retained so
-    // future versions can be slotted in without an API break.
-    let _ = room_version;
-
     let map: Map<String, Value> = serde_json::from_str(raw.get())?;
 
     // MSC4242: reject any event that includes auth_events on the wire.
@@ -477,13 +472,8 @@ mod tests {
 
     #[test]
     fn happy_path_message() {
-        let ev = parse_event(
-            raw(base_event()),
-            eid("$ev1:example.org"),
-            vec![],
-            RoomVersion::V12,
-        )
-        .expect("valid message");
+        let ev =
+            parse_event(raw(base_event()), eid("$ev1:example.org"), vec![]).expect("valid message");
         assert_eq!(ev.event_type, "m.room.message");
         assert_eq!(ev.prev_events.len(), 1);
         assert!(ev.state_key.is_none());
@@ -491,13 +481,8 @@ mod tests {
 
     #[test]
     fn happy_path_create() {
-        let ev = parse_event(
-            raw(base_create()),
-            eid("$create:example.org"),
-            vec![],
-            RoomVersion::V12,
-        )
-        .expect("valid create");
+        let ev = parse_event(raw(base_create()), eid("$create:example.org"), vec![])
+            .expect("valid create");
         assert_eq!(ev.event_type, "m.room.create");
         // F5 sister-check: room_id derived from event_id sigil swap.
         assert_eq!(ev.room_id.as_str(), "!create:example.org");
@@ -509,7 +494,7 @@ mod tests {
         let mut v = base_event();
         v["auth_events"] = json!(["$a:example.org"]);
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::AuthEventsPresent)
         ));
     }
@@ -524,7 +509,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::TooManyPrevEvents)
         ));
     }
@@ -538,7 +523,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::TooManyPrevStateEvents)
         ));
     }
@@ -549,7 +534,7 @@ mod tests {
         let mut v = base_create();
         v["prev_events"] = json!(["$prev:example.org"]);
         assert!(matches!(
-            parse_event(raw(v), eid("$create:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$create:example.org"), vec![]),
             Err(FormatError::CreateHasPrevEvents)
         ));
     }
@@ -559,7 +544,7 @@ mod tests {
         let mut v = base_create();
         v["prev_state_events"] = json!(["$prev:example.org"]);
         assert!(matches!(
-            parse_event(raw(v), eid("$create:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$create:example.org"), vec![]),
             Err(FormatError::CreateHasPrevStateEvents)
         ));
     }
@@ -570,7 +555,7 @@ mod tests {
         let mut v = base_create();
         v["room_id"] = json!("!fake:example.org");
         assert!(matches!(
-            parse_event(raw(v), eid("$create:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$create:example.org"), vec![]),
             Err(FormatError::CreateHasRoomId)
         ));
     }
@@ -581,7 +566,7 @@ mod tests {
         let mut v = base_create();
         v["content"] = json!({ "room_version": "11" });
         assert!(matches!(
-            parse_event(raw(v), eid("$create:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$create:example.org"), vec![]),
             Err(FormatError::UnrecognisedRoomVersion(_))
         ));
     }
@@ -592,7 +577,7 @@ mod tests {
         // "is value valid". When room_version is absent we don't reject here.
         let mut v = base_create();
         v["content"] = json!({});
-        parse_event(raw(v), eid("$create:example.org"), vec![], RoomVersion::V12)
+        parse_event(raw(v), eid("$create:example.org"), vec![])
             .expect("create without content.room_version is permitted in phase 1");
     }
 
@@ -603,7 +588,7 @@ mod tests {
         v["content"] =
             json!({ "room_version": ROOM_VERSION_ID, "additional_creators": "@bob:example.org" });
         assert!(matches!(
-            parse_event(raw(v), eid("$create:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$create:example.org"), vec![]),
             Err(FormatError::InvalidAdditionalCreators)
         ));
     }
@@ -614,7 +599,7 @@ mod tests {
         v["content"] =
             json!({ "room_version": ROOM_VERSION_ID, "additional_creators": ["not-a-user-id"] });
         assert!(matches!(
-            parse_event(raw(v), eid("$create:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$create:example.org"), vec![]),
             Err(FormatError::InvalidAdditionalCreators)
         ));
     }
@@ -626,8 +611,7 @@ mod tests {
             "room_version": ROOM_VERSION_ID,
             "additional_creators": ["@bob:example.org", "@carol:example.org"]
         });
-        parse_event(raw(v), eid("$create:example.org"), vec![], RoomVersion::V12)
-            .expect("valid additional_creators");
+        parse_event(raw(v), eid("$create:example.org"), vec![]).expect("valid additional_creators");
     }
 
     // ---------- F8: m.room.member missing parts ----------
@@ -638,7 +622,7 @@ mod tests {
         v["content"] = json!({ "membership": "join" });
         // state_key absent
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::MemberMissingStateKey)
         ));
     }
@@ -650,7 +634,7 @@ mod tests {
         v["state_key"] = json!("@alice:example.org");
         v["content"] = json!({});
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::MemberMissingMembership)
         ));
     }
@@ -663,7 +647,7 @@ mod tests {
         v["state_key"] = json!("@bob:example.org");
         // sender = @alice — mismatch
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::StateKeyAtSignSenderMismatch)
         ));
     }
@@ -673,8 +657,7 @@ mod tests {
         let mut v = base_event();
         v["type"] = json!("m.something");
         v["state_key"] = json!("@alice:example.org");
-        parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12)
-            .expect("state_key matches sender");
+        parse_event(raw(v), eid("$e:example.org"), vec![]).expect("state_key matches sender");
     }
 
     #[test]
@@ -682,8 +665,7 @@ mod tests {
         let mut v = base_event();
         v["type"] = json!("m.room.topic");
         v["state_key"] = json!("");
-        parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12)
-            .expect("empty state_key ok");
+        parse_event(raw(v), eid("$e:example.org"), vec![]).expect("empty state_key ok");
     }
 
     #[test]
@@ -695,7 +677,7 @@ mod tests {
         v["type"] = json!("m.room.member");
         v["state_key"] = json!("@bob:example.org");
         v["content"] = json!({ "membership": "invite" });
-        parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12)
+        parse_event(raw(v), eid("$e:example.org"), vec![])
             .expect("m.room.member with different state_key/sender is valid");
     }
 
@@ -707,7 +689,7 @@ mod tests {
         v["state_key"] = json!("");
         v["content"] = json!({ "users_default": "high" });
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::PowerLevelsBadIntField("users_default"))
         ));
     }
@@ -719,7 +701,7 @@ mod tests {
         v["state_key"] = json!("");
         v["content"] = json!({ "events": { "m.room.name": "yes" } });
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::PowerLevelsBadObjectField("events"))
         ));
     }
@@ -731,7 +713,7 @@ mod tests {
         v["state_key"] = json!("");
         v["content"] = json!({ "users": { "not-a-user-id": 50 } });
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::PowerLevelsBadUsers)
         ));
     }
@@ -743,7 +725,7 @@ mod tests {
         v["state_key"] = json!("");
         v["content"] = json!({ "users": { "@alice:example.org": "boss" } });
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::PowerLevelsBadUsers)
         ));
     }
@@ -765,8 +747,7 @@ mod tests {
             "events": { "m.room.name": 50 },
             "notifications": { "room": 50 }
         });
-        parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12)
-            .expect("valid power_levels");
+        parse_event(raw(v), eid("$e:example.org"), vec![]).expect("valid power_levels");
     }
 
     // ---------- F14: malformed IDs ----------
@@ -775,7 +756,7 @@ mod tests {
         let mut v = base_event();
         v["sender"] = json!("not-a-user-id");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::MalformedId {
                 field: "sender",
                 ..
@@ -788,7 +769,7 @@ mod tests {
         let mut v = base_event();
         v["room_id"] = json!("not-a-room-id");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::MalformedId {
                 field: "room_id",
                 ..
@@ -801,7 +782,7 @@ mod tests {
         let mut v = base_event();
         v["prev_events"] = json!(["not-an-id"]);
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::MalformedId {
                 field: "prev_events",
                 ..
@@ -815,7 +796,7 @@ mod tests {
         let mut v = base_event();
         v.as_object_mut().unwrap().remove("type");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::MissingField("type"))
         ));
     }
@@ -825,7 +806,7 @@ mod tests {
         let mut v = base_event();
         v.as_object_mut().unwrap().remove("sender");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::MissingField("sender"))
         ));
     }
@@ -835,7 +816,7 @@ mod tests {
         let mut v = base_event();
         v.as_object_mut().unwrap().remove("content");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::MissingField("content"))
         ));
     }
@@ -845,7 +826,7 @@ mod tests {
         let mut v = base_event();
         v.as_object_mut().unwrap().remove("depth");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::MissingField("depth"))
         ));
     }
@@ -855,7 +836,7 @@ mod tests {
         let mut v = base_event();
         v["depth"] = json!("not a number");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::InvalidFieldType { field: "depth", .. })
         ));
     }
@@ -865,7 +846,7 @@ mod tests {
         let mut v = base_event();
         v["depth"] = json!(DEPTH_LIMIT);
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::DepthOutOfRange)
         ));
     }
@@ -874,7 +855,7 @@ mod tests {
     fn accepts_depth_just_under_limit() {
         let mut v = base_event();
         v["depth"] = json!(DEPTH_LIMIT - 1);
-        parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12).expect("depth ok");
+        parse_event(raw(v), eid("$e:example.org"), vec![]).expect("depth ok");
     }
 
     #[test]
@@ -882,7 +863,7 @@ mod tests {
         let mut v = base_event();
         v.as_object_mut().unwrap().remove("hashes");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::MissingField("hashes"))
         ));
     }
@@ -892,7 +873,7 @@ mod tests {
         let mut v = base_event();
         v["hashes"] = json!({ "sha256": 123 });
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::InvalidFieldType {
                 field: "hashes",
                 ..
@@ -905,7 +886,7 @@ mod tests {
         let mut v = base_event();
         v.as_object_mut().unwrap().remove("origin_server_ts");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::MissingField("origin_server_ts"))
         ));
     }
@@ -915,7 +896,7 @@ mod tests {
         let mut v = base_event();
         v["origin_server_ts"] = json!("yesterday");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::InvalidFieldType {
                 field: "origin_server_ts",
                 ..
@@ -930,7 +911,7 @@ mod tests {
         v["type"] = json!("m.room.topic");
         v["state_key"] = json!(null);
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::InvalidFieldType {
                 field: "state_key",
                 ..
@@ -943,7 +924,7 @@ mod tests {
         let mut v = base_event();
         v.as_object_mut().unwrap().remove("prev_events");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::MissingField("prev_events"))
         ));
     }
@@ -953,7 +934,7 @@ mod tests {
         let mut v = base_event();
         v.as_object_mut().unwrap().remove("prev_state_events");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::MissingField("prev_state_events"))
         ));
     }
@@ -963,7 +944,7 @@ mod tests {
         let mut v = base_event();
         v.as_object_mut().unwrap().remove("room_id");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12),
+            parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::MissingField("room_id"))
         ));
     }
@@ -973,20 +954,15 @@ mod tests {
     fn ignores_signatures_field_present() {
         let mut v = base_event();
         v["signatures"] = json!({ "example.org": { "ed25519:key": "sig" } });
-        parse_event(raw(v), eid("$e:example.org"), vec![], RoomVersion::V12)
+        parse_event(raw(v), eid("$e:example.org"), vec![])
             .expect("signatures field accepted but not verified");
     }
 
     #[test]
     fn ignores_signatures_field_absent() {
         // base_event has no signatures field — still accepted.
-        parse_event(
-            raw(base_event()),
-            eid("$e:example.org"),
-            vec![],
-            RoomVersion::V12,
-        )
-        .expect("missing signatures accepted under trusted-network policy");
+        parse_event(raw(base_event()), eid("$e:example.org"), vec![])
+            .expect("missing signatures accepted under trusted-network policy");
     }
 
     // =====================================================================
@@ -1006,10 +982,7 @@ mod tests {
     }
 
     fn make_event(json: Value, event_id: &str) -> Arc<Event> {
-        Arc::new(
-            parse_event(raw(json), eid(event_id), vec![], RoomVersion::V12)
-                .expect("test event valid"),
-        )
+        Arc::new(parse_event(raw(json), eid(event_id), vec![]).expect("test event valid"))
     }
 
     fn make_create(event_id: &str) -> Arc<Event> {

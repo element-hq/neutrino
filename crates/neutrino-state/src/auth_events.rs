@@ -111,7 +111,6 @@ fn add_unique(keys: &mut Vec<(String, String)>, event_type: &str, state_key: Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RoomVersion;
     use crate::validate::parse_event;
     use neutrino_common::ROOM_VERSION_ID;
     use serde_json::{Value, json};
@@ -139,7 +138,7 @@ mod tests {
     }
 
     fn make_event(v: Value, id: &str) -> Event {
-        parse_event(raw(v), eid(id), vec![], RoomVersion::V12).expect("valid test event")
+        parse_event(raw(v), eid(id), vec![]).expect("valid test event")
     }
 
     fn member(sender: &str, target: &str, content: Value, id: &str) -> Event {

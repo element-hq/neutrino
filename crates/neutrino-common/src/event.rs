@@ -19,16 +19,6 @@
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 use serde_json::value::RawValue;
 
-/// Room version supported by this server.
-///
-/// Only v12 (MSC4242-on-v12, wire identifier `org.matrix.msc4242.12`) is
-/// supported. The variant exists so future versions can be slotted in
-/// without an API break.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RoomVersion {
-    V12,
-}
-
 /// Parsed view of a Matrix v12 PDU.
 ///
 /// Constructed by the format-validation pass (`neutrino-state::validate`)

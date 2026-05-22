@@ -7,9 +7,9 @@
 //!   anywhere downstream that needs the event body / rejection flag.
 //! - `auth_chain(seeds)`: used by Phase 4 state resolution. Returns the
 //!   transitive backwards closure of the seeds through their `auth_events`
-//!   (including the seeds themselves). Implementations are free to choose
-//!   their traversal strategy — in-memory does a stack-based DFS; a future
-//!   SQLite-backed provider will use a recursive CTE.
+//!   (including the seeds themselves). **Errors** if any event in the
+//!   closure isn't in the store — every event we know about must have its
+//!   complete auth chain locally (no federation auth-chain backfill).
 //!
 //! Under MSC4242 `auth_events` is **not** on the wire; the server calculates
 //! it once at insert time and stores it on the `Event` struct. The provider
@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 use neutrino_common::Event;
 use ruma::{EventId, OwnedEventId};
+
+use crate::StateResError;
 
 /// View of an event known to the store, with its rejection status.
 ///
@@ -40,21 +42,30 @@ pub trait StateProvider {
 
     /// Transitive backwards closure of `seeds` via `Event.auth_events`.
     ///
-    /// The result includes every `seed` that resolves to a known event (so
-    /// downstream set operations don't have to special-case the seed
-    /// themselves). Seeds that aren't in the store are silently dropped —
-    /// state-res treats them as backfill boundaries.
+    /// Returns every id reachable backwards from the seeds (seeds included
+    /// in the result). **Errors** with `StateResError::MissingAuthEvent` if
+    /// any id — seed or transitively discovered — isn't in the store.
+    ///
+    /// The project invariant: every event we know about has its **complete**
+    /// auth chain locally resolvable. We don't federate auth chains; every
+    /// event is authored locally or arrives with its full chain. A missing
+    /// entry indicates corruption or a write-path bug, never a normal
+    /// backfill boundary — surface it loudly rather than walking around it.
     ///
     /// In-memory impls do a stack-based DFS reading `event.auth_events`
     /// per step. SQLite-backed impls collapse the walk to a single recursive
     /// CTE join against `event_edges WHERE edge_type = 'auth'` — see
     /// `event-id-design.md` §"What event_edges is doing".
-    fn auth_chain(&self, seeds: &HashSet<OwnedEventId>) -> HashSet<OwnedEventId>;
+    fn auth_chain(
+        &self,
+        seeds: &HashSet<OwnedEventId>,
+    ) -> Result<HashSet<OwnedEventId>, StateResError>;
 }
 
 /// In-memory `StateProvider`. Public (not test-cfg) — Phase 6 `apply` uses
-/// it as the storage-free fallback, and unit tests use it directly.
-#[derive(Debug, Default)]
+/// it as the storage-free fallback, and unit tests use it directly. Clone
+/// is cheap: events are `Arc`-shared via `EventInfo`.
+#[derive(Debug, Default, Clone)]
 pub struct InMemoryStateProvider {
     events: HashMap<OwnedEventId, EventInfo>,
 }
@@ -78,24 +89,28 @@ impl StateProvider for InMemoryStateProvider {
         self.events.get(id).cloned()
     }
 
-    fn auth_chain(&self, seeds: &HashSet<OwnedEventId>) -> HashSet<OwnedEventId> {
+    fn auth_chain(
+        &self,
+        seeds: &HashSet<OwnedEventId>,
+    ) -> Result<HashSet<OwnedEventId>, StateResError> {
         let mut visited: HashSet<OwnedEventId> = HashSet::new();
         let mut stack: Vec<OwnedEventId> = seeds.iter().cloned().collect();
         while let Some(id) = stack.pop() {
             if !visited.insert(id.clone()) {
                 continue;
             }
-            // Pull this event's auth_events off the `Event` struct.
-            // Unknown id → no parents to walk (federation backfill
-            // boundary; the seed itself is still in `visited`).
-            if let Some(info) = self.events.get(&id) {
-                for parent in &info.event.auth_events {
-                    if !visited.contains(parent) {
-                        stack.push(parent.clone());
-                    }
+            // Strict closure invariant: every id we visit (seed or
+            // transitively discovered) must resolve. Missing => error.
+            let info = self
+                .events
+                .get(&id)
+                .ok_or_else(|| StateResError::MissingAuthEvent(id.clone()))?;
+            for parent in &info.event.auth_events {
+                if !visited.contains(parent) {
+                    stack.push(parent.clone());
                 }
             }
         }
-        visited
+        Ok(visited)
     }
 }

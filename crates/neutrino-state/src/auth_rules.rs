@@ -856,7 +856,6 @@ fn check_rule_10_power_levels(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RoomVersion;
     use crate::validate::parse_event;
     use neutrino_common::ROOM_VERSION_ID;
     use ruma::OwnedEventId;
@@ -872,7 +871,7 @@ mod tests {
         s.parse().expect("event id")
     }
     fn make(v: Value, id: &str) -> Arc<Event> {
-        Arc::new(parse_event(raw(v), eid(id), vec![], RoomVersion::V12).expect("valid event"))
+        Arc::new(parse_event(raw(v), eid(id), vec![]).expect("valid event"))
     }
 
     fn create_event(creator: &str, additional_creators: &[&str]) -> Arc<Event> {

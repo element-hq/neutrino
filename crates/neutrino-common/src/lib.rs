@@ -1,5 +1,5 @@
 pub mod event;
-pub use event::{Event, RoomVersion};
+pub use event::Event;
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8008";
 const DEFAULT_SERVER_NAME: &str = "localhost";

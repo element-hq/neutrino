@@ -12,7 +12,7 @@ pub mod validate;
 // The canonical `Event` type and the `RoomVersion` enum live in
 // `neutrino-common` so storage and state-machine code share them. See
 // `event-id-design.md` for the rationale.
-pub use neutrino_common::{Event, RoomVersion};
+pub use neutrino_common::Event;
 
 /// Resolved room state: one entry per `(event_type, state_key)` pair.
 pub type StateMap<V> = HashMap<(String, String), V>;
@@ -325,6 +325,20 @@ pub enum ReferenceError {
     PrevStateDifferentRoom(OwnedEventId),
 }
 
+/// Errors raised by state resolution (phase 4) — currently scoped to the
+/// auth-chain traversal contract.
+#[derive(Debug, Error)]
+pub enum StateResError {
+    /// An event referenced in a seed set or transitively via `auth_events`
+    /// is not in the store. Project invariant: every event we know about
+    /// must have its **complete** auth chain locally resolvable; a missing
+    /// entry indicates corruption or a write-path bug, never a normal
+    /// backfill boundary (we don't do federation backfill of auth chains
+    /// — every event is authored locally or arrives with its full chain).
+    #[error("auth chain references unknown event: {0}")]
+    MissingAuthEvent(OwnedEventId),
+}
+
 /// Top-level error type returned by the state machine.
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -334,4 +348,6 @@ pub enum CoreError {
     Reference(#[from] ReferenceError),
     #[error(transparent)]
     Auth(#[from] AuthError),
+    #[error(transparent)]
+    StateRes(#[from] StateResError),
 }
