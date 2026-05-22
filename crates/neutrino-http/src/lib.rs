@@ -11,7 +11,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post, put},
 };
-use neutrino_common::Config;
+use neutrino_common::{Config, ROOM_VERSION_ID};
 use neutrino_store::{EventStore, RoomStore, StateStore, StoredEvent};
 use neutrino_store_sqlite::SqliteStore;
 use rand::{Rng, distr::Alphanumeric};
@@ -464,7 +464,7 @@ async fn create_room(state: State<AppState>, body: Json<Value>) -> axum::respons
         "room_id": room_id,
         "content": {
             "creator": user_id,
-            "room_version": "12"
+            "room_version": ROOM_VERSION_ID
         },
         "origin_server_ts": 0,
         "event_id": mint_id('$', &server_name, 10),

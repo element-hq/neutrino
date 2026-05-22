@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use neutrino_common::ROOM_VERSION_ID;
 use neutrino_store::{EventStore, RoomStore, StoredEvent};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5::{Request, request};
@@ -142,7 +143,7 @@ fn create_event_for(room_id: &RoomId, creator: &UserId) -> StoredEvent {
         Some(""),
         creator,
         0,
-        serde_json::json!({"creator": creator.as_str(), "room_version": "12"}),
+        serde_json::json!({"creator": creator.as_str(), "room_version": ROOM_VERSION_ID}),
     )
 }
 
@@ -940,7 +941,7 @@ async fn seed_invite(
                     "type": "m.room.create",
                     "state_key": "",
                     "sender": inviter.as_str(),
-                    "content": {"creator": inviter.as_str(), "room_version": "12"}
+                    "content": {"creator": inviter.as_str(), "room_version": ROOM_VERSION_ID}
                 },
                 {
                     "type": "m.room.name",
@@ -991,7 +992,7 @@ async fn invited_room_emits_invite_state() {
                     "type": "m.room.create",
                     "state_key": "",
                     "sender": inviter.as_str(),
-                    "content": {"creator": inviter.as_str(), "room_version": "12"}
+                    "content": {"creator": inviter.as_str(), "room_version": ROOM_VERSION_ID}
                 },
                 {
                     "type": "m.room.name",

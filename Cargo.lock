@@ -1033,6 +1033,7 @@ dependencies = [
 name = "neutrino-state"
 version = "0.1.0"
 dependencies = [
+ "neutrino-common",
  "proptest",
  "ruma",
  "serde",
@@ -1058,6 +1059,7 @@ dependencies = [
  "async-trait",
  "deadpool-sqlite",
  "lazy_static",
+ "neutrino-common",
  "neutrino-store",
  "ruma",
  "serde",

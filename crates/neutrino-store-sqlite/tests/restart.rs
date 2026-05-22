@@ -14,8 +14,10 @@
 
 mod common;
 
+use std::str::FromStr;
 use std::time::Duration;
 
+use neutrino_common::ROOM_VERSION_ID;
 use neutrino_store::{
     EventStore, FederationInbox, FederationOutbox, RoomStore, StateStore, StreamPos,
 };
@@ -142,7 +144,7 @@ async fn restart_preserves_all_state() {
         .get_room_version(*ALICE_ROOM_ID)
         .await
         .expect("get_room_version");
-    assert_eq!(v, Some(RoomVersionId::V12));
+    assert_eq!(v, Some(RoomVersionId::from_str(ROOM_VERSION_ID).unwrap()));
 
     // All four events readable via the stream.
     let events = s

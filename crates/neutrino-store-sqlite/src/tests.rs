@@ -8,6 +8,7 @@
 
 use deadpool_sqlite::rusqlite::params;
 use lazy_static::lazy_static;
+use neutrino_common::ROOM_VERSION_ID;
 use neutrino_store::StoredEvent;
 use ruma::{EventId, RoomId, UserId, event_id, room_id, user_id};
 use serde_json::{Value, json, value::RawValue};
@@ -111,7 +112,7 @@ pub(crate) fn create_event(event_id: &EventId, room_id: &RoomId, sender: &UserId
         sender,
         "m.room.create",
         Some(""),
-        json!({"creator": sender.as_str(), "room_version": "12"}),
+        json!({"creator": sender.as_str(), "room_version": ROOM_VERSION_ID}),
     )
 }
 
@@ -195,7 +196,7 @@ pub(crate) async fn setup_room(
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO rooms (room_id, room_version) VALUES (?, ?)",
-            params![room_id.as_str(), "12"],
+            params![room_id.as_str(), ROOM_VERSION_ID],
         )?;
         row.write_into_tx(&tx)?;
         tx.commit()?;
