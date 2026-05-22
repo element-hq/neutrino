@@ -6,6 +6,12 @@ edition = "2024"
 [dependencies]
 axum = "0.8.7"
 tower-http = { version = "0.6.6", features = ["trace"] }
+# `AppState::new` opens a file-backed `SqliteStore` on a `NamedTempFile`
+# rather than the in-memory variant (whose shared-cache mode isn't safe for
+# concurrent reader+writer workloads — see `SqliteStore::open_in_memory`
+# doc-comment). The tempfile is owned by `AppState` so it lives as long
+# as the server, and is cleaned up on exit.
+tempfile = "3.27.0"
 
 async-trait.workspace = true
 rand.workspace = true
@@ -18,4 +24,10 @@ tracing.workspace = true
 
 neutrino-common = { path = "../neutrino-common" }
 neutrino-store = { path = "../neutrino-store" }
-neutrino-sqlite = { path = "../neutrino-sqlite" }
+neutrino-store-sqlite = { path = "../neutrino-store-sqlite" }
+
+[dev-dependencies]
+# Required only for the `tests/e2e_sliding_sync.rs` integration tests so they
+# can drive the router via `Router::oneshot(req)`. Same major version that
+# `tower-http` already pulls in transitively, so no extra build cost.
+tower = "0.5"

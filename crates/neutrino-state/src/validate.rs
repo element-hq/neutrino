@@ -7,6 +7,7 @@
 //! Every check is annotated inline with its spec citation. Anything that
 //! requires resolved room state is deferred to phase 3 (`check_auth_rules`).
 
+use neutrino_common::ROOM_VERSION_ID;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
@@ -276,13 +277,15 @@ fn derive_create_room_id(event_id: &OwnedEventId) -> Result<OwnedRoomId, FormatE
 
 fn check_create(content: &Map<String, Value>) -> Result<(), FormatError> {
     // v12 rule 1.3: "If `content.room_version` is present and is not a
-    // recognised version, reject."
+    // recognised version, reject." We accept exactly the MSC4242 unstable
+    // identifier — see `ROOM_VERSION_ID` for why we don't compare against
+    // ruma's `RoomVersionId::V12`.
     if let Some(v) = content.get("room_version") {
         let s = v.as_str().ok_or(FormatError::InvalidFieldType {
             field: "content.room_version",
             expected: "string",
         })?;
-        if s != "12" {
+        if s != ROOM_VERSION_ID {
             return Err(FormatError::UnrecognisedRoomVersion(s.to_owned()));
         }
     }
@@ -461,7 +464,7 @@ mod tests {
         json!({
             "type": "m.room.create",
             "sender": "@alice:example.org",
-            "content": { "room_version": "12" },
+            "content": { "room_version": ROOM_VERSION_ID },
             "prev_events": [],
             "depth": 0,
             "origin_server_ts": 1_700_000_000_000_u64,
@@ -589,7 +592,8 @@ mod tests {
     #[test]
     fn rejects_additional_creators_non_array() {
         let mut v = base_create();
-        v["content"] = json!({ "room_version": "12", "additional_creators": "@bob:example.org" });
+        v["content"] =
+            json!({ "room_version": ROOM_VERSION_ID, "additional_creators": "@bob:example.org" });
         assert!(matches!(
             parse_event(raw(v), eid("$create:example.org"), RoomVersion::V12),
             Err(FormatError::InvalidAdditionalCreators)
@@ -599,7 +603,8 @@ mod tests {
     #[test]
     fn rejects_additional_creators_with_bad_user_id() {
         let mut v = base_create();
-        v["content"] = json!({ "room_version": "12", "additional_creators": ["not-a-user-id"] });
+        v["content"] =
+            json!({ "room_version": ROOM_VERSION_ID, "additional_creators": ["not-a-user-id"] });
         assert!(matches!(
             parse_event(raw(v), eid("$create:example.org"), RoomVersion::V12),
             Err(FormatError::InvalidAdditionalCreators)
@@ -610,7 +615,7 @@ mod tests {
     fn accepts_additional_creators_valid() {
         let mut v = base_create();
         v["content"] = json!({
-            "room_version": "12",
+            "room_version": ROOM_VERSION_ID,
             "additional_creators": ["@bob:example.org", "@carol:example.org"]
         });
         parse_event(raw(v), eid("$create:example.org"), RoomVersion::V12)

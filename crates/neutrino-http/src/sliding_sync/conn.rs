@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use ruma::api::client::sync::sync_events::v5;
 use ruma::api::client::sync::sync_events::v5::request;
 use ruma::events::StateEventType;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 /// Identifies a sliding-sync connection within the registry.
 ///
@@ -92,6 +93,35 @@ pub struct Conn {
     /// field, so we can't actually surface it on the wire — kept tracked for
     /// when ruma catches up. See MSC4186-gaps.md.
     pub prev_list_timeline_limits: BTreeMap<String, usize>,
+    /// Idempotency cache: the `pos` value the client sent on the most
+    /// recently *processed* request (i.e. the input pos, not the output). If
+    /// the next request arrives with the same value AND the same body hash,
+    /// we return `last_response` verbatim rather than re-processing —
+    /// MSC4186 §"Pagination and Tokens" permits clients to retry by
+    /// re-using the same `pos`.
+    ///
+    /// `None` on a freshly-created conn (the initial sync was the most
+    /// recent processed request, which has no pos input).
+    pub last_request_pos: Option<u64>,
+    /// Hash of the most-recently-processed request's body fields
+    /// (`conn_id`, `txn_id`, `lists`, `room_subscriptions`, `extensions`).
+    /// A retry only hits the cache when *both* `pos` and this hash match
+    /// the cached request — otherwise the retry has changed something
+    /// (different `timeline_limit`, opted into a new extension, etc.) and
+    /// must be re-processed, not served the stale response.
+    ///
+    /// `0` on a freshly-created conn. Computed via `request_body_hash` in
+    /// `super::handle`.
+    pub last_request_hash: u64,
+    /// Companion to `last_request_pos`/`last_request_hash` — the full
+    /// response we returned for that input. On a retry hit
+    /// (`(req.pos, hash) == (last_request_pos, last_request_hash)`) we
+    /// clone this and return immediately, without re-running
+    /// `build_response` or advancing any conn state.
+    ///
+    /// Includes the post-processing extension stubs so the cached response
+    /// matches exactly what the client got the first time, byte-for-byte.
+    pub last_response: Option<v5::Response>,
 }
 
 impl Conn {
@@ -100,12 +130,90 @@ impl Conn {
     }
 }
 
+/// One entry in `ConnRegistry`. Bundles the `Conn` mutex with a cancellation
+/// signal so a newer request can pre-empt an in-flight long-poll on the same
+/// `(user_id, conn_id)` instead of queueing behind the conn lock for the full
+/// long-poll timeout.
+///
+/// **Signal mechanics.** `cancel_gen` is a `watch::Sender<u64>` whose value is
+/// a monotonically incrementing generation counter. The producing side bumps
+/// it via `send_modify` *before* attempting `conn.lock().await`. The in-flight
+/// holder captured its own post-bump generation as `my_gen` at the start of
+/// its request and watches the long-poll wait via
+/// `cancel_rx.wait_for(|g| *g > my_gen)`. Any strictly-later bump (from a
+/// newer request than ours) wakes us, regardless of whether the newer
+/// request's bump happened to land in the window between our `cancel()` and
+/// our subscribe — the `wait_for` predicate is keyed to `my_gen`, not to
+/// "value changed from the receiver's last-seen baseline", so race-induced
+/// "subscribed-already-up-to-date" states don't drop bumps that count as
+/// "after me".
+///
+/// `watch` was chosen over `Notify` / `tokio_util::CancellationToken` because
+/// the receiver doesn't have to be subscribed at the moment the bump fires —
+/// the value is sticky, and `wait_for` polls a stable scalar rather than
+/// edge-triggering on `notify_waiters`.
+///
+/// Both fields are `Arc` so handlers can hold them past the registry-lock
+/// drop and the entry can outlive any single registry traversal.
+#[derive(Clone)]
+pub struct ConnEntry {
+    pub conn: Arc<Mutex<Conn>>,
+    pub cancel_gen: Arc<watch::Sender<u64>>,
+}
+
+impl ConnEntry {
+    fn new() -> Self {
+        let (tx, _rx) = watch::channel(0u64);
+        Self {
+            conn: Arc::new(Mutex::new(Conn::new())),
+            cancel_gen: Arc::new(tx),
+        }
+    }
+
+    /// Bump the cancellation generation and return the new value.
+    ///
+    /// Callers in `handle` use the returned value as their "I am current
+    /// up to this generation; wake me on any strictly later bump" baseline,
+    /// fed into `cancel_gen.subscribe().wait_for(|g| *g > my_gen)`. That
+    /// pattern avoids the three-way race where a request `C` arrives in
+    /// the window between `B`'s `cancel()` and `B`'s subscribe — without
+    /// the explicit `my_gen` baseline, `C`'s bump would be folded into
+    /// the value `subscribe()` reports as already-seen, and B would miss
+    /// the cancellation it should respect.
+    pub fn cancel(&self) -> u64 {
+        let mut new_gen = 0;
+        self.cancel_gen.send_modify(|g| {
+            *g = g.saturating_add(1);
+            new_gen = *g;
+        });
+        new_gen
+    }
+
+    /// Current generation value (no bump). Used by initial-sync handlers
+    /// that don't `cancel()` themselves but still need a `my_gen` baseline
+    /// for the long-poll `wait_for` predicate.
+    pub fn current_gen(&self) -> u64 {
+        *self.cancel_gen.borrow()
+    }
+
+    /// Subscribe to the cancellation signal. The returned receiver's
+    /// "last-seen" version is initialised to the sender's current version
+    /// (per `tokio::sync::watch::Sender::subscribe` contract), so the very
+    /// first `.changed()` await blocks until the *next* bump and won't fire
+    /// on bumps that already happened before the subscribe.
+    pub fn subscribe_cancel(&self) -> watch::Receiver<u64> {
+        self.cancel_gen.subscribe()
+    }
+}
+
 /// In-memory registry of active sliding-sync connections.
 ///
-/// **Storage**: `HashMap<ConnKey, Arc<Mutex<Conn>>>` behind an outer `Mutex` for
-/// insert/lookup. Each conn is itself behind a Mutex so concurrent requests on
-/// the same `(user_id, conn_id)` serialise (MSC3575 forbids concurrent
-/// requests with the same conn_id; we serialise rather than reject).
+/// **Storage**: `HashMap<ConnKey, ConnEntry>` behind an outer `Mutex` for
+/// insert/lookup. Each entry's `Conn` is itself behind a Mutex so concurrent
+/// requests on the same `(user_id, conn_id)` serialise. MSC3575 forbids
+/// concurrent requests with the same conn_id; we cancel-and-replace the
+/// in-flight request rather than reject the newcomer (see
+/// `ConnEntry::cancel` / `MSC4186-gaps.md`).
 ///
 /// **Lifecycle**: connections are created on initial sync (no `pos`) and never
 /// expire. There is **no eviction**, **no idle timeout**, **no LRU**, no
@@ -119,7 +227,7 @@ impl Conn {
 /// `pos`. This is by design — the registry is a cache, not a source of truth.
 #[derive(Default)]
 pub struct ConnRegistry {
-    conns: Mutex<HashMap<ConnKey, Arc<Mutex<Conn>>>>,
+    conns: Mutex<HashMap<ConnKey, ConnEntry>>,
 }
 
 impl ConnRegistry {
@@ -128,14 +236,20 @@ impl ConnRegistry {
     }
 
     /// Allocate a fresh connection, replacing any existing entry for `key`.
-    /// A new initial sync from the same `(user_id, conn_id)` resets state.
-    pub async fn create(&self, key: ConnKey) -> Arc<Mutex<Conn>> {
-        let conn = Arc::new(Mutex::new(Conn::new()));
-        self.conns.lock().await.insert(key, conn.clone());
-        conn
+    /// If a prior entry existed, cancel it first so any in-flight long-poll
+    /// running against that orphan entry wakes promptly instead of running
+    /// its full timeout (it would otherwise complete against the abandoned
+    /// `Conn` and discard the result).
+    pub async fn create(&self, key: ConnKey) -> ConnEntry {
+        let new_entry = ConnEntry::new();
+        let mut conns = self.conns.lock().await;
+        if let Some(prior) = conns.insert(key, new_entry.clone()) {
+            prior.cancel();
+        }
+        new_entry
     }
 
-    pub async fn get(&self, key: &ConnKey) -> Option<Arc<Mutex<Conn>>> {
+    pub async fn get(&self, key: &ConnKey) -> Option<ConnEntry> {
         self.conns.lock().await.get(key).cloned()
     }
 }

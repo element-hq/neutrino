@@ -25,7 +25,11 @@ pub fn start() -> NeutrinoHandle {
         let rt = async_compat::get_runtime_handle();
         rt.block_on(async {
             tokio::select! {
-                _ = neutrino_main::entrypoint() => {},
+                res = neutrino_main::entrypoint() => {
+                    if let Err(e) = res {
+                        eprintln!("entrypoint exited: {e}");
+                    }
+                },
                 _ = rx => {}
             }
         });

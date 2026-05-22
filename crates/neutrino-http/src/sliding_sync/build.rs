@@ -1,7 +1,6 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use neutrino_store::{Direction, StorageBackend, StoredEvent, StreamPos};
+use neutrino_store::{Direction, Membership, StorageBackend, StoredEvent, StreamPos};
 use ruma::UInt;
 use ruma::api::client::sync::sync_events::v5::response;
 use ruma::api::client::sync::sync_events::v5::{Request, Response};
@@ -11,9 +10,8 @@ use ruma::events::{
 use ruma::serde::Raw;
 use ruma::{OwnedRoomId, RoomId, UserId};
 use serde_json::value::RawValue;
-use tokio::sync::Mutex;
 
-use super::conn::{Conn, ConnKey, ConnRegistry, ListCfg, RoomSent, SubCfg};
+use super::conn::{Conn, ListCfg, RoomSent, SubCfg};
 use super::{SyncError, SyncState};
 
 /// How many globally-new events we drain from the store per sync request.
@@ -37,35 +35,36 @@ const EVENTS_PER_SYNC_LIMIT: usize = 1000;
 /// Flip when we have a confirmed need from a target client.
 const EMIT_STATE_STUBS: bool = false;
 
-/// Build one sliding-sync response.
+/// Build one sliding-sync response into the supplied connection.
+///
+/// The caller is responsible for resolving the `Conn` (see
+/// `mod::handle::resolve_conn`) and holding its lock for the duration of the
+/// call. This split exists so that the long-poll loop in `handle` can call
+/// `build_response` multiple times against the same locked conn, and so that
+/// the idempotency-cache check can short-circuit before we ever enter this
+/// path.
 ///
 /// Flow:
-/// 1. Resolve or create the `Conn` for `(user_id, conn_id)`. Absent `pos` →
-///    new conn (initial sync). Present `pos` → must match the conn's
-///    most-recently-issued token, else `UnknownPos`.
-/// 2. Merge the request's list/sub configs into the conn (sticky update).
-/// 3. Fetch globally-new events via `events_after(last_event_stream_pos)`,
+/// 1. Merge the request's list/sub configs into the conn (sticky update).
+/// 2. Fetch globally-new events via `events_after(last_event_stream_pos)`,
 ///    group by room. This drives the timeline delta path.
-/// 4. Rank candidate rooms (joined ∪ invited) by recency, slice by ranges.
-/// 5. For each selected room, build a `response::Room` — initial syncs get a
+/// 3. Rank candidate rooms (joined ∪ invited) by recency, slice by ranges.
+/// 4. For each selected room, build a `response::Room` — initial syncs get a
 ///    full snapshot via `room_messages`, deltas get only the new events.
 ///    Rooms with no updates (and already known) are omitted entirely.
-/// 6. Record what we just sent in `conn.sent` so future deltas can diff.
-/// 7. Bump `conn.pos` and `conn.last_event_stream_pos`, return.
+/// 5. Record what we just sent in `conn.sent` so future deltas can diff.
+/// 6. Compute the response pos as `conn.pos + 1` and bump
+///    `conn.last_event_stream_pos`. **The actual `conn.pos` mutation is
+///    deferred to `super::handle`** so the long-poll loop can call this
+///    function multiple times per request and only commit one pos advance.
 pub(super) async fn build_response<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
-    req: Request,
+    req: &Request,
+    conn: &mut Conn,
 ) -> Result<Response, SyncError> {
-    let key = ConnKey {
-        user_id: user_id.to_owned(),
-        conn_id: req.conn_id.clone().unwrap_or_default(),
-    };
-    let conn_arc = resolve_conn(&state.registry, key, req.pos.as_deref()).await?;
-    let mut conn = conn_arc.lock().await;
-
     let initial_sync = req.pos.is_none();
-    apply_sticky(&mut conn, &req);
+    apply_sticky(conn, req);
 
     // Drain new events since our high-water mark and group them by room.
     // On initial sync we skip the drain entirely — the per-room snapshot
@@ -85,8 +84,8 @@ pub(super) async fn build_response<S: StorageBackend>(
         conn.last_event_stream_pos = max_stream_pos;
     }
 
-    let ranked = candidate_rooms(state, user_id).await?;
-    let combined = combined_room_configs(&conn, &ranked);
+    let ranked = candidate_rooms(state, user_id, conn).await?;
+    let combined = combined_room_configs(conn, &ranked);
 
     let mut rooms_response = BTreeMap::new();
     for (room_id, combined_cfg) in &combined {
@@ -142,36 +141,20 @@ pub(super) async fn build_response<S: StorageBackend>(
         conn.prev_list_timeline_limits.insert(name, limit);
     }
 
-    conn.pos = conn.pos.saturating_add(1);
-    let pos_token = conn.pos.to_string();
+    // The pos token reflects what the conn *will* be advanced to once the
+    // caller commits this response. We deliberately don't mutate `conn.pos`
+    // here — the long-poll loop in `super::handle` may call this function
+    // multiple times per request, but only the final response gets returned
+    // to the client. Committing the bump there means each request consumes
+    // exactly one pos value, and a mid-loop storage error leaves conn.pos
+    // untouched so the client's last-good token still matches.
+    let pos_token = conn.pos.saturating_add(1).to_string();
 
     let mut resp = Response::new(pos_token);
-    resp.txn_id = req.txn_id;
+    resp.txn_id = req.txn_id.clone();
     resp.lists = lists_response;
     resp.rooms = rooms_response;
     Ok(resp)
-}
-
-/// Either look up an existing connection (validating its pos) or allocate a
-/// fresh one. Encapsulates the "is this a new sync or a continuation?" check
-/// so `build_response` reads top-down.
-async fn resolve_conn(
-    registry: &ConnRegistry,
-    key: ConnKey,
-    req_pos: Option<&str>,
-) -> Result<Arc<Mutex<Conn>>, SyncError> {
-    let Some(pos_str) = req_pos else {
-        return Ok(registry.create(key).await);
-    };
-    let pos: u64 = pos_str.parse().map_err(|_| SyncError::UnknownPos)?;
-    let conn = registry.get(&key).await.ok_or(SyncError::UnknownPos)?;
-    // Reject stale tokens. Each response advances pos by one, and the client
-    // must echo the most recent value back — anything else means the client
-    // missed a response or is replaying an old one.
-    if conn.lock().await.pos != pos {
-        return Err(SyncError::UnknownPos);
-    }
-    Ok(conn)
 }
 
 /// Merge per-request sticky params into the connection's stored state.
@@ -214,6 +197,16 @@ fn apply_sticky(conn: &mut Conn, req: &Request) {
 ///
 /// Returns the per-room delta map plus the highest `StreamPos` seen so the
 /// caller can advance the conn's high-water mark.
+///
+/// **Gap (low-severity, single-user embedded scale):** the caller bumps
+/// `conn.last_event_stream_pos` to `max_stream_pos` unconditionally, even
+/// for events belonging to rooms *outside* the connection's combined
+/// candidate set (no matching list range, no subscription). Those events
+/// silently advance the high-water mark and won't be re-fetched on the
+/// next sync, even if the room later enters a list range. In practice
+/// the embedded server has one user with no filters → every event maps
+/// to an emitted room. Surface this in MSC4186-gaps.md so it doesn't
+/// become a surprise if filters are ever wired up.
 async fn fetch_event_deltas<S: StorageBackend>(
     state: &SyncState<S>,
     from_pos: u64,
@@ -264,41 +257,62 @@ struct CombinedCfg {
 
 /// Rank every room the user can see by recency.
 ///
-/// Joined rooms come from current state; invited rooms from invite events.
+/// Applies MSC4186 §"Rooms included in the server list":
+/// - **Join / invite / knock:** always included.
+/// - **Kick** (`m.room.member.content.membership == "leave"`, `sender != user`):
+///   always included so the client can render the notification.
+/// - **Self-leave** (`membership == "leave"`, `sender == user`): included
+///   only if we've previously emitted the room on this connection
+///   (`conn.sent.contains_key`). MSC4186: "Left rooms, unless previously
+///   sent to this connection".
+/// - **Ban** (`membership == "ban"`): included if previously emitted on
+///   this connection. The spec says "previously joined"; we approximate
+///   with "previously emitted" because we don't keep a separate
+///   per-conn history of historical join events. False negatives are
+///   possible after a restart (the conn is fresh, so prior emissions are
+///   lost) — documented in MSC4186-gaps.md.
+///
 /// We don't apply MSC4186's `is_dm`/`is_encrypted`/`spaces`/`tags`/etc.
 /// filters — the embedded single-user server returns the full set (PLAN.md
 /// 2026-05-14). Sorted by `bump_stamp` desc, tiebroken by `room_id` asc so
 /// tests are deterministic.
-///
-/// TODO(phase-3+): include kicked/banned rooms per MSC4186 §"Rooms included in
-/// the server list", and previously-joined left rooms if the conn already saw
-/// them. Blocked on a new `StateStore` method like `rooms_with_membership` —
-/// trait change, ask first.
 async fn candidate_rooms<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
+    conn: &Conn,
 ) -> Result<Vec<RankedRoom>, SyncError> {
-    let joined = state.store.joined_rooms(user_id).await?;
-    let invited = state.store.invited_rooms(user_id).await?;
+    // One round-trip for the union across all five MSC4186-eligible
+    // memberships. The store hands back `(room, current_membership)`
+    // pairs so we can branch on membership without a second lookup. The
+    // trait guarantees exactly one row per matching room (a user has at
+    // most one current `m.room.member` event per room), so no dedup pass.
+    let memberships = BTreeSet::from([
+        Membership::Join,
+        Membership::Invite,
+        Membership::Knock,
+        Membership::Leave,
+        Membership::Ban,
+    ]);
+    let pairs = state
+        .store
+        .rooms_with_membership(user_id, &memberships)
+        .await?;
 
-    let mut seen: HashSet<OwnedRoomId> = HashSet::with_capacity(joined.len() + invited.len());
-    let mut ranked: Vec<RankedRoom> = Vec::with_capacity(joined.len() + invited.len());
-
-    for room_id in joined {
-        if !seen.insert(room_id.clone()) {
+    let mut ranked: Vec<RankedRoom> = Vec::with_capacity(pairs.len());
+    for (room_id, membership) in pairs {
+        if !include_room_per_msc4186(state, user_id, &room_id, membership, conn).await? {
             continue;
         }
-        let bump_stamp = bump_stamp_for_joined(state, &room_id).await?;
-        ranked.push(RankedRoom {
-            room_id,
-            bump_stamp,
-        });
-    }
-    for room_id in invited {
-        if !seen.insert(room_id.clone()) {
-            continue;
-        }
-        let bump_stamp = bump_stamp_for_invited(state, &room_id, user_id).await?;
+        // For rooms we've never joined (`invite`, `knock`) we don't have the
+        // create event or a replicated timeline — fall back to the user's own
+        // member-event ts. For everything else (join, leave/kick, ban) the
+        // timeline + create are available, so the joined path applies.
+        let bump_stamp = match membership {
+            Membership::Invite | Membership::Knock => {
+                bump_stamp_for_invited(state, &room_id, user_id).await?
+            }
+            _ => bump_stamp_for_joined(state, &room_id).await?,
+        };
         ranked.push(RankedRoom {
             room_id,
             bump_stamp,
@@ -313,9 +327,63 @@ async fn candidate_rooms<S: StorageBackend>(
     Ok(ranked)
 }
 
-/// Best-available recency stamp for a **joined** room. Peek the most recent
-/// event (Backward, limit 1), else fall back to the create event. Returns 0
-/// if neither exists — that room sorts to the bottom by room_id.
+/// Decide whether to include a room with the given current membership,
+/// per MSC4186 §"Rooms included in the server list". For `leave` we have
+/// to look at the member event itself to distinguish a kick (always
+/// include) from a self-leave (only if previously emitted on this conn).
+async fn include_room_per_msc4186<S: StorageBackend>(
+    state: &SyncState<S>,
+    user_id: &UserId,
+    room_id: &RoomId,
+    membership: Membership,
+    conn: &Conn,
+) -> Result<bool, SyncError> {
+    match membership {
+        Membership::Join | Membership::Invite | Membership::Knock => Ok(true),
+        Membership::Leave => {
+            let kicked = is_kick(state, room_id, user_id).await?;
+            Ok(kicked || conn.sent.contains_key(room_id))
+        }
+        Membership::Ban => Ok(conn.sent.contains_key(room_id)),
+    }
+}
+
+/// True iff the user's current `m.room.member` event has membership
+/// `leave` AND was set by somebody other than the user themself — i.e.
+/// a kick rather than a self-leave. Reads `content.membership` from the
+/// stored JSON instead of trusting a caller's classification, so the
+/// contract is self-contained: callers can invoke this on any room
+/// without first guaranteeing the user is `leave` — the function returns
+/// `false` for any other membership (including missing/malformed).
+async fn is_kick<S: StorageBackend>(
+    state: &SyncState<S>,
+    room_id: &RoomId,
+    user_id: &UserId,
+) -> Result<bool, SyncError> {
+    let Some(ev) = state
+        .store
+        .current_state_event(room_id, "m.room.member", user_id.as_str())
+        .await?
+    else {
+        return Ok(false);
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(ev.json.get()) else {
+        return Ok(false);
+    };
+    let is_leave = parsed
+        .pointer("/content/membership")
+        .and_then(|v| v.as_str())
+        == Some("leave");
+    if !is_leave {
+        return Ok(false);
+    }
+    Ok(ev.sender.as_str() != user_id.as_str())
+}
+
+/// Best-available recency stamp for a **joined** (or previously-joined: kick
+/// / self-leave / ban) room. Peek the most recent event (Backward, limit 1),
+/// else fall back to the create event. Returns 0 if neither exists — that
+/// room sorts to the bottom by room_id.
 ///
 /// **Cost:** called once per candidate room from `candidate_rooms` on every
 /// sync request, so this is `O(n)` storage round-trips where `n` is the
@@ -671,7 +739,8 @@ async fn build_invite_room<S: StorageBackend>(
 /// `invite_room_state` (parse failure or non-array) silently yields
 /// `(None, None)` — better to render a name-less invite than to surface a
 /// "couldn't read invite" error for what's basically a presentation
-/// fallback.
+/// fallback. Member counts deliberately not populated — Synapse doesn't
+/// expose them on invites either (no leakage of room size pre-accept).
 fn lift_invite_metadata(invite_event: &StoredEvent) -> (Option<String>, Option<String>) {
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(invite_event.json.get()) else {
         return (None, None);

@@ -13,6 +13,7 @@
 #![allow(dead_code)]
 
 use lazy_static::lazy_static;
+use neutrino_common::ROOM_VERSION_ID;
 use neutrino_store::StoredEvent;
 use neutrino_store_sqlite::SqliteStore;
 use ruma::{EventId, RoomId, UserId, event_id, room_id, user_id};
@@ -88,7 +89,7 @@ pub fn create_event(event_id: &EventId, room_id: &RoomId, sender: &UserId) -> St
         sender,
         "m.room.create",
         Some(""),
-        json!({"creator": sender.as_str(), "room_version": "12"}),
+        json!({"creator": sender.as_str(), "room_version": ROOM_VERSION_ID}),
     )
 }
 
