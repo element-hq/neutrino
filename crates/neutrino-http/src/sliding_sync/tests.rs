@@ -10,7 +10,45 @@ use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId, UInt, UserId, event_id, r
 use serde_json::Value;
 use tempfile::NamedTempFile;
 
+use super::conn::ConnKey;
 use super::{SyncError, SyncState, handle};
+
+/// Wait until a spawned long-poll on `(user_id, conn_id)` has subscribed to
+/// its cancel signal and is in (or about to enter) its idle wait.
+///
+/// Deterministic alternative to `tokio::time::sleep(50ms)` for the cancel
+/// tests. The signal we observe is `cancel_gen.receiver_count() > 0`:
+/// `super::handle` calls `entry.subscribe_cancel()` synchronously after
+/// resolving the entry, so the receiver count bumps to 1 before the task
+/// hits any `.await` that could yield indefinitely. Once we see > 0, the
+/// task is past the cancel-subscribe point and any cancellation we issue
+/// next will be observed (either immediately if the task is already in
+/// `select!`, or on the next `.changed()` because `watch` values are
+/// sticky).
+///
+/// `conn_id` matches the wire form: `None` → the empty-string default slot.
+async fn wait_for_in_flight_cancel_sub<S>(
+    state: &SyncState<S>,
+    user_id: &UserId,
+    conn_id: Option<&str>,
+) {
+    let key = ConnKey {
+        user_id: user_id.to_owned(),
+        conn_id: conn_id.unwrap_or_default().to_string(),
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Some(entry) = state.registry.get(&key).await
+            && entry.cancel_gen.receiver_count() > 0
+        {
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("long-poll never subscribed to its cancel signal within 2s");
+        }
+        tokio::task::yield_now().await;
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Test fixtures.
@@ -147,17 +185,33 @@ fn create_event_for(room_id: &RoomId, creator: &UserId) -> StoredEvent {
     )
 }
 
-/// Open `room_id` in the store with `creator` as the create-event sender, no
-/// initial events beyond create. Tests building an invited-only room go
-/// through this so the FK on the events table is satisfied — production sees
-/// the create event arrive over federation alongside the invite; the test
-/// simulates that arrival.
+/// Open `room_id` in the store with `creator` as the create-event sender,
+/// and immediately seed `creator`'s own `member=join` event. Mirrors the
+/// production `createRoom` flow (`neutrino-http::lib::create_room`), which
+/// writes the create event + the creator's join as a single atomic batch
+/// via `RoomStore::create_room`. Tests that subsequently add other users'
+/// membership events (invite/knock/leave/ban) get a room whose state is
+/// reachable in production — without the creator's join, the room would
+/// have a `m.room.create` but no member events at all, which production
+/// never produces.
 async fn setup_room(store: &SqliteStore, room_id: &RoomId, creator: &UserId) {
     let create = create_event_for(room_id, creator);
+    let stem = room_stem(room_id);
+    let join_id_str = format!("$creator-join-{stem}-{}:example.org", creator.localpart());
+    let join_id: OwnedEventId = join_id_str.try_into().expect("creator-join id parses");
+    let join = make_event(
+        &join_id,
+        room_id,
+        "m.room.member",
+        Some(creator.as_str()),
+        creator,
+        0,
+        serde_json::json!({"membership": "join"}),
+    );
     store
-        .create_room(&create, &[])
+        .create_room(&create, std::slice::from_ref(&join))
         .await
-        .expect("create_room succeeds");
+        .expect("create_room + creator-join succeeds");
 }
 
 /// Open `room_id` and immediately add a `member=join` event for `user`. This
@@ -2314,10 +2368,10 @@ async fn concurrent_long_poll_is_cancelled_by_newer_request() {
         handle(&state_a, &user_owned, req).await
     });
 
-    // Give A time to subscribe to its cancel signal and enter the select.
-    // Without this, B's bump can race A's subscribe and the test becomes
-    // timing-dependent.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Wait until A has subscribed to its cancel signal (deterministic;
+    // see `wait_for_in_flight_cancel_sub`). Without this we'd race A's
+    // subscribe with B's bump and the test would be timing-dependent.
+    wait_for_in_flight_cancel_sub(&state, user, Some("c1")).await;
 
     let mut req_b = Request::new();
     req_b.conn_id = conn_id.clone();
@@ -2387,7 +2441,7 @@ async fn initial_sync_cancels_prior_entrys_long_poll() {
         handle(&state_a, &user_owned, req).await
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_in_flight_cancel_sub(&state, user, Some("c1")).await;
 
     // Initial sync (pos=None) on the same conn_id. `registry.create`
     // cancels the prior entry on the way to inserting the replacement,
@@ -2458,7 +2512,7 @@ async fn second_concurrent_request_proceeds_after_first_cancelled() {
         handle(&state_a, &user_owned, req).await
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_in_flight_cancel_sub(&state, user, Some("c1")).await;
 
     // B differs from A in its body (different timeline_limit), so B's
     // retry-cache key won't match A's cached entry — B has to process

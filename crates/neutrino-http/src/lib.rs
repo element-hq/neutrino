@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post, put},
 };
 use neutrino_common::{Config, ROOM_VERSION_ID};
-use neutrino_store::{EventStore, RoomStore, StateStore, StoredEvent};
+use neutrino_store::{EventStore, RoomStore, StateStore, StorageError, StoredEvent};
 use neutrino_store_sqlite::SqliteStore;
 use rand::{Rng, distr::Alphanumeric};
 use ruma::api::client::sync::sync_events::v5;
@@ -20,6 +20,7 @@ use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
+use tempfile::NamedTempFile;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -33,41 +34,68 @@ struct App {
     sync_state: Arc<SyncState<SqliteStore>>,
     keys: Option<Value>,
     config: Config,
+    /// Kept alive for the lifetime of the server; `NamedTempFile::drop`
+    /// removes the underlying db file. Held here so the path stays valid
+    /// for as long as `store` is in use.
+    _db_tempfile: NamedTempFile,
 }
 
 #[derive(Clone)]
 pub struct AppState(Arc<Mutex<App>>);
 
+/// Lock `App`, recovering from `PoisonError` by taking the inner value.
+/// `App`'s fields hold no invariants that can be broken by a panic
+/// mid-write (each field is independently meaningful), so the poison
+/// flag carries no useful signal — `.unwrap()` would crash every
+/// subsequent request once any handler ever panicked under the lock.
+fn lock_app(state: &AppState) -> std::sync::MutexGuard<'_, App> {
+    state.0.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Errors `AppState::new` (and therefore `router` / `serve`) can surface.
+/// Distinct from `std::io::Error` because the failure modes are storage,
+/// not networking.
+#[derive(Debug, thiserror::Error)]
+pub enum StartupError {
+    #[error("creating db tempfile: {0}")]
+    Tempfile(#[from] std::io::Error),
+    #[error("opening sqlite store: {0}")]
+    Store(#[from] StorageError),
+}
+
 impl AppState {
-    async fn new(config: Config) -> Self {
-        // In-memory SQLite for now — gives us the trait impl exercised by the
-        // SqliteStore code paths without committing to a disk path yet.
-        let store = Arc::new(
-            SqliteStore::open_in_memory()
-                .await
-                .expect("SqliteStore::open_in_memory should not fail on a fresh in-memory db"),
-        );
+    async fn new(config: Config) -> Result<Self, StartupError> {
+        // File-backed SQLite on a tempfile. `SqliteStore::open_in_memory`
+        // exists but its shared-cache mode is unsafe for the concurrent
+        // reader+writer workloads sliding-sync long-polls drive — see
+        // the `open_in_memory` doc-comment.
+        let tempfile = NamedTempFile::new()?;
+        let store = Arc::new(SqliteStore::open(tempfile.path()).await?);
         let sync_state = Arc::new(SyncState::new(store.clone()));
         let app = App {
             store,
             sync_state,
             keys: None,
             config,
+            _db_tempfile: tempfile,
         };
-        AppState(Arc::new(Mutex::new(app)))
+        Ok(AppState(Arc::new(Mutex::new(app))))
     }
 }
 
-pub async fn serve(listener: TcpListener, config: Config) -> Result<(), std::io::Error> {
-    axum::serve(listener, router(config).await).await?;
+pub async fn serve(listener: TcpListener, config: Config) -> Result<(), StartupError> {
+    let router = router(config).await?;
+    axum::serve(listener, router)
+        .await
+        .map_err(StartupError::Tempfile)?;
     Ok(())
 }
 
-pub async fn router(config: Config) -> Router {
-    let state = AppState::new(config.clone()).await;
+pub async fn router(config: Config) -> Result<Router, StartupError> {
+    let state = AppState::new(config.clone()).await?;
     let user_id = config.user_id();
 
-    Router::new()
+    let router = Router::new()
         .route("/", get(root))
         .route("/_matrix/client/versions", get(versions))
         .route(
@@ -110,7 +138,8 @@ pub async fn router(config: Config) -> Router {
         .route("/_matrix/client/v3/pushers/set", post(pushers_set))
         .fallback(default_fallback)
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .with_state(state);
+    Ok(router)
 }
 
 fn mint_id(prefix: char, server_name: &str, len: usize) -> String {
@@ -156,7 +185,7 @@ async fn post_register(state: State<AppState>, body: Json<Value>) -> (StatusCode
         );
     }
 
-    let app = state.0.0.lock().unwrap();
+    let app = lock_app(&state.0);
     let device_id = body
         .0
         .pointer("/device_id")
@@ -178,7 +207,7 @@ async fn post_register(state: State<AppState>, body: Json<Value>) -> (StatusCode
 async fn post_login(state: State<AppState>) -> Json<Value> {
     info!("Logged in");
 
-    let app = state.0.0.lock().unwrap();
+    let app = lock_app(&state.0);
     let user_id = app.config.user_id();
     let server_name = app.config.server_name.clone();
 
@@ -204,7 +233,7 @@ async fn sync(
 ) -> axum::response::Response {
     let body_value = body.0;
     let (sync_state, user_id_str) = {
-        let app = state.0.0.lock().unwrap();
+        let app = lock_app(&state.0);
         (app.sync_state.clone(), app.config.user_id())
     };
 
@@ -337,7 +366,7 @@ fn error_response(status: StatusCode, errcode: &str, error: &str) -> axum::respo
 async fn keys_query(state: State<AppState>, body: Json<Value>) -> Json<Value> {
     info!("Received query: {:?}", body.0);
 
-    if let Some(keys) = &state.0.0.lock().unwrap().keys {
+    if let Some(keys) = &lock_app(&state.0).keys {
         info!(
             "Returning stored keys: {}",
             serde_json::to_string(&keys).unwrap()
@@ -353,7 +382,7 @@ async fn keys_query(state: State<AppState>, body: Json<Value>) -> Json<Value> {
 async fn keys_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
     info!("Received keys upload: {:?}", body.0);
 
-    let mut app = state.0.0.lock().unwrap();
+    let mut app = lock_app(&state.0);
     let body = body.0;
 
     if app.keys.is_none() {
@@ -373,7 +402,7 @@ async fn keys_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
 }
 
 async fn device_signing_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
-    let mut app = state.0.0.lock().unwrap();
+    let mut app = lock_app(&state.0);
 
     let mut body = body.0;
     body.as_object_mut().unwrap().remove("auth");
@@ -389,7 +418,7 @@ async fn device_signing_upload(state: State<AppState>, body: Json<Value>) -> Jso
 
 async fn signatures_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
     info!("Received signatures upload: {:?}", body.0);
-    let mut app = state.0.0.lock().unwrap();
+    let mut app = lock_app(&state.0);
     let user_id = app.config.user_id();
 
     let sigs = body
@@ -447,7 +476,7 @@ async fn get_room_keys() -> (StatusCode, Json<Value>) {
 
 async fn create_room(state: State<AppState>, body: Json<Value>) -> axum::response::Response {
     let (store, server_name, user_id) = {
-        let app = state.0.0.lock().unwrap();
+        let app = lock_app(&state.0);
         (
             app.store.clone(),
             app.config.server_name.clone(),
@@ -530,7 +559,7 @@ async fn members(
     state: State<AppState>,
     axum::extract::Path(room_id): axum::extract::Path<String>,
 ) -> axum::response::Response {
-    let store = state.0.0.lock().unwrap().store.clone();
+    let store = lock_app(&state.0).store.clone();
     let rid = match ruma::OwnedRoomId::try_from(room_id.as_str()) {
         Ok(r) => r,
         Err(e) => {
@@ -571,7 +600,7 @@ async fn put_event(
     body: Json<Value>,
 ) -> axum::response::Response {
     let (store, server_name, user_id) = {
-        let app = state.0.0.lock().unwrap();
+        let app = lock_app(&state.0);
         (
             app.store.clone(),
             app.config.server_name.clone(),

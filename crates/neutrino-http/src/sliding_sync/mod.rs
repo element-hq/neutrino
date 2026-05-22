@@ -176,6 +176,14 @@ pub async fn handle<S: StorageBackend>(
     // pos, writes the cache, releases the lock); we then pick up the
     // freshly-written cached response. One round-trip's worth of "force
     // the holder to flush" rather than blocking for the full timeout.
+    // Cache check is gated on `parsed_pos.is_some()`, i.e. delta syncs.
+    // Initial-sync retries (`pos = None`) deliberately bypass the cache and
+    // pay full re-processing — initial sync's cost is bounded by the size
+    // of joined+invited rooms (a single-user embedded server, so small)
+    // and we'd rather take the duplicate work than complicate the cache
+    // key to also distinguish "fresh initial" from "retried initial". The
+    // client orphans the previous initial-sync `pos` token; they re-init
+    // from scratch on the next request and converge.
     if let Some(pos) = parsed_pos {
         if Some(pos) == conn_guard.last_request_pos
             && req_hash == conn_guard.last_request_hash
