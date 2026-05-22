@@ -12,10 +12,13 @@ use axum::{
     routing::{get, post, put},
 };
 use neutrino_common::Config;
+use neutrino_store::{EventStore, RoomStore, StateStore, StoredEvent};
+use neutrino_store_sqlite::SqliteStore;
 use rand::{Rng, distr::Alphanumeric};
-use ruma::OwnedRoomId;
 use ruma::api::client::sync::sync_events::v5;
+use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
@@ -24,12 +27,11 @@ use tracing::info;
 pub mod in_memory_store;
 mod sliding_sync;
 
-use in_memory_store::InMemoryStore;
 use sliding_sync::{SyncError, SyncState};
 
 struct App {
-    store: Arc<InMemoryStore>,
-    sync_state: Arc<SyncState<InMemoryStore>>,
+    store: Arc<SqliteStore>,
+    sync_state: Arc<SyncState<SqliteStore>>,
     keys: Option<Value>,
     config: Config,
 }
@@ -38,8 +40,14 @@ struct App {
 pub struct AppState(Arc<Mutex<App>>);
 
 impl AppState {
-    fn new(config: Config) -> Self {
-        let store = Arc::new(InMemoryStore::new());
+    async fn new(config: Config) -> Self {
+        // In-memory SQLite for now — gives us the trait impl exercised by the
+        // SqliteStore code paths without committing to a disk path yet.
+        let store = Arc::new(
+            SqliteStore::open_in_memory()
+                .await
+                .expect("SqliteStore::open_in_memory should not fail on a fresh in-memory db"),
+        );
         let sync_state = Arc::new(SyncState::new(store.clone()));
         let app = App {
             store,
@@ -52,12 +60,12 @@ impl AppState {
 }
 
 pub async fn serve(listener: TcpListener, config: Config) -> Result<(), std::io::Error> {
-    axum::serve(listener, router(config)).await?;
+    axum::serve(listener, router(config).await).await?;
     Ok(())
 }
 
-pub fn router(config: Config) -> Router {
-    let state = AppState::new(config.clone());
+pub async fn router(config: Config) -> Router {
+    let state = AppState::new(config.clone()).await;
     let user_id = config.user_id();
 
     Router::new()
@@ -439,11 +447,14 @@ async fn get_room_keys() -> (StatusCode, Json<Value>) {
 }
 
 async fn create_room(state: State<AppState>, body: Json<Value>) -> Json<Value> {
-    let app = state.0.0.lock().unwrap();
-    let store = app.store.clone();
-    let server_name = app.config.server_name.clone();
-    let user_id = app.config.user_id();
-    drop(app);
+    let (store, server_name, user_id) = {
+        let app = state.0.0.lock().unwrap();
+        (
+            app.store.clone(),
+            app.config.server_name.clone(),
+            app.config.user_id(),
+        )
+    };
 
     let room_id = mint_id('!', &server_name, 7);
 
@@ -490,8 +501,14 @@ async fn create_room(state: State<AppState>, body: Json<Value>) -> Json<Value> {
         events.push(name_event);
     }
 
-    for ev in &events {
-        let _ = store.insert_event_from_json(ev);
+    // SqliteStore requires `create_room` to register the room before any
+    // `persist_event` calls succeed. The create event lands via the trait's
+    // dedicated path; member-join + (optional) name come through alongside
+    // as `initial_events` so the whole thing is one transaction.
+    let mut stored: Vec<StoredEvent> = events.iter().filter_map(stored_event_from_json).collect();
+    if !stored.is_empty() {
+        let create = stored.remove(0);
+        let _ = store.create_room(&create, &stored).await;
     }
 
     Json(json!({
@@ -504,8 +521,17 @@ async fn members(
     axum::extract::Path(room_id): axum::extract::Path<String>,
 ) -> Json<Value> {
     let store = state.0.0.lock().unwrap().store.clone();
-    let chunk = match ruma::OwnedRoomId::try_from(room_id.as_str()) {
-        Ok(rid) => store.members_of(&rid),
+    let chunk: Vec<Value> = match ruma::OwnedRoomId::try_from(room_id.as_str()) {
+        Ok(rid) => match store
+            .current_state_events_of_type(&rid, "m.room.member")
+            .await
+        {
+            Ok(map) => map
+                .into_values()
+                .filter_map(|ev| serde_json::from_str::<Value>(ev.json.get()).ok())
+                .collect(),
+            Err(_) => Vec::new(),
+        },
         Err(_) => Vec::new(),
     };
     Json(json!({"chunk": chunk}))
@@ -520,11 +546,14 @@ async fn put_event(
     )>,
     body: Json<Value>,
 ) -> Json<Value> {
-    let app = state.0.0.lock().unwrap();
-    let store = app.store.clone();
-    let server_name = app.config.server_name.clone();
-    let user_id = app.config.user_id();
-    drop(app);
+    let (store, server_name, user_id) = {
+        let app = state.0.0.lock().unwrap();
+        (
+            app.store.clone(),
+            app.config.server_name.clone(),
+            app.config.user_id(),
+        )
+    };
 
     let event_id = mint_id('$', &server_name, 10);
 
@@ -536,11 +565,43 @@ async fn put_event(
         "content": body.0,
         "origin_server_ts": 0,
     });
-    let _ = store.insert_event_from_json(&pdu);
+    if let Some(stored) = stored_event_from_json(&pdu) {
+        let _ = store.persist_event(&stored, &[]).await;
+    }
 
     Json(json!({
         "event_id": event_id,
     }))
+}
+
+/// Parse a hand-built PDU `serde_json::Value` into a `StoredEvent`. Used by
+/// the legacy CSAPI write handlers (`createRoom`, `put_event`). Returns
+/// `None` on any required-field-missing path — callers built the PDU
+/// themselves, so a malformed value is a programmer error, not a client
+/// error.
+fn stored_event_from_json(value: &Value) -> Option<StoredEvent> {
+    let event_id: OwnedEventId = value.get("event_id")?.as_str()?.try_into().ok()?;
+    let room_id: OwnedRoomId = value.get("room_id")?.as_str()?.try_into().ok()?;
+    let event_type = value.get("type")?.as_str()?.to_string();
+    let state_key = value
+        .get("state_key")
+        .and_then(|s| s.as_str())
+        .map(String::from);
+    let sender: OwnedUserId = value.get("sender")?.as_str()?.try_into().ok()?;
+    let origin_server_ts = value
+        .get("origin_server_ts")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let json: Box<RawValue> = serde_json::value::to_raw_value(value).ok()?;
+    Some(StoredEvent {
+        event_id,
+        room_id,
+        event_type,
+        state_key,
+        sender,
+        origin_server_ts,
+        json,
+    })
 }
 
 async fn pushers_set() -> (StatusCode, Json<Value>) {

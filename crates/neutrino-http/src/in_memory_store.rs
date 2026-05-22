@@ -1,9 +1,11 @@
 //! In-memory `StorageBackend` implementation.
 //!
-//! Used both as the live backend for the embedded server (`AppState::store`
-//! in `lib.rs`) and as the seeding target for sliding-sync tests. Lives
-//! inside `neutrino-http` for now — promote into a dedicated
-//! `neutrino-store-memory` crate when another consumer needs it.
+//! Used as the seeding target for sliding-sync unit tests. The live router
+//! (`lib.rs`) uses `SqliteStore::open_in_memory()` from `neutrino-store-sqlite`
+//! — this in-memory impl predates that crate and is kept here because the
+//! sliding-sync tests want test helpers (`join_user`, `add_event`,
+//! `remove_state`, `set_membership`) that don't make sense on the real
+//! trait surface.
 //!
 //! **Persistence:** none. All state is lost on restart. Clients recover from
 //! the resulting `M_UNKNOWN_POS` on their next sync by reconnecting without
@@ -34,7 +36,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use neutrino_common::storage::{
+use neutrino_store::{
     DagStore, Direction, EventStore, FederationInbox, FederationOutbox, PaginationToken, RoomStore,
     StateStore, StorageError, StoredEvent, StoredPdu, StreamPos,
 };
@@ -203,9 +205,22 @@ fn insert_event_locked(
     watch_tx: &watch::Sender<StreamPos>,
     track_membership: bool,
 ) {
+    insert_event_locked_with(inner, event, watch_tx, track_membership, true);
+}
+
+/// Lower-level insert that lets `persist_historical_event` skip the
+/// `current_state` UPSERT — historical writes feed history, not the resolved
+/// head.
+fn insert_event_locked_with(
+    inner: &mut Inner,
+    event: StoredEvent,
+    watch_tx: &watch::Sender<StreamPos>,
+    track_membership: bool,
+    update_current_state: bool,
+) {
     let pos = StreamPos(inner.next_pos);
     inner.next_pos += 1;
-    if let Some(state_key) = event.state_key.clone() {
+    if update_current_state && let Some(state_key) = event.state_key.clone() {
         let room_state = inner
             .current_state
             .entry(event.room_id.clone())
@@ -216,7 +231,17 @@ fn insert_event_locked(
         track_membership_from_event(inner, &event);
     }
     inner.events.push((pos, event));
-    let _ = watch_tx.send(pos);
+    // `send_if_modified` notifies even when there are no receivers (`send` is
+    // a no-op in that case). Matches the production `notify_watch` pattern
+    // pulled in from main (PLAN.md 2026-05-21 entry).
+    watch_tx.send_if_modified(|cur| {
+        if *cur < pos {
+            *cur = pos;
+            true
+        } else {
+            false
+        }
+    });
 }
 
 /// Walk the per-user membership index and return `(room, current_membership)`
@@ -354,6 +379,14 @@ impl EventStore for InMemoryStore {
     ) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().unwrap();
         insert_event_locked(&mut inner, dup(event), &self.watch_tx, true);
+        Ok(())
+    }
+
+    async fn persist_historical_event(&self, event: &StoredEvent) -> Result<(), StorageError> {
+        // Historical writes feed history (no current_state update, no outbox)
+        // — see PLAN.md 2026-05-20.
+        let mut inner = self.inner.lock().unwrap();
+        insert_event_locked_with(&mut inner, dup(event), &self.watch_tx, false, false);
         Ok(())
     }
 

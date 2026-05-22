@@ -91,7 +91,7 @@ fn sync_body_with_default_list() -> Value {
 
 #[tokio::test]
 async fn create_room_then_initial_sync_returns_the_room() {
-    let app = router(config());
+    let app = router(config()).await;
 
     let (status, body) = post(&app, "/_matrix/client/v3/createRoom", None, &json!({})).await;
     assert_eq!(status, StatusCode::OK);
@@ -124,7 +124,7 @@ async fn create_room_then_initial_sync_returns_the_room() {
 
 #[tokio::test]
 async fn put_event_then_sync_delivers_it_in_timeline() {
-    let app = router(config());
+    let app = router(config()).await;
 
     let (_, body) = post(&app, "/_matrix/client/v3/createRoom", None, &json!({})).await;
     let room_id = body
@@ -176,7 +176,7 @@ async fn put_event_then_sync_delivers_it_in_timeline() {
 
 #[tokio::test]
 async fn stale_pos_returns_m_unknown_pos() {
-    let app = router(config());
+    let app = router(config()).await;
 
     // Advance the conn so pos="1" is no longer current.
     let (_, resp1) = post(&app, SYNC_PATH, None, &sync_body_with_default_list()).await;
@@ -218,7 +218,7 @@ async fn stale_pos_returns_m_unknown_pos() {
 
 #[tokio::test]
 async fn idempotent_retry_returns_same_response_bytes() {
-    let app = router(config());
+    let app = router(config()).await;
 
     let (_, _) = post(&app, "/_matrix/client/v3/createRoom", None, &json!({})).await;
     let (_, resp1) = post(&app, SYNC_PATH, None, &sync_body_with_default_list()).await;
@@ -252,7 +252,7 @@ async fn idempotent_retry_returns_same_response_bytes() {
 
 #[tokio::test]
 async fn invalid_conn_id_too_long_returns_m_bad_json() {
-    let app = router(config());
+    let app = router(config()).await;
 
     let body = json!({
         "conn_id": "this-string-is-much-longer-than-sixteen-characters",
@@ -268,7 +268,7 @@ async fn invalid_conn_id_too_long_returns_m_bad_json() {
 
 #[tokio::test]
 async fn extension_e2ee_echoed_on_request() {
-    let app = router(config());
+    let app = router(config()).await;
 
     let body = json!({
         "lists": {"all": {"ranges": [[0, 99]], "timeline_limit": 1, "required_state": []}},
@@ -286,7 +286,7 @@ async fn extension_e2ee_echoed_on_request() {
 
 #[tokio::test]
 async fn long_poll_returns_within_timeout_when_no_events() {
-    let app = router(config());
+    let app = router(config()).await;
 
     let (_, _) = post(&app, "/_matrix/client/v3/createRoom", None, &json!({})).await;
     let (_, resp1) = post(&app, SYNC_PATH, None, &sync_body_with_default_list()).await;
@@ -324,7 +324,7 @@ async fn long_poll_returns_within_timeout_when_no_events() {
 async fn long_poll_wakes_on_concurrent_put_event() {
     // Start a long-poll, then PUT an event after a short delay, then assert
     // the long-poll returns the event before its full timeout.
-    let app = router(config());
+    let app = router(config()).await;
 
     let (_, body) = post(&app, "/_matrix/client/v3/createRoom", None, &json!({})).await;
     let room_id = body
@@ -382,7 +382,7 @@ async fn long_poll_wakes_on_concurrent_put_event() {
 
 #[tokio::test]
 async fn initial_sync_with_named_room_returns_the_name() {
-    let app = router(config());
+    let app = router(config()).await;
 
     let (_, body) = post(
         &app,

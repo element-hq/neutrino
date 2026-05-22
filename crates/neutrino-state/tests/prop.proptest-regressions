@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0e2e23cdeffdc9eb8b0aa8a91eb221074a348607a9a596990363863c69cef422 # shrinks to (create_id, creator_uid, state) = ("$a_-_G--0z-rDVhl_u6c-_0sF5IMN-rqT-Kjl_-_fi_L", "@a:example.org", {("m.room.create", ""): Event { event_id: "$--aAAA000_aAAA0a-0-_aAAAAAAAAAa-0AA00EHbKh5", room_id: "!--aAAA000_aAAA0a-0-_aAAAAAAAAAa-0AA00EHbKh5", sender: "@a:example.org", event_type: "m.room.create", state_key: Some(""), origin_server_ts: 1700000000000, content: RawValue({"room_version":"12"}), prev_events: [], prev_state_events: [], raw: RawValue({"content":{"room_version":"12"},"depth":1,"hashes":{"sha256":"abc"},"origin_server_ts":1700000000000,"prev_events":[],"sender":"@a:example.org","state_key":"","type":"m.room.create"}) }}), join_id = "$W68-E4lcD8-V_T-o9-1Rc-7_R-w8-1VXd-Zo8s_q7g-"

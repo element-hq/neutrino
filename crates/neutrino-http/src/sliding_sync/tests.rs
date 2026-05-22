@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use neutrino_common::storage::StoredEvent;
+use neutrino_store::StoredEvent;
 use ruma::api::client::sync::sync_events::v5::{Request, request};
 use ruma::events::StateEventType;
-use ruma::{OwnedRoomId, RoomId, UInt, event_id, room_id, user_id};
+use ruma::{OwnedEventId, OwnedRoomId, RoomId, UInt, event_id, room_id, user_id};
 
 use crate::in_memory_store::{InMemoryStore, make_event};
 
@@ -231,18 +231,12 @@ fn seed_rooms_with_timestamps(
 ) -> Vec<OwnedRoomId> {
     let mut ids = Vec::with_capacity(timestamps.len());
     for (i, ts) in timestamps.iter().enumerate() {
-        let room_id_str = format!("!room-{i}:example.org");
-        let room_id: &RoomId = (&*Box::leak(room_id_str.into_boxed_str()))
-            .try_into()
-            .unwrap();
-        store.join_user(user, room_id);
-        let event_id_str = format!("$ev-{i}:example.org");
-        let event_id: &ruma::EventId = (&*Box::leak(event_id_str.into_boxed_str()))
-            .try_into()
-            .unwrap();
+        let room_id: OwnedRoomId = format!("!room-{i}:example.org").try_into().unwrap();
+        store.join_user(user, &room_id);
+        let event_id: OwnedEventId = format!("$ev-{i}:example.org").try_into().unwrap();
         let ev = make_event(
-            event_id,
-            room_id,
+            &event_id,
+            &room_id,
             "m.room.message",
             None,
             user,
@@ -250,7 +244,7 @@ fn seed_rooms_with_timestamps(
             serde_json::json!({"body": "x", "msgtype": "m.text"}),
         );
         store.add_event(ev);
-        ids.push(room_id.to_owned());
+        ids.push(room_id);
     }
     ids
 }
@@ -393,6 +387,61 @@ async fn multi_range_request_only_honours_first() {
     assert_eq!(resp.rooms.len(), 1, "only the first range applied");
     // rank 0 = highest ts = !room-4 (ts=500).
     assert!(resp.rooms.contains_key(&ids[4]));
+}
+
+#[tokio::test]
+async fn invited_room_bump_stamp_uses_invitee_member_event() {
+    // For an invited room we don't take the latest event in the room — we use
+    // the invitee's own `m.room.member` event ts. Seed an invited room where
+    // the latest event in the room is NOT the invitee's member event, so the
+    // pre-fix code (which peeked room_messages) and the post-fix code (which
+    // looks up the invitee's member event specifically) disagree.
+    let store = Arc::new(InMemoryStore::new());
+    let user = user_id!("@alice:example.org");
+    let inviter = user_id!("@bob:example.org");
+    let invited = room_id!("!invited:example.org");
+    store.invite_user(user, invited);
+
+    let invite_member = make_event(
+        event_id!("$invite:example.org"),
+        invited,
+        "m.room.member",
+        Some(user.as_str()),
+        inviter,
+        500,
+        serde_json::json!({"membership": "invite"}),
+    );
+    store.add_event(invite_member);
+
+    // A later event in the same room — the inviter's own joined-member state,
+    // visible to us via the invite's stripped state. With the previous impl
+    // this would inflate `bump_stamp` to 1000.
+    let inviter_member = make_event(
+        event_id!("$inviter:example.org"),
+        invited,
+        "m.room.member",
+        Some(inviter.as_str()),
+        inviter,
+        1000,
+        serde_json::json!({"membership": "join"}),
+    );
+    store.add_event(inviter_member);
+
+    let state = SyncState::new(store);
+    let mut req = Request::new();
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    req.lists = lists;
+
+    let resp = handle(&state, user, req).await.unwrap();
+    let owned: OwnedRoomId = invited.to_owned();
+    let room = resp.rooms.get(&owned).expect("invited room emitted");
+    assert_eq!(
+        room.bump_stamp,
+        Some(UInt::from(500u32)),
+        "bump_stamp comes from the invitee's m.room.member event ts (500), \
+         not the room's most recent event (1000)"
+    );
 }
 
 #[tokio::test]
@@ -784,6 +833,12 @@ async fn invited_room_emits_invite_state() {
                     "content": {"name": "Bob's invite"}
                 },
                 {
+                    "type": "m.room.avatar",
+                    "state_key": "",
+                    "sender": inviter.as_str(),
+                    "content": {"url": "mxc://example.org/invite-avatar"}
+                },
+                {
                     "type": "m.room.member",
                     "state_key": inviter.as_str(),
                     "sender": inviter.as_str(),
@@ -825,6 +880,7 @@ async fn invited_room_emits_invite_state() {
         .collect();
     assert!(types.contains(&"m.room.create".to_string()));
     assert!(types.contains(&"m.room.name".to_string()));
+    assert!(types.contains(&"m.room.avatar".to_string()));
     // Two membership events: the inviter's join (from `invite_room_state`)
     // and the invitee's own invite event (stripped from the stored PDU).
     let member_count = types
@@ -832,6 +888,18 @@ async fn invited_room_emits_invite_state() {
         .filter(|t| t.as_str() == "m.room.member")
         .count();
     assert_eq!(member_count, 2);
+
+    // Name and avatar lifted from `invite_room_state` up to top-level so the
+    // client can render the invite preview without parsing `invite_state`.
+    assert_eq!(
+        room_res.name.as_deref(),
+        Some("Bob's invite"),
+        "name lifted from invite_room_state"
+    );
+    match &room_res.avatar {
+        ruma::JsOption::Some(uri) => assert_eq!(uri.as_str(), "mxc://example.org/invite-avatar"),
+        _ => panic!("avatar should be Some, lifted from invite_room_state"),
+    }
 }
 
 /// Ported from Synapse's `test_get_invited_banned_knocked_room` (invited
@@ -2085,5 +2153,54 @@ async fn banned_room_remains_visible_after_being_emitted_while_joined() {
     assert!(
         resp2.rooms.contains_key(room),
         "ban after a prior emission stays visible (approximates MSC4186's 'previously joined')"
+    );
+}
+
+/// Ported from main's phase 4-6 review (PLAN.md 2026-05-21 entry). Initial
+/// sync's high-water mark must anchor at the store's current head, not at the
+/// drained `events_after` max — otherwise a store with > EVENTS_PER_SYNC_LIMIT
+/// events re-emits positions past the cap as "new" deltas on the second sync.
+#[tokio::test]
+async fn initial_sync_anchors_high_water_at_store_head() {
+    let store = Arc::new(InMemoryStore::new());
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!room:example.org");
+    store.join_user(user, room);
+    // > EVENTS_PER_SYNC_LIMIT (1000) is required to trip the bug.
+    for i in 0..1100u64 {
+        let id: ruma::OwnedEventId = format!("$e{i}:example.org").try_into().unwrap();
+        store.add_event(make_event(
+            &id,
+            room,
+            "m.room.message",
+            None,
+            user,
+            100 + i,
+            serde_json::json!({"body": "x", "msgtype": "m.text"}),
+        ));
+    }
+    let state = SyncState::new(store);
+
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+
+    let mut req1 = Request::new();
+    req1.lists = lists.clone();
+    let resp1 = handle(&state, user, req1).await.unwrap();
+    assert!(
+        resp1.rooms.contains_key(room),
+        "initial sync emits the room"
+    );
+
+    // No new events between syncs → second sync must omit the room.
+    // Pre-fix this fails: high-water sat at 1000, so the delta path on the
+    // second sync surfaces events 1001..1100 and emits a non-empty timeline.
+    let mut req2 = Request::new();
+    req2.pos = Some(resp1.pos);
+    req2.lists = lists;
+    let resp2 = handle(&state, user, req2).await.unwrap();
+    assert!(
+        !resp2.rooms.contains_key(room),
+        "second sync with no new events omits room — high-water is at store head"
     );
 }

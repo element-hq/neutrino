@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use neutrino_common::storage::{Direction, StorageBackend, StoredEvent, StreamPos};
+use neutrino_store::{Direction, StorageBackend, StoredEvent, StreamPos};
+use ruma::UInt;
 use ruma::api::client::sync::sync_events::v5::response;
 use ruma::api::client::sync::sync_events::v5::{Request, Response};
 use ruma::events::{
     AnyStrippedStateEvent, AnySyncStateEvent, AnySyncTimelineEvent, StateEventType,
 };
 use ruma::serde::Raw;
-use ruma::{OwnedRoomId, RoomId, UInt, UserId};
+use ruma::{OwnedRoomId, RoomId, UserId};
 use serde_json::value::RawValue;
 
 use super::conn::{Conn, ListCfg, RoomSent, SubCfg};
@@ -63,11 +64,19 @@ pub(super) async fn build_response<S: StorageBackend>(
     apply_sticky(conn, req);
 
     // Drain new events since our high-water mark and group them by room.
-    // On initial sync we still drain so the conn's `last_event_stream_pos`
-    // advances past any events the store already has — otherwise the next
-    // sync would re-emit them as "new".
-    let (new_events_by_room, max_stream_pos) =
-        fetch_event_deltas(state, conn.last_event_stream_pos).await?;
+    // On initial sync we skip the drain entirely — the per-room snapshot
+    // comes from `room_messages`, not from `events_after` — and instead
+    // anchor `last_event_stream_pos` at the store's current head via the
+    // watch's borrowed value. Previously we drained up to
+    // `EVENTS_PER_SYNC_LIMIT` and advanced only that far, which on a store
+    // holding > 1000 events would have the next sync re-emit positions
+    // 1001+ as "new" deltas the client already received in the snapshot.
+    let (new_events_by_room, max_stream_pos) = if initial_sync {
+        let head = state.store.subscribe().borrow().0;
+        (HashMap::new(), head)
+    } else {
+        fetch_event_deltas(state, conn.last_event_stream_pos).await?
+    };
     if max_stream_pos > conn.last_event_stream_pos {
         conn.last_event_stream_pos = max_stream_pos;
     }
@@ -200,12 +209,17 @@ async fn fetch_event_deltas<S: StorageBackend>(
 
 /// One candidate room plus its server-computed sort key.
 ///
-/// `bump_stamp` is the most recent `origin_server_ts` observed in the room.
-/// We use timestamp rather than stream position so that federation-backfilled
-/// old events don't bump the room to the top (PLAN.md 2026-05-14). Falls back
-/// to the `m.room.create` event's `origin_server_ts` for rooms with no other
-/// activity (e.g. fresh invites); rooms with truly no state get 0 and sort to
-/// the bottom.
+/// `bump_stamp` uses `origin_server_ts` rather than stream position so that
+/// federation-backfilled old events don't bump the room to the top (PLAN.md
+/// 2026-05-14). The source depends on the user's membership:
+/// - **Joined**: most recent event in the room (via `room_messages` Backward
+///   limit 1), falling back to the `m.room.create` event ts.
+/// - **Invited**: the invitee's own `m.room.member` event ts (i.e. the invite
+///   itself) — we deliberately don't peek into the room's full timeline since
+///   the user only cares about their own invite for sort purposes, and in
+///   practice we may not have the rest of the room's events anyway.
+///
+/// Rooms with no resolvable source get 0 and sort to the bottom by room_id.
 struct RankedRoom {
     room_id: OwnedRoomId,
     bump_stamp: u64,
@@ -256,18 +270,26 @@ async fn candidate_rooms<S: StorageBackend>(
         .rooms_with_membership(user_id, &["join", "invite", "knock", "leave", "ban"])
         .await?;
 
-    let mut included: Vec<OwnedRoomId> = Vec::with_capacity(pairs.len());
+    let mut included: Vec<(OwnedRoomId, String)> = Vec::with_capacity(pairs.len());
     for (room_id, membership) in pairs {
         if include_room_per_msc4186(state, user_id, &room_id, &membership, conn).await? {
-            included.push(room_id);
+            included.push((room_id, membership));
         }
     }
-    included.sort();
-    included.dedup();
+    included.sort_by(|a, b| a.0.cmp(&b.0));
+    included.dedup_by(|a, b| a.0 == b.0);
 
     let mut ranked: Vec<RankedRoom> = Vec::with_capacity(included.len());
-    for room_id in included {
-        let bump_stamp = compute_bump_stamp(state, &room_id).await?;
+    for (room_id, membership) in included {
+        // For rooms we've never joined (`invite`, `knock`) we don't have the
+        // create event or a replicated timeline — fall back to the user's own
+        // member-event ts. For everything else (join, leave/kick, ban) the
+        // timeline + create are available, so the joined path applies.
+        let bump_stamp = if membership == "invite" || membership == "knock" {
+            bump_stamp_for_invited(state, &room_id, user_id).await?
+        } else {
+            bump_stamp_for_joined(state, &room_id).await?
+        };
         ranked.push(RankedRoom {
             room_id,
             bump_stamp,
@@ -323,11 +345,8 @@ async fn is_kick<S: StorageBackend>(
     else {
         return Ok(false);
     };
-    let parsed: serde_json::Value = serde_json::from_str(ev.json.get()).map_err(|e| {
-        SyncError::Storage(neutrino_common::storage::StorageError::Internal(
-            e.to_string(),
-        ))
-    })?;
+    let parsed: serde_json::Value = serde_json::from_str(ev.json.get())
+        .map_err(|e| SyncError::Storage(neutrino_store::StorageError::Internal(e.to_string())))?;
     let membership = parsed
         .pointer("/content/membership")
         .and_then(|m| m.as_str())
@@ -339,9 +358,10 @@ async fn is_kick<S: StorageBackend>(
     Ok(!sender.is_empty() && sender != user_id.as_str())
 }
 
-/// Best-available recency stamp for a room. Peek the most recent event
-/// (Backward, limit 1), else fall back to the create event. Returns 0 if
-/// neither exists — that room sorts to the bottom.
+/// Best-available recency stamp for a **joined** (or previously-joined: kick
+/// / self-leave / ban) room. Peek the most recent event (Backward, limit 1),
+/// else fall back to the create event. Returns 0 if neither exists — that
+/// room sorts to the bottom by room_id.
 ///
 /// **Cost:** called once per candidate room from `candidate_rooms` on every
 /// sync request, so this is `O(n)` storage round-trips where `n` is the
@@ -352,8 +372,8 @@ async fn is_kick<S: StorageBackend>(
 /// `StateStore::room_bump_stamps(rooms)` trait method; (c) maintain a
 /// `bump_stamp` column on the rooms table updated transactionally on every
 /// `persist_event`. (c) is the cleanest long-term; (a) is cheapest if storage
-/// stays single-process.
-async fn compute_bump_stamp<S: StorageBackend>(
+/// stays single-process. All are out of scope for phase 3.
+async fn bump_stamp_for_joined<S: StorageBackend>(
     state: &SyncState<S>,
     room_id: &RoomId,
 ) -> Result<u64, SyncError> {
@@ -369,6 +389,24 @@ async fn compute_bump_stamp<S: StorageBackend>(
         .current_state_event(room_id, "m.room.create", "")
         .await?;
     Ok(create.map(|e| e.origin_server_ts).unwrap_or(0))
+}
+
+/// Best-available recency stamp for an **invited** room. For invited rooms we
+/// haven't joined yet, the timeline and full room state aren't (necessarily)
+/// replicated to us, but the invitee's own `m.room.member` event always is —
+/// it's how we knew to add the room to the invited set in the first place.
+/// Use its `origin_server_ts` as the bump stamp; that's "when this room
+/// changed in a way relevant to the user".
+async fn bump_stamp_for_invited<S: StorageBackend>(
+    state: &SyncState<S>,
+    room_id: &RoomId,
+    user_id: &UserId,
+) -> Result<u64, SyncError> {
+    let member = state
+        .store
+        .current_state_event(room_id, "m.room.member", user_id.as_str())
+        .await?;
+    Ok(member.map(|e| e.origin_server_ts).unwrap_or(0))
 }
 
 /// Slice the ranked candidates by each list's `range`, union in subscriptions,
@@ -430,10 +468,14 @@ fn combined_room_configs(conn: &Conn, ranked: &[RankedRoom]) -> BTreeMap<OwnedRo
 }
 
 /// Normalise a list's `range` against the actual candidate count: clamp the
-/// upper bound to `total - 1` and drop the range entirely if it starts past
-/// the end. `None` input (no `range` field on the request) becomes the full
-/// window `[0, total-1]`. Zero candidates → `None` (caller iterates zero
-/// times anyway).
+/// upper bound to `total - 1`, drop the range if it starts past the end, and
+/// drop inverted ranges (`a > b`) since they describe an empty interval that
+/// the slicing iterator would silently zero-out. `None` input (no `range`
+/// field on the request) becomes the full window `[0, total-1]`. Zero
+/// candidates → `None` (caller iterates zero times anyway).
+///
+/// We *drop* malformed ranges rather than 400'ing because phase 3 has no
+/// request-validation step yet; phase 6 may upgrade this to a `BadRequest`.
 ///
 /// Only one range is honoured per list (MSC4186 removed MSC3575's multi-range
 /// support; see `apply_sticky`).
@@ -444,7 +486,7 @@ fn effective_range(range: Option<(usize, usize)>, total: usize) -> Option<(usize
     let Some((a, b)) = range else {
         return Some((0, total - 1));
     };
-    if a >= total {
+    if a >= total || a > b {
         return None;
     }
     Some((a, b.min(total - 1)))
@@ -577,6 +619,9 @@ async fn build_room<S: StorageBackend>(
 }
 
 /// Whether `user_id`'s current `m.room.member` event in `room_id` is `invite`.
+/// A malformed event (parse failure, missing/typed-wrong `content.membership`)
+/// degrades to `false` — a single bad row shouldn't take the whole sync down
+/// with a 500.
 async fn is_invited<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
@@ -587,11 +632,9 @@ async fn is_invited<S: StorageBackend>(
         .current_state_event(room_id, "m.room.member", user_id.as_str())
         .await?;
     let Some(ev) = ev else { return Ok(false) };
-    let parsed: serde_json::Value = serde_json::from_str(ev.json.get()).map_err(|e| {
-        SyncError::Storage(neutrino_common::storage::StorageError::Internal(
-            e.to_string(),
-        ))
-    })?;
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(ev.json.get()) else {
+        return Ok(false);
+    };
     Ok(parsed
         .pointer("/content/membership")
         .and_then(|v| v.as_str())
@@ -643,10 +686,18 @@ async fn build_invite_room<S: StorageBackend>(
         // Include the invite membership itself so the client can render the
         // "you've been invited by …" preview without parsing the array.
         stripped.push(strip_state_event(ev)?);
-        // Mirror name/avatar from the stripped state up to the top-level
-        // `room.name` / `room.avatar` fields. Synapse-parity: clients
-        // shouldn't have to walk `invite_state` to render the invite UI.
-        populate_invite_room_meta(ev, &mut room)?;
+        // Lift `m.room.name` / `m.room.avatar` out of `invite_room_state` to
+        // the top-level fields. Without this the client sees only the
+        // stripped array and falls back to heroes (unimplemented, PLAN.md)
+        // → renders the raw room id. Member counts are intentionally left
+        // `None` for invites (Synapse-parity, no pre-accept room-size leak).
+        let (name, avatar) = lift_invite_metadata(ev);
+        if let Some(n) = name {
+            room.name = Some(n);
+        }
+        if let Some(url) = avatar {
+            room.avatar = ruma::JsOption::Some(url.into());
+        }
     }
     room.invite_state = Some(stripped);
 
@@ -659,47 +710,48 @@ async fn build_invite_room<S: StorageBackend>(
     Ok(Some((room, Vec::new(), Vec::new())))
 }
 
-/// Read `m.room.name`/`m.room.avatar` out of `unsigned.invite_room_state`
-/// (with `state_key = ""`) and set the top-level `room.name`/`room.avatar`
-/// fields. Member counts deliberately not populated — Synapse doesn't expose
-/// them on invites either (no leakage of room size pre-accept).
-fn populate_invite_room_meta(
-    invite_event: &StoredEvent,
-    room: &mut response::Room,
-) -> Result<(), SyncError> {
-    let parsed: serde_json::Value = serde_json::from_str(invite_event.json.get()).map_err(|e| {
-        SyncError::Storage(neutrino_common::storage::StorageError::Internal(
-            e.to_string(),
-        ))
-    })?;
+/// Scan an invite event's `unsigned.invite_room_state` for the stripped
+/// `m.room.name` / `m.room.avatar` entries (state_key="") and return their
+/// `content.name` / `content.url` strings. Either or both may be absent if
+/// the federating server didn't include them. A malformed
+/// `invite_room_state` (parse failure or non-array) silently yields
+/// `(None, None)` — better to render a name-less invite than to surface a
+/// "couldn't read invite" error for what's basically a presentation
+/// fallback. Member counts deliberately not populated — Synapse doesn't
+/// expose them on invites either (no leakage of room size pre-accept).
+fn lift_invite_metadata(invite_event: &StoredEvent) -> (Option<String>, Option<String>) {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(invite_event.json.get()) else {
+        return (None, None);
+    };
     let Some(arr) = parsed
         .pointer("/unsigned/invite_room_state")
         .and_then(|v| v.as_array())
     else {
-        return Ok(());
+        return (None, None);
     };
+    let mut name = None;
+    let mut avatar = None;
     for v in arr {
-        let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-        let sk = v.get("state_key").and_then(|x| x.as_str()).unwrap_or("");
-        if !sk.is_empty() {
+        let event_type = v.pointer("/type").and_then(|x| x.as_str());
+        let state_key = v.pointer("/state_key").and_then(|x| x.as_str());
+        if state_key != Some("") {
             continue;
         }
-        match ty {
-            "m.room.name" => {
+        match event_type {
+            Some("m.room.name") if name.is_none() => {
                 if let Some(n) = v.pointer("/content/name").and_then(|x| x.as_str()) {
-                    room.name = Some(n.to_string());
+                    name = Some(n.to_string());
                 }
             }
-            "m.room.avatar" => {
+            Some("m.room.avatar") if avatar.is_none() => {
                 if let Some(u) = v.pointer("/content/url").and_then(|x| x.as_str()) {
-                    let uri: ruma::OwnedMxcUri = u.into();
-                    room.avatar = ruma::JsOption::Some(uri);
+                    avatar = Some(u.to_string());
                 }
             }
             _ => {}
         }
     }
-    Ok(())
+    (name, avatar)
 }
 
 /// Pull stripped state out of `unsigned.invite_room_state` on an
@@ -714,11 +766,8 @@ fn populate_invite_room_meta(
 fn extract_invite_room_state(
     invite_event: &StoredEvent,
 ) -> Result<Vec<Raw<AnyStrippedStateEvent>>, SyncError> {
-    let parsed: serde_json::Value = serde_json::from_str(invite_event.json.get()).map_err(|e| {
-        SyncError::Storage(neutrino_common::storage::StorageError::Internal(
-            e.to_string(),
-        ))
-    })?;
+    let parsed: serde_json::Value = serde_json::from_str(invite_event.json.get())
+        .map_err(|e| SyncError::Storage(neutrino_store::StorageError::Internal(e.to_string())))?;
     let Some(arr) = parsed
         .pointer("/unsigned/invite_room_state")
         .and_then(|v| v.as_array())
@@ -728,9 +777,7 @@ fn extract_invite_room_state(
     let mut out = Vec::with_capacity(arr.len());
     for v in arr {
         let raw: Box<RawValue> = serde_json::value::to_raw_value(v).map_err(|e| {
-            SyncError::Storage(neutrino_common::storage::StorageError::Internal(
-                e.to_string(),
-            ))
+            SyncError::Storage(neutrino_store::StorageError::Internal(e.to_string()))
         })?;
         out.push(Raw::<AnyStrippedStateEvent>::from_json(raw));
     }
@@ -741,11 +788,8 @@ fn extract_invite_room_state(
 /// `state_key`, `sender`, `content`. Drops `event_id`, `room_id`,
 /// `origin_server_ts`, and anything else a state PDU normally carries.
 fn strip_state_event(ev: &StoredEvent) -> Result<Raw<AnyStrippedStateEvent>, SyncError> {
-    let parsed: serde_json::Value = serde_json::from_str(ev.json.get()).map_err(|e| {
-        SyncError::Storage(neutrino_common::storage::StorageError::Internal(
-            e.to_string(),
-        ))
-    })?;
+    let parsed: serde_json::Value = serde_json::from_str(ev.json.get())
+        .map_err(|e| SyncError::Storage(neutrino_store::StorageError::Internal(e.to_string())))?;
     let content = parsed
         .get("content")
         .cloned()
@@ -832,9 +876,7 @@ async fn populate_room_metadata<S: StorageBackend>(
     // Name.
     if let Some(ev) = current_state.get(&("m.room.name".to_string(), String::new())) {
         let parsed: serde_json::Value = serde_json::from_str(ev.json.get()).map_err(|e| {
-            SyncError::Storage(neutrino_common::storage::StorageError::Internal(
-                e.to_string(),
-            ))
+            SyncError::Storage(neutrino_store::StorageError::Internal(e.to_string()))
         })?;
         if let Some(n) = parsed.pointer("/content/name").and_then(|v| v.as_str()) {
             room.name = Some(n.to_string());
@@ -844,9 +886,7 @@ async fn populate_room_metadata<S: StorageBackend>(
     // Avatar. Ruma's `JsOption<OwnedMxcUri>` distinguishes set/unset/null.
     if let Some(ev) = current_state.get(&("m.room.avatar".to_string(), String::new())) {
         let parsed: serde_json::Value = serde_json::from_str(ev.json.get()).map_err(|e| {
-            SyncError::Storage(neutrino_common::storage::StorageError::Internal(
-                e.to_string(),
-            ))
+            SyncError::Storage(neutrino_store::StorageError::Internal(e.to_string()))
         })?;
         if let Some(url) = parsed.pointer("/content/url").and_then(|v| v.as_str()) {
             let uri: ruma::OwnedMxcUri = url.into();
@@ -898,7 +938,8 @@ fn required_state_matches(
     state_key: &str,
 ) -> bool {
     for (rule_type, rule_key) in rules {
-        let type_match = rule_type.to_string() == "*" || rule_type.to_string() == evt_type;
+        let rule_type = rule_type.to_string();
+        let type_match = rule_type == "*" || rule_type == evt_type;
         let key_match = rule_key == "*" || rule_key == state_key;
         if type_match && key_match {
             return true;
@@ -945,7 +986,7 @@ fn clone_event(e: &StoredEvent) -> StoredEvent {
 mod unit_tests {
     use std::collections::HashMap;
 
-    use neutrino_common::storage::StoredEvent;
+    use neutrino_store::StoredEvent;
     use ruma::events::StateEventType;
     use ruma::{event_id, room_id, user_id};
 
@@ -1037,5 +1078,13 @@ mod unit_tests {
             origin_server_ts: e.origin_server_ts,
             json: e.json.clone(),
         }
+    }
+    #[test]
+    fn effective_range_drops_inverted_range() {
+        // a > b describes an empty interval; the slicing iterator would
+        // silently zero-out. Drop explicitly so the malformed case is visible.
+        assert_eq!(effective_range(Some((5, 2)), 10), None);
+        // a == b is a valid single-element range, not inverted.
+        assert_eq!(effective_range(Some((3, 3)), 10), Some((3, 3)));
     }
 }

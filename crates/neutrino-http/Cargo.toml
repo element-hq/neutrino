@@ -17,6 +17,8 @@ tokio.workspace = true
 tracing.workspace = true
 
 neutrino-common = { path = "../neutrino-common" }
+neutrino-store = { path = "../neutrino-store" }
+neutrino-store-sqlite = { path = "../neutrino-store-sqlite" }
 
 [dev-dependencies]
 # Required only for the `tests/e2e_sliding_sync.rs` integration tests so they
