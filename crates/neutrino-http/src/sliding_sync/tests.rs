@@ -170,6 +170,10 @@ fn room_stem(room_id: &RoomId) -> String {
 /// Build a minimal v12 `m.room.create` event for `room_id` with `creator` as
 /// sender. Event ID is derived from the room's localpart so a test that calls
 /// `setup_*` for two rooms in the same store doesn't collide.
+///
+/// `content.creator` is intentionally omitted — v12 / MSC4242 derive the
+/// creator from the create event's `sender` and the explicit field is
+/// deprecated.
 fn create_event_for(room_id: &RoomId, creator: &UserId) -> StoredEvent {
     let stem = room_stem(room_id);
     let id_str = format!("$create-{stem}:example.org");
@@ -181,7 +185,7 @@ fn create_event_for(room_id: &RoomId, creator: &UserId) -> StoredEvent {
         Some(""),
         creator,
         0,
-        serde_json::json!({"creator": creator.as_str(), "room_version": ROOM_VERSION_ID}),
+        serde_json::json!({"room_version": ROOM_VERSION_ID}),
     )
 }
 
@@ -214,9 +218,8 @@ async fn setup_room(store: &SqliteStore, room_id: &RoomId, creator: &UserId) {
         .expect("create_room + creator-join succeeds");
 }
 
-/// Open `room_id` and immediately add a `member=join` event for `user`. This
-/// is the closest analog to the old `InMemoryStore::join_user` helper, and
-/// is what most tests want: a room the test user is a member of.
+/// Open `room_id` and immediately add a `member=join` event for `user` —
+/// what most tests want: a room the test user is joined to.
 async fn setup_joined_room(store: &SqliteStore, room_id: &RoomId, user: &UserId) {
     let create = create_event_for(room_id, user);
     let stem = room_stem(room_id);
@@ -954,18 +957,6 @@ async fn required_state_not_re_sent_when_unchanged() {
     );
 }
 
-/// `EMIT_STATE_STUBS=false` skips wire emission of removed-state markers. The
-/// deletion-detection logic itself is covered by
-/// `unit_tests::diff_required_state_detects_deletion` in `build.rs`;
-/// re-exercising it end-to-end through the trait surface needs synthetic
-/// state removal, which `EventStore::persist_event` doesn't provide — every
-/// trait-level path overwrites state rather than removing it. Tracked as a
-/// gap rather than ported, since the behaviour is testable at the unit
-/// level.
-#[tokio::test]
-#[ignore = "trait surface has no way to remove a current_state row; covered by build.rs unit test"]
-async fn deleted_state_not_surfaced_with_stubs_disabled() {}
-
 /// Seed an invited-room scenario: an `m.room.member` event with
 /// `membership = "invite"` for `user`, carrying the canonical pieces of
 /// stripped state inside `unsigned.invite_room_state`. Mirrors what would
@@ -995,7 +986,7 @@ async fn seed_invite(
                     "type": "m.room.create",
                     "state_key": "",
                     "sender": inviter.as_str(),
-                    "content": {"creator": inviter.as_str(), "room_version": ROOM_VERSION_ID}
+                    "content": {"room_version": ROOM_VERSION_ID}
                 },
                 {
                     "type": "m.room.name",
@@ -1046,7 +1037,7 @@ async fn invited_room_emits_invite_state() {
                     "type": "m.room.create",
                     "state_key": "",
                     "sender": inviter.as_str(),
-                    "content": {"creator": inviter.as_str(), "room_version": ROOM_VERSION_ID}
+                    "content": {"room_version": ROOM_VERSION_ID}
                 },
                 {
                     "type": "m.room.name",
@@ -1196,6 +1187,39 @@ async fn fresh_invite_emitted_while_existing_invite_pending() {
     assert!(b_types.contains(&"m.room.name".to_string()));
     assert!(b_types.iter().any(|t| t == "m.room.member"));
 
+    // Pin the stripped state to room B specifically — a regression where A's
+    // `invite_room_state` leaks into B's response would pass the `contains`
+    // checks above (both invites carry `m.room.name`), so we also assert on
+    // the name's value and confirm there's no `Room A`-named entry.
+    let b_name = b_invite_state
+        .iter()
+        .find_map(|raw| {
+            let ty = raw.get_field::<String>("type").ok().flatten()?;
+            if ty != "m.room.name" {
+                return None;
+            }
+            let content = raw
+                .get_field::<serde_json::Value>("content")
+                .ok()
+                .flatten()?;
+            content
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .expect("m.room.name present in B's stripped state");
+    assert_eq!(b_name, "Room B", "B's stripped name event belongs to B");
+    assert!(
+        !b_invite_state.iter().any(|raw| {
+            raw.get_field::<serde_json::Value>("content")
+                .ok()
+                .flatten()
+                .and_then(|c| c.get("name").and_then(|v| v.as_str()).map(str::to_owned))
+                .is_some_and(|n| n == "Room A")
+        }),
+        "B's stripped state must not contain Room A's name"
+    );
+
     assert!(
         !resp3.rooms.contains_key(room_a),
         "A's invite is still pending but not re-emitted"
@@ -1294,6 +1318,42 @@ async fn conn_id_over_16_chars_rejected() {
     req.conn_id = Some("this-string-is-way-longer-than-sixteen".to_string());
     let res = handle(&state, user, req).await;
     assert!(matches!(res, Err(SyncError::BadRequest(_))));
+}
+
+#[tokio::test]
+async fn conn_id_at_limit_16_chars_accepted() {
+    // MSC4186 limits `conn_id` to ≤16 characters. Boundary test: exactly
+    // 16 chars must be accepted.
+    let (store, _tmp) = fresh_store().await;
+    let state = SyncState::new(store);
+    let user = user_id!("@alice:example.org");
+
+    let mut req = Request::new();
+    let id = "x".repeat(16);
+    req.conn_id = Some(id);
+    let res = handle(&state, user, req).await;
+    assert!(
+        res.is_ok(),
+        "16-char conn_id sits exactly at the MSC4186 limit and must be \
+         accepted, got: {res:?}"
+    );
+}
+
+#[tokio::test]
+async fn conn_id_at_17_chars_rejected() {
+    // Boundary test: 17 chars (one over the MSC4186 limit) must be rejected.
+    let (store, _tmp) = fresh_store().await;
+    let state = SyncState::new(store);
+    let user = user_id!("@alice:example.org");
+
+    let mut req = Request::new();
+    req.conn_id = Some("x".repeat(17));
+    let res = handle(&state, user, req).await;
+    assert!(
+        matches!(res, Err(SyncError::BadRequest(_))),
+        "17-char conn_id is one over the MSC4186 limit and must be \
+         rejected, got: {res:?}"
+    );
 }
 
 #[tokio::test]
@@ -1546,6 +1606,63 @@ async fn retry_with_same_pos_returns_cached_response() {
         resp2.rooms.len(),
         "retry returns the same set of rooms"
     );
+}
+
+#[tokio::test]
+async fn retry_at_same_pos_with_different_body_misses_cache() {
+    // Companion to `retry_with_same_pos_returns_cached_response`: the
+    // idempotency cache key is `(pos, body_hash)`, so a retry that keeps
+    // the same `pos` but changes the body (e.g. opting into a different
+    // `timeline_limit`, switching `conn_id`, adding/removing an
+    // extension) must NOT hit the cache. Sequentially the cache-miss
+    // surfaces as `UnknownPos` because the original request already
+    // advanced `conn.pos` past the retry's stale value — but the
+    // important thing being asserted is "the cached response is not
+    // returned", which UnknownPos cleanly distinguishes from a hit
+    // (which would have returned the cached `resp2`).
+    //
+    // If the cache key were only `pos` (regressing the body-hash half),
+    // this test would observe the cached response instead of UnknownPos
+    // and fail.
+    let (store, _tmp) = fresh_store().await;
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!room:example.org");
+    setup_joined_room(&store, room, user).await;
+    let state = SyncState::new(store);
+
+    let mut lists_a = BTreeMap::new();
+    lists_a.insert("all".to_string(), list_with(5, vec![]));
+
+    let mut req1 = Request::new();
+    req1.lists = lists_a.clone();
+    let resp1 = handle(&state, user, req1).await.unwrap();
+
+    let mut req2 = Request::new();
+    req2.pos = Some(resp1.pos.clone());
+    req2.lists = lists_a.clone();
+    let resp2 = handle(&state, user, req2).await.unwrap();
+
+    // Retry at the *same pos as req2* but with a body-different request
+    // (timeline_limit 50 vs 5). Same pos, different hash → cache misses.
+    let mut lists_b = BTreeMap::new();
+    lists_b.insert("all".to_string(), list_with(50, vec![]));
+    let mut retry = Request::new();
+    retry.pos = Some(resp1.pos.clone());
+    retry.lists = lists_b;
+    let result = handle(&state, user, retry).await;
+
+    assert!(
+        matches!(result, Err(SyncError::UnknownPos)),
+        "body-different retry at the cached pos misses the cache and \
+         hits the pos-validation gate (returning UnknownPos because \
+         conn.pos has advanced); a cache hit would have returned a \
+         response. got: {result:?}"
+    );
+
+    // Sanity: `_resp2` was actually consumed by the original processing,
+    // not by the retry — assert pos kept advancing through the cache miss
+    // path attempt (it doesn't, because UnknownPos is the gate response).
+    let _ = resp2;
 }
 
 #[tokio::test]
@@ -2469,7 +2586,7 @@ async fn initial_sync_cancels_prior_entrys_long_poll() {
 }
 
 #[tokio::test]
-async fn second_concurrent_request_proceeds_after_first_cancelled() {
+async fn concurrent_body_differing_request_gets_unknown_pos_after_cancellation() {
     let (store, _tmp) = fresh_store().await;
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
@@ -2498,6 +2615,7 @@ async fn second_concurrent_request_proceeds_after_first_cancelled() {
     req1.lists = lists.clone();
     let resp1 = handle(&state, user, req1).await.unwrap();
 
+    // A: long-poll in flight on the post-init pos.
     let state_a = state.clone();
     let lists_a = lists.clone();
     let conn_id_a = conn_id.clone();
@@ -2514,41 +2632,41 @@ async fn second_concurrent_request_proceeds_after_first_cancelled() {
 
     wait_for_in_flight_cancel_sub(&state, user, Some("c1")).await;
 
-    // B differs from A in its body (different timeline_limit), so B's
-    // retry-cache key won't match A's cached entry — B has to process
-    // fresh. Because A's cancellation advanced `conn.pos`, B's
-    // `req1.resp.pos` no longer matches; the test instead drives B with
-    // the post-cancel pos that A wrote into the cache. To find it, we
-    // use a third request: send the byte-identical retry first (which
-    // cache-hits A's cancel response and gives us its pos), then issue
-    // B against that pos.
+    // B fires truly concurrently with A. Body-different (timeline_limit=50
+    // vs A's 5) so B's body hash won't match anything in A's cache, and at
+    // the same `pos` A was using.
     //
-    // This proves the chain: cancellation completes, cache is queryable,
-    // newer non-cached requests proceed against the advanced state.
-    let mut probe = Request::new();
-    probe.conn_id = conn_id.clone();
-    probe.pos = Some(resp1.pos.clone());
-    probe.lists = lists.clone();
-    let probe_resp = handle(&state, user, probe).await.unwrap();
-
-    let resp_a = a.await.unwrap().unwrap();
-    assert_eq!(
-        probe_resp.pos, resp_a.pos,
-        "byte-identical retry hits the cancelled A's cached response"
-    );
-
-    // Now a body-differing request at A's post-cancel pos.
+    // Expected chain: B's `entry.cancel()` bumps A's cancel signal → A
+    // wakes from its long-poll select, advances `conn.pos`, writes its
+    // cache, drops the lock. B acquires the lock; B's pos (= resp1.pos)
+    // no longer matches the now-advanced `conn.pos`, so the pos-validation
+    // gate in `handle` returns `M_UNKNOWN_POS`. The client is expected to
+    // re-init from scratch — accepted single-re-init cost is documented
+    // in MSC4186-gaps.md.
+    let state_b = state.clone();
+    let conn_id_b = conn_id.clone();
+    let resp1_pos_b = resp1.pos.clone();
+    let user_owned_b = user.to_owned();
     let mut lists_b = lists.clone();
     lists_b.insert("all".to_string(), list_with(50, vec![]));
-    let mut req_b = Request::new();
-    req_b.conn_id = conn_id.clone();
-    req_b.pos = Some(probe_resp.pos.clone());
-    req_b.lists = lists_b;
-    req_b.timeout = Some(std::time::Duration::from_millis(100));
-    let resp_b = handle(&state, user, req_b).await.unwrap();
-    assert_ne!(
-        resp_b.pos, probe_resp.pos,
-        "fresh processing advances pos past the cache-hit pos"
+    let b = tokio::spawn(async move {
+        let mut req = Request::new();
+        req.conn_id = conn_id_b;
+        req.pos = Some(resp1_pos_b);
+        req.lists = lists_b;
+        handle(&state_b, &user_owned_b, req).await
+    });
+
+    let result_b = b.await.unwrap();
+    let resp_a = a.await.unwrap().unwrap();
+
+    assert!(
+        resp_a.rooms.is_empty(),
+        "A's cancellation tail produces an empty response"
+    );
+    assert!(
+        matches!(result_b, Err(SyncError::UnknownPos)),
+        "B's stale pos is rejected after A's cancellation advances conn.pos"
     );
 }
 

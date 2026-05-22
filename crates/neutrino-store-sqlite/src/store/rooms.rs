@@ -730,20 +730,21 @@ mod tests {
         assert!(stream.is_empty());
     }
 
-    // R20: malformed `room_version` in a DB row surfaces from
-    // `get_room_version` as `Internal`, not `InvalidInput`. The schema
-    // doesn't `CHECK` the column, so a future bug or manual SQL edit
-    // could put garbage there; this asserts the mapping. Bypasses
-    // `create_room`'s validation gate by overwriting after a successful
-    // create.
+    // R20: the schema-level `CHECK (room_version = 'org.matrix.msc4242.12')`
+    // on `rooms` rejects any attempt to write a different room_version,
+    // including the bypass path this test exercises (raw UPDATE outside
+    // the trait's `create_room` validation gate). Before the CHECK,
+    // `get_room_version` had to defensively parse the column on read and
+    // map a failure to `Internal`; now the bad row can't exist in the
+    // first place, so the defence-in-depth has moved one layer down.
     #[tokio::test]
-    async fn get_room_version_internal_for_malformed_db_row() {
+    async fn rooms_check_constraint_rejects_non_msc4242_room_version() {
         let store = store().await;
         let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
         store.create_room(&ce, &[]).await.unwrap();
 
         let room = ALICE_ROOM_ID.to_owned();
-        store
+        let result = store
             .run_write(move |conn| -> Result<(), Error> {
                 conn.execute(
                     "UPDATE rooms SET room_version = ? WHERE room_id = ?",
@@ -751,10 +752,12 @@ mod tests {
                 )?;
                 Ok(())
             })
-            .await
-            .unwrap();
-
-        let result = store.get_room_version(*ALICE_ROOM_ID).await;
-        assert!(matches!(result, Err(StorageError::Internal(_))));
+            .await;
+        let err = result.expect_err("CHECK constraint must reject empty room_version");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CHECK constraint failed"),
+            "expected CHECK violation, got: {msg}"
+        );
     }
 }

@@ -138,6 +138,26 @@ pub(crate) fn member_leave(event_id: &EventId, room_id: &RoomId, user_id: &UserI
     )
 }
 
+/// Generic membership helper with caller-controlled sender/target —
+/// invites and bans want `sender != target` (the actor and the affected
+/// user are different); knocks always have `sender == target`.
+pub(crate) fn member_event(
+    event_id: &EventId,
+    room_id: &RoomId,
+    target: &UserId,
+    sender: &UserId,
+    membership: &str,
+) -> StoredEvent {
+    make_event(
+        event_id,
+        room_id,
+        sender,
+        "m.room.member",
+        Some(target.as_str()),
+        json!({"membership": membership}),
+    )
+}
+
 pub(crate) fn name_event(
     event_id: &EventId,
     room_id: &RoomId,

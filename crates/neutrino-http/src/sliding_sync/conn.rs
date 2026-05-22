@@ -137,13 +137,21 @@ impl Conn {
 ///
 /// **Signal mechanics.** `cancel_gen` is a `watch::Sender<u64>` whose value is
 /// a monotonically incrementing generation counter. The producing side bumps
-/// it via `send_modify` *before* attempting `conn.lock().await`; the
-/// in-flight request holds a `Receiver` it `select!`s on in its idle wait,
-/// breaks out, runs its post-loop tail (pos commit + cache write), and drops
-/// the guard. `watch` was chosen over `Notify` / `tokio_util::CancellationToken`
-/// because its value is *sticky* — a bump that happens before the holder
-/// calls `.changed()` is still observed on the next call, eliminating the
-/// lost-wakeup window that `Notify::notify_waiters` has.
+/// it via `send_modify` *before* attempting `conn.lock().await`. The in-flight
+/// holder captured its own post-bump generation as `my_gen` at the start of
+/// its request and watches the long-poll wait via
+/// `cancel_rx.wait_for(|g| *g > my_gen)`. Any strictly-later bump (from a
+/// newer request than ours) wakes us, regardless of whether the newer
+/// request's bump happened to land in the window between our `cancel()` and
+/// our subscribe — the `wait_for` predicate is keyed to `my_gen`, not to
+/// "value changed from the receiver's last-seen baseline", so race-induced
+/// "subscribed-already-up-to-date" states don't drop bumps that count as
+/// "after me".
+///
+/// `watch` was chosen over `Notify` / `tokio_util::CancellationToken` because
+/// the receiver doesn't have to be subscribed at the moment the bump fires —
+/// the value is sticky, and `wait_for` polls a stable scalar rather than
+/// edge-triggering on `notify_waiters`.
 ///
 /// Both fields are `Arc` so handlers can hold them past the registry-lock
 /// drop and the entry can outlive any single registry traversal.
@@ -162,19 +170,37 @@ impl ConnEntry {
         }
     }
 
-    /// Bump the cancellation generation. A holder currently `.changed()`-waiting
-    /// on the matching `Receiver` will wake; a holder that hasn't yet
-    /// subscribed will observe the bump on its next `.changed()` call because
-    /// `watch` values are sticky.
-    pub fn cancel(&self) {
-        self.cancel_gen.send_modify(|g| *g = g.saturating_add(1));
+    /// Bump the cancellation generation and return the new value.
+    ///
+    /// Callers in `handle` use the returned value as their "I am current
+    /// up to this generation; wake me on any strictly later bump" baseline,
+    /// fed into `cancel_gen.subscribe().wait_for(|g| *g > my_gen)`. That
+    /// pattern avoids the three-way race where a request `C` arrives in
+    /// the window between `B`'s `cancel()` and `B`'s subscribe — without
+    /// the explicit `my_gen` baseline, `C`'s bump would be folded into
+    /// the value `subscribe()` reports as already-seen, and B would miss
+    /// the cancellation it should respect.
+    pub fn cancel(&self) -> u64 {
+        let mut new_gen = 0;
+        self.cancel_gen.send_modify(|g| {
+            *g = g.saturating_add(1);
+            new_gen = *g;
+        });
+        new_gen
     }
 
-    /// Subscribe to the cancellation signal. The caller must call
-    /// `borrow_and_update` on the returned receiver to seed its baseline
-    /// against the current generation — otherwise any bump that has *already*
-    /// happened (e.g. by an earlier request that finished and bumped on its
-    /// way out) would fire `.changed()` immediately on the first await.
+    /// Current generation value (no bump). Used by initial-sync handlers
+    /// that don't `cancel()` themselves but still need a `my_gen` baseline
+    /// for the long-poll `wait_for` predicate.
+    pub fn current_gen(&self) -> u64 {
+        *self.cancel_gen.borrow()
+    }
+
+    /// Subscribe to the cancellation signal. The returned receiver's
+    /// "last-seen" version is initialised to the sender's current version
+    /// (per `tokio::sync::watch::Sender::subscribe` contract), so the very
+    /// first `.changed()` await blocks until the *next* bump and won't fire
+    /// on bumps that already happened before the subscribe.
     pub fn subscribe_cancel(&self) -> watch::Receiver<u64> {
         self.cancel_gen.subscribe()
     }

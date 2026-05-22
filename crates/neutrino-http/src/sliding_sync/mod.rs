@@ -14,8 +14,10 @@
 // lands.
 #![allow(dead_code)]
 
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use neutrino_store::{StorageBackend, StorageError};
@@ -138,23 +140,35 @@ pub async fn handle<S: StorageBackend>(
     //   block behind the in-flight request's `rx.changed()` await for up to
     //   30 s — MSC3575 forbids concurrent same-conn requests; we cancel
     //   the older one rather than queue, matching the standard handling.
-    let entry: ConnEntry = match parsed_pos {
-        None => state.registry.create(key.clone()).await,
+    // Resolve the entry and capture the cancellation generation that marks
+    // "this is me, current as of this point". Subsequent code waits for
+    // bumps strictly greater than `my_gen`, which is race-proof against a
+    // third concurrent request arriving between `cancel()` and the
+    // long-poll select: any bump beyond `my_gen` wakes us regardless of
+    // when the receiver subscribes.
+    let (entry, my_gen): (ConnEntry, u64) = match parsed_pos {
+        None => {
+            // `registry.create` cancels any prior entry on the way in and
+            // returns a fresh `ConnEntry` whose `cancel_gen` starts at 0.
+            // We don't bump it ourselves — we're the new entry — so our
+            // baseline is whatever the fresh sender's current value is.
+            let entry = state.registry.create(key.clone()).await;
+            let baseline = entry.current_gen();
+            (entry, baseline)
+        }
         Some(_) => {
             let Some(entry) = state.registry.get(&key).await else {
                 return Err(SyncError::UnknownPos);
             };
-            entry.cancel();
-            entry
+            // `cancel()` returns the post-bump value, which is our `my_gen`:
+            // the long-poll select will wake on any value strictly greater
+            // than this, i.e. any later request's `cancel()` bump.
+            let baseline = entry.cancel();
+            (entry, baseline)
         }
     };
 
-    // Subscribe to our own cancel signal *after* the bump above so we don't
-    // wake ourselves. `borrow_and_update` seeds the receiver's baseline at
-    // the current generation; only a *future* bump (from a newer request
-    // than ours) will fire our `.changed()` inside the long-poll loop.
     let mut cancel_rx = entry.subscribe_cancel();
-    cancel_rx.borrow_and_update();
 
     // TOCTOU: subscribe to the event watch BEFORE the first `build_response`
     // so any `persist_event` that lands between our query and the watch
@@ -216,18 +230,21 @@ pub async fn handle<S: StorageBackend>(
             break resp;
         }
         // Three-way race in the idle wait:
+        // - `cancel_rx.wait_for(|g| *g > my_gen)` fires → a strictly-later
+        //   request has called `cancel()` on our entry (or the registry
+        //   replaced our entry on an initial sync, which also bumps our
+        //   gen via `prior.cancel()`); break out with the current resp.
+        //   The tail below advances `conn.pos` and writes the idempotency
+        //   cache, so a byte-identical newer request immediately hits the
+        //   cache; a body-differing newer request will see the advanced
+        //   `conn.pos` and either match it (process fresh) or return
+        //   UnknownPos.
         // - `rx.changed()` fires → new event(s); rebuild with the advanced
         //   high-water mark.
         // - `tokio::time::timeout` elapses → return the current empty resp.
-        // - `cancel_rx.changed()` fires → a newer same-conn request bumped
-        //   our cancel signal; break out with the current resp. The tail
-        //   below advances `conn.pos` and writes the idempotency cache, so
-        //   a byte-identical newer request immediately hits the cache; a
-        //   body-differing newer request will see the advanced `conn.pos`
-        //   and either match it (process fresh) or return UnknownPos.
         tokio::select! {
             biased;
-            _ = cancel_rx.changed() => break resp,
+            _ = cancel_rx.wait_for(|g| *g > my_gen) => break resp,
             res = tokio::time::timeout(remaining, rx.changed()) => match res {
                 Ok(_) => continue,
                 Err(_) => break resp,
@@ -291,10 +308,21 @@ fn request_body_hash(req: &v5::Request) -> u64 {
     let Ok(bytes) = serde_json::to_vec(&view) else {
         return 0;
     };
-    let mut h = DefaultHasher::new();
-    bytes.hash(&mut h);
-    h.finish()
+    BODY_HASH_BUILDER.hash_one(&bytes)
 }
+
+/// Per-process random hash key for the idempotency-cache body hash.
+///
+/// `std::hash::DefaultHasher` uses SipHash13 with a fixed key; a malicious
+/// or pathological client could in principle craft two different request
+/// bodies with the same hash and retrieve a cached response intended for
+/// a different request. Using `RandomState` (which seeds SipHash13 with
+/// a fresh random key each process start) closes that door. The key
+/// has to be stable for the lifetime of the process — different request
+/// bodies during one process must hash consistently — so we initialise
+/// it once via `LazyLock` and share it across all `request_body_hash`
+/// calls.
+static BODY_HASH_BUILDER: LazyLock<RandomState> = LazyLock::new(RandomState::new);
 
 /// MSC4186 shape limits applied at the request boundary. Anything that
 /// violates these returns `BadRequest` → HTTP 400 / `M_BAD_JSON` when the

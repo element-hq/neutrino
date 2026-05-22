@@ -486,13 +486,14 @@ async fn create_room(state: State<AppState>, body: Json<Value>) -> axum::respons
 
     let room_id = mint_id('!', &server_name, 7);
 
+    // v12 / MSC4242: the creator is implicit (taken from `sender`); the
+    // explicit `content.creator` field that v11 carried is deprecated.
     let create_event = json!({
         "type": "m.room.create",
         "state_key": "",
         "sender": user_id,
         "room_id": room_id,
         "content": {
-            "creator": user_id,
             "room_version": ROOM_VERSION_ID
         },
         "origin_server_ts": 0,

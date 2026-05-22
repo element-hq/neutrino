@@ -61,7 +61,7 @@ pub enum Membership {
 
 impl Membership {
     /// Canonical wire string, as it appears in `m.room.member.content.membership`.
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Membership::Join => "join",
             Membership::Invite => "invite",
@@ -81,6 +81,12 @@ impl Membership {
             "ban" => Some(Membership::Ban),
             _ => None,
         }
+    }
+}
+
+impl std::fmt::Display for Membership {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
