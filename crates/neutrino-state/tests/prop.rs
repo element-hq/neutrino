@@ -21,7 +21,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use neutrino_common::ROOM_VERSION_ID;
 use neutrino_state::auth_events::{auth_event_keys, calculate_auth_events};
 use neutrino_state::auth_rules::check_auth_rules;
 use neutrino_state::provider::{EventInfo, InMemoryStateProvider, StateProvider};
@@ -182,7 +181,7 @@ fn arb_create_event() -> impl Strategy<Value = Event> {
         let mut v = base_message();
         v["type"] = json!("m.room.create");
         v["sender"] = json!(sender);
-        v["content"] = json!({ "room_version": ROOM_VERSION_ID });
+        v["content"] = json!({ "room_version": "12" });
         v["state_key"] = json!("");
         let obj = v.as_object_mut()?;
         obj.remove("room_id");
@@ -290,7 +289,7 @@ fn arb_state_with_create()
             let v = json!({
                 "type": "m.room.create",
                 "sender": sender_str,
-                "content": { "room_version": ROOM_VERSION_ID },
+                "content": { "room_version": "12" },
                 "prev_events": [],
                 "depth": 0,
                 "origin_server_ts": 1_700_000_000_000_u64,
@@ -350,7 +349,7 @@ proptest! {
         let create_v = json!({
             "type": "m.room.create",
             "sender": sender_str,
-            "content": { "room_version": ROOM_VERSION_ID },
+            "content": { "room_version": "12" },
             "prev_events": [],
             "depth": 0,
             "origin_server_ts": 1_700_000_000_000_u64,

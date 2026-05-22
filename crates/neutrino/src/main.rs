@@ -2,6 +2,6 @@
 //! (as opposed to building the embedded/Android target).
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    neutrino_main::entrypoint().await
+async fn main() {
+    neutrino_main::entrypoint().await;
 }

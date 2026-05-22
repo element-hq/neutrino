@@ -27,11 +27,11 @@
 //! queries match the partial-index `WHERE` clauses from `schema.sql`
 //! exactly so SQLite picks the indexes.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{OptionalExtension, params, params_from_iter};
-use neutrino_store::{Membership, StateStore, StorageError, StoredEvent};
+use neutrino_store::{StateStore, StorageError, StoredEvent};
 use ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
 
 use crate::{
@@ -191,65 +191,45 @@ impl StateStore for SqliteStore {
     async fn rooms_with_membership(
         &self,
         user_id: &UserId,
-        memberships: &BTreeSet<Membership>,
-    ) -> Result<Vec<(OwnedRoomId, Membership)>, StorageError> {
+        memberships: &[&str],
+    ) -> Result<Vec<(OwnedRoomId, String)>, StorageError> {
         if memberships.is_empty() {
             return Ok(Vec::new());
         }
         let user_id = user_id.to_owned();
-        // Copy the `Membership` values out of the borrowed `BTreeSet` so
-        // the closure passed to `run_read` doesn't need to capture a
-        // reference to caller-owned data.
-        let memberships: Vec<Membership> = memberships.iter().copied().collect();
+        let memberships: Vec<String> = memberships.iter().map(|s| (*s).to_owned()).collect();
 
-        self.run_read(
-            move |conn| -> Result<Vec<(OwnedRoomId, Membership)>, Error> {
-                // Build the `?` placeholders and the `binds` Vec from the
-                // same iteration over `memberships` so the two can't fall
-                // out of step in a future refactor (e.g. someone dedup'ing
-                // one side without the other and silently misaligning
-                // placeholders to values).
-                //
-                // Same `state_key`-prefix index (`ix_current_state_member`)
-                // as `joined_rooms` — the `IN (…)` filter is applied
-                // within the partial index without a full table scan.
-                let mut binds: Vec<&str> = Vec::with_capacity(memberships.len() + 1);
-                binds.push(user_id.as_str());
-                let mut placeholders = String::new();
-                for (i, m) in memberships.iter().enumerate() {
-                    if i > 0 {
-                        placeholders.push(',');
-                    }
-                    placeholders.push('?');
-                    binds.push(m.as_str());
-                }
-                let query = format!(
-                    "SELECT room_id, membership FROM current_state \
+        self.run_read(move |conn| -> Result<Vec<(OwnedRoomId, String)>, Error> {
+            // Same `state_key`-prefix index (`ix_current_state_member`) as
+            // `joined_rooms` — the `IN (…)` filter is applied within the
+            // partial index without a full table scan.
+            let placeholders = vec!["?"; memberships.len()].join(",");
+            let query = format!(
+                "SELECT room_id, membership FROM current_state \
                  WHERE state_key = ? AND event_type = 'm.room.member' \
                    AND membership IN ({placeholders})"
-                );
-                let mut stmt = conn.prepare(&query)?;
-                let rows = stmt.query_map(params_from_iter(binds.iter()), |row| {
-                    let room_id: String = row.get(0)?;
-                    let membership: String = row.get(1)?;
-                    Ok((room_id, membership))
-                })?;
+            );
+            let mut stmt = conn.prepare(&query)?;
+            let mut binds: Vec<&str> = Vec::with_capacity(memberships.len() + 1);
+            binds.push(user_id.as_str());
+            for m in &memberships {
+                binds.push(m.as_str());
+            }
+            let rows = stmt.query_map(params_from_iter(binds.iter()), |row| {
+                let room_id: String = row.get(0)?;
+                let membership: String = row.get(1)?;
+                Ok((room_id, membership))
+            })?;
 
-                let mut out = Vec::new();
-                for r in rows {
-                    let (room_id, membership) = r?;
-                    let room_id = OwnedRoomId::try_from(room_id)
-                        .map_err(|e| Error::Internal(format!("malformed room_id in DB: {e}")))?;
-                    let membership = Membership::from_wire(&membership).ok_or_else(|| {
-                    Error::Internal(format!(
-                        "unknown membership '{membership}' in DB — schema CHECK should prevent this"
-                    ))
-                })?;
-                    out.push((room_id, membership));
-                }
-                Ok(out)
-            },
-        )
+            let mut out = Vec::new();
+            for r in rows {
+                let (room_id, membership) = r?;
+                let room_id = OwnedRoomId::try_from(room_id)
+                    .map_err(|e| Error::Internal(format!("malformed room_id in DB: {e}")))?;
+                out.push((room_id, membership));
+            }
+            Ok(out)
+        })
         .await
     }
 
@@ -293,10 +273,8 @@ impl StateStore for SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
-    use neutrino_store::{EventStore, Membership, RoomStore, StateStore};
-    use ruma::{event_id, room_id};
+    use neutrino_store::{EventStore, RoomStore, StateStore};
+    use ruma::event_id;
 
     use crate::tests::{
         ALICE_ROOM_ID, ALICE_USER_ID, BOB_ROOM_ID, BOB_USER_ID, create_event,
@@ -522,10 +500,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let got = s
-            .rooms_with_membership(*ALICE_USER_ID, &BTreeSet::new())
-            .await
-            .unwrap();
+        let got = s.rooms_with_membership(*ALICE_USER_ID, &[]).await.unwrap();
         assert!(got.is_empty());
     }
 
@@ -563,18 +538,19 @@ mod tests {
         .unwrap();
 
         let mut got = s
-            .rooms_with_membership(
-                *ALICE_USER_ID,
-                &BTreeSet::from([Membership::Join, Membership::Leave]),
-            )
+            .rooms_with_membership(*ALICE_USER_ID, &["join", "leave"])
             .await
             .unwrap();
         got.sort_by_key(|(r, _)| r.as_str().to_owned());
         assert_eq!(got.len(), 2);
-        assert_eq!(got[0].0.as_str(), ALICE_ROOM_ID.as_str());
-        assert_eq!(got[0].1, Membership::Join);
-        assert_eq!(got[1].0.as_str(), BOB_ROOM_ID.as_str());
-        assert_eq!(got[1].1, Membership::Leave);
+        assert_eq!(
+            (got[0].0.as_str(), got[0].1.as_str()),
+            (ALICE_ROOM_ID.as_str(), "join")
+        );
+        assert_eq!(
+            (got[1].0.as_str(), got[1].1.as_str()),
+            (BOB_ROOM_ID.as_str(), "leave")
+        );
     }
 
     // S13
@@ -610,154 +586,46 @@ mod tests {
 
         // Only ask for "leave"
         let got = s
-            .rooms_with_membership(*ALICE_USER_ID, &BTreeSet::from([Membership::Leave]))
+            .rooms_with_membership(*ALICE_USER_ID, &["leave"])
             .await
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0.as_str(), BOB_ROOM_ID.as_str());
-        assert_eq!(got[0].1, Membership::Leave);
+        assert_eq!(got[0].1, "leave");
     }
 
-    // S14 (renumbered → S15 below): the old "unknown membership string"
-    // case is now unrepresentable at the type boundary — `Membership` is
-    // a closed enum, so no caller can ask for a bogus value.
+    // S14: unknown membership strings in slice silently ignored
+    #[tokio::test]
+    async fn rooms_with_membership_unknown_memberships_silently_ignored() {
+        let s = store().await;
+        s.create_room(
+            &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
+            &[member_join(
+                event_id!("$mj:e"),
+                *ALICE_ROOM_ID,
+                *ALICE_USER_ID,
+            )],
+        )
+        .await
+        .unwrap();
+        let got = s
+            .rooms_with_membership(*ALICE_USER_ID, &["join", "bogus_value"])
+            .await
+            .unwrap();
+        // "bogus_value" doesn't match any row; "join" matches one.
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, "join");
+    }
 
     // S15
     #[tokio::test]
     async fn rooms_with_membership_empty_for_unknown_user() {
         let s = store().await;
         let got = s
-            .rooms_with_membership(
-                *ALICE_USER_ID,
-                &BTreeSet::from([Membership::Join, Membership::Leave]),
-            )
+            .rooms_with_membership(*ALICE_USER_ID, &["join", "leave"])
             .await
             .unwrap();
         assert!(got.is_empty());
-    }
-
-    // SQ-28 — exercise the `Ban` / `Invite` / `Knock` paths through
-    // `rooms_with_membership`. The closed-enum migration meant `Invite`,
-    // `Ban`, and `Knock` round-tripped through the `IN (…)` query had no
-    // direct coverage; the index predicate / value comparison could
-    // silently drift on any of them. One room per membership, all queried
-    // in a single call so the SQL's `IN (…)` clause is exercised across
-    // the multi-value path too.
-    #[tokio::test]
-    async fn rooms_with_membership_returns_ban_invite_knock_rows() {
-        use crate::tests::member_event;
-        let s = store().await;
-        let inviter = *BOB_USER_ID;
-        let alice = *ALICE_USER_ID;
-        let room_invite = room_id!("!invite:example.com");
-        let room_knock = room_id!("!knock:example.com");
-        let room_ban = room_id!("!ban:example.com");
-
-        // Invited room: inviter creates, inviter is joined, alice has
-        // membership=invite. Note `member_event` lets sender ≠ target so
-        // we can express "inviter invited alice".
-        s.create_room(
-            &create_event(event_id!("$ci:e"), room_invite, inviter),
-            &[member_join(event_id!("$ji:e"), room_invite, inviter)],
-        )
-        .await
-        .unwrap();
-        s.persist_event(
-            &member_event(event_id!("$mi:e"), room_invite, alice, inviter, "invite"),
-            &[],
-        )
-        .await
-        .unwrap();
-
-        // Knocked room: knocker creates, knocker joined, alice knocks
-        // (sender == target). The knocker's own membership doesn't
-        // affect alice's view; we include it for production realism.
-        s.create_room(
-            &create_event(event_id!("$ck:e"), room_knock, inviter),
-            &[member_join(event_id!("$jk:e"), room_knock, inviter)],
-        )
-        .await
-        .unwrap();
-        s.persist_event(
-            &member_event(event_id!("$mk:e"), room_knock, alice, alice, "knock"),
-            &[],
-        )
-        .await
-        .unwrap();
-
-        // Banned room: alice was in it; the banner bans her.
-        s.create_room(
-            &create_event(event_id!("$cb:e"), room_ban, inviter),
-            &[member_join(event_id!("$jb:e"), room_ban, inviter)],
-        )
-        .await
-        .unwrap();
-        s.persist_event(&member_join(event_id!("$jab:e"), room_ban, alice), &[])
-            .await
-            .unwrap();
-        s.persist_event(
-            &member_event(event_id!("$mb:e"), room_ban, alice, inviter, "ban"),
-            &[],
-        )
-        .await
-        .unwrap();
-
-        let mut got = s
-            .rooms_with_membership(
-                alice,
-                &BTreeSet::from([Membership::Ban, Membership::Invite, Membership::Knock]),
-            )
-            .await
-            .unwrap();
-        got.sort_by_key(|(r, _)| r.as_str().to_owned());
-
-        assert_eq!(got.len(), 3, "one row per membership-distinct room");
-        assert_eq!(got[0].0.as_str(), room_ban.as_str());
-        assert_eq!(got[0].1, Membership::Ban);
-        assert_eq!(got[1].0.as_str(), room_invite.as_str());
-        assert_eq!(got[1].1, Membership::Invite);
-        assert_eq!(got[2].0.as_str(), room_knock.as_str());
-        assert_eq!(got[2].1, Membership::Knock);
-    }
-
-    #[tokio::test]
-    async fn rooms_with_membership_filters_invite_excludes_join() {
-        // Filter argument scopes results: with only `Invite` in the set,
-        // a Joined room must not appear (rules out a SQL bug where the
-        // membership column comparison is dropped).
-        use crate::tests::member_event;
-        let s = store().await;
-        let inviter = *BOB_USER_ID;
-        let alice = *ALICE_USER_ID;
-        let joined_room = room_id!("!joined:example.com");
-        let invite_room = room_id!("!invite-only:example.com");
-
-        s.create_room(
-            &create_event(event_id!("$cj:e"), joined_room, alice),
-            &[member_join(event_id!("$jj:e"), joined_room, alice)],
-        )
-        .await
-        .unwrap();
-        s.create_room(
-            &create_event(event_id!("$ci:e"), invite_room, inviter),
-            &[member_join(event_id!("$ji:e"), invite_room, inviter)],
-        )
-        .await
-        .unwrap();
-        s.persist_event(
-            &member_event(event_id!("$mi:e"), invite_room, alice, inviter, "invite"),
-            &[],
-        )
-        .await
-        .unwrap();
-
-        let got = s
-            .rooms_with_membership(alice, &BTreeSet::from([Membership::Invite]))
-            .await
-            .unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].0.as_str(), invite_room.as_str());
-        assert_eq!(got[0].1, Membership::Invite);
     }
     // S16
     #[tokio::test]

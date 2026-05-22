@@ -26,18 +26,9 @@
 -- ----------------------------------------------------------------------------
 -- rooms — RoomStore
 -- ----------------------------------------------------------------------------
--- `room_version` CHECK pins the only wire identifier this server accepts —
--- mirrors `neutrino_common::ROOM_VERSION_ID` (MSC4242-on-v12). Defends
--- against a corrupt-DB / bad-migration path where a row with a different
--- string gets inserted: the trait read paths would otherwise see
--- `RoomVersionId::Custom(<wrong-string>)` (ruma maps unknown strings to
--- Custom rather than erroring) and propagate it silently. The string is
--- duplicated here rather than templated because it's both a schema-level
--- invariant *and* a stability promise — if/when the value ever changes
--- the schema needs an explicit migration, not a silent code edit.
 CREATE TABLE rooms (
     room_id        TEXT NOT NULL PRIMARY KEY,
-    room_version   TEXT NOT NULL CHECK (room_version = 'org.matrix.msc4242.12')
+    room_version   TEXT NOT NULL
 ) STRICT, WITHOUT ROWID;
 
 -- ----------------------------------------------------------------------------

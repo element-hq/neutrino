@@ -858,7 +858,6 @@ mod tests {
     use super::*;
     use crate::RoomVersion;
     use crate::validate::parse_event;
-    use neutrino_common::ROOM_VERSION_ID;
     use ruma::OwnedEventId;
     use serde_json::value::RawValue;
     use serde_json::{Value, json};
@@ -876,7 +875,7 @@ mod tests {
     }
 
     fn create_event(creator: &str, additional_creators: &[&str]) -> Arc<Event> {
-        let mut content = json!({ "room_version": ROOM_VERSION_ID });
+        let mut content = json!({ "room_version": "12" });
         if !additional_creators.is_empty() {
             content["additional_creators"] = json!(
                 additional_creators
@@ -1008,7 +1007,7 @@ mod tests {
             json!({
                 "type": "m.room.create",
                 "sender": "@alice:example.org",
-                "content": { "room_version": ROOM_VERSION_ID, "m.federate": false },
+                "content": { "room_version": "12", "m.federate": false },
                 "prev_events": [],
                 "depth": 0,
                 "origin_server_ts": 1_700_000_000_000_u64,
@@ -1036,7 +1035,7 @@ mod tests {
             json!({
                 "type": "m.room.create",
                 "sender": "@alice:example.org",
-                "content": { "room_version": ROOM_VERSION_ID, "m.federate": false },
+                "content": { "room_version": "12", "m.federate": false },
                 "prev_events": [],
                 "depth": 0,
                 "origin_server_ts": 1_700_000_000_000_u64,

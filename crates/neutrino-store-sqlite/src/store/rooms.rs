@@ -4,7 +4,6 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{OptionalExtension, params};
-use neutrino_common::ROOM_VERSION_ID;
 use neutrino_store::{RoomStore, StorageError, StoredEvent};
 use ruma::{RoomId, RoomVersionId};
 use serde_json::Value;
@@ -41,12 +40,9 @@ impl RoomStore for SqliteStore {
 
         // Pull `content.room_version` out of the create event JSON before
         // crossing the closure boundary. Caller-supplied JSON, so a
-        // missing/malformed field is `InvalidInput`. We compare against
-        // `ROOM_VERSION_ID` (the unstable MSC4242 prefix) directly — going
-        // through `RoomVersionId::from_str` would not have caught the
-        // off-by-one between MSC4242's `"org.matrix.msc4242.12"` and ruma's
-        // bare-`"12"` `V12` variant, because ruma silently maps unknown
-        // strings into `RoomVersionId::Custom(...)` rather than erroring.
+        // missing/malformed field is `InvalidInput`. Round-trip through
+        // `RoomVersionId` so the write side validates with the same
+        // grammar `get_room_version` reads back.
         let parsed: Value = serde_json::from_str(create_event.json.get())
             .map_err(|e| Error::InvalidInput(format!("create_event json: {e}")))?;
         let room_version_str = parsed
@@ -55,14 +51,18 @@ impl RoomStore for SqliteStore {
             .ok_or_else(|| {
                 Error::InvalidInput("create_event missing content.room_version".into())
             })?;
+        let room_version = RoomVersionId::from_str(room_version_str).map_err(|e| {
+            Error::InvalidInput(format!("invalid room_version {room_version_str:?}: {e}"))
+        })?;
 
-        // Reject at the create-room boundary rather than letting an
-        // unsupported version land in the DB and surprise downstream code
-        // that assumes the MSC4242-on-v12 state-resolution / auth rules.
-        // Relax this gate if we ever broaden the target.
-        if room_version_str != ROOM_VERSION_ID {
+        // Room versions other than V12 are not part of the design goals
+        // for now. Reject at the create-room boundary rather than letting
+        // unsupported versions land in the DB and surprise downstream
+        // code that assumes v12 state-resolution / auth rules. Relax
+        // this gate if we ever broaden the target.
+        if room_version != RoomVersionId::V12 {
             return Err(Error::InvalidInput(format!(
-                "unsupported room_version {room_version_str:?}; only {ROOM_VERSION_ID} is supported"
+                "unsupported room_version {room_version}; only v12 is supported"
             ))
             .into());
         }
@@ -91,6 +91,8 @@ impl RoomStore for SqliteStore {
             .into());
         }
 
+        let room_version = room_version.to_string();
+
         // Wrap borrowed events into `'static` `EventRow`s for the closure.
         let create_event = EventRow::from(create_event).to_owned();
         let initial_events: Vec<EventRow<'static>> = initial_events
@@ -106,11 +108,9 @@ impl RoomStore for SqliteStore {
             //    `room_id REFERENCES rooms(room_id)` FK would reject the
             //    create event otherwise. `create_event.room_id` resolves
             //    through `EventRow: Deref<Target = StoredEvent>`.
-            //    Version is checked == ROOM_VERSION_ID above; stored
-            //    verbatim so a future column query can grep for it.
             tx.execute(
                 "INSERT INTO rooms (room_id, room_version) VALUES (?, ?)",
-                params![create_event.room_id.as_str(), ROOM_VERSION_ID],
+                params![create_event.room_id.as_str(), room_version],
             )?;
 
             // 2. Write the create event itself.
@@ -168,10 +168,7 @@ impl RoomStore for SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
     use deadpool_sqlite::rusqlite::params;
-    use neutrino_common::ROOM_VERSION_ID;
     use neutrino_store::{EventStore, RoomStore, StorageError, StreamPos};
     use ruma::{RoomVersionId, event_id, room_id};
     use serde_json::json;
@@ -234,28 +231,21 @@ mod tests {
     }
 
     // R3c: content.room_version parses as a valid identifier but isn't
-    // the MSC4242 unstable v12. Out of scope for now (CLAUDE.md: only
-    // MSC4242-on-v12 targeted) — relax if we ever broaden the target.
-    // Covers both the stable `"12"` (which ruma's RoomVersionId::V12
-    // would match but we do not) and an older numbered version.
+    // v12. Out of scope for now (CLAUDE.md: "the server only targets
+    // room version 12") — relax if we ever broaden the target.
     #[tokio::test]
     async fn create_room_rejects_non_v12_room_version() {
         let store = store().await;
-        for version in ["11", "12"] {
-            let bad = make_event(
-                event_id!("$c1:example.com"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "m.room.create",
-                Some(""),
-                json!({"creator": ALICE_USER_ID.as_str(), "room_version": version}),
-            );
-            let result = store.create_room(&bad, &[]).await;
-            assert!(
-                matches!(result, Err(StorageError::InvalidInput(_))),
-                "expected InvalidInput for room_version={version:?}, got {result:?}"
-            );
-        }
+        let bad = make_event(
+            event_id!("$c1:example.com"),
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.create",
+            Some(""),
+            json!({"creator": ALICE_USER_ID.as_str(), "room_version": "11"}),
+        );
+        let result = store.create_room(&bad, &[]).await;
+        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
 
     // R3d: m.room.create with non-empty prev_events is rejected. v12 spec:
@@ -272,13 +262,11 @@ mod tests {
             *ALICE_USER_ID,
             "m.room.create",
             Some(""),
-            &format!(
-                r#"{{
-                "content": {{"creator": "@alice:example.com", "room_version": "{ROOM_VERSION_ID}"}},
+            r#"{
+                "content": {"creator": "@alice:example.com", "room_version": "12"},
                 "prev_events": ["$ghost:example.com"],
                 "prev_state_events": []
-            }}"#
-            ),
+            }"#,
         );
         let result = store.create_room(&bad, &[]).await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
@@ -298,13 +286,11 @@ mod tests {
             *ALICE_USER_ID,
             "m.room.create",
             Some(""),
-            &format!(
-                r#"{{
-                "content": {{"creator": "@alice:example.com", "room_version": "{ROOM_VERSION_ID}"}},
+            r#"{
+                "content": {"creator": "@alice:example.com", "room_version": "12"},
                 "prev_events": [],
                 "prev_state_events": ["$ghost:example.com"]
-            }}"#
-            ),
+            }"#,
         );
         let result = store.create_room(&bad, &[]).await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
@@ -416,7 +402,7 @@ mod tests {
             *ALICE_USER_ID,
             "m.room.member",
             Some(""),
-            json!({"creator": ALICE_USER_ID.as_str(), "room_version": ROOM_VERSION_ID}),
+            json!({"creator": ALICE_USER_ID.as_str(), "room_version": "12"}),
         );
         let result = store.create_room(&bad, &[]).await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
@@ -434,7 +420,7 @@ mod tests {
             *ALICE_USER_ID,
             "m.room.create",
             None,
-            json!({"creator": ALICE_USER_ID.as_str(), "room_version": ROOM_VERSION_ID}),
+            json!({"creator": ALICE_USER_ID.as_str(), "room_version": "12"}),
         );
         let result = store.create_room(&bad, &[]).await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
@@ -451,7 +437,7 @@ mod tests {
             *ALICE_USER_ID,
             "m.room.create",
             Some("not-empty"),
-            json!({"creator": ALICE_USER_ID.as_str(), "room_version": ROOM_VERSION_ID}),
+            json!({"creator": ALICE_USER_ID.as_str(), "room_version": "12"}),
         );
         let result = store.create_room(&bad, &[]).await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
@@ -474,12 +460,9 @@ mod tests {
         let initial_member = member_join(member_id, *ALICE_ROOM_ID, *ALICE_USER_ID);
         store.create_room(&ce, &[initial_member]).await.unwrap();
 
-        // (a) room version round-trips as the MSC4242 unstable id. ruma
-        //     doesn't model MSC4242, so this comes back as
-        //     `RoomVersionId::Custom(...)` rather than `V12` (the bare
-        //     `"12"` variant — different wire string).
+        // (a) room version round-trips as V12.
         let v = store.get_room_version(*ALICE_ROOM_ID).await.unwrap();
-        assert_eq!(v, Some(RoomVersionId::from_str(ROOM_VERSION_ID).unwrap()));
+        assert_eq!(v, Some(RoomVersionId::V12));
 
         // (b) both events observable via `get_events`.
         let got = store.get_events(&[create_id, member_id]).await.unwrap();
@@ -730,21 +713,20 @@ mod tests {
         assert!(stream.is_empty());
     }
 
-    // R20: the schema-level `CHECK (room_version = 'org.matrix.msc4242.12')`
-    // on `rooms` rejects any attempt to write a different room_version,
-    // including the bypass path this test exercises (raw UPDATE outside
-    // the trait's `create_room` validation gate). Before the CHECK,
-    // `get_room_version` had to defensively parse the column on read and
-    // map a failure to `Internal`; now the bad row can't exist in the
-    // first place, so the defence-in-depth has moved one layer down.
+    // R20: malformed `room_version` in a DB row surfaces from
+    // `get_room_version` as `Internal`, not `InvalidInput`. The schema
+    // doesn't `CHECK` the column, so a future bug or manual SQL edit
+    // could put garbage there; this asserts the mapping. Bypasses
+    // `create_room`'s validation gate by overwriting after a successful
+    // create.
     #[tokio::test]
-    async fn rooms_check_constraint_rejects_non_msc4242_room_version() {
+    async fn get_room_version_internal_for_malformed_db_row() {
         let store = store().await;
         let ce = create_event(event_id!("$c1:example.com"), *ALICE_ROOM_ID, *ALICE_USER_ID);
         store.create_room(&ce, &[]).await.unwrap();
 
         let room = ALICE_ROOM_ID.to_owned();
-        let result = store
+        store
             .run_write(move |conn| -> Result<(), Error> {
                 conn.execute(
                     "UPDATE rooms SET room_version = ? WHERE room_id = ?",
@@ -752,12 +734,10 @@ mod tests {
                 )?;
                 Ok(())
             })
-            .await;
-        let err = result.expect_err("CHECK constraint must reject empty room_version");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("CHECK constraint failed"),
-            "expected CHECK violation, got: {msg}"
-        );
+            .await
+            .unwrap();
+
+        let result = store.get_room_version(*ALICE_ROOM_ID).await;
+        assert!(matches!(result, Err(StorageError::Internal(_))));
     }
 }

@@ -87,6 +87,5 @@ Report every issue you find, including ones you are uncertain about or consider 
 Do not filter for importance or confidence at this stage - a separate verification step will do that.
 Your goal here is coverage: it is better to surface a finding that later gets filtered out than to silently drop a real bug.
 For each finding, include your confidence level and an estimated severity so a downstream filter can rank them.
-Number each issue so they can be referred to downstream.
 
 Reviewing code may be supplied via patch/diff files.

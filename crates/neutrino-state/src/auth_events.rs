@@ -113,7 +113,6 @@ mod tests {
     use super::*;
     use crate::RoomVersion;
     use crate::validate::parse_event;
-    use neutrino_common::ROOM_VERSION_ID;
     use serde_json::{Value, json};
     use std::collections::{HashMap, HashSet};
 
@@ -172,7 +171,7 @@ mod tests {
         v["type"] = json!("m.room.create");
         v["sender"] = json!("@alice:example.org");
         v.as_object_mut().unwrap().remove("room_id");
-        v["content"] = json!({ "room_version": ROOM_VERSION_ID });
+        v["content"] = json!({ "room_version": "12" });
         v["state_key"] = json!("");
         let ev = make_event(v, "$create:example.org");
         assert!(auth_event_keys(&ev).is_empty());

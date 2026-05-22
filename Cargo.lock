@@ -995,16 +995,14 @@ dependencies = [
  "async-trait",
  "axum",
  "neutrino-common",
+ "neutrino-sqlite",
  "neutrino-store",
- "neutrino-store-sqlite",
  "rand",
  "ruma",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror",
  "tokio",
- "tower",
  "tower-http",
  "tracing",
 ]
@@ -1033,7 +1031,6 @@ dependencies = [
 name = "neutrino-state"
 version = "0.1.0"
 dependencies = [
- "neutrino-common",
  "proptest",
  "ruma",
  "serde",
@@ -1059,7 +1056,6 @@ dependencies = [
  "async-trait",
  "deadpool-sqlite",
  "lazy_static",
- "neutrino-common",
  "neutrino-store",
  "ruma",
  "serde",

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -8,94 +8,50 @@ use axum::{
     Json, Router,
     extract::{Query, State},
     http::StatusCode,
-    response::IntoResponse,
     routing::{get, post, put},
 };
-use neutrino_common::{Config, ROOM_VERSION_ID};
-use neutrino_store::{EventStore, RoomStore, StateStore, StorageError, StoredEvent};
-use neutrino_store_sqlite::SqliteStore;
+use neutrino_common::Config;
+use neutrino_sqlite::Store;
 use rand::{Rng, distr::Alphanumeric};
-use ruma::api::client::sync::sync_events::v5;
-use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
-use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
+use serde::Serialize;
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
 mod sliding_sync;
 
-use sliding_sync::{SyncError, SyncState};
-
+#[derive(Debug)]
 struct App {
-    store: Arc<SqliteStore>,
-    sync_state: Arc<SyncState<SqliteStore>>,
+    store: Store,
     keys: Option<Value>,
     config: Config,
-    /// Kept alive for the lifetime of the server; `NamedTempFile::drop`
-    /// removes the underlying db file. Held here so the path stays valid
-    /// for as long as `store` is in use.
-    _db_tempfile: NamedTempFile,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AppState(Arc<Mutex<App>>);
 
-/// Lock `App`, recovering from `PoisonError` by taking the inner value.
-/// `App`'s fields hold no invariants that can be broken by a panic
-/// mid-write (each field is independently meaningful), so the poison
-/// flag carries no useful signal — `.unwrap()` would crash every
-/// subsequent request once any handler ever panicked under the lock.
-fn lock_app(state: &AppState) -> std::sync::MutexGuard<'_, App> {
-    state.0.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Errors `AppState::new` (and therefore `router` / `serve`) can surface.
-/// Distinct from `std::io::Error` because the failure modes are storage,
-/// not networking.
-#[derive(Debug, thiserror::Error)]
-pub enum StartupError {
-    #[error("creating db tempfile: {0}")]
-    Tempfile(#[from] std::io::Error),
-    #[error("opening sqlite store: {0}")]
-    Store(#[from] StorageError),
-}
-
 impl AppState {
-    async fn new(config: Config) -> Result<Self, StartupError> {
-        // File-backed SQLite on a tempfile. `SqliteStore::open_in_memory`
-        // exists but its shared-cache mode is unsafe for the concurrent
-        // reader+writer workloads sliding-sync long-polls drive — see
-        // the `open_in_memory` doc-comment.
-        let tempfile = NamedTempFile::new()?;
-        let store = Arc::new(SqliteStore::open(tempfile.path()).await?);
-        let sync_state = Arc::new(SyncState::new(store.clone()));
+    fn new(config: Config) -> Self {
         let app = App {
-            store,
-            sync_state,
+            store: Store::open_in_memory(),
             keys: None,
             config,
-            _db_tempfile: tempfile,
         };
-        Ok(AppState(Arc::new(Mutex::new(app))))
+        AppState(Arc::new(Mutex::new(app)))
     }
 }
 
-pub async fn serve(listener: TcpListener, config: Config) -> Result<(), StartupError> {
-    let router = router(config).await?;
-    axum::serve(listener, router)
-        .await
-        .map_err(StartupError::Tempfile)?;
+pub async fn serve(listener: TcpListener, config: Config) -> Result<(), std::io::Error> {
+    axum::serve(listener, router(config)).await?;
     Ok(())
 }
 
-pub async fn router(config: Config) -> Result<Router, StartupError> {
-    let state = AppState::new(config.clone()).await?;
+fn router(config: Config) -> Router {
+    let state = AppState::new(config.clone());
     let user_id = config.user_id();
 
-    let router = Router::new()
+    Router::new()
         .route("/", get(root))
         .route("/_matrix/client/versions", get(versions))
         .route(
@@ -138,8 +94,7 @@ pub async fn router(config: Config) -> Result<Router, StartupError> {
         .route("/_matrix/client/v3/pushers/set", post(pushers_set))
         .fallback(default_fallback)
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
-    Ok(router)
+        .with_state(state)
 }
 
 fn mint_id(prefix: char, server_name: &str, len: usize) -> String {
@@ -185,7 +140,7 @@ async fn post_register(state: State<AppState>, body: Json<Value>) -> (StatusCode
         );
     }
 
-    let app = lock_app(&state.0);
+    let app = state.0.0.lock().unwrap();
     let device_id = body
         .0
         .pointer("/device_id")
@@ -207,7 +162,7 @@ async fn post_register(state: State<AppState>, body: Json<Value>) -> (StatusCode
 async fn post_login(state: State<AppState>) -> Json<Value> {
     info!("Logged in");
 
-    let app = lock_app(&state.0);
+    let app = state.0.0.lock().unwrap();
     let user_id = app.config.user_id();
     let server_name = app.config.server_name.clone();
 
@@ -219,154 +174,164 @@ async fn post_login(state: State<AppState>) -> Json<Value> {
     }))
 }
 
-/// MSC4186 sliding-sync entrypoint. The actual work is in
-/// `sliding_sync::handle`; this wrapper handles the HTTP/JSON edge:
-/// - assembles a `v5::Request` from the JSON body plus query string (`pos`,
-///   `timeout` live on the URL per ruma's annotations);
-/// - clones the `Arc<SyncState>` out from under the std-mutex'd `AppState`
-///   so we don't hold a `!Send` lock across `.await`;
-/// - maps `SyncError` to the spec's HTTP / errcode shape.
+#[derive(Serialize)]
+struct SyncRoom {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initial: Option<bool>,
+    required_state: Vec<Value>,
+    timeline: Vec<Value>,
+    membership: String,
+}
+
 async fn sync(
     state: State<AppState>,
     query: Query<HashMap<String, String>>,
     body: Json<Value>,
-) -> axum::response::Response {
-    let body_value = body.0;
-    let (sync_state, user_id_str) = {
-        let app = lock_app(&state.0);
-        (app.sync_state.clone(), app.config.user_id())
-    };
+) -> Json<Value> {
+    let pos: i64 = query.get("pos").map(|s| s.parse().unwrap()).unwrap_or(0);
+    let timeout: i64 = query
+        .get("timeout")
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(0);
 
-    let user_id: ruma::OwnedUserId = match user_id_str.as_str().try_into() {
-        Ok(u) => u,
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "M_UNKNOWN",
-                &e.to_string(),
-            );
-        }
-    };
+    info!("Received sync with pos: {}, {:?}", pos, body.0);
 
-    let req = match build_sync_request(&query.0, body_value) {
-        Ok(r) => r,
-        Err(e) => return error_response(StatusCode::BAD_REQUEST, "M_BAD_JSON", &e.to_string()),
-    };
-
-    match sliding_sync::handle(&sync_state, &user_id, req).await {
-        Ok(resp) => (StatusCode::OK, Json(SyncResponseWire::from(resp))).into_response(),
-        Err(SyncError::UnknownPos) => {
-            error_response(StatusCode::BAD_REQUEST, "M_UNKNOWN_POS", "Unknown position")
-        }
-        Err(SyncError::BadRequest(msg)) => {
-            error_response(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", msg)
-        }
-        Err(SyncError::Storage(e)) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "M_UNKNOWN",
-            &e.to_string(),
-        ),
-    }
-}
-
-/// Build a `v5::Request` from the JSON body plus the `pos` and `timeout`
-/// query parameters. The body fields (`conn_id`, `txn_id`, `lists`,
-/// `room_subscriptions`, `extensions`) come from JSON; the query fields
-/// override whatever was in the body.
-///
-/// Ruma's `#[request]` macro doesn't derive plain `Deserialize` on
-/// `v5::Request` (it generates an `IncomingRequest` impl meant for
-/// reconstructing the full HTTP request shape). The inner field types DO
-/// derive `Deserialize`, so we go through a thin wrapper that mirrors only
-/// the body-side fields and copy them onto a fresh `v5::Request`.
-fn build_sync_request(
-    query: &HashMap<String, String>,
-    body: Value,
-) -> Result<v5::Request, serde_json::Error> {
-    let body_typed: SyncRequestBody =
-        if body.is_null() || matches!(&body, Value::Object(m) if m.is_empty()) {
-            SyncRequestBody::default()
-        } else {
-            serde_json::from_value(body)?
-        };
-
-    let mut req = v5::Request::new();
-    req.conn_id = body_typed.conn_id;
-    req.txn_id = body_typed.txn_id;
-    req.lists = body_typed.lists;
-    req.room_subscriptions = body_typed.room_subscriptions;
-    req.extensions = body_typed.extensions;
-
-    if let Some(p) = query.get("pos") {
-        req.pos = Some(p.clone());
-    }
-    if let Some(t) = query.get("timeout")
-        && let Ok(ms) = t.parse::<u64>()
-    {
-        req.timeout = Some(Duration::from_millis(ms));
-    }
-    Ok(req)
-}
-
-/// Deserializable mirror of the *body* half of `v5::Request`. The query
-/// fields (`pos`, `timeout`, `set_presence`) are handled separately.
-#[derive(Default, Deserialize)]
-struct SyncRequestBody {
-    #[serde(default)]
-    conn_id: Option<String>,
-    #[serde(default)]
-    txn_id: Option<String>,
-    #[serde(default)]
-    lists: BTreeMap<String, v5::request::List>,
-    #[serde(default)]
-    room_subscriptions: BTreeMap<OwnedRoomId, v5::request::RoomSubscription>,
-    #[serde(default)]
-    extensions: v5::request::Extensions,
-}
-
-/// Serializable mirror of `v5::Response`. Same trick — ruma's `#[response]`
-/// macro doesn't derive plain `Serialize` on the outer type, but its inner
-/// field types do.
-#[derive(Serialize)]
-struct SyncResponseWire {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    txn_id: Option<String>,
-    pos: String,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    lists: BTreeMap<String, v5::response::List>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    rooms: BTreeMap<OwnedRoomId, v5::response::Room>,
-    #[serde(skip_serializing_if = "extensions_is_empty")]
-    extensions: v5::response::Extensions,
-}
-
-impl From<v5::Response> for SyncResponseWire {
-    fn from(r: v5::Response) -> Self {
-        Self {
-            txn_id: r.txn_id,
-            pos: r.pos,
-            lists: r.lists,
-            rooms: r.rooms,
-            extensions: r.extensions,
+    let mut lists = HashMap::<String, Value>::new();
+    if let Some(lists_json) = body.0.pointer("/lists").and_then(|v| v.as_object()) {
+        let app = state.0.0.lock().unwrap();
+        let count = app.store.count_distinct_rooms();
+        for list_name in lists_json.keys() {
+            lists.insert(list_name.clone(), json!({"count": count}));
         }
     }
-}
 
-fn extensions_is_empty(e: &v5::response::Extensions) -> bool {
-    e.to_device.is_none()
-        && e.e2ee.device_lists.is_empty()
-        && e.e2ee.device_one_time_keys_count.is_empty()
-        && e.e2ee.device_unused_fallback_key_types.is_none()
-}
+    let user_id = state.0.0.lock().unwrap().config.user_id();
 
-fn error_response(status: StatusCode, errcode: &str, error: &str) -> axum::response::Response {
-    (status, Json(json!({"errcode": errcode, "error": error}))).into_response()
+    if !query.contains_key("pos") {
+        return Json(json!({
+            "pos": pos.to_string(),
+            "lists": lists,
+            "rooms": {},
+            "extensions": {
+                "e2ee": {
+                    "device_one_time_keys_count": {
+                        "signed_curve25519": 100
+                    },
+                    "device_lists": {
+                        "changed": [user_id],
+                        "left": []
+                    },
+                    "device_unused_fallback_key_types": [
+                        "signed_curve25519"
+                    ]
+                },
+                "to_device": {"next_batch": "12345"}
+            }
+        }));
+    }
+
+    loop {
+        if !lists.is_empty() {
+            let app = state.0.0.lock().unwrap();
+            let rows = app.store.events_after(pos);
+
+            let mut max_pos = pos;
+            let mut events_by_room: HashMap<String, Vec<Value>> = HashMap::new();
+            for (stream_ordering, room_id, event) in rows {
+                max_pos = stream_ordering;
+                events_by_room.entry(room_id).or_default().push(event);
+            }
+
+            if !events_by_room.is_empty() {
+                info!(
+                    "Returning {} rooms with events up to pos {}",
+                    events_by_room.len(),
+                    max_pos
+                );
+
+                let mut rooms_json = HashMap::new();
+                for (room_id, events) in events_by_room {
+                    let mut entry = SyncRoom {
+                        name: None,
+                        initial: None,
+                        required_state: vec![],
+                        timeline: vec![],
+                        membership: "join".to_string(),
+                    };
+
+                    for event in events {
+                        if event.get("type") == Some(&Value::String("m.room.create".to_string())) {
+                            entry.initial = Some(true);
+                        }
+
+                        if event.get("type") == Some(&Value::String("m.room.name".to_string())) {
+                            entry.name = event
+                                .pointer("/content/name")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                        }
+
+                        if event.get("state_key").is_some() {
+                            entry.required_state.push(event.clone());
+                        }
+
+                        entry.timeline.push(event);
+                    }
+
+                    rooms_json.insert(room_id, entry);
+                }
+
+                let room_count = app.store.count_distinct_rooms();
+
+                for list in lists.values_mut() {
+                    list.as_object_mut()
+                        .unwrap()
+                        .insert("count".to_string(), json!(room_count));
+                }
+
+                return Json(json!({
+                    "pos": max_pos.to_string(),
+                    "lists": lists,
+                    "rooms": rooms_json,
+                    "extensions": {
+                        "e2ee": {
+                            "device_one_time_keys_count": {
+                                "signed_curve25519": 100
+                            },
+                        },
+                        "to_device": {"next_batch": "12345"}
+                    }
+                }));
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        if timeout == 0 {
+            info!("No new events, returning empty sync");
+            return Json(json!({
+                "pos": pos.to_string(),
+                "lists": lists,
+                "rooms": {},
+                "extensions": {
+                    "e2ee": {
+                        "device_one_time_keys_count": {
+                            "signed_curve25519": 100
+                        },
+                    },
+                    "to_device": {"next_batch": "12345"}
+                }
+            }));
+        }
+    }
 }
 
 async fn keys_query(state: State<AppState>, body: Json<Value>) -> Json<Value> {
     info!("Received query: {:?}", body.0);
 
-    if let Some(keys) = &lock_app(&state.0).keys {
+    if let Some(keys) = &state.0.0.lock().unwrap().keys {
         info!(
             "Returning stored keys: {}",
             serde_json::to_string(&keys).unwrap()
@@ -382,7 +347,7 @@ async fn keys_query(state: State<AppState>, body: Json<Value>) -> Json<Value> {
 async fn keys_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
     info!("Received keys upload: {:?}", body.0);
 
-    let mut app = lock_app(&state.0);
+    let mut app = state.0.0.lock().unwrap();
     let body = body.0;
 
     if app.keys.is_none() {
@@ -402,7 +367,7 @@ async fn keys_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
 }
 
 async fn device_signing_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
-    let mut app = lock_app(&state.0);
+    let mut app = state.0.0.lock().unwrap();
 
     let mut body = body.0;
     body.as_object_mut().unwrap().remove("auth");
@@ -418,7 +383,7 @@ async fn device_signing_upload(state: State<AppState>, body: Json<Value>) -> Jso
 
 async fn signatures_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
     info!("Received signatures upload: {:?}", body.0);
-    let mut app = lock_app(&state.0);
+    let mut app = state.0.0.lock().unwrap();
     let user_id = app.config.user_id();
 
     let sigs = body
@@ -474,27 +439,20 @@ async fn get_room_keys() -> (StatusCode, Json<Value>) {
     )
 }
 
-async fn create_room(state: State<AppState>, body: Json<Value>) -> axum::response::Response {
-    let (store, server_name, user_id) = {
-        let app = lock_app(&state.0);
-        (
-            app.store.clone(),
-            app.config.server_name.clone(),
-            app.config.user_id(),
-        )
-    };
-
+async fn create_room(state: State<AppState>, body: Json<Value>) -> Json<Value> {
+    let mut app = state.0.0.lock().unwrap();
+    let server_name = app.config.server_name.clone();
+    let user_id = app.config.user_id();
     let room_id = mint_id('!', &server_name, 7);
 
-    // v12 / MSC4242: the creator is implicit (taken from `sender`); the
-    // explicit `content.creator` field that v11 carried is deprecated.
     let create_event = json!({
         "type": "m.room.create",
         "state_key": "",
         "sender": user_id,
         "room_id": room_id,
         "content": {
-            "room_version": ROOM_VERSION_ID
+            "creator": user_id,
+            "room_version": "12"
         },
         "origin_server_ts": 0,
         "event_id": mint_id('$', &server_name, 10),
@@ -530,65 +488,23 @@ async fn create_room(state: State<AppState>, body: Json<Value>) -> axum::respons
         events.push(name_event);
     }
 
-    // SqliteStore requires `create_room` to register the room before any
-    // `persist_event` calls succeed. The create event lands via the trait's
-    // dedicated path; member-join + (optional) name come through alongside
-    // as `initial_events` so the whole thing is one transaction.
-    let mut stored: Vec<StoredEvent> = match events.iter().map(stored_event_from_json).collect() {
-        Some(v) => v,
-        None => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "M_UNKNOWN",
-                "failed to build create_room PDUs",
-            );
-        }
-    };
-    let create = stored.remove(0);
-    if let Err(e) = store.create_room(&create, &stored).await {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "M_UNKNOWN",
-            &e.to_string(),
-        );
-    }
+    app.store.insert_events(&events);
 
-    (StatusCode::OK, Json(json!({"room_id": room_id}))).into_response()
+    Json(json!({
+        "room_id": room_id,
+    }))
 }
 
 async fn members(
     state: State<AppState>,
     axum::extract::Path(room_id): axum::extract::Path<String>,
-) -> axum::response::Response {
-    let store = lock_app(&state.0).store.clone();
-    let rid = match ruma::OwnedRoomId::try_from(room_id.as_str()) {
-        Ok(r) => r,
-        Err(e) => {
-            return error_response(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", &e.to_string());
-        }
-    };
-    let map = match store
-        .current_state_events_of_type(&rid, "m.room.member")
-        .await
-    {
-        Ok(m) => m,
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "M_UNKNOWN",
-                &e.to_string(),
-            );
-        }
-    };
-    // Per spec (https://spec.matrix.org/v1.18/client-server-api/#get_matrixclientv3roomsroomidmembers)
-    // the default response includes members of every membership; filtering
-    // is opt-in via `membership` / `not_membership` query params (which we
-    // don't honour — see PLAN.md non-goals).
-    let chunk: Vec<Value> = map
-        .into_values()
-        .filter_map(|ev| serde_json::from_str::<Value>(ev.json.get()).ok())
-        .collect();
-    (StatusCode::OK, Json(json!({"chunk": chunk}))).into_response()
+) -> Json<Value> {
+    let app = state.0.0.lock().unwrap();
+    let members = app.store.members_of(&room_id);
+
+    Json(json!({
+        "chunk": members
+    }))
 }
 
 async fn put_event(
@@ -599,72 +515,25 @@ async fn put_event(
         String,
     )>,
     body: Json<Value>,
-) -> axum::response::Response {
-    let (store, server_name, user_id) = {
-        let app = lock_app(&state.0);
-        (
-            app.store.clone(),
-            app.config.server_name.clone(),
-            app.config.user_id(),
-        )
-    };
+) -> Json<Value> {
+    let mut app = state.0.0.lock().unwrap();
+    let server_name = app.config.server_name.clone();
+    let user_id = app.config.user_id();
 
     let event_id = mint_id('$', &server_name, 10);
 
-    let pdu = json!({
+    app.store.insert_events(&[json!({
         "room_id": room_id,
         "type": event_type,
         "sender": user_id,
         "event_id": event_id,
         "content": body.0,
         "origin_server_ts": 0,
-    });
-    let Some(stored) = stored_event_from_json(&pdu) else {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "M_UNKNOWN",
-            "failed to build PDU",
-        );
-    };
-    if let Err(e) = store.persist_event(&stored, &[]).await {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "M_UNKNOWN",
-            &e.to_string(),
-        );
-    }
+    })]);
 
-    (StatusCode::OK, Json(json!({"event_id": event_id}))).into_response()
-}
-
-/// Parse a hand-built PDU `serde_json::Value` into a `StoredEvent`. Used by
-/// the legacy CSAPI write handlers (`createRoom`, `put_event`). Returns
-/// `None` on any required-field-missing path — callers built the PDU
-/// themselves, so a malformed value is a programmer error, not a client
-/// error.
-fn stored_event_from_json(value: &Value) -> Option<StoredEvent> {
-    let event_id: OwnedEventId = value.get("event_id")?.as_str()?.try_into().ok()?;
-    let room_id: OwnedRoomId = value.get("room_id")?.as_str()?.try_into().ok()?;
-    let event_type = value.get("type")?.as_str()?.to_string();
-    let state_key = value
-        .get("state_key")
-        .and_then(|s| s.as_str())
-        .map(String::from);
-    let sender: OwnedUserId = value.get("sender")?.as_str()?.try_into().ok()?;
-    let origin_server_ts = value
-        .get("origin_server_ts")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let json: Box<RawValue> = serde_json::value::to_raw_value(value).ok()?;
-    Some(StoredEvent {
-        event_id,
-        room_id,
-        event_type,
-        state_key,
-        sender,
-        origin_server_ts,
-        json,
-    })
+    Json(json!({
+        "event_id": event_id,
+    }))
 }
 
 async fn pushers_set() -> (StatusCode, Json<Value>) {

@@ -14,10 +14,6 @@
 
 mod common;
 
-use std::str::FromStr;
-use std::time::Duration;
-
-use neutrino_common::ROOM_VERSION_ID;
 use neutrino_store::{
     EventStore, FederationInbox, FederationOutbox, RoomStore, StateStore, StreamPos,
 };
@@ -28,27 +24,6 @@ use tempfile::NamedTempFile;
 use common::{
     ALICE_ROOM_ID, ALICE_USER_ID, CREATE_EVENT_ID, create_event, member_join, message, name_event,
 };
-
-/// Wait for `deadpool-sync` to actually close the previous store's
-/// connections before reopening the same path.
-///
-/// `SyncWrapper::Drop` fires `sqlite3_close` onto tokio's blocking pool via
-/// `spawn_blocking_background` — no `JoinHandle`, so we can't `await` it.
-/// On a constrained runtime (current-thread tokio, low core count) the
-/// immediate reopen can race against the still-running close on the same
-/// path and stall inside SQLite's WAL recovery, surfacing as an indefinite
-/// test hang. Forcing a blocking-pool round-trip + a brief sleep gives the
-/// queued close tasks time to release POSIX SHM locks before the reopen's
-/// `Connection::open` competes for them. Same race the 2026-05-21 schema
-/// tests hit; they sidestepped it by moving their raw `Connection::open`
-/// calls into `spawn_blocking` (which by happenstance bridged the same
-/// gap). This helper is the explicit, documented version of that bridge.
-async fn settle_close_race() {
-    tokio::task::spawn_blocking(|| {})
-        .await
-        .expect("blocking-pool round-trip");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-}
 
 /// Comprehensive restart-survival test: populate every durable trait
 /// surface (events, current_state, outbox, client_txns,
@@ -128,7 +103,6 @@ async fn restart_preserves_all_state() {
     };
 
     // ---- Process 2: reopen and verify. ----
-    settle_close_race().await;
     let s = SqliteStore::open(path).await.expect("reopen");
 
     // Watch must seed from MAX(stream_pos) — the durability contract
@@ -144,7 +118,7 @@ async fn restart_preserves_all_state() {
         .get_room_version(*ALICE_ROOM_ID)
         .await
         .expect("get_room_version");
-    assert_eq!(v, Some(RoomVersionId::from_str(ROOM_VERSION_ID).unwrap()));
+    assert_eq!(v, Some(RoomVersionId::V12));
 
     // All four events readable via the stream.
     let events = s
@@ -228,7 +202,6 @@ async fn restart_empty_db_seeds_watch_at_zero() {
         let _ = SqliteStore::open(path).await.expect("first open");
     }
 
-    settle_close_race().await;
     let s = SqliteStore::open(path).await.expect("reopen");
     assert_eq!(
         *s.subscribe().borrow(),
