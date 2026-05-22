@@ -139,7 +139,7 @@ mod tests {
     }
 
     fn make_event(v: Value, id: &str) -> Event {
-        parse_event(raw(v), eid(id), RoomVersion::V12).expect("valid test event")
+        parse_event(raw(v), eid(id), vec![], RoomVersion::V12).expect("valid test event")
     }
 
     fn member(sender: &str, target: &str, content: Value, id: &str) -> Event {

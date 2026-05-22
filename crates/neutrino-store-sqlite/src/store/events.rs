@@ -2,9 +2,7 @@
 
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{OptionalExtension, params, params_from_iter};
-use neutrino_store::{
-    Direction, EventStore, PaginationToken, StorageError, StoredEvent, StreamPos,
-};
+use neutrino_store::{Direction, Event, EventStore, PaginationToken, StorageError, StreamPos};
 use ruma::{EventId, OwnedEventId, OwnedServerName, RoomId, ServerName, UserId};
 use tokio::sync::watch;
 
@@ -18,7 +16,7 @@ use crate::{
 impl EventStore for SqliteStore {
     async fn persist_event(
         &self,
-        event: &StoredEvent,
+        event: &Event,
         destinations: &[&ServerName],
     ) -> Result<(), StorageError> {
         let event = EventRow::from(event).to_owned();
@@ -33,7 +31,7 @@ impl EventStore for SqliteStore {
 
             // Outbox: one row per destination, idempotent via the
             // UNIQUE(destination, event_id) constraint. `event.event_id`
-            // resolves through `EventRow: Deref<Target = StoredEvent>`.
+            // resolves through `EventRow: Deref<Target = Event>`.
             {
                 let mut stmt = tx.prepare(
                     "INSERT OR IGNORE INTO outbox (destination, event_id) VALUES (?, ?)",
@@ -54,7 +52,7 @@ impl EventStore for SqliteStore {
         .await
     }
 
-    async fn persist_historical_event(&self, event: &StoredEvent) -> Result<(), StorageError> {
+    async fn persist_historical_event(&self, event: &Event) -> Result<(), StorageError> {
         let event = EventRow::from(event).to_owned();
         let watch_tx = self.watch_tx.clone();
 
@@ -128,13 +126,13 @@ impl EventStore for SqliteStore {
         .await
     }
 
-    async fn get_events(&self, ids: &[&EventId]) -> Result<Vec<StoredEvent>, StorageError> {
+    async fn get_events(&self, ids: &[&EventId]) -> Result<Vec<Event>, StorageError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
         let ids: Vec<String> = ids.iter().map(|e| e.as_str().to_owned()).collect();
 
-        self.run_read(move |conn| -> Result<Vec<StoredEvent>, Error> {
+        self.run_read(move |conn| -> Result<Vec<Event>, Error> {
             // SQLite caps host parameters per statement (default 999 on
             // older builds, 32766 on 3.32+; the bundled rusqlite tracks
             // this). Chunk the `IN (?, …)` query so callers can pass any
@@ -169,35 +167,33 @@ impl EventStore for SqliteStore {
         &self,
         pos: StreamPos,
         limit: usize,
-    ) -> Result<Vec<(StreamPos, StoredEvent)>, StorageError> {
+    ) -> Result<Vec<(StreamPos, Event)>, StorageError> {
         let pos = i64::try_from(pos.0)
             .map_err(|_| Error::InvalidInput(format!("StreamPos {} exceeds i64::MAX", pos.0)))?;
         let limit_i64 = i64::try_from(limit)
             .map_err(|_| Error::InvalidInput(format!("limit {limit} exceeds i64::MAX")))?;
 
-        self.run_read(
-            move |conn| -> Result<Vec<(StreamPos, StoredEvent)>, Error> {
-                let query = format!(
-                    "SELECT stream_pos, {EVENT_COLUMNS} FROM events \
+        self.run_read(move |conn| -> Result<Vec<(StreamPos, Event)>, Error> {
+            let query = format!(
+                "SELECT stream_pos, {EVENT_COLUMNS} FROM events \
                  WHERE stream_pos > ? ORDER BY stream_pos ASC LIMIT ?"
-                );
-                let mut stmt = conn.prepare(&query)?;
-                let rows = stmt.query_map(params![pos, limit_i64], |row| {
-                    let stream_pos: i64 = row.get("stream_pos")?;
-                    Ok((stream_pos, EventRow::try_from(row)))
-                })?;
+            );
+            let mut stmt = conn.prepare(&query)?;
+            let rows = stmt.query_map(params![pos, limit_i64], |row| {
+                let stream_pos: i64 = row.get("stream_pos")?;
+                Ok((stream_pos, EventRow::try_from(row)))
+            })?;
 
-                let mut out = Vec::new();
-                for r in rows {
-                    let (sp, ev) = r?;
-                    let sp = u64::try_from(sp).map_err(|_| {
-                        Error::Internal(format!("Invalid negative stream_pos {sp} in events table"))
-                    })?;
-                    out.push((StreamPos(sp), ev?.into_event()));
-                }
-                Ok(out)
-            },
-        )
+            let mut out = Vec::new();
+            for r in rows {
+                let (sp, ev) = r?;
+                let sp = u64::try_from(sp).map_err(|_| {
+                    Error::Internal(format!("Invalid negative stream_pos {sp} in events table"))
+                })?;
+                out.push((StreamPos(sp), ev?.into_event()));
+            }
+            Ok(out)
+        })
         .await
     }
 
@@ -207,7 +203,7 @@ impl EventStore for SqliteStore {
         from: Option<PaginationToken>,
         dir: Direction,
         limit: usize,
-    ) -> Result<(Vec<StoredEvent>, Option<PaginationToken>), StorageError> {
+    ) -> Result<(Vec<Event>, Option<PaginationToken>), StorageError> {
         let room_id = room_id.to_owned();
         // Fetch one extra row so we can distinguish "exactly `limit`
         // events remain" (post-condition: return `None` token) from
@@ -231,7 +227,7 @@ impl EventStore for SqliteStore {
         };
 
         self.run_read(
-            move |conn| -> Result<(Vec<StoredEvent>, Option<PaginationToken>), Error> {
+            move |conn| -> Result<(Vec<Event>, Option<PaginationToken>), Error> {
                 // Pre-condition (trait: "the room must exist"). Surface a
                 // violation rather than silently returning empty — caller
                 // wants a fault, not a successful no-op.
@@ -401,10 +397,10 @@ mod tests {
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
 
-    // E4a-d: `StoredEvent` columns must agree with the raw JSON copy on
+    // E4a-d: `Event` columns must agree with the raw JSON copy on
     // every axis where both are present. Defence-in-depth at the storage
     // write boundary — a buggy caller (or a future code path) that
-    // builds a `StoredEvent` with column values disagreeing with the
+    // builds a `Event` with column values disagreeing with the
     // JSON would otherwise silently desync the two surfaces (column
     // reads vs. wire re-emission).
     #[tokio::test]

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use neutrino_store::{Direction, Membership, StorageBackend, StoredEvent, StreamPos};
+use neutrino_store::{Direction, Event, Membership, StorageBackend, StreamPos};
 use ruma::UInt;
 use ruma::api::client::sync::sync_events::v5::response;
 use ruma::api::client::sync::sync_events::v5::{Request, Response};
@@ -90,7 +90,7 @@ pub(super) async fn build_response<S: StorageBackend>(
     let mut rooms_response = BTreeMap::new();
     for (room_id, combined_cfg) in &combined {
         let is_initial_for_room = !conn.sent.contains_key(room_id);
-        let room_delta: &[StoredEvent] = new_events_by_room
+        let room_delta: &[Event] = new_events_by_room
             .get(room_id)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
@@ -210,13 +210,13 @@ fn apply_sticky(conn: &mut Conn, req: &Request) {
 async fn fetch_event_deltas<S: StorageBackend>(
     state: &SyncState<S>,
     from_pos: u64,
-) -> Result<(HashMap<OwnedRoomId, Vec<StoredEvent>>, u64), SyncError> {
+) -> Result<(HashMap<OwnedRoomId, Vec<Event>>, u64), SyncError> {
     let events = state
         .store
         .events_after(StreamPos(from_pos), EVENTS_PER_SYNC_LIMIT)
         .await?;
     let mut max_pos = from_pos;
-    let mut by_room: HashMap<OwnedRoomId, Vec<StoredEvent>> = HashMap::new();
+    let mut by_room: HashMap<OwnedRoomId, Vec<Event>> = HashMap::new();
     for (pos, ev) in events {
         if pos.0 > max_pos {
             max_pos = pos.0;
@@ -367,7 +367,7 @@ async fn is_kick<S: StorageBackend>(
     else {
         return Ok(false);
     };
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(ev.json.get()) else {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(ev.raw.get()) else {
         return Ok(false);
     };
     let is_leave = parsed
@@ -545,9 +545,9 @@ async fn build_room<S: StorageBackend>(
     cfg: &CombinedCfg,
     is_initial_for_room: bool,
     is_initial_sync: bool,
-    room_delta: &[StoredEvent],
+    room_delta: &[Event],
     sent_snapshot: Option<&RoomSent>,
-) -> Result<Option<(response::Room, Vec<StoredEvent>, Vec<(String, String)>)>, SyncError> {
+) -> Result<Option<(response::Room, Vec<Event>, Vec<(String, String)>)>, SyncError> {
     let invited = is_invited(state, user_id, room_id).await?;
 
     if invited {
@@ -575,16 +575,16 @@ async fn build_room<S: StorageBackend>(
             // Drop the older events that don't fit; client backfills via
             // `prev_batch` if it wants them.
             let start = total_new - cfg.timeline_limit;
-            (room_delta[start..].iter().map(clone_event).collect(), true)
+            (room_delta[start..].to_vec(), true)
         } else {
-            (room_delta.iter().map(clone_event).collect(), false)
+            (room_delta.to_vec(), false)
         };
         (events, None, limited)
     };
 
     let timeline_raw: Vec<Raw<AnySyncTimelineEvent>> = timeline_events
         .iter()
-        .map(|e| Raw::<AnySyncTimelineEvent>::from_json(e.json.clone()))
+        .map(|e| Raw::<AnySyncTimelineEvent>::from_json(e.raw.clone()))
         .collect();
     room.timeline = timeline_raw;
     room.prev_batch = prev_batch_str;
@@ -609,7 +609,7 @@ async fn build_room<S: StorageBackend>(
     if !state_events.is_empty() || !deleted_state_keys.is_empty() {
         let mut raw: Vec<Raw<AnySyncStateEvent>> = state_events
             .iter()
-            .map(|e| Raw::<AnySyncStateEvent>::from_json(e.json.clone()))
+            .map(|e| Raw::<AnySyncStateEvent>::from_json(e.raw.clone()))
             .collect();
         for (t, k) in &deleted_state_keys {
             raw.push(state_stub_raw(t, k));
@@ -654,7 +654,7 @@ async fn is_invited<S: StorageBackend>(
         .current_state_event(room_id, "m.room.member", user_id.as_str())
         .await?;
     let Some(ev) = ev else { return Ok(false) };
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(ev.json.get()) else {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(ev.raw.get()) else {
         return Ok(false);
     };
     Ok(parsed
@@ -685,7 +685,7 @@ async fn build_invite_room<S: StorageBackend>(
     room_id: &OwnedRoomId,
     cfg: &CombinedCfg,
     is_initial_for_room: bool,
-) -> Result<Option<(response::Room, Vec<StoredEvent>, Vec<(String, String)>)>, SyncError> {
+) -> Result<Option<(response::Room, Vec<Event>, Vec<(String, String)>)>, SyncError> {
     if !is_initial_for_room {
         // The invite_room_state is fixed at invite time and doesn't change
         // until accept/reject (which would move the room out of
@@ -741,8 +741,8 @@ async fn build_invite_room<S: StorageBackend>(
 /// "couldn't read invite" error for what's basically a presentation
 /// fallback. Member counts deliberately not populated — Synapse doesn't
 /// expose them on invites either (no leakage of room size pre-accept).
-fn lift_invite_metadata(invite_event: &StoredEvent) -> (Option<String>, Option<String>) {
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(invite_event.json.get()) else {
+fn lift_invite_metadata(invite_event: &Event) -> (Option<String>, Option<String>) {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(invite_event.raw.get()) else {
         return (None, None);
     };
     let Some(arr) = parsed
@@ -786,9 +786,9 @@ fn lift_invite_metadata(invite_event: &StoredEvent) -> (Option<String>, Option<S
 /// not an array — better to surface a name-less invite than to fail the
 /// whole sync over a single malformed event.
 fn extract_invite_room_state(
-    invite_event: &StoredEvent,
+    invite_event: &Event,
 ) -> Result<Vec<Raw<AnyStrippedStateEvent>>, SyncError> {
-    let parsed: serde_json::Value = serde_json::from_str(invite_event.json.get())
+    let parsed: serde_json::Value = serde_json::from_str(invite_event.raw.get())
         .map_err(|e| SyncError::Storage(neutrino_store::StorageError::Internal(e.to_string())))?;
     let Some(arr) = parsed
         .pointer("/unsigned/invite_room_state")
@@ -809,8 +809,8 @@ fn extract_invite_room_state(
 /// Re-serialise a state event in MSC1772 stripped form: only `type`,
 /// `state_key`, `sender`, `content`. Drops `event_id`, `room_id`,
 /// `origin_server_ts`, and anything else a state PDU normally carries.
-fn strip_state_event(ev: &StoredEvent) -> Result<Raw<AnyStrippedStateEvent>, SyncError> {
-    let parsed: serde_json::Value = serde_json::from_str(ev.json.get())
+fn strip_state_event(ev: &Event) -> Result<Raw<AnyStrippedStateEvent>, SyncError> {
+    let parsed: serde_json::Value = serde_json::from_str(ev.raw.get())
         .map_err(|e| SyncError::Storage(neutrino_store::StorageError::Internal(e.to_string())))?;
     let content = parsed
         .get("content")
@@ -832,23 +832,23 @@ fn strip_state_event(ev: &StoredEvent) -> Result<Raw<AnyStrippedStateEvent>, Syn
 /// - `state_events`: new or changed entries the client hasn't seen.
 /// - `deleted_state_keys`: keys we sent before but are no longer current.
 fn diff_required_state(
-    current_state: &HashMap<(String, String), StoredEvent>,
+    current_state: &HashMap<(String, String), Event>,
     required_state: &[(StateEventType, String)],
     sent_snapshot: Option<&RoomSent>,
-) -> (Vec<StoredEvent>, Vec<(String, String)>) {
-    let filtered: Vec<(&(String, String), &StoredEvent)> = current_state
+) -> (Vec<Event>, Vec<(String, String)>) {
+    let filtered: Vec<(&(String, String), &Event)> = current_state
         .iter()
         .filter(|((t, k), _)| required_state_matches(required_state, t, k))
         .collect();
 
-    let mut state_events: Vec<StoredEvent> = Vec::new();
+    let mut state_events: Vec<Event> = Vec::new();
     for (key, ev) in &filtered {
         let already_sent = sent_snapshot
             .and_then(|s| s.required_state_keys.get(*key))
             .map(|prev_id| prev_id == &ev.event_id)
             .unwrap_or(false);
         if !already_sent {
-            state_events.push(clone_event(ev));
+            state_events.push((*ev).clone());
         }
     }
 
@@ -892,12 +892,12 @@ async fn populate_room_metadata<S: StorageBackend>(
     state: &SyncState<S>,
     room_id: &RoomId,
     room: &mut response::Room,
-    current_state: &HashMap<(String, String), StoredEvent>,
+    current_state: &HashMap<(String, String), Event>,
     bump_stamp: u64,
 ) -> Result<(), SyncError> {
     // Name.
     if let Some(ev) = current_state.get(&("m.room.name".to_string(), String::new())) {
-        let parsed: serde_json::Value = serde_json::from_str(ev.json.get()).map_err(|e| {
+        let parsed: serde_json::Value = serde_json::from_str(ev.raw.get()).map_err(|e| {
             SyncError::Storage(neutrino_store::StorageError::Internal(e.to_string()))
         })?;
         if let Some(n) = parsed.pointer("/content/name").and_then(|v| v.as_str()) {
@@ -907,7 +907,7 @@ async fn populate_room_metadata<S: StorageBackend>(
 
     // Avatar. Ruma's `JsOption<OwnedMxcUri>` distinguishes set/unset/null.
     if let Some(ev) = current_state.get(&("m.room.avatar".to_string(), String::new())) {
-        let parsed: serde_json::Value = serde_json::from_str(ev.json.get()).map_err(|e| {
+        let parsed: serde_json::Value = serde_json::from_str(ev.raw.get()).map_err(|e| {
             SyncError::Storage(neutrino_store::StorageError::Internal(e.to_string()))
         })?;
         if let Some(url) = parsed.pointer("/content/url").and_then(|v| v.as_str()) {
@@ -929,7 +929,7 @@ async fn populate_room_metadata<S: StorageBackend>(
     let invited_count = members
         .values()
         .filter(|ev| {
-            serde_json::from_str::<serde_json::Value>(ev.json.get())
+            serde_json::from_str::<serde_json::Value>(ev.raw.get())
                 .ok()
                 .and_then(|v| {
                     v.pointer("/content/membership")
@@ -976,7 +976,7 @@ fn required_state_matches(
 ///   `required_state_keys`.
 /// - For deleted state keys: drop them from `required_state_keys` so future
 ///   syncs don't keep emitting the stub.
-fn update_sent(sent: &mut RoomSent, state_events: &[StoredEvent], deleted: &[(String, String)]) {
+fn update_sent(sent: &mut RoomSent, state_events: &[Event], deleted: &[(String, String)]) {
     for ev in state_events {
         if let Some(state_key) = &ev.state_key {
             sent.required_state_keys.insert(
@@ -990,25 +990,11 @@ fn update_sent(sent: &mut RoomSent, state_events: &[StoredEvent], deleted: &[(St
     }
 }
 
-/// `StoredEvent` doesn't derive `Clone` in `neutrino-common`. Hand-clone it
-/// here in the build path.
-fn clone_event(e: &StoredEvent) -> StoredEvent {
-    StoredEvent {
-        event_id: e.event_id.clone(),
-        room_id: e.room_id.clone(),
-        event_type: e.event_type.clone(),
-        state_key: e.state_key.clone(),
-        sender: e.sender.clone(),
-        origin_server_ts: e.origin_server_ts,
-        json: e.json.clone(),
-    }
-}
-
 #[cfg(test)]
 mod unit_tests {
     use std::collections::HashMap;
 
-    use neutrino_store::StoredEvent;
+    use neutrino_common::Event;
     use ruma::events::StateEventType;
     use ruma::{event_id, room_id, user_id};
 
@@ -1046,17 +1032,22 @@ mod unit_tests {
     fn diff_required_state_detects_deletion() {
         let room = room_id!("!r:example.org");
         let user = user_id!("@u:example.org");
-        let name_ev = StoredEvent {
+        let content_value = serde_json::json!({"name": "X"});
+        let name_ev = Event {
             event_id: event_id!("$name:example.org").to_owned(),
             room_id: room.to_owned(),
             event_type: "m.room.name".to_string(),
             state_key: Some(String::new()),
             sender: user.to_owned(),
             origin_server_ts: 100,
-            json: serde_json::value::to_raw_value(&serde_json::json!({
+            content: serde_json::value::to_raw_value(&content_value).unwrap(),
+            prev_events: Vec::new(),
+            prev_state_events: Vec::new(),
+            auth_events: Vec::new(),
+            raw: serde_json::value::to_raw_value(&serde_json::json!({
                 "type": "m.room.name",
                 "state_key": "",
-                "content": {"name": "X"},
+                "content": content_value,
             }))
             .unwrap(),
         };
@@ -1069,12 +1060,9 @@ mod unit_tests {
         );
 
         // First call: name is still current → no change, no deletion.
-        let current_state: HashMap<(String, String), StoredEvent> = {
+        let current_state: HashMap<(String, String), Event> = {
             let mut m = HashMap::new();
-            m.insert(
-                ("m.room.name".to_string(), String::new()),
-                clone_for_test(&name_ev),
-            );
+            m.insert(("m.room.name".to_string(), String::new()), name_ev.clone());
             m
         };
         let rules = vec![(StateEventType::RoomName, String::new())];
@@ -1084,23 +1072,12 @@ mod unit_tests {
 
         // Second call: current state no longer has the name → deletion
         // surfaced regardless of EMIT_STATE_STUBS.
-        let empty_state: HashMap<(String, String), StoredEvent> = HashMap::new();
+        let empty_state: HashMap<(String, String), Event> = HashMap::new();
         let (changed, deleted) = diff_required_state(&empty_state, &rules, Some(&sent));
         assert!(changed.is_empty());
         assert_eq!(deleted, vec![("m.room.name".to_string(), String::new())]);
     }
 
-    fn clone_for_test(e: &StoredEvent) -> StoredEvent {
-        StoredEvent {
-            event_id: e.event_id.clone(),
-            room_id: e.room_id.clone(),
-            event_type: e.event_type.clone(),
-            state_key: e.state_key.clone(),
-            sender: e.sender.clone(),
-            origin_server_ts: e.origin_server_ts,
-            json: e.json.clone(),
-        }
-    }
     #[test]
     fn effective_range_drops_inverted_range() {
         // a > b describes an empty interval; the slicing iterator would

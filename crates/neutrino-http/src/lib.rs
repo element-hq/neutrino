@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post, put},
 };
 use neutrino_common::{Config, ROOM_VERSION_ID};
-use neutrino_store::{EventStore, RoomStore, StateStore, StorageError, StoredEvent};
+use neutrino_store::{Event, EventStore, RoomStore, StateStore, StorageError};
 use neutrino_store_sqlite::SqliteStore;
 use rand::{Rng, distr::Alphanumeric};
 use ruma::api::client::sync::sync_events::v5;
@@ -534,7 +534,7 @@ async fn create_room(state: State<AppState>, body: Json<Value>) -> axum::respons
     // `persist_event` calls succeed. The create event lands via the trait's
     // dedicated path; member-join + (optional) name come through alongside
     // as `initial_events` so the whole thing is one transaction.
-    let mut stored: Vec<StoredEvent> = match events.iter().map(stored_event_from_json).collect() {
+    let mut stored: Vec<Event> = match events.iter().map(stored_event_from_json).collect() {
         Some(v) => v,
         None => {
             return error_response(
@@ -586,7 +586,7 @@ async fn members(
     // don't honour — see PLAN.md non-goals).
     let chunk: Vec<Value> = map
         .into_values()
-        .filter_map(|ev| serde_json::from_str::<Value>(ev.json.get()).ok())
+        .filter_map(|ev| serde_json::from_str::<Value>(ev.raw.get()).ok())
         .collect();
     (StatusCode::OK, Json(json!({"chunk": chunk}))).into_response()
 }
@@ -637,12 +637,17 @@ async fn put_event(
     (StatusCode::OK, Json(json!({"event_id": event_id}))).into_response()
 }
 
-/// Parse a hand-built PDU `serde_json::Value` into a `StoredEvent`. Used by
+/// Parse a hand-built PDU `serde_json::Value` into a `Event`. Used by
 /// the legacy CSAPI write handlers (`createRoom`, `put_event`). Returns
 /// `None` on any required-field-missing path — callers built the PDU
 /// themselves, so a malformed value is a programmer error, not a client
 /// error.
-fn stored_event_from_json(value: &Value) -> Option<StoredEvent> {
+///
+/// This is **transitional code**. PR 2 introduces `EventBuilder::build`
+/// which assembles the wire JSON, computes the reference hash, and
+/// constructs the `Event` end-to-end. Once that lands, both CSAPI write
+/// handlers migrate to it and this helper plus `mint_id` are deleted.
+fn stored_event_from_json(value: &Value) -> Option<Event> {
     let event_id: OwnedEventId = value.get("event_id")?.as_str()?.try_into().ok()?;
     let room_id: OwnedRoomId = value.get("room_id")?.as_str()?.try_into().ok()?;
     let event_type = value.get("type")?.as_str()?.to_string();
@@ -655,15 +660,51 @@ fn stored_event_from_json(value: &Value) -> Option<StoredEvent> {
         .get("origin_server_ts")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let json: Box<RawValue> = serde_json::value::to_raw_value(value).ok()?;
-    Some(StoredEvent {
+    let raw: Box<RawValue> = serde_json::value::to_raw_value(value).ok()?;
+    // Mirror what the storage layer's row hydration does: pull `content`,
+    // `prev_events`, `prev_state_events` out of the raw value. Failures
+    // surface as `None` (programmer error in the caller's hand-built
+    // PDU). auth_events is empty — the legacy write path is server-
+    // authored and these are wired up properly by `EventBuilder` in PR 2.
+    let content = value
+        .get("content")
+        .and_then(|c| serde_json::value::to_raw_value(c).ok())?;
+    let prev_events = value
+        .get("prev_events")
+        .map(|arr| {
+            arr.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().and_then(|s| OwnedEventId::try_from(s).ok()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let prev_state_events = value
+        .get("prev_state_events")
+        .map(|arr| {
+            arr.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().and_then(|s| OwnedEventId::try_from(s).ok()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    Some(Event {
         event_id,
         room_id,
         event_type,
         state_key,
         sender,
         origin_server_ts,
-        json,
+        content,
+        prev_events,
+        prev_state_events,
+        auth_events: Vec::new(),
+        raw,
     })
 }
 

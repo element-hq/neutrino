@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
-use serde_json::value::RawValue;
 use thiserror::Error;
 
 pub mod auth_events;
@@ -10,39 +9,13 @@ pub mod provider;
 pub mod state_res;
 pub mod validate;
 
-/// Room version supported by this state machine.
-///
-/// Only v12 is supported (see `CLAUDE.md`). MSC4242 state DAG semantics
-/// (`prev_state_events`) are assumed throughout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RoomVersion {
-    V12,
-}
+// The canonical `Event` type and the `RoomVersion` enum live in
+// `neutrino-common` so storage and state-machine code share them. See
+// `event-id-design.md` for the rationale.
+pub use neutrino_common::{Event, RoomVersion};
 
 /// Resolved room state: one entry per `(event_type, state_key)` pair.
 pub type StateMap<V> = HashMap<(String, String), V>;
-
-/// Parsed view of a Matrix event plus the original canonical JSON.
-///
-/// Constructed by the format-validation pass (phase 1). Under MSC4242 the
-/// wire format does not carry `auth_events`; the auth-events set is
-/// calculated server-side from state-before-event when needed.
-#[derive(Debug)]
-pub struct Event {
-    pub event_id: OwnedEventId,
-    pub room_id: OwnedRoomId,
-    pub sender: OwnedUserId,
-    pub event_type: String,
-    pub state_key: Option<String>,
-    pub origin_server_ts: u64,
-    pub content: Box<RawValue>,
-    pub prev_events: Vec<OwnedEventId>,
-    /// MSC4242: state-DAG parents of this event.
-    pub prev_state_events: Vec<OwnedEventId>,
-    /// Original full event JSON, preserved so the event can be re-emitted
-    /// byte-for-byte and so redaction can rewrite it later.
-    pub raw: Box<RawValue>,
-}
 
 /// Errors raised by format validation (phase 1) — wire-format violations that
 /// reject the event outright, before any state lookup happens.

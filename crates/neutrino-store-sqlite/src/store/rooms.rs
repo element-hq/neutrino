@@ -5,7 +5,7 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{OptionalExtension, params};
 use neutrino_common::ROOM_VERSION_ID;
-use neutrino_store::{RoomStore, StorageError, StoredEvent};
+use neutrino_store::{Event, RoomStore, StorageError};
 use ruma::{RoomId, RoomVersionId};
 use serde_json::Value;
 
@@ -15,8 +15,8 @@ use crate::{SqliteStore, error::Error, row::EventRow};
 impl RoomStore for SqliteStore {
     async fn create_room(
         &self,
-        create_event: &StoredEvent,
-        initial_events: &[StoredEvent],
+        create_event: &Event,
+        initial_events: &[Event],
     ) -> Result<(), StorageError> {
         // The schema is structurally agnostic to which (event_type,
         // state_key) lands in `events` / `current_state`. A non-create
@@ -47,7 +47,7 @@ impl RoomStore for SqliteStore {
         // off-by-one between MSC4242's `"org.matrix.msc4242.12"` and ruma's
         // bare-`"12"` `V12` variant, because ruma silently maps unknown
         // strings into `RoomVersionId::Custom(...)` rather than erroring.
-        let parsed: Value = serde_json::from_str(create_event.json.get())
+        let parsed: Value = serde_json::from_str(create_event.raw.get())
             .map_err(|e| Error::InvalidInput(format!("create_event json: {e}")))?;
         let room_version_str = parsed
             .pointer("/content/room_version")
@@ -105,7 +105,7 @@ impl RoomStore for SqliteStore {
             // 1. Register the room row first — the events table's
             //    `room_id REFERENCES rooms(room_id)` FK would reject the
             //    create event otherwise. `create_event.room_id` resolves
-            //    through `EventRow: Deref<Target = StoredEvent>`.
+            //    through `EventRow: Deref<Target = Event>`.
             //    Version is checked == ROOM_VERSION_ID above; stored
             //    verbatim so a future column query can grep for it.
             tx.execute(

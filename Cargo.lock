@@ -977,6 +977,12 @@ dependencies = [
 [[package]]
 name = "neutrino-common"
 version = "0.1.0"
+dependencies = [
+ "ruma",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "neutrino-ffi"
@@ -1046,6 +1052,7 @@ name = "neutrino-store"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "neutrino-common",
  "ruma",
  "serde_json",
  "thiserror",

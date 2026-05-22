@@ -88,24 +88,14 @@ pub fn separate(state_sets: &[&StateMap<OwnedEventId>]) -> Separated {
 /// ambiguity — simpler, no special-casing).
 ///
 /// `seeds` is typically the union of all event IDs across the conflicted
-/// values produced by `separate`. The output joins `seeds` plus everything
-/// transitively reachable via `provider.auth_event_ids`.
+/// values produced by `separate`. The traversal is delegated to
+/// `provider.auth_chain` — in-memory does DFS, SQLite will do a recursive
+/// CTE.
 pub fn conflicted_subgraph(
     seeds: &HashSet<OwnedEventId>,
     provider: &dyn StateProvider,
 ) -> HashSet<OwnedEventId> {
-    let mut visited: HashSet<OwnedEventId> = HashSet::new();
-    let mut stack: Vec<OwnedEventId> = seeds.iter().cloned().collect();
-    while let Some(id) = stack.pop() {
-        if visited.insert(id.clone()) {
-            for parent in provider.auth_event_ids(&id).iter() {
-                if !visited.contains(parent) {
-                    stack.push(parent.clone());
-                }
-            }
-        }
-    }
-    visited
+    provider.auth_chain(seeds)
 }
 
 // ----------------- auth_chain_difference -----------------
@@ -113,7 +103,7 @@ pub fn conflicted_subgraph(
 /// Events that appear in *some* but not *all* auth chains across the input
 /// state sets — i.e. `(∪ chains) \ (∩ chains)` where each chain is the
 /// transitive backwards closure of an entire state set via
-/// `provider.auth_event_ids`.
+/// `provider.auth_chain`.
 ///
 /// This is the v2 quantity (synapse `_get_auth_chain_difference`); the v2.1
 /// conflicted subgraph is a *separate* set computed by `conflicted_subgraph`.
@@ -132,18 +122,8 @@ pub fn auth_chain_difference(
     let chains: Vec<HashSet<OwnedEventId>> = state_sets
         .iter()
         .map(|set| {
-            let mut chain: HashSet<OwnedEventId> = HashSet::new();
-            let mut stack: Vec<OwnedEventId> = set.values().cloned().collect();
-            while let Some(id) = stack.pop() {
-                if chain.insert(id.clone()) {
-                    for parent in provider.auth_event_ids(&id).iter() {
-                        if !chain.contains(parent) {
-                            stack.push(parent.clone());
-                        }
-                    }
-                }
-            }
-            chain
+            let seeds: HashSet<OwnedEventId> = set.values().cloned().collect();
+            provider.auth_chain(&seeds)
         })
         .collect();
 
@@ -172,10 +152,10 @@ mod tests {
         s.parse().expect("event id")
     }
 
-    /// Construct a minimal `Event` with a given event_id and (optionally) a
-    /// state_key. Other fields are placeholder — state-res only consults
-    /// event_id + auth_event_ids in 4a.
-    fn make_event(id: &str, state_key: Option<&str>) -> Arc<Event> {
+    /// Construct a minimal `Event` with a given event_id, state_key, and
+    /// auth_event_ids. Other fields are placeholder — state-res only
+    /// consults event_id + auth_events in 4a.
+    fn make_event(id: &str, state_key: Option<&str>, auth_chain: &[&str]) -> Arc<Event> {
         let mut v = json!({
             "type": "m.room.placeholder",
             "sender": "@alice:example.org",
@@ -190,15 +170,16 @@ mod tests {
         if let Some(sk) = state_key {
             v["state_key"] = json!(sk);
         }
-        Arc::new(parse_event(raw(v), eid(id), RoomVersion::V12).expect("valid"))
+        let auth_events: Vec<OwnedEventId> = auth_chain.iter().map(|s| eid(s)).collect();
+        Arc::new(parse_event(raw(v), eid(id), auth_events, RoomVersion::V12).expect("valid"))
     }
 
     fn insert(provider: &mut InMemoryStateProvider, id: &str, auth_chain: &[&str]) {
         let info = EventInfo {
-            event: make_event(id, Some("")),
+            event: make_event(id, Some(""), auth_chain),
             rejected: false,
         };
-        provider.insert(info, auth_chain.iter().map(|s| eid(s)).collect());
+        provider.insert(info);
     }
 
     /// Build a state map from `(type, state_key, event_id)` triples.

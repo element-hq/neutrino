@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{params, params_from_iter};
-use neutrino_store::{FederationOutbox, StorageError, StoredEvent};
+use neutrino_store::{Event, FederationOutbox, StorageError};
 use ruma::{EventId, OwnedServerName, ServerName};
 
 use crate::{
@@ -30,13 +30,10 @@ impl FederationOutbox for SqliteStore {
         .await
     }
 
-    async fn pending_pdus(
-        &self,
-        destination: &ServerName,
-    ) -> Result<Vec<StoredEvent>, StorageError> {
+    async fn pending_pdus(&self, destination: &ServerName) -> Result<Vec<Event>, StorageError> {
         let destination = destination.to_owned();
 
-        self.run_read(move |conn| -> Result<Vec<StoredEvent>, Error> {
+        self.run_read(move |conn| -> Result<Vec<Event>, Error> {
             let query = format!(
                 "SELECT {EVENT_COLUMNS_PREFIXED} \
                  FROM outbox o \
