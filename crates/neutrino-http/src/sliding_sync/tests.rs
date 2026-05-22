@@ -2256,6 +2256,247 @@ async fn banned_room_remains_visible_after_being_emitted_while_joined() {
     );
 }
 
+// -----------------------------------------------------------------------------
+// Concurrent same-conn requests — cancel-older-on-newer semantics.
+//
+// MSC3575/4186 forbids concurrent requests with the same conn_id. The
+// embedded server cancels the in-flight long-poll rather than queueing the
+// newcomer (which would otherwise block for up to 30 s) or rejecting it.
+// See `MSC4186-gaps.md` for the spec deviation note.
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn concurrent_long_poll_is_cancelled_by_newer_request() {
+    let (store, _tmp) = fresh_store().await;
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!room:example.org");
+    setup_joined_room(&store, room, user).await;
+    seed(
+        &store,
+        &make_event(
+            event_id!("$seed:example.org"),
+            room,
+            "m.room.message",
+            None,
+            user,
+            100,
+            serde_json::json!({"body": "seed", "msgtype": "m.text"}),
+        ),
+    )
+    .await;
+    let state = Arc::new(SyncState::new(store));
+
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let conn_id = Some("c1".to_string());
+
+    let mut req1 = Request::new();
+    req1.conn_id = conn_id.clone();
+    req1.lists = lists.clone();
+    let resp1 = handle(&state, user, req1).await.unwrap();
+
+    // Spawn the long-poll. 10 s timeout is well past the test's deadline so
+    // a "without cancellation" regression would hang the test out instead of
+    // silently passing.
+    let state_a = state.clone();
+    let lists_a = lists.clone();
+    let conn_id_a = conn_id.clone();
+    let resp1_pos = resp1.pos.clone();
+    let user_owned = user.to_owned();
+    let a_started = std::time::Instant::now();
+    let a = tokio::spawn(async move {
+        let mut req = Request::new();
+        req.conn_id = conn_id_a;
+        req.pos = Some(resp1_pos);
+        req.lists = lists_a;
+        req.timeout = Some(std::time::Duration::from_secs(10));
+        handle(&state_a, &user_owned, req).await
+    });
+
+    // Give A time to subscribe to its cancel signal and enter the select.
+    // Without this, B's bump can race A's subscribe and the test becomes
+    // timing-dependent.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut req_b = Request::new();
+    req_b.conn_id = conn_id.clone();
+    req_b.pos = Some(resp1.pos.clone());
+    req_b.lists = lists.clone();
+    let resp_b = handle(&state, user, req_b).await.unwrap();
+
+    let resp_a = a.await.unwrap().unwrap();
+    let elapsed = a_started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "cancelled long-poll should return well before its 10s timeout, got {elapsed:?}"
+    );
+    // B was a byte-identical retry of A's request (same pos, same body).
+    // A's cancellation wrote the idempotency cache on its way out, so B
+    // hits the cache and gets the same response A returned.
+    assert_eq!(
+        resp_a.pos, resp_b.pos,
+        "B's cache hit returns the response A wrote on cancellation"
+    );
+    assert!(resp_a.rooms.is_empty(), "cancelled A returns empty rooms");
+}
+
+#[tokio::test]
+async fn initial_sync_cancels_prior_entrys_long_poll() {
+    let (store, _tmp) = fresh_store().await;
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!room:example.org");
+    setup_joined_room(&store, room, user).await;
+    seed(
+        &store,
+        &make_event(
+            event_id!("$seed:example.org"),
+            room,
+            "m.room.message",
+            None,
+            user,
+            100,
+            serde_json::json!({"body": "seed", "msgtype": "m.text"}),
+        ),
+    )
+    .await;
+    let state = Arc::new(SyncState::new(store));
+
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let conn_id = Some("c1".to_string());
+
+    let mut req1 = Request::new();
+    req1.conn_id = conn_id.clone();
+    req1.lists = lists.clone();
+    let resp1 = handle(&state, user, req1).await.unwrap();
+
+    let state_a = state.clone();
+    let lists_a = lists.clone();
+    let conn_id_a = conn_id.clone();
+    let resp1_pos = resp1.pos.clone();
+    let user_owned = user.to_owned();
+    let a_started = std::time::Instant::now();
+    let a = tokio::spawn(async move {
+        let mut req = Request::new();
+        req.conn_id = conn_id_a;
+        req.pos = Some(resp1_pos);
+        req.lists = lists_a;
+        req.timeout = Some(std::time::Duration::from_secs(10));
+        handle(&state_a, &user_owned, req).await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Initial sync (pos=None) on the same conn_id. `registry.create`
+    // cancels the prior entry on the way to inserting the replacement,
+    // which is what should wake A.
+    let mut req_b = Request::new();
+    req_b.conn_id = conn_id.clone();
+    req_b.lists = lists.clone();
+    let resp_b = handle(&state, user, req_b).await.unwrap();
+    assert!(
+        resp_b.rooms.contains_key(room),
+        "initial sync re-emits the joined room"
+    );
+
+    let resp_a = a.await.unwrap().unwrap();
+    let elapsed = a_started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "orphan long-poll should wake when prior entry is replaced, got {elapsed:?}"
+    );
+    // The orphan A still completes successfully — its response goes to the
+    // (cancelled-by-client) HTTP connection. We only assert it returned;
+    // the body is empty because no events arrived during A's brief window.
+    assert!(resp_a.rooms.is_empty());
+}
+
+#[tokio::test]
+async fn second_concurrent_request_proceeds_after_first_cancelled() {
+    let (store, _tmp) = fresh_store().await;
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!room:example.org");
+    setup_joined_room(&store, room, user).await;
+    seed(
+        &store,
+        &make_event(
+            event_id!("$seed:example.org"),
+            room,
+            "m.room.message",
+            None,
+            user,
+            100,
+            serde_json::json!({"body": "seed", "msgtype": "m.text"}),
+        ),
+    )
+    .await;
+    let state = Arc::new(SyncState::new(store.clone()));
+
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let conn_id = Some("c1".to_string());
+
+    let mut req1 = Request::new();
+    req1.conn_id = conn_id.clone();
+    req1.lists = lists.clone();
+    let resp1 = handle(&state, user, req1).await.unwrap();
+
+    let state_a = state.clone();
+    let lists_a = lists.clone();
+    let conn_id_a = conn_id.clone();
+    let resp1_pos = resp1.pos.clone();
+    let user_owned = user.to_owned();
+    let a = tokio::spawn(async move {
+        let mut req = Request::new();
+        req.conn_id = conn_id_a;
+        req.pos = Some(resp1_pos);
+        req.lists = lists_a;
+        req.timeout = Some(std::time::Duration::from_secs(10));
+        handle(&state_a, &user_owned, req).await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // B differs from A in its body (different timeline_limit), so B's
+    // retry-cache key won't match A's cached entry — B has to process
+    // fresh. Because A's cancellation advanced `conn.pos`, B's
+    // `req1.resp.pos` no longer matches; the test instead drives B with
+    // the post-cancel pos that A wrote into the cache. To find it, we
+    // use a third request: send the byte-identical retry first (which
+    // cache-hits A's cancel response and gives us its pos), then issue
+    // B against that pos.
+    //
+    // This proves the chain: cancellation completes, cache is queryable,
+    // newer non-cached requests proceed against the advanced state.
+    let mut probe = Request::new();
+    probe.conn_id = conn_id.clone();
+    probe.pos = Some(resp1.pos.clone());
+    probe.lists = lists.clone();
+    let probe_resp = handle(&state, user, probe).await.unwrap();
+
+    let resp_a = a.await.unwrap().unwrap();
+    assert_eq!(
+        probe_resp.pos, resp_a.pos,
+        "byte-identical retry hits the cancelled A's cached response"
+    );
+
+    // Now a body-differing request at A's post-cancel pos.
+    let mut lists_b = lists.clone();
+    lists_b.insert("all".to_string(), list_with(50, vec![]));
+    let mut req_b = Request::new();
+    req_b.conn_id = conn_id.clone();
+    req_b.pos = Some(probe_resp.pos.clone());
+    req_b.lists = lists_b;
+    req_b.timeout = Some(std::time::Duration::from_millis(100));
+    let resp_b = handle(&state, user, req_b).await.unwrap();
+    assert_ne!(
+        resp_b.pos, probe_resp.pos,
+        "fresh processing advances pos past the cache-hit pos"
+    );
+}
+
 #[tokio::test]
 async fn initial_sync_anchors_high_water_at_store_head() {
     let (store, _tmp) = fresh_store().await;

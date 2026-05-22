@@ -5,7 +5,7 @@ use ruma::api::client::sync::sync_events::v5;
 use ruma::api::client::sync::sync_events::v5::request;
 use ruma::events::StateEventType;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 /// Identifies a sliding-sync connection within the registry.
 ///
@@ -130,12 +130,64 @@ impl Conn {
     }
 }
 
+/// One entry in `ConnRegistry`. Bundles the `Conn` mutex with a cancellation
+/// signal so a newer request can pre-empt an in-flight long-poll on the same
+/// `(user_id, conn_id)` instead of queueing behind the conn lock for the full
+/// long-poll timeout.
+///
+/// **Signal mechanics.** `cancel_gen` is a `watch::Sender<u64>` whose value is
+/// a monotonically incrementing generation counter. The producing side bumps
+/// it via `send_modify` *before* attempting `conn.lock().await`; the
+/// in-flight request holds a `Receiver` it `select!`s on in its idle wait,
+/// breaks out, runs its post-loop tail (pos commit + cache write), and drops
+/// the guard. `watch` was chosen over `Notify` / `tokio_util::CancellationToken`
+/// because its value is *sticky* — a bump that happens before the holder
+/// calls `.changed()` is still observed on the next call, eliminating the
+/// lost-wakeup window that `Notify::notify_waiters` has.
+///
+/// Both fields are `Arc` so handlers can hold them past the registry-lock
+/// drop and the entry can outlive any single registry traversal.
+#[derive(Clone)]
+pub struct ConnEntry {
+    pub conn: Arc<Mutex<Conn>>,
+    pub cancel_gen: Arc<watch::Sender<u64>>,
+}
+
+impl ConnEntry {
+    fn new() -> Self {
+        let (tx, _rx) = watch::channel(0u64);
+        Self {
+            conn: Arc::new(Mutex::new(Conn::new())),
+            cancel_gen: Arc::new(tx),
+        }
+    }
+
+    /// Bump the cancellation generation. A holder currently `.changed()`-waiting
+    /// on the matching `Receiver` will wake; a holder that hasn't yet
+    /// subscribed will observe the bump on its next `.changed()` call because
+    /// `watch` values are sticky.
+    pub fn cancel(&self) {
+        self.cancel_gen.send_modify(|g| *g = g.saturating_add(1));
+    }
+
+    /// Subscribe to the cancellation signal. The caller must call
+    /// `borrow_and_update` on the returned receiver to seed its baseline
+    /// against the current generation — otherwise any bump that has *already*
+    /// happened (e.g. by an earlier request that finished and bumped on its
+    /// way out) would fire `.changed()` immediately on the first await.
+    pub fn subscribe_cancel(&self) -> watch::Receiver<u64> {
+        self.cancel_gen.subscribe()
+    }
+}
+
 /// In-memory registry of active sliding-sync connections.
 ///
-/// **Storage**: `HashMap<ConnKey, Arc<Mutex<Conn>>>` behind an outer `Mutex` for
-/// insert/lookup. Each conn is itself behind a Mutex so concurrent requests on
-/// the same `(user_id, conn_id)` serialise (MSC3575 forbids concurrent
-/// requests with the same conn_id; we serialise rather than reject).
+/// **Storage**: `HashMap<ConnKey, ConnEntry>` behind an outer `Mutex` for
+/// insert/lookup. Each entry's `Conn` is itself behind a Mutex so concurrent
+/// requests on the same `(user_id, conn_id)` serialise. MSC3575 forbids
+/// concurrent requests with the same conn_id; we cancel-and-replace the
+/// in-flight request rather than reject the newcomer (see
+/// `ConnEntry::cancel` / `MSC4186-gaps.md`).
 ///
 /// **Lifecycle**: connections are created on initial sync (no `pos`) and never
 /// expire. There is **no eviction**, **no idle timeout**, **no LRU**, no
@@ -149,7 +201,7 @@ impl Conn {
 /// `pos`. This is by design — the registry is a cache, not a source of truth.
 #[derive(Default)]
 pub struct ConnRegistry {
-    conns: Mutex<HashMap<ConnKey, Arc<Mutex<Conn>>>>,
+    conns: Mutex<HashMap<ConnKey, ConnEntry>>,
 }
 
 impl ConnRegistry {
@@ -158,14 +210,20 @@ impl ConnRegistry {
     }
 
     /// Allocate a fresh connection, replacing any existing entry for `key`.
-    /// A new initial sync from the same `(user_id, conn_id)` resets state.
-    pub async fn create(&self, key: ConnKey) -> Arc<Mutex<Conn>> {
-        let conn = Arc::new(Mutex::new(Conn::new()));
-        self.conns.lock().await.insert(key, conn.clone());
-        conn
+    /// If a prior entry existed, cancel it first so any in-flight long-poll
+    /// running against that orphan entry wakes promptly instead of running
+    /// its full timeout (it would otherwise complete against the abandoned
+    /// `Conn` and discard the result).
+    pub async fn create(&self, key: ConnKey) -> ConnEntry {
+        let new_entry = ConnEntry::new();
+        let mut conns = self.conns.lock().await;
+        if let Some(prior) = conns.insert(key, new_entry.clone()) {
+            prior.cancel();
+        }
+        new_entry
     }
 
-    pub async fn get(&self, key: &ConnKey) -> Option<Arc<Mutex<Conn>>> {
+    pub async fn get(&self, key: &ConnKey) -> Option<ConnEntry> {
         self.conns.lock().await.get(key).cloned()
     }
 }

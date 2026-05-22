@@ -26,7 +26,6 @@ use ruma::api::client::sync::sync_events::v5;
 use ruma::events::AnyToDeviceEvent;
 use ruma::serde::Raw;
 use thiserror::Error;
-use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 mod build;
@@ -35,7 +34,7 @@ mod conn;
 #[cfg(test)]
 mod tests;
 
-use conn::{Conn, ConnKey, ConnRegistry};
+use conn::{ConnEntry, ConnKey, ConnRegistry};
 
 /// MSC4186 §"Connection Identifier": `conn_id` is max 16 chars on the wire.
 const MAX_CONN_ID_LEN: usize = 16;
@@ -88,18 +87,22 @@ impl<S> SyncState<S> {
     }
 }
 
-/// Entry point used by the axum handler (when wired) and by tests.
+/// Entry point used by the axum handler and by tests.
 ///
-/// Orchestrates the four boundary concerns that don't belong in
+/// Orchestrates the boundary concerns that don't belong in
 /// `build::build_response`:
 /// 1. **Validation** — MSC4186 size/length limits up front.
-/// 2. **Connection resolution + idempotency** — `resolve_conn` either
-///    returns a cached response (retry of a previously-served pos), an
-///    unlocked `Arc<Mutex<Conn>>` for a fresh request, or `UnknownPos`.
-/// 3. **Long-poll loop** — subscribe to the event watch BEFORE the first
+/// 2. **Entry resolution + concurrent-request cancellation** — initial
+///    sync allocates a fresh entry (cancelling any prior); a delta looks
+///    up the existing entry and bumps its cancel signal so an in-flight
+///    long-poll on the same `(user_id, conn_id)` wakes promptly and
+///    releases the conn lock.
+/// 3. **Cache hit / pos validation** — under the conn lock, either return
+///    a previously-served response (byte-identical retry) or proceed.
+/// 4. **Long-poll loop** — subscribe to the event watch BEFORE the first
 ///    build (TOCTOU per the trait docs), then iterate
-///    build → has_data?-or-timeout? → `rx.changed()`.
-/// 4. **Extension stubs + idempotency cache write** — populate the
+///    build → has_data?-or-timeout?-or-cancelled? → `rx.changed()`.
+/// 5. **Extension stubs + idempotency cache write** — populate the
 ///    e2ee/to_device echoes the client opted into, then snapshot the final
 ///    response into `Conn::last_response` so any retry returns the same
 ///    bytes.
@@ -116,16 +119,74 @@ pub async fn handle<S: StorageBackend>(
     };
 
     let req_hash = request_body_hash(&req);
-    let resolution = resolve_conn(&state.registry, key, req.pos.as_deref(), req_hash).await?;
-    let conn_arc = match resolution {
-        Resolution::Cached(resp) => return Ok(*resp),
-        Resolution::Fresh(arc) => arc,
+
+    // Parse `pos` up-front so a garbage value fails fast without touching
+    // the registry.
+    let parsed_pos: Option<u64> = match req.pos.as_deref() {
+        None => None,
+        Some(s) => Some(s.parse().map_err(|_| SyncError::UnknownPos)?),
     };
 
-    // TOCTOU: subscribe BEFORE the first `build_response` so any
-    // `persist_event` that lands between our query and the watch
+    // Resolve the conn entry, with cancellation of any in-flight long-poll
+    // on the same `(user_id, conn_id)`:
+    //
+    // - **Initial sync** (`pos == None`): allocate a fresh entry. If a prior
+    //   entry existed for this key, `create` cancels it on the way in so the
+    //   orphaned long-poll wakes promptly instead of running its full timeout.
+    // - **Delta** (`pos == Some(_)`): look up the existing entry and bump its
+    //   cancel signal *before* we queue on the conn lock. Otherwise we'd
+    //   block behind the in-flight request's `rx.changed()` await for up to
+    //   30 s — MSC3575 forbids concurrent same-conn requests; we cancel
+    //   the older one rather than queue, matching the standard handling.
+    let entry: ConnEntry = match parsed_pos {
+        None => state.registry.create(key.clone()).await,
+        Some(_) => {
+            let Some(entry) = state.registry.get(&key).await else {
+                return Err(SyncError::UnknownPos);
+            };
+            entry.cancel();
+            entry
+        }
+    };
+
+    // Subscribe to our own cancel signal *after* the bump above so we don't
+    // wake ourselves. `borrow_and_update` seeds the receiver's baseline at
+    // the current generation; only a *future* bump (from a newer request
+    // than ours) will fire our `.changed()` inside the long-poll loop.
+    let mut cancel_rx = entry.subscribe_cancel();
+    cancel_rx.borrow_and_update();
+
+    // TOCTOU: subscribe to the event watch BEFORE the first `build_response`
+    // so any `persist_event` that lands between our query and the watch
     // registration still wakes us. The trait docs spell this out.
     let mut rx = state.store.subscribe();
+
+    // Short wait while the prior holder (if any) observes the cancel above
+    // and unwinds.
+    let mut conn_guard = entry.conn.lock().await;
+
+    // Cache hit / pos validation, formerly the body of `resolve_conn`. Has
+    // to run under the conn lock — `last_request_pos`, `last_request_hash`,
+    // `last_response`, and `pos` all live inside the mutex.
+    //
+    // Note the ordering: cache-hit short-circuits *after* we paid the cost
+    // of bumping cancel on the entry. A byte-identical retry that arrives
+    // during an in-flight long-poll therefore forces the in-flight to
+    // complete early (treating the cancellation as a timeout: it advances
+    // pos, writes the cache, releases the lock); we then pick up the
+    // freshly-written cached response. One round-trip's worth of "force
+    // the holder to flush" rather than blocking for the full timeout.
+    if let Some(pos) = parsed_pos {
+        if Some(pos) == conn_guard.last_request_pos
+            && req_hash == conn_guard.last_request_hash
+            && let Some(cached) = &conn_guard.last_response
+        {
+            return Ok(cached.clone());
+        }
+        if pos != conn_guard.pos {
+            return Err(SyncError::UnknownPos);
+        }
+    }
 
     let extensions_req = req.extensions.clone();
     let timeout = clamp_timeout(req.timeout);
@@ -137,7 +198,6 @@ pub async fn handle<S: StorageBackend>(
     // can iterate; everything else exits after one build.
     let wait_for_data = !initial_sync && !timeout.is_zero();
 
-    let mut conn_guard = conn_arc.lock().await;
     let mut final_resp = loop {
         let resp = build::build_response(state, user_id, &req, &mut conn_guard).await?;
         if !wait_for_data || has_data(&resp) {
@@ -147,11 +207,23 @@ pub async fn handle<S: StorageBackend>(
         if remaining.is_zero() {
             break resp;
         }
-        // `rx.changed()` resolves on the next `persist_event` watch
-        // update; the next loop iter rebuilds with the new high-water mark.
-        match tokio::time::timeout(remaining, rx.changed()).await {
-            Ok(_) => continue,
-            Err(_) => break resp,
+        // Three-way race in the idle wait:
+        // - `rx.changed()` fires → new event(s); rebuild with the advanced
+        //   high-water mark.
+        // - `tokio::time::timeout` elapses → return the current empty resp.
+        // - `cancel_rx.changed()` fires → a newer same-conn request bumped
+        //   our cancel signal; break out with the current resp. The tail
+        //   below advances `conn.pos` and writes the idempotency cache, so
+        //   a byte-identical newer request immediately hits the cache; a
+        //   body-differing newer request will see the advanced `conn.pos`
+        //   and either match it (process fresh) or return UnknownPos.
+        tokio::select! {
+            biased;
+            _ = cancel_rx.changed() => break resp,
+            res = tokio::time::timeout(remaining, rx.changed()) => match res {
+                Ok(_) => continue,
+                Err(_) => break resp,
+            },
         }
     };
 
@@ -169,61 +241,11 @@ pub async fn handle<S: StorageBackend>(
     // hits the cache when *both* pos and hash match — anything else
     // (different `timeline_limit`, newly-opted-into extension) must be
     // re-processed.
-    conn_guard.last_request_pos = req.pos.as_ref().and_then(|s| s.parse::<u64>().ok());
+    conn_guard.last_request_pos = parsed_pos;
     conn_guard.last_request_hash = req_hash;
     conn_guard.last_response = Some(final_resp.clone());
 
     Ok(final_resp)
-}
-
-/// Outcome of `resolve_conn` — either an exact retry-cache hit (return the
-/// cached response with no further processing) or a writable handle to the
-/// conn (we're about to mutate it).
-///
-/// `Cached` is boxed because `v5::Response` is large (~336 bytes) and we'd
-/// otherwise pay that cost on every `Resolution::Fresh` too.
-enum Resolution {
-    Cached(Box<v5::Response>),
-    Fresh(Arc<Mutex<Conn>>),
-}
-
-/// Three-way classification of an incoming request against the conn state:
-/// - `req.pos == None` → initial sync, always allocate a fresh conn.
-/// - `(req.pos, req_hash)` matches the cached `(last_request_pos,
-///   last_request_hash)` → byte-identical retry, return cached response.
-/// - `req.pos` matches `conn.pos` (the value we last issued in a response)
-///   → fresh request, return the unlocked Arc for processing.
-/// - Anything else (including a retry with same pos but different body) →
-///   either treat as a fresh request (if pos still matches `conn.pos`) or
-///   `UnknownPos`.
-async fn resolve_conn(
-    registry: &ConnRegistry,
-    key: ConnKey,
-    req_pos: Option<&str>,
-    req_hash: u64,
-) -> Result<Resolution, SyncError> {
-    let Some(pos_str) = req_pos else {
-        return Ok(Resolution::Fresh(registry.create(key).await));
-    };
-    let pos: u64 = pos_str.parse().map_err(|_| SyncError::UnknownPos)?;
-    let conn_arc = registry.get(&key).await.ok_or(SyncError::UnknownPos)?;
-
-    // Brief lock to inspect cache + pos, then drop so the caller can
-    // re-acquire for the long-poll loop. Could just hold and pass the
-    // guard, but the type plumbing for a re-entrant lock is worse than the
-    // brief re-lock.
-    let guard = conn_arc.lock().await;
-    if Some(pos) == guard.last_request_pos
-        && req_hash == guard.last_request_hash
-        && let Some(cached) = &guard.last_response
-    {
-        return Ok(Resolution::Cached(Box::new(cached.clone())));
-    }
-    if pos != guard.pos {
-        return Err(SyncError::UnknownPos);
-    }
-    drop(guard);
-    Ok(Resolution::Fresh(conn_arc))
 }
 
 /// Hash the body fields of a sliding-sync request: everything that
