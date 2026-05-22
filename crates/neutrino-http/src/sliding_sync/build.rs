@@ -138,8 +138,14 @@ pub(super) async fn build_response<S: StorageBackend>(
         conn.prev_list_timeline_limits.insert(name, limit);
     }
 
-    conn.pos = conn.pos.saturating_add(1);
-    let pos_token = conn.pos.to_string();
+    // The pos token reflects what the conn *will* be advanced to once the
+    // caller commits this response. We deliberately don't mutate `conn.pos`
+    // here — the long-poll loop in `super::handle` may call this function
+    // multiple times per request, but only the final response gets returned
+    // to the client. Committing the bump there means each request consumes
+    // exactly one pos value, and a mid-loop storage error leaves conn.pos
+    // untouched so the client's last-good token still matches.
+    let pos_token = conn.pos.saturating_add(1).to_string();
 
     let mut resp = Response::new(pos_token);
     resp.txn_id = req.txn_id.clone();
@@ -277,7 +283,6 @@ async fn candidate_rooms<S: StorageBackend>(
         }
     }
     included.sort_by(|a, b| a.0.cmp(&b.0));
-    included.dedup_by(|a, b| a.0 == b.0);
 
     let mut ranked: Vec<RankedRoom> = Vec::with_capacity(included.len());
     for (room_id, membership) in included {
@@ -327,12 +332,11 @@ async fn include_room_per_msc4186<S: StorageBackend>(
 }
 
 /// True iff the current `m.room.member` event for `user_id` in `room_id`
-/// represents a kick: `content.membership == "leave"` AND
-/// `sender != user_id` (somebody else flipped us to "leave"). The
-/// membership check matters — an invite event also has `sender ≠ target`,
-/// so leaving it out would mis-classify invites as kicks if a caller ever
-/// invoked this helper outside the `"leave"` branch of
-/// `include_room_per_msc4186`.
+/// has a different sender than the target — i.e. somebody else flipped us
+/// to "leave". Caller is responsible for only invoking this when the user's
+/// current membership is already known to be "leave"; we don't re-parse the
+/// JSON to check, since `StoredEvent.sender` is the typed canonical value
+/// the storage layer already extracted.
 async fn is_kick<S: StorageBackend>(
     state: &SyncState<S>,
     room_id: &RoomId,
@@ -345,17 +349,7 @@ async fn is_kick<S: StorageBackend>(
     else {
         return Ok(false);
     };
-    let parsed: serde_json::Value = serde_json::from_str(ev.json.get())
-        .map_err(|e| SyncError::Storage(neutrino_store::StorageError::Internal(e.to_string())))?;
-    let membership = parsed
-        .pointer("/content/membership")
-        .and_then(|m| m.as_str())
-        .unwrap_or("");
-    if membership != "leave" {
-        return Ok(false);
-    }
-    let sender = parsed.get("sender").and_then(|s| s.as_str()).unwrap_or("");
-    Ok(!sender.is_empty() && sender != user_id.as_str())
+    Ok(ev.sender.as_str() != user_id.as_str())
 }
 
 /// Best-available recency stamp for a **joined** (or previously-joined: kick

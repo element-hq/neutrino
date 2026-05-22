@@ -91,7 +91,7 @@ MSC4186 §"Rooms included in the server list" wants:
 We approximate "previously joined" with "previously emitted on this conn" (`conn.sent.contains_key`) because we don't keep a separate per-conn record of historical join events. The approximation is exact within a single connection's lifetime; a fresh conn after a server restart will not include rooms the user was banned from before the restart. For an embedded single-user server this trade-off is acceptable. Covered by `banned_room_only_appears_if_previously_emitted` (negative) and `banned_room_remains_visible_after_being_emitted_while_joined` (positive).
 
 ### `joined_count` accuracy depends on the storage backend
-`populate_room_metadata` derives `joined_count` from `StateStore::joined_members(room).len()`. The current live backend (`InMemoryStore`) computes this from the in-memory current state and is accurate. A future SQLite backend must populate this correctly — that's load-bearing for any client that sorts/groups by room size.
+`populate_room_metadata` derives `joined_count` from `StateStore::joined_members(room).len()`. The live `SqliteStore` populates this from the `current_state.membership` column, indexed and filtered to `"join"` — accurate as long as `persist_event` is the only path that updates membership.
 
 ### `has_data` in the long-poll loop is intentionally narrow
 The loop returns early when `!resp.rooms.is_empty()`. It does NOT wake on OTK / device-list changes, to-device messages, account-data updates, receipts, typing, or list `count` shifts. Safe today because all of those are stubbed or dropped; if real extensions are ever wired in, `mod.rs::has_data` is the single place to expand. The function's doc comment is the canonical list.
@@ -101,9 +101,6 @@ The token clients receive is `conn.pos`, incremented per response. It's opaque a
 
 ### `ConnRegistry` has no eviction
 Connections live forever until the process restarts. Each carries a cached `last_response` (~hundreds of bytes plus the room snapshot). Single-user mobile scale → not a concern; a multi-user deployment would need an LRU before shipping.
-
-### `InMemoryStore` is the live backend
-No persistence — restart wipes all rooms / events / conns. Clients recover on the next sync via `M_UNKNOWN_POS` → reconnect-without-pos. Federation DAG-walk methods (`events_before`, `missing_events`) are `todo!()` — federation backfill isn't wired through the router yet, so nothing reaches them, but adding a federation handler will hit those panics. Swap in the SQLite `StorageBackend` impl when it lands (PLAN.md in-progress).
 
 ### Initial sync `num_live` is `None`
 Live events on delta syncs report `num_live = timeline.len()`. The first sync intentionally returns `None`: a client just loading state isn't being notified of "new" activity.

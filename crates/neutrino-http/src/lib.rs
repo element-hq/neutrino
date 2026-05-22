@@ -24,7 +24,6 @@ use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
-pub mod in_memory_store;
 mod sliding_sync;
 
 use sliding_sync::{SyncError, SyncState};
@@ -446,7 +445,7 @@ async fn get_room_keys() -> (StatusCode, Json<Value>) {
     )
 }
 
-async fn create_room(state: State<AppState>, body: Json<Value>) -> Json<Value> {
+async fn create_room(state: State<AppState>, body: Json<Value>) -> axum::response::Response {
     let (store, server_name, user_id) = {
         let app = state.0.0.lock().unwrap();
         (
@@ -505,15 +504,26 @@ async fn create_room(state: State<AppState>, body: Json<Value>) -> Json<Value> {
     // `persist_event` calls succeed. The create event lands via the trait's
     // dedicated path; member-join + (optional) name come through alongside
     // as `initial_events` so the whole thing is one transaction.
-    let mut stored: Vec<StoredEvent> = events.iter().filter_map(stored_event_from_json).collect();
-    if !stored.is_empty() {
-        let create = stored.remove(0);
-        let _ = store.create_room(&create, &stored).await;
+    let mut stored: Vec<StoredEvent> = match events.iter().map(stored_event_from_json).collect() {
+        Some(v) => v,
+        None => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                "failed to build create_room PDUs",
+            );
+        }
+    };
+    let create = stored.remove(0);
+    if let Err(e) = store.create_room(&create, &stored).await {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &e.to_string(),
+        );
     }
 
-    Json(json!({
-        "room_id": room_id,
-    }))
+    (StatusCode::OK, Json(json!({"room_id": room_id}))).into_response()
 }
 
 async fn members(
@@ -545,7 +555,7 @@ async fn put_event(
         String,
     )>,
     body: Json<Value>,
-) -> Json<Value> {
+) -> axum::response::Response {
     let (store, server_name, user_id) = {
         let app = state.0.0.lock().unwrap();
         (
@@ -565,13 +575,22 @@ async fn put_event(
         "content": body.0,
         "origin_server_ts": 0,
     });
-    if let Some(stored) = stored_event_from_json(&pdu) {
-        let _ = store.persist_event(&stored, &[]).await;
+    let Some(stored) = stored_event_from_json(&pdu) else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            "failed to build PDU",
+        );
+    };
+    if let Err(e) = store.persist_event(&stored, &[]).await {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &e.to_string(),
+        );
     }
 
-    Json(json!({
-        "event_id": event_id,
-    }))
+    (StatusCode::OK, Json(json!({"event_id": event_id}))).into_response()
 }
 
 /// Parse a hand-built PDU `serde_json::Value` into a `StoredEvent`. Used by

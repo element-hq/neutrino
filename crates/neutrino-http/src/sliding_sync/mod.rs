@@ -153,6 +153,13 @@ pub async fn handle<S: StorageBackend>(
 
     populate_extension_stubs(&extensions_req, &mut final_resp);
 
+    // `build_response` chose `conn.pos + 1` as the response's pos_token but
+    // didn't mutate `conn.pos` — commit the advance here, once per request,
+    // now that we're past every fallible step. If the build loop errored
+    // mid-way we'd never reach this, so `conn.pos` would still match the
+    // last value the client received.
+    conn_guard.pos = conn_guard.pos.saturating_add(1);
+
     // Idempotency cache: remember the input pos that produced this response
     // (or `None` for initial sync) and snapshot the full final response.
     conn_guard.last_request_pos = req.pos.as_ref().and_then(|s| s.parse::<u64>().ok());

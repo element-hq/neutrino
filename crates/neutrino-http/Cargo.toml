@@ -25,3 +25,7 @@ neutrino-store-sqlite = { path = "../neutrino-store-sqlite" }
 # can drive the router via `Router::oneshot(req)`. Same major version that
 # `tower-http` already pulls in transitively, so no extra build cost.
 tower = "0.5"
+# Each sliding-sync unit test opens its own file-backed `SqliteStore` on a
+# `NamedTempFile` (the in-memory variant's shared-cache mode isn't safe for
+# the concurrent reader+writer workloads the long-poll tests drive).
+tempfile = "3.27.0"
