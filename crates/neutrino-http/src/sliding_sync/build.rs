@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use neutrino_store::{Direction, StorageBackend, StoredEvent, StreamPos};
+use neutrino_store::{Direction, Membership, StorageBackend, StoredEvent, StreamPos};
 use ruma::UInt;
 use ruma::api::client::sync::sync_events::v5::response;
 use ruma::api::client::sync::sync_events::v5::{Request, Response};
@@ -53,7 +53,10 @@ const EMIT_STATE_STUBS: bool = false;
 ///    full snapshot via `room_messages`, deltas get only the new events.
 ///    Rooms with no updates (and already known) are omitted entirely.
 /// 5. Record what we just sent in `conn.sent` so future deltas can diff.
-/// 6. Bump `conn.pos` and `conn.last_event_stream_pos`, return.
+/// 6. Compute the response pos as `conn.pos + 1` and bump
+///    `conn.last_event_stream_pos`. **The actual `conn.pos` mutation is
+///    deferred to `super::handle`** so the long-poll loop can call this
+///    function multiple times per request and only commit one pos advance.
 pub(super) async fn build_response<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
@@ -194,6 +197,16 @@ fn apply_sticky(conn: &mut Conn, req: &Request) {
 ///
 /// Returns the per-room delta map plus the highest `StreamPos` seen so the
 /// caller can advance the conn's high-water mark.
+///
+/// **Gap (low-severity, single-user embedded scale):** the caller bumps
+/// `conn.last_event_stream_pos` to `max_stream_pos` unconditionally, even
+/// for events belonging to rooms *outside* the connection's combined
+/// candidate set (no matching list range, no subscription). Those events
+/// silently advance the high-water mark and won't be re-fetched on the
+/// next sync, even if the room later enters a list range. In practice
+/// the embedded server has one user with no filters → every event maps
+/// to an emitted room. Surface this in MSC4186-gaps.md so it doesn't
+/// become a surprise if filters are ever wired up.
 async fn fetch_event_deltas<S: StorageBackend>(
     state: &SyncState<S>,
     from_pos: u64,
@@ -270,30 +283,35 @@ async fn candidate_rooms<S: StorageBackend>(
 ) -> Result<Vec<RankedRoom>, SyncError> {
     // One round-trip for the union across all five MSC4186-eligible
     // memberships. The store hands back `(room, current_membership)`
-    // pairs so we can branch on membership without a second lookup.
+    // pairs so we can branch on membership without a second lookup. The
+    // trait guarantees exactly one row per matching room (a user has at
+    // most one current `m.room.member` event per room), so no dedup pass.
+    let memberships = BTreeSet::from([
+        Membership::Join,
+        Membership::Invite,
+        Membership::Knock,
+        Membership::Leave,
+        Membership::Ban,
+    ]);
     let pairs = state
         .store
-        .rooms_with_membership(user_id, &["join", "invite", "knock", "leave", "ban"])
+        .rooms_with_membership(user_id, &memberships)
         .await?;
 
-    let mut included: Vec<(OwnedRoomId, String)> = Vec::with_capacity(pairs.len());
+    let mut ranked: Vec<RankedRoom> = Vec::with_capacity(pairs.len());
     for (room_id, membership) in pairs {
-        if include_room_per_msc4186(state, user_id, &room_id, &membership, conn).await? {
-            included.push((room_id, membership));
+        if !include_room_per_msc4186(state, user_id, &room_id, membership, conn).await? {
+            continue;
         }
-    }
-    included.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut ranked: Vec<RankedRoom> = Vec::with_capacity(included.len());
-    for (room_id, membership) in included {
         // For rooms we've never joined (`invite`, `knock`) we don't have the
         // create event or a replicated timeline — fall back to the user's own
         // member-event ts. For everything else (join, leave/kick, ban) the
         // timeline + create are available, so the joined path applies.
-        let bump_stamp = if membership == "invite" || membership == "knock" {
-            bump_stamp_for_invited(state, &room_id, user_id).await?
-        } else {
-            bump_stamp_for_joined(state, &room_id).await?
+        let bump_stamp = match membership {
+            Membership::Invite | Membership::Knock => {
+                bump_stamp_for_invited(state, &room_id, user_id).await?
+            }
+            _ => bump_stamp_for_joined(state, &room_id).await?,
         };
         ranked.push(RankedRoom {
             room_id,
@@ -317,26 +335,26 @@ async fn include_room_per_msc4186<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
     room_id: &RoomId,
-    membership: &str,
+    membership: Membership,
     conn: &Conn,
 ) -> Result<bool, SyncError> {
     match membership {
-        "join" | "invite" | "knock" => Ok(true),
-        "leave" => {
+        Membership::Join | Membership::Invite | Membership::Knock => Ok(true),
+        Membership::Leave => {
             let kicked = is_kick(state, room_id, user_id).await?;
             Ok(kicked || conn.sent.contains_key(room_id))
         }
-        "ban" => Ok(conn.sent.contains_key(room_id)),
-        _ => Ok(false),
+        Membership::Ban => Ok(conn.sent.contains_key(room_id)),
     }
 }
 
-/// True iff the current `m.room.member` event for `user_id` in `room_id`
-/// has a different sender than the target — i.e. somebody else flipped us
-/// to "leave". Caller is responsible for only invoking this when the user's
-/// current membership is already known to be "leave"; we don't re-parse the
-/// JSON to check, since `StoredEvent.sender` is the typed canonical value
-/// the storage layer already extracted.
+/// True iff the user's current `m.room.member` event has membership
+/// `leave` AND was set by somebody other than the user themself — i.e.
+/// a kick rather than a self-leave. Reads `content.membership` from the
+/// stored JSON instead of trusting a caller's classification, so the
+/// contract is self-contained: callers can invoke this on any room
+/// without first guaranteeing the user is `leave` — the function returns
+/// `false` for any other membership (including missing/malformed).
 async fn is_kick<S: StorageBackend>(
     state: &SyncState<S>,
     room_id: &RoomId,
@@ -349,6 +367,16 @@ async fn is_kick<S: StorageBackend>(
     else {
         return Ok(false);
     };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(ev.json.get()) else {
+        return Ok(false);
+    };
+    let is_leave = parsed
+        .pointer("/content/membership")
+        .and_then(|v| v.as_str())
+        == Some("leave");
+    if !is_leave {
+        return Ok(false);
+    }
     Ok(ev.sender.as_str() != user_id.as_str())
 }
 

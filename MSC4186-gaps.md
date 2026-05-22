@@ -104,3 +104,9 @@ Connections live forever until the process restarts. Each carries a cached `last
 
 ### Initial sync `num_live` is `None`
 Live events on delta syncs report `num_live = timeline.len()`. The first sync intentionally returns `None`: a client just loading state isn't being notified of "new" activity.
+
+### Idempotency retry cache keys on `(pos, body_hash)`, not `pos` alone
+A retry only hits the cache when *both* the input `pos` and a hash of the request body (`conn_id`, `txn_id`, `lists`, `room_subscriptions`, `extensions`) match the cached request. Same `pos` with a different body (e.g. a freshly-enabled extension, a new list range) is re-processed, not served the stale response. Hashing falls back to `0` on a `serde_json` failure, which trivially misses the cache and forces re-processing — that's the safe direction.
+
+### Events for rooms outside the combined candidate set silently advance the high-water mark
+`build::fetch_event_deltas` drains every event past `conn.last_event_stream_pos` and bumps the mark to the highest position seen. Events for rooms that are not in any list range and not subscribed are not emitted to the client *and* won't be re-fetched on the next sync. For the embedded single-user server with no filters this is moot (every event maps to an emitted room), but if list filters are ever wired up, a room newly entering a list range would skip the events that arrived while it was outside. Fixable by either (a) only advancing the high-water to the max position whose room was actually emitted, or (b) tracking per-room high-water marks.

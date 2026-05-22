@@ -32,42 +32,12 @@ async fn fresh_store() -> (Arc<SqliteStore>, NamedTempFile) {
     (Arc::new(store), tmp)
 }
 
-/// Build a `StoredEvent` whose `json` field is a flat object with the standard
-/// PDU keys. Tests pass `content` separately so they don't have to construct
-/// the wrapper themselves.
-fn make_event(
-    event_id: &EventId,
-    room_id: &RoomId,
-    event_type: &str,
-    state_key: Option<&str>,
-    sender: &UserId,
-    origin_server_ts: u64,
-    content: Value,
-) -> StoredEvent {
-    let json = serde_json::json!({
-        "event_id": event_id.as_str(),
-        "room_id": room_id.as_str(),
-        "type": event_type,
-        "state_key": state_key,
-        "sender": sender.as_str(),
-        "origin_server_ts": origin_server_ts,
-        "content": content,
-    });
-    let json = serde_json::value::to_raw_value(&json).expect("to_raw_value");
-    StoredEvent {
-        event_id: event_id.to_owned(),
-        room_id: room_id.to_owned(),
-        event_type: event_type.to_string(),
-        state_key: state_key.map(String::from),
-        sender: sender.to_owned(),
-        origin_server_ts,
-        json,
-    }
-}
-
-/// Build a `StoredEvent` from a caller-supplied JSON object (for tests that
-/// need `unsigned.invite_room_state` populated on a member-invite event).
-fn make_event_from_json(
+/// Build a `StoredEvent` whose JSON field is exactly the caller-supplied
+/// `Value`. Lower-level helper — most tests want `make_event` (which
+/// constructs the standard PDU wrapper); `make_event_from_json` is the
+/// escape hatch when tests need to set `unsigned.invite_room_state` or
+/// otherwise control the full body.
+fn build_stored_event(
     event_id: &EventId,
     room_id: &RoomId,
     event_type: &str,
@@ -86,6 +56,61 @@ fn make_event_from_json(
         origin_server_ts,
         json,
     }
+}
+
+/// Build a `StoredEvent` whose `json` field is a flat object with the
+/// standard PDU keys. Tests pass `content` separately so they don't have
+/// to construct the wrapper themselves.
+fn make_event(
+    event_id: &EventId,
+    room_id: &RoomId,
+    event_type: &str,
+    state_key: Option<&str>,
+    sender: &UserId,
+    origin_server_ts: u64,
+    content: Value,
+) -> StoredEvent {
+    let json = serde_json::json!({
+        "event_id": event_id.as_str(),
+        "room_id": room_id.as_str(),
+        "type": event_type,
+        "state_key": state_key,
+        "sender": sender.as_str(),
+        "origin_server_ts": origin_server_ts,
+        "content": content,
+    });
+    build_stored_event(
+        event_id,
+        room_id,
+        event_type,
+        state_key,
+        sender,
+        origin_server_ts,
+        json,
+    )
+}
+
+/// Same as `make_event` but the caller supplies the full JSON body — used
+/// when a test needs `unsigned.invite_room_state` or other top-level keys
+/// the standard wrapper doesn't expose.
+fn make_event_from_json(
+    event_id: &EventId,
+    room_id: &RoomId,
+    event_type: &str,
+    state_key: Option<&str>,
+    sender: &UserId,
+    origin_server_ts: u64,
+    json: Value,
+) -> StoredEvent {
+    build_stored_event(
+        event_id,
+        room_id,
+        event_type,
+        state_key,
+        sender,
+        origin_server_ts,
+        json,
+    )
 }
 
 /// Deterministic per-room "stem" for generated event IDs — tests construct

@@ -2,7 +2,7 @@
 //! - The HTTP/JSON edge in `lib.rs::sync` (body parse, query extraction,
 //!   response serialization, error → HTTP mapping).
 //! - The full `sliding_sync::handle` pipeline.
-//! - The `InMemoryStore`'s `RoomStore::create_room` / `EventStore::persist_event`
+//! - The `SqliteStore`'s `RoomStore::create_room` / `EventStore::persist_event`
 //!   paths via the legacy `/createRoom` and `/send/{type}/{txn}` endpoints.
 //!
 //! These tests build the same `Router` the production binary serves and
@@ -251,7 +251,7 @@ async fn idempotent_retry_returns_same_response_bytes() {
 }
 
 #[tokio::test]
-async fn invalid_conn_id_too_long_returns_m_bad_json() {
+async fn invalid_conn_id_too_long_returns_m_invalid_param() {
     let app = router(config()).await;
 
     let body = json!({
@@ -262,7 +262,7 @@ async fn invalid_conn_id_too_long_returns_m_bad_json() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
         body.get("errcode").and_then(|v| v.as_str()),
-        Some("M_BAD_JSON")
+        Some("M_INVALID_PARAM")
     );
 }
 

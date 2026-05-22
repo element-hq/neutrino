@@ -95,18 +95,29 @@ pub struct Conn {
     pub prev_list_timeline_limits: BTreeMap<String, usize>,
     /// Idempotency cache: the `pos` value the client sent on the most
     /// recently *processed* request (i.e. the input pos, not the output). If
-    /// the next request arrives with the same value, we return
-    /// `last_response` verbatim rather than re-processing — MSC4186
-    /// §"Pagination and Tokens" permits clients to retry by re-using the
-    /// same `pos`.
+    /// the next request arrives with the same value AND the same body hash,
+    /// we return `last_response` verbatim rather than re-processing —
+    /// MSC4186 §"Pagination and Tokens" permits clients to retry by
+    /// re-using the same `pos`.
     ///
     /// `None` on a freshly-created conn (the initial sync was the most
     /// recent processed request, which has no pos input).
     pub last_request_pos: Option<u64>,
-    /// Companion to `last_request_pos` — the full response we returned for
-    /// that input pos. On a retry hit (`req.pos == last_request_pos`) we
-    /// clone this and return immediately, without re-running `build_response`
-    /// or advancing any conn state.
+    /// Hash of the most-recently-processed request's body fields
+    /// (`conn_id`, `txn_id`, `lists`, `room_subscriptions`, `extensions`).
+    /// A retry only hits the cache when *both* `pos` and this hash match
+    /// the cached request — otherwise the retry has changed something
+    /// (different `timeline_limit`, opted into a new extension, etc.) and
+    /// must be re-processed, not served the stale response.
+    ///
+    /// `0` on a freshly-created conn. Computed via `request_body_hash` in
+    /// `super::handle`.
+    pub last_request_hash: u64,
+    /// Companion to `last_request_pos`/`last_request_hash` — the full
+    /// response we returned for that input. On a retry hit
+    /// (`(req.pos, hash) == (last_request_pos, last_request_hash)`) we
+    /// clone this and return immediately, without re-running
+    /// `build_response` or advancing any conn state.
     ///
     /// Includes the post-processing extension stubs so the cached response
     /// matches exactly what the client got the first time, byte-for-byte.

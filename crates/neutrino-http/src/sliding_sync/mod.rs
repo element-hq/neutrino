@@ -14,6 +14,7 @@
 // lands.
 #![allow(dead_code)]
 
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,9 +57,10 @@ pub enum SyncError {
     /// for this conn (client is on a stale token).
     #[error("M_UNKNOWN_POS")]
     UnknownPos,
-    /// Returned as HTTP 400 with errcode `M_BAD_JSON`. Triggered by violations
-    /// of MSC4186's size/length limits (`conn_id` over 16 chars, over 100
-    /// lists, or over 100 room subscriptions). The string is the
+    /// Returned as HTTP 400 with errcode `M_INVALID_PARAM`. Triggered by
+    /// violations of MSC4186's size/length limits (`conn_id` over 16 chars,
+    /// over 100 lists, or over 100 room subscriptions) — the JSON parses
+    /// fine but the semantic constraints fail. The string is the
     /// human-readable reason for logging/debugging; clients only see the
     /// errcode.
     #[error("bad request: {0}")]
@@ -113,7 +115,8 @@ pub async fn handle<S: StorageBackend>(
         conn_id: req.conn_id.clone().unwrap_or_default(),
     };
 
-    let resolution = resolve_conn(&state.registry, key, req.pos.as_deref()).await?;
+    let req_hash = request_body_hash(&req);
+    let resolution = resolve_conn(&state.registry, key, req.pos.as_deref(), req_hash).await?;
     let conn_arc = match resolution {
         Resolution::Cached(resp) => return Ok(*resp),
         Resolution::Fresh(arc) => arc,
@@ -128,23 +131,24 @@ pub async fn handle<S: StorageBackend>(
     let timeout = clamp_timeout(req.timeout);
     let deadline = Instant::now() + timeout;
     let initial_sync = req.pos.is_none();
+    // Pulled out so the loop's break condition reads as a single boolean
+    // rather than entangling "initial sync" with "non-empty response" with
+    // "zero remaining wall time". `wait_for_data` is the only branch that
+    // can iterate; everything else exits after one build.
+    let wait_for_data = !initial_sync && !timeout.is_zero();
 
     let mut conn_guard = conn_arc.lock().await;
     let mut final_resp = loop {
         let resp = build::build_response(state, user_id, &req, &mut conn_guard).await?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-
-        // Initial sync always returns its full snapshot immediately; the
-        // client is loading state, not waiting for live updates. After
-        // that, we only return early when the response is non-empty (see
-        // `has_data` for the precise definition) or the deadline is up.
-        if initial_sync || has_data(&resp) || remaining.is_zero() {
+        if !wait_for_data || has_data(&resp) {
             break resp;
         }
-
-        // No data and time left → wait. `rx.changed()` resolves on the next
-        // `persist_event` watch update; the next loop iter rebuilds with
-        // the new high-water mark.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break resp;
+        }
+        // `rx.changed()` resolves on the next `persist_event` watch
+        // update; the next loop iter rebuilds with the new high-water mark.
         match tokio::time::timeout(remaining, rx.changed()).await {
             Ok(_) => continue,
             Err(_) => break resp,
@@ -160,9 +164,13 @@ pub async fn handle<S: StorageBackend>(
     // last value the client received.
     conn_guard.pos = conn_guard.pos.saturating_add(1);
 
-    // Idempotency cache: remember the input pos that produced this response
-    // (or `None` for initial sync) and snapshot the full final response.
+    // Idempotency cache: remember the input pos (or `None` for initial
+    // sync), the body hash, and the full final response. A retry only
+    // hits the cache when *both* pos and hash match — anything else
+    // (different `timeline_limit`, newly-opted-into extension) must be
+    // re-processed.
     conn_guard.last_request_pos = req.pos.as_ref().and_then(|s| s.parse::<u64>().ok());
+    conn_guard.last_request_hash = req_hash;
     conn_guard.last_response = Some(final_resp.clone());
 
     Ok(final_resp)
@@ -181,15 +189,18 @@ enum Resolution {
 
 /// Three-way classification of an incoming request against the conn state:
 /// - `req.pos == None` → initial sync, always allocate a fresh conn.
-/// - `req.pos` matches `conn.last_request_pos` → retry of a previously
-///   processed request, return the cached response verbatim.
+/// - `(req.pos, req_hash)` matches the cached `(last_request_pos,
+///   last_request_hash)` → byte-identical retry, return cached response.
 /// - `req.pos` matches `conn.pos` (the value we last issued in a response)
 ///   → fresh request, return the unlocked Arc for processing.
-/// - Anything else → `UnknownPos`.
+/// - Anything else (including a retry with same pos but different body) →
+///   either treat as a fresh request (if pos still matches `conn.pos`) or
+///   `UnknownPos`.
 async fn resolve_conn(
     registry: &ConnRegistry,
     key: ConnKey,
     req_pos: Option<&str>,
+    req_hash: u64,
 ) -> Result<Resolution, SyncError> {
     let Some(pos_str) = req_pos else {
         return Ok(Resolution::Fresh(registry.create(key).await));
@@ -203,6 +214,7 @@ async fn resolve_conn(
     // brief re-lock.
     let guard = conn_arc.lock().await;
     if Some(pos) == guard.last_request_pos
+        && req_hash == guard.last_request_hash
         && let Some(cached) = &guard.last_response
     {
         return Ok(Resolution::Cached(Box::new(cached.clone())));
@@ -212,6 +224,46 @@ async fn resolve_conn(
     }
     drop(guard);
     Ok(Resolution::Fresh(conn_arc))
+}
+
+/// Hash the body fields of a sliding-sync request: everything that
+/// influences the response shape *except* `pos`, `timeout`, and
+/// `set_presence` (the latter is dropped on the floor; the first two
+/// don't change the response content, only its timing / cursor).
+///
+/// Used as the second half of the idempotency cache key — a "retry" with
+/// the same `pos` but a different body (e.g. an extension was just
+/// enabled) must be re-processed, not served the stale response.
+///
+/// We hash the canonical JSON serialisation rather than implementing
+/// `Hash` on every ruma field — the field types are `#[non_exhaustive]`
+/// and don't all derive `Hash`, but they all derive `Serialize`. A
+/// serialisation failure falls back to `0` which trivially won't match
+/// the stored hash, so the request gets re-processed; that's the safe
+/// direction.
+fn request_body_hash(req: &v5::Request) -> u64 {
+    #[derive(serde::Serialize)]
+    struct BodyView<'a> {
+        conn_id: &'a Option<String>,
+        txn_id: &'a Option<String>,
+        lists: &'a std::collections::BTreeMap<String, v5::request::List>,
+        room_subscriptions:
+            &'a std::collections::BTreeMap<ruma::OwnedRoomId, v5::request::RoomSubscription>,
+        extensions: &'a v5::request::Extensions,
+    }
+    let view = BodyView {
+        conn_id: &req.conn_id,
+        txn_id: &req.txn_id,
+        lists: &req.lists,
+        room_subscriptions: &req.room_subscriptions,
+        extensions: &req.extensions,
+    };
+    let Ok(bytes) = serde_json::to_vec(&view) else {
+        return 0;
+    };
+    let mut h = DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
 }
 
 /// MSC4186 shape limits applied at the request boundary. Anything that

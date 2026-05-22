@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use async_trait::async_trait;
 use ruma::{
@@ -45,6 +45,43 @@ pub struct PaginationToken(pub u64);
 pub enum Direction {
     Forward,
     Backward,
+}
+
+/// The five canonical `m.room.member` membership states. Sliding sync's
+/// `rooms_with_membership` takes a set of these so the wire-string
+/// alphabet is closed and duplicates can't be expressed at the type level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Membership {
+    Join,
+    Invite,
+    Knock,
+    Leave,
+    Ban,
+}
+
+impl Membership {
+    /// Canonical wire string, as it appears in `m.room.member.content.membership`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Membership::Join => "join",
+            Membership::Invite => "invite",
+            Membership::Knock => "knock",
+            Membership::Leave => "leave",
+            Membership::Ban => "ban",
+        }
+    }
+
+    /// Parse from the wire string; returns `None` for anything else.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "join" => Some(Membership::Join),
+            "invite" => Some(Membership::Invite),
+            "knock" => Some(Membership::Knock),
+            "leave" => Some(Membership::Leave),
+            "ban" => Some(Membership::Ban),
+            _ => None,
+        }
+    }
 }
 
 #[async_trait]
@@ -209,27 +246,23 @@ pub trait StateStore: Send + Sync {
     ///       a single method with a membership filter in the future.
     async fn invited_rooms(&self, user_id: &UserId) -> Result<Vec<OwnedRoomId>, StorageError>;
 
-    /// Pre:  none. `memberships` is a slice of the canonical Matrix membership
-    ///       strings: `"join"`, `"invite"`, `"knock"`, `"leave"`, `"ban"`.
-    ///       Unknown strings are silently ignored; an empty slice returns an
-    ///       empty vec.
-    /// Post: returns one `(room_id, current_membership)` pair for every room
-    ///       in which `user_id`'s current `m.room.member` event has a
-    ///       `content.membership` matching one of the requested values. The
-    ///       `current_membership` is the actual string from the event (one
-    ///       of the values from `memberships`), so the caller can branch on
-    ///       it without a second lookup. The caller can pass multiple
-    ///       memberships to get the union in one round-trip (used by
-    ///       sliding sync to enumerate candidate rooms across all the
-    ///       MSC4186-eligible memberships at once). Result order is
-    ///       unspecified — callers sort/dedup as needed. Implementations
-    ///       should answer this from an indexed lookup rather than a full
-    ///       table scan.
+    /// Pre:  none. An empty `memberships` set returns an empty vec.
+    /// Post: returns **exactly one** `(room_id, current_membership)` pair for
+    ///       every room in which `user_id`'s current `m.room.member` event has
+    ///       a `content.membership` in `memberships`. The `current_membership`
+    ///       value is the actual membership the user currently has — duplicates
+    ///       per room are impossible by construction since each `(room, user)`
+    ///       has a single current member event. The caller can pass multiple
+    ///       memberships to get the union in one round-trip (used by sliding
+    ///       sync to enumerate candidate rooms across all the MSC4186-eligible
+    ///       memberships at once). Result order is unspecified — callers sort
+    ///       as needed. Implementations should answer this from an indexed
+    ///       lookup rather than a full table scan.
     async fn rooms_with_membership(
         &self,
         user_id: &UserId,
-        memberships: &[&str],
-    ) -> Result<Vec<(OwnedRoomId, String)>, StorageError>;
+        memberships: &BTreeSet<Membership>,
+    ) -> Result<Vec<(OwnedRoomId, Membership)>, StorageError>;
 
     /// Pre:  none (returns empty map if the room does not exist).
     /// Post: returns one member event per `user_id` (state_key) whose current

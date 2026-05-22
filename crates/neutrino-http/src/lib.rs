@@ -230,7 +230,7 @@ async fn sync(
             error_response(StatusCode::BAD_REQUEST, "M_UNKNOWN_POS", "Unknown position")
         }
         Err(SyncError::BadRequest(msg)) => {
-            error_response(StatusCode::BAD_REQUEST, "M_BAD_JSON", msg)
+            error_response(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", msg)
         }
         Err(SyncError::Storage(e)) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -529,22 +529,36 @@ async fn create_room(state: State<AppState>, body: Json<Value>) -> axum::respons
 async fn members(
     state: State<AppState>,
     axum::extract::Path(room_id): axum::extract::Path<String>,
-) -> Json<Value> {
+) -> axum::response::Response {
     let store = state.0.0.lock().unwrap().store.clone();
-    let chunk: Vec<Value> = match ruma::OwnedRoomId::try_from(room_id.as_str()) {
-        Ok(rid) => match store
-            .current_state_events_of_type(&rid, "m.room.member")
-            .await
-        {
-            Ok(map) => map
-                .into_values()
-                .filter_map(|ev| serde_json::from_str::<Value>(ev.json.get()).ok())
-                .collect(),
-            Err(_) => Vec::new(),
-        },
-        Err(_) => Vec::new(),
+    let rid = match ruma::OwnedRoomId::try_from(room_id.as_str()) {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", &e.to_string());
+        }
     };
-    Json(json!({"chunk": chunk}))
+    let map = match store
+        .current_state_events_of_type(&rid, "m.room.member")
+        .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            );
+        }
+    };
+    // Per spec (https://spec.matrix.org/v1.18/client-server-api/#get_matrixclientv3roomsroomidmembers)
+    // the default response includes members of every membership; filtering
+    // is opt-in via `membership` / `not_membership` query params (which we
+    // don't honour — see PLAN.md non-goals).
+    let chunk: Vec<Value> = map
+        .into_values()
+        .filter_map(|ev| serde_json::from_str::<Value>(ev.json.get()).ok())
+        .collect();
+    (StatusCode::OK, Json(json!({"chunk": chunk}))).into_response()
 }
 
 async fn put_event(
