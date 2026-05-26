@@ -69,13 +69,16 @@ pub(crate) fn b64_url_unpadded(bytes: &[u8]) -> String {
 ///
 /// See `project-msc4242-redaction` memory and `event-id-design.md`
 /// §"ruma redaction wrapper".
+///
+/// On error: `prev_state_events` is restored before returning, so the caller
+/// sees the input in its original shape regardless of outcome.
 pub(crate) fn redact_for_hash(obj: &mut CanonicalJsonObject) -> Result<(), RedactionError> {
     let saved_prev_state = obj.remove("prev_state_events");
-    redact_in_place(obj, &RoomVersionRules::V12.redaction, None)?;
+    let result = redact_in_place(obj, &RoomVersionRules::V12.redaction, None);
     if let Some(v) = saved_prev_state {
         obj.insert("prev_state_events".to_owned(), v);
     }
-    Ok(())
+    result
 }
 
 /// Content hash of an unhashed event object.
@@ -95,17 +98,17 @@ pub fn content_hash(obj: &CanonicalJsonObject) -> [u8; 32] {
 /// Reference hash of an event object — feeds the v3+ event_id.
 ///
 /// Spec: <https://spec.matrix.org/v1.18/server-server-api/#calculating-the-reference-hash-for-an-event>.
-/// Removes `unsigned` and `signatures`, then runs [`redact_for_hash`] (V12
-/// redaction with the MSC4242 `prev_state_events` carve-out), canonical-encodes,
+/// Runs [`redact_for_hash`] (V12 redaction with the MSC4242 `prev_state_events`
+/// carve-out), then removes `signatures` and `unsigned`, canonical-encodes,
 /// SHA-256s.
 ///
 /// Returns `RedactionError` only if the input object violates the redaction
 /// preconditions ruma checks (e.g. non-object `content`, missing `type`).
 pub fn reference_hash(obj: &CanonicalJsonObject) -> Result<[u8; 32], RedactionError> {
     let mut clone = obj.clone();
-    clone.remove("unsigned");
-    clone.remove("signatures");
     redact_for_hash(&mut clone)?;
+    clone.remove("signatures");
+    clone.remove("unsigned");
     Ok(sha256(&canonical(&clone)))
 }
 
@@ -124,13 +127,11 @@ pub fn event_id_from_hash(hash: &[u8; 32]) -> OwnedEventId {
 /// event_id with the leading `$` swapped to `!`. The suffix is identical
 /// (43 url-safe-b64 chars). Spec: <https://spec.matrix.org/v1.18/rooms/v12/#room-ids>.
 pub fn room_id_from_create(create_event_id: &EventId) -> OwnedRoomId {
-    let s = create_event_id.as_str();
-    debug_assert!(
-        s.starts_with('$'),
-        "EventId by construction starts with '$'"
-    );
-    let swapped = format!("!{}", &s[1..]);
-    OwnedRoomId::try_from(swapped)
+    let suffix = create_event_id
+        .as_str()
+        .strip_prefix('$')
+        .expect("EventId by construction starts with '$'");
+    OwnedRoomId::try_from(format!("!{suffix}"))
         .expect("'!' + valid event_id suffix is a valid room_id under format v2")
 }
 
@@ -351,6 +352,23 @@ mod tests {
         assert_ne!(
             reference_hash(&a).expect("redacts"),
             reference_hash(&b).expect("redacts"),
+        );
+    }
+
+    #[test]
+    fn reference_hash_propagates_redaction_error_on_missing_type() {
+        // ruma's `redact_in_place` returns `MissingField { path: "type" }` when
+        // the input lacks a `type` field. Pins that the `?` in `reference_hash`
+        // surfaces the error rather than panicking or masking it.
+        let o = obj(json!({
+            "sender": "@a:d", "room_id": "!r:d",
+            "content": {}, "origin_server_ts": 1,
+            "prev_events": []
+        }));
+        let err = reference_hash(&o).expect_err("missing `type` must trip redaction");
+        assert!(
+            matches!(err, RedactionError::MissingField { ref path } if path == "type"),
+            "expected MissingField {{ path: \"type\" }}, got {err:?}",
         );
     }
 

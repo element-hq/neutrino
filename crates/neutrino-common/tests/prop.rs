@@ -78,10 +78,14 @@ fn arb_json_value() -> impl Strategy<Value = Value> {
     )
 }
 
-/// Arbitrary list of event IDs (0-4 entries). Used to drive `prev_state_events`.
+/// Arbitrary list of v12-shaped event IDs (0-4 entries). Used to drive
+/// `prev_state_events`. v12 event_ids are `$` + 43 url-safe-base64 chars
+/// (no domain suffix) — see `event_id_from_hash`. Only distinctness matters
+/// for the property, but matching the project's actual on-wire shape avoids
+/// inconsistency with the rest of the codebase.
 fn arb_event_id_list() -> impl Strategy<Value = Vec<String>> {
     prop::collection::vec(
-        "[a-zA-Z0-9_-]{8,20}".prop_map(|tail| format!("${tail}:example.org")),
+        "[A-Za-z0-9_-]{43}".prop_map(|suffix| format!("${suffix}")),
         0..4,
     )
 }
