@@ -55,7 +55,14 @@ CREATE TABLE events (
     state_key         TEXT,                          -- NULL ⇔ non-state event
     sender            TEXT    NOT NULL,
     origin_server_ts  INTEGER NOT NULL,
-    json              TEXT    NOT NULL
+    json              TEXT    NOT NULL,
+    -- MSC4242: `auth_events` is calculated server-side and not on the
+    -- wire. Stored here as a JSON array of event ids so it survives the
+    -- round-trip into the canonical `neutrino_common::Event`. The
+    -- denormalised `event_edges WHERE edge_type='auth'` rows below are
+    -- derivable from this column; see `event-id-design.md` §"What
+    -- event_edges is doing".
+    auth_events_json  TEXT    NOT NULL DEFAULT '[]'
 ) STRICT;
 
 CREATE INDEX ix_events_room_stream ON events(room_id, stream_pos);
@@ -82,7 +89,7 @@ CREATE UNIQUE INDEX ix_events_id_room_type_key
 CREATE TABLE event_edges (
     child_event_id   TEXT NOT NULL REFERENCES events(event_id),
     edge_type        TEXT NOT NULL
-        CHECK (edge_type IN ('prev', 'prev_state')),
+        CHECK (edge_type IN ('prev', 'prev_state', 'auth')),
     parent_event_id  TEXT NOT NULL,
     PRIMARY KEY (child_event_id, edge_type, parent_event_id)
 ) STRICT, WITHOUT ROWID;

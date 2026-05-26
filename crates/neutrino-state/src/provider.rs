@@ -2,20 +2,26 @@
 //! in-memory implementation used by tests and (until storage lands) by
 //! Phase 6 `apply`.
 //!
-//! The trait grows as state resolution lands; today it carries:
+//! The trait carries:
 //! - `get_event(id)`: used by `validate::validate_references` (Phase 1b) and
 //!   anywhere downstream that needs the event body / rejection flag.
-//! - `auth_event_ids(id)`: used by Phase 4 state resolution to walk the
-//!   precomputed auth chain. Under MSC4242 these are calculated server-side
-//!   at insert time (by `auth_events::calculate_auth_events`) and stored.
+//! - `auth_chain(seeds)`: used by Phase 4 state resolution. Returns the
+//!   transitive backwards closure of the seeds through their `auth_events`
+//!   (including the seeds themselves). **Errors** if any event in the
+//!   closure isn't in the store — every event we know about must have its
+//!   complete auth chain locally (no federation auth-chain backfill).
+//!
+//! Under MSC4242 `auth_events` is **not** on the wire; the server calculates
+//! it once at insert time and stores it on the `Event` struct. The provider
+//! reads from there — there's no separate `auth_event_ids` map any more.
 
-use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use neutrino_common::Event;
 use ruma::{EventId, OwnedEventId};
 
-use crate::Event;
+use crate::StateResError;
 
 /// View of an event known to the store, with its rejection status.
 ///
@@ -34,27 +40,34 @@ pub trait StateProvider {
     /// Look up an event by ID, returning `None` if the store does not know it.
     fn get_event(&self, id: &EventId) -> Option<EventInfo>;
 
-    /// Precomputed auth_events of `id` — under MSC4242, `auth_events` is not
-    /// on the wire; the server calculates it once at insert time via
-    /// `auth_events::calculate_auth_events` and stores it alongside the
-    /// event.
+    /// Transitive backwards closure of `seeds` via `Event.auth_events`.
     ///
-    /// Returns an empty slice if `id` is unknown **or** if `id` is known to
-    /// be an `m.room.create` event (which legitimately has zero auth_events).
-    /// Callers that need to distinguish the two cases should `get_event(id)`
-    /// first.
+    /// Returns every id reachable backwards from the seeds (seeds included
+    /// in the result). **Errors** with `StateResError::MissingAuthEvent` if
+    /// any id — seed or transitively discovered — isn't in the store.
     ///
-    /// Returning `Cow` lets in-memory impls borrow their stored vec while
-    /// DB-backed impls return an owned vec materialised from a row scan.
-    fn auth_event_ids(&self, id: &EventId) -> Cow<'_, [OwnedEventId]>;
+    /// The project invariant: every event we know about has its **complete**
+    /// auth chain locally resolvable. We don't federate auth chains; every
+    /// event is authored locally or arrives with its full chain. A missing
+    /// entry indicates corruption or a write-path bug, never a normal
+    /// backfill boundary — surface it loudly rather than walking around it.
+    ///
+    /// In-memory impls do a stack-based DFS reading `event.auth_events`
+    /// per step. SQLite-backed impls collapse the walk to a single recursive
+    /// CTE join against `event_edges WHERE edge_type = 'auth'` — see
+    /// `event-id-design.md` §"What event_edges is doing".
+    fn auth_chain(
+        &self,
+        seeds: &HashSet<OwnedEventId>,
+    ) -> Result<HashSet<OwnedEventId>, StateResError>;
 }
 
 /// In-memory `StateProvider`. Public (not test-cfg) — Phase 6 `apply` uses
-/// it as the storage-free fallback, and unit tests use it directly.
-#[derive(Debug, Default)]
+/// it as the storage-free fallback, and unit tests use it directly. Clone
+/// is cheap: events are `Arc`-shared via `EventInfo`.
+#[derive(Debug, Default, Clone)]
 pub struct InMemoryStateProvider {
     events: HashMap<OwnedEventId, EventInfo>,
-    auth_event_ids: HashMap<OwnedEventId, Vec<OwnedEventId>>,
 }
 
 impl InMemoryStateProvider {
@@ -62,16 +75,12 @@ impl InMemoryStateProvider {
         Self::default()
     }
 
-    /// Insert an event into the provider with its precomputed auth_events.
-    ///
-    /// `auth_events` is the result of running
-    /// `auth_events::calculate_auth_events(event, state_before_event)` at the
-    /// time this event was accepted. The provider stores it verbatim — it
-    /// does not recompute or validate.
-    pub fn insert(&mut self, info: EventInfo, auth_events: Vec<OwnedEventId>) {
+    /// Insert an event into the provider. `auth_events` lives on the
+    /// `Event` itself (MSC4242 server-side metadata) — the provider
+    /// reads them from there.
+    pub fn insert(&mut self, info: EventInfo) {
         let id = info.event.event_id.clone();
-        self.events.insert(id.clone(), info);
-        self.auth_event_ids.insert(id, auth_events);
+        self.events.insert(id, info);
     }
 }
 
@@ -80,10 +89,28 @@ impl StateProvider for InMemoryStateProvider {
         self.events.get(id).cloned()
     }
 
-    fn auth_event_ids(&self, id: &EventId) -> Cow<'_, [OwnedEventId]> {
-        self.auth_event_ids
-            .get(id)
-            .map(|v| Cow::Borrowed(v.as_slice()))
-            .unwrap_or(Cow::Borrowed(&[]))
+    fn auth_chain(
+        &self,
+        seeds: &HashSet<OwnedEventId>,
+    ) -> Result<HashSet<OwnedEventId>, StateResError> {
+        let mut visited: HashSet<OwnedEventId> = HashSet::new();
+        let mut stack: Vec<OwnedEventId> = seeds.iter().cloned().collect();
+        while let Some(id) = stack.pop() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            // Strict closure invariant: every id we visit (seed or
+            // transitively discovered) must resolve. Missing => error.
+            let info = self
+                .events
+                .get(&id)
+                .ok_or_else(|| StateResError::MissingAuthEvent(id.clone()))?;
+            for parent in &info.event.auth_events {
+                if !visited.contains(parent) {
+                    stack.push(parent.clone());
+                }
+            }
+        }
+        Ok(visited)
     }
 }

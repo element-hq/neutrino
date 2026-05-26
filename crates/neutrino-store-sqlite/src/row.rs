@@ -1,11 +1,11 @@
 //! Row ↔ event I/O. Single source of truth for the column shape on both
-//! the SELECT side (hydration into `StoredEvent`) and the INSERT side
+//! the SELECT side (hydration into `Event`) and the INSERT side
 //! ([`EventRow::write_into_tx`]). Per design doc §3: keeping this in one
 //! place means the SELECTs and INSERTs in `store/{events,state,dag,outbox}.rs`
 //! all agree on what they project, and a schema change touches one file.
 //!
 //! Column access on the SELECT side is by *name*, not by position. Any
-//! query feeding [`EventRow::try_from`] only needs to project the seven
+//! query feeding [`EventRow::try_from`] only needs to project the eight
 //! [`EVENT_COLUMNS`] (or [`EVENT_COLUMNS_PREFIXED`] when JOINing with an
 //! `e` alias); their position in the row (and any extra leading columns
 //! like `stream_pos`) is irrelevant.
@@ -13,7 +13,7 @@
 use std::{borrow::Cow, ops::Deref};
 
 use deadpool_sqlite::rusqlite::{Row, Transaction, params};
-use neutrino_store::StoredEvent;
+use neutrino_common::Event;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -23,41 +23,108 @@ use crate::error::Error;
 /// Canonical event-row column list. SELECTs feeding [`EventRow::try_from`]
 /// must project at least these columns by name (order doesn't matter,
 /// extra columns are allowed and ignored).
+///
+/// `auth_events_json` carries the MSC4242 server-computed auth_events
+/// list — it's not on the wire and not in `json`, so the column is its
+/// authoritative storage. See `event-id-design.md` §"Co-location pattern".
 pub(crate) const EVENT_COLUMNS: &str =
-    "event_id, room_id, event_type, state_key, sender, origin_server_ts, json";
+    "event_id, room_id, event_type, state_key, sender, origin_server_ts, json, auth_events_json";
 
 /// Same as [`EVENT_COLUMNS`] but with an `e.` prefix on each column, for
 /// SELECTs that JOIN `events` aliased as `e` (state, outbox, etc.). Keep
 /// in sync with [`EVENT_COLUMNS`] — one is just the prefixed sibling of
 /// the other.
-pub(crate) const EVENT_COLUMNS_PREFIXED: &str =
-    "e.event_id, e.room_id, e.event_type, e.state_key, e.sender, e.origin_server_ts, e.json";
+pub(crate) const EVENT_COLUMNS_PREFIXED: &str = "e.event_id, e.room_id, e.event_type, e.state_key, e.sender, e.origin_server_ts, e.json, e.auth_events_json";
 
-/// Row-shape wrapper around a [`StoredEvent`].
+/// Row-shape wrapper around an [`Event`].
 ///
 /// - **Read**: `EventRow::try_from(row)?` produces `EventRow<'static>`
 ///   (owned). Unwrap via [`EventRow::into_event`].
 /// - **Write**: `EventRow::from(&event).write_into_tx(&tx)?` borrows the
 ///   caller's event; no clone.
-pub(crate) struct EventRow<'a>(pub Cow<'a, StoredEvent>);
+pub(crate) struct EventRow<'a>(pub Cow<'a, Event>);
 
 impl Deref for EventRow<'_> {
-    type Target = StoredEvent;
-    fn deref(&self) -> &StoredEvent {
+    type Target = Event;
+    fn deref(&self) -> &Event {
         &self.0
     }
 }
 
-impl<'a> From<&'a StoredEvent> for EventRow<'a> {
-    fn from(event: &'a StoredEvent) -> Self {
+impl<'a> From<&'a Event> for EventRow<'a> {
+    fn from(event: &'a Event) -> Self {
         Self(Cow::Borrowed(event))
     }
 }
 
-impl From<StoredEvent> for EventRow<'static> {
-    fn from(event: StoredEvent) -> Self {
+impl From<Event> for EventRow<'static> {
+    fn from(event: Event) -> Self {
         Self(Cow::Owned(event))
     }
+}
+
+/// Parse the auth_events_json column into a `Vec<OwnedEventId>`. Failures
+/// map to `Error::Internal` — auth_events_json is written by this crate.
+fn parse_auth_events_json(s: &str) -> Result<Vec<OwnedEventId>, Error> {
+    let ids: Vec<String> = serde_json::from_str(s)
+        .map_err(|e| Error::Internal(format!("malformed auth_events_json in DB row: {e}")))?;
+    ids.into_iter()
+        .map(|id| {
+            OwnedEventId::try_from(id).map_err(|e| {
+                Error::Internal(format!("malformed event_id in auth_events_json: {e}"))
+            })
+        })
+        .collect()
+}
+
+/// Fields extracted from `events.json` to populate `Event`: the `content`
+/// sub-RawValue, plus the `prev_events` / `prev_state_events` arrays.
+struct ExtractedFields {
+    content: Box<RawValue>,
+    prev_events: Vec<OwnedEventId>,
+    prev_state_events: Vec<OwnedEventId>,
+}
+
+/// Parse `events.json` into the fields needed to populate `Event`.
+fn extract_event_fields(raw: &RawValue) -> Result<ExtractedFields, Error> {
+    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(raw.get())
+        .map_err(|e| Error::Internal(format!("malformed json in DB row: {e}")))?;
+
+    let content_value = map
+        .get("content")
+        .ok_or_else(|| Error::Internal("event json missing `content`".into()))?;
+    let content = serde_json::value::to_raw_value(content_value)
+        .map_err(|e| Error::Internal(format!("re-serialising content: {e}")))?;
+
+    let prev_events = parse_event_id_array(&map, "prev_events")?;
+    let prev_state_events = parse_event_id_array(&map, "prev_state_events")?;
+
+    Ok(ExtractedFields {
+        content,
+        prev_events,
+        prev_state_events,
+    })
+}
+
+fn parse_event_id_array(
+    map: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Vec<OwnedEventId>, Error> {
+    let Some(v) = map.get(field) else {
+        return Ok(Vec::new());
+    };
+    let arr = v
+        .as_array()
+        .ok_or_else(|| Error::Internal(format!("event json `{field}` is not an array")))?;
+    arr.iter()
+        .map(|item| {
+            let s = item.as_str().ok_or_else(|| {
+                Error::Internal(format!("event json `{field}` contains non-string entry"))
+            })?;
+            OwnedEventId::try_from(s.to_owned())
+                .map_err(|e| Error::Internal(format!("malformed event_id in `{field}`: {e}")))
+        })
+        .collect()
 }
 
 impl TryFrom<&Row<'_>> for EventRow<'static> {
@@ -74,6 +141,7 @@ impl TryFrom<&Row<'_>> for EventRow<'static> {
         let sender: String = row.get("sender")?;
         let origin_server_ts: i64 = row.get("origin_server_ts")?;
         let json: String = row.get("json")?;
+        let auth_events_json: String = row.get("auth_events_json")?;
 
         let event_id = OwnedEventId::try_from(event_id)
             .map_err(|e| Error::Internal(format!("malformed event_id in DB row: {e}")))?;
@@ -81,7 +149,7 @@ impl TryFrom<&Row<'_>> for EventRow<'static> {
             .map_err(|e| Error::Internal(format!("malformed room_id in DB row: {e}")))?;
         let sender = OwnedUserId::try_from(sender)
             .map_err(|e| Error::Internal(format!("malformed sender in DB row: {e}")))?;
-        let json = RawValue::from_string(json)
+        let raw = RawValue::from_string(json)
             .map_err(|e| Error::Internal(format!("malformed json in DB row: {e}")))?;
         // SQLite stores INTEGER (i64). The write side rejects values
         // outside `0..=i64::MAX`, so any negative we see here is DB
@@ -92,28 +160,35 @@ impl TryFrom<&Row<'_>> for EventRow<'static> {
             ))
         })?;
 
-        Ok(EventRow(Cow::Owned(StoredEvent {
+        let auth_events = parse_auth_events_json(&auth_events_json)?;
+        let extracted = extract_event_fields(&raw)?;
+
+        Ok(EventRow(Cow::Owned(Event {
             event_id,
             room_id,
+            sender,
             event_type,
             state_key,
-            sender,
             origin_server_ts,
-            json,
+            content: extracted.content,
+            prev_events: extracted.prev_events,
+            prev_state_events: extracted.prev_state_events,
+            auth_events,
+            raw,
         })))
     }
 }
 
 impl<'a> EventRow<'a> {
-    /// Unwrap into the inner [`StoredEvent`], allocating only if the
-    /// underlying `Cow` is `Borrowed`. For the `TryFrom<&Row>` path the
-    /// `Cow` is always `Owned`, so this is a zero-cost move.
-    pub fn into_event(self) -> StoredEvent {
+    /// Unwrap into the inner [`Event`], allocating only if the underlying
+    /// `Cow` is `Borrowed`. For the `TryFrom<&Row>` path the `Cow` is
+    /// always `Owned`, so this is a zero-cost move.
+    pub fn into_event(self) -> Event {
         self.0.into_owned()
     }
 
     /// Promote a (possibly borrowed) `EventRow` to a `'static` one,
-    /// cloning the inner [`StoredEvent`] if necessary. Inherent shadow of
+    /// cloning the inner [`Event`] if necessary. Inherent shadow of
     /// `ToOwned::to_owned` — the std trait would require a `Borrow<Self>`
     /// dance across `EventRow<'a>` ↔ `EventRow<'static>` that the blanket
     /// `impl<T> Borrow<T> for T` makes unsound without specialisation.
@@ -153,27 +228,24 @@ impl<'a> EventRow<'a> {
         update_current_state: bool,
     ) -> Result<i64, Error> {
         // Inline cracker for the JSON fields we need *and* the ones we
-        // cross-check against the `StoredEvent` columns. A caller that
-        // passes a `StoredEvent` whose column values disagree with the
-        // raw JSON (different `type`, `room_id`, `sender`, or
-        // `state_key`) could otherwise silently desync the two tables:
-        // every read path projects the columns, but federation re-emits
-        // the raw JSON, so a downstream consumer would see one shape via
-        // the trait and another via the wire. Reject at the write
+        // cross-check against the `Event` columns. A caller that
+        // passes an `Event` whose column values disagree with the raw
+        // JSON (different `type`, `room_id`, `sender`, or `state_key`)
+        // could otherwise silently desync the two tables: every read
+        // path projects the columns, but federation re-emits the raw
+        // JSON, so a downstream consumer would see one shape via the
+        // trait and another via the wire. Reject at the write
         // boundary instead — defence-in-depth against a buggy upstream
         // caller; the trust boundary still nominally lives at the
         // handler.
         #[derive(Deserialize)]
-        struct CrackedEvent {
+        struct WriteSideCracked {
             #[serde(rename = "type", default)]
             event_type: Option<String>,
             #[serde(default)]
             room_id: Option<String>,
             #[serde(default)]
             sender: Option<String>,
-            // Outer-None = field absent in JSON (skip cross-check);
-            // outer-Some(inner) = field present (inner is the actual
-            // state_key, which may itself be JSON `null` → Rust None).
             #[serde(default)]
             state_key: Option<Option<String>>,
             #[serde(default)]
@@ -181,31 +253,31 @@ impl<'a> EventRow<'a> {
             #[serde(default)]
             prev_state_events: Vec<String>,
             #[serde(default)]
-            content: CrackedContent,
+            content: WriteSideContent,
         }
         #[derive(Deserialize, Default)]
-        struct CrackedContent {
+        struct WriteSideContent {
             membership: Option<String>,
         }
 
-        let cracked: CrackedEvent = serde_json::from_str(self.json.get())
+        let cracked: WriteSideCracked = serde_json::from_str(self.raw.get())
             .map_err(|e| Error::InvalidInput(format!("event json: {e}")))?;
 
         // Cross-check every column against the JSON copy. A `None` on
         // the JSON side means "field absent"; we treat that as agreement
-        // since the column is the canonical value (callers building a
-        // `StoredEvent` may legitimately omit redundant fields from the
-        // JSON, though the test helpers always emit them). A `Some`
-        // that disagrees with the column is a hard reject. For
-        // `state_key` the JSON value is `Option<Option<String>>`:
-        // outer-None = field absent (skip check), outer-Some = present
-        // (inner is the actual state_key, which may itself be JSON
-        // null → Rust None).
+        // since the column is the canonical value (callers building an
+        // `Event` may legitimately omit redundant fields from the JSON,
+        // though the test helpers always emit them). A `Some` that
+        // disagrees with the column is a hard reject. For `state_key`
+        // the JSON value is `Option<Option<String>>`: outer-None =
+        // field absent (skip check), outer-Some = present (inner is
+        // the actual state_key, which may itself be JSON null → Rust
+        // None).
         if let Some(t) = cracked.event_type.as_deref()
             && t != self.event_type
         {
             return Err(Error::InvalidInput(format!(
-                "event.json `type` ({t:?}) disagrees with column `event_type` ({:?})",
+                "event.raw `type` ({t:?}) disagrees with column `event_type` ({:?})",
                 self.event_type
             )));
         }
@@ -213,7 +285,7 @@ impl<'a> EventRow<'a> {
             && r != self.room_id.as_str()
         {
             return Err(Error::InvalidInput(format!(
-                "event.json `room_id` ({r:?}) disagrees with column `room_id` ({:?})",
+                "event.raw `room_id` ({r:?}) disagrees with column `room_id` ({:?})",
                 self.room_id.as_str()
             )));
         }
@@ -221,7 +293,7 @@ impl<'a> EventRow<'a> {
             && s != self.sender.as_str()
         {
             return Err(Error::InvalidInput(format!(
-                "event.json `sender` ({s:?}) disagrees with column `sender` ({:?})",
+                "event.raw `sender` ({s:?}) disagrees with column `sender` ({:?})",
                 self.sender.as_str()
             )));
         }
@@ -229,7 +301,7 @@ impl<'a> EventRow<'a> {
             && json_state_key.as_deref() != self.state_key.as_deref()
         {
             return Err(Error::InvalidInput(format!(
-                "event.json `state_key` ({:?}) disagrees with column `state_key` ({:?})",
+                "event.raw `state_key` ({:?}) disagrees with column `state_key` ({:?})",
                 json_state_key, self.state_key
             )));
         }
@@ -257,6 +329,18 @@ impl<'a> EventRow<'a> {
             None
         };
 
+        // Serialise auth_events for the column. List is small and
+        // already validated (the IDs are typed) — serialisation can't
+        // fail in practice; map any error to Internal.
+        let auth_events_json = serde_json::to_string(
+            &self
+                .auth_events
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| Error::Internal(format!("serialising auth_events: {e}")))?;
+
         let origin_server_ts = i64::try_from(self.origin_server_ts).map_err(|_| {
             Error::InvalidInput(format!(
                 "origin_server_ts {} exceeds i64::MAX",
@@ -265,8 +349,8 @@ impl<'a> EventRow<'a> {
         })?;
         tx.execute(
             "INSERT INTO events \
-             (event_id, room_id, event_type, state_key, sender, origin_server_ts, json) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             (event_id, room_id, event_type, state_key, sender, origin_server_ts, json, auth_events_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 self.event_id.as_str(),
                 self.room_id.as_str(),
@@ -274,7 +358,8 @@ impl<'a> EventRow<'a> {
                 self.state_key,
                 self.sender.as_str(),
                 origin_server_ts,
-                self.json.get(),
+                self.raw.get(),
+                auth_events_json,
             ],
         )?;
         let stream_pos = tx.last_insert_rowid();
@@ -289,6 +374,9 @@ impl<'a> EventRow<'a> {
             }
             for parent in &cracked.prev_state_events {
                 stmt.execute(params![self.event_id.as_str(), "prev_state", parent])?;
+            }
+            for parent in &self.auth_events {
+                stmt.execute(params![self.event_id.as_str(), "auth", parent.as_str()])?;
             }
         }
 

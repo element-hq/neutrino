@@ -8,8 +8,8 @@
 
 use deadpool_sqlite::rusqlite::params;
 use lazy_static::lazy_static;
+use neutrino_common::Event;
 use neutrino_common::ROOM_VERSION_ID;
-use neutrino_store::StoredEvent;
 use ruma::{EventId, RoomId, UserId, event_id, room_id, user_id};
 use serde_json::{Value, json, value::RawValue};
 
@@ -48,7 +48,7 @@ pub(crate) async fn store_with_room() -> SqliteStore {
     s
 }
 
-/// Build a `StoredEvent` from a JSON value supplied by the caller. The
+/// Build a `Event` from a JSON value supplied by the caller. The
 /// `prev_events` / `prev_state_events` arrays default to empty.
 pub(crate) fn make_event(
     event_id: &EventId,
@@ -57,7 +57,7 @@ pub(crate) fn make_event(
     event_type: &str,
     state_key: Option<&str>,
     content: Value,
-) -> StoredEvent {
+) -> Event {
     let json_val = json!({
         "event_id": event_id.as_str(),
         "room_id": room_id.as_str(),
@@ -70,20 +70,25 @@ pub(crate) fn make_event(
         "prev_state_events": [],
     });
     let json_str = serde_json::to_string(&json_val).unwrap();
-    let json = RawValue::from_string(json_str).unwrap();
+    let raw = RawValue::from_string(json_str).unwrap();
+    let content_raw = serde_json::value::to_raw_value(&content).unwrap();
 
-    StoredEvent {
+    Event {
         event_id: event_id.to_owned(),
         room_id: room_id.to_owned(),
         event_type: event_type.to_owned(),
         state_key: state_key.map(str::to_owned),
         sender: sender.to_owned(),
         origin_server_ts: 0,
-        json,
+        content: content_raw,
+        prev_events: Vec::new(),
+        prev_state_events: Vec::new(),
+        auth_events: Vec::new(),
+        raw,
     }
 }
 
-/// Construct a `StoredEvent` with caller-supplied raw JSON (for tests that
+/// Construct a `Event` with caller-supplied raw JSON (for tests that
 /// need to exercise the deserializer error path).
 pub(crate) fn make_event_with_raw_json(
     event_id: &EventId,
@@ -92,20 +97,35 @@ pub(crate) fn make_event_with_raw_json(
     event_type: &str,
     state_key: Option<&str>,
     raw_json: &str,
-) -> StoredEvent {
-    let json = RawValue::from_string(raw_json.to_owned()).unwrap();
-    StoredEvent {
+) -> Event {
+    let raw = RawValue::from_string(raw_json.to_owned()).unwrap();
+    // The fixture used by the deserializer-error tests intentionally
+    // passes malformed JSON; fall back to `{}` for `content` so the
+    // struct can be built and the storage layer's own validation
+    // exercises the parse failure path.
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw_json).unwrap_or(serde_json::Value::Object(Default::default()));
+    let content_value = parsed
+        .get("content")
+        .cloned()
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+    let content = serde_json::value::to_raw_value(&content_value).unwrap();
+    Event {
         event_id: event_id.to_owned(),
         room_id: room_id.to_owned(),
         event_type: event_type.to_owned(),
         state_key: state_key.map(str::to_owned),
         sender: sender.to_owned(),
         origin_server_ts: 0,
-        json,
+        content,
+        prev_events: Vec::new(),
+        prev_state_events: Vec::new(),
+        auth_events: Vec::new(),
+        raw,
     }
 }
 
-pub(crate) fn create_event(event_id: &EventId, room_id: &RoomId, sender: &UserId) -> StoredEvent {
+pub(crate) fn create_event(event_id: &EventId, room_id: &RoomId, sender: &UserId) -> Event {
     make_event(
         event_id,
         room_id,
@@ -116,7 +136,7 @@ pub(crate) fn create_event(event_id: &EventId, room_id: &RoomId, sender: &UserId
     )
 }
 
-pub(crate) fn member_join(event_id: &EventId, room_id: &RoomId, user_id: &UserId) -> StoredEvent {
+pub(crate) fn member_join(event_id: &EventId, room_id: &RoomId, user_id: &UserId) -> Event {
     make_event(
         event_id,
         room_id,
@@ -127,7 +147,7 @@ pub(crate) fn member_join(event_id: &EventId, room_id: &RoomId, user_id: &UserId
     )
 }
 
-pub(crate) fn member_leave(event_id: &EventId, room_id: &RoomId, user_id: &UserId) -> StoredEvent {
+pub(crate) fn member_leave(event_id: &EventId, room_id: &RoomId, user_id: &UserId) -> Event {
     make_event(
         event_id,
         room_id,
@@ -147,7 +167,7 @@ pub(crate) fn member_event(
     target: &UserId,
     sender: &UserId,
     membership: &str,
-) -> StoredEvent {
+) -> Event {
     make_event(
         event_id,
         room_id,
@@ -163,7 +183,7 @@ pub(crate) fn name_event(
     room_id: &RoomId,
     sender: &UserId,
     name: &str,
-) -> StoredEvent {
+) -> Event {
     make_event(
         event_id,
         room_id,
@@ -174,12 +194,7 @@ pub(crate) fn name_event(
     )
 }
 
-pub(crate) fn message(
-    event_id: &EventId,
-    room_id: &RoomId,
-    sender: &UserId,
-    body: &str,
-) -> StoredEvent {
+pub(crate) fn message(event_id: &EventId, room_id: &RoomId, sender: &UserId, body: &str) -> Event {
     make_event(
         event_id,
         room_id,
@@ -234,7 +249,7 @@ pub(crate) fn message_with_prev(
     sender: &UserId,
     body: &str,
     prev_events: &[&EventId],
-) -> StoredEvent {
+) -> Event {
     let prev_event_strs: Vec<&str> = prev_events.iter().map(|e| e.as_str()).collect();
     let json_val = json!({
         "event_id": event_id.as_str(),
@@ -248,15 +263,25 @@ pub(crate) fn message_with_prev(
         "prev_state_events": [],
     });
     let json_str = serde_json::to_string(&json_val).unwrap();
-    let json = RawValue::from_string(json_str).unwrap();
+    let raw = RawValue::from_string(json_str).unwrap();
+    let content_raw =
+        serde_json::value::to_raw_value(&json!({"body": body, "msgtype": "m.text"})).unwrap();
+    let prev = prev_events
+        .iter()
+        .map(|e| (*e).to_owned())
+        .collect::<Vec<_>>();
 
-    StoredEvent {
+    Event {
         event_id: event_id.to_owned(),
         room_id: room_id.to_owned(),
         event_type: "m.room.message".to_owned(),
         state_key: None,
         sender: sender.to_owned(),
         origin_server_ts: 0,
-        json,
+        content: content_raw,
+        prev_events: prev,
+        prev_state_events: Vec::new(),
+        auth_events: Vec::new(),
+        raw,
     }
 }

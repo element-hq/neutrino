@@ -20,7 +20,7 @@ use std::collections::{HashSet, VecDeque};
 
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{Connection, OptionalExtension, params, params_from_iter};
-use neutrino_store::{DagStore, StorageError, StoredEvent, StoredPdu};
+use neutrino_store::{DagStore, Event, StorageError};
 use ruma::{EventId, OwnedEventId, RoomId};
 
 use crate::{
@@ -39,9 +39,9 @@ fn hydrate_pdu(
     conn: &Connection,
     event_id: &EventId,
     room_id: &RoomId,
-) -> Result<Option<StoredPdu>, Error> {
+) -> Result<Option<Event>, Error> {
     let query = format!("SELECT {EVENT_COLUMNS} FROM events WHERE event_id = ? AND room_id = ?");
-    let event_result: Option<Result<StoredEvent, Error>> = conn
+    let event_result: Option<Result<Event, Error>> = conn
         .query_row(
             &query,
             params![event_id.as_str(), room_id.as_str()],
@@ -52,29 +52,27 @@ fn hydrate_pdu(
     let Some(inner) = event_result else {
         return Ok(None);
     };
-    let event = inner?;
-
-    let prev_events = fetch_edges(conn, event_id, "prev")?;
-    let prev_state_events = fetch_edges(conn, event_id, "prev_state")?;
-
-    Ok(Some(StoredPdu {
-        event,
-        prev_events,
-        prev_state_events,
-    }))
+    // `prev_events` and `prev_state_events` are populated by row hydration
+    // from the canonical JSON in `events.json` — no edge-table lookup
+    // needed for the per-event view. `event_edges` still exists for graph
+    // queries (BFS in `events_before` / `missing_events`); see the
+    // "denormalisation" note in `event-id-design.md`.
+    Ok(Some(inner?))
 }
 
+/// Fetch a child's parents of a given edge type from `event_edges`,
+/// sorted by `parent_event_id`. This pins the BFS sibling-visit order so
+/// `events_before` / `missing_events` results are deterministic across
+/// runs regardless of the order the parent IDs appeared in the
+/// originating JSON. `event_edges` has a `WITHOUT ROWID PRIMARY KEY
+/// (child_event_id, edge_type, parent_event_id)`, so the explicit
+/// `ORDER BY` matches the natural PK scan — free at runtime, contractual
+/// at the spec boundary.
 fn fetch_edges(
     conn: &Connection,
     child_event_id: &EventId,
     edge_type: &str,
 ) -> Result<Vec<OwnedEventId>, Error> {
-    // `ORDER BY parent_event_id` pins the BFS sibling-visit order so
-    // `events_before` / `missing_events` results are deterministic.
-    // `event_edges` is `WITHOUT ROWID PRIMARY KEY (child_event_id,
-    // edge_type, parent_event_id)`, so the explicit sort matches the
-    // natural PK scan — free at runtime, contractual at the spec
-    // boundary.
     let mut stmt = conn.prepare(
         "SELECT parent_event_id FROM event_edges \
          WHERE child_event_id = ? AND edge_type = ? \
@@ -106,7 +104,7 @@ fn walk_prev_events(
     start: Vec<OwnedEventId>,
     excluded: &HashSet<OwnedEventId>,
     limit: usize,
-) -> Result<Vec<StoredPdu>, Error> {
+) -> Result<Vec<Event>, Error> {
     let mut visited: HashSet<OwnedEventId> = HashSet::new();
     let mut frontier: VecDeque<OwnedEventId> = start.into_iter().collect();
     let mut results = Vec::new();
@@ -126,8 +124,12 @@ fn walk_prev_events(
             // way, federation-backfill / wrong-room boundary.
             continue;
         };
-        for parent in &pdu.prev_events {
-            frontier.push_back(parent.clone());
+        // Walk via event_edges (sorted by parent_event_id) rather than
+        // the JSON-derived `pdu.prev_events` — the SQL-side sort is what
+        // pins BFS determinism across runs; the JSON order is whatever
+        // the sender chose and not guaranteed stable.
+        for parent in fetch_edges(conn, &id, "prev")? {
+            frontier.push_back(parent);
         }
         results.push(pdu);
     }
@@ -218,11 +220,11 @@ impl DagStore for SqliteStore {
         room_id: &RoomId,
         from: &[&EventId],
         limit: usize,
-    ) -> Result<Vec<StoredPdu>, StorageError> {
+    ) -> Result<Vec<Event>, StorageError> {
         let room_id = room_id.to_owned();
         let from: Vec<OwnedEventId> = from.iter().map(|&e| e.to_owned()).collect();
 
-        self.run_read(move |conn| -> Result<Vec<StoredPdu>, Error> {
+        self.run_read(move |conn| -> Result<Vec<Event>, Error> {
             let id_refs: Vec<&OwnedEventId> = from.iter().collect();
             validate_inputs(conn, &room_id, &id_refs)?;
             walk_prev_events(conn, &room_id, from, &HashSet::new(), limit)
@@ -236,12 +238,12 @@ impl DagStore for SqliteStore {
         latest: &[&EventId],
         earliest: &[&EventId],
         limit: usize,
-    ) -> Result<Vec<StoredPdu>, StorageError> {
+    ) -> Result<Vec<Event>, StorageError> {
         let room_id = room_id.to_owned();
         let latest: Vec<OwnedEventId> = latest.iter().map(|&e| e.to_owned()).collect();
         let earliest: Vec<OwnedEventId> = earliest.iter().map(|&e| e.to_owned()).collect();
 
-        self.run_read(move |conn| -> Result<Vec<StoredPdu>, Error> {
+        self.run_read(move |conn| -> Result<Vec<Event>, Error> {
             let id_refs: Vec<&OwnedEventId> = latest.iter().chain(earliest.iter()).collect();
             validate_inputs(conn, &room_id, &id_refs)?;
             let earliest_set: HashSet<OwnedEventId> = earliest.into_iter().collect();
@@ -317,7 +319,7 @@ mod tests {
             .events_before(*ALICE_ROOM_ID, &[event_id!("$c:e")], 10)
             .await
             .unwrap();
-        let ids: Vec<&str> = got.iter().map(|p| p.event.event_id.as_str()).collect();
+        let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
         assert_eq!(ids, ["$c:e", "$b:e", "$a:e"]);
     }
 
@@ -351,7 +353,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got.len(), 3);
-        let ids: Vec<&str> = got.iter().map(|p| p.event.event_id.as_str()).collect();
+        let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
         assert_eq!(ids, ["$e4:e", "$e3:e", "$e2:e"]);
     }
 
@@ -388,7 +390,7 @@ mod tests {
             .events_before(*ALICE_ROOM_ID, &[event_id!("$c:e")], 10)
             .await
             .unwrap();
-        let ids: Vec<&str> = got.iter().map(|p| p.event.event_id.as_str()).collect();
+        let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
         // Deterministic order: c is the seed; its prev_events come back
         // from `fetch_edges` sorted by `parent_event_id`, so the BFS
         // pushes `$a:e` before `$b:e` and pops in FIFO order.
@@ -418,7 +420,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].event.event_id.as_str(), "$a:e");
+        assert_eq!(got[0].event_id.as_str(), "$a:e");
     }
 
     // D6: storage-corruption defence — event with self-loop in `prev_events`
@@ -445,7 +447,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].event.event_id.as_str(), "$a:e");
+        assert_eq!(got[0].event_id.as_str(), "$a:e");
     }
 
     // D7: missing_events excludes IDs listed in `earliest`.
@@ -492,7 +494,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let ids: Vec<&str> = got.iter().map(|p| p.event.event_id.as_str()).collect();
+        let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
         // a is in `earliest`; walker skips it. c and b returned.
         assert_eq!(ids, ["$c:e", "$b:e"]);
     }
@@ -588,7 +590,7 @@ mod tests {
             .events_before(*ALICE_ROOM_ID, &[event_id!("$a:e")], 10)
             .await
             .unwrap();
-        let ids: Vec<&str> = got.iter().map(|p| p.event.event_id.as_str()).collect();
+        let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
         assert_eq!(ids, ["$a:e"], "walker leaked cross-room PDU via edge");
 
         // Same shape via missing_events — same underlying walk_prev_events.
@@ -596,7 +598,7 @@ mod tests {
             .missing_events(*ALICE_ROOM_ID, &[event_id!("$a:e")], &[], 10)
             .await
             .unwrap();
-        let ids: Vec<&str> = got.iter().map(|p| p.event.event_id.as_str()).collect();
+        let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
         assert_eq!(
             ids,
             ["$a:e"],
@@ -667,7 +669,7 @@ mod tests {
             .events_before(*ALICE_ROOM_ID, &[event_id!("$c:e"), event_id!("$d:e")], 10)
             .await
             .unwrap();
-        let ids: Vec<&str> = got.iter().map(|p| p.event.event_id.as_str()).collect();
+        let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
         assert_eq!(ids, ["$c:e", "$d:e", "$a:e", "$b:e"]);
     }
 
@@ -725,7 +727,7 @@ mod tests {
             .events_before(*ALICE_ROOM_ID, &[event_id!("$d:e")], 10)
             .await
             .unwrap();
-        let ids: Vec<&str> = got.iter().map(|p| p.event.event_id.as_str()).collect();
+        let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
         assert_eq!(ids, ["$d:e", "$b:e", "$c:e", "$a:e"]);
         assert_eq!(ids.len(), 4, "shared ancestor surfaced more than once");
     }
@@ -782,19 +784,19 @@ mod tests {
             .events_before(*ALICE_ROOM_ID, &[event_id!("$c:e")], 10)
             .await
             .unwrap();
-        let ids: Vec<&str> = got.iter().map(|p| p.event.event_id.as_str()).collect();
+        let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
         assert_eq!(ids, ["$c:e", "$p1:e", "$p2:e", "$g1:e", "$g2:e"]);
     }
 
     // D15: `hydrate_pdu` populates `prev_state_events` on the returned
-    // `StoredPdu`. The BFS itself only follows `prev` edges (MSC4242
+    // `Event`. The BFS itself only follows `prev` edges (MSC4242
     // state DAG is walked separately), but downstream callers — state
     // resolution, etc. — rely on `prev_state_events` being present on
     // the PDUs `events_before` hands back. Build a message with both
     // edge kinds and assert both fields land.
     #[tokio::test]
     async fn stored_pdu_exposes_prev_state_events() {
-        use neutrino_store::StoredEvent;
+        use neutrino_common::Event;
         use serde_json::{json, value::RawValue};
 
         let s = store_with_room().await;
@@ -815,15 +817,24 @@ mod tests {
             "prev_state_events": ["$create:e"],
         });
         let json_str = serde_json::to_string(&json_val).unwrap();
-        let json = RawValue::from_string(json_str).unwrap();
-        let event = StoredEvent {
+        let raw = RawValue::from_string(json_str).unwrap();
+        let content =
+            serde_json::value::to_raw_value(&json!({"body": "msg"})).unwrap_or_else(|_| {
+                serde_json::value::to_raw_value(&serde_json::Value::Object(Default::default()))
+                    .unwrap()
+            });
+        let event = Event {
             event_id: event_id!("$msg:e").to_owned(),
             room_id: ALICE_ROOM_ID.to_owned(),
             event_type: "m.room.message".to_owned(),
             state_key: None,
             sender: ALICE_USER_ID.to_owned(),
             origin_server_ts: 0,
-            json,
+            content,
+            prev_events: vec![event_id!("$create:e").to_owned()],
+            prev_state_events: vec![event_id!("$create:e").to_owned()],
+            auth_events: Vec::new(),
+            raw,
         };
         s.persist_event(&event, &[]).await.unwrap();
 
@@ -1090,7 +1101,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let ids: Vec<&str> = got.iter().map(|p| p.event.event_id.as_str()).collect();
+        let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
         assert_eq!(ids, ["$c:e", "$d:e", "$a:e", "$b:e"]);
     }
 }

@@ -1,11 +1,11 @@
 use std::collections::{BTreeSet, HashMap};
 
 use async_trait::async_trait;
+pub use neutrino_common::Event;
 use ruma::{
     EventId, OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, RoomVersionId,
     ServerName, UserId,
 };
-use serde_json::value::RawValue;
 use thiserror::Error;
 use tokio::sync::watch;
 
@@ -15,24 +15,6 @@ pub enum StorageError {
     InvalidInput(String),
     #[error("{0}")]
     Internal(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct StoredEvent {
-    pub event_id: OwnedEventId,
-    pub room_id: OwnedRoomId,
-    pub event_type: String,
-    pub state_key: Option<String>,
-    pub sender: OwnedUserId,
-    pub origin_server_ts: u64,
-    pub json: Box<RawValue>,
-}
-
-#[derive(Debug, Clone)]
-pub struct StoredPdu {
-    pub event: StoredEvent,
-    pub prev_events: Vec<OwnedEventId>,
-    pub prev_state_events: Vec<OwnedEventId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -93,7 +75,7 @@ impl std::fmt::Display for Membership {
 #[async_trait]
 pub trait RoomStore: Send + Sync {
     /// Pre:  `create_event.event_type` is "m.room.create"; `create_event.room_id` is derived
-    ///       from the reference hash of `create_event.json` (room version 12 semantics);
+    ///       from the reference hash of `create_event.raw` (room version 12 semantics);
     ///       the room does not already exist; every event in `initial_events` has the same
     ///       `room_id` as `create_event`.
     /// Post: the room record is registered with the version from `create_event` content;
@@ -102,8 +84,8 @@ pub trait RoomStore: Send + Sync {
     ///       no outbox entries are created (new rooms have no remote members yet).
     async fn create_room(
         &self,
-        create_event: &StoredEvent,
-        initial_events: &[StoredEvent],
+        create_event: &Event,
+        initial_events: &[Event],
     ) -> Result<(), StorageError>;
 
     /// Pre:  none.
@@ -130,7 +112,7 @@ pub trait EventStore: Send + Sync {
     ///       new `StreamPos` after the transaction commits.
     async fn persist_event(
         &self,
-        event: &StoredEvent,
+        event: &Event,
         destinations: &[&ServerName],
     ) -> Result<(), StorageError>;
 
@@ -150,7 +132,7 @@ pub trait EventStore: Send + Sync {
     /// inserts events older than the current head. Use `persist_event` for
     /// forward extension where the new event has been resolved into the room's
     /// current state by the caller.
-    async fn persist_historical_event(&self, event: &StoredEvent) -> Result<(), StorageError>;
+    async fn persist_historical_event(&self, event: &Event) -> Result<(), StorageError>;
 
     /// Pre:  none.
     /// Post: if `(txn_id, user_id)` was previously recorded via `record_client_txn`,
@@ -172,9 +154,9 @@ pub trait EventStore: Send + Sync {
     ) -> Result<(), StorageError>;
 
     /// Pre:  none.
-    /// Post: returns one `StoredEvent` per ID that exists in the store; IDs with no
+    /// Post: returns one `Event` per ID that exists in the store; IDs with no
     ///       matching event are silently omitted (result length may be < `ids.len()`).
-    async fn get_events(&self, ids: &[&EventId]) -> Result<Vec<StoredEvent>, StorageError>;
+    async fn get_events(&self, ids: &[&EventId]) -> Result<Vec<Event>, StorageError>;
 
     /// Pre:  none (`StreamPos(0)` is valid for an initial full query).
     /// Post: returns all events with `stream_pos > pos` in ascending stream order;
@@ -183,7 +165,7 @@ pub trait EventStore: Send + Sync {
         &self,
         pos: StreamPos,
         limit: usize,
-    ) -> Result<Vec<(StreamPos, StoredEvent)>, StorageError>;
+    ) -> Result<Vec<(StreamPos, Event)>, StorageError>;
 
     /// Pre:  the room must exist; if `from` is `Some`, the token must have been returned
     ///       by a previous call to this method (or constructed from a known `StreamPos`).
@@ -197,7 +179,7 @@ pub trait EventStore: Send + Sync {
         from: Option<PaginationToken>,
         dir: Direction,
         limit: usize,
-    ) -> Result<(Vec<StoredEvent>, Option<PaginationToken>), StorageError>;
+    ) -> Result<(Vec<Event>, Option<PaginationToken>), StorageError>;
 
     /// Pre:  none.
     /// Post: returns a receiver whose value is the `StreamPos` of the most recently
@@ -217,7 +199,7 @@ pub trait StateStore: Send + Sync {
     async fn current_room_state(
         &self,
         room_id: &RoomId,
-    ) -> Result<HashMap<(String, String), StoredEvent>, StorageError>;
+    ) -> Result<HashMap<(String, String), Event>, StorageError>;
 
     /// Pre:  none.
     /// Post: returns the current state event for `(room_id, event_type, state_key)`, or
@@ -227,7 +209,7 @@ pub trait StateStore: Send + Sync {
         room_id: &RoomId,
         event_type: &str,
         state_key: &str,
-    ) -> Result<Option<StoredEvent>, StorageError>;
+    ) -> Result<Option<Event>, StorageError>;
 
     /// Pre:  none (returns empty map if the room does not exist or has no state of that type).
     /// Post: returns one current state event per `state_key` for the given `event_type`;
@@ -236,7 +218,7 @@ pub trait StateStore: Send + Sync {
         &self,
         room_id: &RoomId,
         event_type: &str,
-    ) -> Result<HashMap<String, StoredEvent>, StorageError>;
+    ) -> Result<HashMap<String, Event>, StorageError>;
 
     /// Pre:  none.
     /// Post: returns the `room_id` of every room in which `user_id` has a current
@@ -278,14 +260,14 @@ pub trait StateStore: Send + Sync {
     async fn joined_members(
         &self,
         room_id: &RoomId,
-    ) -> Result<HashMap<OwnedUserId, StoredEvent>, StorageError>;
+    ) -> Result<HashMap<OwnedUserId, Event>, StorageError>;
 }
 
 #[async_trait]
 pub trait DagStore: Send + Sync {
     /// Pre:  all event IDs in `from` must exist in the store; `room_id` must exist.
     /// Post: walks `prev_events` backwards from `from`, returning up to `limit` distinct
-    ///       events in reverse-chronological order; each `StoredPdu` has `prev_events` and
+    ///       events in reverse-chronological order; each `Event` has `prev_events` and
     ///       `prev_state_events` pre-parsed for further DAG traversal; events already
     ///       known to the caller can be excluded by stopping the walk early.
     async fn events_before(
@@ -293,7 +275,7 @@ pub trait DagStore: Send + Sync {
         room_id: &RoomId,
         from: &[&EventId],
         limit: usize,
-    ) -> Result<Vec<StoredPdu>, StorageError>;
+    ) -> Result<Vec<Event>, StorageError>;
 
     /// Pre:  all event IDs in `latest` and `earliest` must be valid; `room_id` must exist.
     /// Post: performs a BFS over `prev_events` starting from `latest`, skipping any event
@@ -305,7 +287,7 @@ pub trait DagStore: Send + Sync {
         latest: &[&EventId],
         earliest: &[&EventId],
         limit: usize,
-    ) -> Result<Vec<StoredPdu>, StorageError>;
+    ) -> Result<Vec<Event>, StorageError>;
 }
 
 #[async_trait]
@@ -321,10 +303,7 @@ pub trait FederationOutbox: Send + Sync {
     /// Post: returns all undelivered PDUs for `destination` in insertion (causal) order;
     ///       does not remove them — the caller must call `remove_pdus` after a successful
     ///       `/send` transaction.
-    async fn pending_pdus(
-        &self,
-        destination: &ServerName,
-    ) -> Result<Vec<StoredEvent>, StorageError>;
+    async fn pending_pdus(&self, destination: &ServerName) -> Result<Vec<Event>, StorageError>;
 
     /// Pre:  each `event_id` in `event_ids` should have been returned by `pending_pdus`
     ///       for this `destination`; must only be called after the remote server returned

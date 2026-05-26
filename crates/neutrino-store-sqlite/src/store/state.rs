@@ -19,7 +19,7 @@
 //!   sliding sync calls these on every connect and we don't want to
 //!   load member-event JSON when the only fact the caller needs is "is
 //!   this user in this room with this membership". `joined_members`
-//!   *does* need the event row (it returns full `StoredEvent`s), so it
+//!   *does* need the event row (it returns full `Event`s), so it
 //!   pays the JOIN; the partial index `ix_current_state_room_member`
 //!   still lets the planner narrow before the JOIN.
 //!
@@ -31,7 +31,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{OptionalExtension, params, params_from_iter};
-use neutrino_store::{Membership, StateStore, StorageError, StoredEvent};
+use neutrino_store::{Event, Membership, StateStore, StorageError};
 use ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
 
 use crate::{
@@ -45,11 +45,11 @@ impl StateStore for SqliteStore {
     async fn current_room_state(
         &self,
         room_id: &RoomId,
-    ) -> Result<HashMap<(String, String), StoredEvent>, StorageError> {
+    ) -> Result<HashMap<(String, String), Event>, StorageError> {
         let room_id = room_id.to_owned();
 
         self.run_read(
-            move |conn| -> Result<HashMap<(String, String), StoredEvent>, Error> {
+            move |conn| -> Result<HashMap<(String, String), Event>, Error> {
                 let query = format!(
                     "SELECT cs.event_type AS map_event_type, cs.state_key AS map_state_key, \
                             {EVENT_COLUMNS_PREFIXED} \
@@ -80,12 +80,12 @@ impl StateStore for SqliteStore {
         room_id: &RoomId,
         event_type: &str,
         state_key: &str,
-    ) -> Result<Option<StoredEvent>, StorageError> {
+    ) -> Result<Option<Event>, StorageError> {
         let room_id = room_id.to_owned();
         let event_type = event_type.to_owned();
         let state_key = state_key.to_owned();
 
-        self.run_read(move |conn| -> Result<Option<StoredEvent>, Error> {
+        self.run_read(move |conn| -> Result<Option<Event>, Error> {
             let query = format!(
                 "SELECT {EVENT_COLUMNS_PREFIXED} \
                  FROM current_state cs \
@@ -111,11 +111,11 @@ impl StateStore for SqliteStore {
         &self,
         room_id: &RoomId,
         event_type: &str,
-    ) -> Result<HashMap<String, StoredEvent>, StorageError> {
+    ) -> Result<HashMap<String, Event>, StorageError> {
         let room_id = room_id.to_owned();
         let event_type = event_type.to_owned();
 
-        self.run_read(move |conn| -> Result<HashMap<String, StoredEvent>, Error> {
+        self.run_read(move |conn| -> Result<HashMap<String, Event>, Error> {
             let query = format!(
                 "SELECT cs.state_key AS map_state_key, {EVENT_COLUMNS_PREFIXED} \
                  FROM current_state cs \
@@ -256,37 +256,35 @@ impl StateStore for SqliteStore {
     async fn joined_members(
         &self,
         room_id: &RoomId,
-    ) -> Result<HashMap<OwnedUserId, StoredEvent>, StorageError> {
+    ) -> Result<HashMap<OwnedUserId, Event>, StorageError> {
         let room_id = room_id.to_owned();
 
-        self.run_read(
-            move |conn| -> Result<HashMap<OwnedUserId, StoredEvent>, Error> {
-                // `room_id`-prefix matches the partial index
-                // `ix_current_state_room_member`; `membership` filter
-                // narrows within the index.
-                let query = format!(
-                    "SELECT cs.state_key AS user_id, {EVENT_COLUMNS_PREFIXED} \
+        self.run_read(move |conn| -> Result<HashMap<OwnedUserId, Event>, Error> {
+            // `room_id`-prefix matches the partial index
+            // `ix_current_state_room_member`; `membership` filter
+            // narrows within the index.
+            let query = format!(
+                "SELECT cs.state_key AS user_id, {EVENT_COLUMNS_PREFIXED} \
                      FROM current_state cs \
                      JOIN events e ON cs.event_id = e.event_id \
                      WHERE cs.room_id = ? AND cs.event_type = 'm.room.member' \
                        AND cs.membership = 'join'"
-                );
-                let mut stmt = conn.prepare(&query)?;
-                let rows = stmt.query_map(params![room_id.as_str()], |row| {
-                    let user: String = row.get("user_id")?;
-                    Ok((user, EventRow::try_from(row)))
-                })?;
+            );
+            let mut stmt = conn.prepare(&query)?;
+            let rows = stmt.query_map(params![room_id.as_str()], |row| {
+                let user: String = row.get("user_id")?;
+                Ok((user, EventRow::try_from(row)))
+            })?;
 
-                let mut out = HashMap::new();
-                for r in rows {
-                    let (user, ev) = r?;
-                    let user_id = OwnedUserId::try_from(user)
-                        .map_err(|e| Error::Internal(format!("malformed user_id in DB: {e}")))?;
-                    out.insert(user_id, ev?.into_event());
-                }
-                Ok(out)
-            },
-        )
+            let mut out = HashMap::new();
+            for r in rows {
+                let (user, ev) = r?;
+                let user_id = OwnedUserId::try_from(user)
+                    .map_err(|e| Error::Internal(format!("malformed user_id in DB: {e}")))?;
+                out.insert(user_id, ev?.into_event());
+            }
+            Ok(out)
+        })
         .await
     }
 }

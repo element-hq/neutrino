@@ -13,8 +13,8 @@
 #![allow(dead_code)]
 
 use lazy_static::lazy_static;
+use neutrino_common::Event;
 use neutrino_common::ROOM_VERSION_ID;
-use neutrino_store::StoredEvent;
 use neutrino_store_sqlite::SqliteStore;
 use ruma::{EventId, RoomId, UserId, event_id, room_id, user_id};
 use serde_json::{Value, json, value::RawValue};
@@ -56,7 +56,7 @@ pub fn make_event(
     event_type: &str,
     state_key: Option<&str>,
     content: Value,
-) -> StoredEvent {
+) -> Event {
     let json_val = json!({
         "event_id": event_id.as_str(),
         "room_id": room_id.as_str(),
@@ -69,20 +69,25 @@ pub fn make_event(
         "prev_state_events": [],
     });
     let json_str = serde_json::to_string(&json_val).unwrap();
-    let json = RawValue::from_string(json_str).unwrap();
+    let raw = RawValue::from_string(json_str).unwrap();
+    let content_raw = serde_json::value::to_raw_value(&content).unwrap();
 
-    StoredEvent {
+    Event {
         event_id: event_id.to_owned(),
         room_id: room_id.to_owned(),
         event_type: event_type.to_owned(),
         state_key: state_key.map(str::to_owned),
         sender: sender.to_owned(),
         origin_server_ts: 0,
-        json,
+        content: content_raw,
+        prev_events: Vec::new(),
+        prev_state_events: Vec::new(),
+        auth_events: Vec::new(),
+        raw,
     }
 }
 
-pub fn create_event(event_id: &EventId, room_id: &RoomId, sender: &UserId) -> StoredEvent {
+pub fn create_event(event_id: &EventId, room_id: &RoomId, sender: &UserId) -> Event {
     make_event(
         event_id,
         room_id,
@@ -93,7 +98,7 @@ pub fn create_event(event_id: &EventId, room_id: &RoomId, sender: &UserId) -> St
     )
 }
 
-pub fn member_join(event_id: &EventId, room_id: &RoomId, user_id: &UserId) -> StoredEvent {
+pub fn member_join(event_id: &EventId, room_id: &RoomId, user_id: &UserId) -> Event {
     make_event(
         event_id,
         room_id,
@@ -104,7 +109,7 @@ pub fn member_join(event_id: &EventId, room_id: &RoomId, user_id: &UserId) -> St
     )
 }
 
-pub fn member_leave(event_id: &EventId, room_id: &RoomId, user_id: &UserId) -> StoredEvent {
+pub fn member_leave(event_id: &EventId, room_id: &RoomId, user_id: &UserId) -> Event {
     make_event(
         event_id,
         room_id,
@@ -115,12 +120,7 @@ pub fn member_leave(event_id: &EventId, room_id: &RoomId, user_id: &UserId) -> S
     )
 }
 
-pub fn name_event(
-    event_id: &EventId,
-    room_id: &RoomId,
-    sender: &UserId,
-    name: &str,
-) -> StoredEvent {
+pub fn name_event(event_id: &EventId, room_id: &RoomId, sender: &UserId, name: &str) -> Event {
     make_event(
         event_id,
         room_id,
@@ -131,7 +131,7 @@ pub fn name_event(
     )
 }
 
-pub fn message(event_id: &EventId, room_id: &RoomId, sender: &UserId, body: &str) -> StoredEvent {
+pub fn message(event_id: &EventId, room_id: &RoomId, sender: &UserId, body: &str) -> Event {
     make_event(
         event_id,
         room_id,

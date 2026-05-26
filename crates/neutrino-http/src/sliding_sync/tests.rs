@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use neutrino_common::ROOM_VERSION_ID;
-use neutrino_store::{EventStore, RoomStore, StoredEvent};
+use neutrino_store::{Event, EventStore, RoomStore};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5::{Request, request};
 use ruma::events::StateEventType;
@@ -71,7 +71,7 @@ async fn fresh_store() -> (Arc<SqliteStore>, NamedTempFile) {
     (Arc::new(store), tmp)
 }
 
-/// Build a `StoredEvent` whose JSON field is exactly the caller-supplied
+/// Build a `Event` whose JSON field is exactly the caller-supplied
 /// `Value`. Lower-level helper — most tests want `make_event` (which
 /// constructs the standard PDU wrapper); `make_event_from_json` is the
 /// escape hatch when tests need to set `unsigned.invite_room_state` or
@@ -84,20 +84,32 @@ fn build_stored_event(
     sender: &UserId,
     origin_server_ts: u64,
     json: Value,
-) -> StoredEvent {
-    let json = serde_json::value::to_raw_value(&json).expect("to_raw_value");
-    StoredEvent {
+) -> Event {
+    let raw = serde_json::value::to_raw_value(&json).expect("to_raw_value");
+    // Extract `content` to the canonical position; default `{}` if the
+    // caller-supplied JSON doesn't include one (a small handful of
+    // sliding-sync tests synthesise minimal fixtures).
+    let content_value = json
+        .get("content")
+        .cloned()
+        .unwrap_or(Value::Object(Default::default()));
+    let content = serde_json::value::to_raw_value(&content_value).expect("content");
+    Event {
         event_id: event_id.to_owned(),
         room_id: room_id.to_owned(),
         event_type: event_type.to_string(),
         state_key: state_key.map(String::from),
         sender: sender.to_owned(),
         origin_server_ts,
-        json,
+        content,
+        prev_events: Vec::new(),
+        prev_state_events: Vec::new(),
+        auth_events: Vec::new(),
+        raw,
     }
 }
 
-/// Build a `StoredEvent` whose `json` field is a flat object with the
+/// Build a `Event` whose `json` field is a flat object with the
 /// standard PDU keys. Tests pass `content` separately so they don't have
 /// to construct the wrapper themselves.
 fn make_event(
@@ -108,7 +120,7 @@ fn make_event(
     sender: &UserId,
     origin_server_ts: u64,
     content: Value,
-) -> StoredEvent {
+) -> Event {
     let json = serde_json::json!({
         "event_id": event_id.as_str(),
         "room_id": room_id.as_str(),
@@ -140,7 +152,7 @@ fn make_event_from_json(
     sender: &UserId,
     origin_server_ts: u64,
     json: Value,
-) -> StoredEvent {
+) -> Event {
     build_stored_event(
         event_id,
         room_id,
@@ -174,7 +186,7 @@ fn room_stem(room_id: &RoomId) -> String {
 /// `content.creator` is intentionally omitted — v12 / MSC4242 derive the
 /// creator from the create event's `sender` and the explicit field is
 /// deprecated.
-fn create_event_for(room_id: &RoomId, creator: &UserId) -> StoredEvent {
+fn create_event_for(room_id: &RoomId, creator: &UserId) -> Event {
     let stem = room_stem(room_id);
     let id_str = format!("$create-{stem}:example.org");
     let id: OwnedEventId = id_str.try_into().expect("create event id parses");
@@ -243,7 +255,7 @@ async fn setup_joined_room(store: &SqliteStore, room_id: &RoomId, user: &UserId)
 /// Persist any pre-built event via the trait surface. Panics on error so the
 /// failure is visible at the call site — every test in this module wants
 /// "this seeding succeeded" as a precondition.
-async fn seed(store: &SqliteStore, ev: &StoredEvent) {
+async fn seed(store: &SqliteStore, ev: &Event) {
     store
         .persist_event(ev, &[])
         .await

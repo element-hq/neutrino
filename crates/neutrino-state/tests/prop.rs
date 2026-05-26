@@ -27,7 +27,7 @@ use neutrino_state::auth_rules::check_auth_rules;
 use neutrino_state::provider::{EventInfo, InMemoryStateProvider, StateProvider};
 use neutrino_state::state_res::{auth_chain_difference, conflicted_subgraph, separate};
 use neutrino_state::validate::parse_event;
-use neutrino_state::{Event, FormatError, RoomVersion, StateMap};
+use neutrino_state::{Event, FormatError, StateMap};
 use proptest::prelude::*;
 use ruma::{OwnedEventId, OwnedUserId};
 use serde_json::value::RawValue;
@@ -78,7 +78,7 @@ fn parse_event_rejects_any_missing_required_field() {
     for &field in REQUIRED_FIELDS {
         let mut v = base_message();
         v.as_object_mut().expect("object").remove(field);
-        let result = parse_event(raw(v), eid("$e:example.org"), RoomVersion::V12);
+        let result = parse_event(raw(v), eid("$e:example.org"), vec![]);
         match result {
             Err(FormatError::MissingField(f)) => {
                 assert_eq!(f, field, "field {field} produced wrong MissingField");
@@ -135,7 +135,7 @@ fn arb_message_event() -> impl Strategy<Value = Event> {
             v["sender"] = json!(sender);
             v["prev_events"] = ids_as_json(&prevs);
             v["prev_state_events"] = ids_as_json(&prev_states);
-            parse_event(raw(v), id, RoomVersion::V12).ok()
+            parse_event(raw(v), id, vec![]).ok()
         })
 }
 
@@ -170,7 +170,7 @@ fn arb_member_event() -> impl Strategy<Value = Event> {
                 v["content"] = json!({ "membership": membership });
                 v["prev_events"] = ids_as_json(&prevs);
                 v["prev_state_events"] = ids_as_json(&prev_states);
-                parse_event(raw(v), id, RoomVersion::V12).ok()
+                parse_event(raw(v), id, vec![]).ok()
             },
         )
 }
@@ -188,7 +188,7 @@ fn arb_create_event() -> impl Strategy<Value = Event> {
         obj.remove("room_id");
         obj.remove("prev_state_events");
         // prev_events stays [] from base_message — rule 1.1.
-        parse_event(raw(v), id, RoomVersion::V12).ok()
+        parse_event(raw(v), id, vec![]).ok()
     })
 }
 
@@ -297,7 +297,7 @@ fn arb_state_with_create()
                 "hashes": { "sha256": "abc" },
                 "state_key": ""
             });
-            let create_event = parse_event(raw(v), create_id.clone(), RoomVersion::V12).ok()?;
+            let create_event = parse_event(raw(v), create_id.clone(), vec![]).ok()?;
             let creator_uid = create_event.sender.clone();
             let create = Arc::new(create_event);
             let mut state: StateMap<Arc<Event>> = StateMap::new();
@@ -357,7 +357,7 @@ proptest! {
             "hashes": { "sha256": "abc" },
             "state_key": ""
         });
-        let create_event = parse_event(raw(create_v), create_id.clone(), RoomVersion::V12)
+        let create_event = parse_event(raw(create_v), create_id.clone(), vec![])
             .expect("create event valid wire format");
         let creator_uid: OwnedUserId = create_event.sender.clone();
         let mut state: StateMap<Arc<Event>> = StateMap::new();
@@ -393,7 +393,7 @@ proptest! {
             "origin_server_ts": 1_700_000_000_000_u64,
             "hashes": { "sha256": "abc" }
         });
-        let join = parse_event(raw(join_v), join_id, RoomVersion::V12)
+        let join = parse_event(raw(join_v), join_id, vec![])
             .expect("self-join event valid wire format");
         prop_assert!(check_auth_rules(&join, &state).is_ok());
     }
@@ -406,10 +406,11 @@ proptest! {
 // reference unknown events, may contain cycles); the algorithms must hold
 // under that.
 
-/// Placeholder `Arc<Event>` for an arbitrary event id. The state-res
-/// functions don't look at the event body — only `event_id` and the
-/// precomputed `auth_event_ids` — so a minimal valid event suffices.
-fn placeholder_arc_event(id: &OwnedEventId) -> Arc<Event> {
+/// Placeholder `Arc<Event>` for an arbitrary event id with caller-supplied
+/// `auth_events`. The state-res functions don't look at the event body —
+/// only `event_id` and `auth_events` — so a minimal valid event with the
+/// auth list attached suffices.
+fn placeholder_arc_event(id: &OwnedEventId, auth_events: Vec<OwnedEventId>) -> Arc<Event> {
     Arc::new(
         parse_event(
             raw(json!({
@@ -425,46 +426,81 @@ fn placeholder_arc_event(id: &OwnedEventId) -> Arc<Event> {
                 "state_key": ""
             })),
             id.clone(),
-            RoomVersion::V12,
+            auth_events,
         )
         .expect("placeholder event"),
     )
 }
 
-/// Arbitrary `InMemoryStateProvider` with random auth-chain mappings. Chains
-/// may reference event ids not present in the provider (provider returns
-/// empty for unknown), and may contain cycles — the algorithms must
-/// terminate either way.
-fn arb_provider() -> impl Strategy<Value = InMemoryStateProvider> {
-    prop::collection::hash_map(
-        arb_event_id(),
-        prop::collection::vec(arb_event_id(), 0..4),
-        0..15,
-    )
-    .prop_map(|chains| {
-        let mut provider = InMemoryStateProvider::new();
-        for (id, parents) in chains {
-            let event = placeholder_arc_event(&id);
-            provider.insert(
-                EventInfo {
-                    event,
-                    rejected: false,
-                },
-                parents,
-            );
-        }
-        provider
+/// Arbitrary `InMemoryStateProvider` that is **closed** under `auth_events`
+/// — every id any event references via its `auth_events` is itself in the
+/// provider. Cycles are allowed (the DFS in `auth_chain` dedupes via a
+/// visited set, so cyclic input still terminates).
+///
+/// Closure is the project invariant for state-res input: a referenced-but-
+/// unknown event is an error (`StateResError::MissingAuthEvent`), not a
+/// silent backfill boundary. The strategy reflects that.
+///
+/// Yields the provider **and the list of known ids** so callers can draw
+/// seeds / state values from the keyset — input seeds outside this keyset
+/// would (correctly) blow up `auth_chain` with `MissingAuthEvent` and aren't
+/// what most properties want to test.
+fn arb_provider_with_ids() -> impl Strategy<Value = (InMemoryStateProvider, Vec<OwnedEventId>)> {
+    prop::collection::hash_set(arb_event_id(), 1..=15).prop_flat_map(|ids| {
+        let len = ids.len();
+        let ids_vec: Vec<OwnedEventId> = ids.into_iter().collect();
+        (
+            Just(ids_vec.clone()),
+            prop::collection::vec(prop::collection::vec(0usize..len, 0..4), len),
+        )
+            .prop_map(|(ids, parents_per_event)| {
+                let mut provider = InMemoryStateProvider::new();
+                for (id, parent_indices) in ids.iter().zip(&parents_per_event) {
+                    let parents: Vec<OwnedEventId> =
+                        parent_indices.iter().map(|i| ids[*i].clone()).collect();
+                    let event = placeholder_arc_event(id, parents);
+                    provider.insert(EventInfo {
+                        event,
+                        rejected: false,
+                    });
+                }
+                (provider, ids)
+            })
     })
+}
+
+/// Build a deterministic state set whose values are drawn from `ids`
+/// (which is yielded by `arb_provider_with_ids` and therefore known to
+/// the matching provider). `offset` lets tests vary the set across
+/// iterations without needing another `prop_flat_map` binding.
+fn state_set_from_ids(ids: &[OwnedEventId]) -> StateMap<OwnedEventId> {
+    state_set_from_ids_offset(ids, 0)
+}
+
+fn state_set_from_ids_offset(ids: &[OwnedEventId], offset: usize) -> StateMap<OwnedEventId> {
+    let mut m = StateMap::new();
+    let n = 3.min(ids.len());
+    for i in 0..n {
+        let idx = (i + offset) % ids.len();
+        m.insert(("m.room.x".to_string(), format!("k{i}")), ids[idx].clone());
+    }
+    m
 }
 
 /// Helper for properties that need to compute the auth chain of an event id
 /// from outside the algorithm under test, so the property can compare.
+/// Reads auth_events off the `Event` directly rather than going through
+/// `provider.auth_chain`, so the property genuinely cross-checks the impl.
 fn auth_chain_of(seed: &OwnedEventId, provider: &dyn StateProvider) -> HashSet<OwnedEventId> {
     let mut chain: HashSet<OwnedEventId> = HashSet::new();
     let mut stack = vec![seed.clone()];
     while let Some(id) = stack.pop() {
         if chain.insert(id.clone()) {
-            for parent in provider.auth_event_ids(&id).iter() {
+            let parents: Vec<OwnedEventId> = provider
+                .get_event(&id)
+                .map(|info| info.event.auth_events.clone())
+                .unwrap_or_default();
+            for parent in &parents {
                 if !chain.contains(parent) {
                     stack.push(parent.clone());
                 }
@@ -658,10 +694,12 @@ proptest! {
     /// Output contains every seed (we picked include-endpoints).
     #[test]
     fn subgraph_contains_seeds(
-        seeds in prop::collection::hash_set(arb_event_id(), 0..10),
-        provider in arb_provider(),
+        (provider, ids) in arb_provider_with_ids(),
+        n_seeds in 0usize..10,
     ) {
-        let sg = conflicted_subgraph(&seeds, &provider);
+        let seeds: HashSet<OwnedEventId> =
+            ids.iter().take(n_seeds.min(ids.len())).cloned().collect();
+        let sg = conflicted_subgraph(&seeds, &provider).unwrap();
         for s in &seeds {
             prop_assert!(sg.contains(s));
         }
@@ -669,21 +707,27 @@ proptest! {
 
     /// Empty seeds produce empty output.
     #[test]
-    fn subgraph_empty_seeds_empty_output(provider in arb_provider()) {
-        let sg = conflicted_subgraph(&HashSet::new(), &provider);
+    fn subgraph_empty_seeds_empty_output((provider, _ids) in arb_provider_with_ids()) {
+        let sg = conflicted_subgraph(&HashSet::new(), &provider).unwrap();
         prop_assert!(sg.is_empty());
     }
 
-    /// Output is closed under `auth_event_ids`: for every id in the output,
-    /// every event in its precomputed auth chain is also in the output.
+    /// Output is closed under `Event.auth_events`: for every id in the
+    /// output, every event in its auth chain is also in the output.
     #[test]
-    fn subgraph_closed_under_auth_event_ids(
-        seeds in prop::collection::hash_set(arb_event_id(), 1..6),
-        provider in arb_provider(),
+    fn subgraph_closed_under_auth_events(
+        (provider, ids) in arb_provider_with_ids(),
+        n_seeds in 1usize..6,
     ) {
-        let sg = conflicted_subgraph(&seeds, &provider);
+        let seeds: HashSet<OwnedEventId> =
+            ids.iter().take(n_seeds.min(ids.len())).cloned().collect();
+        let sg = conflicted_subgraph(&seeds, &provider).unwrap();
         for id in &sg {
-            for parent in provider.auth_event_ids(id).iter() {
+            let parents: Vec<OwnedEventId> = provider
+                .get_event(id)
+                .map(|info| info.event.auth_events.clone())
+                .unwrap_or_default();
+            for parent in &parents {
                 prop_assert!(
                     sg.contains(parent),
                     "subgraph missing parent {} of {}",
@@ -698,10 +742,12 @@ proptest! {
     /// member of some seed's auth-chain transitive closure.
     #[test]
     fn subgraph_no_fabricated_ids(
-        seeds in prop::collection::hash_set(arb_event_id(), 1..6),
-        provider in arb_provider(),
+        (provider, ids) in arb_provider_with_ids(),
+        n_seeds in 1usize..6,
     ) {
-        let sg = conflicted_subgraph(&seeds, &provider);
+        let seeds: HashSet<OwnedEventId> =
+            ids.iter().take(n_seeds.min(ids.len())).cloned().collect();
+        let sg = conflicted_subgraph(&seeds, &provider).unwrap();
         let mut allowed: HashSet<OwnedEventId> = HashSet::new();
         for seed in &seeds {
             allowed.extend(auth_chain_of(seed, &provider));
@@ -717,24 +763,29 @@ proptest! {
 
     // ----- auth_chain_difference -----
 
-    /// Zero or one state sets: empty output.
+    /// Zero or one state sets: empty output. (Empty short-circuits;
+    /// single set: chain difference is well-defined as empty because
+    /// "in some but not all chains" is vacuous for a single chain.)
     #[test]
-    fn acd_zero_or_one_state_set_empty(s in arb_state_set(), provider in arb_provider()) {
-        prop_assert!(auth_chain_difference(&[], &provider).is_empty());
-        prop_assert!(auth_chain_difference(&[&s], &provider).is_empty());
+    fn acd_zero_or_one_state_set_empty(
+        (provider, ids) in arb_provider_with_ids(),
+    ) {
+        prop_assert!(auth_chain_difference(&[], &provider).unwrap().is_empty());
+        let s = state_set_from_ids(&ids);
+        prop_assert!(auth_chain_difference(&[&s], &provider).unwrap().is_empty());
     }
 
     /// N identical state sets: empty output (chains are identical →
     /// intersection equals union → difference empty).
     #[test]
     fn acd_identical_state_sets_empty(
-        s in arb_state_set(),
+        (provider, ids) in arb_provider_with_ids(),
         n in 2usize..5,
-        provider in arb_provider(),
     ) {
+        let s = state_set_from_ids(&ids);
         let cloned: Vec<StateMap<OwnedEventId>> = (0..n).map(|_| s.clone()).collect();
         let refs: Vec<&StateMap<OwnedEventId>> = cloned.iter().collect();
-        prop_assert!(auth_chain_difference(&refs, &provider).is_empty());
+        prop_assert!(auth_chain_difference(&refs, &provider).unwrap().is_empty());
     }
 
     /// `diff == union(chains) \ intersection(chains)`. Both sides computed
@@ -743,11 +794,13 @@ proptest! {
     /// which together did not pin equality.
     #[test]
     fn acd_equals_union_minus_intersection(
-        state_sets in prop::collection::vec(arb_state_set(), 2..5),
-        provider in arb_provider(),
+        (provider, ids) in arb_provider_with_ids(),
+        n in 2usize..5,
     ) {
+        let state_sets: Vec<StateMap<OwnedEventId>> =
+            (0..n).map(|k| state_set_from_ids_offset(&ids, k)).collect();
         let refs: Vec<&StateMap<OwnedEventId>> = state_sets.iter().collect();
-        let diff = auth_chain_difference(&refs, &provider);
+        let diff = auth_chain_difference(&refs, &provider).unwrap();
         let chains: Vec<HashSet<OwnedEventId>> = refs
             .iter()
             .map(|s| {
@@ -774,15 +827,17 @@ proptest! {
     /// output.
     #[test]
     fn acd_order_independent(
-        state_sets in prop::collection::vec(arb_state_set(), 2..5),
-        provider in arb_provider(),
+        (provider, ids) in arb_provider_with_ids(),
+        n in 2usize..5,
     ) {
+        let state_sets: Vec<StateMap<OwnedEventId>> =
+            (0..n).map(|k| state_set_from_ids_offset(&ids, k)).collect();
         let refs_forward: Vec<&StateMap<OwnedEventId>> = state_sets.iter().collect();
-        let out_forward = auth_chain_difference(&refs_forward, &provider);
+        let out_forward = auth_chain_difference(&refs_forward, &provider).unwrap();
         let mut reversed = state_sets.clone();
         reversed.reverse();
         let refs_reverse: Vec<&StateMap<OwnedEventId>> = reversed.iter().collect();
-        let out_reverse = auth_chain_difference(&refs_reverse, &provider);
+        let out_reverse = auth_chain_difference(&refs_reverse, &provider).unwrap();
         prop_assert_eq!(out_forward, out_reverse);
     }
 }
@@ -814,13 +869,10 @@ fn arb_linear_chain(
                 } else {
                     vec![]
                 };
-                provider.insert(
-                    EventInfo {
-                        event: placeholder_arc_event(id),
-                        rejected: false,
-                    },
-                    parents,
-                );
+                provider.insert(EventInfo {
+                    event: placeholder_arc_event(id, parents),
+                    rejected: false,
+                });
             }
             (provider, ids)
         })
@@ -853,34 +905,22 @@ fn arb_diamond() -> impl Strategy<Value = (InMemoryStateProvider, [OwnedEventId;
         })
         .prop_map(|(root, left, right, bottom)| {
             let mut provider = InMemoryStateProvider::new();
-            provider.insert(
-                EventInfo {
-                    event: placeholder_arc_event(&root),
-                    rejected: false,
-                },
-                vec![left.clone(), right.clone()],
-            );
-            provider.insert(
-                EventInfo {
-                    event: placeholder_arc_event(&left),
-                    rejected: false,
-                },
-                vec![bottom.clone()],
-            );
-            provider.insert(
-                EventInfo {
-                    event: placeholder_arc_event(&right),
-                    rejected: false,
-                },
-                vec![bottom.clone()],
-            );
-            provider.insert(
-                EventInfo {
-                    event: placeholder_arc_event(&bottom),
-                    rejected: false,
-                },
-                vec![],
-            );
+            provider.insert(EventInfo {
+                event: placeholder_arc_event(&root, vec![left.clone(), right.clone()]),
+                rejected: false,
+            });
+            provider.insert(EventInfo {
+                event: placeholder_arc_event(&left, vec![bottom.clone()]),
+                rejected: false,
+            });
+            provider.insert(EventInfo {
+                event: placeholder_arc_event(&right, vec![bottom.clone()]),
+                rejected: false,
+            });
+            provider.insert(EventInfo {
+                event: placeholder_arc_event(&bottom, vec![]),
+                rejected: false,
+            });
             (provider, [root, left, right, bottom])
         })
 }
@@ -894,7 +934,7 @@ proptest! {
     ) {
         let mut seeds = HashSet::new();
         seeds.insert(ids[0].clone());
-        let sg = conflicted_subgraph(&seeds, &provider);
+        let sg = conflicted_subgraph(&seeds, &provider).unwrap();
         let expected: HashSet<OwnedEventId> = ids.into_iter().collect();
         prop_assert_eq!(sg, expected);
     }
@@ -908,7 +948,7 @@ proptest! {
         let [root, left, right, bottom] = corners;
         let mut seeds = HashSet::new();
         seeds.insert(root.clone());
-        let sg = conflicted_subgraph(&seeds, &provider);
+        let sg = conflicted_subgraph(&seeds, &provider).unwrap();
         let expected: HashSet<OwnedEventId> =
             [root, left, right, bottom].into_iter().collect();
         prop_assert_eq!(sg, expected);
@@ -929,23 +969,27 @@ proptest! {
             return Ok(());
         }
         let mut merged = InMemoryStateProvider::new();
+        // Pull each event's auth_events off its placeholder Event in the
+        // source provider, then rebuild a new event in the merged provider
+        // with the same auth_events embedded.
+        let copy_event_auth = |id: &OwnedEventId, src: &InMemoryStateProvider| -> Vec<OwnedEventId> {
+            src.get_event(id)
+                .map(|info| info.event.auth_events.clone())
+                .unwrap_or_default()
+        };
         for id in &ids_a {
-            merged.insert(
-                EventInfo {
-                    event: placeholder_arc_event(id),
-                    rejected: false,
-                },
-                provider_a.auth_event_ids(id).into_owned(),
-            );
+            let parents = copy_event_auth(id, &provider_a);
+            merged.insert(EventInfo {
+                event: placeholder_arc_event(id, parents),
+                rejected: false,
+            });
         }
         for id in &ids_b {
-            merged.insert(
-                EventInfo {
-                    event: placeholder_arc_event(id),
-                    rejected: false,
-                },
-                provider_b.auth_event_ids(id).into_owned(),
-            );
+            let parents = copy_event_auth(id, &provider_b);
+            merged.insert(EventInfo {
+                event: placeholder_arc_event(id, parents),
+                rejected: false,
+            });
         }
 
         let mut s1 = StateMap::new();
@@ -953,7 +997,7 @@ proptest! {
         let mut s2 = StateMap::new();
         s2.insert(("m.room.name".to_string(), String::new()), ids_b[0].clone());
         let refs = vec![&s1, &s2];
-        let diff = auth_chain_difference(&refs, &merged);
+        let diff = auth_chain_difference(&refs, &merged).unwrap();
         let expected: HashSet<OwnedEventId> = ids_a.into_iter().chain(ids_b).collect();
         prop_assert_eq!(diff, expected);
     }
@@ -986,7 +1030,7 @@ proptest! {
         let mut s2 = StateMap::new();
         s2.insert(("m.room.name".to_string(), String::new()), ids[shallower].clone());
         let refs = vec![&s1, &s2];
-        let diff = auth_chain_difference(&refs, &provider);
+        let diff = auth_chain_difference(&refs, &provider).unwrap();
 
         // chain(deeper) = ids[deeper..]
         // chain(shallower) = ids[shallower..]
