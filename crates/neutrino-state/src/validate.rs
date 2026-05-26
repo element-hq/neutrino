@@ -17,7 +17,6 @@ use crate::{Event, FormatError, ReferenceError};
 
 const MAX_PREV_EVENTS: usize = 20;
 const MAX_PREV_STATE_EVENTS: usize = 20;
-const DEPTH_LIMIT: u64 = (1u64 << 53) - 1;
 
 /// Parse a raw event JSON into an `Event`, applying every phase-1a check
 /// (wire-format only; no provider lookups). Reference validation —
@@ -56,12 +55,10 @@ pub fn parse_event(
     })?;
 
     let origin_server_ts = required_u64(&map, "origin_server_ts")?;
-    let depth = required_u64(&map, "depth")?;
-    // v12 PDU schema: depth "Must be less than the maximum value for an
-    // integer (2^53 - 1)."
-    if depth >= DEPTH_LIMIT {
-        return Err(FormatError::DepthOutOfRange);
-    }
+    // `depth` is intentionally not parsed: this server uses
+    // `origin_server_ts` for everything Synapse would use depth for
+    // (backfill ordering etc.). v12 inbound events MAY include `depth` for
+    // interop with non-MSC4242 senders; we ignore it.
 
     // Hashes: required, well-formed object of strings. Content hashes are
     // independent of signatures/keys — we keep this check even though we
@@ -822,40 +819,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_depth() {
-        let mut v = base_event();
-        v.as_object_mut().unwrap().remove("depth");
-        assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![]),
-            Err(FormatError::MissingField("depth"))
-        ));
-    }
+    fn ignores_depth_field_when_present() {
+        // `depth` is silently accepted on the wire for interop with non-MSC4242
+        // senders but never parsed into the `Event` struct. Both presence
+        // (any integer) and absence parse the same.
+        let mut with_depth = base_event();
+        with_depth["depth"] = json!(42);
+        let mut without_depth = base_event();
+        without_depth.as_object_mut().unwrap().remove("depth");
 
-    #[test]
-    fn rejects_non_integer_depth() {
-        let mut v = base_event();
-        v["depth"] = json!("not a number");
-        assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![]),
-            Err(FormatError::InvalidFieldType { field: "depth", .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_depth_at_limit() {
-        let mut v = base_event();
-        v["depth"] = json!(DEPTH_LIMIT);
-        assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![]),
-            Err(FormatError::DepthOutOfRange)
-        ));
-    }
-
-    #[test]
-    fn accepts_depth_just_under_limit() {
-        let mut v = base_event();
-        v["depth"] = json!(DEPTH_LIMIT - 1);
-        parse_event(raw(v), eid("$e:example.org"), vec![]).expect("depth ok");
+        parse_event(raw(with_depth), eid("$e:example.org"), vec![]).expect("depth tolerated");
+        parse_event(raw(without_depth), eid("$e:example.org"), vec![]).expect("missing depth ok");
     }
 
     #[test]

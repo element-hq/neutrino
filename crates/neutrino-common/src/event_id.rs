@@ -43,17 +43,17 @@ pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
 ///
 /// Used for the `hashes.sha256` field — the Matrix spec specifies
 /// "unpadded Base64" (standard alphabet, no `=` padding) for content hashes.
-///
-/// Consumed by `EventBuilder` in B2 — kept under `#[allow(dead_code)]`
-/// until then so the helper sits next to its url-safe counterpart.
-#[allow(dead_code)]
-pub(crate) fn b64_unpadded(bytes: &[u8]) -> String {
+/// Exposed for consumers (e.g. `EventBuilder`) that need to embed the b64
+/// form of a content hash into wire JSON.
+pub fn b64_unpadded(bytes: &[u8]) -> String {
     general_purpose::STANDARD_NO_PAD.encode(bytes)
 }
 
 /// URL-safe-alphabet base64, no padding.
 ///
-/// Used for the event_id suffix (v3+): `event_id = "$" + b64url_unpadded(reference_hash)`.
+/// Used internally for the event_id suffix (v3+):
+/// `event_id = "$" + b64url_unpadded(reference_hash)`. Not exposed publicly
+/// — callers should use [`event_id_from_hash`] which wraps it.
 pub(crate) fn b64_url_unpadded(bytes: &[u8]) -> String {
     general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }

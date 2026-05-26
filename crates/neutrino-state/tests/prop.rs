@@ -62,7 +62,6 @@ const REQUIRED_FIELDS: &[&str] = &[
     "type",
     "sender",
     "content",
-    "depth",
     "origin_server_ts",
     "prev_events",
     "prev_state_events",
