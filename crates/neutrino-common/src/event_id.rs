@@ -1,25 +1,22 @@
-//! Hashing and event-id derivation primitives (PR 2 / B0).
+//! Hashing and event-id derivation for v12 / MSC4242.
 //!
-//! Building blocks used by:
+//! Used by:
 //! - `EventBuilder` in `neutrino-state::event_id` (server-authored events)
 //! - `Event::from_wire` here in `neutrino-common::event` (federation receive)
 //!
-//! This module owns the four primitives the v12 / MSC4242 hash flow needs:
-//! canonical-JSON encoding, SHA-256, two base64 flavours, and a redaction
-//! wrapper. PR 2 / B1 layers `content_hash` / `reference_hash` /
-//! `event_id_from_hash` on top of these.
+//! Layered as:
+//! - **B0** — internal primitives (`canonical`, `sha256`, two base64 flavours,
+//!   `redact_for_hash`).
+//! - **B1** — public spec functions (`content_hash`, `reference_hash`,
+//!   `event_id_from_hash`, `room_id_from_create`).
 //!
 //! See `event-id-design.md` for the full flow.
-
-// Consumed by B1 (`content_hash` / `reference_hash` / `event_id_from_hash`)
-// within this same module in the next commit; the dead-code allowance lifts
-// then.
-#![allow(dead_code)]
 
 use base64::Engine;
 use base64::engine::general_purpose;
 use ruma::canonical_json::{CanonicalJsonObject, RedactionError, redact_in_place};
 use ruma::room_version_rules::RoomVersionRules;
+use ruma::{EventId, OwnedEventId, OwnedRoomId};
 use sha2::{Digest, Sha256};
 
 /// Serialise a canonical-JSON object to its canonical byte representation.
@@ -46,6 +43,10 @@ pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
 ///
 /// Used for the `hashes.sha256` field — the Matrix spec specifies
 /// "unpadded Base64" (standard alphabet, no `=` padding) for content hashes.
+///
+/// Consumed by `EventBuilder` in B2 — kept under `#[allow(dead_code)]`
+/// until then so the helper sits next to its url-safe counterpart.
+#[allow(dead_code)]
 pub(crate) fn b64_unpadded(bytes: &[u8]) -> String {
     general_purpose::STANDARD_NO_PAD.encode(bytes)
 }
@@ -75,6 +76,62 @@ pub(crate) fn redact_for_hash(obj: &mut CanonicalJsonObject) -> Result<(), Redac
         obj.insert("prev_state_events".to_owned(), v);
     }
     Ok(())
+}
+
+/// Content hash of an unhashed event object.
+///
+/// Spec: <https://spec.matrix.org/v1.18/server-server-api/#calculating-the-content-hash-for-an-event>.
+/// Removes `unsigned`, `signatures`, `hashes` from a clone of the input,
+/// canonical-encodes, SHA-256s. The b64-encoded form goes into the event's
+/// `hashes.sha256` field before signing.
+pub fn content_hash(obj: &CanonicalJsonObject) -> [u8; 32] {
+    let mut clone = obj.clone();
+    clone.remove("unsigned");
+    clone.remove("signatures");
+    clone.remove("hashes");
+    sha256(&canonical(&clone))
+}
+
+/// Reference hash of an event object — feeds the v3+ event_id.
+///
+/// Spec: <https://spec.matrix.org/v1.18/server-server-api/#calculating-the-reference-hash-for-an-event>.
+/// Removes `unsigned` and `signatures`, then runs [`redact_for_hash`] (V12
+/// redaction with the MSC4242 `prev_state_events` carve-out), canonical-encodes,
+/// SHA-256s.
+///
+/// Returns `RedactionError` only if the input object violates the redaction
+/// preconditions ruma checks (e.g. non-object `content`, missing `type`).
+pub fn reference_hash(obj: &CanonicalJsonObject) -> Result<[u8; 32], RedactionError> {
+    let mut clone = obj.clone();
+    clone.remove("unsigned");
+    clone.remove("signatures");
+    redact_for_hash(&mut clone)?;
+    Ok(sha256(&canonical(&clone)))
+}
+
+/// Format an event_id from a reference hash. v3+ rooms only.
+///
+/// `event_id = "$" + url-safe-unpadded-base64(reference_hash)`.
+pub fn event_id_from_hash(hash: &[u8; 32]) -> OwnedEventId {
+    let s = format!("${}", b64_url_unpadded(hash));
+    // 43 url-safe-b64 chars after `$` is always a syntactically valid event_id.
+    OwnedEventId::try_from(s).expect("'$' + 43 url-safe-b64 chars is a valid event_id")
+}
+
+/// Derive a room_id from a create event's event_id.
+///
+/// Room v12 uses `RoomIdFormatVersion::V2`: the room_id is the create event's
+/// event_id with the leading `$` swapped to `!`. The suffix is identical
+/// (43 url-safe-b64 chars). Spec: <https://spec.matrix.org/v1.18/rooms/v12/#room-ids>.
+pub fn room_id_from_create(create_event_id: &EventId) -> OwnedRoomId {
+    let s = create_event_id.as_str();
+    debug_assert!(
+        s.starts_with('$'),
+        "EventId by construction starts with '$'"
+    );
+    let swapped = format!("!{}", &s[1..]);
+    OwnedRoomId::try_from(swapped)
+        .expect("'!' + valid event_id suffix is a valid room_id under format v2")
 }
 
 #[cfg(test)]
@@ -179,5 +236,164 @@ mod tests {
         }));
         redact_for_hash(&mut o).expect("redaction succeeds");
         assert!(!o.contains_key("prev_state_events"));
+    }
+
+    // ---- B1: content_hash, reference_hash, event_id_from_hash, room_id_from_create ----
+
+    /// Spec appendix §event-signing, vector 1 ("minimally-sized event").
+    /// v1-shaped (`origin` field, v1 event_id format, `auth_events: []` on a
+    /// non-create event) — valid as a content-hash test because the algorithm
+    /// is byte-level and doesn't care about field semantics.
+    #[test]
+    fn content_hash_spec_vector_minimally_sized_event() {
+        let o = obj(json!({
+            "room_id": "!x:domain",
+            "sender": "@a:domain",
+            "origin": "domain",
+            "origin_server_ts": 1_000_000,
+            "signatures": {},
+            "hashes": {},
+            "type": "X",
+            "content": {},
+            "prev_events": [],
+            "auth_events": [],
+            "depth": 3,
+            "unsigned": { "age_ts": 1_000_000 }
+        }));
+        let h = content_hash(&o);
+        assert_eq!(
+            b64_unpadded(&h),
+            "5jM4wQpv6lnBo7CLIghJuHdW+s2CMBJPUOGOC89ncos"
+        );
+    }
+
+    /// Spec appendix §event-signing, vector 2 ("event containing redactable content").
+    #[test]
+    fn content_hash_spec_vector_redactable_content() {
+        let o = obj(json!({
+            "content": { "body": "Here is the message content" },
+            "event_id": "$0:domain",
+            "origin": "domain",
+            "origin_server_ts": 1_000_000,
+            "type": "m.room.message",
+            "room_id": "!r:domain",
+            "sender": "@u:domain",
+            "signatures": {},
+            "unsigned": { "age_ts": 1_000_000 }
+        }));
+        let h = content_hash(&o);
+        assert_eq!(
+            b64_unpadded(&h),
+            "onLKD1bGljeBWQhWZ1kaP9SorVmRQNdN5aM2JYU2n/g"
+        );
+    }
+
+    #[test]
+    fn content_hash_is_invariant_under_unsigned_signatures_hashes() {
+        let base = obj(json!({
+            "type": "X", "sender": "@a:d", "room_id": "!r:d",
+            "content": {}, "origin_server_ts": 1
+        }));
+        let h_base = content_hash(&base);
+
+        // Adding unsigned/signatures/hashes must not change the hash.
+        let with_strippable = obj(json!({
+            "type": "X", "sender": "@a:d", "room_id": "!r:d",
+            "content": {}, "origin_server_ts": 1,
+            "unsigned": { "age": 42 },
+            "signatures": { "d": { "ed25519:a": "sig" } },
+            "hashes": { "sha256": "junk" }
+        }));
+        assert_eq!(h_base, content_hash(&with_strippable));
+
+        // Changing a non-stripped field must change the hash.
+        let altered = obj(json!({
+            "type": "Y", "sender": "@a:d", "room_id": "!r:d",
+            "content": {}, "origin_server_ts": 1
+        }));
+        assert_ne!(h_base, content_hash(&altered));
+    }
+
+    #[test]
+    fn reference_hash_strips_unsigned_and_signatures() {
+        let base = obj(json!({
+            "type": "m.room.message", "sender": "@a:d", "room_id": "!r:d",
+            "content": {}, "origin_server_ts": 1,
+            "prev_events": [], "auth_events": []
+        }));
+        let h_base = reference_hash(&base).expect("redacts");
+
+        let with_strippable = obj(json!({
+            "type": "m.room.message", "sender": "@a:d", "room_id": "!r:d",
+            "content": {}, "origin_server_ts": 1,
+            "prev_events": [], "auth_events": [],
+            "unsigned": { "age": 42 },
+            "signatures": { "d": { "ed25519:a": "sig" } }
+        }));
+        assert_eq!(h_base, reference_hash(&with_strippable).expect("redacts"));
+    }
+
+    #[test]
+    fn reference_hash_covers_prev_state_events_msc4242() {
+        // Two otherwise-identical events differing only in prev_state_events
+        // must produce different reference hashes — proof that our MSC4242
+        // carve-out actually feeds the hash.
+        let a = obj(json!({
+            "type": "m.room.message", "sender": "@a:d", "room_id": "!r:d",
+            "content": {}, "origin_server_ts": 1,
+            "prev_events": [], "prev_state_events": ["$ps_a:d"]
+        }));
+        let b = obj(json!({
+            "type": "m.room.message", "sender": "@a:d", "room_id": "!r:d",
+            "content": {}, "origin_server_ts": 1,
+            "prev_events": [], "prev_state_events": ["$ps_b:d"]
+        }));
+        assert_ne!(
+            reference_hash(&a).expect("redacts"),
+            reference_hash(&b).expect("redacts"),
+        );
+    }
+
+    #[test]
+    fn reference_hash_differs_from_content_hash_for_redactable_event() {
+        // m.room.message's content gets stripped on redaction → ref hash
+        // must differ from content hash (which preserves content).
+        let o = obj(json!({
+            "type": "m.room.message", "sender": "@a:d", "room_id": "!r:d",
+            "content": { "body": "hi" }, "origin_server_ts": 1,
+            "prev_events": [], "auth_events": []
+        }));
+        let c = content_hash(&o);
+        let r = reference_hash(&o).expect("redacts");
+        assert_ne!(c, r);
+    }
+
+    #[test]
+    fn event_id_from_hash_dollar_plus_url_safe_b64() {
+        // All-0xff input exercises the URL-safe alphabet distinction
+        // (`-` / `_` instead of `+` / `/`). 32 bytes = 256 bits, encoded
+        // as 43 base64 chars: 42 sextets of `111111` = `_`, plus the trailing
+        // sextet `1111_00` (4 bits of payload + 2 padding zero bits) = '8'.
+        let hash = [0xff_u8; 32];
+        let id = event_id_from_hash(&hash);
+        assert_eq!(id.as_str(), "$__________________________________________8");
+        assert_eq!(id.as_str().len(), 1 + 43);
+    }
+
+    #[test]
+    fn event_id_from_hash_zero_vector() {
+        let hash = [0_u8; 32];
+        let id = event_id_from_hash(&hash);
+        assert_eq!(id.as_str(), "$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    }
+
+    #[test]
+    fn room_id_from_create_sigil_swap() {
+        let hash = [0xab_u8; 32];
+        let event_id = event_id_from_hash(&hash);
+        let room_id = room_id_from_create(&event_id);
+        assert!(room_id.as_str().starts_with('!'));
+        // Suffix is byte-identical to the event_id (everything after the sigil).
+        assert_eq!(&room_id.as_str()[1..], &event_id.as_str()[1..]);
     }
 }
