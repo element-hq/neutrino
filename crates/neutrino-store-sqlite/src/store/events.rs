@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{OptionalExtension, params, params_from_iter};
 use neutrino_store::{Direction, Event, EventStore, PaginationToken, StorageError, StreamPos};
-use ruma::{EventId, OwnedEventId, OwnedServerName, RoomId, ServerName, UserId};
+use ruma::{EventId, OwnedServerName, RoomId, ServerName};
 use tokio::sync::watch;
 
 use crate::{
@@ -73,54 +73,6 @@ impl EventStore for SqliteStore {
             // client refetching `room_messages`).
             SqliteStore::notify_watch(&watch_tx, stream_pos);
 
-            Ok(())
-        })
-        .await
-    }
-
-    async fn get_client_txn(
-        &self,
-        txn_id: &str,
-        user_id: &UserId,
-    ) -> Result<Option<OwnedEventId>, StorageError> {
-        let txn_id = txn_id.to_owned();
-        let user_id = user_id.to_owned();
-
-        self.run_read(move |conn| -> Result<Option<OwnedEventId>, Error> {
-            let result: Option<String> = conn
-                .query_row(
-                    "SELECT event_id FROM client_txns WHERE txn_id = ? AND user_id = ?",
-                    params![txn_id, user_id.as_str()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-
-            match result {
-                None => Ok(None),
-                Some(s) => OwnedEventId::try_from(s)
-                    .map(Some)
-                    .map_err(|e| Error::Internal(format!("malformed event_id in DB: {e}"))),
-            }
-        })
-        .await
-    }
-
-    async fn record_client_txn(
-        &self,
-        txn_id: &str,
-        user_id: &UserId,
-        event_id: &EventId,
-    ) -> Result<(), StorageError> {
-        let txn_id = txn_id.to_owned();
-        let user_id = user_id.to_owned();
-        let event_id = event_id.to_owned();
-
-        self.run_write(move |conn| -> Result<(), Error> {
-            conn.execute(
-                "INSERT OR IGNORE INTO client_txns (txn_id, user_id, event_id) \
-                 VALUES (?, ?, ?)",
-                params![txn_id, user_id.as_str(), event_id.as_str()],
-            )?;
             Ok(())
         })
         .await
@@ -328,8 +280,8 @@ mod tests {
     use crate::SqliteStore;
     use crate::error::Error;
     use crate::tests::{
-        ALICE_ROOM_ID, ALICE_USER_ID, BOB_ROOM_ID, BOB_USER_ID, make_event,
-        make_event_with_raw_json, message, name_event, setup_room, store,
+        ALICE_ROOM_ID, ALICE_USER_ID, BOB_ROOM_ID, make_event, make_event_with_raw_json, message,
+        name_event, setup_room, store,
     };
 
     /// Open an in-memory store with a single create event in `*ALICE_ROOM_ID` —
@@ -522,131 +474,6 @@ mod tests {
             }"#,
         );
         s.persist_event(&ok, &[]).await.unwrap();
-    }
-
-    // E12: get_client_txn on unrecorded → None
-    #[tokio::test]
-    async fn get_client_txn_none_for_unrecorded() {
-        let s = store().await;
-        assert!(
-            s.get_client_txn("txn1", *ALICE_USER_ID)
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    // E13: record then get round-trip
-    #[tokio::test]
-    async fn record_then_get_client_txn() {
-        let s = store_with_room().await;
-        let msg = message(
-            event_id!("$m1:example.com"),
-            *ALICE_ROOM_ID,
-            *ALICE_USER_ID,
-            "hi",
-        );
-        s.persist_event(&msg, &[]).await.unwrap();
-
-        let user = *ALICE_USER_ID;
-        let evt_id = event_id!("$m1:example.com");
-        s.record_client_txn("txn1", user, evt_id).await.unwrap();
-
-        let got = s.get_client_txn("txn1", user).await.unwrap();
-        assert_eq!(got.as_deref(), Some(evt_id));
-    }
-
-    // E14: second record with same (txn_id, user_id) is a no-op (idempotent)
-    #[tokio::test]
-    async fn record_client_txn_idempotent() {
-        let s = store_with_room().await;
-        let m1 = message(
-            event_id!("$m1:example.com"),
-            *ALICE_ROOM_ID,
-            *ALICE_USER_ID,
-            "first",
-        );
-        let m2 = message(
-            event_id!("$m2:example.com"),
-            *ALICE_ROOM_ID,
-            *ALICE_USER_ID,
-            "second",
-        );
-        s.persist_event(&m1, &[]).await.unwrap();
-        s.persist_event(&m2, &[]).await.unwrap();
-
-        let user = *ALICE_USER_ID;
-        let id1 = event_id!("$m1:example.com");
-        s.record_client_txn("txn1", user, id1).await.unwrap();
-        // Second record with same key should be a no-op — original wins.
-        s.record_client_txn("txn1", user, event_id!("$m2:example.com"))
-            .await
-            .unwrap();
-
-        let got = s.get_client_txn("txn1", user).await.unwrap();
-        assert_eq!(got.as_deref(), Some(id1));
-    }
-
-    // E15: same txn_id, different user_id → independent
-    #[tokio::test]
-    async fn record_client_txn_isolated_per_user() {
-        let s = store_with_room().await;
-        // Bob sends a message too, so we have a second user available.
-        let m1 = message(
-            event_id!("$m1:example.com"),
-            *ALICE_ROOM_ID,
-            *ALICE_USER_ID,
-            "from alice",
-        );
-        let m2 = message(
-            event_id!("$m2:example.com"),
-            *ALICE_ROOM_ID,
-            *BOB_USER_ID,
-            "from bob",
-        );
-        s.persist_event(&m1, &[]).await.unwrap();
-        s.persist_event(&m2, &[]).await.unwrap();
-
-        let alice = *ALICE_USER_ID;
-        let bob = *BOB_USER_ID;
-        let id1 = event_id!("$m1:example.com");
-        let id2 = event_id!("$m2:example.com");
-        s.record_client_txn("shared", alice, id1).await.unwrap();
-        s.record_client_txn("shared", bob, id2).await.unwrap();
-
-        assert_eq!(
-            s.get_client_txn("shared", alice).await.unwrap().as_deref(),
-            Some(id1)
-        );
-        assert_eq!(
-            s.get_client_txn("shared", bob).await.unwrap().as_deref(),
-            Some(id2)
-        );
-    }
-
-    // E16: record_client_txn with unknown event_id → InvalidInput (FK)
-    #[tokio::test]
-    async fn record_client_txn_rejects_unknown_event_id() {
-        let s = store_with_room().await;
-        let unknown = event_id!("$nope:example.com");
-        let result = s.record_client_txn("txn1", *ALICE_USER_ID, unknown).await;
-        assert!(matches!(result, Err(StorageError::InvalidInput(_))));
-    }
-
-    // E31: empty txn_id / user_id strings allowed by schema
-    #[tokio::test]
-    async fn record_client_txn_empty_strings_ok() {
-        let s = store_with_room().await;
-        // Schema allows empty strings (TEXT NOT NULL ≠ disallow ""), but
-        // user_id parsing in ruma would reject "". So we test empty txn_id
-        // only — empty user_id can't be constructed as a UserId.
-        let user = *ALICE_USER_ID;
-        let evt = event_id!("$create:example.com");
-        s.record_client_txn("", user, evt).await.unwrap();
-        assert_eq!(
-            s.get_client_txn("", user).await.unwrap().as_deref(),
-            Some(evt)
-        );
     }
 
     // E17: empty ids → empty result, no SQL run

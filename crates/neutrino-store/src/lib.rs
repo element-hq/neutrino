@@ -3,8 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use async_trait::async_trait;
 pub use neutrino_common::Event;
 use ruma::{
-    EventId, OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, RoomVersionId,
-    ServerName, UserId,
+    EventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, RoomVersionId, ServerName, UserId,
 };
 use thiserror::Error;
 use tokio::sync::watch;
@@ -133,25 +132,6 @@ pub trait EventStore: Send + Sync {
     /// forward extension where the new event has been resolved into the room's
     /// current state by the caller.
     async fn persist_historical_event(&self, event: &Event) -> Result<(), StorageError>;
-
-    /// Pre:  none.
-    /// Post: if `(txn_id, user_id)` was previously recorded via `record_client_txn`,
-    ///       returns the associated `event_id`; otherwise returns `None`.
-    async fn get_client_txn(
-        &self,
-        txn_id: &str,
-        user_id: &UserId,
-    ) -> Result<Option<OwnedEventId>, StorageError>;
-
-    /// Pre:  none.
-    /// Post: records `(txn_id, user_id) → event_id` for future dedup lookups;
-    ///       idempotent — recording the same `(txn_id, user_id)` pair twice is a no-op.
-    async fn record_client_txn(
-        &self,
-        txn_id: &str,
-        user_id: &UserId,
-        event_id: &EventId,
-    ) -> Result<(), StorageError>;
 
     /// Pre:  none.
     /// Post: returns one `Event` per ID that exists in the store; IDs with no

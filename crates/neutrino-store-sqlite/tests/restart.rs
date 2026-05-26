@@ -51,8 +51,8 @@ async fn settle_close_race() {
 }
 
 /// Comprehensive restart-survival test: populate every durable trait
-/// surface (events, current_state, outbox, client_txns,
-/// federation_txns), drop the store, reopen at the same path, and
+/// surface (events, current_state, outbox, federation_txns), drop the
+/// store, reopen at the same path, and
 /// assert every observable persists. A single fat test rather than
 /// one per surface — the setup cost dominates and each assertion's
 /// failure message ("name event missing", "outbox empty", etc.)
@@ -103,11 +103,6 @@ async fn restart_preserves_all_state() {
         )
         .await
         .expect("persist message");
-
-        // CSAPI txn dedup record.
-        s.record_client_txn("txn-A", *ALICE_USER_ID, msg_id)
-            .await
-            .expect("record client txn");
 
         // FederationInbox dedup record — first call returns false.
         let already = s
@@ -191,14 +186,6 @@ async fn restart_preserves_all_state() {
     let pdus = s.pending_pdus(dest).await.expect("pending_pdus");
     assert_eq!(pdus.len(), 1);
     assert_eq!(pdus[0].event_id.as_str(), "$msg:e");
-
-    // Client txn dedup record survives — the same (txn_id, user_id)
-    // resolves to the originally-recorded event_id.
-    let recorded = s
-        .get_client_txn("txn-A", *ALICE_USER_ID)
-        .await
-        .expect("get_client_txn");
-    assert_eq!(recorded.as_deref(), Some(event_id!("$msg:e")));
 
     // Federation inbox dedup record survives — replaying the same
     // (origin, txn_id) must return true (already seen). This is the

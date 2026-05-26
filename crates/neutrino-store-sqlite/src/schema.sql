@@ -177,17 +177,6 @@ CREATE INDEX ix_current_state_room_member
     WHERE event_type = 'm.room.member';
 
 -- ----------------------------------------------------------------------------
--- client_txns — EventStore::{record_client_txn, get_client_txn}
--- INSERT OR IGNORE gives the post-condition's idempotency.
--- ----------------------------------------------------------------------------
-CREATE TABLE client_txns (
-    txn_id    TEXT NOT NULL,
-    user_id   TEXT NOT NULL,
-    event_id  TEXT NOT NULL REFERENCES events(event_id),
-    PRIMARY KEY (txn_id, user_id)
-) STRICT, WITHOUT ROWID;
-
--- ----------------------------------------------------------------------------
 -- federation_txns — FederationInbox::record_federation_txn
 -- Minimal per Decision §6. No received_at / GC for V1.
 -- record_federation_txn = INSERT OR IGNORE + check `changes() == 0`.
