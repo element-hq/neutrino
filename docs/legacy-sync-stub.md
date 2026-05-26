@@ -1,6 +1,6 @@
 # Legacy `/sync` stub over sliding-sync (MSC4222 semantics)
 
-Status: design sketch, not implemented.
+Status: implemented (2026-05-26). The handler lives at `crates/neutrino-http/src/legacy_sync/`; the wildcard / dual-emission / knock decisions called out below in the original sketch were all carried through. See the PLAN.md decisions log entry of 2026-05-26 for the build-out detail and any deviations from this sketch.
 
 ## Goal
 
@@ -66,18 +66,18 @@ Synthesized into the v5 request:
 - `room_subscriptions: BTreeMap::new()`
 - `extensions: Default::default()`
 
-If `StateEventType::from("*")` doesn't round-trip cleanly through the v5
-type (TBD — verify with ruma), fall back to an explicit enumeration:
-`m.room.create`, `m.room.member`, `m.room.name`, `m.room.topic`,
-`m.room.power_levels`, `m.room.join_rules`. Smaller blast radius and
-covers what complement tests inspect.
+**Resolved:** `StateEventType::from("*")` round-trips cleanly. The existing
+sliding-sync tests (`sliding_sync/tests.rs::required_state_wildcard_*`)
+already exercise this exact pair through `request::List::room_details
+::required_state` and `build::required_state_matches`; no fallback to
+explicit enumeration is needed. The implementation uses the wildcard.
 
 ## Response translation (v5::Response → v3 JSON)
 
 Top-level mapping:
 
 - `pos` → `next_batch`
-- `rooms` → buckets `rooms.join`, `rooms.invite`, `rooms.leave` (see below)
+- `rooms` → buckets `rooms.join`, `rooms.invite`, `rooms.leave`, `rooms.knock` (see below)
 - Stubs:
   - `presence: {"events": []}`
   - `account_data: {"events": []}`
@@ -144,6 +144,40 @@ Sliding-sync gates leave-room inclusion through `include_room_per_msc4186`
 in `sliding_sync/build.rs` (kicks always included; self-leave / ban only
 if previously emitted on the same conn). Inherit this — if a leave room
 shows up in the v5 response, surface it in `rooms.leave`.
+
+### Knock room shape
+
+```json
+{
+  "knock_state": {
+    "events": [<stripped {type, state_key, sender, content} from v5 required_state>]
+  }
+}
+```
+
+Knock rooms are not in the original three-bucket enumeration above but the
+upstream `candidate_rooms` *does* include `Membership::Knock`
+(`sliding_sync/build.rs:292,311`), so they reach the translator and would
+otherwise need to be silently dropped. We surface them under `rooms.knock`
+with the v3 spec's `knock_state.events` shape.
+
+Stripping: v5's `Room.required_state` carries full
+`Raw<AnySyncStateEvent>` values (with `event_id`, `origin_server_ts`,
+`unsigned`, `prev_content`, `room_id`). The v3 spec defines `knock_state`
+as stripped state — `{type, state_key, sender, content}` only. Ruma
+0.15 has no `JsonCastable` impl from the type-erased `AnySyncStateEvent`
+enum to `AnyStrippedStateEvent` and no general `fn strip()`; `Raw::cast_unchecked`
+would emit the full event JSON under a stripped type label (a soft lie about
+the bytes), so the translator reshapes the JSON manually via
+`translate::strip_state_event` — parse, pull the four canonical keys, emit
+a new object. Missing canonical fields are dropped silently.
+
+The upstream sliding-sync handler's `is_invited` check
+(`sliding_sync/build.rs:647-663`) matches only `membership == "invite"`, so
+knock rooms go through the non-invite build path and do **not** get their
+state put into `v5::Room.invite_state`. Our wildcard `required_state`
+captures the state events into `Room.required_state` instead, which is
+where the stripper reads from.
 
 ## `/versions` advertisement
 
@@ -219,21 +253,19 @@ subtests.
 
 ## Risks and caveats
 
-1. **Wildcard `required_state` ergonomics.** Verify `StateEventType::from("*")`
-   round-trips through ruma's v5 types. If not, use explicit enumeration.
-2. **Filter dropped silently.** Tests that pass a strict filter expecting
+1. **Filter dropped silently.** Tests that pass a strict filter expecting
    it to be honored will see a fatter response than they wanted. Should
    still pass assertions because they're typically over-specified, not
    restrictive.
-3. **`prev_batch` per room is empty.** A test that tries to paginate
+2. **`prev_batch` per room is empty.** A test that tries to paginate
    backwards via `/messages` would fail — but `/messages` isn't wired,
    so that test would fail upstream anyway.
-4. **Strict MSC4222 spec compliance vs. dual-emission.** The MSC says
+3. **Strict MSC4222 spec compliance vs. dual-emission.** The MSC says
    the server emits `state_after` *only* when the client opts in. We're
    recommending unconditional dual emission for compat. Revisit if a
    real MSC4222-aware client breaks on seeing both fields (it shouldn't
    per the MSC — extra unknown fields are ignored).
-5. **MSC4222 unstable name might shift.** Use
+4. **MSC4222 unstable name might shift.** Use
    `org.matrix.msc4222.state_after` until the MSC stabilizes; flip to
    plain `state_after` then. Same pattern as
    `org.matrix.msc4242.12` already in `neutrino-common`.
