@@ -139,50 +139,88 @@ pub fn auth_chain_difference(
 mod tests {
     use super::*;
     use crate::Event;
+    use crate::event_id::EventBuilder;
     use crate::provider::{EventInfo, InMemoryStateProvider};
-    use crate::validate::parse_event;
-    use serde_json::value::RawValue;
-    use serde_json::{Value, json};
+    use ruma::{room_id, user_id};
+    use serde_json::json;
+    use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn raw(v: Value) -> Box<RawValue> {
-        serde_json::value::to_raw_value(&v).expect("fixture")
-    }
     fn eid(s: &str) -> OwnedEventId {
         s.parse().expect("event id")
     }
 
-    /// Construct a minimal `Event` with a given event_id, state_key, and
-    /// auth_event_ids. Other fields are placeholder — state-res only
-    /// consults event_id + auth_events in 4a.
-    fn make_event(id: &str, state_key: Option<&str>, auth_chain: &[&str]) -> Arc<Event> {
-        let mut v = json!({
-            "type": "m.room.placeholder",
-            "sender": "@alice:example.org",
-            "room_id": "!room:example.org",
-            "content": {},
-            "prev_events": [],
-            "prev_state_events": [],
-            "depth": 1,
-            "origin_server_ts": 1_700_000_000_000_u64,
-            "hashes": { "sha256": "abc" }
-        });
-        if let Some(sk) = state_key {
-            v["state_key"] = json!(sk);
-        }
-        let auth_events: Vec<OwnedEventId> = auth_chain.iter().map(|s| eid(s)).collect();
-        Arc::new(parse_event(raw(v), eid(id), auth_events).expect("valid"))
+    /// Monotonically-increasing origin_server_ts so successive placeholder
+    /// fixtures hash to distinct event_ids (post-v11-redaction they'd
+    /// collapse to the same bytes otherwise).
+    fn next_ts() -> u64 {
+        static TS: AtomicU64 = AtomicU64::new(1_700_000_000_000);
+        TS.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn insert(provider: &mut InMemoryStateProvider, id: &str, auth_chain: &[&str]) {
-        let info = EventInfo {
-            event: make_event(id, Some(""), auth_chain),
+    /// Construct a placeholder state event with caller-supplied auth chain
+    /// and return the computed event_id paired with the `Arc<Event>`.
+    /// State-res only consults `event_id` + `auth_events`, so the rest of
+    /// the event shape is fixed.
+    fn placeholder(auth_chain: Vec<OwnedEventId>) -> (OwnedEventId, Arc<Event>) {
+        let ev = EventBuilder::new(
+            user_id!("@alice:example.org").to_owned(),
+            "m.room.placeholder".to_owned(),
+        )
+        .room_id(room_id!("!room:example.org").to_owned())
+        .state_key(String::new())
+        .content(json!({}))
+        .auth_events(auth_chain)
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("placeholder event");
+        let id = ev.event_id.clone();
+        (id, Arc::new(ev))
+    }
+
+    /// Register a labelled placeholder in `bag` and the provider. The label
+    /// is just a string the test uses to refer back to the computed id —
+    /// auth_chain is supplied via labels referenced earlier in the same
+    /// graph.
+    fn insert(
+        provider: &mut InMemoryStateProvider,
+        bag: &mut HashMap<&'static str, OwnedEventId>,
+        label: &'static str,
+        auth_labels: &[&'static str],
+    ) {
+        let auth_chain: Vec<OwnedEventId> = auth_labels
+            .iter()
+            .map(|l| {
+                bag.get(l)
+                    .expect("auth label must be inserted first")
+                    .clone()
+            })
+            .collect();
+        let (id, ev) = placeholder(auth_chain);
+        bag.insert(label, id);
+        provider.insert(EventInfo {
+            event: ev,
             rejected: false,
-        };
-        provider.insert(info);
+        });
     }
 
-    /// Build a state map from `(type, state_key, event_id)` triples.
+    /// Build a state map from `(type, state_key, label)` triples — the label
+    /// is resolved against the `bag` populated by previous `insert` calls.
+    fn state_from_labels(
+        bag: &HashMap<&'static str, OwnedEventId>,
+        entries: &[(&str, &str, &str)],
+    ) -> StateMap<OwnedEventId> {
+        let mut m = StateMap::new();
+        for (t, sk, label) in entries {
+            let id = bag.get(label).expect("label registered").clone();
+            m.insert(((*t).to_string(), (*sk).to_string()), id);
+        }
+        m
+    }
+
+    /// Build a state map from `(type, state_key, event_id)` triples — used
+    /// by tests that need to introduce ids the provider doesn't know.
     fn state(entries: &[(&str, &str, &str)]) -> StateMap<OwnedEventId> {
         let mut m = StateMap::new();
         for (t, sk, id) in entries {
@@ -202,6 +240,8 @@ mod tests {
 
     #[test]
     fn separate_identical_sets_all_unconflicted() {
+        // `separate` is purely structural — the event_ids needn't reference
+        // events the provider knows about. Use synthetic ids for brevity.
         let s1 = state(&[
             ("m.room.power_levels", "", "$pl:example.org"),
             ("m.room.name", "", "$name:example.org"),
@@ -267,20 +307,18 @@ mod tests {
     #[test]
     fn conflicted_subgraph_walks_auth_event_ids_transitively() {
         // a → b → c (a's auth_events = [b], b's auth_events = [c]).
+        // Insert leaves first so each id is known before being referenced.
         let mut provider = InMemoryStateProvider::new();
-        insert(&mut provider, "$a:example.org", &["$b:example.org"]);
-        insert(&mut provider, "$b:example.org", &["$c:example.org"]);
-        insert(&mut provider, "$c:example.org", &[]);
+        let mut bag = HashMap::new();
+        insert(&mut provider, &mut bag, "c", &[]);
+        insert(&mut provider, &mut bag, "b", &["c"]);
+        insert(&mut provider, &mut bag, "a", &["b"]);
         let mut seeds = HashSet::new();
-        seeds.insert(eid("$a:example.org"));
+        seeds.insert(bag["a"].clone());
         let sg = conflicted_subgraph(&seeds, &provider).unwrap();
-        let expected: HashSet<_> = [
-            eid("$a:example.org"),
-            eid("$b:example.org"),
-            eid("$c:example.org"),
-        ]
-        .into_iter()
-        .collect();
+        let expected: HashSet<_> = [bag["a"].clone(), bag["b"].clone(), bag["c"].clone()]
+            .into_iter()
+            .collect();
         assert_eq!(sg, expected);
     }
 
@@ -288,13 +326,12 @@ mod tests {
     fn conflicted_subgraph_unions_multiple_seed_chains() {
         // a → b; c → d. Seeds {a, c} → {a, b, c, d}.
         let mut provider = InMemoryStateProvider::new();
-        insert(&mut provider, "$a:example.org", &["$b:example.org"]);
-        insert(&mut provider, "$b:example.org", &[]);
-        insert(&mut provider, "$c:example.org", &["$d:example.org"]);
-        insert(&mut provider, "$d:example.org", &[]);
-        let seeds: HashSet<_> = [eid("$a:example.org"), eid("$c:example.org")]
-            .into_iter()
-            .collect();
+        let mut bag = HashMap::new();
+        insert(&mut provider, &mut bag, "b", &[]);
+        insert(&mut provider, &mut bag, "a", &["b"]);
+        insert(&mut provider, &mut bag, "d", &[]);
+        insert(&mut provider, &mut bag, "c", &["d"]);
+        let seeds: HashSet<_> = [bag["a"].clone(), bag["c"].clone()].into_iter().collect();
         let sg = conflicted_subgraph(&seeds, &provider).unwrap();
         assert_eq!(sg.len(), 4);
     }
@@ -317,14 +354,13 @@ mod tests {
         // Empty state set's chain is empty; intersection with empty = empty;
         // difference = union of all other chains.
         let mut provider = InMemoryStateProvider::new();
-        insert(&mut provider, "$a:example.org", &["$b:example.org"]);
-        insert(&mut provider, "$b:example.org", &[]);
+        let mut bag = HashMap::new();
+        insert(&mut provider, &mut bag, "b", &[]);
+        insert(&mut provider, &mut bag, "a", &["b"]);
         let empty = StateMap::<OwnedEventId>::new();
-        let s2 = state(&[("m.room.name", "", "$a:example.org")]);
+        let s2 = state_from_labels(&bag, &[("m.room.name", "", "a")]);
         let diff = auth_chain_difference(&[&empty, &s2], &provider).unwrap();
-        let expected: HashSet<_> = [eid("$a:example.org"), eid("$b:example.org")]
-            .into_iter()
-            .collect();
+        let expected: HashSet<_> = [bag["a"].clone(), bag["b"].clone()].into_iter().collect();
         assert_eq!(diff, expected);
     }
 
@@ -333,10 +369,11 @@ mod tests {
         // Two state sets share the same single event whose auth chain is X→Y.
         // Both chains are {X, Y}; difference is empty.
         let mut provider = InMemoryStateProvider::new();
-        insert(&mut provider, "$x:example.org", &["$y:example.org"]);
-        insert(&mut provider, "$y:example.org", &[]);
-        let s1 = state(&[("m.room.name", "", "$x:example.org")]);
-        let s2 = state(&[("m.room.name", "", "$x:example.org")]);
+        let mut bag = HashMap::new();
+        insert(&mut provider, &mut bag, "y", &[]);
+        insert(&mut provider, &mut bag, "x", &["y"]);
+        let s1 = state_from_labels(&bag, &[("m.room.name", "", "x")]);
+        let s2 = state_from_labels(&bag, &[("m.room.name", "", "x")]);
         assert!(
             auth_chain_difference(&[&s1, &s2], &provider)
                 .unwrap()
@@ -349,14 +386,13 @@ mod tests {
         // s1 carries event A (auth chain {A}); s2 carries event B (auth chain
         // {B}). Union = {A, B}, intersection = {}. Difference = {A, B}.
         let mut provider = InMemoryStateProvider::new();
-        insert(&mut provider, "$a:example.org", &[]);
-        insert(&mut provider, "$b:example.org", &[]);
-        let s1 = state(&[("m.room.name", "", "$a:example.org")]);
-        let s2 = state(&[("m.room.name", "", "$b:example.org")]);
+        let mut bag = HashMap::new();
+        insert(&mut provider, &mut bag, "a", &[]);
+        insert(&mut provider, &mut bag, "b", &[]);
+        let s1 = state_from_labels(&bag, &[("m.room.name", "", "a")]);
+        let s2 = state_from_labels(&bag, &[("m.room.name", "", "b")]);
         let diff = auth_chain_difference(&[&s1, &s2], &provider).unwrap();
-        let expected: HashSet<_> = [eid("$a:example.org"), eid("$b:example.org")]
-            .into_iter()
-            .collect();
+        let expected: HashSet<_> = [bag["a"].clone(), bag["b"].clone()].into_iter().collect();
         assert_eq!(diff, expected);
     }
 
@@ -365,15 +401,16 @@ mod tests {
         // s1: event A with chain {A, common}; s2: event B with chain {B, common}.
         // Union = {A, B, common}; intersection = {common}; difference = {A, B}.
         let mut provider = InMemoryStateProvider::new();
-        insert(&mut provider, "$a:example.org", &["$common:example.org"]);
-        insert(&mut provider, "$b:example.org", &["$common:example.org"]);
-        insert(&mut provider, "$common:example.org", &[]);
-        let s1 = state(&[("m.room.name", "", "$a:example.org")]);
-        let s2 = state(&[("m.room.name", "", "$b:example.org")]);
+        let mut bag = HashMap::new();
+        insert(&mut provider, &mut bag, "common", &[]);
+        insert(&mut provider, &mut bag, "a", &["common"]);
+        insert(&mut provider, &mut bag, "b", &["common"]);
+        let s1 = state_from_labels(&bag, &[("m.room.name", "", "a")]);
+        let s2 = state_from_labels(&bag, &[("m.room.name", "", "b")]);
         let diff = auth_chain_difference(&[&s1, &s2], &provider).unwrap();
-        assert!(diff.contains(&eid("$a:example.org")));
-        assert!(diff.contains(&eid("$b:example.org")));
-        assert!(!diff.contains(&eid("$common:example.org")));
+        assert!(diff.contains(&bag["a"]));
+        assert!(diff.contains(&bag["b"]));
+        assert!(!diff.contains(&bag["common"]));
     }
 
     #[test]
@@ -386,16 +423,15 @@ mod tests {
         // missing from s2's chain, B is missing from s1/s3's chains).
         // Difference = {A, B}.
         let mut provider = InMemoryStateProvider::new();
-        insert(&mut provider, "$a:example.org", &["$x:example.org"]);
-        insert(&mut provider, "$b:example.org", &["$x:example.org"]);
-        insert(&mut provider, "$x:example.org", &[]);
-        let s1 = state(&[("m.room.name", "", "$a:example.org")]);
-        let s2 = state(&[("m.room.name", "", "$b:example.org")]);
-        let s3 = state(&[("m.room.name", "", "$a:example.org")]);
+        let mut bag = HashMap::new();
+        insert(&mut provider, &mut bag, "x", &[]);
+        insert(&mut provider, &mut bag, "a", &["x"]);
+        insert(&mut provider, &mut bag, "b", &["x"]);
+        let s1 = state_from_labels(&bag, &[("m.room.name", "", "a")]);
+        let s2 = state_from_labels(&bag, &[("m.room.name", "", "b")]);
+        let s3 = state_from_labels(&bag, &[("m.room.name", "", "a")]);
         let diff = auth_chain_difference(&[&s1, &s2, &s3], &provider).unwrap();
-        let expected: HashSet<_> = [eid("$a:example.org"), eid("$b:example.org")]
-            .into_iter()
-            .collect();
+        let expected: HashSet<_> = [bag["a"].clone(), bag["b"].clone()].into_iter().collect();
         assert_eq!(diff, expected);
     }
 }

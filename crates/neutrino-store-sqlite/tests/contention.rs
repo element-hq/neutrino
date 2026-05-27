@@ -19,10 +19,9 @@ use std::time::{Duration, Instant};
 
 use neutrino_store::{EventStore, RoomStore, StorageError, StreamPos};
 use neutrino_store_sqlite::SqliteStore;
-use ruma::{OwnedEventId, event_id};
 use tempfile::NamedTempFile;
 
-use common::{ALICE_ROOM_ID, ALICE_USER_ID, CREATE_EVENT_ID, create_event, message};
+use common::{ALICE_ROOM_ID, ALICE_USER_ID, create_event, message_with_ts};
 
 /// Bootstrap a file-backed `SqliteStore` on a fresh tempfile, plus the
 /// create event for [`ALICE_ROOM_ID`]. The returned [`NamedTempFile`]
@@ -44,12 +43,9 @@ async fn store_with_room_on_tempfile() -> (SqliteStore, NamedTempFile) {
     let s = SqliteStore::open(file.path())
         .await
         .expect("open store on tempfile");
-    s.create_room(
-        &create_event(*CREATE_EVENT_ID, *ALICE_ROOM_ID, *ALICE_USER_ID),
-        &[],
-    )
-    .await
-    .expect("bootstrap room");
+    s.create_room(&create_event(*ALICE_ROOM_ID, *ALICE_USER_ID), &[])
+        .await
+        .expect("bootstrap room");
     (s, file)
 }
 
@@ -68,8 +64,7 @@ async fn concurrent_writes_never_busy() {
         .map(|i| {
             let s = s.clone();
             tokio::spawn(async move {
-                let id: OwnedEventId = format!("$m{i}:example.com").try_into().unwrap();
-                let m = message(&id, *ALICE_ROOM_ID, *ALICE_USER_ID, "hi");
+                let m = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "hi", i as u64);
                 s.persist_event(&m, &[]).await
             })
         })
@@ -101,8 +96,7 @@ async fn concurrent_writes_produce_unique_stream_positions() {
         .map(|i| {
             let s = s.clone();
             tokio::spawn(async move {
-                let id: OwnedEventId = format!("$m{i}:example.com").try_into().unwrap();
-                let m = message(&id, *ALICE_ROOM_ID, *ALICE_USER_ID, "hi");
+                let m = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "hi", i as u64);
                 s.persist_event(&m, &[]).await.unwrap();
             })
         })
@@ -144,8 +138,7 @@ async fn watch_monotonic_under_concurrent_writes() {
         .map(|i| {
             let s = s.clone();
             tokio::spawn(async move {
-                let id: OwnedEventId = format!("$m{i}:example.com").try_into().unwrap();
-                let m = message(&id, *ALICE_ROOM_ID, *ALICE_USER_ID, "hi");
+                let m = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "hi", i as u64);
                 s.persist_event(&m, &[]).await.unwrap();
             })
         })
@@ -191,8 +184,7 @@ async fn mixed_reads_and_writes_make_progress() {
     for i in 0..n_writers {
         let s = s.clone();
         handles.push(tokio::spawn(async move {
-            let id: OwnedEventId = format!("$m{i}:example.com").try_into().unwrap();
-            let m = message(&id, *ALICE_ROOM_ID, *ALICE_USER_ID, "hi");
+            let m = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "hi", i as u64);
             s.persist_event(&m, &[]).await.unwrap();
         }));
     }
@@ -234,13 +226,18 @@ async fn mixed_reads_and_writes_make_progress() {
 async fn duplicate_persist_event_under_contention_is_unique() {
     let (s, _tempfile) = store_with_room_on_tempfile().await;
     let n = 32_usize;
-    let dup_id = event_id!("$dup:example.com");
+    // All N tasks build the same event (same room/sender/body/ts → same
+    // computed event_id), so the UNIQUE(event_id) constraint fires on
+    // every attempt past the first.
+    let dup_id = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "dup", 0)
+        .event_id
+        .clone();
 
     let handles: Vec<_> = (0..n)
         .map(|_| {
             let s = s.clone();
             tokio::spawn(async move {
-                let m = message(dup_id, *ALICE_ROOM_ID, *ALICE_USER_ID, "dup");
+                let m = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "dup", 0);
                 s.persist_event(&m, &[]).await
             })
         })

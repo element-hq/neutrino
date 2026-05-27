@@ -856,22 +856,35 @@ fn check_rule_10_power_levels(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::validate::parse_event;
+    use crate::event_id::EventBuilder;
     use neutrino_common::ROOM_VERSION_ID;
-    use ruma::OwnedEventId;
-    use serde_json::value::RawValue;
+    use ruma::{OwnedEventId, OwnedRoomId};
     use serde_json::{Value, json};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     // ---------- fixture helpers ----------
+    //
+    // Helpers build events via `EventBuilder`, which computes the event_id
+    // from the canonical wire bytes. Most tests don't care about the actual
+    // event_id values — `state_map` keys events by `(type, state_key)`, and
+    // the auth-rules code only reaches into `create_event.event_id` for
+    // rule 5.3.1. Tests reuse a single fixture room (`fixture_room_id`) so
+    // non-create events all share a consistent `room_id`.
 
-    fn raw(v: Value) -> Box<RawValue> {
-        serde_json::value::to_raw_value(&v).expect("fixture")
+    /// Monotonically-increasing origin_server_ts for fixtures — events that
+    /// would otherwise share their canonical bytes (after v11 redaction
+    /// strips the body) need distinct timestamps to hash to distinct ids.
+    fn next_ts() -> u64 {
+        static TS: AtomicU64 = AtomicU64::new(1_700_000_000_000);
+        TS.fetch_add(1, Ordering::Relaxed)
     }
-    fn eid(s: &str) -> OwnedEventId {
-        s.parse().expect("event id")
-    }
-    fn make(v: Value, id: &str) -> Arc<Event> {
-        Arc::new(parse_event(raw(v), eid(id), vec![]).expect("valid event"))
+
+    /// Shared room_id for all non-create fixtures in this module. The
+    /// auth-rules code doesn't validate room_id consistency against the
+    /// create event (that's `validate_references`' job, not in scope here),
+    /// so a single arbitrary value suffices.
+    fn fixture_room_id() -> OwnedRoomId {
+        "!create:example.org".parse().expect("room id")
     }
 
     fn create_event(creator: &str, additional_creators: &[&str]) -> Arc<Event> {
@@ -884,100 +897,69 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
-        let mut v = json!({
-            "type": "m.room.create",
-            "sender": creator,
-            "content": content,
-            "prev_events": [],
-            "depth": 0,
-            "origin_server_ts": 1_700_000_000_000_u64,
-            "hashes": { "sha256": "abc" },
-            "state_key": ""
-        });
-        // Ensure no room_id field on create.
-        let _ = v.as_object_mut().unwrap().remove("room_id");
-        make(v, "$create:example.org")
+        let ev = EventBuilder::new(creator.parse().expect("sender"), "m.room.create".to_owned())
+            .state_key(String::new())
+            .content(content)
+            .origin_server_ts(next_ts())
+            .build()
+            .expect("valid create");
+        Arc::new(ev)
     }
 
     fn member_event(
         sender: &str,
         target: &str,
         membership: &str,
-        id: &str,
-        prev_events: &[&str],
+        prev_events: &[&Arc<Event>],
         extra_content: Value,
     ) -> Arc<Event> {
         let mut content = json!({ "membership": membership });
         for (k, v) in extra_content.as_object().cloned().unwrap_or_default() {
             content[k] = v;
         }
-        let v = json!({
-            "type": "m.room.member",
-            "sender": sender,
-            "state_key": target,
-            "room_id": "!create:example.org",
-            "content": content,
-            "prev_events": prev_events,
-            "prev_state_events": [],
-            "depth": 1,
-            "origin_server_ts": 1_700_000_000_000_u64,
-            "hashes": { "sha256": "abc" }
-        });
-        make(v, id)
+        let prevs: Vec<OwnedEventId> = prev_events.iter().map(|e| e.event_id.clone()).collect();
+        let ev = EventBuilder::new(sender.parse().expect("sender"), "m.room.member".to_owned())
+            .room_id(fixture_room_id())
+            .state_key(target.to_owned())
+            .content(content)
+            .prev_events(prevs)
+            .origin_server_ts(next_ts())
+            .build()
+            .expect("valid member");
+        Arc::new(ev)
     }
 
-    fn message_event(sender: &str, id: &str) -> Arc<Event> {
-        make(
-            json!({
-                "type": "m.room.message",
-                "sender": sender,
-                "room_id": "!create:example.org",
-                "content": { "msgtype": "m.text", "body": "hi" },
-                "prev_events": [],
-                "prev_state_events": [],
-                "depth": 1,
-                "origin_server_ts": 1_700_000_000_000_u64,
-                "hashes": { "sha256": "abc" }
-            }),
-            id,
-        )
+    fn message_event(sender: &str) -> Arc<Event> {
+        let ev = EventBuilder::new(sender.parse().expect("sender"), "m.room.message".to_owned())
+            .room_id(fixture_room_id())
+            .content(json!({ "msgtype": "m.text", "body": "hi" }))
+            .origin_server_ts(next_ts())
+            .build()
+            .expect("valid message");
+        Arc::new(ev)
     }
 
-    fn state_event(
-        event_type: &str,
-        state_key: &str,
-        sender: &str,
-        content: Value,
-        id: &str,
-    ) -> Arc<Event> {
-        make(
-            json!({
-                "type": event_type,
-                "sender": sender,
-                "state_key": state_key,
-                "room_id": "!create:example.org",
-                "content": content,
-                "prev_events": [],
-                "prev_state_events": [],
-                "depth": 1,
-                "origin_server_ts": 1_700_000_000_000_u64,
-                "hashes": { "sha256": "abc" }
-            }),
-            id,
-        )
+    fn state_event(event_type: &str, state_key: &str, sender: &str, content: Value) -> Arc<Event> {
+        let ev = EventBuilder::new(sender.parse().expect("sender"), event_type.to_owned())
+            .room_id(fixture_room_id())
+            .state_key(state_key.to_owned())
+            .content(content)
+            .origin_server_ts(next_ts())
+            .build()
+            .expect("valid state event");
+        Arc::new(ev)
     }
 
-    fn power_levels_event(sender: &str, content: Value, id: &str) -> Arc<Event> {
-        state_event("m.room.power_levels", "", sender, content, id)
+    fn power_levels_event(sender: &str, content: Value) -> Arc<Event> {
+        state_event("m.room.power_levels", "", sender, content)
     }
 
-    fn join_rules_event(rule: &str, id: &str) -> Arc<Event> {
+    fn join_rules_event(rule: &str) -> Arc<Event> {
         state_event(
             "m.room.join_rules",
             "",
             "@alice:example.org",
             json!({ "join_rule": rule }),
-            id,
         )
     }
 
@@ -1003,65 +985,52 @@ mod tests {
         let mut create_content = parse_content(&create);
         create_content["m.federate"] = json!(false);
         // Re-build a create with m.federate: false
-        let create = make(
-            json!({
-                "type": "m.room.create",
-                "sender": "@alice:example.org",
-                "content": { "room_version": ROOM_VERSION_ID, "m.federate": false },
-                "prev_events": [],
-                "depth": 0,
-                "origin_server_ts": 1_700_000_000_000_u64,
-                "hashes": { "sha256": "abc" },
-                "state_key": ""
-            }),
-            "$create:example.org",
+        let create = Arc::new(
+            EventBuilder::new(
+                "@alice:example.org".parse().expect("sender"),
+                "m.room.create".to_owned(),
+            )
+            .state_key(String::new())
+            .content(json!({ "room_version": ROOM_VERSION_ID, "m.federate": false }))
+            .origin_server_ts(next_ts())
+            .build()
+            .expect("valid create"),
         );
         let alice_join = member_event(
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$j1:example.org",
             &[],
             json!({}),
         );
         let st = state_map([create.clone(), alice_join]);
-        let msg = message_event("@alice:example.org", "$m:example.org");
+        let msg = message_event("@alice:example.org");
         check_auth_rules(&msg, &st).expect("same-domain sender allowed when federation off");
     }
 
     #[test]
     fn rule_4_rejects_cross_domain_when_non_federating() {
-        let create = make(
-            json!({
-                "type": "m.room.create",
-                "sender": "@alice:example.org",
-                "content": { "room_version": ROOM_VERSION_ID, "m.federate": false },
-                "prev_events": [],
-                "depth": 0,
-                "origin_server_ts": 1_700_000_000_000_u64,
-                "hashes": { "sha256": "abc" },
-                "state_key": ""
-            }),
-            "$create:example.org",
+        let create = Arc::new(
+            EventBuilder::new(
+                "@alice:example.org".parse().expect("sender"),
+                "m.room.create".to_owned(),
+            )
+            .state_key(String::new())
+            .content(json!({ "room_version": ROOM_VERSION_ID, "m.federate": false }))
+            .origin_server_ts(next_ts())
+            .build()
+            .expect("valid create"),
         );
         let alice_join = member_event(
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$j1:example.org",
             &[],
             json!({}),
         );
-        let bob_join = member_event(
-            "@bob:other.org",
-            "@bob:other.org",
-            "join",
-            "$j2:example.org",
-            &[],
-            json!({}),
-        );
+        let bob_join = member_event("@bob:other.org", "@bob:other.org", "join", &[], json!({}));
         let st = state_map([create.clone(), alice_join, bob_join]);
-        let msg = message_event("@bob:other.org", "$m:example.org");
+        let msg = message_event("@bob:other.org");
         assert!(matches!(
             check_auth_rules(&msg, &st),
             Err(AuthError::Rule4FederationDisallowed { .. })
@@ -1076,20 +1045,19 @@ mod tests {
         // previous reference; state_key == create sender. Inlined because
         // the `member_event` helper hard-codes prev_state_events: [].
         let create = create_event("@alice:example.org", &[]);
-        let join = make(
-            json!({
-                "type": "m.room.member",
-                "sender": "@alice:example.org",
-                "state_key": "@alice:example.org",
-                "room_id": "!create:example.org",
-                "content": { "membership": "join" },
-                "prev_events": ["$create:example.org"],
-                "prev_state_events": ["$create:example.org"],
-                "depth": 1,
-                "origin_server_ts": 1_700_000_000_000_u64,
-                "hashes": { "sha256": "abc" }
-            }),
-            "$j:example.org",
+        let join = Arc::new(
+            EventBuilder::new(
+                "@alice:example.org".parse().expect("sender"),
+                "m.room.member".to_owned(),
+            )
+            .room_id(create.room_id.clone())
+            .state_key("@alice:example.org".to_owned())
+            .content(json!({ "membership": "join" }))
+            .prev_events(vec![create.event_id.clone()])
+            .prev_state_events(vec![create.event_id.clone()])
+            .origin_server_ts(next_ts())
+            .build()
+            .expect("valid join"),
         );
         let st = state_map([create]);
         check_auth_rules(&join, &st).expect("first-join after create allowed");
@@ -1099,12 +1067,11 @@ mod tests {
     fn rule_5_3_2_join_mismatched_sender_rejected() {
         let create = create_event("@alice:example.org", &[]);
         // Public join_rule so we'd otherwise pass 5.3.4
-        let jr = join_rules_event("public", "$jr:example.org");
+        let jr = join_rules_event("public");
         let join = member_event(
             "@alice:example.org",
             "@bob:example.org",
             "join",
-            "$j:example.org",
             &[],
             json!({}),
         );
@@ -1122,7 +1089,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$j1:example.org",
             &[],
             json!({}),
         );
@@ -1130,18 +1096,16 @@ mod tests {
             "@alice:example.org",
             "@bob:example.org",
             "ban",
-            "$ban:example.org",
             &[],
             json!({}),
         );
-        let jr = join_rules_event("public", "$jr:example.org");
+        let jr = join_rules_event("public");
         // Need power for alice to have banned bob; rely on creators-have-infinite power.
         let st = state_map([create, alice_join, bob_banned, jr]);
         let bob_join = member_event(
             "@bob:example.org",
             "@bob:example.org",
             "join",
-            "$bj:example.org",
             &[],
             json!({}),
         );
@@ -1154,13 +1118,12 @@ mod tests {
     #[test]
     fn rule_5_3_4_invite_join_rule_requires_prior_invite() {
         let create = create_event("@alice:example.org", &[]);
-        let jr = join_rules_event("invite", "$jr:example.org");
+        let jr = join_rules_event("invite");
         let st = state_map([create, jr]);
         let join = member_event(
             "@bob:example.org",
             "@bob:example.org",
             "join",
-            "$j:example.org",
             &[],
             json!({}),
         );
@@ -1173,13 +1136,12 @@ mod tests {
     #[test]
     fn rule_5_3_public_join_rule_allows_anyone() {
         let create = create_event("@alice:example.org", &[]);
-        let jr = join_rules_event("public", "$jr:example.org");
+        let jr = join_rules_event("public");
         let st = state_map([create, jr]);
         let join = member_event(
             "@bob:example.org",
             "@bob:example.org",
             "join",
-            "$j:example.org",
             &[],
             json!({}),
         );
@@ -1195,7 +1157,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$j1:example.org",
             &[],
             json!({}),
         );
@@ -1205,7 +1166,6 @@ mod tests {
             "@alice:example.org",
             "@bob:example.org",
             "invite",
-            "$inv:example.org",
             &[],
             json!({}),
         );
@@ -1221,7 +1181,6 @@ mod tests {
             "@bob:example.org",
             "@carol:example.org",
             "invite",
-            "$inv:example.org",
             &[],
             json!({}),
         );
@@ -1238,7 +1197,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -1246,7 +1204,6 @@ mod tests {
             "@alice:example.org",
             "@bob:example.org",
             "join",
-            "$bj:example.org",
             &[],
             json!({}),
         );
@@ -1255,7 +1212,6 @@ mod tests {
             "@alice:example.org",
             "@bob:example.org",
             "invite",
-            "$reinv:example.org",
             &[],
             json!({}),
         );
@@ -1274,7 +1230,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -1283,7 +1238,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "leave",
-            "$lv:example.org",
             &[],
             json!({}),
         );
@@ -1298,7 +1252,6 @@ mod tests {
             "@bob:example.org",
             "@bob:example.org",
             "leave",
-            "$lv:example.org",
             &[],
             json!({}),
         );
@@ -1315,7 +1268,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -1323,7 +1275,6 @@ mod tests {
             "@alice:example.org",
             "@bob:example.org",
             "join",
-            "$bj:example.org",
             &[],
             json!({}),
         );
@@ -1332,7 +1283,6 @@ mod tests {
             "@alice:example.org",
             "@bob:example.org",
             "leave",
-            "$kick:example.org",
             &[],
             json!({}),
         );
@@ -1348,7 +1298,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -1356,7 +1305,6 @@ mod tests {
             "@alice:example.org",
             "@bob:example.org",
             "join",
-            "$bj:example.org",
             &[],
             json!({}),
         );
@@ -1365,7 +1313,6 @@ mod tests {
             "@alice:example.org",
             "@bob:example.org",
             "ban",
-            "$ban:example.org",
             &[],
             json!({}),
         );
@@ -1380,7 +1327,6 @@ mod tests {
             "@bob:example.org",
             "@carol:example.org",
             "ban",
-            "$ban:example.org",
             &[],
             json!({}),
         );
@@ -1395,13 +1341,12 @@ mod tests {
     #[test]
     fn rule_5_7_1_knock_on_non_knockable_room_rejected() {
         let create = create_event("@alice:example.org", &[]);
-        let jr = join_rules_event("invite", "$jr:example.org");
+        let jr = join_rules_event("invite");
         let st = state_map([create, jr]);
         let knock = member_event(
             "@bob:example.org",
             "@bob:example.org",
             "knock",
-            "$knock:example.org",
             &[],
             json!({}),
         );
@@ -1414,13 +1359,12 @@ mod tests {
     #[test]
     fn rule_5_7_knock_on_knockable_room_allowed() {
         let create = create_event("@alice:example.org", &[]);
-        let jr = join_rules_event("knock", "$jr:example.org");
+        let jr = join_rules_event("knock");
         let st = state_map([create, jr]);
         let knock = member_event(
             "@bob:example.org",
             "@bob:example.org",
             "knock",
-            "$knock:example.org",
             &[],
             json!({}),
         );
@@ -1437,7 +1381,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "lurking",
-            "$w:example.org",
             &[],
             json!({}),
         );
@@ -1454,7 +1397,7 @@ mod tests {
         let create = create_event("@alice:example.org", &[]);
         let st = state_map([create]);
         // @bob is not a member; tries to send a message.
-        let msg = message_event("@bob:example.org", "$m:example.org");
+        let msg = message_event("@bob:example.org");
         assert!(matches!(
             check_auth_rules(&msg, &st),
             Err(AuthError::Rule6_SenderNotJoined)
@@ -1468,12 +1411,11 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
         let st = state_map([create, alice_join]);
-        let msg = message_event("@alice:example.org", "$m:example.org");
+        let msg = message_event("@alice:example.org");
         check_auth_rules(&msg, &st).expect("joined sender");
     }
 
@@ -1486,7 +1428,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -1494,7 +1435,6 @@ mod tests {
             "@bob:example.org",
             "@bob:example.org",
             "join",
-            "$bj:example.org",
             &[],
             json!({}),
         );
@@ -1502,7 +1442,6 @@ mod tests {
         let pl = power_levels_event(
             "@alice:example.org",
             json!({ "users": { "@alice:example.org": 100 }, "state_default": 50 }),
-            "$pl:example.org",
         );
         let st = state_map([create, alice_join, bob_join, pl]);
         // bob tries to set a topic (state event, requires state_default = 50).
@@ -1511,7 +1450,6 @@ mod tests {
             "",
             "@bob:example.org",
             json!({ "topic": "spam" }),
-            "$topic:example.org",
         );
         assert!(matches!(
             check_auth_rules(&topic, &st),
@@ -1530,7 +1468,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -1538,7 +1475,6 @@ mod tests {
         let pl = power_levels_event(
             "@alice:example.org",
             json!({ "users_default": 0, "state_default": 50 }),
-            "$pl:example.org",
         );
         check_auth_rules(&pl, &st).expect("first power_levels event");
     }
@@ -1550,7 +1486,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -1559,7 +1494,6 @@ mod tests {
             "@alice:example.org",
             // Alice IS a creator; rule 10.4 forbids naming creators in users.
             json!({ "users": { "@alice:example.org": 100 } }),
-            "$pl:example.org",
         );
         // 10.4 (creator-in-users) is checked before 10.5 (first-PL allow),
         // so this rejects even with no prior power_levels event in state.
@@ -1574,13 +1508,12 @@ mod tests {
     /// Build a `m.room.join_rules` event of type `restricted` (no `allow`
     /// entries — auth checks only verify the authoriser, not allow rules,
     /// matching synapse's `event_auth.py`).
-    fn restricted_join_rules(id: &str) -> Arc<Event> {
+    fn restricted_join_rules() -> Arc<Event> {
         state_event(
             "m.room.join_rules",
             "",
             "@alice:example.org",
             json!({ "join_rule": "restricted", "allow": [] }),
-            id,
         )
     }
 
@@ -1591,18 +1524,16 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
-        let jr = restricted_join_rules("$jr:example.org");
+        let jr = restricted_join_rules();
         let st = state_map([create, alice_join, jr]);
         // Alice (creator → infinite power, joined) authorises bob's join.
         let join = member_event(
             "@bob:example.org",
             "@bob:example.org",
             "join",
-            "$bj:example.org",
             &[],
             json!({ "join_authorised_via_users_server": "@alice:example.org" }),
         );
@@ -1612,13 +1543,12 @@ mod tests {
     #[test]
     fn rule_5_3_5_restricted_join_missing_authoriser_field_rejected() {
         let create = create_event("@alice:example.org", &[]);
-        let jr = restricted_join_rules("$jr:example.org");
+        let jr = restricted_join_rules();
         let st = state_map([create, jr]);
         let join = member_event(
             "@bob:example.org",
             "@bob:example.org",
             "join",
-            "$bj:example.org",
             &[],
             // No `join_authorised_via_users_server` field.
             json!({}),
@@ -1632,13 +1562,12 @@ mod tests {
     #[test]
     fn rule_5_3_5_restricted_join_authoriser_not_joined_rejected() {
         let create = create_event("@alice:example.org", &[]);
-        let jr = restricted_join_rules("$jr:example.org");
+        let jr = restricted_join_rules();
         let st = state_map([create, jr]);
         let join = member_event(
             "@bob:example.org",
             "@bob:example.org",
             "join",
-            "$bj:example.org",
             &[],
             // Carol exists in user-id-space but has no member event in state.
             json!({ "join_authorised_via_users_server": "@carol:example.org" }),
@@ -1656,7 +1585,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -1664,23 +1592,20 @@ mod tests {
             "@alice:example.org",
             "@carol:example.org",
             "join",
-            "$cj:example.org",
             &[],
             json!({}),
         );
-        let jr = restricted_join_rules("$jr:example.org");
+        let jr = restricted_join_rules();
         // Carol joined (users_default=0) but invite level is 50.
         let pl = power_levels_event(
             "@alice:example.org",
             json!({ "invite": 50, "users_default": 0 }),
-            "$pl:example.org",
         );
         let st = state_map([create, alice_join, carol_join, jr, pl]);
         let join = member_event(
             "@bob:example.org",
             "@bob:example.org",
             "join",
-            "$bj:example.org",
             &[],
             json!({ "join_authorised_via_users_server": "@carol:example.org" }),
         );
@@ -1696,7 +1621,7 @@ mod tests {
     /// token, optionally carrying a `public_key`. Sender is alice for these
     /// fixtures so the rule 5.4.1 sender-match check succeeds against an
     /// alice-sent invite.
-    fn third_party_invite_state_event(token: &str, with_public_key: bool, id: &str) -> Arc<Event> {
+    fn third_party_invite_state_event(token: &str, with_public_key: bool) -> Arc<Event> {
         let mut content = json!({ "display_name": "example" });
         if with_public_key {
             content["public_key"] = json!("base64-key-here");
@@ -1706,16 +1631,14 @@ mod tests {
             token,
             "@alice:example.org",
             content,
-            id,
         )
     }
 
-    fn tpi_member_invite(sender: &str, target: &str, token: &str, id: &str) -> Arc<Event> {
+    fn tpi_member_invite(sender: &str, target: &str, token: &str) -> Arc<Event> {
         member_event(
             sender,
             target,
             "invite",
-            id,
             &[],
             json!({
                 "third_party_invite": {
@@ -1737,18 +1660,12 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
-        let tpi = third_party_invite_state_event("token-abc", true, "$tpi:example.org");
+        let tpi = third_party_invite_state_event("token-abc", true);
         let st = state_map([create, alice_join, tpi]);
-        let invite = tpi_member_invite(
-            "@alice:example.org",
-            "@bob:example.org",
-            "token-abc",
-            "$inv:example.org",
-        );
+        let invite = tpi_member_invite("@alice:example.org", "@bob:example.org", "token-abc");
         check_auth_rules(&invite, &st).expect("third-party invite with matching tpi allowed");
     }
 
@@ -1759,18 +1676,12 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
         // No m.room.third_party_invite event in state.
         let st = state_map([create, alice_join]);
-        let invite = tpi_member_invite(
-            "@alice:example.org",
-            "@bob:example.org",
-            "token-missing",
-            "$inv:example.org",
-        );
+        let invite = tpi_member_invite("@alice:example.org", "@bob:example.org", "token-missing");
         assert!(matches!(
             check_auth_rules(&invite, &st),
             Err(AuthError::Rule5_4_1_ThirdPartyInviteInvalid(_))
@@ -1784,18 +1695,16 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
-        let tpi = third_party_invite_state_event("token-abc", true, "$tpi:example.org");
+        let tpi = third_party_invite_state_event("token-abc", true);
         let st = state_map([create, alice_join, tpi]);
         // Member event's state_key (target) is bob, but `signed.mxid` is carol.
         let invite = member_event(
             "@alice:example.org",
             "@bob:example.org",
             "invite",
-            "$inv:example.org",
             &[],
             json!({
                 "third_party_invite": {
@@ -1819,18 +1728,12 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
-        let tpi = third_party_invite_state_event("token-abc", false, "$tpi:example.org");
+        let tpi = third_party_invite_state_event("token-abc", false);
         let st = state_map([create, alice_join, tpi]);
-        let invite = tpi_member_invite(
-            "@alice:example.org",
-            "@bob:example.org",
-            "token-abc",
-            "$inv:example.org",
-        );
+        let invite = tpi_member_invite("@alice:example.org", "@bob:example.org", "token-abc");
         assert!(matches!(
             check_auth_rules(&invite, &st),
             Err(AuthError::Rule5_4_1_ThirdPartyInviteInvalid(_))
@@ -1846,7 +1749,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -1856,7 +1758,6 @@ mod tests {
             "token-xyz",
             "@alice:example.org",
             json!({ "display_name": "example", "public_key": "base64" }),
-            "$tpi:example.org",
         );
         check_auth_rules(&tpi_event, &st).expect("creator (infinite power) ≥ invite level");
     }
@@ -1868,7 +1769,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -1876,7 +1776,6 @@ mod tests {
             "@bob:example.org",
             "@bob:example.org",
             "join",
-            "$bj:example.org",
             &[],
             json!({}),
         );
@@ -1884,7 +1783,6 @@ mod tests {
         let pl = power_levels_event(
             "@alice:example.org",
             json!({ "invite": 50, "users_default": 0 }),
-            "$pl:example.org",
         );
         let st = state_map([create, alice_join, bob_join, pl]);
         let tpi_event = state_event(
@@ -1892,7 +1790,6 @@ mod tests {
             "token-xyz",
             "@bob:example.org",
             json!({ "display_name": "example", "public_key": "base64" }),
-            "$tpi:example.org",
         );
         assert!(matches!(
             check_auth_rules(&tpi_event, &st),
@@ -1912,7 +1809,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -1920,7 +1816,6 @@ mod tests {
             "@bob:example.org",
             "@bob:example.org",
             "join",
-            "$bj:example.org",
             &[],
             json!({}),
         );
@@ -1931,7 +1826,6 @@ mod tests {
                 "ban": 80,
                 "state_default": 0,
             }),
-            "$pl1:example.org",
         );
         let st = state_map([create, alice_join, bob_join, pl1]);
         let pl2 = power_levels_event(
@@ -1941,7 +1835,6 @@ mod tests {
                 "ban": 40,
                 "state_default": 0,
             }),
-            "$pl2:example.org",
         );
         assert!(matches!(
             check_auth_rules(&pl2, &st),
@@ -1958,7 +1851,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -1966,7 +1858,6 @@ mod tests {
             "@bob:example.org",
             "@bob:example.org",
             "join",
-            "$bj:example.org",
             &[],
             json!({}),
         );
@@ -1977,7 +1868,6 @@ mod tests {
                 "events": { "m.room.tombstone": 100 },
                 "state_default": 0,
             }),
-            "$pl1:example.org",
         );
         let st = state_map([create, alice_join, bob_join, pl1]);
         let pl2 = power_levels_event(
@@ -1987,7 +1877,6 @@ mod tests {
                 "events": { "m.room.tombstone": 50 },
                 "state_default": 0,
             }),
-            "$pl2:example.org",
         );
         assert!(matches!(
             check_auth_rules(&pl2, &st),
@@ -2004,7 +1893,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -2012,7 +1900,6 @@ mod tests {
             "@bob:example.org",
             "@bob:example.org",
             "join",
-            "$bj:example.org",
             &[],
             json!({}),
         );
@@ -2022,7 +1909,6 @@ mod tests {
                 "users": { "@bob:example.org": 50, "@carol:example.org": 50 },
                 "state_default": 0,
             }),
-            "$pl1:example.org",
         );
         let st = state_map([create, alice_join, bob_join, pl1]);
         let pl2 = power_levels_event(
@@ -2031,7 +1917,6 @@ mod tests {
                 "users": { "@bob:example.org": 50, "@carol:example.org": 0 },
                 "state_default": 0,
             }),
-            "$pl2:example.org",
         );
         assert!(matches!(
             check_auth_rules(&pl2, &st),
@@ -2053,7 +1938,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -2061,7 +1945,6 @@ mod tests {
             "@bob:example.org",
             "@bob:example.org",
             "join",
-            "$bj:example.org",
             &[],
             json!({}),
         );
@@ -2074,7 +1957,6 @@ mod tests {
                 "events_default": 30,
                 "state_default": 0,
             }),
-            "$pl1:example.org",
         );
         let st = state_map([create, alice_join, bob_join, pl1]);
         let pl2 = power_levels_event(
@@ -2085,7 +1967,6 @@ mod tests {
                 "state_default": 0,
                 "events": { "m.room.message": 30 },
             }),
-            "$pl2:example.org",
         );
         assert!(matches!(
             check_auth_rules(&pl2, &st),
@@ -2105,7 +1986,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -2113,7 +1993,6 @@ mod tests {
         let pl = power_levels_event(
             "@alice:example.org",
             json!({ "users": { "@bob:example.org": 100 } }),
-            "$pl:example.org",
         );
         let err = check_auth_rules(&pl, &st).expect_err("10.4 fires on additional creator");
         match err {
@@ -2134,7 +2013,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -2142,7 +2020,6 @@ mod tests {
             "@bob:example.org",
             "@bob:example.org",
             "join",
-            "$bj:example.org",
             &[],
             json!({}),
         );
@@ -2151,7 +2028,6 @@ mod tests {
             "@alice:example.org",
             "@bob:example.org",
             "leave",
-            "$kick:example.org",
             &[],
             json!({}),
         );
@@ -2170,7 +2046,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -2179,7 +2054,6 @@ mod tests {
             "@alice:example.org",
             "@bob:example.org",
             "invite",
-            "$inv:example.org",
             &[],
             json!({}),
         );
@@ -2196,7 +2070,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -2204,7 +2077,6 @@ mod tests {
             "@bob:example.org",
             "@bob:example.org",
             "join",
-            "$bj:example.org",
             &[],
             json!({}),
         );
@@ -2212,21 +2084,18 @@ mod tests {
             "@alice:example.org",
             "@carol:example.org",
             "join",
-            "$cj:example.org",
             &[],
             json!({}),
         );
         let pl = power_levels_event(
             "@alice:example.org",
             json!({ "kick": 50, "users_default": 0 }),
-            "$pl:example.org",
         );
         let st = state_map([create, alice_join, bob_join, carol_join, pl]);
         let kick = member_event(
             "@bob:example.org",
             "@carol:example.org",
             "leave",
-            "$kick:example.org",
             &[],
             json!({}),
         );
@@ -2253,7 +2122,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -2262,7 +2130,6 @@ mod tests {
             "@alice:example.org",
             "not-a-user-id",
             "invite",
-            "$inv:example.org",
             &[],
             json!({}),
         );
@@ -2281,7 +2148,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             "join",
-            "$aj:example.org",
             &[],
             json!({}),
         );
@@ -2289,20 +2155,17 @@ mod tests {
             "@bob:example.org",
             "@bob:example.org",
             "join",
-            "$bj:example.org",
             &[],
             json!({}),
         );
         let pl1 = power_levels_event(
             "@alice:example.org",
             json!({ "users": { "@bob:example.org": 50 }, "users_default": 0, "state_default": 0 }),
-            "$pl1:example.org",
         );
         let st = state_map([create, alice_join, bob_join, pl1]);
         let pl2 = power_levels_event(
             "@bob:example.org",
             json!({ "users": { "@bob:example.org": 50, "@carol:example.org": 100 }, "users_default": 0, "state_default": 0 }),
-            "$pl2:example.org",
         );
         assert!(matches!(
             check_auth_rules(&pl2, &st),

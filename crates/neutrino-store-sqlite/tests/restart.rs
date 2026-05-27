@@ -22,12 +22,10 @@ use neutrino_store::{
     EventStore, FederationInbox, FederationOutbox, RoomStore, StateStore, StreamPos,
 };
 use neutrino_store_sqlite::SqliteStore;
-use ruma::{RoomVersionId, event_id, server_name};
+use ruma::{RoomVersionId, server_name};
 use tempfile::NamedTempFile;
 
-use common::{
-    ALICE_ROOM_ID, ALICE_USER_ID, CREATE_EVENT_ID, create_event, member_join, message, name_event,
-};
+use common::{ALICE_ROOM_ID, ALICE_USER_ID, create_event, member_join, message, name_event};
 
 /// Wait for `deadpool-sync` to actually close the previous store's
 /// connections before reopening the same path.
@@ -65,44 +63,36 @@ async fn restart_preserves_all_state() {
     let dest = server_name!("matrix.org");
     let origin = server_name!("origin.example.com");
 
+    // Pre-compute the event ids we'll cross-check after restart.
+    let create_ev = create_event(*ALICE_ROOM_ID, *ALICE_USER_ID);
+    let member_ev = member_join(*ALICE_ROOM_ID, *ALICE_USER_ID);
+    let name_ev = name_event(*ALICE_ROOM_ID, *ALICE_USER_ID, "Test Room");
+    let msg_ev = message(*ALICE_ROOM_ID, *ALICE_USER_ID, "hello");
+
+    let create_id = create_ev.event_id.clone();
+    let member_id = member_ev.event_id.clone();
+    let name_id = name_ev.event_id.clone();
+    let msg_id = msg_ev.event_id.clone();
+
     // ---- Process 1: populate every durable surface. ----
     let final_pos = {
         let s = SqliteStore::open(path).await.expect("first open");
 
         // create_room writes the create event + one initial member event.
-        s.create_room(
-            &create_event(*CREATE_EVENT_ID, *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[member_join(
-                event_id!("$m_alice:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-            )],
-        )
-        .await
-        .expect("create room");
+        s.create_room(&create_ev, &[member_ev])
+            .await
+            .expect("create room");
 
         // A state event — exercises the `current_state` upsert path.
-        s.persist_event(
-            &name_event(
-                event_id!("$n:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "Test Room",
-            ),
-            &[],
-        )
-        .await
-        .expect("persist name event");
+        s.persist_event(&name_ev, &[])
+            .await
+            .expect("persist name event");
 
         // A non-state event with a federation destination — exercises
         // the outbox.
-        let msg_id = event_id!("$msg:e");
-        s.persist_event(
-            &message(msg_id, *ALICE_ROOM_ID, *ALICE_USER_ID, "hello"),
-            &[dest],
-        )
-        .await
-        .expect("persist message");
+        s.persist_event(&msg_ev, &[dest])
+            .await
+            .expect("persist message");
 
         // FederationInbox dedup record — first call returns false.
         let already = s
@@ -148,7 +138,12 @@ async fn restart_preserves_all_state() {
         .expect("events_after");
     assert_eq!(events.len(), 4, "expected 4 events to survive restart");
     let ids: Vec<&str> = events.iter().map(|(_, e)| e.event_id.as_str()).collect();
-    for expected in ["$create:example.com", "$m_alice:e", "$n:e", "$msg:e"] {
+    for expected in [
+        create_id.as_str(),
+        member_id.as_str(),
+        name_id.as_str(),
+        msg_id.as_str(),
+    ] {
         assert!(
             ids.contains(&expected),
             "event {expected} missing after restart"
@@ -162,7 +157,7 @@ async fn restart_preserves_all_state() {
         .await
         .expect("current_state_event")
         .expect("name state row present after restart");
-    assert_eq!(name.event_id.as_str(), "$n:e");
+    assert_eq!(name.event_id.as_str(), name_id.as_str());
 
     let members = s
         .joined_members(*ALICE_ROOM_ID)
@@ -185,7 +180,7 @@ async fn restart_preserves_all_state() {
 
     let pdus = s.pending_pdus(dest).await.expect("pending_pdus");
     assert_eq!(pdus.len(), 1);
-    assert_eq!(pdus[0].event_id.as_str(), "$msg:e");
+    assert_eq!(pdus[0].event_id.as_str(), msg_id.as_str());
 
     // Federation inbox dedup record survives — replaying the same
     // (origin, txn_id) must return true (already seen). This is the

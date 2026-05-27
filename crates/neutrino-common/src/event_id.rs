@@ -121,6 +121,50 @@ pub fn event_id_from_hash(hash: &[u8; 32]) -> OwnedEventId {
     OwnedEventId::try_from(s).expect("'$' + 43 url-safe-b64 chars is a valid event_id")
 }
 
+/// Compute an event's event_id directly from its canonical wire bytes.
+///
+/// Convenience wrapper around `reference_hash` + `event_id_from_hash` for
+/// callers that hold the `raw` bytes and don't want to parse them into a
+/// `CanonicalJsonObject` themselves. Used by `EventStore::persist_event`'s
+/// debug-build round-trip check and by test helpers that need a hash-correct
+/// event_id without depending on `neutrino-state::EventBuilder`.
+///
+/// Returns the same errors `reference_hash` would for malformed input:
+/// non-object root, missing `type`, non-object `content`/`hashes`/`signatures`.
+pub fn compute_event_id(raw: &serde_json::value::RawValue) -> Result<OwnedEventId, ComputeIdError> {
+    let parsed: ruma::canonical_json::CanonicalJsonValue =
+        serde_json::from_str(raw.get()).map_err(ComputeIdError::Parse)?;
+    let ruma::canonical_json::CanonicalJsonValue::Object(obj) = parsed else {
+        return Err(ComputeIdError::NonObjectRoot);
+    };
+    let rh = reference_hash(&obj).map_err(ComputeIdError::Redaction)?;
+    Ok(event_id_from_hash(&rh))
+}
+
+/// Failure modes for [`compute_event_id`].
+#[derive(Debug)]
+pub enum ComputeIdError {
+    /// `raw` isn't valid JSON.
+    Parse(serde_json::Error),
+    /// `raw` is valid JSON but the root value isn't an object.
+    NonObjectRoot,
+    /// `reference_hash`'s redaction preconditions weren't met
+    /// (missing `type`, non-object `content`/`hashes`/`signatures`).
+    Redaction(RedactionError),
+}
+
+impl std::fmt::Display for ComputeIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parse(e) => write!(f, "raw is not valid JSON: {e}"),
+            Self::NonObjectRoot => write!(f, "raw JSON root is not an object"),
+            Self::Redaction(e) => write!(f, "redaction precondition failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ComputeIdError {}
+
 /// Derive a room_id from a create event's event_id.
 ///
 /// Room v12 uses `RoomIdFormatVersion::V2`: the room_id is the create event's
@@ -413,5 +457,69 @@ mod tests {
         assert!(room_id.as_str().starts_with('!'));
         // Suffix is byte-identical to the event_id (everything after the sigil).
         assert_eq!(&room_id.as_str()[1..], &event_id.as_str()[1..]);
+    }
+
+    /// Hand-authored v12 reference-hash vector with independent verification.
+    ///
+    /// The spec appendix only carries v1-shaped content-hash vectors (already
+    /// pinned by `content_hash_spec_vector_*` above). There is no published
+    /// v12 reference-hash vector, so we author one and cross-check it by:
+    ///
+    /// 1. Constructing an input event (`INPUT`).
+    /// 2. Manually computing what V11 redaction + MSC4242 carve-out + strip
+    ///    `signatures`/`unsigned` should leave behind (`EXPECTED_POST_REDACTION`).
+    /// 3. Asserting `reference_hash(INPUT) == sha256(EXPECTED_POST_REDACTION)`.
+    ///    The right-hand side runs SHA-256 (FIPS-verified by `sha256_known_vector`)
+    ///    against bytes a human can read — if our redaction step diverges, this
+    ///    assertion catches it.
+    /// 4. Additionally pinning `event_id_from_hash(reference_hash(INPUT))` so
+    ///    a regression in `b64_url_unpadded` or the event_id format would also
+    ///    fail this test.
+    ///
+    /// For `m.room.message` events the V11 content keep-list is empty, so
+    /// `content` collapses to `{}`. `unsigned` is not in the top-level keep-list
+    /// → stripped by redaction. `signatures` IS in the keep-list but we strip
+    /// it after redaction (spec step). `prev_state_events` is preserved by our
+    /// MSC4242 wrapper. Final keys, sorted alphabetically:
+    /// `content, hashes, origin_server_ts, prev_events, prev_state_events,
+    ///  room_id, sender, type`.
+    #[test]
+    fn reference_hash_v12_authored_vector() {
+        // The input event — every field a v12 m.room.message can carry.
+        let input = obj(json!({
+            "type": "m.room.message",
+            "sender": "@alice:example.org",
+            "room_id": "!room:example.org",
+            "content": { "msgtype": "m.text", "body": "hello" },
+            "prev_events": ["$prev:example.org"],
+            "prev_state_events": ["$ps:example.org"],
+            "origin_server_ts": 1_700_000_000_000_u64,
+            "hashes": { "sha256": "Y29udGVudGhhc2g" },
+            "unsigned": { "age": 42 },
+            "signatures": {}
+        }));
+
+        // What our pipeline (redact_for_hash → strip signatures → strip
+        // unsigned → canonical-encode) MUST produce. Keys sorted; content
+        // emptied (no keep-list entries for m.room.message); unsigned and
+        // signatures removed; everything else preserved (prev_state_events
+        // is the MSC4242 carve-out — V11 alone would have stripped it).
+        const EXPECTED_POST_REDACTION: &[u8] = br#"{"content":{},"hashes":{"sha256":"Y29udGVudGhhc2g"},"origin_server_ts":1700000000000,"prev_events":["$prev:example.org"],"prev_state_events":["$ps:example.org"],"room_id":"!room:example.org","sender":"@alice:example.org","type":"m.room.message"}"#;
+
+        let h = reference_hash(&input).expect("redacts");
+
+        // Independent cross-check: SHA-256 over the human-readable expected
+        // bytes must equal our reference_hash output. If our redaction step
+        // produces different bytes, this will fail.
+        assert_eq!(
+            h,
+            sha256(EXPECTED_POST_REDACTION),
+            "reference_hash diverges from sha256(hand-traced redaction bytes)"
+        );
+
+        // Pinned event_id — guards against regressions in `b64_url_unpadded`
+        // or the `$<43 chars>` format. Recorded from the verified hash above.
+        let id = event_id_from_hash(&h);
+        assert_eq!(id.as_str(), "$mY2a13t3rnoKFepL_yWIHDCPjw7WoP1Rem5QJyvom9w",);
     }
 }

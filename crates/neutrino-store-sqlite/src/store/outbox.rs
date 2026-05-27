@@ -86,23 +86,18 @@ impl FederationOutbox for SqliteStore {
 #[cfg(test)]
 mod tests {
     use neutrino_store::{EventStore, FederationOutbox, RoomStore};
-    use ruma::{OwnedEventId, event_id, server_name};
+    use ruma::{event_id, server_name};
 
     use crate::SqliteStore;
-    use crate::tests::{ALICE_ROOM_ID, ALICE_USER_ID, create_event, message, store};
+    use crate::tests::{
+        ALICE_ROOM_ID, ALICE_USER_ID, create_event, message, message_with_ts, store,
+    };
 
     async fn store_with_room() -> SqliteStore {
         let s = store().await;
-        s.create_room(
-            &create_event(
-                event_id!("$create:example.com"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-            ),
-            &[],
-        )
-        .await
-        .unwrap();
+        s.create_room(&create_event(*ALICE_ROOM_ID, *ALICE_USER_ID), &[])
+            .await
+            .unwrap();
         s
     }
 
@@ -131,28 +126,10 @@ mod tests {
         let s = store_with_room().await;
         let dest = server_name!("matrix.org");
 
-        s.persist_event(
-            &message(
-                event_id!("$m1:example.com"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "a",
-            ),
-            &[dest],
-        )
-        .await
-        .unwrap();
-        s.persist_event(
-            &message(
-                event_id!("$m2:example.com"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "b",
-            ),
-            &[dest],
-        )
-        .await
-        .unwrap();
+        let ev_a = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", 0);
+        s.persist_event(&ev_a, &[dest]).await.unwrap();
+        let ev_b = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "b", 1);
+        s.persist_event(&ev_b, &[dest]).await.unwrap();
 
         let dests = s.pending_destinations().await.unwrap();
         assert_eq!(dests.len(), 1);
@@ -165,19 +142,18 @@ mod tests {
         let s = store_with_room().await;
         let dest = server_name!("matrix.org");
 
+        // Distinct origin_server_ts → distinct event_ids despite identical content.
+        let mut expected = Vec::new();
         for i in 0..3 {
-            let id: OwnedEventId = format!("$m{i}:example.com").try_into().unwrap();
-            s.persist_event(&message(&id, *ALICE_ROOM_ID, *ALICE_USER_ID, "x"), &[dest])
-                .await
-                .unwrap();
+            let ev = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "x", i);
+            expected.push(ev.event_id.clone());
+            s.persist_event(&ev, &[dest]).await.unwrap();
         }
 
         let pdus = s.pending_pdus(dest).await.unwrap();
         let ids: Vec<&str> = pdus.iter().map(|e| e.event_id.as_str()).collect();
-        assert_eq!(
-            ids,
-            ["$m0:example.com", "$m1:example.com", "$m2:example.com"]
-        );
+        let expected_strs: Vec<&str> = expected.iter().map(|e| e.as_str()).collect();
+        assert_eq!(ids, expected_strs);
     }
 
     // O5: remove the named event_ids only.
@@ -186,36 +162,18 @@ mod tests {
         let s = store_with_room().await;
         let dest = server_name!("matrix.org");
 
-        s.persist_event(
-            &message(
-                event_id!("$m1:example.com"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "a",
-            ),
-            &[dest],
-        )
-        .await
-        .unwrap();
-        s.persist_event(
-            &message(
-                event_id!("$m2:example.com"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "b",
-            ),
-            &[dest],
-        )
-        .await
-        .unwrap();
+        let ev_a = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", 0);
+        let id_a = ev_a.event_id.clone();
+        s.persist_event(&ev_a, &[dest]).await.unwrap();
+        let ev_b = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "b", 1);
+        let id_b = ev_b.event_id.clone();
+        s.persist_event(&ev_b, &[dest]).await.unwrap();
 
-        s.remove_pdus(dest, &[event_id!("$m1:example.com")])
-            .await
-            .unwrap();
+        s.remove_pdus(dest, &[&id_a]).await.unwrap();
 
         let pdus = s.pending_pdus(dest).await.unwrap();
         assert_eq!(pdus.len(), 1);
-        assert_eq!(pdus[0].event_id.as_str(), "$m2:example.com");
+        assert_eq!(pdus[0].event_id.as_str(), id_b.as_str());
     }
 
     // O6: second remove of already-removed IDs is a silent no-op.
@@ -224,25 +182,13 @@ mod tests {
         let s = store_with_room().await;
         let dest = server_name!("matrix.org");
 
-        s.persist_event(
-            &message(
-                event_id!("$m1:example.com"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "a",
-            ),
-            &[dest],
-        )
-        .await
-        .unwrap();
+        let ev_a = message(*ALICE_ROOM_ID, *ALICE_USER_ID, "a");
+        let id_a = ev_a.event_id.clone();
+        s.persist_event(&ev_a, &[dest]).await.unwrap();
 
-        s.remove_pdus(dest, &[event_id!("$m1:example.com")])
-            .await
-            .unwrap();
+        s.remove_pdus(dest, &[&id_a]).await.unwrap();
         // Second call with the same IDs — no error, no change.
-        s.remove_pdus(dest, &[event_id!("$m1:example.com")])
-            .await
-            .unwrap();
+        s.remove_pdus(dest, &[&id_a]).await.unwrap();
 
         assert!(s.pending_pdus(dest).await.unwrap().is_empty());
     }

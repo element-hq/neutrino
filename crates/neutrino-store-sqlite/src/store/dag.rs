@@ -263,12 +263,9 @@ mod tests {
 
     async fn store_with_room() -> SqliteStore {
         let s = store().await;
-        s.create_room(
-            &create_event(event_id!("$create:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[],
-        )
-        .await
-        .unwrap();
+        s.create_room(&create_event(*ALICE_ROOM_ID, *ALICE_USER_ID), &[])
+            .await
+            .unwrap();
         s
     }
 
@@ -284,117 +281,88 @@ mod tests {
     #[tokio::test]
     async fn events_before_walks_prev_events_chain() {
         let s = store_with_room().await;
-        s.persist_event(
-            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]),
-            &[],
-        )
-        .await
-        .unwrap();
-        s.persist_event(
-            &message_with_prev(
-                event_id!("$b:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "b",
-                &[event_id!("$a:e")],
-            ),
-            &[],
-        )
-        .await
-        .unwrap();
-        s.persist_event(
-            &message_with_prev(
-                event_id!("$c:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "c",
-                &[event_id!("$b:e")],
-            ),
-            &[],
-        )
-        .await
-        .unwrap();
+        let ev_a = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]);
+        let id_a = ev_a.event_id.clone();
+        s.persist_event(&ev_a, &[]).await.unwrap();
+        let ev_b = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "b", &[&id_a]);
+        let id_b = ev_b.event_id.clone();
+        s.persist_event(&ev_b, &[]).await.unwrap();
+        let ev_c = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "c", &[&id_b]);
+        let id_c = ev_c.event_id.clone();
+        s.persist_event(&ev_c, &[]).await.unwrap();
 
-        let got = s
-            .events_before(*ALICE_ROOM_ID, &[event_id!("$c:e")], 10)
-            .await
-            .unwrap();
+        let got = s.events_before(*ALICE_ROOM_ID, &[&id_c], 10).await.unwrap();
         let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
-        assert_eq!(ids, ["$c:e", "$b:e", "$a:e"]);
+        assert_eq!(ids, [id_c.as_str(), id_b.as_str(), id_a.as_str()]);
     }
 
     // D3: chain of 5, limit=3 → first 3 returned.
     #[tokio::test]
     async fn events_before_respects_limit() {
         let s = store_with_room().await;
-        let chain_ids: [&EventId; 5] = [
-            event_id!("$e0:e"),
-            event_id!("$e1:e"),
-            event_id!("$e2:e"),
-            event_id!("$e3:e"),
-            event_id!("$e4:e"),
-        ];
-        for (i, eid) in chain_ids.iter().enumerate() {
+        // Build a chain of 5 events; each one's prev points at the prior id.
+        let mut ids: Vec<OwnedEventId> = Vec::with_capacity(5);
+        for i in 0..5 {
             let prevs: Vec<&EventId> = if i == 0 {
                 Vec::new()
             } else {
-                vec![chain_ids[i - 1]]
+                vec![ids[i - 1].as_ref()]
             };
-            s.persist_event(
-                &message_with_prev(eid, *ALICE_ROOM_ID, *ALICE_USER_ID, "x", &prevs),
+            // Distinct ts disambiguates otherwise-identical bodies.
+            let ev = crate::tests::make_event(
+                *ALICE_ROOM_ID,
+                *ALICE_USER_ID,
+                "m.room.message",
+                None,
+                serde_json::json!({"body": "x", "msgtype": "m.text"}),
+                i as u64,
+                &prevs,
                 &[],
-            )
-            .await
-            .unwrap();
+            );
+            ids.push(ev.event_id.clone());
+            s.persist_event(&ev, &[]).await.unwrap();
         }
 
         let got = s
-            .events_before(*ALICE_ROOM_ID, &[event_id!("$e4:e")], 3)
+            .events_before(*ALICE_ROOM_ID, &[ids[4].as_ref()], 3)
             .await
             .unwrap();
         assert_eq!(got.len(), 3);
-        let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
-        assert_eq!(ids, ["$e4:e", "$e3:e", "$e2:e"]);
+        let result_ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
+        assert_eq!(
+            result_ids,
+            [ids[4].as_str(), ids[3].as_str(), ids[2].as_str()]
+        );
     }
 
     // D4: event with two `prev_events` → BFS visits both parents.
     #[tokio::test]
     async fn events_before_handles_branching() {
         let s = store_with_room().await;
-        s.persist_event(
-            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]),
-            &[],
-        )
-        .await
-        .unwrap();
-        s.persist_event(
-            &message_with_prev(event_id!("$b:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "b", &[]),
-            &[],
-        )
-        .await
-        .unwrap();
-        s.persist_event(
-            &message_with_prev(
-                event_id!("$c:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "c",
-                &[event_id!("$a:e"), event_id!("$b:e")],
-            ),
-            &[],
-        )
-        .await
-        .unwrap();
+        // a and b have no prev_events; their bodies get stripped by v12
+        // redaction (m.room.message has no content keep-list), so they
+        // must differ via origin_server_ts to get distinct event_ids.
+        let ev_a = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", 0);
+        let id_a = ev_a.event_id.clone();
+        s.persist_event(&ev_a, &[]).await.unwrap();
+        let ev_b = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "b", 1);
+        let id_b = ev_b.event_id.clone();
+        s.persist_event(&ev_b, &[]).await.unwrap();
+        let ev_c = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "c", &[&id_a, &id_b]);
+        let id_c = ev_c.event_id.clone();
+        s.persist_event(&ev_c, &[]).await.unwrap();
 
-        let got = s
-            .events_before(*ALICE_ROOM_ID, &[event_id!("$c:e")], 10)
-            .await
-            .unwrap();
+        let got = s.events_before(*ALICE_ROOM_ID, &[&id_c], 10).await.unwrap();
         let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
         // Deterministic order: c is the seed; its prev_events come back
-        // from `fetch_edges` sorted by `parent_event_id`, so the BFS
-        // pushes `$a:e` before `$b:e` and pops in FIFO order.
-        assert_eq!(ids, ["$c:e", "$a:e", "$b:e"]);
+        // from `fetch_edges` sorted by `parent_event_id` (lex order on the
+        // computed event_id strings), so the BFS pops in that order.
+        let mut parents_sorted = vec![id_a.as_str(), id_b.as_str()];
+        parents_sorted.sort();
+        let expected: Vec<&str> = std::iter::once(id_c.as_str())
+            .chain(parents_sorted)
+            .collect();
+        assert_eq!(ids, expected);
     }
 
     // D5: event's prev_events references an ID not in the local store →
@@ -402,25 +370,18 @@ mod tests {
     #[tokio::test]
     async fn events_before_skips_missing_parents() {
         let s = store_with_room().await;
-        s.persist_event(
-            &message_with_prev(
-                event_id!("$a:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "a",
-                &[event_id!("$ghost:e")],
-            ),
-            &[],
-        )
-        .await
-        .unwrap();
+        let ev_a = message_with_prev(
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "a",
+            &[event_id!("$ghost:e")],
+        );
+        let id_a = ev_a.event_id.clone();
+        s.persist_event(&ev_a, &[]).await.unwrap();
 
-        let got = s
-            .events_before(*ALICE_ROOM_ID, &[event_id!("$a:e")], 10)
-            .await
-            .unwrap();
+        let got = s.events_before(*ALICE_ROOM_ID, &[&id_a], 10).await.unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].event_id.as_str(), "$a:e");
+        assert_eq!(got[0].event_id.as_str(), id_a.as_str());
     }
 
     // D6: storage-corruption defence — event with self-loop in `prev_events`
@@ -429,74 +390,82 @@ mod tests {
     #[tokio::test]
     async fn events_before_cycle_handling() {
         let s = store_with_room().await;
-        s.persist_event(
-            &message_with_prev(
-                event_id!("$a:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "a",
-                &[event_id!("$a:e")],
-            ),
-            &[],
-        )
+        // Build the event with a forward-looking prev pointer at its own id.
+        // We don't know the id until after compute, so first build with no
+        // prevs to learn the id, then rebuild declaring that id as prev.
+        let ev_probe = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]);
+        let probe_id = ev_probe.event_id.clone();
+        // The actual self-loop event references the probe's id. Note: the
+        // self-loop event has *different* prevs, so its computed id won't
+        // match probe_id. To get a true self-loop, we need the id to be
+        // fixed-point. Use a raw-json helper to bypass id computation.
+        // Approach: persist `ev_probe` (no prevs); then synthesise a
+        // *separate* event whose prev_events points to itself via raw JSON.
+        // But `persist_event` debug-asserts the id matches `compute`. So
+        // instead, just test the simpler case: a self-pointer via the
+        // probe's own id (the probe doesn't actually reference itself).
+        //
+        // The test intent is "cycle defence in the walker"; we achieve that
+        // by giving an event a prev pointing at itself via a sibling chain
+        // that loops back. Simplest faithful version: a → b → a cycle, which
+        // forces visited-set defence.
+        s.persist_event(&ev_probe, &[]).await.unwrap();
+        // b declares a as prev.
+        let ev_b = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "b", &[&probe_id]);
+        let id_b = ev_b.event_id.clone();
+        s.persist_event(&ev_b, &[]).await.unwrap();
+        // Inject a cycle directly via the edges table: a's prev now points
+        // back to b. `write_into_tx`'s edge insertion already wrote
+        // (b -> a); we manually add (a -> b) to close the cycle, exercising
+        // the walker's `visited` defence.
+        let probe_id_str = probe_id.as_str().to_owned();
+        let id_b_str = id_b.as_str().to_owned();
+        s.run_write(move |conn| -> Result<(), crate::error::Error> {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT INTO event_edges (child_event_id, edge_type, parent_event_id) \
+                 VALUES (?, ?, ?)",
+                deadpool_sqlite::rusqlite::params![probe_id_str, "prev", id_b_str],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
         .await
         .unwrap();
 
         let got = s
-            .events_before(*ALICE_ROOM_ID, &[event_id!("$a:e")], 10)
+            .events_before(*ALICE_ROOM_ID, &[&probe_id], 10)
             .await
             .unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].event_id.as_str(), "$a:e");
+        // Both a and b are reachable; walker terminates rather than looping.
+        assert_eq!(got.len(), 2);
+        let ids: std::collections::HashSet<&str> =
+            got.iter().map(|p| p.event_id.as_str()).collect();
+        assert!(ids.contains(probe_id.as_str()));
+        assert!(ids.contains(id_b.as_str()));
     }
 
     // D7: missing_events excludes IDs listed in `earliest`.
     #[tokio::test]
     async fn missing_events_excludes_earliest() {
         let s = store_with_room().await;
-        s.persist_event(
-            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]),
-            &[],
-        )
-        .await
-        .unwrap();
-        s.persist_event(
-            &message_with_prev(
-                event_id!("$b:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "b",
-                &[event_id!("$a:e")],
-            ),
-            &[],
-        )
-        .await
-        .unwrap();
-        s.persist_event(
-            &message_with_prev(
-                event_id!("$c:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "c",
-                &[event_id!("$b:e")],
-            ),
-            &[],
-        )
-        .await
-        .unwrap();
+        let ev_a = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]);
+        let id_a = ev_a.event_id.clone();
+        s.persist_event(&ev_a, &[]).await.unwrap();
+        let ev_b = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "b", &[&id_a]);
+        let id_b = ev_b.event_id.clone();
+        s.persist_event(&ev_b, &[]).await.unwrap();
+        let ev_c = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "c", &[&id_b]);
+        let id_c = ev_c.event_id.clone();
+        s.persist_event(&ev_c, &[]).await.unwrap();
 
         let got = s
-            .missing_events(
-                *ALICE_ROOM_ID,
-                &[event_id!("$c:e")],
-                &[event_id!("$a:e")],
-                10,
-            )
+            .missing_events(*ALICE_ROOM_ID, &[&id_c], &[&id_a], 10)
             .await
             .unwrap();
         let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
         // a is in `earliest`; walker skips it. c and b returned.
-        assert_eq!(ids, ["$c:e", "$b:e"]);
+        assert_eq!(ids, [id_c.as_str(), id_b.as_str()]);
     }
 
     // D8: empty `latest` → empty result.
@@ -519,28 +488,30 @@ mod tests {
     async fn dag_queries_scoped_to_room_id() {
         let s = store_with_room().await; // room A = *ALICE_ROOM_ID
         let other_room = room_id!("!r2:example.com");
-        s.create_room(
-            &create_event(event_id!("$c2:e"), other_room, *ALICE_USER_ID),
-            &[],
-        )
-        .await
-        .unwrap();
-        s.persist_event(
-            &message_with_prev(event_id!("$other:e"), other_room, *ALICE_USER_ID, "x", &[]),
-            &[],
-        )
-        .await
-        .unwrap();
+        s.create_room(&create_event(other_room, *ALICE_USER_ID), &[])
+            .await
+            .unwrap();
+        let ev_other = message_with_prev(other_room, *ALICE_USER_ID, "x", &[]);
+        let id_other = ev_other.event_id.clone();
+        s.persist_event(&ev_other, &[]).await.unwrap();
 
-        // Seed exists, but in the *other* room.
+        // Seed exists, but in the *other* room. Validation rejects it
+        // because `validate_inputs` only checks existence in the events
+        // table globally — but the walker scopes by `room_id`, so the seed
+        // hydrates as None and we get an empty result.
+        //
+        // Note: D19 covers the bogus-seed InvalidInput case. Here the seed
+        // is real (just in the wrong room), and the validator does find
+        // it in events globally, so validation passes and the walk runs
+        // (and returns empty due to room-scoping in hydrate_pdu).
         let got = s
-            .events_before(*ALICE_ROOM_ID, &[event_id!("$other:e")], 10)
+            .events_before(*ALICE_ROOM_ID, &[&id_other], 10)
             .await
             .unwrap();
         assert!(got.is_empty(), "events_before leaked cross-room PDU");
 
         let got = s
-            .missing_events(*ALICE_ROOM_ID, &[event_id!("$other:e")], &[], 10)
+            .missing_events(*ALICE_ROOM_ID, &[&id_other], &[], 10)
             .await
             .unwrap();
         assert!(got.is_empty(), "missing_events leaked cross-room PDU");
@@ -556,52 +527,38 @@ mod tests {
     async fn events_before_does_not_cross_room_boundary_via_edges() {
         let s = store_with_room().await; // room A = *ALICE_ROOM_ID
         let other_room = room_id!("!r2:example.com");
-        s.create_room(
-            &create_event(event_id!("$cR2:e"), other_room, *ALICE_USER_ID),
-            &[],
-        )
-        .await
-        .unwrap();
+        s.create_room(&create_event(other_room, *ALICE_USER_ID), &[])
+            .await
+            .unwrap();
         // $b is a real persisted event in R2 — so the edge actually
         // resolves; the cross-room filter is the only thing stopping it.
-        s.persist_event(
-            &message_with_prev(event_id!("$b:e"), other_room, *ALICE_USER_ID, "b", &[]),
-            &[],
-        )
-        .await
-        .unwrap();
+        let ev_b = message_with_prev(other_room, *ALICE_USER_ID, "b", &[]);
+        let id_b = ev_b.event_id.clone();
+        s.persist_event(&ev_b, &[]).await.unwrap();
         // $a is in R1 with prev_events=[$b:e]. `write_into_tx` only
         // records the edge string — it doesn't validate that the parent
         // is in the same room.
-        s.persist_event(
-            &message_with_prev(
-                event_id!("$a:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "a",
-                &[event_id!("$b:e")],
-            ),
-            &[],
-        )
-        .await
-        .unwrap();
+        let ev_a = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[&id_b]);
+        let id_a = ev_a.event_id.clone();
+        s.persist_event(&ev_a, &[]).await.unwrap();
 
-        let got = s
-            .events_before(*ALICE_ROOM_ID, &[event_id!("$a:e")], 10)
-            .await
-            .unwrap();
+        let got = s.events_before(*ALICE_ROOM_ID, &[&id_a], 10).await.unwrap();
         let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
-        assert_eq!(ids, ["$a:e"], "walker leaked cross-room PDU via edge");
+        assert_eq!(
+            ids,
+            [id_a.as_str()],
+            "walker leaked cross-room PDU via edge"
+        );
 
         // Same shape via missing_events — same underlying walk_prev_events.
         let got = s
-            .missing_events(*ALICE_ROOM_ID, &[event_id!("$a:e")], &[], 10)
+            .missing_events(*ALICE_ROOM_ID, &[&id_a], &[], 10)
             .await
             .unwrap();
         let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
         assert_eq!(
             ids,
-            ["$a:e"],
+            [id_a.as_str()],
             "missing_events leaked cross-room PDU via edge"
         );
     }
@@ -612,16 +569,10 @@ mod tests {
     #[tokio::test]
     async fn events_before_limit_zero_returns_empty() {
         let s = store_with_room().await;
-        s.persist_event(
-            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]),
-            &[],
-        )
-        .await
-        .unwrap();
-        let got = s
-            .events_before(*ALICE_ROOM_ID, &[event_id!("$a:e")], 0)
-            .await
-            .unwrap();
+        let ev_a = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]);
+        let id_a = ev_a.event_id.clone();
+        s.persist_event(&ev_a, &[]).await.unwrap();
+        let got = s.events_before(*ALICE_ROOM_ID, &[&id_a], 0).await.unwrap();
         assert!(got.is_empty());
     }
 
@@ -632,45 +583,48 @@ mod tests {
     #[tokio::test]
     async fn events_before_handles_multiple_seeds() {
         let s = store_with_room().await;
-        for id in [event_id!("$a:e"), event_id!("$b:e")] {
-            s.persist_event(
-                &message_with_prev(id, *ALICE_ROOM_ID, *ALICE_USER_ID, "x", &[]),
-                &[],
-            )
-            .await
-            .unwrap();
-        }
-        s.persist_event(
-            &message_with_prev(
-                event_id!("$c:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "c",
-                &[event_id!("$a:e")],
-            ),
+        let ev_a = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "x", 0);
+        let id_a = ev_a.event_id.clone();
+        s.persist_event(&ev_a, &[]).await.unwrap();
+        let ev_b = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "x", 1);
+        let id_b = ev_b.event_id.clone();
+        s.persist_event(&ev_b, &[]).await.unwrap();
+        let ev_c = crate::tests::make_event(
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.message",
+            None,
+            serde_json::json!({"body": "c", "msgtype": "m.text"}),
+            0,
+            &[&id_a],
             &[],
-        )
-        .await
-        .unwrap();
-        s.persist_event(
-            &message_with_prev(
-                event_id!("$d:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "d",
-                &[event_id!("$b:e")],
-            ),
+        );
+        let id_c = ev_c.event_id.clone();
+        s.persist_event(&ev_c, &[]).await.unwrap();
+        let ev_d = crate::tests::make_event(
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.message",
+            None,
+            serde_json::json!({"body": "d", "msgtype": "m.text"}),
+            0,
+            &[&id_b],
             &[],
-        )
-        .await
-        .unwrap();
+        );
+        let id_d = ev_d.event_id.clone();
+        s.persist_event(&ev_d, &[]).await.unwrap();
 
         let got = s
-            .events_before(*ALICE_ROOM_ID, &[event_id!("$c:e"), event_id!("$d:e")], 10)
+            .events_before(*ALICE_ROOM_ID, &[&id_c, &id_d], 10)
             .await
             .unwrap();
         let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
-        assert_eq!(ids, ["$c:e", "$d:e", "$a:e", "$b:e"]);
+        // BFS interleaves seeds. Seeds pop in the order passed (c, d);
+        // their parents (a, b respectively) pop in the order pushed.
+        assert_eq!(
+            ids,
+            [id_c.as_str(), id_d.as_str(), id_a.as_str(), id_b.as_str()]
+        );
     }
 
     // D13: diamond DAG — the `visited` set must dedup shared ancestors
@@ -680,55 +634,49 @@ mod tests {
     #[tokio::test]
     async fn events_before_dedups_shared_ancestors_in_diamond() {
         let s = store_with_room().await;
-        s.persist_event(
-            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]),
+        let ev_a = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", 0);
+        let id_a = ev_a.event_id.clone();
+        s.persist_event(&ev_a, &[]).await.unwrap();
+        // b and c share prev=[a] and body collapses on redaction → use ts
+        // to disambiguate.
+        let ev_b = crate::tests::make_event(
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.message",
+            None,
+            serde_json::json!({"body": "b", "msgtype": "m.text"}),
+            1,
+            &[&id_a],
             &[],
-        )
-        .await
-        .unwrap();
-        s.persist_event(
-            &message_with_prev(
-                event_id!("$b:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "b",
-                &[event_id!("$a:e")],
-            ),
+        );
+        let id_b = ev_b.event_id.clone();
+        s.persist_event(&ev_b, &[]).await.unwrap();
+        let ev_c = crate::tests::make_event(
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.message",
+            None,
+            serde_json::json!({"body": "c", "msgtype": "m.text"}),
+            2,
+            &[&id_a],
             &[],
-        )
-        .await
-        .unwrap();
-        s.persist_event(
-            &message_with_prev(
-                event_id!("$c:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "c",
-                &[event_id!("$a:e")],
-            ),
-            &[],
-        )
-        .await
-        .unwrap();
-        s.persist_event(
-            &message_with_prev(
-                event_id!("$d:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "d",
-                &[event_id!("$b:e"), event_id!("$c:e")],
-            ),
-            &[],
-        )
-        .await
-        .unwrap();
+        );
+        let id_c = ev_c.event_id.clone();
+        s.persist_event(&ev_c, &[]).await.unwrap();
+        let ev_d = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "d", &[&id_b, &id_c]);
+        let id_d = ev_d.event_id.clone();
+        s.persist_event(&ev_d, &[]).await.unwrap();
 
-        let got = s
-            .events_before(*ALICE_ROOM_ID, &[event_id!("$d:e")], 10)
-            .await
-            .unwrap();
+        let got = s.events_before(*ALICE_ROOM_ID, &[&id_d], 10).await.unwrap();
         let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
-        assert_eq!(ids, ["$d:e", "$b:e", "$c:e", "$a:e"]);
+        // BFS: d -> sorted(b, c) -> a (deduped). Sort b/c lex.
+        let mut bc_sorted = vec![id_b.as_str(), id_c.as_str()];
+        bc_sorted.sort();
+        let expected: Vec<&str> = std::iter::once(id_d.as_str())
+            .chain(bc_sorted)
+            .chain(std::iter::once(id_a.as_str()))
+            .collect();
+        assert_eq!(ids, expected);
         assert_eq!(ids.len(), 4, "shared ancestor surfaced more than once");
     }
 
@@ -741,51 +689,71 @@ mod tests {
     #[tokio::test]
     async fn events_before_determinism_holds_at_every_level() {
         let s = store_with_room().await;
-        for id in [event_id!("$g1:e"), event_id!("$g2:e")] {
-            s.persist_event(
-                &message_with_prev(id, *ALICE_ROOM_ID, *ALICE_USER_ID, "x", &[]),
-                &[],
-            )
-            .await
-            .unwrap();
-        }
+        let ev_g1 = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "x", 0);
+        let id_g1 = ev_g1.event_id.clone();
+        s.persist_event(&ev_g1, &[]).await.unwrap();
+        let ev_g2 = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "x", 1);
+        let id_g2 = ev_g2.event_id.clone();
+        s.persist_event(&ev_g2, &[]).await.unwrap();
         // Parents both reference grandparents in REVERSE lex order
-        // ($g2 before $g1). `fetch_edges` sorts on read so the BFS
-        // still visits in $g1 < $g2 order.
-        for id in [event_id!("$p1:e"), event_id!("$p2:e")] {
-            s.persist_event(
-                &message_with_prev(
-                    id,
-                    *ALICE_ROOM_ID,
-                    *ALICE_USER_ID,
-                    "x",
-                    &[event_id!("$g2:e"), event_id!("$g1:e")],
-                ),
-                &[],
-            )
-            .await
-            .unwrap();
-        }
-        // Child references parents in reverse lex order too.
-        s.persist_event(
-            &message_with_prev(
-                event_id!("$c:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "x",
-                &[event_id!("$p2:e"), event_id!("$p1:e")],
-            ),
+        // (whichever id sorts higher first). `fetch_edges` sorts on read
+        // so the BFS still visits in lex order regardless of insertion.
+        let mut gs_reversed = [id_g1.clone(), id_g2.clone()];
+        gs_reversed.sort_by(|a, b| b.as_str().cmp(a.as_str())); // descending
+        let gs_refs: Vec<&EventId> = gs_reversed.iter().map(|i| i.as_ref()).collect();
+        let ev_p1 = crate::tests::make_event(
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.message",
+            None,
+            serde_json::json!({"body": "p1", "msgtype": "m.text"}),
+            10,
+            &gs_refs,
             &[],
-        )
-        .await
-        .unwrap();
+        );
+        let id_p1 = ev_p1.event_id.clone();
+        s.persist_event(&ev_p1, &[]).await.unwrap();
+        let ev_p2 = crate::tests::make_event(
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.message",
+            None,
+            serde_json::json!({"body": "p2", "msgtype": "m.text"}),
+            11,
+            &gs_refs,
+            &[],
+        );
+        let id_p2 = ev_p2.event_id.clone();
+        s.persist_event(&ev_p2, &[]).await.unwrap();
+        // Child references parents in reverse lex order too.
+        let mut ps_reversed = [id_p1.clone(), id_p2.clone()];
+        ps_reversed.sort_by(|a, b| b.as_str().cmp(a.as_str()));
+        let ps_refs: Vec<&EventId> = ps_reversed.iter().map(|i| i.as_ref()).collect();
+        let ev_c = crate::tests::make_event(
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.message",
+            None,
+            serde_json::json!({"body": "c", "msgtype": "m.text"}),
+            0,
+            &ps_refs,
+            &[],
+        );
+        let id_c = ev_c.event_id.clone();
+        s.persist_event(&ev_c, &[]).await.unwrap();
 
-        let got = s
-            .events_before(*ALICE_ROOM_ID, &[event_id!("$c:e")], 10)
-            .await
-            .unwrap();
+        let got = s.events_before(*ALICE_ROOM_ID, &[&id_c], 10).await.unwrap();
         let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
-        assert_eq!(ids, ["$c:e", "$p1:e", "$p2:e", "$g1:e", "$g2:e"]);
+        // Expected: c, sorted(p1,p2), sorted(g1,g2).
+        let mut ps_sorted = vec![id_p1.as_str(), id_p2.as_str()];
+        ps_sorted.sort();
+        let mut gs_sorted = vec![id_g1.as_str(), id_g2.as_str()];
+        gs_sorted.sort();
+        let expected: Vec<&str> = std::iter::once(id_c.as_str())
+            .chain(ps_sorted)
+            .chain(gs_sorted)
+            .collect();
+        assert_eq!(ids, expected);
     }
 
     // D15: `hydrate_pdu` populates `prev_state_events` on the returned
@@ -796,58 +764,38 @@ mod tests {
     // edge kinds and assert both fields land.
     #[tokio::test]
     async fn stored_pdu_exposes_prev_state_events() {
-        use neutrino_common::Event;
-        use serde_json::{json, value::RawValue};
-
         let s = store_with_room().await;
         // Build a message whose JSON declares both prev_events and
-        // prev_state_events. The values just need to be syntactically
-        // valid event IDs — `write_into_tx` writes the edges without
-        // validating the parents exist, and the BFS doesn't follow
-        // prev_state_events.
-        let json_val = json!({
-            "event_id": "$msg:e",
-            "room_id": ALICE_ROOM_ID.as_str(),
-            "sender": ALICE_USER_ID.as_str(),
-            "type": "m.room.message",
-            "state_key": Option::<String>::None,
-            "content": {"body": "msg", "msgtype": "m.text"},
-            "origin_server_ts": 0,
-            "prev_events": ["$create:e"],
-            "prev_state_events": ["$create:e"],
-        });
-        let json_str = serde_json::to_string(&json_val).unwrap();
-        let raw = RawValue::from_string(json_str).unwrap();
-        let content =
-            serde_json::value::to_raw_value(&json!({"body": "msg"})).unwrap_or_else(|_| {
-                serde_json::value::to_raw_value(&serde_json::Value::Object(Default::default()))
-                    .unwrap()
-            });
-        let event = Event {
-            event_id: event_id!("$msg:e").to_owned(),
-            room_id: ALICE_ROOM_ID.to_owned(),
-            event_type: "m.room.message".to_owned(),
-            state_key: None,
-            sender: ALICE_USER_ID.to_owned(),
-            origin_server_ts: 0,
-            content,
-            prev_events: vec![event_id!("$create:e").to_owned()],
-            prev_state_events: vec![event_id!("$create:e").to_owned()],
-            auth_events: Vec::new(),
-            raw,
+        // prev_state_events pointing at the room's create event. The
+        // create event is real, so the BFS will hydrate it.
+        let create_event_id: OwnedEventId = {
+            // Recreate the create event to learn its computed id.
+            let ce = create_event(*ALICE_ROOM_ID, *ALICE_USER_ID);
+            ce.event_id
         };
-        s.persist_event(&event, &[]).await.unwrap();
+        let msg = crate::tests::make_event(
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.message",
+            None,
+            serde_json::json!({"body": "msg", "msgtype": "m.text"}),
+            0,
+            &[create_event_id.as_ref()],
+            &[create_event_id.as_ref()],
+        );
+        let msg_id = msg.event_id.clone();
+        s.persist_event(&msg, &[]).await.unwrap();
 
         let got = s
-            .events_before(*ALICE_ROOM_ID, &[event_id!("$msg:e")], 1)
+            .events_before(*ALICE_ROOM_ID, &[&msg_id], 1)
             .await
             .unwrap();
         assert_eq!(got.len(), 1);
         let pdu = &got[0];
         let prev_ids: Vec<&str> = pdu.prev_events.iter().map(|e| e.as_str()).collect();
         let prev_state_ids: Vec<&str> = pdu.prev_state_events.iter().map(|e| e.as_str()).collect();
-        assert_eq!(prev_ids, ["$create:e"]);
-        assert_eq!(prev_state_ids, ["$create:e"]);
+        assert_eq!(prev_ids, [create_event_id.as_str()]);
+        assert_eq!(prev_state_ids, [create_event_id.as_str()]);
     }
 
     // D16: missing_events limit=0 parity with D11. `events_before` and
@@ -857,14 +805,11 @@ mod tests {
     #[tokio::test]
     async fn missing_events_limit_zero_returns_empty() {
         let s = store_with_room().await;
-        s.persist_event(
-            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]),
-            &[],
-        )
-        .await
-        .unwrap();
+        let ev_a = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]);
+        let id_a = ev_a.event_id.clone();
+        s.persist_event(&ev_a, &[]).await.unwrap();
         let got = s
-            .missing_events(*ALICE_ROOM_ID, &[event_id!("$a:e")], &[], 0)
+            .missing_events(*ALICE_ROOM_ID, &[&id_a], &[], 0)
             .await
             .unwrap();
         assert!(got.is_empty());
@@ -938,17 +883,13 @@ mod tests {
     #[tokio::test]
     async fn events_before_validates_inputs_in_chunks() {
         let s = store_with_room().await;
-        let count = 6;
-        let owned_ids: Vec<OwnedEventId> = (0..count)
-            .map(|i| OwnedEventId::try_from(format!("$e{i}:e")).unwrap())
-            .collect();
-        for id in &owned_ids {
-            s.persist_event(
-                &message_with_prev(id, *ALICE_ROOM_ID, *ALICE_USER_ID, "x", &[]),
-                &[],
-            )
-            .await
-            .unwrap();
+        let count = 6usize;
+        let mut owned_ids: Vec<OwnedEventId> = Vec::with_capacity(count);
+        for i in 0..count {
+            // Distinct ts so each event has a distinct computed id.
+            let ev = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "x", i as u64);
+            owned_ids.push(ev.event_id.clone());
+            s.persist_event(&ev, &[]).await.unwrap();
         }
         let id_refs: Vec<&EventId> = owned_ids.iter().map(|id| id.as_ref()).collect();
         let got = s
@@ -968,17 +909,12 @@ mod tests {
     #[tokio::test]
     async fn events_before_chunked_validation_rejects_missing() {
         let s = store_with_room().await;
-        let count = 5;
-        let owned_ids: Vec<OwnedEventId> = (0..count)
-            .map(|i| OwnedEventId::try_from(format!("$e{i}:e")).unwrap())
-            .collect();
-        for id in &owned_ids {
-            s.persist_event(
-                &message_with_prev(id, *ALICE_ROOM_ID, *ALICE_USER_ID, "x", &[]),
-                &[],
-            )
-            .await
-            .unwrap();
+        let count = 5usize;
+        let mut owned_ids: Vec<OwnedEventId> = Vec::with_capacity(count);
+        for i in 0..count {
+            let ev = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "x", i as u64);
+            owned_ids.push(ev.event_id.clone());
+            s.persist_event(&ev, &[]).await.unwrap();
         }
         let fake = OwnedEventId::try_from("$nope:e".to_owned()).unwrap();
         let mut all_ids: Vec<&EventId> = owned_ids.iter().map(|id| id.as_ref()).collect();
@@ -999,19 +935,11 @@ mod tests {
     #[tokio::test]
     async fn missing_events_missing_earliest_returns_invalid_input() {
         let s = store_with_room().await;
-        s.persist_event(
-            &message_with_prev(event_id!("$a:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]),
-            &[],
-        )
-        .await
-        .unwrap();
+        let ev_a = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]);
+        let id_a = ev_a.event_id.clone();
+        s.persist_event(&ev_a, &[]).await.unwrap();
         let err = s
-            .missing_events(
-                *ALICE_ROOM_ID,
-                &[event_id!("$a:e")],
-                &[event_id!("$nope:e")],
-                10,
-            )
+            .missing_events(*ALICE_ROOM_ID, &[&id_a], &[event_id!("$nope:e")], 10)
             .await
             .expect_err("missing earliest must reject");
         assert!(
@@ -1059,49 +987,45 @@ mod tests {
     #[tokio::test]
     async fn missing_events_handles_multiple_latest() {
         let s = store_with_room().await;
-        for id in [event_id!("$a:e"), event_id!("$b:e")] {
-            s.persist_event(
-                &message_with_prev(id, *ALICE_ROOM_ID, *ALICE_USER_ID, "x", &[]),
-                &[],
-            )
-            .await
-            .unwrap();
-        }
-        s.persist_event(
-            &message_with_prev(
-                event_id!("$c:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "c",
-                &[event_id!("$a:e")],
-            ),
+        let ev_a = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "x", 0);
+        let id_a = ev_a.event_id.clone();
+        s.persist_event(&ev_a, &[]).await.unwrap();
+        let ev_b = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "x", 1);
+        let id_b = ev_b.event_id.clone();
+        s.persist_event(&ev_b, &[]).await.unwrap();
+        let ev_c = crate::tests::make_event(
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.message",
+            None,
+            serde_json::json!({"body": "c", "msgtype": "m.text"}),
+            0,
+            &[&id_a],
             &[],
-        )
-        .await
-        .unwrap();
-        s.persist_event(
-            &message_with_prev(
-                event_id!("$d:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "d",
-                &[event_id!("$b:e")],
-            ),
+        );
+        let id_c = ev_c.event_id.clone();
+        s.persist_event(&ev_c, &[]).await.unwrap();
+        let ev_d = crate::tests::make_event(
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.message",
+            None,
+            serde_json::json!({"body": "d", "msgtype": "m.text"}),
+            0,
+            &[&id_b],
             &[],
-        )
-        .await
-        .unwrap();
+        );
+        let id_d = ev_d.event_id.clone();
+        s.persist_event(&ev_d, &[]).await.unwrap();
 
         let got = s
-            .missing_events(
-                *ALICE_ROOM_ID,
-                &[event_id!("$c:e"), event_id!("$d:e")],
-                &[],
-                10,
-            )
+            .missing_events(*ALICE_ROOM_ID, &[&id_c, &id_d], &[], 10)
             .await
             .unwrap();
         let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
-        assert_eq!(ids, ["$c:e", "$d:e", "$a:e", "$b:e"]);
+        assert_eq!(
+            ids,
+            [id_c.as_str(), id_d.as_str(), id_a.as_str(), id_b.as_str()]
+        );
     }
 }
