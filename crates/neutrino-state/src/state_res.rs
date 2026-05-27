@@ -652,19 +652,12 @@ mod tests {
     // ===== Phase 4b: power_of_sender / reverse_topological_power_sort / iterative_auth_checks =====
 
     use neutrino_common::ROOM_VERSION_ID;
-    use ruma::RoomId;
-
-    /// Stable room_id for non-create test events. The auth rules don't
-    /// cross-check the room_id against the create event's derived id, so a
-    /// fixed string is fine for unit tests.
-    fn test_room() -> &'static RoomId {
-        room_id!("!room:example.org")
-    }
+    use neutrino_common::event_id::room_id_from_create;
+    use ruma::{OwnedRoomId, RoomId};
 
     /// Build an `m.room.create` event. `additional_creators` is a slice of
     /// user-id strings; passing an empty slice omits the field. `federate =
-    /// false` writes `m.federate: false` into content; `true` omits it (the
-    /// default).
+    /// false` writes `m.federate: false` into content; `true` omits it.
     fn build_create(creator: &str, additional_creators: &[&str], federate: bool) -> Event {
         let mut content = json!({ "room_version": ROOM_VERSION_ID });
         if !additional_creators.is_empty() {
@@ -689,8 +682,34 @@ mod tests {
         .expect("valid create")
     }
 
-    /// `m.room.power_levels` event with caller-supplied content + auth chain.
-    fn build_power_levels(
+    /// One-shot test-room setup: builds a create event, derives its room_id
+    /// via the v12 sigil swap (`!` ← `$`), inserts the create into a fresh
+    /// in-memory provider, and returns the bundle.
+    ///
+    /// All non-create events built by `room_msg`, `room_pl`, `room_topic`
+    /// thread this derived room_id through (no synthetic `!room:example.org`
+    /// — the v12 spec only admits sigil-swapped event-id-derived room_ids).
+    fn setup(
+        creator: &str,
+        additional_creators: &[&str],
+        federate: bool,
+    ) -> (InMemoryStateProvider, OwnedEventId, OwnedRoomId) {
+        let create = build_create(creator, additional_creators, federate);
+        let room_id = room_id_from_create(&create.event_id);
+        let mut provider = InMemoryStateProvider::new();
+        let create_id = put(&mut provider, create);
+        (provider, create_id, room_id)
+    }
+
+    /// Sugar for `setup("@alice:example.org", &[], true)`.
+    fn setup_default() -> (InMemoryStateProvider, OwnedEventId, OwnedRoomId) {
+        setup("@alice:example.org", &[], true)
+    }
+
+    /// `m.room.power_levels` event in a known room with caller-supplied
+    /// content + auth chain.
+    fn room_pl(
+        room_id: &RoomId,
         sender: &str,
         content: serde_json::Value,
         auth: Vec<OwnedEventId>,
@@ -699,7 +718,7 @@ mod tests {
             sender.parse().expect("sender"),
             "m.room.power_levels".to_owned(),
         )
-        .room_id(test_room().to_owned())
+        .room_id(room_id.to_owned())
         .state_key(String::new())
         .content(content)
         .auth_events(auth)
@@ -708,10 +727,10 @@ mod tests {
         .expect("valid power_levels")
     }
 
-    /// `m.room.message` event with caller-supplied auth chain.
-    fn build_message(sender: &str, auth: Vec<OwnedEventId>) -> Event {
+    /// `m.room.message` event in a known room with caller-supplied auth chain.
+    fn room_msg(room_id: &RoomId, sender: &str, auth: Vec<OwnedEventId>) -> Event {
         EventBuilder::new(sender.parse().expect("sender"), "m.room.message".to_owned())
-            .room_id(test_room().to_owned())
+            .room_id(room_id.to_owned())
             .content(json!({ "msgtype": "m.text", "body": "hi" }))
             .auth_events(auth)
             .origin_server_ts(next_ts())
@@ -719,11 +738,11 @@ mod tests {
             .expect("valid message")
     }
 
-    /// `m.room.topic` state event with caller-supplied auth chain — used as a
-    /// non-member state event for rule 4 / rule 8 paths.
-    fn build_topic(sender: &str, auth: Vec<OwnedEventId>) -> Event {
+    /// `m.room.topic` state event in a known room — used as a non-member
+    /// state event for rule 4 / rule 8 paths.
+    fn room_topic(room_id: &RoomId, sender: &str, auth: Vec<OwnedEventId>) -> Event {
         EventBuilder::new(sender.parse().expect("sender"), "m.room.topic".to_owned())
-            .room_id(test_room().to_owned())
+            .room_id(room_id.to_owned())
             .state_key(String::new())
             .content(json!({ "topic": "hi" }))
             .auth_events(auth)
@@ -767,61 +786,54 @@ mod tests {
 
     #[test]
     fn power_of_sender_creator_with_no_pl_in_auth() {
-        let mut provider = InMemoryStateProvider::new();
-        let create = build_create("@alice:example.org", &[], true);
-        let create_id = put(&mut provider, create);
+        let (provider, create_id, room_id) = setup_default();
         // alice messages the room before any PL exists. Her power = MAX
         // (she's the creator).
-        let msg = build_message("@alice:example.org", vec![create_id]);
+        let msg = room_msg(&room_id, "@alice:example.org", vec![create_id]);
         assert_eq!(power_of_sender(&msg, &provider).unwrap(), i64::MAX);
     }
 
     #[test]
     fn power_of_sender_additional_creator_is_max() {
-        let mut provider = InMemoryStateProvider::new();
-        let create = build_create("@alice:example.org", &["@bob:example.org"], true);
-        let create_id = put(&mut provider, create);
-        let msg = build_message("@bob:example.org", vec![create_id]);
+        let (provider, create_id, room_id) =
+            setup("@alice:example.org", &["@bob:example.org"], true);
+        let msg = room_msg(&room_id, "@bob:example.org", vec![create_id]);
         assert_eq!(power_of_sender(&msg, &provider).unwrap(), i64::MAX);
     }
 
     #[test]
     fn power_of_sender_non_creator_no_pl_returns_zero() {
-        let mut provider = InMemoryStateProvider::new();
-        let create = build_create("@alice:example.org", &[], true);
-        let create_id = put(&mut provider, create);
-        let msg = build_message("@charlie:example.org", vec![create_id]);
+        let (provider, create_id, room_id) = setup_default();
+        let msg = room_msg(&room_id, "@charlie:example.org", vec![create_id]);
         // No PL in auth_events, charlie isn't a creator → users_default (0).
         assert_eq!(power_of_sender(&msg, &provider).unwrap(), 0);
     }
 
     #[test]
     fn power_of_sender_uses_explicit_users_entry() {
-        let mut provider = InMemoryStateProvider::new();
-        let create = build_create("@alice:example.org", &[], true);
-        let create_id = put(&mut provider, create);
-        let pl = build_power_levels(
+        let (mut provider, create_id, room_id) = setup_default();
+        let pl = room_pl(
+            &room_id,
             "@alice:example.org",
             json!({ "users": { "@charlie:example.org": 42 } }),
             vec![create_id.clone()],
         );
         let pl_id = put(&mut provider, pl);
-        let msg = build_message("@charlie:example.org", vec![create_id, pl_id]);
+        let msg = room_msg(&room_id, "@charlie:example.org", vec![create_id, pl_id]);
         assert_eq!(power_of_sender(&msg, &provider).unwrap(), 42);
     }
 
     #[test]
     fn power_of_sender_falls_back_to_users_default() {
-        let mut provider = InMemoryStateProvider::new();
-        let create = build_create("@alice:example.org", &[], true);
-        let create_id = put(&mut provider, create);
-        let pl = build_power_levels(
+        let (mut provider, create_id, room_id) = setup_default();
+        let pl = room_pl(
+            &room_id,
             "@alice:example.org",
             json!({ "users_default": 33 }),
             vec![create_id.clone()],
         );
         let pl_id = put(&mut provider, pl);
-        let msg = build_message("@charlie:example.org", vec![create_id, pl_id]);
+        let msg = room_msg(&room_id, "@charlie:example.org", vec![create_id, pl_id]);
         assert_eq!(power_of_sender(&msg, &provider).unwrap(), 33);
     }
 
@@ -831,16 +843,15 @@ mod tests {
         // to the no-PL path. Matches synapse's `if ev.rejected_reason is None`
         // filter (we don't model `rejected` as a soft-fail here, just as
         // "treat as absent").
-        let mut provider = InMemoryStateProvider::new();
-        let create = build_create("@alice:example.org", &[], true);
-        let create_id = put(&mut provider, create);
-        let pl = build_power_levels(
+        let (mut provider, create_id, room_id) = setup_default();
+        let pl = room_pl(
+            &room_id,
             "@alice:example.org",
             json!({ "users": { "@charlie:example.org": 99 } }),
             vec![create_id.clone()],
         );
         let pl_id = put_rejected(&mut provider, pl);
-        let msg = build_message("@charlie:example.org", vec![create_id, pl_id]);
+        let msg = room_msg(&room_id, "@charlie:example.org", vec![create_id, pl_id]);
         // Rejected PL is skipped → charlie falls back to 0 (no PL, non-creator).
         assert_eq!(power_of_sender(&msg, &provider).unwrap(), 0);
     }
@@ -876,11 +887,9 @@ mod tests {
     fn sort_higher_power_first_for_same_outdegree() {
         // Two events, both outdegree 0. alice = creator (MAX); charlie = 0.
         // Output order: alice first.
-        let mut provider = InMemoryStateProvider::new();
-        let create = build_create("@alice:example.org", &[], true);
-        let create_id = put(&mut provider, create);
-        let alice_msg = build_message("@alice:example.org", vec![create_id.clone()]);
-        let charlie_msg = build_message("@charlie:example.org", vec![create_id.clone()]);
+        let (mut provider, create_id, room_id) = setup_default();
+        let alice_msg = room_msg(&room_id, "@alice:example.org", vec![create_id.clone()]);
+        let charlie_msg = room_msg(&room_id, "@charlie:example.org", vec![create_id]);
         let alice_id = put(&mut provider, alice_msg);
         let charlie_id = put(&mut provider, charlie_msg);
         let events: HashSet<_> = [alice_id.clone(), charlie_id.clone()].into_iter().collect();
@@ -895,11 +904,9 @@ mod tests {
         // Two messages by the same sender (same power). next_ts() guarantees
         // strictly monotonic origin_server_ts, so the *earlier* event must
         // come first in the sort (synapse heap key: ts ascending).
-        let mut provider = InMemoryStateProvider::new();
-        let create = build_create("@alice:example.org", &[], true);
-        let create_id = put(&mut provider, create);
-        let early = build_message("@charlie:example.org", vec![create_id.clone()]);
-        let late = build_message("@charlie:example.org", vec![create_id.clone()]);
+        let (mut provider, create_id, room_id) = setup_default();
+        let early = room_msg(&room_id, "@charlie:example.org", vec![create_id.clone()]);
+        let late = room_msg(&room_id, "@charlie:example.org", vec![create_id]);
         assert!(
             early.origin_server_ts < late.origin_server_ts,
             "next_ts() must be monotonic for this test"
@@ -1004,13 +1011,11 @@ mod tests {
     fn iac_auth_rule_failure_does_not_apply_event() {
         // create with m.federate=false. A topic from a different domain
         // fails rule 4 → not written into resolved.
-        let mut provider = InMemoryStateProvider::new();
-        let create = build_create("@alice:here.org", &[], false);
-        let create_id = put(&mut provider, create);
-        let topic = build_topic("@bob:there.org", vec![create_id.clone()]);
+        let (mut provider, create_id, room_id) = setup("@alice:here.org", &[], false);
+        let topic = room_topic(&room_id, "@bob:there.org", vec![create_id.clone()]);
         let topic_id = put(&mut provider, topic);
-        let out = iterative_auth_checks(&[create_id.clone(), topic_id], StateMap::new(), &provider)
-            .unwrap();
+        let out =
+            iterative_auth_checks(&[create_id, topic_id], StateMap::new(), &provider).unwrap();
         // Only create made it in; topic was rule-4 rejected.
         assert_eq!(out.len(), 1);
         assert!(
@@ -1025,31 +1030,14 @@ mod tests {
 
     #[test]
     fn iac_accepted_non_state_event_leaves_resolved_unchanged() {
-        // alice sends a message. It passes auth (creator, rule 6 self-joined
-        // is bypassed because alice is creator and has implicit join; in
-        // practice we also need alice's member event in auth, but the v12
-        // rule 6 check uses ctx.membership which falls back to None — so the
-        // message would be rejected by rule 6. Use a more permissive setup:
-        // a non-member, non-message *state* event by the creator is the only
-        // case that mechanically auth-passes without alice's member event.
-        // Switch to topic by alice — passes rule 8 (creator → MAX power),
-        // but it IS a state event so we can't observe "state unchanged".
-        //
-        // So: directly verify that the loop runs without crashing on a
-        // non-state event and the resolved state grows only by state-event
-        // acceptances, by constructing a setup that has both a message and
-        // a state event in the sort.
-        let mut provider = InMemoryStateProvider::new();
-        let create = build_create("@alice:here.org", &[], true);
-        let create_id = put(&mut provider, create);
-        // alice's message will fail rule 6 (no member event in auth), but
-        // that's fine — the point of this test is that a non-state-event
-        // acceptance OR rejection doesn't pollute `resolved`.
-        let msg = build_message("@alice:here.org", vec![create_id.clone()]);
+        // Sort = [create, alice_message]. The message has no state_key — IAC
+        // must not surface it in `resolved` regardless of whether
+        // check_auth_rules accepts the message under this minimal setup.
+        let (mut provider, create_id, room_id) = setup_default();
+        let msg = room_msg(&room_id, "@alice:example.org", vec![create_id.clone()]);
         let msg_id = put(&mut provider, msg);
         let out = iterative_auth_checks(&[create_id, msg_id], StateMap::new(), &provider).unwrap();
-        // Whether the message accepts or rejects, `resolved` must only
-        // contain the create event — m.room.message has no state_key.
+        // `resolved` must only contain the create event — m.room.message has no state_key.
         assert_eq!(out.len(), 1);
         assert!(out.contains_key(&("m.room.create".to_string(), String::new())));
     }
@@ -1057,11 +1045,15 @@ mod tests {
     #[test]
     fn iac_propagates_missing_auth_event_error() {
         // Build a topic referencing a create_id that is NOT in the provider.
-        // Phase-4b IAC errors loudly per the project invariant ("every event
-        // we know about has its complete auth chain locally resolvable").
+        // The phantom create event is built but never inserted, giving us a
+        // v12-shaped room_id without populating the auth chain. Phase-4b IAC
+        // errors loudly per the project invariant ("every event we know about
+        // has its complete auth chain locally resolvable").
+        let phantom_create = build_create("@alice:example.org", &[], true);
+        let phantom_room = room_id_from_create(&phantom_create.event_id);
+        let fake_create_id = phantom_create.event_id.clone();
         let mut provider = InMemoryStateProvider::new();
-        let fake_create_id: OwnedEventId = "$nonexistent:example.org".parse().unwrap();
-        let topic = build_topic("@alice:example.org", vec![fake_create_id.clone()]);
+        let topic = room_topic(&phantom_room, "@alice:example.org", vec![fake_create_id]);
         let topic_id = put(&mut provider, topic);
         let err = iterative_auth_checks(&[topic_id], StateMap::new(), &provider).unwrap_err();
         assert!(matches!(err, StateResError::MissingAuthEvent(_)));
