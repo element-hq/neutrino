@@ -68,6 +68,34 @@ If there are no relevant tests in either repository, ask for suggestions.
 - do not erase lines in LOG.md
 - do not delete tests. Ask before modifying tests.
 
+## before starting any non-trivial task
+
+If the task touches more than one file, do a scope-scan before the first edit.
+
+A scope-scan is one read-only command that surfaces the full shape of the work:
+- behavioural change to a function used elsewhere → `mcp__rust-analyzer__references <symbol>`
+- adding an assertion or stricter check → `cargo test --workspace --no-fail-fast` to see every failing target at once
+- helper-signature refactor → `references` on the helper, plus its callers' files
+- non-symbol pattern (string, JSON shape) → `grep -rn` once across `crates/`
+
+Run the scan ONCE upfront, not after the first failure surfaces. Acting on one
+failure at a time hides the fan-out structure and forces sequential work where
+parallel was possible.
+
+After the scan, decide strategy:
+- 1 unit of work: just do it.
+- 2+ units, independent (different crates, no shared edits): fire one `Agent`
+  call per unit in a SINGLE message, multiple tool blocks. **Sequential
+  delegation on independent work is a code smell.**
+- 2+ units, coupled (changes ripple between them): sequential, but commit
+  to an order before starting the first one.
+
+For mechanical rewrites across many call sites (>20), write a Python rewriter
+with `find_matching_paren` + arg-aware splitting, designed up-front for
+trailing commas, inline comments, and multi-line calls. Half-baked scripts that
+need 3 iterations cost more than 5 extra min of robust design.
+
+
 ## before finishing any task
 1. cargo fmt
 2. cargo clippy -- -D warnings
@@ -86,7 +114,56 @@ one clarifying question is better than a wrong implementation.
 Report every issue you find, including ones you are uncertain about or consider low-severity.
 Do not filter for importance or confidence at this stage - a separate verification step will do that.
 Your goal here is coverage: it is better to surface a finding that later gets filtered out than to silently drop a real bug.
-For each finding, include your confidence level and an estimated severity so a downstream filter can rank them.
-Number each issue so they can be referred to downstream.
+For each finding, include your confidence level (low, medium, high, certain) and an estimated severity (nit, minor, major, critical) so a downstream filter can rank them.
+Number each issue (I1, I2, I3, ...) so they can be referred to downstream.
 
 Reviewing code may be supplied via patch/diff files.
+
+
+## rust-analyzer (LSP)
+For non-trivial work, prefer the `mcp__rust-analyzer__*` tools over manual
+grep / `cargo build` / file-reading:
+
+- `references` — impact analysis. Before changing a public symbol's signature
+  (helpers, trait methods, anything `pub`/`pub(crate)`), run `references`
+  to enumerate real call sites. Don't grep for `foo(` — too many false
+  positives from comments/strings/macros.
+- `definition` — navigate to a symbol's declaration, including across
+  crate boundaries and through re-exports. Use this instead of grep + Read.
+- `hover` — type + docs on any symbol. First port of call when meeting a
+  new type or unfamiliar trait method.
+- `diagnostics` — type-check feedback for a single file. Drives the inner
+  edit loop. `cargo build` / `cargo test` are for final verification only.
+- `edit_file` — multi-edit atomic writes. Use when applying ≥3 edits to
+  the same file in one logical change.
+- `rename_symbol` — workspace-wide rename. One call replaces N file edits.
+
+Reserve grep / `cargo build` / Read for: non-source files (TOML, MD, JSON),
+generated code, situations where rust-analyzer is unavailable, or when
+investigating raw bytes (e.g. tests that pin a literal string).
+
+## Iteration loops
+Default to per-crate during development:
+- `cargo test -p <crate>` instead of `--workspace`
+- `cargo clippy -p <crate> --tests -- -D warnings` instead of `--workspace --all-targets`
+
+Workspace-wide builds are 5-10× slower; reserve them for: final verification
+before declaring a task done, cross-crate refactors where one crate's
+signature change ripples through another, or when explicitly asked for a
+"full check".
+
+## Parallelisation
+When a task fans out across independent crates / modules (e.g., updating
+test fixtures in each of `neutrino-state`, `neutrino-http`,
+`neutrino-store-sqlite`), run subagents in parallel — single message,
+multiple `Agent` tool calls. Sequential subagents on independent work
+costs ~3-4× wall-clock for no benefit.
+
+## Scope triage before refactors
+Any task that touches multiple call sites: first action is `references`
+(or `grep -c` if the symbol isn't LSP-known yet) to count. Then decide:
+- 1-5 sites: hand-edit
+- 5-20 sites: hand-edit per file, or `rename_symbol` if it's a rename
+- 20+ sites: write a mechanical rewriter (Python script with `find_matching_paren` + arg-aware `split_args`, designed up-front for
+  trailing commas, inline comments, multi-line calls) or delegate to a
+  subagent with a clear pattern spec.
