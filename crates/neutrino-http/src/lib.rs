@@ -12,13 +12,12 @@ use axum::{
     routing::{get, post, put},
 };
 use neutrino_common::{Config, ROOM_VERSION_ID};
-use neutrino_store::{Event, EventStore, RoomStore, StateStore, StorageError};
+use neutrino_state::event_id::EventBuilder;
+use neutrino_store::{EventStore, RoomStore, StateStore, StorageError};
 use neutrino_store_sqlite::SqliteStore;
-use rand::{Rng, distr::Alphanumeric};
 use ruma::api::client::sync::sync_events::v5;
-use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
+use ruma::{OwnedRoomId, OwnedUserId};
 use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use tokio::net::TcpListener;
@@ -140,15 +139,6 @@ pub async fn router(config: Config) -> Result<Router, StartupError> {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     Ok(router)
-}
-
-fn mint_id(prefix: char, server_name: &str, len: usize) -> String {
-    let chars: String = rand::rng()
-        .sample_iter(Alphanumeric)
-        .take(len)
-        .map(|c| c as char)
-        .collect();
-    format!("{}{}:{}", prefix, chars, server_name)
 }
 
 async fn root() -> &'static str {
@@ -475,77 +465,91 @@ async fn get_room_keys() -> (StatusCode, Json<Value>) {
 }
 
 async fn create_room(state: State<AppState>, body: Json<Value>) -> axum::response::Response {
-    let (store, server_name, user_id) = {
+    let (store, user_id) = {
         let app = lock_app(&state.0);
-        (
-            app.store.clone(),
-            app.config.server_name.clone(),
-            app.config.user_id(),
-        )
+        (app.store.clone(), app.config.user_id())
     };
 
-    let room_id = mint_id('!', &server_name, 7);
+    let sender: OwnedUserId = match user_id.parse() {
+        Ok(s) => s,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            );
+        }
+    };
 
     // v12 / MSC4242: the creator is implicit (taken from `sender`); the
-    // explicit `content.creator` field that v11 carried is deprecated.
-    let create_event = json!({
-        "type": "m.room.create",
-        "state_key": "",
-        "sender": user_id,
-        "room_id": room_id,
-        "content": {
-            "room_version": ROOM_VERSION_ID
-        },
-        "origin_server_ts": 0,
-        "event_id": mint_id('$', &server_name, 10),
-    });
+    // explicit `content.creator` field v11 carried is deprecated. The
+    // builder computes the create event's event_id from the reference
+    // hash, and `parse_event` derives `room_id` from it via the sigil swap.
+    let create = match EventBuilder::new(sender.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+    {
+        Ok(ev) => ev,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            );
+        }
+    };
+    let room_id = create.room_id.clone();
+    let create_event_id = create.event_id.clone();
 
-    let join_event = json!({
-        "type": "m.room.member",
-        "state_key": user_id,
-        "sender": user_id,
-        "room_id": room_id,
-        "content": {
-            "membership": "join",
-            "displayname": "Alice"
-        },
-        "origin_server_ts": 0,
-        "event_id": mint_id('$', &server_name, 10),
-    });
+    // Self-join. References the create event as both `prev_events` (DAG
+    // parent) and `prev_state_events` (state-DAG parent, MSC4242).
+    let join = match EventBuilder::new(sender.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(sender.as_str().to_owned())
+        .content(json!({ "membership": "join", "displayname": "Alice" }))
+        .prev_events(vec![create_event_id.clone()])
+        .prev_state_events(vec![create_event_id.clone()])
+        .build()
+    {
+        Ok(ev) => ev,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            );
+        }
+    };
 
-    let mut events = vec![create_event, join_event];
+    let mut initial = vec![join];
 
     if let Some(n) = body.0.pointer("/name").and_then(|v| v.as_str()) {
-        let name_event = json!({
-            "type": "m.room.name",
-            "state_key": "",
-            "sender": user_id,
-            "room_id": room_id,
-            "content": {
-                "name": n
-            },
-            "origin_server_ts": 0,
-            "event_id": mint_id('$', &server_name, 10),
-        });
-        events.push(name_event);
+        let name = match EventBuilder::new(sender, "m.room.name".to_owned())
+            .room_id(room_id.clone())
+            .state_key(String::new())
+            .content(json!({ "name": n }))
+            .prev_events(vec![initial[0].event_id.clone()])
+            .prev_state_events(vec![create_event_id.clone()])
+            .build()
+        {
+            Ok(ev) => ev,
+            Err(e) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "M_UNKNOWN",
+                    &e.to_string(),
+                );
+            }
+        };
+        initial.push(name);
     }
 
     // SqliteStore requires `create_room` to register the room before any
     // `persist_event` calls succeed. The create event lands via the trait's
     // dedicated path; member-join + (optional) name come through alongside
     // as `initial_events` so the whole thing is one transaction.
-    let mut stored: Vec<Event> = match events.iter().map(stored_event_from_json).collect() {
-        Some(v) => v,
-        None => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "M_UNKNOWN",
-                "failed to build create_room PDUs",
-            );
-        }
-    };
-    let create = stored.remove(0);
-    if let Err(e) = store.create_room(&create, &stored).await {
+    if let Err(e) = store.create_room(&create, &initial).await {
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "M_UNKNOWN",
@@ -600,33 +604,43 @@ async fn put_event(
     )>,
     body: Json<Value>,
 ) -> axum::response::Response {
-    let (store, server_name, user_id) = {
+    let (store, user_id) = {
         let app = lock_app(&state.0);
-        (
-            app.store.clone(),
-            app.config.server_name.clone(),
-            app.config.user_id(),
-        )
+        (app.store.clone(), app.config.user_id())
     };
 
-    let event_id = mint_id('$', &server_name, 10);
-
-    let pdu = json!({
-        "room_id": room_id,
-        "type": event_type,
-        "sender": user_id,
-        "event_id": event_id,
-        "content": body.0,
-        "origin_server_ts": 0,
-    });
-    let Some(stored) = stored_event_from_json(&pdu) else {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "M_UNKNOWN",
-            "failed to build PDU",
-        );
+    let sender: OwnedUserId = match user_id.parse() {
+        Ok(s) => s,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            );
+        }
     };
-    if let Err(e) = store.persist_event(&stored, &[]).await {
+    let parsed_room_id: OwnedRoomId = match room_id.parse() {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", &e.to_string());
+        }
+    };
+
+    // `prev_events` intentionally empty for now — wiring the DAG against the
+    // room's current head is state-machine work (PLAN.md Phase 6) and not
+    // in scope here. Matches the pre-B6 behaviour of this handler.
+    let event = match EventBuilder::new(sender, event_type)
+        .room_id(parsed_room_id)
+        .content(body.0)
+        .build()
+    {
+        Ok(ev) => ev,
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, "M_BAD_JSON", &e.to_string());
+        }
+    };
+    let event_id = event.event_id.clone();
+    if let Err(e) = store.persist_event(&event, &[]).await {
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "M_UNKNOWN",
@@ -635,77 +649,6 @@ async fn put_event(
     }
 
     (StatusCode::OK, Json(json!({"event_id": event_id}))).into_response()
-}
-
-/// Parse a hand-built PDU `serde_json::Value` into a `Event`. Used by
-/// the legacy CSAPI write handlers (`createRoom`, `put_event`). Returns
-/// `None` on any required-field-missing path — callers built the PDU
-/// themselves, so a malformed value is a programmer error, not a client
-/// error.
-///
-/// This is **transitional code**. PR 2 introduces `EventBuilder::build`
-/// which assembles the wire JSON, computes the reference hash, and
-/// constructs the `Event` end-to-end. Once that lands, both CSAPI write
-/// handlers migrate to it and this helper plus `mint_id` are deleted.
-fn stored_event_from_json(value: &Value) -> Option<Event> {
-    let event_id: OwnedEventId = value.get("event_id")?.as_str()?.try_into().ok()?;
-    let room_id: OwnedRoomId = value.get("room_id")?.as_str()?.try_into().ok()?;
-    let event_type = value.get("type")?.as_str()?.to_string();
-    let state_key = value
-        .get("state_key")
-        .and_then(|s| s.as_str())
-        .map(String::from);
-    let sender: OwnedUserId = value.get("sender")?.as_str()?.try_into().ok()?;
-    let origin_server_ts = value
-        .get("origin_server_ts")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let raw: Box<RawValue> = serde_json::value::to_raw_value(value).ok()?;
-    // Mirror what the storage layer's row hydration does: pull `content`,
-    // `prev_events`, `prev_state_events` out of the raw value. Failures
-    // surface as `None` (programmer error in the caller's hand-built
-    // PDU). auth_events is empty — the legacy write path is server-
-    // authored and these are wired up properly by `EventBuilder` in PR 2.
-    let content = value
-        .get("content")
-        .and_then(|c| serde_json::value::to_raw_value(c).ok())?;
-    let prev_events = value
-        .get("prev_events")
-        .map(|arr| {
-            arr.as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().and_then(|s| OwnedEventId::try_from(s).ok()))
-                        .collect()
-                })
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    let prev_state_events = value
-        .get("prev_state_events")
-        .map(|arr| {
-            arr.as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().and_then(|s| OwnedEventId::try_from(s).ok()))
-                        .collect()
-                })
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    Some(Event {
-        event_id,
-        room_id,
-        event_type,
-        state_key,
-        sender,
-        origin_server_ts,
-        content,
-        prev_events,
-        prev_state_events,
-        auth_events: Vec::new(),
-        raw,
-    })
 }
 
 async fn pushers_set() -> (StatusCode, Json<Value>) {
