@@ -303,6 +303,14 @@ pub fn reverse_topological_power_sort(
 /// `initial_state` is **empty** for v12 IAC pass 1 (v2.1 divergence), passed
 /// through unchanged for IAC pass 2 (phase 4c). This function is agnostic to
 /// which pass is running.
+///
+/// **Caller contract**: every event_id reachable from this run — every entry
+/// in `sorted`, every id in their `event.auth_events`, and every value in
+/// `initial_state` — must be in `provider`. A missing lookup raises
+/// `StateResError::MissingAuthEvent`. In particular: if `initial_state` is
+/// not empty (i.e. IAC pass 2 in phase 4c), the caller must ensure every
+/// value in it is provider-known. Pass 1 sidesteps this by passing
+/// `StateMap::new()`.
 pub fn iterative_auth_checks(
     sorted: &[OwnedEventId],
     initial_state: StateMap<OwnedEventId>,
@@ -327,10 +335,16 @@ pub fn iterative_auth_checks(
             if parent.rejected {
                 continue;
             }
-            let key = (
-                parent.event.event_type.clone(),
-                parent.event.state_key.clone().unwrap_or_default(),
-            );
+            // calculate_auth_events only selects state events into auth_events;
+            // a None state_key here means upstream (storage or calculate_auth_events)
+            // produced a malformed auth chain. Surface loudly rather than
+            // inserting under `(type, "")` and masking the corruption.
+            let sk = parent
+                .event
+                .state_key
+                .clone()
+                .expect("auth_events entries are state events (state_key present)");
+            let key = (parent.event.event_type.clone(), sk);
             auth_map.insert(key, parent.event);
         }
 
@@ -338,11 +352,11 @@ pub fn iterative_auth_checks(
         // event actually consults.
         for key in auth_event_keys(&event) {
             if let Some(rs_id) = resolved.get(&key) {
-                let info = provider
+                let rs_info = provider
                     .get_event(rs_id)
                     .ok_or_else(|| StateResError::MissingAuthEvent(rs_id.clone()))?;
-                if !info.rejected {
-                    auth_map.insert(key, info.event);
+                if !rs_info.rejected {
+                    auth_map.insert(key, rs_info.event);
                 }
             }
         }
