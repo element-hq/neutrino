@@ -14,10 +14,13 @@
 
 use base64::Engine;
 use base64::engine::general_purpose;
-use ruma::canonical_json::{CanonicalJsonObject, RedactionError, redact_in_place};
+use ruma::canonical_json::{
+    CanonicalJsonObject, CanonicalJsonValue, RedactionError, redact_in_place,
+};
 use ruma::room_version_rules::RoomVersionRules;
 use ruma::{EventId, OwnedEventId, OwnedRoomId};
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 
 /// Serialise a canonical-JSON object to its canonical byte representation.
 ///
@@ -98,18 +101,47 @@ pub fn content_hash(obj: &CanonicalJsonObject) -> [u8; 32] {
 /// Reference hash of an event object — feeds the v3+ event_id.
 ///
 /// Spec: <https://spec.matrix.org/v1.18/server-server-api/#calculating-the-reference-hash-for-an-event>.
-/// Runs [`redact_for_hash`] (V12 redaction with the MSC4242 `prev_state_events`
-/// carve-out), then removes `signatures` and `unsigned`, canonical-encodes,
-/// SHA-256s.
-///
-/// Returns `RedactionError` only if the input object violates the redaction
-/// preconditions ruma checks (e.g. non-object `content`, missing `type`).
+/// Runs [`redact_to_canonical_bytes`] and SHA-256s the result.
 pub fn reference_hash(obj: &CanonicalJsonObject) -> Result<[u8; 32], RedactionError> {
+    Ok(sha256(&redact_to_canonical_bytes(obj)?))
+}
+
+/// Apply V12 redaction (with the MSC4242 `prev_state_events` carve-out),
+/// strip `signatures` and `unsigned`, and return the canonical-JSON bytes.
+///
+/// Used both as an internal step of [`reference_hash`] and exposed for
+/// from-wire callers that need the redacted form on content-hash mismatch
+/// (Matrix S2S §"Validating hashes and signatures on received events":
+/// "If the content hashes are not present, or do not match the supplied
+/// content, then the receiving server must redact the event before
+/// accepting it").
+///
+/// Returns `RedactionError` only if the input violates ruma's redaction
+/// preconditions (non-object `content`/`hashes`/`signatures`, missing `type`).
+pub fn redact_to_canonical_bytes(obj: &CanonicalJsonObject) -> Result<Vec<u8>, RedactionError> {
     let mut clone = obj.clone();
     redact_for_hash(&mut clone)?;
     clone.remove("signatures");
     clone.remove("unsigned");
-    Ok(sha256(&canonical(&clone)))
+    Ok(canonical(&clone))
+}
+
+/// Verify an event's content hash against its `hashes.sha256` field.
+///
+/// Returns `true` iff the event has a well-shaped `hashes.sha256` string
+/// AND its value equals `b64_unpadded(content_hash(obj))`. Absent / malformed
+/// `hashes` returns `false`.
+///
+/// Spec: <https://spec.matrix.org/v1.18/server-server-api/#calculating-the-content-hash-for-an-event>.
+pub fn verify_content_hash(obj: &CanonicalJsonObject) -> bool {
+    let Some(CanonicalJsonValue::Object(hashes)) = obj.get("hashes") else {
+        return false;
+    };
+    let Some(CanonicalJsonValue::String(expected)) = hashes.get("sha256") else {
+        return false;
+    };
+    let computed = b64_unpadded(&content_hash(obj));
+    *expected == computed
 }
 
 /// Format an event_id from a reference hash. v3+ rooms only.
@@ -132,9 +164,8 @@ pub fn event_id_from_hash(hash: &[u8; 32]) -> OwnedEventId {
 /// Returns the same errors `reference_hash` would for malformed input:
 /// non-object root, missing `type`, non-object `content`/`hashes`/`signatures`.
 pub fn compute_event_id(raw: &serde_json::value::RawValue) -> Result<OwnedEventId, ComputeIdError> {
-    let parsed: ruma::canonical_json::CanonicalJsonValue =
-        serde_json::from_str(raw.get()).map_err(ComputeIdError::Parse)?;
-    let ruma::canonical_json::CanonicalJsonValue::Object(obj) = parsed else {
+    let parsed: CanonicalJsonValue = serde_json::from_str(raw.get())?;
+    let CanonicalJsonValue::Object(obj) = parsed else {
         return Err(ComputeIdError::NonObjectRoot);
     };
     let rh = reference_hash(&obj).map_err(ComputeIdError::Redaction)?;
@@ -142,28 +173,21 @@ pub fn compute_event_id(raw: &serde_json::value::RawValue) -> Result<OwnedEventI
 }
 
 /// Failure modes for [`compute_event_id`].
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ComputeIdError {
     /// `raw` isn't valid JSON.
-    Parse(serde_json::Error),
+    #[error("raw is not valid JSON: {0}")]
+    Parse(#[from] serde_json::Error),
+
     /// `raw` is valid JSON but the root value isn't an object.
+    #[error("raw JSON root is not an object")]
     NonObjectRoot,
+
     /// `reference_hash`'s redaction preconditions weren't met
     /// (missing `type`, non-object `content`/`hashes`/`signatures`).
+    #[error("redaction precondition failed: {0}")]
     Redaction(RedactionError),
 }
-
-impl std::fmt::Display for ComputeIdError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Parse(e) => write!(f, "raw is not valid JSON: {e}"),
-            Self::NonObjectRoot => write!(f, "raw JSON root is not an object"),
-            Self::Redaction(e) => write!(f, "redaction precondition failed: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for ComputeIdError {}
 
 /// Derive a room_id from a create event's event_id.
 ///
@@ -460,6 +484,17 @@ mod tests {
     }
 
     /// Hand-authored v12 reference-hash vector with independent verification.
+    ///
+    /// **Keep this test even though `compute_event_id_matches_real_matrix_org_event`
+    /// and `compute_event_id_matches_real_msc4242_event` below also exercise
+    /// the same pipeline against real homeserver outputs.** The hand-traced
+    /// `EXPECTED_POST_REDACTION` literal is the only place where the
+    /// post-redaction canonical bytes are spelled out in human-readable form,
+    /// which makes it auditable: when a regression splits between "redaction
+    /// changed shape" vs "sha256/canonical/b64 changed", the dual assertion
+    /// (`reference_hash == sha256(EXPECTED)` AND `id == "$pinned"`) tells you
+    /// which layer broke. The real-event vectors are end-to-end black-box
+    /// checks; this one is a glass-box check.
     ///
     /// The spec appendix only carries v1-shaped content-hash vectors (already
     /// pinned by `content_hash_spec_vector_*` above). There is no published

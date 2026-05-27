@@ -141,22 +141,14 @@ mod tests {
     use crate::Event;
     use crate::event_id::EventBuilder;
     use crate::provider::{EventInfo, InMemoryStateProvider};
+    use crate::test_utils::next_ts;
     use ruma::{room_id, user_id};
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn eid(s: &str) -> OwnedEventId {
         s.parse().expect("event id")
-    }
-
-    /// Monotonically-increasing origin_server_ts so successive placeholder
-    /// fixtures hash to distinct event_ids (post-v11-redaction they'd
-    /// collapse to the same bytes otherwise).
-    fn next_ts() -> u64 {
-        static TS: AtomicU64 = AtomicU64::new(1_700_000_000_000);
-        TS.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Construct a placeholder state event with caller-supplied auth chain

@@ -112,23 +112,14 @@ fn add_unique(keys: &mut Vec<(String, String)>, event_type: &str, state_key: Str
 mod tests {
     use super::*;
     use crate::event_id::EventBuilder;
+    use crate::test_utils::next_ts;
     use neutrino_common::ROOM_VERSION_ID;
     use ruma::room_id;
     use serde_json::{Value, json};
     use std::collections::{HashMap, HashSet};
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn eid(s: &str) -> OwnedEventId {
         s.parse().expect("test event id")
-    }
-
-    /// Monotonically-increasing origin_server_ts for the fixtures in this
-    /// module — events with otherwise-identical fields hash to the same
-    /// event_id under v11 redaction (which strips `body`), so we need a
-    /// per-fixture ts to keep them distinct.
-    fn next_ts() -> u64 {
-        static TS: AtomicU64 = AtomicU64::new(1_700_000_000_000);
-        TS.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Build a default-shape `m.room.message` event with a chosen sender —

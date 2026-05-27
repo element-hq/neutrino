@@ -1078,7 +1078,7 @@ mod tests {
             r#"{"prev_events":[],"prev_state_events":[],"content":{}}"#,
         );
 
-        let row = crate::row::EventRow::from(&event).to_owned();
+        let row = crate::row::EventRow::unchecked(&event).to_owned();
         let err = s
             .run_write(move |conn| -> Result<(), crate::error::Error> {
                 let tx = conn.transaction()?;

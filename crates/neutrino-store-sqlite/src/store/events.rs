@@ -12,39 +12,6 @@ use crate::{
     row::{EVENT_COLUMNS, EventRow},
 };
 
-/// Defence-in-depth: in debug builds, every event handed to the storage
-/// layer must round-trip through `compute_event_id(raw)` and produce the
-/// `event_id` already attached to the struct. Production code goes through
-/// `EventBuilder` / `from_wire`, both of which compute the event_id from
-/// the same canonical bytes — a mismatch here is a caller bug (hand-rolled
-/// event with the wrong id) and a hard-fail signal during development.
-///
-/// No-op in release builds.
-#[track_caller]
-fn debug_assert_event_id_matches_raw(event: &Event) {
-    #[cfg(debug_assertions)]
-    {
-        match neutrino_common::event_id::compute_event_id(&event.raw) {
-            Ok(computed) if computed == event.event_id => {}
-            Ok(computed) => panic!(
-                "persist_event: event.event_id ({}) does not match reference hash of event.raw ({}). \
-                 Either build via EventBuilder / from_wire, or fix the caller's hand-rolled id.",
-                event.event_id, computed,
-            ),
-            Err(e) => panic!(
-                "persist_event: failed to compute event_id from event.raw ({}). \
-                 The raw bytes do not satisfy `compute_event_id`'s preconditions. \
-                 Underlying error: {e}",
-                event.event_id,
-            ),
-        }
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = event;
-    }
-}
-
 #[async_trait]
 impl EventStore for SqliteStore {
     async fn persist_event(
@@ -52,7 +19,8 @@ impl EventStore for SqliteStore {
         event: &Event,
         destinations: &[&ServerName],
     ) -> Result<(), StorageError> {
-        debug_assert_event_id_matches_raw(event);
+        // event_id <-> raw consistency is asserted inside `EventRow::from`
+        // (debug builds only). No need to repeat the check here.
         let event = EventRow::from(event).to_owned();
         let destinations: Vec<OwnedServerName> =
             destinations.iter().map(|s| (*s).to_owned()).collect();
@@ -87,7 +55,7 @@ impl EventStore for SqliteStore {
     }
 
     async fn persist_historical_event(&self, event: &Event) -> Result<(), StorageError> {
-        debug_assert_event_id_matches_raw(event);
+        // event_id <-> raw consistency asserted inside `EventRow::from`.
         let event = EventRow::from(event).to_owned();
         let watch_tx = self.watch_tx.clone();
 
@@ -355,15 +323,16 @@ mod tests {
     }
 
     // Helper: write a hand-rolled `Event` via the raw `write_into_tx`
-    // path, bypassing `persist_event`'s debug B4 round-trip check. These
-    // tests intentionally use malformed/mismatched raw bytes whose
-    // `compute_event_id` wouldn't agree with the column event_id; the
-    // debug_assert would mask the storage-layer validation we want to pin.
+    // path, bypassing the `debug_assert_event_id_matches_raw` check in
+    // `EventRow::from`. These tests intentionally use malformed/mismatched
+    // raw bytes whose `compute_event_id` wouldn't agree with the column
+    // event_id; the debug_assert would mask the storage-layer validation
+    // we want to pin.
     async fn write_event_directly(
         s: &SqliteStore,
         ev: &neutrino_common::Event,
     ) -> Result<(), neutrino_store::StorageError> {
-        let row = crate::row::EventRow::from(ev).to_owned();
+        let row = crate::row::EventRow::unchecked(ev).to_owned();
         s.run_write(move |conn| -> Result<(), Error> {
             let tx = conn.transaction()?;
             row.write_into_tx(&tx)?;

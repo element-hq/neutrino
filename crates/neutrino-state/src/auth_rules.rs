@@ -857,10 +857,10 @@ fn check_rule_10_power_levels(
 mod tests {
     use super::*;
     use crate::event_id::EventBuilder;
+    use crate::test_utils::next_ts;
     use neutrino_common::ROOM_VERSION_ID;
     use ruma::{OwnedEventId, OwnedRoomId};
     use serde_json::{Value, json};
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     // ---------- fixture helpers ----------
     //
@@ -870,14 +870,6 @@ mod tests {
     // the auth-rules code only reaches into `create_event.event_id` for
     // rule 5.3.1. Tests reuse a single fixture room (`fixture_room_id`) so
     // non-create events all share a consistent `room_id`.
-
-    /// Monotonically-increasing origin_server_ts for fixtures — events that
-    /// would otherwise share their canonical bytes (after v11 redaction
-    /// strips the body) need distinct timestamps to hash to distinct ids.
-    fn next_ts() -> u64 {
-        static TS: AtomicU64 = AtomicU64::new(1_700_000_000_000);
-        TS.fetch_add(1, Ordering::Relaxed)
-    }
 
     /// Shared room_id for all non-create fixtures in this module. The
     /// auth-rules code doesn't validate room_id consistency against the

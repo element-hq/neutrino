@@ -11,6 +11,23 @@ pub mod provider;
 pub mod state_res;
 pub mod validate;
 
+#[cfg(test)]
+pub(crate) mod test_utils {
+    //! Shared helpers for `#[cfg(test)]` fixtures across the crate. Single
+    //! definition of `next_ts()` so different test modules can't desync
+    //! their counters or duplicate the AtomicU64 logic.
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Monotonically increasing test-fixture timestamp. Different test modules
+    /// share the same counter — fine because fixtures don't pin literal
+    /// values, only their relative ordering matters. Starts well past v12
+    /// release so absolute values are plausible to a future debugger.
+    pub fn next_ts() -> u64 {
+        static TS: AtomicU64 = AtomicU64::new(1_700_000_000_000);
+        TS.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
 // The canonical `Event` type and the `RoomVersion` enum live in
 // `neutrino-common` so storage and state-machine code share them. See
 // `event-id-design.md` for the rationale.
