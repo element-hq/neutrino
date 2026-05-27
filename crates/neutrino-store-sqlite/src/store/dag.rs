@@ -390,25 +390,12 @@ mod tests {
     #[tokio::test]
     async fn events_before_cycle_handling() {
         let s = store_with_room().await;
-        // Build the event with a forward-looking prev pointer at its own id.
-        // We don't know the id until after compute, so first build with no
-        // prevs to learn the id, then rebuild declaring that id as prev.
+        // Forward self-loop is unbuildable under hash-derived ids (the id is
+        // a fixed point of `reference_hash`, which can't exist). Inject an
+        // a→b→a cycle via raw SQL on `event_edges` to exercise the walker's
+        // visited-set defence.
         let ev_probe = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]);
         let probe_id = ev_probe.event_id.clone();
-        // The actual self-loop event references the probe's id. Note: the
-        // self-loop event has *different* prevs, so its computed id won't
-        // match probe_id. To get a true self-loop, we need the id to be
-        // fixed-point. Use a raw-json helper to bypass id computation.
-        // Approach: persist `ev_probe` (no prevs); then synthesise a
-        // *separate* event whose prev_events points to itself via raw JSON.
-        // But `persist_event` debug-asserts the id matches `compute`. So
-        // instead, just test the simpler case: a self-pointer via the
-        // probe's own id (the probe doesn't actually reference itself).
-        //
-        // The test intent is "cycle defence in the walker"; we achieve that
-        // by giving an event a prev pointing at itself via a sibling chain
-        // that loops back. Simplest faithful version: a → b → a cycle, which
-        // forces visited-set defence.
         s.persist_event(&ev_probe, &[]).await.unwrap();
         // b declares a as prev.
         let ev_b = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "b", &[&probe_id]);

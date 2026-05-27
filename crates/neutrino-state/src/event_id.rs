@@ -216,12 +216,15 @@ impl EventBuilder {
 
         // Defence-in-depth: round-trip through the wire-format validator.
         // For create events, parse_event derives room_id from event_id (sigil
-        // swap), so we don't need to do that here. A failure at this step
-        // means the builder produced bytes that parse_event rejects — that's
-        // a builder bug, never a caller bug, so we panic loudly rather than
-        // surface it as an opaque `FormatError` the caller can't act on.
-        Ok(parse_event(raw, event_id, self.auth_events)
-            .expect("builder output round-trips through parse_event"))
+        // swap), so we don't need to do that here.
+        //
+        // Failures here are caller bugs (not builder bugs): the builder doesn't
+        // validate every field `parse_event` does — `state_key` for member
+        // events must parse as a user id (`MalformedId`), `content` shape for
+        // `m.room.create` / `m.room.power_levels` is rule-checked, etc. Bubble
+        // the `FormatError` up so the caller sees the specific reason rather
+        // than a panic from inside the builder.
+        parse_event(raw, event_id, self.auth_events)
     }
 }
 
@@ -542,6 +545,26 @@ mod tests {
                 expected: "object"
             }
         ));
+    }
+
+    #[test]
+    fn build_surfaces_parse_event_error_when_caller_violates_rule_1_1() {
+        // The builder doesn't reject every shape that `parse_event` rejects
+        // — e.g. a create event with `prev_events` set passes the skeleton
+        // checks but trips v12 rule 1.1. Previously this `.expect`-panicked
+        // from inside `build()`; now the `FormatError` bubbles up so the
+        // caller sees the specific rule that fired.
+        let err = EventBuilder::new(user("@a:d"), "m.room.create".to_owned())
+            .state_key(String::new())
+            .content(json!({ "room_version": neutrino_common::ROOM_VERSION_ID }))
+            .prev_events(vec![eid("$bogus:d")])
+            .origin_server_ts(1)
+            .build()
+            .expect_err("create with prev_events must surface as FormatError");
+        assert!(
+            matches!(err, FormatError::CreateHasPrevEvents),
+            "expected CreateHasPrevEvents, got: {err:?}"
+        );
     }
 
     // ---------- from_wire ----------
