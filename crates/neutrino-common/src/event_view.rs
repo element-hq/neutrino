@@ -135,39 +135,17 @@ impl TryFrom<&Event> for Raw<AnyStrippedStateEvent> {
     }
 }
 
-/// Strip a typed `Raw<AnySyncStateEvent>` down to MSC1772 stripped form
-/// (`type`, `state_key`, `sender`, `content`). The orphan rule forbids
-/// expressing this as a `From` / `TryFrom` impl (both `Raw<…>` types live in
-/// ruma, no local type in the signature), so it's a free function instead.
+/// Strip a `Raw<AnySyncStateEvent>` down to MSC1772 stripped form (`type`,
+/// `state_key`, `sender`, `content`). Free function because the orphan
+/// rule forbids `impl TryFrom<Raw<_>> for Raw<_>` — both types are foreign.
 ///
-/// Used by the legacy `/sync` stub to translate a v5 sliding-sync response's
-/// `required_state` into v3 `knock_state.events` for knocked rooms — the v5
-/// handler doesn't natively populate `invite_state` for knocks (its
-/// `is_invited` check matches only `invite`), so `required_state` is the
-/// source field, but v3's `knock_state` is defined as stripped state.
-///
-/// # Why this is infallible
-///
-/// Constructing a `Raw<T>` does **not** validate the bytes against `T` —
-/// `Raw::from_json` and `Raw::cast_unchecked` both accept any JSON. Type
-/// validation only happens at `.deserialize::<T>()` time. So the input here
-/// might be a well-formed state event, might be anything.
-///
-/// That's fine: the operation we perform is "pick out whichever of these
-/// four canonical fields exist at the root", which is well-defined for any
-/// JSON object. If the input isn't a JSON object, or carries none of the
-/// four fields, the result is an empty `{}` — still a valid `Raw`. The
-/// caller can `.deserialize::<AnyStrippedStateEvent>()` on the result if
-/// they want type validation; that's where any structural deficiency
-/// surfaces, not here.
+/// Infallible: keeps whichever of the four canonical fields are present at
+/// the root. Non-object / missing-field inputs yield `{}`. `Raw<T>` doesn't
+/// validate bytes against `T` at construction, so structural validation is
+/// the caller's job, via `.deserialize::<AnyStrippedStateEvent>()`.
 pub fn strip_state_event(raw: &Raw<AnySyncStateEvent>) -> Raw<AnyStrippedStateEvent> {
-    // `Raw::json()` returns a `&RawValue`, whose bytes are valid JSON by
-    // construction — the re-parse cannot fail.
     let parsed: Value = serde_json::from_str(raw.json().get())
         .expect("Raw<…> bytes are valid JSON by RawValue invariant");
-    // `Value::get(&str)` returns `None` for any non-object root, so the
-    // loop is well-defined even for arrays/strings/numbers — see the
-    // function-level doc.
     let mut stripped = Map::new();
     for field in ["type", "state_key", "sender", "content"] {
         if let Some(v) = parsed.get(field) {

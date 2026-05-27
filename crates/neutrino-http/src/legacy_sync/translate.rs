@@ -284,18 +284,13 @@ fn invite_room_shape(room: &v5::response::Room) -> Value {
 /// emitted `knock_state.events` carries only the four canonical stripped
 /// fields, matching the v3 spec.
 fn knock_room_shape(room: &v5::response::Room) -> Value {
-    // Strip each v5 `required_state` entry down to v3 stripped-state shape
-    // (`type`, `state_key`, `sender`, `content` only). `strip_state_event` is
-    // infallible by contract — its input is a `Raw<AnySyncStateEvent>` the
-    // caller already validated — and `Raw<…>` serialises directly, so we
-    // hand the typed vec to `json!` without an intermediate parse.
+    // `strip_state_event` is infallible and `Raw<T>` already implements
+    // `Serialize`, so the typed vec goes straight to `json!`.
     //
-    // Note for the next reader: a knocked room's state arrives from the
-    // remote homeserver's `/send_knock` response (we haven't joined it), so
-    // a malformed entry here is a federated-input bug, not local corruption.
-    // Today the upstream is well-formed because we wrote the state ourselves
-    // — once real federation lands, expect this path to start needing
-    // defensive handling (drop + warn) instead of trusting the input.
+    // Knocked rooms get their state from the remote homeserver's
+    // `/send_knock` response — once real federation lands, malformed
+    // upstream entries become possible and this path will need a
+    // defensive drop-and-warn instead of trusting the input.
     let events: Vec<Raw<AnyStrippedStateEvent>> = room
         .required_state
         .iter()

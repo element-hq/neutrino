@@ -18,6 +18,7 @@ From `crates/neutrino-http/src/lib.rs:99-144`:
 | GET | `/_matrix/client/v3/user/{self}/account_data/{type}` | stub |
 | GET | `/_matrix/client/v3/room_keys/version` | stub |
 | POST | `/_matrix/client/v3/createRoom` | basic; **drops** `preset`, `topic`, `visibility`, `creation_content`, `initial_state`, `invite`, `room_alias_name`, `power_level_content_override`, `room_version` |
+| GET | `/_matrix/client/v3/capabilities` | advertises `m.room_versions.default = "12"`, `available = {"12": "stable"}` (see PLAN.md 2026-05-27 — the wire `room_version` is the MSC4242 unstable id, the advertised string is the stable `"12"` to keep `gomatrixserverlib.MustGetRoomVersion` happy) |
 | GET | `/_matrix/client/v3/rooms/{room_id}/members` | ignores `at`/`membership` filters |
 | PUT | `/_matrix/client/v3/rooms/{room_id}/send/{type}/{msg_id}` | the only write endpoint |
 | POST | `/_matrix/client/v3/pushers/set` | stub |
@@ -96,7 +97,6 @@ The stub need only `POST /user/{uid}/filter → {"filter_id": "<uuid>"}` and `GE
 - Room aliases, hierarchy/spaces
 - `/messages`, `/redact`, `/forget`, `/upgrade`, `/kick`, `/ban`, `/unban`, `/typing`, `/devices`
 - Profile per-user APIs
-- Capabilities endpoint
 - All `tests/msc{2836,3391,3757,3874,3890,3930,3967,4140,4155,4306}` directories
 
 ---

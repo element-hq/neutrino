@@ -1,15 +1,14 @@
 # `Event` ↔ ruma client-view conversions
 
-Status: design (2026-05-27). Drives the fix for the failing complement test
-`TestRoomCreate/Parallel/Can_/sync_newly_created_room`. See PLAN.md decisions
-log once landed for any deviations from this sketch.
+Status: landed 2026-05-27 (branch `kaylendog/fix/sss-eventid`). The bits flagged
+"future endpoint" stay descriptive — the impl exists, callers do not.
 
 ## Goal
 
-Add conventional Rust `From` / `TryFrom` impls converting
-`neutrino_common::Event` to ruma's client-facing `Raw<T>` shapes, so that the
-CSAPI delivers events with the server-computed fields (`event_id`, and
-`room_id` on create events) that v12 / MSC4242 wire bytes deliberately omit.
+Conventional Rust `From` / `TryFrom` impls converting `neutrino_common::Event`
+to ruma's client-facing `Raw<T>` shapes, so the CSAPI delivers events with the
+server-computed fields (`event_id`, and `room_id` on create events) that v12 /
+MSC4242 wire bytes deliberately omit.
 
 ## Root cause being fixed
 
@@ -20,24 +19,25 @@ event_id via sigil swap). `event_id`, `room_id`, and `auth_events` live on
 the `Event` struct as server-computed sidecar fields. See
 `event-id-design.md` §"Co-location pattern".
 
-`sliding_sync/build.rs` currently constructs the `/sync` timeline and
+`sliding_sync/build.rs` previously constructed the `/sync` timeline and
 `required_state` arrays by passing `e.raw.clone()` straight into
 `Raw::<…>::from_json`, with no enrichment. The legacy `/v3/sync` wrapper
-(`legacy_sync/translate.rs`) forwards these verbatim into
+(`legacy_sync/translate.rs`) forwarded these verbatim into
 `rooms.join.<id>.timeline.events`.
 
-So the CSAPI `/sync` response delivers events with no `event_id`. Meanwhile
+So the CSAPI `/sync` response delivered events with no `event_id`. Meanwhile
 `PUT /_matrix/client/v3/rooms/{}/send/{type}/{txn}` returns
 `{event_id: "$abc…"}` (the computed reference hash). Complement's
 `SendEventSynced` calls
 `MustSyncUntil(SyncTimelineHas(roomID, ev => ev.event_id == eventID))` —
-which can never match.
+which could never match.
 
 ## Module location
 
-New module: `crates/neutrino-common/src/event_view.rs`, declared from
-`lib.rs`. No new dependencies — `neutrino-common` already pulls in `ruma`,
-`serde_json`, and `thiserror` (since the 2026-05-22 PR-1 type unification).
+Module: `crates/neutrino-common/src/event_view.rs`, declared from `lib.rs`.
+The `ruma` dep on `neutrino-common` gained the `events` feature so the
+`Raw<AnyXxx>` types are reachable directly (was implicitly enabled
+transitively via `neutrino-http`'s `client-api-s` feature).
 
 ## The five conversions
 
@@ -47,9 +47,9 @@ Infallible — timeline targets accept both message and state events:
   — `/sync` `timeline.events` (v3 and v5)
 - `impl From<&Event> for Raw<AnyTimelineEvent>`
   — `/_matrix/client/v3/rooms/{}/event/{eventId}` full-event view
-  (anticipates the endpoint listed in PLAN.md but not yet built)
+  (forward-declared; the endpoint itself is not yet routed)
 
-Fallible — state-shaped targets require `state_key`:
+Fallible — state-shaped targets require `Event.state_key.is_some()`:
 
 - `impl TryFrom<&Event> for Raw<AnySyncStateEvent>`
   — `/sync` `state.events` / v5 `required_state`
@@ -60,15 +60,23 @@ All four are orphan-rule-legal because `Event` (local to `neutrino-common`)
 appears as a type parameter to the trait — the local-type anchor the orphan
 rule requires.
 
-Free function for the Raw→Raw strip — orphan rule forbids it as a trait
-impl (both `Raw<AnySyncStateEvent>` and `Raw<AnyStrippedStateEvent>` are
-foreign types):
+Infallible free function for the Raw→Raw strip — orphan rule forbids it as
+a trait impl (both `Raw<…>` types are foreign):
 
 ```rust
 pub fn strip_state_event(
     raw: &Raw<AnySyncStateEvent>,
-) -> Result<Raw<AnyStrippedStateEvent>, StateEventConversionError>;
+) -> Raw<AnyStrippedStateEvent>;
 ```
+
+Why infallible: `Raw<T>` doesn't validate against `T` at construction
+(`from_json` / `cast_unchecked` accept any JSON; validation only happens at
+`.deserialize()` time), so we can't lean on the input being a state event.
+What we *can* do is "collect whichever of `type` / `state_key` / `sender` /
+`content` exist at the root", which is well-defined for any JSON value —
+`Value::get(&str)` returns `None` on non-objects, so the loop is a no-op
+and the result is `{}`. Structural validity surfaces at the caller's
+downstream `.deserialize::<AnyStrippedStateEvent>()`, not here.
 
 ## Error type
 
@@ -77,16 +85,15 @@ pub fn strip_state_event(
 pub enum StateEventConversionError {
     #[error("event of type {event_type} has no state_key — cannot represent as a state event")]
     NotAStateEvent { event_type: String },
-    #[error("Raw<AnySyncStateEvent> JSON is malformed: {0}")]
-    Malformed(#[from] serde_json::Error),
-    #[error("Raw<AnySyncStateEvent> is missing required field {0}")]
-    MissingField(&'static str),
 }
 ```
 
-The two `&Event` TryFrom impls only return `NotAStateEvent`; the Raw→Raw
-`strip_state_event` can return any of the three (the input is type-opaque
-JSON behind `Raw<T>`).
+Single variant: the two `TryFrom<&Event>` impls hit it when
+`Event.state_key` is `None`. It's `#[from]`-bridged into
+`sliding_sync::SyncError::EventConversion`, mapped to HTTP 500 `M_UNKNOWN`
+in `lib.rs::sync` and `legacy_sync::handle` — every reachable case is a
+storage-layer invariant violation (a row claiming to carry a state event
+has `state_key = NULL`), not bad input.
 
 ## Shared helper
 
@@ -119,40 +126,48 @@ The `.expect`s are justified by `Event` invariants — `parse_event` already
 validated that `raw` is a JSON object and re-serialising a `serde_json::Map`
 back to `RawValue` is type-system-guaranteed infallible.
 
-## Call-site migrations
+## Call sites
 
-| File:line | Before | After |
-|---|---|---|
-| `sliding_sync/build.rs:585-588` | `Raw::from_json(e.raw.clone())` | `e.into()` |
-| `sliding_sync/build.rs:610-613` | `Raw::from_json(e.raw.clone())` | `e.try_into().expect("current_state events have state_keys by HashMap key invariant")` |
-| `sliding_sync/build.rs:812-828` (`strip_state_event(&Event)`) | bespoke fn | delete; callers use `TryFrom<&Event>` |
-| `legacy_sync/translate.rs:303-315` (`strip_state_event(&Raw<…>)`) | bespoke fn | delete; callers use `event_view::strip_state_event` |
+| File | What it does |
+|---|---|
+| `sliding_sync/build.rs` timeline loop | `timeline_events.iter().map(Into::into)` → `Vec<Raw<AnySyncTimelineEvent>>` |
+| `sliding_sync/build.rs` required_state | `.map(TryInto::try_into).collect::<Result<_, _>>()?` — error propagates via `SyncError::EventConversion` |
+| `sliding_sync/build.rs` invite member | `ev.try_into()?` — same propagation |
+| `legacy_sync/translate.rs::knock_room_shape` | `room.required_state.iter().map(event_view::strip_state_event).collect::<Vec<Raw<AnyStrippedStateEvent>>>()`, handed straight to `json!` |
 
-Sliding-sync's `required_state` events come from `current_room_state`, a
-`HashMap<(String, String), Event>` keyed by `(type, state_key)`, so
-`state_key` is structurally guaranteed at the call site. The `.expect`
-message documents *why* the conversion is safe there. The alternative —
-`filter_map(|e| e.try_into().ok())` — silently drops bugs, so we don't use
-it.
+The `expect`-message at each `TryInto` site argued the conversion couldn't
+fail (state map / member lookup guarantees `state_key.is_some()`). True
+for well-formed storage, but CLAUDE.md bans `.expect` in handler code:
+a storage-layer regression would have panicked instead of returning 500.
+We now propagate.
 
-Federation paths (`StorageBackend::persist_event`, the outbox sender) are
-untouched. They continue to ship `Event.raw` verbatim, which is correct
-because federation peers verify the reference hash against the wire bytes.
+Federation paths (`StorageBackend::persist_event` → outbox) untouched.
+They continue to ship `Event.raw` verbatim, which is correct because
+federation peers verify the reference hash against the wire bytes.
 
 ## Tests
 
-Unit tests in `neutrino-common::event_view::tests`:
+Unit tests in `neutrino-common::event_view::tests` (13 total):
 
 - `from_event_for_sync_timeline_injects_event_id`
 - `from_event_for_sync_timeline_create_event_carries_room_id`
 - `from_event_for_sync_timeline_non_create_strips_room_id`
+- `from_event_for_sync_timeline_preserves_unsigned`
 - `try_from_event_for_sync_state_err_when_no_state_key`
 - `try_from_event_for_sync_state_ok_when_state_key_present`
+- `try_from_event_for_sync_state_preserves_unsigned_and_prev_content`
 - `try_from_event_for_stripped_state_keeps_only_four_canonical_fields`
 - `try_from_event_for_stripped_state_err_when_no_state_key`
 - `from_event_for_room_event_carries_both_ids`
+- `from_event_for_room_event_create_event_also_carries_both_ids`
 - `strip_state_event_drops_non_canonical_fields`
-- `strip_state_event_err_when_state_key_missing`
+- `strip_state_event_returns_empty_for_non_object_input`
+
+In `neutrino-state::event_id::tests`:
+
+- `build_output_raw_lacks_event_id` — pins that `EventBuilder` never
+  serialises `event_id` into `raw` for either create or non-create
+  output; the load-bearing invariant the enrichment pipeline rests on.
 
 E2e regressions — landing these closes the gap that let the original bug
 ship:
@@ -160,22 +175,6 @@ ship:
 - `tests/e2e_legacy_sync.rs::send_event_then_legacy_sync_returns_event_with_event_id`
 - `tests/e2e_legacy_sync.rs::legacy_sync_create_event_carries_room_id_and_event_id`
 - `tests/e2e_sliding_sync.rs::put_event_then_sliding_sync_returns_event_with_event_id`
-
-## Order of operations
-
-Small, atomic commits:
-
-1. New `event_view` module + the five conversions + unit tests.
-   `cargo test -p neutrino-common`.
-2. Migrate `sliding_sync/build.rs` timeline + state-events sites; delete
-   the local `strip_state_event(&Event)` helper.
-   `cargo test -p neutrino-http`.
-3. Migrate `legacy_sync/translate.rs`; delete the local
-   `strip_state_event(&Raw<…>)` helper. `cargo test -p neutrino-http`.
-4. Land the three e2e regressions. They pass against the migrated code.
-5. `cargo fmt && cargo clippy --workspace --all-targets -- -D warnings &&
-   cargo test --workspace`. Update PLAN.md status + decisions log; append
-   LOG.md.
 
 ## Non-goals (explicitly out of scope)
 
