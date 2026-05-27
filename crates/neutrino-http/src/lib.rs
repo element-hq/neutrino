@@ -138,6 +138,7 @@ pub async fn router(config: Config) -> Result<Router, StartupError> {
             put(put_event),
         )
         .route("/_matrix/client/v3/pushers/set", post(pushers_set))
+        .route("/_matrix/client/v3/capabilities", get(get_capabilities))
         .fallback(default_fallback)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -715,6 +716,17 @@ fn stored_event_from_json(value: &Value) -> Option<Event> {
 
 async fn pushers_set() -> (StatusCode, Json<Value>) {
     (StatusCode::OK, Json(json!({})))
+}
+
+async fn get_capabilities() -> Json<Value> {
+    Json(json!({
+        "capabilities": {
+            "m.room_versions": {
+                "default": "12",
+                "available": { "12": "stable" }
+            }
+        }
+    }))
 }
 
 async fn default_fallback(request: axum::extract::Request) -> (StatusCode, &'static str) {
