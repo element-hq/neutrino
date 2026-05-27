@@ -18,19 +18,23 @@
 //! `#[test]` that loops over `REQUIRED_FIELDS` — sweeping a fixed array
 //! doesn't need proptest entropy.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use neutrino_common::ROOM_VERSION_ID;
+use neutrino_common::event_id::room_id_from_create;
 use neutrino_state::auth_events::{auth_event_keys, calculate_auth_events};
 use neutrino_state::auth_rules::check_auth_rules;
 use neutrino_state::event_id::EventBuilder;
 use neutrino_state::provider::{EventInfo, InMemoryStateProvider, StateProvider};
-use neutrino_state::state_res::{auth_chain_difference, conflicted_subgraph, separate};
+use neutrino_state::state_res::{
+    auth_chain_difference, conflicted_subgraph, iterative_auth_checks, power_of_sender,
+    reverse_topological_power_sort, separate,
+};
 use neutrino_state::validate::parse_event;
 use neutrino_state::{Event, FormatError, StateMap};
 use proptest::prelude::*;
-use ruma::{OwnedEventId, OwnedUserId, room_id};
+use ruma::{OwnedEventId, OwnedUserId, RoomId, room_id};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
@@ -1024,5 +1028,292 @@ proptest! {
         let expected: HashSet<OwnedEventId> =
             ids[deeper..shallower].iter().cloned().collect();
         prop_assert_eq!(diff, expected);
+    }
+}
+
+// ====================================================================
+// Phase 4b: power_of_sender / reverse_topological_power_sort / IAC
+// ====================================================================
+
+/// Monotonic per-call ts for prop fixtures. Distinct from `arb_*`'s ts ranges
+/// (which start at 1_700_000_000_000) — using a separate base avoids ts
+/// collisions between the strategy-generated events and these builder-emitted
+/// fixtures, so v11 redaction never collapses two distinct fixtures to the
+/// same event_id.
+fn prop_ts() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static T: AtomicU64 = AtomicU64::new(1_800_000_000_000);
+    T.fetch_add(1, Ordering::Relaxed)
+}
+
+fn prop_build_create(creator: &str, additional_creators: &[String], federate: bool) -> Event {
+    let mut content = json!({ "room_version": ROOM_VERSION_ID });
+    if !additional_creators.is_empty() {
+        content["additional_creators"] = json!(additional_creators);
+    }
+    if !federate {
+        content["m.federate"] = json!(false);
+    }
+    EventBuilder::new(
+        creator.parse::<OwnedUserId>().expect("creator user id"),
+        "m.room.create".to_owned(),
+    )
+    .state_key(String::new())
+    .content(content)
+    .origin_server_ts(prop_ts())
+    .build()
+    .expect("valid create")
+}
+
+fn prop_build_msg(room_id: &RoomId, sender: &str, auth: Vec<OwnedEventId>) -> Event {
+    EventBuilder::new(
+        sender.parse::<OwnedUserId>().expect("sender user id"),
+        "m.room.message".to_owned(),
+    )
+    .room_id(room_id.to_owned())
+    .content(json!({ "msgtype": "m.text", "body": "hi" }))
+    .auth_events(auth)
+    .origin_server_ts(prop_ts())
+    .build()
+    .expect("valid message")
+}
+
+fn prop_build_pl(room_id: &RoomId, sender: &str, content: Value, auth: Vec<OwnedEventId>) -> Event {
+    EventBuilder::new(
+        sender.parse::<OwnedUserId>().expect("sender user id"),
+        "m.room.power_levels".to_owned(),
+    )
+    .room_id(room_id.to_owned())
+    .state_key(String::new())
+    .content(content)
+    .auth_events(auth)
+    .origin_server_ts(prop_ts())
+    .build()
+    .expect("valid power_levels")
+}
+
+/// 1–`max` distinct user IDs (HashSet collapses duplicates from `arb_user_id`).
+/// The min is set to 1 so callers always have at least one user to designate
+/// as the room creator.
+fn arb_distinct_user_ids(max: usize) -> impl Strategy<Value = Vec<String>> {
+    prop::collection::hash_set(arb_user_id(), 1..=max).prop_map(|set| set.into_iter().collect())
+}
+
+/// PL `users` map: at most 5 entries, integer power levels in `[-100, 100]`.
+fn arb_pl_users() -> impl Strategy<Value = HashMap<String, i64>> {
+    prop::collection::hash_map(arb_user_id(), -100i64..=100, 0..5)
+}
+
+/// Render a `users` map plus `users_default` into a v12 `m.room.power_levels`
+/// content payload. Tests vary only the bits power_of_sender consults.
+fn pl_content(users: &HashMap<String, i64>, users_default: i64) -> Value {
+    let mut users_json = serde_json::Map::new();
+    for (u, v) in users {
+        users_json.insert(u.clone(), json!(v));
+    }
+    json!({ "users_default": users_default, "users": users_json })
+}
+
+proptest! {
+    /// Property 1: creators (the create event's sender + everyone in
+    /// `additional_creators`) always get `i64::MAX`, regardless of what the
+    /// PL's `users` map or `users_default` would otherwise assign them.
+    /// Spec v12: creators "cannot be demoted to a lower power level, even
+    /// through m.room.power_levels".
+    #[test]
+    fn power_of_sender_creator_always_max(
+        creators in arb_distinct_user_ids(4),
+        pl_users in arb_pl_users(),
+        pl_users_default in -100i64..=100,
+        creator_idx in 0usize..32,
+    ) {
+        let primary = creators[0].clone();
+        let additional: Vec<String> = creators[1..].to_vec();
+
+        let create = prop_build_create(&primary, &additional, true);
+        let room_id = room_id_from_create(&create.event_id);
+        let create_id = create.event_id.clone();
+        let mut provider = InMemoryStateProvider::new();
+        provider.insert(EventInfo { event: Arc::new(create), rejected: false });
+
+        // PL authored by the primary creator (anyone in `creators` could
+        // author it — the choice doesn't affect power_of_sender for senders).
+        let pl = prop_build_pl(&room_id, &primary, pl_content(&pl_users, pl_users_default), vec![create_id.clone()]);
+        let pl_id = pl.event_id.clone();
+        provider.insert(EventInfo { event: Arc::new(pl), rejected: false });
+
+        // Pick any creator as the sender.
+        let sender = &creators[creator_idx % creators.len()];
+        let msg = prop_build_msg(&room_id, sender, vec![create_id, pl_id]);
+        prop_assert_eq!(power_of_sender(&msg, &provider).unwrap(), i64::MAX);
+    }
+
+    /// Property 2: a PL marked `rejected: true` in the provider is treated
+    /// identically to "no PL at all". For any pair (sender, PL content) the
+    /// power computed with a rejected PL must equal the power computed with
+    /// no PL referenced from auth_events.
+    #[test]
+    fn power_of_sender_rejected_pl_equals_no_pl(
+        pl_users in arb_pl_users(),
+        pl_users_default in -100i64..=100,
+        sender in arb_user_id(),
+    ) {
+        let creator = "@creator:example.org";
+
+        // Setup A: create + rejected PL referenced in the message's auth_events.
+        let create_a = prop_build_create(creator, &[], true);
+        let room_id_a = room_id_from_create(&create_a.event_id);
+        let create_id_a = create_a.event_id.clone();
+        let mut provider_a = InMemoryStateProvider::new();
+        provider_a.insert(EventInfo { event: Arc::new(create_a), rejected: false });
+        let pl = prop_build_pl(&room_id_a, creator, pl_content(&pl_users, pl_users_default), vec![create_id_a.clone()]);
+        let pl_id = pl.event_id.clone();
+        provider_a.insert(EventInfo { event: Arc::new(pl), rejected: true });
+        let msg_a = prop_build_msg(&room_id_a, &sender, vec![create_id_a, pl_id]);
+
+        // Setup B: create only — no PL in auth_events.
+        let create_b = prop_build_create(creator, &[], true);
+        let room_id_b = room_id_from_create(&create_b.event_id);
+        let create_id_b = create_b.event_id.clone();
+        let mut provider_b = InMemoryStateProvider::new();
+        provider_b.insert(EventInfo { event: Arc::new(create_b), rejected: false });
+        let msg_b = prop_build_msg(&room_id_b, &sender, vec![create_id_b]);
+
+        let power_a = power_of_sender(&msg_a, &provider_a).unwrap();
+        let power_b = power_of_sender(&msg_b, &provider_b).unwrap();
+        prop_assert_eq!(power_a, power_b);
+    }
+
+    /// Property 3: for a non-creator sender, power equals the PL's `users`
+    /// lookup if present, else `users_default`. Couples the impl to the
+    /// `PowerLevels::user_power` semantics at the property level.
+    #[test]
+    fn power_of_sender_non_creator_matches_pl_lookup(
+        pl_users in arb_pl_users(),
+        pl_users_default in -100i64..=100,
+        sender in arb_user_id(),
+    ) {
+        let creator = "@creator:example.org";
+        // Filter out the case where the random sender happens to land on
+        // "@creator:example.org" — that's property 1's domain.
+        prop_assume!(sender != creator);
+
+        let create = prop_build_create(creator, &[], true);
+        let room_id = room_id_from_create(&create.event_id);
+        let create_id = create.event_id.clone();
+        let mut provider = InMemoryStateProvider::new();
+        provider.insert(EventInfo { event: Arc::new(create), rejected: false });
+
+        let pl = prop_build_pl(&room_id, creator, pl_content(&pl_users, pl_users_default), vec![create_id.clone()]);
+        let pl_id = pl.event_id.clone();
+        provider.insert(EventInfo { event: Arc::new(pl), rejected: false });
+
+        let msg = prop_build_msg(&room_id, &sender, vec![create_id, pl_id]);
+        let power = power_of_sender(&msg, &provider).unwrap();
+        let expected = pl_users.get(&sender).copied().unwrap_or(pl_users_default);
+        prop_assert_eq!(power, expected);
+    }
+
+    /// Property 4: `reverse_topological_power_sort` output is a permutation
+    /// of its input (no fabrication, no loss). Catches "drop event on cycle
+    /// detection" or "duplicate emission" bugs at the algorithm level.
+    #[test]
+    fn sort_output_is_permutation_of_input(
+        (provider, ids) in arb_provider_with_ids(),
+        take in 0usize..16,
+    ) {
+        let n = take.min(ids.len());
+        let subset: HashSet<OwnedEventId> = ids.iter().take(n).cloned().collect();
+        let sorted = reverse_topological_power_sort(&subset, &provider).unwrap();
+        prop_assert_eq!(sorted.len(), subset.len());
+        let sorted_set: HashSet<OwnedEventId> = sorted.into_iter().collect();
+        prop_assert_eq!(sorted_set, subset);
+    }
+
+    /// Property 5: for every (parent, child) pair where parent ∈
+    /// child.auth_events and both are in the input subset, parent's index in
+    /// the output is strictly less than child's. The defining
+    /// reverse-topological invariant — case tests pin specific shapes, this
+    /// generalises to every subset of every closed-under-auth_events provider.
+    #[test]
+    fn sort_parents_come_before_children(
+        (provider, ids) in arb_provider_with_ids(),
+        take in 0usize..16,
+    ) {
+        let n = take.min(ids.len());
+        let subset: HashSet<OwnedEventId> = ids.iter().take(n).cloned().collect();
+        let sorted = reverse_topological_power_sort(&subset, &provider).unwrap();
+        let pos: HashMap<OwnedEventId, usize> = sorted
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i))
+            .collect();
+        for eid in &subset {
+            let info = provider.get_event(eid).expect("subset event in provider");
+            for parent in &info.event.auth_events {
+                if subset.contains(parent) {
+                    let p_idx = pos[parent];
+                    let e_idx = pos[eid];
+                    prop_assert!(
+                        p_idx < e_idx,
+                        "parent {parent} (idx {p_idx}) must come before child {eid} (idx {e_idx})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Property 7: every key written by IAC is either present in the initial
+    /// state or matches `(event_type, state_key)` of some event in `sorted`.
+    /// "No fabricated keys".
+    ///
+    /// Strategy: multiple m.room.create events (each by a distinct creator)
+    /// — every create accepts under rule 1.5, so the writeback branch fires
+    /// non-vacuously. All accepted writes land under the same key
+    /// `("m.room.create", "")` which is a legitimate sorted-event key.
+    #[test]
+    fn iac_output_keys_only_from_initial_or_sorted(
+        creators in arb_distinct_user_ids(4),
+        initial in arb_state_set(),
+    ) {
+        let mut provider = InMemoryStateProvider::new();
+        let mut sorted: Vec<OwnedEventId> = Vec::new();
+        let mut allowed_keys: HashSet<(String, String)> = initial.keys().cloned().collect();
+
+        for c in &creators {
+            let create = prop_build_create(c, &[], true);
+            let id = create.event_id.clone();
+            allowed_keys.insert((create.event_type.clone(), create.state_key.clone().unwrap_or_default()));
+            sorted.push(id);
+            provider.insert(EventInfo { event: Arc::new(create), rejected: false });
+        }
+
+        let resolved = iterative_auth_checks(&sorted, initial, &provider).unwrap();
+        for k in resolved.keys() {
+            prop_assert!(
+                allowed_keys.contains(k),
+                "fabricated key in resolved state: {k:?}"
+            );
+        }
+    }
+
+    /// Property 9: if every event in `sorted` is provider-marked
+    /// `rejected: true`, IAC's output equals the initial state byte-for-byte.
+    /// Pins the early-skip branch at the property level — sweeps arbitrary
+    /// graph shapes via `arb_provider_with_ids`.
+    #[test]
+    fn iac_all_rejected_sorted_yields_initial_state(
+        (provider, ids) in arb_provider_with_ids(),
+        initial in arb_state_set(),
+    ) {
+        // Re-insert every event in the provider with `rejected: true`. The
+        // strategy returned them all as accepted; we override.
+        let mut rejected_provider = InMemoryStateProvider::new();
+        for id in &ids {
+            let info = provider.get_event(id).expect("provider returned its own id");
+            rejected_provider.insert(EventInfo { event: info.event, rejected: true });
+        }
+        let resolved = iterative_auth_checks(&ids, initial.clone(), &rejected_provider).unwrap();
+        prop_assert_eq!(resolved, initial);
     }
 }
