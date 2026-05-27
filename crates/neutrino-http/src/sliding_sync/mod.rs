@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use neutrino_common::event_view::StateEventConversionError;
 use neutrino_store::{StorageBackend, StorageError};
 use ruma::OneTimeKeyAlgorithm;
 use ruma::UInt;
@@ -68,6 +69,12 @@ pub enum SyncError {
     BadRequest(&'static str),
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
+    /// Surfaced when a stored `Event` cannot be reshaped for client delivery
+    /// (e.g. a row claiming to carry a state event has `state_key = NULL`).
+    /// Mapped to HTTP 500 `M_UNKNOWN` at the handler boundary — every
+    /// reachable case is a storage-layer invariant violation, not bad input.
+    #[error("event conversion: {0}")]
+    EventConversion(#[from] StateEventConversionError),
 }
 
 /// Per-process state for the sliding-sync handler.

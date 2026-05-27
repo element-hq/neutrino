@@ -33,7 +33,7 @@ pub mod translate;
 /// extraction (clone `sync_state` + `user_id` out of the std-mutex'd
 /// `AppState` so we don't hold a `!Send` lock across `.await`) and error
 /// mapping (`UnknownPos` → 400 M_UNKNOWN_POS, `BadRequest` → 400
-/// M_INVALID_PARAM, `Storage` → 500 M_UNKNOWN).
+/// M_INVALID_PARAM, `Storage` / `EventConversion` → 500 M_UNKNOWN).
 pub(crate) async fn handle(
     state: State<AppState>,
     query: Query<HashMap<String, String>>,
@@ -83,6 +83,11 @@ pub(crate) async fn handle(
             error_response(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", msg)
         }
         Err(SyncError::Storage(e)) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &e.to_string(),
+        ),
+        Err(SyncError::EventConversion(e)) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "M_UNKNOWN",
             &e.to_string(),

@@ -262,6 +262,11 @@ async fn sync(
             "M_UNKNOWN",
             &e.to_string(),
         ),
+        Err(SyncError::EventConversion(e)) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &e.to_string(),
+        ),
     }
 }
 

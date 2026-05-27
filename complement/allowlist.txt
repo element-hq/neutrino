@@ -24,3 +24,11 @@ TestRegistration/parallel/Registration_accepts_non-ascii_passwords$
 TestRoomCreate/Parallel/POST_/createRoom_makes_a_private_room$
 TestRoomCreate/Parallel/POST_/createRoom_makes_a_private_room_with_invites$
 TestRoomCreate/Parallel/POST_/createRoom_makes_a_public_room$
+
+# Round-trip via /v3/sync: created room's m.room.create / m.room.member /
+# subsequently-PUT message events surface in alice's own sync. Single user,
+# no /join or /state endpoints exercised — pure validation of the legacy
+# sync stub over create_room + put_event.
+TestRoomCreate/Parallel/Can_/sync_newly_created_room$
+TestRoomCreationReportsEventsToMyself/parallel/Room_creation_reports_m.room.create_to_myself$
+TestRoomCreationReportsEventsToMyself/parallel/Room_creation_reports_m.room.member_to_myself$

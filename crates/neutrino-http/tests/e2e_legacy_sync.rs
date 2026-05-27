@@ -304,3 +304,96 @@ async fn legacy_sync_timeout_zero_returns_immediately() {
         "no-timeout sync returned promptly (elapsed = {elapsed:?})",
     );
 }
+
+#[tokio::test]
+async fn send_event_then_legacy_sync_returns_event_with_event_id() {
+    // Regression test for the complement failure
+    // `TestRoomCreate/Parallel/Can_/sync_newly_created_room`: PUT an event,
+    // capture its event_id, and verify the same id appears on the event when
+    // it comes back via /sync. The v12 / MSC4242 wire bytes don't carry
+    // event_id; this exercises the `event_view::From<&Event>` enrichment
+    // path that injects it for CSAPI delivery.
+    let app = router(config()).await.expect("router init");
+
+    let (_, body) = post(&app, "/_matrix/client/v3/createRoom", &json!({})).await;
+    let room_id = body
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+    let put_path = format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/txn-evtid");
+    let (status, put_body) = put(
+        &app,
+        &put_path,
+        &json!({"body": "regression-canary", "msgtype": "m.text"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let sent_event_id = put_body
+        .get("event_id")
+        .and_then(|v| v.as_str())
+        .expect("PUT returns event_id")
+        .to_string();
+
+    let (status, body) = get(&app, LEGACY_SYNC_PATH, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let timeline = body
+        .pointer(&format!("/rooms/join/{room_id}/timeline/events"))
+        .and_then(Value::as_array)
+        .expect("timeline.events is an array");
+
+    let found = timeline
+        .iter()
+        .any(|ev| ev.get("event_id").and_then(Value::as_str) == Some(sent_event_id.as_str()));
+    assert!(
+        found,
+        "PUT'd event must appear in the legacy /sync timeline with event_id {sent_event_id:?}: \
+         timeline={timeline:?}",
+    );
+}
+
+#[tokio::test]
+async fn legacy_sync_create_event_carries_room_id_and_event_id() {
+    // The v12 / MSC4242 wire bytes of an m.room.create event don't carry
+    // room_id (derived from event_id via sigil swap) and never carry
+    // event_id. Both must be injected when delivered via CSAPI /sync,
+    // otherwise complement / clients can't address the event.
+    let app = router(config()).await.expect("router init");
+
+    let (_, body) = post(&app, "/_matrix/client/v3/createRoom", &json!({})).await;
+    let room_id = body
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+    let (status, body) = get(&app, LEGACY_SYNC_PATH, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The create event is delivered as state on initial sync (via the
+    // wildcard required_state pulled into rooms.join.<id>.state.events).
+    let state_events = body
+        .pointer(&format!("/rooms/join/{room_id}/state/events"))
+        .and_then(Value::as_array)
+        .expect("state.events is an array");
+
+    let create = state_events
+        .iter()
+        .find(|ev| ev.get("type").and_then(Value::as_str) == Some("m.room.create"))
+        .expect("create event present in initial-sync state");
+
+    assert!(
+        create
+            .get("event_id")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty()),
+        "create event carries event_id: {create}",
+    );
+    assert_eq!(
+        create.get("room_id").and_then(Value::as_str),
+        Some(room_id.as_str()),
+        "create event carries injected room_id (wire bytes lack it for v12): {create}",
+    );
+}

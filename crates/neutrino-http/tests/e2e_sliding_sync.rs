@@ -175,6 +175,68 @@ async fn put_event_then_sync_delivers_it_in_timeline() {
 }
 
 #[tokio::test]
+async fn put_event_then_sliding_sync_returns_event_with_event_id() {
+    // Regression test mirroring the legacy /sync version: events delivered
+    // via the v5 sliding-sync endpoint must carry the same event_id that
+    // PUT /send returned to the caller. v12 / MSC4242 wire bytes don't
+    // carry event_id; this pins the `event_view::From<&Event>` enrichment
+    // for the v5 timeline path.
+    let app = router(config()).await.expect("router init");
+
+    let (_, body) = post(&app, "/_matrix/client/v3/createRoom", None, &json!({})).await;
+    let room_id = body
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+    let (_, resp1) = post(&app, SYNC_PATH, None, &sync_body_with_default_list()).await;
+    let pos1 = resp1
+        .get("pos")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+    let put_path = format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/txn-evtid-v5");
+    let (status, put_body) = put(
+        &app,
+        &put_path,
+        &json!({"body": "regression-canary-v5", "msgtype": "m.text"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let sent_event_id = put_body
+        .get("event_id")
+        .and_then(|v| v.as_str())
+        .expect("PUT returns event_id")
+        .to_string();
+
+    let pos_query = format!("pos={pos1}");
+    let (status, body) = post(
+        &app,
+        SYNC_PATH,
+        Some(&pos_query),
+        &sync_body_with_default_list(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let timeline = body
+        .pointer(&format!("/rooms/{room_id}/timeline"))
+        .and_then(Value::as_array)
+        .expect("timeline in delta response");
+
+    let found = timeline
+        .iter()
+        .any(|ev| ev.get("event_id").and_then(Value::as_str) == Some(sent_event_id.as_str()));
+    assert!(
+        found,
+        "PUT'd event must appear in the v5 timeline with event_id {sent_event_id:?}: \
+         timeline={timeline:?}",
+    );
+}
+
+#[tokio::test]
 async fn stale_pos_returns_m_unknown_pos() {
     let app = router(config()).await.expect("router init");
 
