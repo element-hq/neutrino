@@ -13,6 +13,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
+use neutrino_common::event_view;
 use neutrino_store::Membership;
 use ruma::OwnedRoomId;
 use ruma::api::client::sync::sync_events::v5;
@@ -282,36 +283,28 @@ fn invite_room_shape(room: &v5::response::Room) -> Value {
 /// emitted `knock_state.events` carries only the four canonical stripped
 /// fields, matching the v3 spec.
 fn knock_room_shape(room: &v5::response::Room) -> Value {
-    let events: Vec<Value> = room.required_state.iter().map(strip_state_event).collect();
+    // Strip each v5 `required_state` entry down to v3 stripped-state shape
+    // (`type`, `state_key`, `sender`, `content` only). Malformed inputs —
+    // missing `state_key`, unparseable JSON — are skipped with a warn:
+    // sliding-sync populates `required_state` from events we ourselves
+    // wrote through the storage round-trip, so a failure here means data
+    // corruption, not a benign protocol skew.
+    let events: Vec<Value> = room
+        .required_state
+        .iter()
+        .filter_map(|raw| match event_view::strip_state_event(raw) {
+            Ok(stripped) => serde_json::from_str(stripped.json().get()).ok(),
+            Err(e) => {
+                tracing::warn!(error = %e, "skipping malformed state event in knock_state");
+                None
+            }
+        })
+        .collect();
     json!({
         "knock_state": {
             "events": events,
         },
     })
-}
-
-/// Strip a v5 `Raw<AnySyncStateEvent>` down to the v3 stripped-state shape
-/// (`type`, `state_key`, `sender`, `content` and nothing else). Used to
-/// build `rooms.knock.{id}.knock_state.events` — v5's `required_state`
-/// carries full state events but the v3 spec defines `knock_state` as
-/// stripped state only. Ruma has no general-purpose "strip a typed state
-/// event" method (`Raw::cast` requires the concrete content type, which we
-/// don't statically know for `AnySyncStateEvent`'s 50+ variants), so we
-/// reshape the JSON directly. Missing fields are dropped silently — if a
-/// malformed event lacks one of the four, the resulting stripped object is
-/// still valid stripped state for whatever fields it does have.
-fn strip_state_event(raw: &ruma::serde::Raw<ruma::events::AnySyncStateEvent>) -> serde_json::Value {
-    let parsed: serde_json::Value = match serde_json::from_str(raw.json().get()) {
-        Ok(v) => v,
-        Err(_) => return serde_json::Value::Object(Default::default()),
-    };
-    let mut stripped = serde_json::Map::new();
-    for field in ["type", "state_key", "sender", "content"] {
-        if let Some(v) = parsed.get(field) {
-            stripped.insert(field.to_string(), v.clone());
-        }
-    }
-    serde_json::Value::Object(stripped)
 }
 
 #[cfg(test)]
@@ -684,83 +677,6 @@ mod tests {
                 "stripped event must not carry {dropped}",
             );
         }
-    }
-
-    #[test]
-    fn strip_state_event_keeps_only_canonical_four_fields() {
-        // A `Raw<AnySyncStateEvent>` carrying every server-side field a full
-        // state event might have must come out the other side of
-        // `strip_state_event` containing **exactly** the four canonical
-        // stripped fields — type, state_key, sender, content — and nothing
-        // else.
-        let raw = ruma::serde::Raw::<ruma::events::AnySyncStateEvent>::from_json(
-            to_raw_value(&json!({
-                "type": "m.room.name",
-                "state_key": "",
-                "sender": "@creator:example.org",
-                "content": {"name": "Hello"},
-                "event_id": "$evt:example.org",
-                "origin_server_ts": 1_700_000_000_000u64,
-                "unsigned": {"age": 17, "prev_sender": "@x:y"},
-                "prev_content": {"name": "Old"},
-                "room_id": "!room:example.org",
-            }))
-            .unwrap(),
-        );
-        let stripped = strip_state_event(&raw);
-        let obj = stripped.as_object().expect("stripped event is an object");
-        let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
-        assert_eq!(
-            keys,
-            ["content", "sender", "state_key", "type"]
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>(),
-            "exactly the four canonical fields are kept",
-        );
-        assert_eq!(stripped["type"], "m.room.name");
-        assert_eq!(stripped["state_key"], "");
-        assert_eq!(stripped["sender"], "@creator:example.org");
-        assert_eq!(stripped["content"], json!({"name": "Hello"}));
-        for dropped in [
-            "event_id",
-            "origin_server_ts",
-            "unsigned",
-            "prev_content",
-            "room_id",
-        ] {
-            assert!(
-                stripped.get(dropped).is_none(),
-                "stripped output must drop {dropped}",
-            );
-        }
-    }
-
-    #[test]
-    fn strip_state_event_handles_partial_events() {
-        // A malformed input missing some of the canonical fields must not
-        // panic and must not synthesize the missing ones — only the fields
-        // that were actually present pass through.
-        let raw = ruma::serde::Raw::<ruma::events::AnySyncStateEvent>::from_json(
-            to_raw_value(&json!({
-                "type": "m.room.topic",
-                "content": {"topic": "lol"},
-            }))
-            .unwrap(),
-        );
-        let stripped = strip_state_event(&raw);
-        let obj = stripped.as_object().expect("stripped event is an object");
-        let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
-        assert_eq!(
-            keys,
-            ["content", "type"]
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>(),
-            "only the fields that were present are kept",
-        );
-        assert_eq!(stripped["type"], "m.room.topic");
-        assert_eq!(stripped["content"], json!({"topic": "lol"}));
-        assert!(stripped.get("state_key").is_none());
-        assert!(stripped.get("sender").is_none());
     }
 
     #[test]

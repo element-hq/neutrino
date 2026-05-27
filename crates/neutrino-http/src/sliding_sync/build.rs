@@ -582,10 +582,8 @@ async fn build_room<S: StorageBackend>(
         (events, None, limited)
     };
 
-    let timeline_raw: Vec<Raw<AnySyncTimelineEvent>> = timeline_events
-        .iter()
-        .map(|e| Raw::<AnySyncTimelineEvent>::from_json(e.raw.clone()))
-        .collect();
+    let timeline_raw: Vec<Raw<AnySyncTimelineEvent>> =
+        timeline_events.iter().map(Into::into).collect();
     room.timeline = timeline_raw;
     room.prev_batch = prev_batch_str;
     room.limited = limited;
@@ -609,7 +607,10 @@ async fn build_room<S: StorageBackend>(
     if !state_events.is_empty() || !deleted_state_keys.is_empty() {
         let mut raw: Vec<Raw<AnySyncStateEvent>> = state_events
             .iter()
-            .map(|e| Raw::<AnySyncStateEvent>::from_json(e.raw.clone()))
+            .map(|e| {
+                e.try_into()
+                    .expect("current_state events have state_keys by HashMap key invariant")
+            })
             .collect();
         for (t, k) in &deleted_state_keys {
             raw.push(state_stub_raw(t, k));
@@ -707,7 +708,10 @@ async fn build_invite_room<S: StorageBackend>(
         stripped.extend(extract_invite_room_state(ev)?);
         // Include the invite membership itself so the client can render the
         // "you've been invited by …" preview without parsing the array.
-        stripped.push(strip_state_event(ev)?);
+        stripped.push(
+            ev.try_into()
+                .expect("invite member event has state_key by current_state_event lookup"),
+        );
         // Lift `m.room.name` / `m.room.avatar` out of `invite_room_state` to
         // the top-level fields. Without this the client sees only the
         // stripped array and falls back to heroes (unimplemented, PLAN.md)
@@ -804,27 +808,6 @@ fn extract_invite_room_state(
         out.push(Raw::<AnyStrippedStateEvent>::from_json(raw));
     }
     Ok(out)
-}
-
-/// Re-serialise a state event in MSC1772 stripped form: only `type`,
-/// `state_key`, `sender`, `content`. Drops `event_id`, `room_id`,
-/// `origin_server_ts`, and anything else a state PDU normally carries.
-fn strip_state_event(ev: &Event) -> Result<Raw<AnyStrippedStateEvent>, SyncError> {
-    let parsed: serde_json::Value = serde_json::from_str(ev.raw.get())
-        .map_err(|e| SyncError::Storage(neutrino_store::StorageError::Internal(e.to_string())))?;
-    let content = parsed
-        .get("content")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    let stripped = serde_json::json!({
-        "type": &ev.event_type,
-        "state_key": ev.state_key.as_deref().unwrap_or(""),
-        "sender": ev.sender.as_str(),
-        "content": content,
-    });
-    let raw: Box<RawValue> = serde_json::value::to_raw_value(&stripped)
-        .expect("fixed-shape JSON serialisation cannot fail");
-    Ok(Raw::<AnyStrippedStateEvent>::from_json(raw))
 }
 
 /// Filter `current_state` through `required_state` rules and diff against

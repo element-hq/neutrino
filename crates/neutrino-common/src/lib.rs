@@ -1,5 +1,6 @@
 pub mod event;
 pub mod event_id;
+pub mod event_view;
 pub use event::Event;
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8008";
