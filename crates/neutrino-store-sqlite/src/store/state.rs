@@ -314,10 +314,10 @@ mod tests {
     async fn current_room_state_returns_all_state_events() {
         let s = store().await;
         s.create_room(
-            &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
             &[
-                member_join(event_id!("$mj:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-                name_event(event_id!("$n:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "room"),
+                member_join(*ALICE_ROOM_ID, *ALICE_USER_ID),
+                name_event(*ALICE_ROOM_ID, *ALICE_USER_ID, "room"),
             ],
         )
         .await
@@ -338,12 +338,9 @@ mod tests {
     #[tokio::test]
     async fn current_state_event_none_for_missing_key() {
         let s = store().await;
-        s.create_room(
-            &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[],
-        )
-        .await
-        .unwrap();
+        s.create_room(&create_event(*ALICE_ROOM_ID, *ALICE_USER_ID), &[])
+            .await
+            .unwrap();
         let got = s
             .current_state_event(*ALICE_ROOM_ID, "m.room.name", "")
             .await
@@ -355,23 +352,17 @@ mod tests {
     #[tokio::test]
     async fn current_state_event_returns_specific() {
         let s = store().await;
-        s.create_room(
-            &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[name_event(
-                event_id!("$n:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "Test Room",
-            )],
-        )
-        .await
-        .unwrap();
+        let name_ev = name_event(*ALICE_ROOM_ID, *ALICE_USER_ID, "Test Room");
+        let name_id = name_ev.event_id.clone();
+        s.create_room(&create_event(*ALICE_ROOM_ID, *ALICE_USER_ID), &[name_ev])
+            .await
+            .unwrap();
         let got = s
             .current_state_event(*ALICE_ROOM_ID, "m.room.name", "")
             .await
             .unwrap()
             .expect("name event should be present");
-        assert_eq!(got.event_id.as_str(), "$n:e");
+        assert_eq!(got.event_id.as_str(), name_id.as_str());
     }
 
     // S5
@@ -379,11 +370,11 @@ mod tests {
     async fn current_state_events_of_type_returns_subset() {
         let s = store().await;
         s.create_room(
-            &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
             &[
-                member_join(event_id!("$mj1:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-                member_join(event_id!("$mj2:e"), *ALICE_ROOM_ID, *BOB_USER_ID),
-                name_event(event_id!("$n:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "room"),
+                member_join(*ALICE_ROOM_ID, *ALICE_USER_ID),
+                member_join(*ALICE_ROOM_ID, *BOB_USER_ID),
+                name_event(*ALICE_ROOM_ID, *ALICE_USER_ID, "room"),
             ],
         )
         .await
@@ -411,22 +402,14 @@ mod tests {
     async fn joined_rooms_returns_user_rooms() {
         let s = store().await;
         s.create_room(
-            &create_event(event_id!("$c1:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[member_join(
-                event_id!("$mj1:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-            )],
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
+            &[member_join(*ALICE_ROOM_ID, *ALICE_USER_ID)],
         )
         .await
         .unwrap();
         s.create_room(
-            &create_event(event_id!("$c2:e"), *BOB_ROOM_ID, *ALICE_USER_ID),
-            &[member_join(
-                event_id!("$mj2:e"),
-                *BOB_ROOM_ID,
-                *ALICE_USER_ID,
-            )],
+            &create_event(*BOB_ROOM_ID, *ALICE_USER_ID),
+            &[member_join(*BOB_ROOM_ID, *ALICE_USER_ID)],
         )
         .await
         .unwrap();
@@ -443,17 +426,13 @@ mod tests {
     async fn joined_rooms_excludes_non_join_membership() {
         let s = store().await;
         s.create_room(
-            &create_event(event_id!("$c1:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[member_join(
-                event_id!("$mj:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-            )],
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
+            &[member_join(*ALICE_ROOM_ID, *ALICE_USER_ID)],
         )
         .await
         .unwrap();
         // alice leaves *ALICE_ROOM_ID
-        let leave = member_leave(event_id!("$ml:e"), *ALICE_ROOM_ID, *ALICE_USER_ID);
+        let leave = member_leave(*ALICE_ROOM_ID, *ALICE_USER_ID);
         s.persist_event(&leave, &[]).await.unwrap();
 
         assert!(s.joined_rooms(*ALICE_USER_ID).await.unwrap().is_empty());
@@ -464,10 +443,10 @@ mod tests {
     async fn joined_members_returns_joined_users() {
         let s = store().await;
         s.create_room(
-            &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
             &[
-                member_join(event_id!("$mj1:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-                member_join(event_id!("$mj2:e"), *ALICE_ROOM_ID, *BOB_USER_ID),
+                member_join(*ALICE_ROOM_ID, *ALICE_USER_ID),
+                member_join(*ALICE_ROOM_ID, *BOB_USER_ID),
             ],
         )
         .await
@@ -484,21 +463,18 @@ mod tests {
     async fn joined_members_excludes_non_joined() {
         let s = store().await;
         s.create_room(
-            &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
             &[
-                member_join(event_id!("$mj1:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-                member_join(event_id!("$mj2:e"), *ALICE_ROOM_ID, *BOB_USER_ID),
+                member_join(*ALICE_ROOM_ID, *ALICE_USER_ID),
+                member_join(*ALICE_ROOM_ID, *BOB_USER_ID),
             ],
         )
         .await
         .unwrap();
         // bob leaves
-        s.persist_event(
-            &member_leave(event_id!("$ml:e"), *ALICE_ROOM_ID, *BOB_USER_ID),
-            &[],
-        )
-        .await
-        .unwrap();
+        s.persist_event(&member_leave(*ALICE_ROOM_ID, *BOB_USER_ID), &[])
+            .await
+            .unwrap();
 
         let got = s.joined_members(*ALICE_ROOM_ID).await.unwrap();
         assert_eq!(got.len(), 1);
@@ -511,12 +487,8 @@ mod tests {
     async fn rooms_with_membership_empty_memberships_returns_empty() {
         let s = store().await;
         s.create_room(
-            &create_event(event_id!("$c:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[member_join(
-                event_id!("$mj:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-            )],
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
+            &[member_join(*ALICE_ROOM_ID, *ALICE_USER_ID)],
         )
         .await
         .unwrap();
@@ -533,32 +505,21 @@ mod tests {
         let s = store().await;
         // *ALICE_ROOM_ID: alice joined
         s.create_room(
-            &create_event(event_id!("$c1:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[member_join(
-                event_id!("$mj1:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-            )],
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
+            &[member_join(*ALICE_ROOM_ID, *ALICE_USER_ID)],
         )
         .await
         .unwrap();
         // *BOB_ROOM_ID: alice joined then left
         s.create_room(
-            &create_event(event_id!("$c2:e"), *BOB_ROOM_ID, *ALICE_USER_ID),
-            &[member_join(
-                event_id!("$mj2:e"),
-                *BOB_ROOM_ID,
-                *ALICE_USER_ID,
-            )],
+            &create_event(*BOB_ROOM_ID, *ALICE_USER_ID),
+            &[member_join(*BOB_ROOM_ID, *ALICE_USER_ID)],
         )
         .await
         .unwrap();
-        s.persist_event(
-            &member_leave(event_id!("$ml:e"), *BOB_ROOM_ID, *ALICE_USER_ID),
-            &[],
-        )
-        .await
-        .unwrap();
+        s.persist_event(&member_leave(*BOB_ROOM_ID, *ALICE_USER_ID), &[])
+            .await
+            .unwrap();
 
         let mut got = s
             .rooms_with_membership(
@@ -580,31 +541,20 @@ mod tests {
     async fn rooms_with_membership_filters_by_value() {
         let s = store().await;
         s.create_room(
-            &create_event(event_id!("$c1:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[member_join(
-                event_id!("$mj1:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-            )],
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
+            &[member_join(*ALICE_ROOM_ID, *ALICE_USER_ID)],
         )
         .await
         .unwrap();
         s.create_room(
-            &create_event(event_id!("$c2:e"), *BOB_ROOM_ID, *ALICE_USER_ID),
-            &[member_join(
-                event_id!("$mj2:e"),
-                *BOB_ROOM_ID,
-                *ALICE_USER_ID,
-            )],
+            &create_event(*BOB_ROOM_ID, *ALICE_USER_ID),
+            &[member_join(*BOB_ROOM_ID, *ALICE_USER_ID)],
         )
         .await
         .unwrap();
-        s.persist_event(
-            &member_leave(event_id!("$ml:e"), *BOB_ROOM_ID, *ALICE_USER_ID),
-            &[],
-        )
-        .await
-        .unwrap();
+        s.persist_event(&member_leave(*BOB_ROOM_ID, *ALICE_USER_ID), &[])
+            .await
+            .unwrap();
 
         // Only ask for "leave"
         let got = s
@@ -655,50 +605,41 @@ mod tests {
         // membership=invite. Note `member_event` lets sender ≠ target so
         // we can express "inviter invited alice".
         s.create_room(
-            &create_event(event_id!("$ci:e"), room_invite, inviter),
-            &[member_join(event_id!("$ji:e"), room_invite, inviter)],
+            &create_event(room_invite, inviter),
+            &[member_join(room_invite, inviter)],
         )
         .await
         .unwrap();
-        s.persist_event(
-            &member_event(event_id!("$mi:e"), room_invite, alice, inviter, "invite"),
-            &[],
-        )
-        .await
-        .unwrap();
+        s.persist_event(&member_event(room_invite, alice, inviter, "invite"), &[])
+            .await
+            .unwrap();
 
         // Knocked room: knocker creates, knocker joined, alice knocks
         // (sender == target). The knocker's own membership doesn't
         // affect alice's view; we include it for production realism.
         s.create_room(
-            &create_event(event_id!("$ck:e"), room_knock, inviter),
-            &[member_join(event_id!("$jk:e"), room_knock, inviter)],
+            &create_event(room_knock, inviter),
+            &[member_join(room_knock, inviter)],
         )
         .await
         .unwrap();
-        s.persist_event(
-            &member_event(event_id!("$mk:e"), room_knock, alice, alice, "knock"),
-            &[],
-        )
-        .await
-        .unwrap();
+        s.persist_event(&member_event(room_knock, alice, alice, "knock"), &[])
+            .await
+            .unwrap();
 
         // Banned room: alice was in it; the banner bans her.
         s.create_room(
-            &create_event(event_id!("$cb:e"), room_ban, inviter),
-            &[member_join(event_id!("$jb:e"), room_ban, inviter)],
+            &create_event(room_ban, inviter),
+            &[member_join(room_ban, inviter)],
         )
         .await
         .unwrap();
-        s.persist_event(&member_join(event_id!("$jab:e"), room_ban, alice), &[])
+        s.persist_event(&member_join(room_ban, alice), &[])
             .await
             .unwrap();
-        s.persist_event(
-            &member_event(event_id!("$mb:e"), room_ban, alice, inviter, "ban"),
-            &[],
-        )
-        .await
-        .unwrap();
+        s.persist_event(&member_event(room_ban, alice, inviter, "ban"), &[])
+            .await
+            .unwrap();
 
         let mut got = s
             .rooms_with_membership(
@@ -731,23 +672,20 @@ mod tests {
         let invite_room = room_id!("!invite-only:example.com");
 
         s.create_room(
-            &create_event(event_id!("$cj:e"), joined_room, alice),
-            &[member_join(event_id!("$jj:e"), joined_room, alice)],
+            &create_event(joined_room, alice),
+            &[member_join(joined_room, alice)],
         )
         .await
         .unwrap();
         s.create_room(
-            &create_event(event_id!("$ci:e"), invite_room, inviter),
-            &[member_join(event_id!("$ji:e"), invite_room, inviter)],
+            &create_event(invite_room, inviter),
+            &[member_join(invite_room, inviter)],
         )
         .await
         .unwrap();
-        s.persist_event(
-            &member_event(event_id!("$mi:e"), invite_room, alice, inviter, "invite"),
-            &[],
-        )
-        .await
-        .unwrap();
+        s.persist_event(&member_event(invite_room, alice, inviter, "invite"), &[])
+            .await
+            .unwrap();
 
         let got = s
             .rooms_with_membership(alice, &BTreeSet::from([Membership::Invite]))
@@ -761,25 +699,14 @@ mod tests {
     #[tokio::test]
     async fn current_room_state_isolates_by_room_id() {
         let s = store().await;
+        let create_a = create_event(*ALICE_ROOM_ID, *ALICE_USER_ID);
+        let id_create_a = create_a.event_id.clone();
+        let name_a = name_event(*ALICE_ROOM_ID, *ALICE_USER_ID, "A");
+        let id_name_a = name_a.event_id.clone();
+        s.create_room(&create_a, &[name_a]).await.unwrap();
         s.create_room(
-            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[name_event(
-                event_id!("$nA:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "A",
-            )],
-        )
-        .await
-        .unwrap();
-        s.create_room(
-            &create_event(event_id!("$cB:e"), *BOB_ROOM_ID, *ALICE_USER_ID),
-            &[name_event(
-                event_id!("$nB:e"),
-                *BOB_ROOM_ID,
-                *ALICE_USER_ID,
-                "B",
-            )],
+            &create_event(*BOB_ROOM_ID, *ALICE_USER_ID),
+            &[name_event(*BOB_ROOM_ID, *ALICE_USER_ID, "B")],
         )
         .await
         .unwrap();
@@ -790,11 +717,11 @@ mod tests {
         let create = got
             .get(&("m.room.create".to_owned(), "".to_owned()))
             .expect("room A create event present");
-        assert_eq!(create.event_id.as_str(), "$cA:e");
+        assert_eq!(create.event_id.as_str(), id_create_a.as_str());
         let name = got
             .get(&("m.room.name".to_owned(), "".to_owned()))
             .expect("room A name event present");
-        assert_eq!(name.event_id.as_str(), "$nA:e");
+        assert_eq!(name.event_id.as_str(), id_name_a.as_str());
     }
 
     // S17
@@ -804,23 +731,14 @@ mod tests {
         // Room A has no name; room B does. Same (event_type, state_key)
         // pair on both sides, so a missing room-scoping filter would
         // surface B's name event when querying A.
-        s.create_room(
-            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[],
-        )
-        .await
-        .unwrap();
-        s.create_room(
-            &create_event(event_id!("$cB:e"), *BOB_ROOM_ID, *ALICE_USER_ID),
-            &[name_event(
-                event_id!("$nB:e"),
-                *BOB_ROOM_ID,
-                *ALICE_USER_ID,
-                "B",
-            )],
-        )
-        .await
-        .unwrap();
+        s.create_room(&create_event(*ALICE_ROOM_ID, *ALICE_USER_ID), &[])
+            .await
+            .unwrap();
+        let name_b = name_event(*BOB_ROOM_ID, *ALICE_USER_ID, "B");
+        let id_name_b = name_b.event_id.clone();
+        s.create_room(&create_event(*BOB_ROOM_ID, *ALICE_USER_ID), &[name_b])
+            .await
+            .unwrap();
 
         assert!(
             s.current_state_event(*ALICE_ROOM_ID, "m.room.name", "")
@@ -833,26 +751,24 @@ mod tests {
             .await
             .unwrap()
             .expect("room B name event present");
-        assert_eq!(got.event_id.as_str(), "$nB:e");
+        assert_eq!(got.event_id.as_str(), id_name_b.as_str());
     }
 
     // S18
     #[tokio::test]
     async fn current_state_events_of_type_isolates_by_room_id() {
         let s = store().await;
+        let alice_member = member_join(*ALICE_ROOM_ID, *ALICE_USER_ID);
+        let id_alice_member = alice_member.event_id.clone();
         s.create_room(
-            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[member_join(
-                event_id!("$mjA:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-            )],
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
+            &[alice_member],
         )
         .await
         .unwrap();
         s.create_room(
-            &create_event(event_id!("$cB:e"), *BOB_ROOM_ID, *BOB_USER_ID),
-            &[member_join(event_id!("$mjB:e"), *BOB_ROOM_ID, *BOB_USER_ID)],
+            &create_event(*BOB_ROOM_ID, *BOB_USER_ID),
+            &[member_join(*BOB_ROOM_ID, *BOB_USER_ID)],
         )
         .await
         .unwrap();
@@ -865,7 +781,7 @@ mod tests {
         let alice = got
             .get(ALICE_USER_ID.as_str())
             .expect("alice's member event present in room A");
-        assert_eq!(alice.event_id.as_str(), "$mjA:e");
+        assert_eq!(alice.event_id.as_str(), id_alice_member.as_str());
         assert!(!got.contains_key(BOB_USER_ID.as_str()));
     }
 
@@ -874,18 +790,14 @@ mod tests {
     async fn joined_members_isolates_by_room_id() {
         let s = store().await;
         s.create_room(
-            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[member_join(
-                event_id!("$mjA:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-            )],
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
+            &[member_join(*ALICE_ROOM_ID, *ALICE_USER_ID)],
         )
         .await
         .unwrap();
         s.create_room(
-            &create_event(event_id!("$cB:e"), *BOB_ROOM_ID, *BOB_USER_ID),
-            &[member_join(event_id!("$mjB:e"), *BOB_ROOM_ID, *BOB_USER_ID)],
+            &create_event(*BOB_ROOM_ID, *BOB_USER_ID),
+            &[member_join(*BOB_ROOM_ID, *BOB_USER_ID)],
         )
         .await
         .unwrap();
@@ -905,19 +817,15 @@ mod tests {
         let s = store().await;
         // Alice is in room A.
         s.create_room(
-            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[member_join(
-                event_id!("$mjA:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-            )],
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
+            &[member_join(*ALICE_ROOM_ID, *ALICE_USER_ID)],
         )
         .await
         .unwrap();
         // Bob is in room B; alice is NOT.
         s.create_room(
-            &create_event(event_id!("$cB:e"), *BOB_ROOM_ID, *BOB_USER_ID),
-            &[member_join(event_id!("$mjB:e"), *BOB_ROOM_ID, *BOB_USER_ID)],
+            &create_event(*BOB_ROOM_ID, *BOB_USER_ID),
+            &[member_join(*BOB_ROOM_ID, *BOB_USER_ID)],
         )
         .await
         .unwrap();
@@ -943,22 +851,14 @@ mod tests {
         use crate::error::Error;
 
         let s = store().await;
-        s.create_room(
-            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[],
-        )
-        .await
-        .unwrap();
+        s.create_room(&create_event(*ALICE_ROOM_ID, *ALICE_USER_ID), &[])
+            .await
+            .unwrap();
         // Room B holds the real $nB:e — without it, the FK would fail
         // on event_id alone and we wouldn't be testing the room-axis.
         s.create_room(
-            &create_event(event_id!("$cB:e"), *BOB_ROOM_ID, *BOB_USER_ID),
-            &[name_event(
-                event_id!("$nB:e"),
-                *BOB_ROOM_ID,
-                *BOB_USER_ID,
-                "B",
-            )],
+            &create_event(*BOB_ROOM_ID, *BOB_USER_ID),
+            &[name_event(*BOB_ROOM_ID, *BOB_USER_ID, "B")],
         )
         .await
         .unwrap();
@@ -995,13 +895,8 @@ mod tests {
 
         let s = store().await;
         s.create_room(
-            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[name_event(
-                event_id!("$name:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "A",
-            )],
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
+            &[name_event(*ALICE_ROOM_ID, *ALICE_USER_ID, "A")],
         )
         .await
         .unwrap();
@@ -1045,18 +940,12 @@ mod tests {
         use crate::error::Error;
 
         let s = store().await;
-        s.create_room(
-            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[],
-        )
-        .await
-        .unwrap();
-        s.persist_event(
-            &message(event_id!("$msg:e"), *ALICE_ROOM_ID, *ALICE_USER_ID, "hi"),
-            &[],
-        )
-        .await
-        .unwrap();
+        s.create_room(&create_event(*ALICE_ROOM_ID, *ALICE_USER_ID), &[])
+            .await
+            .unwrap();
+        s.persist_event(&message(*ALICE_ROOM_ID, *ALICE_USER_ID, "hi"), &[])
+            .await
+            .unwrap();
 
         let alice_room = ALICE_ROOM_ID.as_str().to_owned();
         let err = s
@@ -1092,12 +981,8 @@ mod tests {
 
         let s = store().await;
         s.create_room(
-            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[member_join(
-                event_id!("$mj:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-            )],
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
+            &[member_join(*ALICE_ROOM_ID, *ALICE_USER_ID)],
         )
         .await
         .unwrap();
@@ -1138,13 +1023,8 @@ mod tests {
 
         let s = store().await;
         s.create_room(
-            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[name_event(
-                event_id!("$n:e"),
-                *ALICE_ROOM_ID,
-                *ALICE_USER_ID,
-                "A",
-            )],
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
+            &[name_event(*ALICE_ROOM_ID, *ALICE_USER_ID, "A")],
         )
         .await
         .unwrap();
@@ -1178,16 +1058,17 @@ mod tests {
     #[tokio::test]
     async fn persist_event_rejects_member_without_membership() {
         let s = store().await;
-        s.create_room(
-            &create_event(event_id!("$cA:e"), *ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[],
-        )
-        .await
-        .unwrap();
+        s.create_room(&create_event(*ALICE_ROOM_ID, *ALICE_USER_ID), &[])
+            .await
+            .unwrap();
 
         // write_into_tx only inspects `prev_events`, `prev_state_events`
         // and `content.membership` from the raw JSON, so the minimal
-        // body below is enough to drive the code path.
+        // body below is enough to drive the code path. We bypass
+        // `persist_event`'s B4 debug round-trip (which would panic on
+        // the intentionally malformed raw bytes here) by writing via
+        // `write_into_tx` directly — same SQL boundary the production
+        // path uses, just without the dev-only id-vs-raw assertion.
         let event = make_event_with_raw_json(
             event_id!("$bad:e"),
             *ALICE_ROOM_ID,
@@ -1197,8 +1078,14 @@ mod tests {
             r#"{"prev_events":[],"prev_state_events":[],"content":{}}"#,
         );
 
+        let row = crate::row::EventRow::unchecked(&event).to_owned();
         let err = s
-            .persist_event(&event, &[])
+            .run_write(move |conn| -> Result<(), crate::error::Error> {
+                let tx = conn.transaction()?;
+                row.write_into_tx(&tx)?;
+                tx.commit()?;
+                Ok(())
+            })
             .await
             .expect_err("malformed member event must surface InvalidInput");
         assert!(

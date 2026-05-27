@@ -24,12 +24,13 @@ use std::sync::Arc;
 use neutrino_common::ROOM_VERSION_ID;
 use neutrino_state::auth_events::{auth_event_keys, calculate_auth_events};
 use neutrino_state::auth_rules::check_auth_rules;
+use neutrino_state::event_id::EventBuilder;
 use neutrino_state::provider::{EventInfo, InMemoryStateProvider, StateProvider};
 use neutrino_state::state_res::{auth_chain_difference, conflicted_subgraph, separate};
 use neutrino_state::validate::parse_event;
 use neutrino_state::{Event, FormatError, StateMap};
 use proptest::prelude::*;
-use ruma::{OwnedEventId, OwnedUserId};
+use ruma::{OwnedEventId, OwnedUserId, room_id};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
@@ -62,7 +63,6 @@ const REQUIRED_FIELDS: &[&str] = &[
     "type",
     "sender",
     "content",
-    "depth",
     "origin_server_ts",
     "prev_events",
     "prev_state_events",
@@ -118,24 +118,29 @@ fn arb_prev_state_events() -> impl Strategy<Value = Vec<OwnedEventId>> {
     prop::collection::vec(arb_event_id(), 0..=3)
 }
 
-fn ids_as_json(ids: &[OwnedEventId]) -> Value {
-    json!(ids.iter().map(|e| e.as_str()).collect::<Vec<_>>())
-}
-
 /// Strategy for an `m.room.message` event with varied sender and ancestry.
+/// `EventBuilder` computes the event_id from the canonical bytes, so the
+/// strategy no longer threads in a separate `arb_event_id`.
 fn arb_message_event() -> impl Strategy<Value = Event> {
     (
         arb_user_id(),
-        arb_event_id(),
         arb_prev_events(),
         arb_prev_state_events(),
+        // origin_server_ts: keep the fixture-ts to disambiguate otherwise-
+        // identical events (v11 redaction strips the body, so two messages
+        // with the same sender/prevs/ts would hash to the same id).
+        1u64..1_000_000_000_000_000u64,
     )
-        .prop_filter_map("valid message", |(sender, id, prevs, prev_states)| {
-            let mut v = base_message();
-            v["sender"] = json!(sender);
-            v["prev_events"] = ids_as_json(&prevs);
-            v["prev_state_events"] = ids_as_json(&prev_states);
-            parse_event(raw(v), id, vec![]).ok()
+        .prop_filter_map("valid message", |(sender, prevs, prev_states, ts)| {
+            let sender: OwnedUserId = sender.parse().ok()?;
+            EventBuilder::new(sender, "m.room.message".to_owned())
+                .room_id(room_id!("!room:example.org").to_owned())
+                .content(json!({ "msgtype": "m.text", "body": "hi" }))
+                .prev_events(prevs)
+                .prev_state_events(prev_states)
+                .origin_server_ts(ts)
+                .build()
+                .ok()
         })
 }
 
@@ -155,22 +160,24 @@ fn arb_member_event() -> impl Strategy<Value = Event> {
                 Just(sender),
                 Just(target),
                 proptest::sample::select(memberships),
-                arb_event_id(),
                 arb_prev_events(),
                 arb_prev_state_events(),
+                1u64..1_000_000_000_000_000u64,
             )
         })
         .prop_filter_map(
             "valid member",
-            |(sender, target, membership, id, prevs, prev_states)| {
-                let mut v = base_message();
-                v["type"] = json!("m.room.member");
-                v["sender"] = json!(sender);
-                v["state_key"] = json!(target);
-                v["content"] = json!({ "membership": membership });
-                v["prev_events"] = ids_as_json(&prevs);
-                v["prev_state_events"] = ids_as_json(&prev_states);
-                parse_event(raw(v), id, vec![]).ok()
+            |(sender, target, membership, prevs, prev_states, ts)| {
+                let sender: OwnedUserId = sender.parse().ok()?;
+                EventBuilder::new(sender, "m.room.member".to_owned())
+                    .room_id(room_id!("!room:example.org").to_owned())
+                    .state_key(target)
+                    .content(json!({ "membership": membership }))
+                    .prev_events(prevs)
+                    .prev_state_events(prev_states)
+                    .origin_server_ts(ts)
+                    .build()
+                    .ok()
             },
         )
 }
@@ -178,18 +185,18 @@ fn arb_member_event() -> impl Strategy<Value = Event> {
 /// Strategy for an `m.room.create` event. Create events carry no `room_id`
 /// (derived from `event_id`) and no ancestry (rule 1.1 / MSC4242).
 fn arb_create_event() -> impl Strategy<Value = Event> {
-    (arb_user_id(), arb_event_id()).prop_filter_map("valid create", |(sender, id)| {
-        let mut v = base_message();
-        v["type"] = json!("m.room.create");
-        v["sender"] = json!(sender);
-        v["content"] = json!({ "room_version": ROOM_VERSION_ID });
-        v["state_key"] = json!("");
-        let obj = v.as_object_mut()?;
-        obj.remove("room_id");
-        obj.remove("prev_state_events");
-        // prev_events stays [] from base_message — rule 1.1.
-        parse_event(raw(v), id, vec![]).ok()
-    })
+    (arb_user_id(), 1u64..1_000_000_000_000_000u64).prop_filter_map(
+        "valid create",
+        |(sender, ts)| {
+            let sender: OwnedUserId = sender.parse().ok()?;
+            EventBuilder::new(sender, "m.room.create".to_owned())
+                .state_key(String::new())
+                .content(json!({ "room_version": ROOM_VERSION_ID }))
+                .origin_server_ts(ts)
+                .build()
+                .ok()
+        },
+    )
 }
 
 /// Arbitrary `Event` — mix of message, member, and create events. Senders,
@@ -269,35 +276,28 @@ proptest! {
 
 // ---------- auth_rules sanity floor ----------
 
-/// Combined strategy: a create event_id, the create event built around it,
-/// and 0..10 other state events with arbitrary keys. The create_id and
-/// create event are coupled inside one `prop_filter_map` so the proptest
-/// shrinker can't desynchronise them — without this coupling, shrinking
-/// `create_id` independently would leave the `Event` carrying its original
-/// id, and the 5.3.1 property below would never see matching ancestry.
-///
-/// Returning the `create_id` lets call-site strategies thread it into
-/// `prev_events` / `prev_state_events` of the event-under-test, so rule
-/// 5.3.1 (self-join immediately after create) is actually reachable.
+/// Combined strategy: a create event, its computed event_id, and 0..10
+/// other state events with arbitrary keys. The create event is built via
+/// `EventBuilder`, so its `event_id` is the canonical reference hash —
+/// returned to call-site strategies so they can thread it into
+/// `prev_events` / `prev_state_events` of the event-under-test (rule
+/// 5.3.1: self-join immediately after create).
 fn arb_state_with_create()
 -> impl Strategy<Value = (OwnedEventId, OwnedUserId, StateMap<Arc<Event>>)> {
     (
-        arb_event_id(),
         arb_user_id(),
+        1u64..1_000_000_000_000_000u64,
         prop::collection::vec(arb_event().prop_map(Arc::new), 0..10),
     )
-        .prop_filter_map("valid create + state", |(create_id, sender_str, events)| {
-            let v = json!({
-                "type": "m.room.create",
-                "sender": sender_str,
-                "content": { "room_version": ROOM_VERSION_ID },
-                "prev_events": [],
-                "depth": 0,
-                "origin_server_ts": 1_700_000_000_000_u64,
-                "hashes": { "sha256": "abc" },
-                "state_key": ""
-            });
-            let create_event = parse_event(raw(v), create_id.clone(), vec![]).ok()?;
+        .prop_filter_map("valid create + state", |(sender_str, ts, events)| {
+            let sender: OwnedUserId = sender_str.parse().ok()?;
+            let create_event = EventBuilder::new(sender, "m.room.create".to_owned())
+                .state_key(String::new())
+                .content(json!({ "room_version": ROOM_VERSION_ID }))
+                .origin_server_ts(ts)
+                .build()
+                .ok()?;
+            let create_id = create_event.event_id.clone();
             let creator_uid = create_event.sender.clone();
             let create = Arc::new(create_event);
             let mut state: StateMap<Arc<Event>> = StateMap::new();
@@ -335,30 +335,25 @@ proptest! {
 
     /// Rule 5.3.1: a self-join event whose only ancestry (in both DAGs) is
     /// the create event is always allowed, regardless of additional state.
-    /// Everything is built inside the test body from primitive inputs so the
-    /// shrinker can't desynchronise the create_id from the create event's
-    /// stored `event_id`.
+    /// The create event is built via `EventBuilder` so its `event_id` is
+    /// the canonical reference hash — and the join is built from that same
+    /// id, keeping the two synchronised by construction.
     #[test]
     fn rule_5_3_1_self_join_after_create_always_allowed(
-        create_id in arb_event_id(),
         sender_str in arb_user_id(),
         extras in prop::collection::vec(arb_event().prop_map(Arc::new), 0..10),
-        join_id in arb_event_id(),
+        create_ts in 1u64..1_000_000_000_000_000u64,
+        join_ts in 1u64..1_000_000_000_000_000u64,
     ) {
-        prop_assume!(create_id != join_id);
-
-        let create_v = json!({
-            "type": "m.room.create",
-            "sender": sender_str,
-            "content": { "room_version": ROOM_VERSION_ID },
-            "prev_events": [],
-            "depth": 0,
-            "origin_server_ts": 1_700_000_000_000_u64,
-            "hashes": { "sha256": "abc" },
-            "state_key": ""
-        });
-        let create_event = parse_event(raw(create_v), create_id.clone(), vec![])
-            .expect("create event valid wire format");
+        let sender: OwnedUserId = sender_str.parse().expect("sender");
+        let create_event = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
+            .state_key(String::new())
+            .content(json!({ "room_version": ROOM_VERSION_ID }))
+            .origin_server_ts(create_ts)
+            .build()
+            .expect("create event valid");
+        let create_id = create_event.event_id.clone();
+        let create_room_id = create_event.room_id.clone();
         let creator_uid: OwnedUserId = create_event.sender.clone();
         let mut state: StateMap<Arc<Event>> = StateMap::new();
         // Insert extras first; the explicit create below must win at
@@ -377,24 +372,15 @@ proptest! {
             Arc::new(create_event),
         );
 
-        // `Event::room_id` is derived inline by `parse_event` from the
-        // create event's id (`$X...` → `!X...`), so the join must carry the
-        // matching `room_id` to pass phase 1a.
-        let derived_room_id = format!("!{}", &create_id.as_str()[1..]);
-        let join_v = json!({
-            "type": "m.room.member",
-            "sender": creator_uid.as_str(),
-            "state_key": creator_uid.as_str(),
-            "room_id": derived_room_id,
-            "content": { "membership": "join" },
-            "prev_events": [create_id.as_str()],
-            "prev_state_events": [create_id.as_str()],
-            "depth": 1,
-            "origin_server_ts": 1_700_000_000_000_u64,
-            "hashes": { "sha256": "abc" }
-        });
-        let join = parse_event(raw(join_v), join_id, vec![])
-            .expect("self-join event valid wire format");
+        let join = EventBuilder::new(creator_uid.clone(), "m.room.member".to_owned())
+            .room_id(create_room_id)
+            .state_key(creator_uid.as_str().to_owned())
+            .content(json!({ "membership": "join" }))
+            .prev_events(vec![create_id.clone()])
+            .prev_state_events(vec![create_id.clone()])
+            .origin_server_ts(join_ts)
+            .build()
+            .expect("self-join valid");
         prop_assert!(check_auth_rules(&join, &state).is_ok());
     }
 }
@@ -406,67 +392,72 @@ proptest! {
 // reference unknown events, may contain cycles); the algorithms must hold
 // under that.
 
-/// Placeholder `Arc<Event>` for an arbitrary event id with caller-supplied
+/// Placeholder `Arc<Event>` built via `EventBuilder` with caller-supplied
 /// `auth_events`. The state-res functions don't look at the event body —
-/// only `event_id` and `auth_events` — so a minimal valid event with the
-/// auth list attached suffices.
-fn placeholder_arc_event(id: &OwnedEventId, auth_events: Vec<OwnedEventId>) -> Arc<Event> {
+/// only `event_id` and `auth_events` — so a minimal valid event suffices,
+/// and the computed event_id is what callers index by.
+fn placeholder_arc_event(ts: u64, auth_events: Vec<OwnedEventId>) -> Arc<Event> {
     Arc::new(
-        parse_event(
-            raw(json!({
-                "type": "m.room.placeholder",
-                "sender": "@alice:example.org",
-                "room_id": "!room:example.org",
-                "content": {},
-                "prev_events": [],
-                "prev_state_events": [],
-                "depth": 1,
-                "origin_server_ts": 1_700_000_000_000_u64,
-                "hashes": { "sha256": "abc" },
-                "state_key": ""
-            })),
-            id.clone(),
-            auth_events,
+        EventBuilder::new(
+            "@alice:example.org"
+                .parse::<OwnedUserId>()
+                .expect("user id"),
+            "m.room.placeholder".to_owned(),
         )
+        .room_id(room_id!("!room:example.org").to_owned())
+        .state_key(String::new())
+        .content(json!({}))
+        .auth_events(auth_events)
+        .origin_server_ts(ts)
+        .build()
         .expect("placeholder event"),
     )
 }
 
 /// Arbitrary `InMemoryStateProvider` that is **closed** under `auth_events`
 /// — every id any event references via its `auth_events` is itself in the
-/// provider. Cycles are allowed (the DFS in `auth_chain` dedupes via a
-/// visited set, so cyclic input still terminates).
+/// provider. Cycles are not constructed (we only point at *earlier* events
+/// in the build order); the DFS in `auth_chain` dedupes via a visited set
+/// regardless.
 ///
 /// Closure is the project invariant for state-res input: a referenced-but-
 /// unknown event is an error (`StateResError::MissingAuthEvent`), not a
 /// silent backfill boundary. The strategy reflects that.
 ///
-/// Yields the provider **and the list of known ids** so callers can draw
-/// seeds / state values from the keyset — input seeds outside this keyset
-/// would (correctly) blow up `auth_chain` with `MissingAuthEvent` and aren't
-/// what most properties want to test.
+/// Yields the provider **and the list of known ids** (in build order, so
+/// any event references only ids earlier in the list).
 fn arb_provider_with_ids() -> impl Strategy<Value = (InMemoryStateProvider, Vec<OwnedEventId>)> {
-    prop::collection::hash_set(arb_event_id(), 1..=15).prop_flat_map(|ids| {
-        let len = ids.len();
-        let ids_vec: Vec<OwnedEventId> = ids.into_iter().collect();
-        (
-            Just(ids_vec.clone()),
-            prop::collection::vec(prop::collection::vec(0usize..len, 0..4), len),
-        )
-            .prop_map(|(ids, parents_per_event)| {
-                let mut provider = InMemoryStateProvider::new();
-                for (id, parent_indices) in ids.iter().zip(&parents_per_event) {
-                    let parents: Vec<OwnedEventId> =
-                        parent_indices.iter().map(|i| ids[*i].clone()).collect();
-                    let event = placeholder_arc_event(id, parents);
-                    provider.insert(EventInfo {
-                        event,
-                        rejected: false,
-                    });
-                }
-                (provider, ids)
-            })
-    })
+    // `n` events; for each, the indices (in the build order) of its
+    // auth_events parents. Parents are constrained to earlier indices so
+    // every reference resolves locally without needing back-patching.
+    (1usize..=15)
+        .prop_flat_map(|n| {
+            (
+                Just(n),
+                prop::collection::vec(prop::collection::vec(0usize..n, 0..4), n),
+            )
+        })
+        .prop_map(|(n, parents_per_event)| {
+            let mut provider = InMemoryStateProvider::new();
+            let mut ids: Vec<OwnedEventId> = Vec::with_capacity(n);
+            for (i, parent_indices) in parents_per_event.iter().enumerate() {
+                // Parents must reference earlier indices to avoid forward
+                // references (and self-loops); clamp the sampled index
+                // accordingly.
+                let parents: Vec<OwnedEventId> = parent_indices
+                    .iter()
+                    .filter_map(|j| if *j < i { Some(ids[*j].clone()) } else { None })
+                    .collect();
+                let ts = 1_700_000_000_000 + (i as u64);
+                let event = placeholder_arc_event(ts, parents);
+                ids.push(event.event_id.clone());
+                provider.insert(EventInfo {
+                    event,
+                    rejected: false,
+                });
+            }
+            (provider, ids)
+        })
 }
 
 /// Build a deterministic state set whose values are drawn from `ids`
@@ -852,30 +843,37 @@ proptest! {
 
 /// Linear chain of distinct event ids: ids[0] → ids[1] → ... → ids[n-1].
 /// `ids[0]` is the head (deepest descendant); `ids[n-1]` is the tail (no
-/// parents). Distinct ids enforced via `prop_filter`.
+/// parents). Events are built tail-first so each parent reference resolves
+/// to a real, already-computed event_id; ids are distinct by virtue of
+/// distinct `origin_server_ts` values.
 fn arb_linear_chain(
     min: usize,
     max: usize,
 ) -> impl Strategy<Value = (InMemoryStateProvider, Vec<OwnedEventId>)> {
-    prop::collection::vec(arb_event_id(), min..=max)
-        .prop_filter("distinct ids", |ids| {
-            ids.iter().collect::<HashSet<_>>().len() == ids.len()
-        })
-        .prop_map(|ids| {
-            let mut provider = InMemoryStateProvider::new();
-            for (i, id) in ids.iter().enumerate() {
-                let parents = if i + 1 < ids.len() {
-                    vec![ids[i + 1].clone()]
-                } else {
-                    vec![]
-                };
-                provider.insert(EventInfo {
-                    event: placeholder_arc_event(id, parents),
-                    rejected: false,
-                });
-            }
-            (provider, ids)
-        })
+    (min..=max).prop_map(|n| {
+        let mut provider = InMemoryStateProvider::new();
+        // Build tail (no parents) first, walking back to the head. Each
+        // event's only parent is the next one along, whose id we just
+        // computed.
+        let mut tail_to_head: Vec<OwnedEventId> = Vec::with_capacity(n);
+        for i in (0..n).rev() {
+            let parents = tail_to_head
+                .last()
+                .cloned()
+                .map(|p| vec![p])
+                .unwrap_or_default();
+            let ts = 1_700_000_000_000 + (i as u64);
+            let event = placeholder_arc_event(ts, parents);
+            tail_to_head.push(event.event_id.clone());
+            provider.insert(EventInfo {
+                event,
+                rejected: false,
+            });
+        }
+        // Caller expects head-first order (ids[0] is the deepest descendant).
+        tail_to_head.reverse();
+        (provider, tail_to_head)
+    })
 }
 
 /// Four-node diamond:
@@ -887,42 +885,31 @@ fn arb_linear_chain(
 ///    bottom
 /// ```
 /// `root` has two parents (`left`, `right`), each of which has the single
-/// parent `bottom`. Distinct ids enforced.
+/// parent `bottom`. Build bottom-up so each parent reference resolves to a
+/// real computed event_id; corners are distinct by construction (each
+/// carries a unique origin_server_ts and a unique parent set).
 fn arb_diamond() -> impl Strategy<Value = (InMemoryStateProvider, [OwnedEventId; 4])> {
-    (
-        arb_event_id(),
-        arb_event_id(),
-        arb_event_id(),
-        arb_event_id(),
-    )
-        .prop_filter("distinct corners", |(r, l, ri, b)| {
-            let mut set: HashSet<&OwnedEventId> = HashSet::new();
-            set.insert(r);
-            set.insert(l);
-            set.insert(ri);
-            set.insert(b);
-            set.len() == 4
-        })
-        .prop_map(|(root, left, right, bottom)| {
-            let mut provider = InMemoryStateProvider::new();
+    Just(()).prop_map(|()| {
+        let mut provider = InMemoryStateProvider::new();
+        let bottom_ev = placeholder_arc_event(1, vec![]);
+        let bottom = bottom_ev.event_id.clone();
+        // left and right both carry `bottom` as their only parent — they'd
+        // hash to the same id under v11 redaction (the body is stripped) if
+        // their other inputs matched. Disambiguate via distinct ts.
+        let left_ev = placeholder_arc_event(2, vec![bottom.clone()]);
+        let left = left_ev.event_id.clone();
+        let right_ev = placeholder_arc_event(3, vec![bottom.clone()]);
+        let right = right_ev.event_id.clone();
+        let root_ev = placeholder_arc_event(4, vec![left.clone(), right.clone()]);
+        let root = root_ev.event_id.clone();
+        for ev in [bottom_ev, left_ev, right_ev, root_ev] {
             provider.insert(EventInfo {
-                event: placeholder_arc_event(&root, vec![left.clone(), right.clone()]),
+                event: ev,
                 rejected: false,
             });
-            provider.insert(EventInfo {
-                event: placeholder_arc_event(&left, vec![bottom.clone()]),
-                rejected: false,
-            });
-            provider.insert(EventInfo {
-                event: placeholder_arc_event(&right, vec![bottom.clone()]),
-                rejected: false,
-            });
-            provider.insert(EventInfo {
-                event: placeholder_arc_event(&bottom, vec![]),
-                rejected: false,
-            });
-            (provider, [root, left, right, bottom])
-        })
+        }
+        (provider, [root, left, right, bottom])
+    })
 }
 
 proptest! {
@@ -969,27 +956,25 @@ proptest! {
             return Ok(());
         }
         let mut merged = InMemoryStateProvider::new();
-        // Pull each event's auth_events off its placeholder Event in the
-        // source provider, then rebuild a new event in the merged provider
-        // with the same auth_events embedded.
-        let copy_event_auth = |id: &OwnedEventId, src: &InMemoryStateProvider| -> Vec<OwnedEventId> {
-            src.get_event(id)
-                .map(|info| info.event.auth_events.clone())
-                .unwrap_or_default()
-        };
+        // Copy the existing events directly from each source provider into
+        // the merged one — we need the event_ids to match the ids we just
+        // collected (rebuilding via `placeholder_arc_event` would compute
+        // fresh ids and the test invariants would no longer hold).
         for id in &ids_a {
-            let parents = copy_event_auth(id, &provider_a);
-            merged.insert(EventInfo {
-                event: placeholder_arc_event(id, parents),
-                rejected: false,
-            });
+            if let Some(info) = provider_a.get_event(id) {
+                merged.insert(EventInfo {
+                    event: info.event.clone(),
+                    rejected: info.rejected,
+                });
+            }
         }
         for id in &ids_b {
-            let parents = copy_event_auth(id, &provider_b);
-            merged.insert(EventInfo {
-                event: placeholder_arc_event(id, parents),
-                rejected: false,
-            });
+            if let Some(info) = provider_b.get_event(id) {
+                merged.insert(EventInfo {
+                    event: info.event.clone(),
+                    rejected: info.rejected,
+                });
+            }
         }
 
         let mut s1 = StateMap::new();

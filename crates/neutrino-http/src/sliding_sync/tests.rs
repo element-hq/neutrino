@@ -2,11 +2,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use neutrino_common::ROOM_VERSION_ID;
+use neutrino_common::event_id::compute_event_id;
 use neutrino_store::{Event, EventStore, RoomStore};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5::{Request, request};
 use ruma::events::StateEventType;
-use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId, UInt, UserId, event_id, room_id, user_id};
+use ruma::{OwnedRoomId, RoomId, UInt, UserId, room_id, user_id};
 use serde_json::Value;
 use tempfile::NamedTempFile;
 
@@ -76,8 +77,12 @@ async fn fresh_store() -> (Arc<SqliteStore>, NamedTempFile) {
 /// constructs the standard PDU wrapper); `make_event_from_json` is the
 /// escape hatch when tests need to set `unsigned.invite_room_state` or
 /// otherwise control the full body.
+///
+/// The `event_id` is computed from the canonical bytes of `json` via
+/// [`compute_event_id`], matching `EventStore::persist_event`'s debug-build
+/// hash check (PR 2 / B4). Callers that need to refer to the resulting
+/// event_id capture it from the returned `Event`.
 fn build_stored_event(
-    event_id: &EventId,
     room_id: &RoomId,
     event_type: &str,
     state_key: Option<&str>,
@@ -86,6 +91,7 @@ fn build_stored_event(
     json: Value,
 ) -> Event {
     let raw = serde_json::value::to_raw_value(&json).expect("to_raw_value");
+    let event_id = compute_event_id(&raw).expect("test fixture must compute event_id");
     // Extract `content` to the canonical position; default `{}` if the
     // caller-supplied JSON doesn't include one (a small handful of
     // sliding-sync tests synthesise minimal fixtures).
@@ -95,7 +101,7 @@ fn build_stored_event(
         .unwrap_or(Value::Object(Default::default()));
     let content = serde_json::value::to_raw_value(&content_value).expect("content");
     Event {
-        event_id: event_id.to_owned(),
+        event_id,
         room_id: room_id.to_owned(),
         event_type: event_type.to_string(),
         state_key: state_key.map(String::from),
@@ -111,9 +117,9 @@ fn build_stored_event(
 
 /// Build a `Event` whose `json` field is a flat object with the
 /// standard PDU keys. Tests pass `content` separately so they don't have
-/// to construct the wrapper themselves.
+/// to construct the wrapper themselves. The returned event's `event_id`
+/// is derived from the canonical bytes via [`compute_event_id`].
 fn make_event(
-    event_id: &EventId,
     room_id: &RoomId,
     event_type: &str,
     state_key: Option<&str>,
@@ -122,7 +128,6 @@ fn make_event(
     content: Value,
 ) -> Event {
     let json = serde_json::json!({
-        "event_id": event_id.as_str(),
         "room_id": room_id.as_str(),
         "type": event_type,
         "state_key": state_key,
@@ -131,7 +136,6 @@ fn make_event(
         "content": content,
     });
     build_stored_event(
-        event_id,
         room_id,
         event_type,
         state_key,
@@ -143,9 +147,9 @@ fn make_event(
 
 /// Same as `make_event` but the caller supplies the full JSON body — used
 /// when a test needs `unsigned.invite_room_state` or other top-level keys
-/// the standard wrapper doesn't expose.
+/// the standard wrapper doesn't expose. The returned event's `event_id`
+/// is derived from the canonical bytes via [`compute_event_id`].
 fn make_event_from_json(
-    event_id: &EventId,
     room_id: &RoomId,
     event_type: &str,
     state_key: Option<&str>,
@@ -154,7 +158,6 @@ fn make_event_from_json(
     json: Value,
 ) -> Event {
     build_stored_event(
-        event_id,
         room_id,
         event_type,
         state_key,
@@ -164,34 +167,15 @@ fn make_event_from_json(
     )
 }
 
-/// Deterministic per-room "stem" for generated event IDs — tests construct
-/// multiple rooms in one store and need their create / join event IDs to
-/// avoid colliding.
-fn room_stem(room_id: &RoomId) -> String {
-    room_id
-        .as_str()
-        .trim_start_matches('!')
-        .split(':')
-        .next()
-        .unwrap_or("room")
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-')
-        .collect()
-}
-
 /// Build a minimal v12 `m.room.create` event for `room_id` with `creator` as
-/// sender. Event ID is derived from the room's localpart so a test that calls
-/// `setup_*` for two rooms in the same store doesn't collide.
+/// sender. Distinct rooms hash to distinct event_ids automatically because
+/// the room_id is part of the canonical bytes.
 ///
 /// `content.creator` is intentionally omitted — v12 / MSC4242 derive the
 /// creator from the create event's `sender` and the explicit field is
 /// deprecated.
 fn create_event_for(room_id: &RoomId, creator: &UserId) -> Event {
-    let stem = room_stem(room_id);
-    let id_str = format!("$create-{stem}:example.org");
-    let id: OwnedEventId = id_str.try_into().expect("create event id parses");
     make_event(
-        &id,
         room_id,
         "m.room.create",
         Some(""),
@@ -212,11 +196,7 @@ fn create_event_for(room_id: &RoomId, creator: &UserId) -> Event {
 /// never produces.
 async fn setup_room(store: &SqliteStore, room_id: &RoomId, creator: &UserId) {
     let create = create_event_for(room_id, creator);
-    let stem = room_stem(room_id);
-    let join_id_str = format!("$creator-join-{stem}-{}:example.org", creator.localpart());
-    let join_id: OwnedEventId = join_id_str.try_into().expect("creator-join id parses");
     let join = make_event(
-        &join_id,
         room_id,
         "m.room.member",
         Some(creator.as_str()),
@@ -234,11 +214,7 @@ async fn setup_room(store: &SqliteStore, room_id: &RoomId, creator: &UserId) {
 /// what most tests want: a room the test user is joined to.
 async fn setup_joined_room(store: &SqliteStore, room_id: &RoomId, user: &UserId) {
     let create = create_event_for(room_id, user);
-    let stem = room_stem(room_id);
-    let member_id_str = format!("$join-{stem}-{}:example.org", user.localpart());
-    let member_id: OwnedEventId = member_id_str.try_into().expect("member id parses");
     let join = make_event(
-        &member_id,
         room_id,
         "m.room.member",
         Some(user.as_str()),
@@ -264,10 +240,11 @@ async fn seed(store: &SqliteStore, ev: &Event) {
 
 /// Seed an `m.room.member` event with caller-controlled sender/target/
 /// membership. Used by the kick / ban / self-leave / knock tests where the
-/// sender-vs-target distinction matters.
+/// sender-vs-target distinction matters. The event_id is derived from the
+/// canonical bytes — callers that need it can `make_event` themselves and
+/// seed manually instead.
 async fn seed_member(
     store: &SqliteStore,
-    event_id: &EventId,
     room: &RoomId,
     target: &UserId,
     sender: &UserId,
@@ -275,7 +252,6 @@ async fn seed_member(
     ts: u64,
 ) {
     let ev = make_event(
-        event_id,
         room,
         "m.room.member",
         Some(target.as_str()),
@@ -332,7 +308,6 @@ async fn initial_sync_with_list_returns_joined_rooms_and_calls_storage() {
     seed(
         &store,
         &make_event(
-            event_id!("$ev-a-1:example.org"),
             room_a,
             "m.room.message",
             None,
@@ -345,7 +320,6 @@ async fn initial_sync_with_list_returns_joined_rooms_and_calls_storage() {
     seed(
         &store,
         &make_event(
-            event_id!("$ev-b-1:example.org"),
             room_b,
             "m.room.message",
             None,
@@ -403,7 +377,6 @@ async fn required_state_filters_current_state() {
     seed(
         &store,
         &make_event(
-            event_id!("$name:example.org"),
             room,
             "m.room.name",
             Some(""),
@@ -484,16 +457,7 @@ async fn invited_rooms_are_candidates() {
     // alongside the invite. Tests simulate that arrival by writing the create
     // before the invite member event.
     setup_room(&store, invited_room, inviter).await;
-    seed_member(
-        &store,
-        event_id!("$invite:example.org"),
-        invited_room,
-        user,
-        inviter,
-        "invite",
-        100,
-    )
-    .await;
+    seed_member(&store, invited_room, user, inviter, "invite", 100).await;
 
     let state = SyncState::new(store);
 
@@ -523,9 +487,7 @@ async fn seed_rooms_with_timestamps(
     for (i, ts) in timestamps.iter().enumerate() {
         let room_id: OwnedRoomId = format!("!room-{i}:example.org").try_into().unwrap();
         setup_joined_room(store, &room_id, user).await;
-        let event_id: OwnedEventId = format!("$ev-{i}:example.org").try_into().unwrap();
         let ev = make_event(
-            &event_id,
             &room_id,
             "m.room.message",
             None,
@@ -677,28 +639,10 @@ async fn invited_room_bump_stamp_uses_invitee_member_event() {
     let invited = room_id!("!invited:example.org");
     setup_room(&store, invited, inviter).await;
 
-    seed_member(
-        &store,
-        event_id!("$invite:example.org"),
-        invited,
-        user,
-        inviter,
-        "invite",
-        500,
-    )
-    .await;
+    seed_member(&store, invited, user, inviter, "invite", 500).await;
     // A later member event in the same room — inviter's own state. Without
     // the per-membership branch this would inflate bump_stamp to 1000.
-    seed_member(
-        &store,
-        event_id!("$inviter:example.org"),
-        invited,
-        inviter,
-        inviter,
-        "join",
-        1000,
-    )
-    .await;
+    seed_member(&store, invited, inviter, inviter, "join", 1000).await;
 
     let state = SyncState::new(store);
     let mut req = Request::new();
@@ -752,7 +696,6 @@ async fn second_sync_returns_only_new_events() {
     seed(
         &store,
         &make_event(
-            event_id!("$ev1:example.org"),
             room,
             "m.room.message",
             None,
@@ -781,7 +724,6 @@ async fn second_sync_returns_only_new_events() {
     seed(
         &store,
         &make_event(
-            event_id!("$ev2:example.org"),
             room,
             "m.room.message",
             None,
@@ -803,11 +745,15 @@ async fn second_sync_returns_only_new_events() {
         1,
         "delta: only the new event, not the earlier snapshot"
     );
-    let event_id_returned: String = room2.timeline[0]
-        .get_field::<String>("event_id")
+    // The wire bytes don't carry an `event_id` field (v12 / MSC4242 — the id
+    // is the reference hash of the canonical bytes, not embedded in them), so
+    // we identify the returned event via its body — which is unique per seed.
+    let returned_body: String = room2.timeline[0]
+        .get_field::<serde_json::Value>("content")
         .unwrap()
-        .unwrap();
-    assert_eq!(event_id_returned, "$ev2:example.org");
+        .and_then(|c| c.get("body").and_then(|v| v.as_str()).map(str::to_owned))
+        .expect("timeline event has content.body");
+    assert_eq!(returned_body, "second");
     assert_eq!(
         room2.num_live,
         Some(UInt::from(1u32)),
@@ -824,7 +770,6 @@ async fn third_sync_with_no_new_events_omits_room() {
     seed(
         &store,
         &make_event(
-            event_id!("$only:example.org"),
             room,
             "m.room.message",
             None,
@@ -863,7 +808,6 @@ async fn limited_set_when_timeline_truncated() {
     seed(
         &store,
         &make_event(
-            event_id!("$seed:example.org"),
             room,
             "m.room.message",
             None,
@@ -882,12 +826,9 @@ async fn limited_set_when_timeline_truncated() {
     let resp1 = handle(&state, user, req1).await.unwrap();
 
     for i in 0..5 {
-        let id_str = format!("$ev-{i}:example.org");
-        let id: OwnedEventId = id_str.try_into().unwrap();
         seed(
             &store,
             &make_event(
-                &id,
                 room,
                 "m.room.message",
                 None,
@@ -920,7 +861,6 @@ async fn required_state_not_re_sent_when_unchanged() {
     seed(
         &store,
         &make_event(
-            event_id!("$name:example.org"),
             room,
             "m.room.name",
             Some(""),
@@ -947,7 +887,6 @@ async fn required_state_not_re_sent_when_unchanged() {
     seed(
         &store,
         &make_event(
-            event_id!("$msg:example.org"),
             room,
             "m.room.message",
             None,
@@ -980,12 +919,10 @@ async fn seed_invite(
     room: &RoomId,
     user: &UserId,
     inviter: &UserId,
-    invite_event_id: &EventId,
     room_name: &str,
     ts: u64,
 ) {
     let invite_json = serde_json::json!({
-        "event_id": invite_event_id.as_str(),
         "room_id": room.as_str(),
         "type": "m.room.member",
         "state_key": user.as_str(),
@@ -1016,7 +953,6 @@ async fn seed_invite(
         }
     });
     let invite_event = make_event_from_json(
-        invite_event_id,
         room,
         "m.room.member",
         Some(user.as_str()),
@@ -1036,7 +972,6 @@ async fn invited_room_emits_invite_state() {
     setup_room(&store, room, inviter).await;
 
     let invite_json = serde_json::json!({
-        "event_id": "$invite:example.org",
         "room_id": room.as_str(),
         "type": "m.room.member",
         "state_key": user.as_str(),
@@ -1073,7 +1008,6 @@ async fn invited_room_emits_invite_state() {
         }
     });
     let invite_event = make_event_from_json(
-        event_id!("$invite:example.org"),
         room,
         "m.room.member",
         Some(user.as_str()),
@@ -1132,16 +1066,7 @@ async fn fresh_invite_emitted_while_existing_invite_pending() {
     let room_b = room_id!("!b:example.org");
 
     setup_room(&store, room_a, inviter).await;
-    seed_invite(
-        &store,
-        room_a,
-        user,
-        inviter,
-        event_id!("$invite-a:example.org"),
-        "Room A",
-        100,
-    )
-    .await;
+    seed_invite(&store, room_a, user, inviter, "Room A", 100).await;
     let state = SyncState::new(store.clone());
 
     let mut lists = BTreeMap::new();
@@ -1169,16 +1094,7 @@ async fn fresh_invite_emitted_while_existing_invite_pending() {
     );
 
     setup_room(&store, room_b, inviter).await;
-    seed_invite(
-        &store,
-        room_b,
-        user,
-        inviter,
-        event_id!("$invite-b:example.org"),
-        "Room B",
-        200,
-    )
-    .await;
+    seed_invite(&store, room_b, user, inviter, "Room B", 200).await;
 
     let mut req3 = Request::new();
     req3.pos = Some(resp2.pos);
@@ -1251,7 +1167,6 @@ async fn name_avatar_and_counts_emitted() {
     seed(
         &store,
         &make_event(
-            event_id!("$name:example.org"),
             room,
             "m.room.name",
             Some(""),
@@ -1264,7 +1179,6 @@ async fn name_avatar_and_counts_emitted() {
     seed(
         &store,
         &make_event(
-            event_id!("$avatar:example.org"),
             room,
             "m.room.avatar",
             Some(""),
@@ -1274,26 +1188,8 @@ async fn name_avatar_and_counts_emitted() {
         ),
     )
     .await;
-    seed_member(
-        &store,
-        event_id!("$bob-join:example.org"),
-        room,
-        bob,
-        bob,
-        "join",
-        130,
-    )
-    .await;
-    seed_member(
-        &store,
-        event_id!("$carol-invite:example.org"),
-        room,
-        carol,
-        user,
-        "invite",
-        140,
-    )
-    .await;
+    seed_member(&store, room, bob, bob, "join", 130).await;
+    seed_member(&store, room, carol, user, "invite", 140).await;
 
     let state = SyncState::new(store);
     let mut req = Request::new();
@@ -1466,7 +1362,6 @@ async fn long_poll_returns_empty_after_timeout() {
     seed(
         &store,
         &make_event(
-            event_id!("$seed:example.org"),
             room,
             "m.room.message",
             None,
@@ -1510,7 +1405,6 @@ async fn long_poll_wakes_on_new_event() {
     seed(
         &store,
         &make_event(
-            event_id!("$seed:example.org"),
             room,
             "m.room.message",
             None,
@@ -1537,7 +1431,6 @@ async fn long_poll_wakes_on_new_event() {
         seed(
             &store_for_task,
             &make_event(
-                event_id!("$late:example.org"),
                 &waker_room,
                 "m.room.message",
                 None,
@@ -1579,7 +1472,6 @@ async fn retry_with_same_pos_returns_cached_response() {
     seed(
         &store,
         &make_event(
-            event_id!("$ev:example.org"),
             room,
             "m.room.message",
             None,
@@ -1711,7 +1603,6 @@ async fn retry_does_not_consume_pending_events() {
     seed(
         &store,
         &make_event(
-            event_id!("$first:example.org"),
             room,
             "m.room.message",
             None,
@@ -1737,7 +1628,6 @@ async fn retry_does_not_consume_pending_events() {
     seed(
         &store,
         &make_event(
-            event_id!("$second:example.org"),
             room,
             "m.room.message",
             None,
@@ -1782,7 +1672,6 @@ async fn required_state_wildcard_matches_everything() {
     seed(
         &store,
         &make_event(
-            event_id!("$name:example.org"),
             room,
             "m.room.name",
             Some(""),
@@ -1825,21 +1714,11 @@ async fn required_state_wildcard_state_key_returns_all_keys_of_type() {
     let bob = user_id!("@bob:example.org");
     let room = room_id!("!room:example.org");
     setup_joined_room(&store, room, user).await;
-    seed_member(
-        &store,
-        event_id!("$bob:example.org"),
-        room,
-        bob,
-        bob,
-        "join",
-        110,
-    )
-    .await;
+    seed_member(&store, room, bob, bob, "join", 110).await;
     // Different event type — must NOT come back when the rule targets members.
     seed(
         &store,
         &make_event(
-            event_id!("$name:example.org"),
             room,
             "m.room.name",
             Some(""),
@@ -1880,7 +1759,6 @@ async fn required_state_wildcard_event_type_matches_specific_state_key() {
     seed(
         &store,
         &make_event(
-            event_id!("$name:example.org"),
             room,
             "m.room.name",
             Some(""),
@@ -1923,12 +1801,9 @@ async fn initial_sync_sets_limited_true_when_room_has_more_events_than_limit() {
     let room = room_id!("!room:example.org");
     setup_joined_room(&store, room, user).await;
     for i in 0..5 {
-        let id_str = format!("$ev-{i}:example.org");
-        let id: OwnedEventId = id_str.try_into().unwrap();
         seed(
             &store,
             &make_event(
-                &id,
                 room,
                 "m.room.message",
                 None,
@@ -1968,7 +1843,6 @@ async fn initial_sync_sets_limited_false_when_all_events_fit() {
     seed(
         &store,
         &make_event(
-            event_id!("$only:example.org"),
             room,
             "m.room.message",
             None,
@@ -2004,7 +1878,6 @@ async fn newly_joined_room_emits_initial_snapshot_on_incremental_sync() {
     seed(
         &store,
         &make_event(
-            event_id!("$existing:example.org"),
             existing,
             "m.room.message",
             None,
@@ -2028,7 +1901,6 @@ async fn newly_joined_room_emits_initial_snapshot_on_incremental_sync() {
     seed(
         &store,
         &make_event(
-            event_id!("$f1:example.org"),
             fresh,
             "m.room.message",
             None,
@@ -2041,7 +1913,6 @@ async fn newly_joined_room_emits_initial_snapshot_on_incremental_sync() {
     seed(
         &store,
         &make_event(
-            event_id!("$f2:example.org"),
             fresh,
             "m.room.message",
             None,
@@ -2104,7 +1975,6 @@ async fn name_change_propagates_on_incremental_sync() {
     seed(
         &store,
         &make_event(
-            event_id!("$name-1:example.org"),
             room,
             "m.room.name",
             Some(""),
@@ -2132,7 +2002,6 @@ async fn name_change_propagates_on_incremental_sync() {
     seed(
         &store,
         &make_event(
-            event_id!("$name-2:example.org"),
             room,
             "m.room.name",
             Some(""),
@@ -2168,7 +2037,6 @@ async fn invited_room_emits_name_and_avatar_from_stripped_state() {
     setup_room(&store, room, inviter).await;
 
     let invite_json = serde_json::json!({
-        "event_id": "$invite:example.org",
         "room_id": room.as_str(),
         "type": "m.room.member",
         "state_key": user.as_str(),
@@ -2193,7 +2061,6 @@ async fn invited_room_emits_name_and_avatar_from_stripped_state() {
         }
     });
     let invite_event = make_event_from_json(
-        event_id!("$invite:example.org"),
         room,
         "m.room.member",
         Some(user.as_str()),
@@ -2234,16 +2101,7 @@ async fn knocked_room_appears_in_candidates() {
     let knocker = user_id!("@knock-host:example.org");
     let room = room_id!("!knock:example.org");
     setup_room(&store, room, knocker).await;
-    seed_member(
-        &store,
-        event_id!("$knock:example.org"),
-        room,
-        user,
-        user,
-        "knock",
-        100,
-    )
-    .await;
+    seed_member(&store, room, user, user, "knock", 100).await;
 
     let state = SyncState::new(store);
 
@@ -2268,36 +2126,9 @@ async fn kicked_room_appears_in_candidates_even_on_fresh_connection() {
     setup_room(&store, room, kicker).await;
     // Member event with sender != target — that's a kick. The kicker's own
     // join also needs to exist for an authentic-looking pre-kick state.
-    seed_member(
-        &store,
-        event_id!("$kicker-join:example.org"),
-        room,
-        kicker,
-        kicker,
-        "join",
-        50,
-    )
-    .await;
-    seed_member(
-        &store,
-        event_id!("$alice-join:example.org"),
-        room,
-        user,
-        user,
-        "join",
-        60,
-    )
-    .await;
-    seed_member(
-        &store,
-        event_id!("$kick:example.org"),
-        room,
-        user,
-        kicker,
-        "leave",
-        100,
-    )
-    .await;
+    seed_member(&store, room, kicker, kicker, "join", 50).await;
+    seed_member(&store, room, user, user, "join", 60).await;
+    seed_member(&store, room, user, kicker, "leave", 100).await;
 
     let state = SyncState::new(store);
     let mut req = Request::new();
@@ -2330,16 +2161,7 @@ async fn self_left_room_only_appears_if_previously_emitted() {
 
     // Step 2: user self-leaves. They should still see the room because the
     // conn previously emitted it.
-    seed_member(
-        &store,
-        event_id!("$self-leave:example.org"),
-        room,
-        user,
-        user,
-        "leave",
-        200,
-    )
-    .await;
+    seed_member(&store, room, user, user, "leave", 200).await;
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos);
     req2.lists = lists;
@@ -2370,26 +2192,8 @@ async fn banned_room_only_appears_if_previously_emitted() {
     let banner = user_id!("@bob:example.org");
     let room = room_id!("!ban:example.org");
     setup_room(&store, room, banner).await;
-    seed_member(
-        &store,
-        event_id!("$banner-join:example.org"),
-        room,
-        banner,
-        banner,
-        "join",
-        50,
-    )
-    .await;
-    seed_member(
-        &store,
-        event_id!("$ban:example.org"),
-        room,
-        user,
-        banner,
-        "ban",
-        100,
-    )
-    .await;
+    seed_member(&store, room, banner, banner, "join", 50).await;
+    seed_member(&store, room, user, banner, "ban", 100).await;
     let state = SyncState::new(store);
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -2420,16 +2224,7 @@ async fn banned_room_remains_visible_after_being_emitted_while_joined() {
     let resp1 = handle(&state, user, req1).await.unwrap();
     assert!(resp1.rooms.contains_key(room));
 
-    seed_member(
-        &store,
-        event_id!("$ban:example.org"),
-        room,
-        user,
-        banner,
-        "ban",
-        200,
-    )
-    .await;
+    seed_member(&store, room, user, banner, "ban", 200).await;
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos);
     req2.lists = lists;
@@ -2458,7 +2253,6 @@ async fn concurrent_long_poll_is_cancelled_by_newer_request() {
     seed(
         &store,
         &make_event(
-            event_id!("$seed:example.org"),
             room,
             "m.room.message",
             None,
@@ -2534,7 +2328,6 @@ async fn initial_sync_cancels_prior_entrys_long_poll() {
     seed(
         &store,
         &make_event(
-            event_id!("$seed:example.org"),
             room,
             "m.room.message",
             None,
@@ -2606,7 +2399,6 @@ async fn concurrent_body_differing_request_gets_unknown_pos_after_cancellation()
     seed(
         &store,
         &make_event(
-            event_id!("$seed:example.org"),
             room,
             "m.room.message",
             None,
@@ -2691,11 +2483,9 @@ async fn initial_sync_anchors_high_water_at_store_head() {
     // > EVENTS_PER_SYNC_LIMIT (1000) is required to trip the bug. We seed
     // 1100 events past the create + member-join already written by setup.
     for i in 0..1100u64 {
-        let id: OwnedEventId = format!("$e{i}:example.org").try_into().unwrap();
         seed(
             &store,
             &make_event(
-                &id,
                 room,
                 "m.room.message",
                 None,

@@ -14,10 +14,13 @@
 
 use base64::Engine;
 use base64::engine::general_purpose;
-use ruma::canonical_json::{CanonicalJsonObject, RedactionError, redact_in_place};
+use ruma::canonical_json::{
+    CanonicalJsonObject, CanonicalJsonValue, RedactionError, redact_in_place,
+};
 use ruma::room_version_rules::RoomVersionRules;
 use ruma::{EventId, OwnedEventId, OwnedRoomId};
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 
 /// Serialise a canonical-JSON object to its canonical byte representation.
 ///
@@ -43,17 +46,17 @@ pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
 ///
 /// Used for the `hashes.sha256` field — the Matrix spec specifies
 /// "unpadded Base64" (standard alphabet, no `=` padding) for content hashes.
-///
-/// Consumed by `EventBuilder` in B2 — kept under `#[allow(dead_code)]`
-/// until then so the helper sits next to its url-safe counterpart.
-#[allow(dead_code)]
-pub(crate) fn b64_unpadded(bytes: &[u8]) -> String {
+/// Exposed for consumers (e.g. `EventBuilder`) that need to embed the b64
+/// form of a content hash into wire JSON.
+pub fn b64_unpadded(bytes: &[u8]) -> String {
     general_purpose::STANDARD_NO_PAD.encode(bytes)
 }
 
 /// URL-safe-alphabet base64, no padding.
 ///
-/// Used for the event_id suffix (v3+): `event_id = "$" + b64url_unpadded(reference_hash)`.
+/// Used internally for the event_id suffix (v3+):
+/// `event_id = "$" + b64url_unpadded(reference_hash)`. Not exposed publicly
+/// — callers should use [`event_id_from_hash`] which wraps it.
 pub(crate) fn b64_url_unpadded(bytes: &[u8]) -> String {
     general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
@@ -98,18 +101,47 @@ pub fn content_hash(obj: &CanonicalJsonObject) -> [u8; 32] {
 /// Reference hash of an event object — feeds the v3+ event_id.
 ///
 /// Spec: <https://spec.matrix.org/v1.18/server-server-api/#calculating-the-reference-hash-for-an-event>.
-/// Runs [`redact_for_hash`] (V12 redaction with the MSC4242 `prev_state_events`
-/// carve-out), then removes `signatures` and `unsigned`, canonical-encodes,
-/// SHA-256s.
-///
-/// Returns `RedactionError` only if the input object violates the redaction
-/// preconditions ruma checks (e.g. non-object `content`, missing `type`).
+/// Runs [`redact_to_canonical_bytes`] and SHA-256s the result.
 pub fn reference_hash(obj: &CanonicalJsonObject) -> Result<[u8; 32], RedactionError> {
+    Ok(sha256(&redact_to_canonical_bytes(obj)?))
+}
+
+/// Apply V12 redaction (with the MSC4242 `prev_state_events` carve-out),
+/// strip `signatures` and `unsigned`, and return the canonical-JSON bytes.
+///
+/// Used both as an internal step of [`reference_hash`] and exposed for
+/// from-wire callers that need the redacted form on content-hash mismatch
+/// (Matrix S2S §"Validating hashes and signatures on received events":
+/// "If the content hashes are not present, or do not match the supplied
+/// content, then the receiving server must redact the event before
+/// accepting it").
+///
+/// Returns `RedactionError` only if the input violates ruma's redaction
+/// preconditions (non-object `content`/`hashes`/`signatures`, missing `type`).
+pub fn redact_to_canonical_bytes(obj: &CanonicalJsonObject) -> Result<Vec<u8>, RedactionError> {
     let mut clone = obj.clone();
     redact_for_hash(&mut clone)?;
     clone.remove("signatures");
     clone.remove("unsigned");
-    Ok(sha256(&canonical(&clone)))
+    Ok(canonical(&clone))
+}
+
+/// Verify an event's content hash against its `hashes.sha256` field.
+///
+/// Returns `true` iff the event has a well-shaped `hashes.sha256` string
+/// AND its value equals `b64_unpadded(content_hash(obj))`. Absent / malformed
+/// `hashes` returns `false`.
+///
+/// Spec: <https://spec.matrix.org/v1.18/server-server-api/#calculating-the-content-hash-for-an-event>.
+pub fn verify_content_hash(obj: &CanonicalJsonObject) -> bool {
+    let Some(CanonicalJsonValue::Object(hashes)) = obj.get("hashes") else {
+        return false;
+    };
+    let Some(CanonicalJsonValue::String(expected)) = hashes.get("sha256") else {
+        return false;
+    };
+    let computed = b64_unpadded(&content_hash(obj));
+    *expected == computed
 }
 
 /// Format an event_id from a reference hash. v3+ rooms only.
@@ -119,6 +151,42 @@ pub fn event_id_from_hash(hash: &[u8; 32]) -> OwnedEventId {
     let s = format!("${}", b64_url_unpadded(hash));
     // 43 url-safe-b64 chars after `$` is always a syntactically valid event_id.
     OwnedEventId::try_from(s).expect("'$' + 43 url-safe-b64 chars is a valid event_id")
+}
+
+/// Compute an event's event_id directly from its canonical wire bytes.
+///
+/// Convenience wrapper around `reference_hash` + `event_id_from_hash` for
+/// callers that hold the `raw` bytes and don't want to parse them into a
+/// `CanonicalJsonObject` themselves. Used by `EventStore::persist_event`'s
+/// debug-build round-trip check and by test helpers that need a hash-correct
+/// event_id without depending on `neutrino-state::EventBuilder`.
+///
+/// Returns the same errors `reference_hash` would for malformed input:
+/// non-object root, missing `type`, non-object `content`/`hashes`/`signatures`.
+pub fn compute_event_id(raw: &serde_json::value::RawValue) -> Result<OwnedEventId, ComputeIdError> {
+    let parsed: CanonicalJsonValue = serde_json::from_str(raw.get())?;
+    let CanonicalJsonValue::Object(obj) = parsed else {
+        return Err(ComputeIdError::NonObjectRoot);
+    };
+    let rh = reference_hash(&obj).map_err(ComputeIdError::Redaction)?;
+    Ok(event_id_from_hash(&rh))
+}
+
+/// Failure modes for [`compute_event_id`].
+#[derive(Debug, Error)]
+pub enum ComputeIdError {
+    /// `raw` isn't valid JSON.
+    #[error("raw is not valid JSON: {0}")]
+    Parse(#[from] serde_json::Error),
+
+    /// `raw` is valid JSON but the root value isn't an object.
+    #[error("raw JSON root is not an object")]
+    NonObjectRoot,
+
+    /// `reference_hash`'s redaction preconditions weren't met
+    /// (missing `type`, non-object `content`/`hashes`/`signatures`).
+    #[error("redaction precondition failed: {0}")]
+    Redaction(RedactionError),
 }
 
 /// Derive a room_id from a create event's event_id.
@@ -413,5 +481,186 @@ mod tests {
         assert!(room_id.as_str().starts_with('!'));
         // Suffix is byte-identical to the event_id (everything after the sigil).
         assert_eq!(&room_id.as_str()[1..], &event_id.as_str()[1..]);
+    }
+
+    /// Hand-authored v12 reference-hash vector with independent verification.
+    ///
+    /// **Keep this test even though `compute_event_id_matches_real_matrix_org_event`
+    /// and `compute_event_id_matches_real_msc4242_event` below also exercise
+    /// the same pipeline against real homeserver outputs.** The hand-traced
+    /// `EXPECTED_POST_REDACTION` literal is the only place where the
+    /// post-redaction canonical bytes are spelled out in human-readable form,
+    /// which makes it auditable: when a regression splits between "redaction
+    /// changed shape" vs "sha256/canonical/b64 changed", the dual assertion
+    /// (`reference_hash == sha256(EXPECTED)` AND `id == "$pinned"`) tells you
+    /// which layer broke. The real-event vectors are end-to-end black-box
+    /// checks; this one is a glass-box check.
+    ///
+    /// The spec appendix only carries v1-shaped content-hash vectors (already
+    /// pinned by `content_hash_spec_vector_*` above). There is no published
+    /// v12 reference-hash vector, so we author one and cross-check it by:
+    ///
+    /// 1. Constructing an input event (`INPUT`).
+    /// 2. Manually computing what V11 redaction + MSC4242 carve-out + strip
+    ///    `signatures`/`unsigned` should leave behind (`EXPECTED_POST_REDACTION`).
+    /// 3. Asserting `reference_hash(INPUT) == sha256(EXPECTED_POST_REDACTION)`.
+    ///    The right-hand side runs SHA-256 (FIPS-verified by `sha256_known_vector`)
+    ///    against bytes a human can read — if our redaction step diverges, this
+    ///    assertion catches it.
+    /// 4. Additionally pinning `event_id_from_hash(reference_hash(INPUT))` so
+    ///    a regression in `b64_url_unpadded` or the event_id format would also
+    ///    fail this test.
+    ///
+    /// For `m.room.message` events the V11 content keep-list is empty, so
+    /// `content` collapses to `{}`. `unsigned` is not in the top-level keep-list
+    /// → stripped by redaction. `signatures` IS in the keep-list but we strip
+    /// it after redaction (spec step). `prev_state_events` is preserved by our
+    /// MSC4242 wrapper. Final keys, sorted alphabetically:
+    /// `content, hashes, origin_server_ts, prev_events, prev_state_events,
+    ///  room_id, sender, type`.
+    #[test]
+    fn reference_hash_v12_authored_vector() {
+        // The input event — every field a v12 m.room.message can carry.
+        let input = obj(json!({
+            "type": "m.room.message",
+            "sender": "@alice:example.org",
+            "room_id": "!room:example.org",
+            "content": { "msgtype": "m.text", "body": "hello" },
+            "prev_events": ["$prev:example.org"],
+            "prev_state_events": ["$ps:example.org"],
+            "origin_server_ts": 1_700_000_000_000_u64,
+            "hashes": { "sha256": "Y29udGVudGhhc2g" },
+            "unsigned": { "age": 42 },
+            "signatures": {}
+        }));
+
+        // What our pipeline (redact_for_hash → strip signatures → strip
+        // unsigned → canonical-encode) MUST produce. Keys sorted; content
+        // emptied (no keep-list entries for m.room.message); unsigned and
+        // signatures removed; everything else preserved (prev_state_events
+        // is the MSC4242 carve-out — V11 alone would have stripped it).
+        const EXPECTED_POST_REDACTION: &[u8] = br#"{"content":{},"hashes":{"sha256":"Y29udGVudGhhc2g"},"origin_server_ts":1700000000000,"prev_events":["$prev:example.org"],"prev_state_events":["$ps:example.org"],"room_id":"!room:example.org","sender":"@alice:example.org","type":"m.room.message"}"#;
+
+        let h = reference_hash(&input).expect("redacts");
+
+        // Independent cross-check: SHA-256 over the human-readable expected
+        // bytes must equal our reference_hash output. If our redaction step
+        // produces different bytes, this will fail.
+        assert_eq!(
+            h,
+            sha256(EXPECTED_POST_REDACTION),
+            "reference_hash diverges from sha256(hand-traced redaction bytes)"
+        );
+
+        // Pinned event_id — guards against regressions in `b64_url_unpadded`
+        // or the `$<43 chars>` format. Recorded from the verified hash above.
+        let id = event_id_from_hash(&h);
+        assert_eq!(id.as_str(), "$mY2a13t3rnoKFepL_yWIHDCPjw7WoP1Rem5QJyvom9w",);
+    }
+
+    /// Cross-check against a real matrix.org-produced event_id (supplied by
+    /// Kegan, 2026-05-27). Pre-MSC4242 event with `auth_events` on the wire
+    /// (not `prev_state_events`), so our redaction wrapper's save/restore
+    /// is a no-op and the result must match stock V11 behaviour byte-for-byte.
+    /// If this drifts, either ruma's `redact_in_place` changed or our
+    /// canonical encoding broke — both would be regressions.
+    #[test]
+    fn compute_event_id_matches_real_matrix_org_event() {
+        let raw_json = r#"{
+  "auth_events": [
+    "$Fw7pQdLu79h74bsZabn1UKXoXo7-q5M-cOwQxQxfh2c",
+    "$WadCIT8wxAK3K7zCT9OmewBHyQFIzTRLo15lobAE3zE",
+    "$7qryV2SHr6Vb7ztIf20gqFyCKWD6A7faRdHQnJaeXGc"
+  ],
+  "content": {
+    "body": "ping",
+    "m.mentions": {},
+    "msgtype": "m.text"
+  },
+  "depth": 8,
+  "hashes": {
+    "sha256": "ASg2wblVle+n4idsXYALIQuBTk6I99UtfeOsvsMZX0I"
+  },
+  "origin_server_ts": 1779866621967,
+  "prev_events": [
+    "$7z8Yl5LzVNoP6iqWr580M0fv9-ZV8nE73ojfFEKATJc"
+  ],
+  "room_id": "!ySniwzsmihjTTwbBtv:matrix.org",
+  "sender": "@kegan:matrix.org",
+  "type": "m.room.message",
+  "signatures": {
+    "matrix.org": {
+      "ed25519:a_RXGa": "zr5GHROMC0lSeRnBonZE1nFC1dqJLwe1IKxcOU66cuQuJaIH6KZCCwMAz6IqgXUQz3hX4FOmzem13vo3sz6WDg"
+    }
+  },
+  "unsigned": {
+    "age_ts": 1779866621967
+  }
+}"#;
+        let raw = serde_json::value::RawValue::from_string(raw_json.to_owned()).expect("raw");
+        let id = compute_event_id(&raw).expect("computes");
+        assert_eq!(id.as_str(), "$KXQOIuyr9pVHI6YAqMtwYCJbeh8-KtZbl8XCDHA53qY");
+    }
+
+    /// Cross-check against a real MSC4242 / v12 event_id (supplied by Kegan,
+    /// 2026-05-27). This event has `prev_state_events` (not `auth_events`)
+    /// on the wire and a v12-format room_id (`!` + 43 url-safe-b64 chars),
+    /// so it exercises **the MSC4242 carve-out path itself**: without our
+    /// save/restore of `prev_state_events` across V11 redaction, the field
+    /// would be stripped and the resulting event_id would differ.
+    /// Complements `compute_event_id_matches_real_matrix_org_event` which
+    /// only exercised stock V11 redaction.
+    #[test]
+    fn compute_event_id_matches_real_msc4242_event() {
+        let raw_json = r#"{
+  "prev_events": [
+    "$zo_-jrWvI_eBqBktaYF2uIZ4pS2hngkQ4J9wWm37w0g"
+  ],
+  "type": "m.room.power_levels",
+  "sender": "@alice2:localhost",
+  "content": {
+    "ban": 50,
+    "events": {
+      "m.room.avatar": 50,
+      "m.room.canonical_alias": 50,
+      "m.room.encryption": 100,
+      "m.room.history_visibility": 100,
+      "m.room.name": 50,
+      "m.room.power_levels": 100,
+      "m.room.server_acl": 100,
+      "m.room.tombstone": 150
+    },
+    "events_default": 0,
+    "historical": 100,
+    "invite": 50,
+    "kick": 50,
+    "m.call.invite": 50,
+    "redact": 50,
+    "state_default": 50,
+    "users": {},
+    "users_default": 0
+  },
+  "depth": 3,
+  "prev_state_events": [
+    "$zo_-jrWvI_eBqBktaYF2uIZ4pS2hngkQ4J9wWm37w0g"
+  ],
+  "room_id": "!KlUQEifCY1P4t_lJDp5enSu82bnnQWvjZXGXsv9FA_4",
+  "state_key": "",
+  "origin_server_ts": 1779867947339,
+  "hashes": {
+    "sha256": "nRF+dz1Qn0cLXL9GLjTEyR6BbsoOtx01LIYi9AUld1A"
+  },
+  "signatures": {
+    "localhost": {
+      "ed25519:a_vQAB": "NHb3pa0sPIxe8uEIxmrApZgj2rBCRwTDGAfmsnQ6IUq8jZBirpNo+BpMO+jC4geK89GJ1/yqz1z44rlLlVjpAg"
+    }
+  },
+  "unsigned": {
+    "age_ts": 1779867947339
+  }
+}"#;
+        let raw = serde_json::value::RawValue::from_string(raw_json.to_owned()).expect("raw");
+        let id = compute_event_id(&raw).expect("computes");
+        assert_eq!(id.as_str(), "$B551KEsRXrNE3knHLSP-QszuqJYSjasJECVcmP1JIkI");
     }
 }

@@ -53,13 +53,66 @@ impl Deref for EventRow<'_> {
 
 impl<'a> From<&'a Event> for EventRow<'a> {
     fn from(event: &'a Event) -> Self {
+        debug_assert_event_id_matches_raw(event);
         Self(Cow::Borrowed(event))
     }
 }
 
 impl From<Event> for EventRow<'static> {
     fn from(event: Event) -> Self {
+        debug_assert_event_id_matches_raw(&event);
         Self(Cow::Owned(event))
+    }
+}
+
+impl<'a> EventRow<'a> {
+    /// Wrap an event without the `debug_assert_event_id_matches_raw` check.
+    /// **Only for tests** that exercise the storage layer's *own* JSON
+    /// validation by passing intentionally-malformed raw bytes (the column
+    /// vs JSON cross-checks, malformed-JSON rejection, missing-membership
+    /// CHECK constraint). Production callers must go through `From<Event>`
+    /// so the round-trip check fires.
+    #[cfg(test)]
+    pub(crate) fn unchecked(event: &'a Event) -> Self {
+        Self(Cow::Borrowed(event))
+    }
+}
+
+/// Defence-in-depth: in debug builds, every event handed to the storage
+/// layer (through `EventRow::from`) must round-trip through
+/// `compute_event_id(raw)` and produce the `event_id` already attached to
+/// the struct. Production code goes through `EventBuilder` / `from_wire`,
+/// both of which compute the event_id from the same canonical bytes — a
+/// mismatch is a caller bug (hand-rolled event with the wrong id) and a
+/// hard-fail signal during development. No-op in release builds.
+///
+/// `EventRow::from` is the single chokepoint for every write path
+/// (`persist_event`, `persist_historical_event`, `create_room`'s initial
+/// events, the `setup_room` test helper, etc.) — placing the check here
+/// rather than in each `EventStore` method ensures no write path can skip it.
+#[track_caller]
+fn debug_assert_event_id_matches_raw(event: &Event) {
+    #[cfg(debug_assertions)]
+    {
+        match neutrino_common::event_id::compute_event_id(&event.raw) {
+            Ok(computed) if computed == event.event_id => {}
+            Ok(computed) => panic!(
+                "EventRow::from: event.event_id ({}) does not match reference \
+                 hash of event.raw ({}). Either build via EventBuilder / \
+                 from_wire, or fix the caller's hand-rolled id.",
+                event.event_id, computed,
+            ),
+            Err(e) => panic!(
+                "EventRow::from: failed to compute event_id from event.raw \
+                 ({}). The raw bytes do not satisfy `compute_event_id`'s \
+                 preconditions. Underlying error: {e}",
+                event.event_id,
+            ),
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = event;
     }
 }
 
@@ -193,7 +246,12 @@ impl<'a> EventRow<'a> {
     /// dance across `EventRow<'a>` ↔ `EventRow<'static>` that the blanket
     /// `impl<T> Borrow<T> for T` makes unsound without specialisation.
     pub fn to_owned(&self) -> EventRow<'static> {
-        EventRow::from(self.0.as_ref().clone())
+        // The borrow was already checked at the original `EventRow::from`
+        // call site (or intentionally bypassed via `unchecked`); cloning
+        // doesn't change the relationship between event_id and raw, so the
+        // assert is redundant here. Constructing via `Cow::Owned` directly
+        // avoids re-firing it.
+        EventRow(Cow::Owned(self.0.as_ref().clone()))
     }
 
     /// Forward-extension write: crack JSON, INSERT into `events`, INSERT

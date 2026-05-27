@@ -111,43 +111,36 @@ fn add_unique(keys: &mut Vec<(String, String)>, event_type: &str, state_key: Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::validate::parse_event;
+    use crate::event_id::EventBuilder;
+    use crate::test_utils::next_ts;
     use neutrino_common::ROOM_VERSION_ID;
+    use ruma::room_id;
     use serde_json::{Value, json};
     use std::collections::{HashMap, HashSet};
 
-    fn raw(v: Value) -> Box<serde_json::value::RawValue> {
-        serde_json::value::to_raw_value(&v).expect("test fixture")
-    }
     fn eid(s: &str) -> OwnedEventId {
         s.parse().expect("test event id")
     }
 
-    fn base_event() -> Value {
-        json!({
-            "type": "m.room.message",
-            "sender": "@alice:example.org",
-            "room_id": "!room:example.org",
-            "content": { "msgtype": "m.text", "body": "hi" },
-            "prev_events": [],
-            "prev_state_events": [],
-            "depth": 1,
-            "origin_server_ts": 1_700_000_000_000_u64,
-            "hashes": { "sha256": "abc" }
-        })
+    /// Build a default-shape `m.room.message` event with a chosen sender —
+    /// the auth_event tests only consult `event_type` and `sender` here.
+    fn message_from(sender: &str) -> Event {
+        EventBuilder::new(sender.parse().expect("sender"), "m.room.message".to_owned())
+            .room_id(room_id!("!room:example.org").to_owned())
+            .content(json!({ "msgtype": "m.text", "body": "hi" }))
+            .origin_server_ts(next_ts())
+            .build()
+            .expect("valid message")
     }
 
-    fn make_event(v: Value, id: &str) -> Event {
-        parse_event(raw(v), eid(id), vec![]).expect("valid test event")
-    }
-
-    fn member(sender: &str, target: &str, content: Value, id: &str) -> Event {
-        let mut v = base_event();
-        v["type"] = json!("m.room.member");
-        v["sender"] = json!(sender);
-        v["state_key"] = json!(target);
-        v["content"] = content;
-        make_event(v, id)
+    fn member(sender: &str, target: &str, content: Value) -> Event {
+        EventBuilder::new(sender.parse().expect("sender"), "m.room.member".to_owned())
+            .room_id(room_id!("!room:example.org").to_owned())
+            .state_key(target.to_owned())
+            .content(content)
+            .origin_server_ts(next_ts())
+            .build()
+            .expect("valid member")
     }
 
     /// Build a state map from `(type, state_key, event_id)` triples.
@@ -167,19 +160,21 @@ mod tests {
 
     #[test]
     fn create_event_has_no_auth_events() {
-        let mut v = base_event();
-        v["type"] = json!("m.room.create");
-        v["sender"] = json!("@alice:example.org");
-        v.as_object_mut().unwrap().remove("room_id");
-        v["content"] = json!({ "room_version": ROOM_VERSION_ID });
-        v["state_key"] = json!("");
-        let ev = make_event(v, "$create:example.org");
+        let ev = EventBuilder::new(
+            "@alice:example.org".parse().expect("user id"),
+            "m.room.create".to_owned(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid create");
         assert!(auth_event_keys(&ev).is_empty());
     }
 
     #[test]
     fn non_member_keys() {
-        let ev = make_event(base_event(), "$m:example.org");
+        let ev = message_from("@alice:example.org");
         assert_eq!(
             auth_event_keys(&ev),
             vec![
@@ -196,7 +191,7 @@ mod tests {
     fn v12_omits_create_event_key() {
         // Sanity: even when state contains a create event, auth_event_keys
         // for a non-create event must not ask for it.
-        let ev = make_event(base_event(), "$m:example.org");
+        let ev = message_from("@alice:example.org");
         let keys = auth_event_keys(&ev);
         assert!(
             !keys.iter().any(|(t, _)| t == "m.room.create"),
@@ -210,7 +205,6 @@ mod tests {
             "@alice:example.org",
             "@bob:example.org",
             json!({ "membership": "join" }),
-            "$j:example.org",
         );
         assert_eq!(
             auth_event_keys(&ev),
@@ -232,7 +226,6 @@ mod tests {
             "@alice:example.org",
             "@bob:example.org",
             json!({ "membership": "leave" }),
-            "$l:example.org",
         );
         let keys = auth_event_keys(&ev);
         assert!(!keys.iter().any(|(t, _)| t == "m.room.join_rules"));
@@ -250,7 +243,6 @@ mod tests {
             "@alice:example.org",
             "@alice:example.org",
             json!({ "membership": "join" }),
-            "$self:example.org",
         );
         let keys = auth_event_keys(&ev);
         let member_entries: Vec<_> = keys.iter().filter(|(t, _)| t == "m.room.member").collect();
@@ -269,7 +261,6 @@ mod tests {
                     "signed": { "token": "tok123" }
                 }
             }),
-            "$inv:example.org",
         );
         let keys = auth_event_keys(&ev);
         assert!(
@@ -284,7 +275,6 @@ mod tests {
             "@alice:example.org",
             "@bob:example.org",
             json!({ "membership": "invite" }),
-            "$inv:example.org",
         );
         let keys = auth_event_keys(&ev);
         assert!(!keys.iter().any(|(t, _)| t == "m.room.third_party_invite"));
@@ -299,7 +289,6 @@ mod tests {
                 "membership": "join",
                 "join_authorised_via_users_server": "@carol:example.org"
             }),
-            "$rj:example.org",
         );
         let keys = auth_event_keys(&ev);
         assert!(
@@ -318,7 +307,6 @@ mod tests {
                 "membership": "leave",
                 "join_authorised_via_users_server": "@carol:example.org"
             }),
-            "$leave-with-auth:example.org",
         );
         let keys = auth_event_keys(&ev);
         assert!(
@@ -337,7 +325,6 @@ mod tests {
             "@alice:example.org",
             "@bob:example.org",
             json!({ "membership": "lurking" }),
-            "$weird:example.org",
         );
         let keys = auth_event_keys(&ev);
         assert!(!keys.iter().any(|(t, _)| t == "m.room.join_rules"));
@@ -347,7 +334,7 @@ mod tests {
 
     #[test]
     fn expected_resolves_keys_through_state() {
-        let ev = make_event(base_event(), "$m:example.org");
+        let ev = message_from("@alice:example.org");
         let st = state(&[
             ("m.room.power_levels", "", "$pl:example.org"),
             (
@@ -365,7 +352,7 @@ mod tests {
     #[test]
     fn expected_drops_absent_entries() {
         // No power_levels and no sender member event in state → output is empty.
-        let ev = make_event(base_event(), "$m:example.org");
+        let ev = message_from("@alice:example.org");
         let st = HashMap::new();
         assert!(calculate_auth_events(&ev, &st).is_empty());
     }
@@ -374,7 +361,7 @@ mod tests {
     fn expected_v12_excludes_create_even_when_in_state() {
         // Put a create event in state under (m.room.create, "") — auth_events
         // must not include it.
-        let ev = make_event(base_event(), "$m:example.org");
+        let ev = message_from("@alice:example.org");
         let st = state(&[
             ("m.room.create", "", "$create:example.org"),
             ("m.room.power_levels", "", "$pl:example.org"),
@@ -396,7 +383,6 @@ mod tests {
             "@alice:example.org",
             "@bob:example.org",
             json!({ "membership": "join" }),
-            "$j:example.org",
         );
         let st = state(&[
             ("m.room.power_levels", "", "$pl:example.org"),
