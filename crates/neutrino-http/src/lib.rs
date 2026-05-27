@@ -25,6 +25,7 @@ use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+mod legacy_sync;
 mod sliding_sync;
 
 use sliding_sync::{SyncError, SyncState};
@@ -107,6 +108,7 @@ pub async fn router(config: Config) -> Result<Router, StartupError> {
             "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync",
             post(sync),
         )
+        .route("/_matrix/client/v3/sync", get(legacy_sync::handle))
         .route("/_matrix/client/v3/keys/query", post(keys_query))
         .route("/_matrix/client/v3/keys/upload", post(keys_upload))
         .route(
@@ -157,7 +159,10 @@ async fn root() -> &'static str {
 
 async fn versions() -> Json<Value> {
     Json(json!({
-        "unstable_features": {"org.matrix.simplified_msc3575": true},
+        "unstable_features": {
+            "org.matrix.simplified_msc3575": true,
+            "org.matrix.msc4222": true,
+        },
         "versions": ["v1.16"]
     }))
 }
