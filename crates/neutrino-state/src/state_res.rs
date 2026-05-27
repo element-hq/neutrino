@@ -12,16 +12,20 @@
 //! - Iterative auth checks pass 1 starts from the **empty state**, not from
 //!   the unconflicted state. v2 started from unconflicted.
 //!
-//! Phase 4a (this file as of now): `separate`, `conflicted_subgraph`,
-//! `auth_chain_difference`. Phase 4b/4c will add the sorters, IAC, mainline,
-//! and the `resolve_state` top-level entry point.
+//! Phase 4b adds the reverse-topological power sort and the iterative auth
+//! checks loop. Phase 4c will add mainline ordering, IAC pass 2, and the
+//! `resolve_state` top-level entry point.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::Arc;
 
 use ruma::OwnedEventId;
 
+use crate::auth_events::auth_event_keys;
+use crate::auth_rules::{AuthContext, check_auth_rules};
 use crate::provider::StateProvider;
-use crate::{StateMap, StateResError};
+use crate::{Event, StateMap, StateResError};
 
 // ----------------- separate -----------------
 
@@ -133,6 +137,224 @@ pub fn auth_chain_difference(
         intersection = intersection.intersection(c).cloned().collect();
     }
     Ok(union.difference(&intersection).cloned().collect())
+}
+
+// ----------------- power_of_sender -----------------
+
+/// Effective power level of `event.sender` *at the time of `event`*, computed
+/// by inspecting `event.auth_events` directly (spec v12 state-res §reverse
+/// topological power ordering: "looking at their respective `auth_event`s").
+///
+/// Synapse parity (`state/v2.py::_get_power_level_for_sender`):
+/// - Walk `event.auth_events`; pick out the create event and the latest
+///   `m.room.power_levels` event referenced directly.
+/// - If a PL event is found, use it. If no PL is found but a create event is,
+///   the only signal is creator-set membership → `i64::MAX` for creators,
+///   `0` for non-creators (no PL ⇒ `users_default` is 0).
+/// - If neither create nor PL is found (an invariant violation by the caller —
+///   our `calculate_auth_events` always emits a create reference for
+///   non-create events), return `0`.
+///
+/// `m.room.create` events have no `auth_events` and are authored by the
+/// creator → MAX.
+///
+/// Reuses `AuthContext` so creator detection (sender + `additional_creators`)
+/// and PL parsing stay defined in exactly one place.
+pub fn power_of_sender(event: &Event, provider: &dyn StateProvider) -> Result<i64, StateResError> {
+    if event.event_type == "m.room.create" {
+        return Ok(i64::MAX);
+    }
+
+    let mut state: StateMap<Arc<Event>> = HashMap::new();
+    for aid in &event.auth_events {
+        let info = provider
+            .get_event(aid)
+            .ok_or_else(|| StateResError::MissingAuthEvent(aid.clone()))?;
+        if info.rejected {
+            continue;
+        }
+        match info.event.event_type.as_str() {
+            "m.room.create" => {
+                state.insert(("m.room.create".to_owned(), String::new()), info.event);
+            }
+            "m.room.power_levels" => {
+                state.insert(
+                    ("m.room.power_levels".to_owned(), String::new()),
+                    info.event,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    if !state.contains_key(&("m.room.create".to_owned(), String::new())) {
+        return Ok(0);
+    }
+    let ctx = AuthContext::new(&state);
+    Ok(ctx.user_power(&event.sender))
+}
+
+// ----------------- reverse_topological_power_sort -----------------
+
+/// Reverse-topological power sort over the auth subgraph induced by `events`.
+///
+/// Output order: parents (events others depend on via `auth_events`) come
+/// before their dependents. Ties broken by **higher power first**, then by
+/// **lower `origin_server_ts`**, then by **lower `event_id`** — matching
+/// synapse `state/v2.py::_reverse_topological_power_sort`'s heap key
+/// `(-power_level, origin_server_ts, event_id)`.
+///
+/// Outdegree-restricted Kahn's: `outdegree(e) = |e.auth_events ∩ events|`. The
+/// algorithm short-circuits if a cycle traps any subset — surfaced as a
+/// shorter-than-input output rather than an error (cycles can't form in a
+/// hash-derived auth chain, so this is a defensive observation, not a path
+/// the caller is expected to hit).
+pub fn reverse_topological_power_sort(
+    events: &HashSet<OwnedEventId>,
+    provider: &dyn StateProvider,
+) -> Result<Vec<OwnedEventId>, StateResError> {
+    if events.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Resolve each input event and its power once.
+    let mut event_map: HashMap<OwnedEventId, Arc<Event>> = HashMap::with_capacity(events.len());
+    let mut event_to_pl: HashMap<OwnedEventId, i64> = HashMap::with_capacity(events.len());
+    for eid in events {
+        let info = provider
+            .get_event(eid)
+            .ok_or_else(|| StateResError::MissingAuthEvent(eid.clone()))?;
+        let pl = power_of_sender(&info.event, provider)?;
+        event_map.insert(eid.clone(), info.event);
+        event_to_pl.insert(eid.clone(), pl);
+    }
+
+    // outdegree[e] = how many of e.auth_events are in `events`.
+    // children_of[p] = events e where p ∈ e.auth_events ∩ events.
+    let mut outdegree: HashMap<OwnedEventId, usize> = HashMap::with_capacity(events.len());
+    let mut children_of: HashMap<OwnedEventId, Vec<OwnedEventId>> = HashMap::new();
+    for eid in events {
+        let ev = &event_map[eid];
+        let mut deg = 0usize;
+        for parent in &ev.auth_events {
+            if events.contains(parent) {
+                deg += 1;
+                children_of
+                    .entry(parent.clone())
+                    .or_default()
+                    .push(eid.clone());
+            }
+        }
+        outdegree.insert(eid.clone(), deg);
+    }
+
+    // Max-heap on (power, Reverse(ts), Reverse(event_id)) → pop yields
+    // (highest power, lowest ts, lowest event_id). Synapse equivalent is a
+    // min-heap on (-power, ts, event_id).
+    type Key = (i64, Reverse<u64>, Reverse<OwnedEventId>);
+    let mut heap: BinaryHeap<Key> = BinaryHeap::new();
+    let key_for = |eid: &OwnedEventId, event_map: &HashMap<OwnedEventId, Arc<Event>>| -> Key {
+        let ev = &event_map[eid];
+        (
+            event_to_pl[eid],
+            Reverse(ev.origin_server_ts),
+            Reverse(eid.clone()),
+        )
+    };
+    for eid in events {
+        if outdegree[eid] == 0 {
+            heap.push(key_for(eid, &event_map));
+        }
+    }
+
+    let mut sorted = Vec::with_capacity(events.len());
+    while let Some((_, _, Reverse(eid))) = heap.pop() {
+        if let Some(child_list) = children_of.get(&eid) {
+            for child in child_list {
+                let deg = outdegree
+                    .get_mut(child)
+                    .expect("child registered during outdegree pass");
+                *deg -= 1;
+                if *deg == 0 {
+                    heap.push(key_for(child, &event_map));
+                }
+            }
+        }
+        sorted.push(eid);
+    }
+    Ok(sorted)
+}
+
+// ----------------- iterative_auth_checks -----------------
+
+/// IAC: walk `sorted` in order, accept-or-reject each event against an
+/// `auth_events` map built from the event's own `auth_events` overlaid with
+/// the current `resolved` state for keys the event needs (`auth_event_keys`).
+///
+/// Synapse parity (`state/v2.py::_iterative_auth_checks`):
+/// 1. Build per-event auth map from `event.auth_events` (skipping rejected).
+/// 2. Overlay entries from `resolved` for each key in
+///    `auth_events::auth_event_keys(event)` — earlier accepted events in this
+///    pass override the as-shipped auth_events. This is the iterative step.
+/// 3. Skip events the provider has pre-marked rejected.
+/// 4. Run `check_auth_rules`; on `Ok`, write the event into `resolved` if it's
+///    a state event. Message events leave `resolved` unchanged.
+///
+/// `initial_state` is **empty** for v12 IAC pass 1 (v2.1 divergence), passed
+/// through unchanged for IAC pass 2 (phase 4c). This function is agnostic to
+/// which pass is running.
+pub fn iterative_auth_checks(
+    sorted: &[OwnedEventId],
+    initial_state: StateMap<OwnedEventId>,
+    provider: &dyn StateProvider,
+) -> Result<StateMap<OwnedEventId>, StateResError> {
+    let mut resolved = initial_state;
+
+    for eid in sorted {
+        let info = provider
+            .get_event(eid)
+            .ok_or_else(|| StateResError::MissingAuthEvent(eid.clone()))?;
+        if info.rejected {
+            continue;
+        }
+        let event = info.event;
+
+        let mut auth_map: StateMap<Arc<Event>> = HashMap::new();
+        for aid in &event.auth_events {
+            let parent = provider
+                .get_event(aid)
+                .ok_or_else(|| StateResError::MissingAuthEvent(aid.clone()))?;
+            if parent.rejected {
+                continue;
+            }
+            let key = (
+                parent.event.event_type.clone(),
+                parent.event.state_key.clone().unwrap_or_default(),
+            );
+            auth_map.insert(key, parent.event);
+        }
+
+        // Iterative step: overlay resolved-state entries for the keys this
+        // event actually consults.
+        for key in auth_event_keys(&event) {
+            if let Some(rs_id) = resolved.get(&key) {
+                let info = provider
+                    .get_event(rs_id)
+                    .ok_or_else(|| StateResError::MissingAuthEvent(rs_id.clone()))?;
+                if !info.rejected {
+                    auth_map.insert(key, info.event);
+                }
+            }
+        }
+
+        if check_auth_rules(&event, &auth_map).is_ok()
+            && let Some(sk) = &event.state_key
+        {
+            resolved.insert((event.event_type.clone(), sk.clone()), eid.clone());
+        }
+    }
+
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -425,5 +647,423 @@ mod tests {
         let diff = auth_chain_difference(&[&s1, &s2, &s3], &provider).unwrap();
         let expected: HashSet<_> = [bag["a"].clone(), bag["b"].clone()].into_iter().collect();
         assert_eq!(diff, expected);
+    }
+
+    // ===== Phase 4b: power_of_sender / reverse_topological_power_sort / iterative_auth_checks =====
+
+    use neutrino_common::ROOM_VERSION_ID;
+    use ruma::RoomId;
+
+    /// Stable room_id for non-create test events. The auth rules don't
+    /// cross-check the room_id against the create event's derived id, so a
+    /// fixed string is fine for unit tests.
+    fn test_room() -> &'static RoomId {
+        room_id!("!room:example.org")
+    }
+
+    /// Build an `m.room.create` event. `additional_creators` is a slice of
+    /// user-id strings; passing an empty slice omits the field. `federate =
+    /// false` writes `m.federate: false` into content; `true` omits it (the
+    /// default).
+    fn build_create(creator: &str, additional_creators: &[&str], federate: bool) -> Event {
+        let mut content = json!({ "room_version": ROOM_VERSION_ID });
+        if !additional_creators.is_empty() {
+            content["additional_creators"] = json!(
+                additional_creators
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
+        if !federate {
+            content["m.federate"] = json!(false);
+        }
+        EventBuilder::new(
+            creator.parse().expect("creator"),
+            "m.room.create".to_owned(),
+        )
+        .state_key(String::new())
+        .content(content)
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid create")
+    }
+
+    /// `m.room.power_levels` event with caller-supplied content + auth chain.
+    fn build_power_levels(
+        sender: &str,
+        content: serde_json::Value,
+        auth: Vec<OwnedEventId>,
+    ) -> Event {
+        EventBuilder::new(
+            sender.parse().expect("sender"),
+            "m.room.power_levels".to_owned(),
+        )
+        .room_id(test_room().to_owned())
+        .state_key(String::new())
+        .content(content)
+        .auth_events(auth)
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid power_levels")
+    }
+
+    /// `m.room.message` event with caller-supplied auth chain.
+    fn build_message(sender: &str, auth: Vec<OwnedEventId>) -> Event {
+        EventBuilder::new(sender.parse().expect("sender"), "m.room.message".to_owned())
+            .room_id(test_room().to_owned())
+            .content(json!({ "msgtype": "m.text", "body": "hi" }))
+            .auth_events(auth)
+            .origin_server_ts(next_ts())
+            .build()
+            .expect("valid message")
+    }
+
+    /// `m.room.topic` state event with caller-supplied auth chain — used as a
+    /// non-member state event for rule 4 / rule 8 paths.
+    fn build_topic(sender: &str, auth: Vec<OwnedEventId>) -> Event {
+        EventBuilder::new(sender.parse().expect("sender"), "m.room.topic".to_owned())
+            .room_id(test_room().to_owned())
+            .state_key(String::new())
+            .content(json!({ "topic": "hi" }))
+            .auth_events(auth)
+            .origin_server_ts(next_ts())
+            .build()
+            .expect("valid topic")
+    }
+
+    /// Insert an event into the provider as `rejected: false` and return its
+    /// id.
+    fn put(provider: &mut InMemoryStateProvider, ev: Event) -> OwnedEventId {
+        let id = ev.event_id.clone();
+        provider.insert(EventInfo {
+            event: Arc::new(ev),
+            rejected: false,
+        });
+        id
+    }
+
+    /// Insert an event into the provider as `rejected: true` (skipped by
+    /// downstream consumers).
+    fn put_rejected(provider: &mut InMemoryStateProvider, ev: Event) -> OwnedEventId {
+        let id = ev.event_id.clone();
+        provider.insert(EventInfo {
+            event: Arc::new(ev),
+            rejected: true,
+        });
+        id
+    }
+
+    // ----- power_of_sender -----
+
+    #[test]
+    fn power_of_sender_create_event_is_max() {
+        let provider = InMemoryStateProvider::new();
+        let create = build_create("@alice:example.org", &[], true);
+        // The create event's auth_events is empty per spec; power_of_sender
+        // short-circuits to MAX.
+        assert_eq!(power_of_sender(&create, &provider).unwrap(), i64::MAX);
+    }
+
+    #[test]
+    fn power_of_sender_creator_with_no_pl_in_auth() {
+        let mut provider = InMemoryStateProvider::new();
+        let create = build_create("@alice:example.org", &[], true);
+        let create_id = put(&mut provider, create);
+        // alice messages the room before any PL exists. Her power = MAX
+        // (she's the creator).
+        let msg = build_message("@alice:example.org", vec![create_id]);
+        assert_eq!(power_of_sender(&msg, &provider).unwrap(), i64::MAX);
+    }
+
+    #[test]
+    fn power_of_sender_additional_creator_is_max() {
+        let mut provider = InMemoryStateProvider::new();
+        let create = build_create("@alice:example.org", &["@bob:example.org"], true);
+        let create_id = put(&mut provider, create);
+        let msg = build_message("@bob:example.org", vec![create_id]);
+        assert_eq!(power_of_sender(&msg, &provider).unwrap(), i64::MAX);
+    }
+
+    #[test]
+    fn power_of_sender_non_creator_no_pl_returns_zero() {
+        let mut provider = InMemoryStateProvider::new();
+        let create = build_create("@alice:example.org", &[], true);
+        let create_id = put(&mut provider, create);
+        let msg = build_message("@charlie:example.org", vec![create_id]);
+        // No PL in auth_events, charlie isn't a creator → users_default (0).
+        assert_eq!(power_of_sender(&msg, &provider).unwrap(), 0);
+    }
+
+    #[test]
+    fn power_of_sender_uses_explicit_users_entry() {
+        let mut provider = InMemoryStateProvider::new();
+        let create = build_create("@alice:example.org", &[], true);
+        let create_id = put(&mut provider, create);
+        let pl = build_power_levels(
+            "@alice:example.org",
+            json!({ "users": { "@charlie:example.org": 42 } }),
+            vec![create_id.clone()],
+        );
+        let pl_id = put(&mut provider, pl);
+        let msg = build_message("@charlie:example.org", vec![create_id, pl_id]);
+        assert_eq!(power_of_sender(&msg, &provider).unwrap(), 42);
+    }
+
+    #[test]
+    fn power_of_sender_falls_back_to_users_default() {
+        let mut provider = InMemoryStateProvider::new();
+        let create = build_create("@alice:example.org", &[], true);
+        let create_id = put(&mut provider, create);
+        let pl = build_power_levels(
+            "@alice:example.org",
+            json!({ "users_default": 33 }),
+            vec![create_id.clone()],
+        );
+        let pl_id = put(&mut provider, pl);
+        let msg = build_message("@charlie:example.org", vec![create_id, pl_id]);
+        assert_eq!(power_of_sender(&msg, &provider).unwrap(), 33);
+    }
+
+    #[test]
+    fn power_of_sender_skips_rejected_pl_in_auth_events() {
+        // If the PL referenced in auth_events is marked rejected, fall through
+        // to the no-PL path. Matches synapse's `if ev.rejected_reason is None`
+        // filter (we don't model `rejected` as a soft-fail here, just as
+        // "treat as absent").
+        let mut provider = InMemoryStateProvider::new();
+        let create = build_create("@alice:example.org", &[], true);
+        let create_id = put(&mut provider, create);
+        let pl = build_power_levels(
+            "@alice:example.org",
+            json!({ "users": { "@charlie:example.org": 99 } }),
+            vec![create_id.clone()],
+        );
+        let pl_id = put_rejected(&mut provider, pl);
+        let msg = build_message("@charlie:example.org", vec![create_id, pl_id]);
+        // Rejected PL is skipped → charlie falls back to 0 (no PL, non-creator).
+        assert_eq!(power_of_sender(&msg, &provider).unwrap(), 0);
+    }
+
+    // ----- reverse_topological_power_sort -----
+
+    #[test]
+    fn sort_empty_input_returns_empty() {
+        let provider = InMemoryStateProvider::new();
+        let out = reverse_topological_power_sort(&HashSet::new(), &provider).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn sort_chain_orders_parent_before_child() {
+        // c (no auth) → b (auth = [c]) → a (auth = [b]). Sort yields [c, b, a].
+        let mut provider = InMemoryStateProvider::new();
+        let mut bag = HashMap::new();
+        insert(&mut provider, &mut bag, "c", &[]);
+        insert(&mut provider, &mut bag, "b", &["c"]);
+        insert(&mut provider, &mut bag, "a", &["b"]);
+        let events: HashSet<_> = [bag["a"].clone(), bag["b"].clone(), bag["c"].clone()]
+            .into_iter()
+            .collect();
+        let sorted = reverse_topological_power_sort(&events, &provider).unwrap();
+        assert_eq!(
+            sorted,
+            vec![bag["c"].clone(), bag["b"].clone(), bag["a"].clone()]
+        );
+    }
+
+    #[test]
+    fn sort_higher_power_first_for_same_outdegree() {
+        // Two events, both outdegree 0. alice = creator (MAX); charlie = 0.
+        // Output order: alice first.
+        let mut provider = InMemoryStateProvider::new();
+        let create = build_create("@alice:example.org", &[], true);
+        let create_id = put(&mut provider, create);
+        let alice_msg = build_message("@alice:example.org", vec![create_id.clone()]);
+        let charlie_msg = build_message("@charlie:example.org", vec![create_id.clone()]);
+        let alice_id = put(&mut provider, alice_msg);
+        let charlie_id = put(&mut provider, charlie_msg);
+        let events: HashSet<_> = [alice_id.clone(), charlie_id.clone()].into_iter().collect();
+        // The sort set excludes the create event so both events have
+        // outdegree 0 in the restricted graph.
+        let sorted = reverse_topological_power_sort(&events, &provider).unwrap();
+        assert_eq!(sorted, vec![alice_id, charlie_id]);
+    }
+
+    #[test]
+    fn sort_ts_tiebreak_when_power_equal() {
+        // Two messages by the same sender (same power). next_ts() guarantees
+        // strictly monotonic origin_server_ts, so the *earlier* event must
+        // come first in the sort (synapse heap key: ts ascending).
+        let mut provider = InMemoryStateProvider::new();
+        let create = build_create("@alice:example.org", &[], true);
+        let create_id = put(&mut provider, create);
+        let early = build_message("@charlie:example.org", vec![create_id.clone()]);
+        let late = build_message("@charlie:example.org", vec![create_id.clone()]);
+        assert!(
+            early.origin_server_ts < late.origin_server_ts,
+            "next_ts() must be monotonic for this test"
+        );
+        let early_id = put(&mut provider, early);
+        let late_id = put(&mut provider, late);
+        let events: HashSet<_> = [late_id.clone(), early_id.clone()].into_iter().collect();
+        let sorted = reverse_topological_power_sort(&events, &provider).unwrap();
+        assert_eq!(sorted, vec![early_id, late_id]);
+    }
+
+    #[test]
+    fn sort_diamond_orders_root_first_and_top_last() {
+        //     top  (auth = [a, b])
+        //     / \
+        //    a   b   (each auth = [d])
+        //     \ /
+        //      d  (no auth)
+        // Expected: d first, then {a, b} in tiebreak order, then top.
+        let mut provider = InMemoryStateProvider::new();
+        let mut bag = HashMap::new();
+        insert(&mut provider, &mut bag, "d", &[]);
+        insert(&mut provider, &mut bag, "a", &["d"]);
+        insert(&mut provider, &mut bag, "b", &["d"]);
+        insert(&mut provider, &mut bag, "top", &["a", "b"]);
+        let events: HashSet<_> = [
+            bag["a"].clone(),
+            bag["b"].clone(),
+            bag["d"].clone(),
+            bag["top"].clone(),
+        ]
+        .into_iter()
+        .collect();
+        let sorted = reverse_topological_power_sort(&events, &provider).unwrap();
+        // Don't pin a/b order (both have power 0 from placeholder + same
+        // sender; id-tiebreak depends on hash-derived ids). Pin only the
+        // structural property: d first, top last.
+        assert_eq!(sorted.len(), 4);
+        assert_eq!(sorted[0], bag["d"]);
+        assert_eq!(sorted[3], bag["top"]);
+        let middle: HashSet<_> = sorted[1..3].iter().cloned().collect();
+        let expected_middle: HashSet<_> =
+            [bag["a"].clone(), bag["b"].clone()].into_iter().collect();
+        assert_eq!(middle, expected_middle);
+    }
+
+    #[test]
+    fn sort_excludes_out_of_set_auth_parents_from_outdegree() {
+        // The outdegree restriction must only count parents that are in the
+        // input set. Otherwise events with parents outside the set would
+        // never reach outdegree 0 and the sort would stall.
+        let mut provider = InMemoryStateProvider::new();
+        let mut bag = HashMap::new();
+        insert(&mut provider, &mut bag, "outside", &[]);
+        insert(&mut provider, &mut bag, "inside", &["outside"]);
+        let events: HashSet<_> = [bag["inside"].clone()].into_iter().collect();
+        let sorted = reverse_topological_power_sort(&events, &provider).unwrap();
+        assert_eq!(sorted, vec![bag["inside"].clone()]);
+    }
+
+    // ----- iterative_auth_checks -----
+
+    #[test]
+    fn iac_empty_sorted_returns_initial_state() {
+        let provider = InMemoryStateProvider::new();
+        let mut initial = StateMap::new();
+        initial.insert(
+            ("m.room.name".to_string(), String::new()),
+            eid("$preexisting:example.org"),
+        );
+        let out = iterative_auth_checks(&[], initial.clone(), &provider).unwrap();
+        assert_eq!(out, initial);
+    }
+
+    #[test]
+    fn iac_accepts_create_event_and_writes_to_resolved() {
+        let mut provider = InMemoryStateProvider::new();
+        let create = build_create("@alice:example.org", &[], true);
+        let create_id = put(&mut provider, create);
+        let out =
+            iterative_auth_checks(std::slice::from_ref(&create_id), StateMap::new(), &provider)
+                .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out.get(&("m.room.create".to_string(), String::new())),
+            Some(&create_id)
+        );
+    }
+
+    #[test]
+    fn iac_skips_pre_rejected_event() {
+        let mut provider = InMemoryStateProvider::new();
+        let create = build_create("@alice:example.org", &[], true);
+        let create_id = put_rejected(&mut provider, create);
+        let out =
+            iterative_auth_checks(std::slice::from_ref(&create_id), StateMap::new(), &provider)
+                .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn iac_auth_rule_failure_does_not_apply_event() {
+        // create with m.federate=false. A topic from a different domain
+        // fails rule 4 → not written into resolved.
+        let mut provider = InMemoryStateProvider::new();
+        let create = build_create("@alice:here.org", &[], false);
+        let create_id = put(&mut provider, create);
+        let topic = build_topic("@bob:there.org", vec![create_id.clone()]);
+        let topic_id = put(&mut provider, topic);
+        let out = iterative_auth_checks(&[create_id.clone(), topic_id], StateMap::new(), &provider)
+            .unwrap();
+        // Only create made it in; topic was rule-4 rejected.
+        assert_eq!(out.len(), 1);
+        assert!(
+            out.contains_key(&("m.room.create".to_string(), String::new())),
+            "create event applied"
+        );
+        assert!(
+            !out.contains_key(&("m.room.topic".to_string(), String::new())),
+            "rule-4-rejected topic must not be in resolved state"
+        );
+    }
+
+    #[test]
+    fn iac_accepted_non_state_event_leaves_resolved_unchanged() {
+        // alice sends a message. It passes auth (creator, rule 6 self-joined
+        // is bypassed because alice is creator and has implicit join; in
+        // practice we also need alice's member event in auth, but the v12
+        // rule 6 check uses ctx.membership which falls back to None — so the
+        // message would be rejected by rule 6. Use a more permissive setup:
+        // a non-member, non-message *state* event by the creator is the only
+        // case that mechanically auth-passes without alice's member event.
+        // Switch to topic by alice — passes rule 8 (creator → MAX power),
+        // but it IS a state event so we can't observe "state unchanged".
+        //
+        // So: directly verify that the loop runs without crashing on a
+        // non-state event and the resolved state grows only by state-event
+        // acceptances, by constructing a setup that has both a message and
+        // a state event in the sort.
+        let mut provider = InMemoryStateProvider::new();
+        let create = build_create("@alice:here.org", &[], true);
+        let create_id = put(&mut provider, create);
+        // alice's message will fail rule 6 (no member event in auth), but
+        // that's fine — the point of this test is that a non-state-event
+        // acceptance OR rejection doesn't pollute `resolved`.
+        let msg = build_message("@alice:here.org", vec![create_id.clone()]);
+        let msg_id = put(&mut provider, msg);
+        let out = iterative_auth_checks(&[create_id, msg_id], StateMap::new(), &provider).unwrap();
+        // Whether the message accepts or rejects, `resolved` must only
+        // contain the create event — m.room.message has no state_key.
+        assert_eq!(out.len(), 1);
+        assert!(out.contains_key(&("m.room.create".to_string(), String::new())));
+    }
+
+    #[test]
+    fn iac_propagates_missing_auth_event_error() {
+        // Build a topic referencing a create_id that is NOT in the provider.
+        // Phase-4b IAC errors loudly per the project invariant ("every event
+        // we know about has its complete auth chain locally resolvable").
+        let mut provider = InMemoryStateProvider::new();
+        let fake_create_id: OwnedEventId = "$nonexistent:example.org".parse().unwrap();
+        let topic = build_topic("@alice:example.org", vec![fake_create_id.clone()]);
+        let topic_id = put(&mut provider, topic);
+        let err = iterative_auth_checks(&[topic_id], StateMap::new(), &provider).unwrap_err();
+        assert!(matches!(err, StateResError::MissingAuthEvent(_)));
     }
 }

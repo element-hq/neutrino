@@ -112,7 +112,11 @@ pub fn check_auth_rules(event: &Event, state: &StateMap<Arc<Event>>) -> Result<(
 
 /// Pre-computed views over state-before-event. Built once per
 /// `check_auth_rules` call; rule sub-functions only borrow.
-struct AuthContext<'a> {
+///
+/// `pub(crate)` so `state_res::power_of_sender` can reuse the creator-set and
+/// power-level parsing — under MSC4242 the "state" we hand it is the synthetic
+/// 2-entry map (create + latest PL) derived from `event.auth_events`.
+pub(crate) struct AuthContext<'a> {
     state: &'a StateMap<Arc<Event>>,
     create_event: &'a Arc<Event>,
     creators: HashSet<OwnedUserId>,
@@ -129,7 +133,7 @@ struct AuthContext<'a> {
 }
 
 impl<'a> AuthContext<'a> {
-    fn new(state: &'a StateMap<Arc<Event>>) -> Self {
+    pub(crate) fn new(state: &'a StateMap<Arc<Event>>) -> Self {
         // `validate::validate_references` (phase 1b) has already verified
         // that this room's create event is in state; reaching auth without
         // it is a state-machine invariant violation by the caller.
@@ -182,7 +186,7 @@ impl<'a> AuthContext<'a> {
 
     /// User's effective power level. Creators have `i64::MAX` ("cannot be
     /// demoted to a lower power level, even through m.room.power_levels").
-    fn user_power(&self, user: &UserId) -> i64 {
+    pub(crate) fn user_power(&self, user: &UserId) -> i64 {
         if self.creators.contains(user) {
             return i64::MAX;
         }
