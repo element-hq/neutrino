@@ -522,4 +522,110 @@ mod tests {
         let id = event_id_from_hash(&h);
         assert_eq!(id.as_str(), "$mY2a13t3rnoKFepL_yWIHDCPjw7WoP1Rem5QJyvom9w",);
     }
+
+    /// Cross-check against a real matrix.org-produced event_id (supplied by
+    /// Kegan, 2026-05-27). Pre-MSC4242 event with `auth_events` on the wire
+    /// (not `prev_state_events`), so our redaction wrapper's save/restore
+    /// is a no-op and the result must match stock V11 behaviour byte-for-byte.
+    /// If this drifts, either ruma's `redact_in_place` changed or our
+    /// canonical encoding broke — both would be regressions.
+    #[test]
+    fn compute_event_id_matches_real_matrix_org_event() {
+        let raw_json = r#"{
+  "auth_events": [
+    "$Fw7pQdLu79h74bsZabn1UKXoXo7-q5M-cOwQxQxfh2c",
+    "$WadCIT8wxAK3K7zCT9OmewBHyQFIzTRLo15lobAE3zE",
+    "$7qryV2SHr6Vb7ztIf20gqFyCKWD6A7faRdHQnJaeXGc"
+  ],
+  "content": {
+    "body": "ping",
+    "m.mentions": {},
+    "msgtype": "m.text"
+  },
+  "depth": 8,
+  "hashes": {
+    "sha256": "ASg2wblVle+n4idsXYALIQuBTk6I99UtfeOsvsMZX0I"
+  },
+  "origin_server_ts": 1779866621967,
+  "prev_events": [
+    "$7z8Yl5LzVNoP6iqWr580M0fv9-ZV8nE73ojfFEKATJc"
+  ],
+  "room_id": "!ySniwzsmihjTTwbBtv:matrix.org",
+  "sender": "@kegan:matrix.org",
+  "type": "m.room.message",
+  "signatures": {
+    "matrix.org": {
+      "ed25519:a_RXGa": "zr5GHROMC0lSeRnBonZE1nFC1dqJLwe1IKxcOU66cuQuJaIH6KZCCwMAz6IqgXUQz3hX4FOmzem13vo3sz6WDg"
+    }
+  },
+  "unsigned": {
+    "age_ts": 1779866621967
+  }
+}"#;
+        let raw = serde_json::value::RawValue::from_string(raw_json.to_owned()).expect("raw");
+        let id = compute_event_id(&raw).expect("computes");
+        assert_eq!(id.as_str(), "$KXQOIuyr9pVHI6YAqMtwYCJbeh8-KtZbl8XCDHA53qY");
+    }
+
+    /// Cross-check against a real MSC4242 / v12 event_id (supplied by Kegan,
+    /// 2026-05-27). This event has `prev_state_events` (not `auth_events`)
+    /// on the wire and a v12-format room_id (`!` + 43 url-safe-b64 chars),
+    /// so it exercises **the MSC4242 carve-out path itself**: without our
+    /// save/restore of `prev_state_events` across V11 redaction, the field
+    /// would be stripped and the resulting event_id would differ.
+    /// Complements `compute_event_id_matches_real_matrix_org_event` which
+    /// only exercised stock V11 redaction.
+    #[test]
+    fn compute_event_id_matches_real_msc4242_event() {
+        let raw_json = r#"{
+  "prev_events": [
+    "$zo_-jrWvI_eBqBktaYF2uIZ4pS2hngkQ4J9wWm37w0g"
+  ],
+  "type": "m.room.power_levels",
+  "sender": "@alice2:localhost",
+  "content": {
+    "ban": 50,
+    "events": {
+      "m.room.avatar": 50,
+      "m.room.canonical_alias": 50,
+      "m.room.encryption": 100,
+      "m.room.history_visibility": 100,
+      "m.room.name": 50,
+      "m.room.power_levels": 100,
+      "m.room.server_acl": 100,
+      "m.room.tombstone": 150
+    },
+    "events_default": 0,
+    "historical": 100,
+    "invite": 50,
+    "kick": 50,
+    "m.call.invite": 50,
+    "redact": 50,
+    "state_default": 50,
+    "users": {},
+    "users_default": 0
+  },
+  "depth": 3,
+  "prev_state_events": [
+    "$zo_-jrWvI_eBqBktaYF2uIZ4pS2hngkQ4J9wWm37w0g"
+  ],
+  "room_id": "!KlUQEifCY1P4t_lJDp5enSu82bnnQWvjZXGXsv9FA_4",
+  "state_key": "",
+  "origin_server_ts": 1779867947339,
+  "hashes": {
+    "sha256": "nRF+dz1Qn0cLXL9GLjTEyR6BbsoOtx01LIYi9AUld1A"
+  },
+  "signatures": {
+    "localhost": {
+      "ed25519:a_vQAB": "NHb3pa0sPIxe8uEIxmrApZgj2rBCRwTDGAfmsnQ6IUq8jZBirpNo+BpMO+jC4geK89GJ1/yqz1z44rlLlVjpAg"
+    }
+  },
+  "unsigned": {
+    "age_ts": 1779867947339
+  }
+}"#;
+        let raw = serde_json::value::RawValue::from_string(raw_json.to_owned()).expect("raw");
+        let id = compute_event_id(&raw).expect("computes");
+        assert_eq!(id.as_str(), "$B551KEsRXrNE3knHLSP-QszuqJYSjasJECVcmP1JIkI");
+    }
 }

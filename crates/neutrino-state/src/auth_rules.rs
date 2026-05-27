@@ -882,9 +882,13 @@ mod tests {
     /// Shared room_id for all non-create fixtures in this module. The
     /// auth-rules code doesn't validate room_id consistency against the
     /// create event (that's `validate_references`' job, not in scope here),
-    /// so a single arbitrary value suffices.
+    /// so a single arbitrary value suffices. Uses v12 / RoomIdFormatVersion::V2
+    /// shape (`!` + 43 url-safe-base64 chars, no domain) to match what
+    /// `EventBuilder` derives for real create events.
     fn fixture_room_id() -> OwnedRoomId {
-        "!create:example.org".parse().expect("room id")
+        "!AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            .parse()
+            .expect("room id")
     }
 
     fn create_event(creator: &str, additional_creators: &[&str]) -> Arc<Event> {
