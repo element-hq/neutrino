@@ -25,20 +25,15 @@ use thiserror::Error;
 
 use crate::Event;
 
-/// Failure modes for conversions into state-shaped client views.
-///
-/// The infallible `From<&Event>` impls (timeline targets) can't fail. The
-/// `TryFrom<&Event>` impls (state targets) can only return `NotAStateEvent`.
-/// Only [`strip_state_event`] — which operates on type-opaque `Raw<…>` JSON
-/// — can hit `Malformed` / `MissingField`.
+/// Failure mode for the `TryFrom<&Event>` impls into state-shaped client
+/// views: an `Event` whose `state_key` is `None` cannot be represented as a
+/// state event. The infallible `From<&Event>` impls (timeline targets) can't
+/// fail; [`strip_state_event`] is intrinsically infallible (it just removes
+/// non-canonical fields from a JSON value) — see its doc for why.
 #[derive(Debug, Error)]
 pub enum StateEventConversionError {
     #[error("event of type {event_type} has no state_key — cannot represent as a state event")]
     NotAStateEvent { event_type: String },
-    #[error("Raw<AnySyncStateEvent> JSON is malformed: {0}")]
-    Malformed(#[from] serde_json::Error),
-    #[error("Raw<AnySyncStateEvent> is missing required field {0}")]
-    MissingField(&'static str),
 }
 
 /// Policy for `room_id` placement when enriching a wire event for the CSAPI.
@@ -150,30 +145,38 @@ impl TryFrom<&Event> for Raw<AnyStrippedStateEvent> {
 /// handler doesn't natively populate `invite_state` for knocks (its
 /// `is_invited` check matches only `invite`), so `required_state` is the
 /// source field, but v3's `knock_state` is defined as stripped state.
-pub fn strip_state_event(
-    raw: &Raw<AnySyncStateEvent>,
-) -> Result<Raw<AnyStrippedStateEvent>, StateEventConversionError> {
-    let parsed: Value = serde_json::from_str(raw.json().get())?;
-    let obj = parsed
-        .as_object()
-        .ok_or(StateEventConversionError::MissingField(
-            "(root must be object)",
-        ))?;
-    // state_key is the only field MSC1772 stripped state strictly requires
-    // beyond type/sender/content; absence here means the input wasn't a
-    // valid state event.
-    if obj.get("state_key").and_then(Value::as_str).is_none() {
-        return Err(StateEventConversionError::MissingField("state_key"));
-    }
+///
+/// # Why this is infallible
+///
+/// Constructing a `Raw<T>` does **not** validate the bytes against `T` —
+/// `Raw::from_json` and `Raw::cast_unchecked` both accept any JSON. Type
+/// validation only happens at `.deserialize::<T>()` time. So the input here
+/// might be a well-formed state event, might be anything.
+///
+/// That's fine: the operation we perform is "pick out whichever of these
+/// four canonical fields exist at the root", which is well-defined for any
+/// JSON object. If the input isn't a JSON object, or carries none of the
+/// four fields, the result is an empty `{}` — still a valid `Raw`. The
+/// caller can `.deserialize::<AnyStrippedStateEvent>()` on the result if
+/// they want type validation; that's where any structural deficiency
+/// surfaces, not here.
+pub fn strip_state_event(raw: &Raw<AnySyncStateEvent>) -> Raw<AnyStrippedStateEvent> {
+    // `Raw::json()` returns a `&RawValue`, whose bytes are valid JSON by
+    // construction — the re-parse cannot fail.
+    let parsed: Value = serde_json::from_str(raw.json().get())
+        .expect("Raw<…> bytes are valid JSON by RawValue invariant");
+    // `Value::get(&str)` returns `None` for any non-object root, so the
+    // loop is well-defined even for arrays/strings/numbers — see the
+    // function-level doc.
     let mut stripped = Map::new();
     for field in ["type", "state_key", "sender", "content"] {
-        if let Some(v) = obj.get(field) {
+        if let Some(v) = parsed.get(field) {
             stripped.insert(field.to_string(), v.clone());
         }
     }
-    Ok(Raw::from_json(
-        to_raw_value(&Value::Object(stripped)).expect("known-shape JSON"),
-    ))
+    Raw::from_json(
+        to_raw_value(&Value::Object(stripped)).expect("fixed-shape JSON → RawValue is infallible"),
+    )
 }
 
 #[cfg(test)]
@@ -329,12 +332,8 @@ mod tests {
         let msg = message_event(&create.room_id);
         // m.room.message has no state_key.
         let err = Raw::<AnySyncStateEvent>::try_from(&msg).unwrap_err();
-        match err {
-            StateEventConversionError::NotAStateEvent { event_type } => {
-                assert_eq!(event_type, "m.room.message");
-            }
-            other => panic!("expected NotAStateEvent, got {other:?}"),
-        }
+        let StateEventConversionError::NotAStateEvent { event_type } = err;
+        assert_eq!(event_type, "m.room.message");
     }
 
     #[test]
@@ -404,6 +403,70 @@ mod tests {
         assert_eq!(v["room_id"].as_str(), Some(create.room_id.as_str()));
     }
 
+    /// Timeline delivery must pass `unsigned` (e.g. `age`, `prev_content`,
+    /// `redacted_because`) through verbatim — clients depend on it for
+    /// rendering. Pinning both arms (message and state event reaching the
+    /// timeline target) guards against a future "normalise raw before
+    /// delivery" change accidentally stripping fields the spec keeps.
+    #[test]
+    fn from_event_for_sync_timeline_preserves_unsigned() {
+        let create = create_event();
+        let msg = build_event(
+            "m.room.message",
+            None,
+            "@alice:hs1",
+            json!({
+                "type": "m.room.message",
+                "sender": "@alice:hs1",
+                "room_id": create.room_id.as_str(),
+                "origin_server_ts": 1_001,
+                "content": {"msgtype": "m.text", "body": "hi"},
+                "unsigned": {"age": 17, "transaction_id": "txn-42"},
+                "hashes": {"sha256": "BBBB"},
+                "prev_events": [],
+                "prev_state_events": [],
+            }),
+        );
+        let raw: Raw<AnySyncTimelineEvent> = (&msg).into();
+        let v = parse_raw(&raw);
+        assert_eq!(v["unsigned"]["age"].as_u64(), Some(17));
+        assert_eq!(v["unsigned"]["transaction_id"].as_str(), Some("txn-42"));
+    }
+
+    /// State-event delivery must preserve `unsigned` *and* `prev_content`
+    /// (state-event-only field carrying the previous content of the state
+    /// key). The TryFrom impl re-uses `enrich_for_client` which goes through
+    /// the same parse-and-inject path as the timeline impl, but the spec
+    /// distinguishes the two shapes — pin them independently so a future
+    /// divergence is caught.
+    #[test]
+    fn try_from_event_for_sync_state_preserves_unsigned_and_prev_content() {
+        let create = create_event();
+        let name = build_event(
+            "m.room.name",
+            Some(""),
+            "@alice:hs1",
+            json!({
+                "type": "m.room.name",
+                "state_key": "",
+                "sender": "@alice:hs1",
+                "room_id": create.room_id.as_str(),
+                "origin_server_ts": 1_002,
+                "content": {"name": "New"},
+                "prev_content": {"name": "Old"},
+                "unsigned": {"age": 99},
+                "hashes": {"sha256": "CCCC"},
+                "prev_events": [],
+                "prev_state_events": [],
+            }),
+        );
+        let raw = Raw::<AnySyncStateEvent>::try_from(&name).expect("name event is a state event");
+        let v = parse_raw(&raw);
+        assert_eq!(v["unsigned"]["age"].as_u64(), Some(99));
+        assert_eq!(v["prev_content"]["name"].as_str(), Some("Old"));
+        assert_eq!(v["content"]["name"].as_str(), Some("New"));
+    }
+
     #[test]
     fn strip_state_event_drops_non_canonical_fields() {
         let raw_in = Raw::<AnySyncStateEvent>::from_json(
@@ -420,7 +483,7 @@ mod tests {
             }))
             .unwrap(),
         );
-        let stripped = strip_state_event(&raw_in).expect("valid state event strips fine");
+        let stripped = strip_state_event(&raw_in);
         let v = parse_raw(&stripped);
         let obj = v.as_object().expect("object");
         let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
@@ -445,21 +508,30 @@ mod tests {
         }
     }
 
+    /// `Raw<AnySyncStateEvent>` doesn't validate its input — it can wrap any
+    /// JSON, including non-objects, via `Raw::from_json` or `cast_unchecked`.
+    /// `strip_state_event` must remain well-defined for those degenerate
+    /// inputs: an empty `{}` result is fine, panicking is not.
     #[test]
-    fn strip_state_event_err_when_state_key_missing() {
-        let raw_in = Raw::<AnySyncStateEvent>::from_json(
-            to_raw_value(&json!({
-                "type": "m.room.name",
-                "sender": "@u:example.org",
-                "content": {"name": "X"},
-            }))
-            .unwrap(),
-        );
-        let err = strip_state_event(&raw_in).unwrap_err();
-        assert!(
-            matches!(err, StateEventConversionError::MissingField("state_key")),
-            "expected MissingField(\"state_key\"), got {err:?}",
-        );
+    fn strip_state_event_returns_empty_for_non_object_input() {
+        for raw_in in [
+            // JSON array.
+            Raw::<AnySyncStateEvent>::from_json(to_raw_value(&json!([1, 2, 3])).unwrap()),
+            // JSON string.
+            Raw::<AnySyncStateEvent>::from_json(to_raw_value(&json!("not an event")).unwrap()),
+            // JSON null.
+            Raw::<AnySyncStateEvent>::from_json(to_raw_value(&Value::Null).unwrap()),
+            // Empty JSON object.
+            Raw::<AnySyncStateEvent>::from_json(to_raw_value(&json!({})).unwrap()),
+        ] {
+            let stripped = strip_state_event(&raw_in);
+            let v = parse_raw(&stripped);
+            assert_eq!(
+                v,
+                json!({}),
+                "non-object / empty-object input yields empty stripped output: {v}",
+            );
+        }
     }
 
     /// Suppress the unused-import lint when the helper is left over after

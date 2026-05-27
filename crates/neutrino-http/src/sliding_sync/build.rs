@@ -605,13 +605,13 @@ async fn build_room<S: StorageBackend>(
     }
 
     if !state_events.is_empty() || !deleted_state_keys.is_empty() {
+        // Conversion fails iff a stored "state" event has no state_key — a
+        // storage-layer invariant violation, surfaced as 500 M_UNKNOWN via
+        // `SyncError::EventConversion` rather than panicked at the .expect.
         let mut raw: Vec<Raw<AnySyncStateEvent>> = state_events
             .iter()
-            .map(|e| {
-                e.try_into()
-                    .expect("current_state events have state_keys by HashMap key invariant")
-            })
-            .collect();
+            .map(TryInto::try_into)
+            .collect::<Result<_, _>>()?;
         for (t, k) in &deleted_state_keys {
             raw.push(state_stub_raw(t, k));
         }
@@ -708,10 +708,9 @@ async fn build_invite_room<S: StorageBackend>(
         stripped.extend(extract_invite_room_state(ev)?);
         // Include the invite membership itself so the client can render the
         // "you've been invited by …" preview without parsing the array.
-        stripped.push(
-            ev.try_into()
-                .expect("invite member event has state_key by current_state_event lookup"),
-        );
+        // Conversion fails iff the stored member event has no state_key — a
+        // storage-layer invariant violation, surfaced as 500 M_UNKNOWN.
+        stripped.push(ev.try_into()?);
         // Lift `m.room.name` / `m.room.avatar` out of `invite_room_state` to
         // the top-level fields. Without this the client sees only the
         // stripped array and falls back to heroes (unimplemented, PLAN.md)

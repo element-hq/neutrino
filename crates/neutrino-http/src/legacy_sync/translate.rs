@@ -17,7 +17,8 @@ use neutrino_common::event_view;
 use neutrino_store::Membership;
 use ruma::OwnedRoomId;
 use ruma::api::client::sync::sync_events::v5;
-use ruma::events::StateEventType;
+use ruma::events::{AnyStrippedStateEvent, StateEventType};
+use ruma::serde::Raw;
 use serde_json::{Value, json};
 
 /// Parsed v3 `/sync` query parameters.
@@ -284,21 +285,21 @@ fn invite_room_shape(room: &v5::response::Room) -> Value {
 /// fields, matching the v3 spec.
 fn knock_room_shape(room: &v5::response::Room) -> Value {
     // Strip each v5 `required_state` entry down to v3 stripped-state shape
-    // (`type`, `state_key`, `sender`, `content` only). Malformed inputs —
-    // missing `state_key`, unparseable JSON — are skipped with a warn:
-    // sliding-sync populates `required_state` from events we ourselves
-    // wrote through the storage round-trip, so a failure here means data
-    // corruption, not a benign protocol skew.
-    let events: Vec<Value> = room
+    // (`type`, `state_key`, `sender`, `content` only). `strip_state_event` is
+    // infallible by contract — its input is a `Raw<AnySyncStateEvent>` the
+    // caller already validated — and `Raw<…>` serialises directly, so we
+    // hand the typed vec to `json!` without an intermediate parse.
+    //
+    // Note for the next reader: a knocked room's state arrives from the
+    // remote homeserver's `/send_knock` response (we haven't joined it), so
+    // a malformed entry here is a federated-input bug, not local corruption.
+    // Today the upstream is well-formed because we wrote the state ourselves
+    // — once real federation lands, expect this path to start needing
+    // defensive handling (drop + warn) instead of trusting the input.
+    let events: Vec<Raw<AnyStrippedStateEvent>> = room
         .required_state
         .iter()
-        .filter_map(|raw| match event_view::strip_state_event(raw) {
-            Ok(stripped) => serde_json::from_str(stripped.json().get()).ok(),
-            Err(e) => {
-                tracing::warn!(error = %e, "skipping malformed state event in knock_state");
-                None
-            }
-        })
+        .map(event_view::strip_state_event)
         .collect();
     json!({
         "knock_state": {

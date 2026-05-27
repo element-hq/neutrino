@@ -367,6 +367,40 @@ mod tests {
         );
     }
 
+    /// Wire bytes never carry `event_id` — it's the reference hash, computed
+    /// post-canonicalisation and stored only on the `Event` struct as a
+    /// sidecar field. The whole `event_view` enrichment pipeline rests on
+    /// this invariant; a regression that serialised `event_id` back into
+    /// `raw` would let stale ids slip through with no defence beyond a
+    /// `Map::insert` overwrite. Pin both arms (create + message).
+    #[test]
+    fn build_output_raw_lacks_event_id() {
+        let create = EventBuilder::new(user("@alice:example.org"), "m.room.create".to_owned())
+            .state_key(String::new())
+            .content(json!({ "room_version": neutrino_common::ROOM_VERSION_ID }))
+            .origin_server_ts(1_700_000_000_000)
+            .build()
+            .expect("create event builds");
+        let create_raw: serde_json::Value = serde_json::from_str(create.raw.get()).unwrap();
+        assert!(
+            create_raw.get("event_id").is_none(),
+            "create event wire bytes must not carry event_id: {create_raw}",
+        );
+
+        let msg = EventBuilder::new(user("@alice:example.org"), "m.room.message".to_owned())
+            .room_id(create.room_id.clone())
+            .content(json!({ "msgtype": "m.text", "body": "hi" }))
+            .prev_events(vec![create.event_id.clone()])
+            .origin_server_ts(1_700_000_000_001)
+            .build()
+            .expect("message event builds");
+        let msg_raw: serde_json::Value = serde_json::from_str(msg.raw.get()).unwrap();
+        assert!(
+            msg_raw.get("event_id").is_none(),
+            "non-create event wire bytes must not carry event_id either: {msg_raw}",
+        );
+    }
+
     #[test]
     fn build_message_event_round_trips() {
         let create = EventBuilder::new(user("@alice:example.org"), "m.room.create".to_owned())
