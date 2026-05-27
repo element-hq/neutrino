@@ -859,29 +859,18 @@ mod tests {
     use crate::event_id::EventBuilder;
     use crate::test_utils::next_ts;
     use neutrino_common::ROOM_VERSION_ID;
-    use ruma::OwnedRoomId;
+    use ruma::RoomId;
     use serde_json::{Value, json};
 
     // ---------- fixture helpers ----------
     //
     // Helpers build events via `EventBuilder`, which computes the event_id
     // from the canonical wire bytes. Most tests don't care about the actual
-    // event_id values — `state_map` keys events by `(type, state_key)`, and
-    // the auth-rules code only reaches into `create_event.event_id` for
-    // rule 5.3.1. Tests reuse a single fixture room (`fixture_room_id`) so
-    // non-create events all share a consistent `room_id`.
-
-    /// Shared room_id for all non-create fixtures in this module. The
-    /// auth-rules code doesn't validate room_id consistency against the
-    /// create event (that's `validate_references`' job, not in scope here),
-    /// so a single arbitrary value suffices. Uses v12 / RoomIdFormatVersion::V2
-    /// shape (`!` + 43 url-safe-base64 chars, no domain) to match what
-    /// `EventBuilder` derives for real create events.
-    fn fixture_room_id() -> OwnedRoomId {
-        "!AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-            .parse()
-            .expect("room id")
-    }
+    // event_id values — `state_map` keys events by `(type, state_key)`. The
+    // auth-rules code only consults `create_event.event_id` for rule 5.3.1,
+    // but the real-world invariant "every event in a room shares that room's
+    // create-derived room_id" is preserved by threading `&RoomId` through
+    // each non-create helper; callers pass `&create.room_id`.
 
     fn create_event(creator: &str, additional_creators: &[&str]) -> Arc<Event> {
         let mut content = json!({ "room_version": ROOM_VERSION_ID });
@@ -903,6 +892,7 @@ mod tests {
     }
 
     fn member_event(
+        room: &RoomId,
         sender: &str,
         target: &str,
         membership: &str,
@@ -913,7 +903,7 @@ mod tests {
             content[k] = v;
         }
         let ev = EventBuilder::new(sender.parse().expect("sender"), "m.room.member".to_owned())
-            .room_id(fixture_room_id())
+            .room_id(room.to_owned())
             .state_key(target.to_owned())
             .content(content)
             .origin_server_ts(next_ts())
@@ -922,9 +912,9 @@ mod tests {
         Arc::new(ev)
     }
 
-    fn message_event(sender: &str) -> Arc<Event> {
+    fn message_event(room: &RoomId, sender: &str) -> Arc<Event> {
         let ev = EventBuilder::new(sender.parse().expect("sender"), "m.room.message".to_owned())
-            .room_id(fixture_room_id())
+            .room_id(room.to_owned())
             .content(json!({ "msgtype": "m.text", "body": "hi" }))
             .origin_server_ts(next_ts())
             .build()
@@ -932,9 +922,15 @@ mod tests {
         Arc::new(ev)
     }
 
-    fn state_event(event_type: &str, state_key: &str, sender: &str, content: Value) -> Arc<Event> {
+    fn state_event(
+        room: &RoomId,
+        event_type: &str,
+        state_key: &str,
+        sender: &str,
+        content: Value,
+    ) -> Arc<Event> {
         let ev = EventBuilder::new(sender.parse().expect("sender"), event_type.to_owned())
-            .room_id(fixture_room_id())
+            .room_id(room.to_owned())
             .state_key(state_key.to_owned())
             .content(content)
             .origin_server_ts(next_ts())
@@ -943,12 +939,13 @@ mod tests {
         Arc::new(ev)
     }
 
-    fn power_levels_event(sender: &str, content: Value) -> Arc<Event> {
-        state_event("m.room.power_levels", "", sender, content)
+    fn power_levels_event(room: &RoomId, sender: &str, content: Value) -> Arc<Event> {
+        state_event(room, "m.room.power_levels", "", sender, content)
     }
 
-    fn join_rules_event(rule: &str) -> Arc<Event> {
+    fn join_rules_event(room: &RoomId, rule: &str) -> Arc<Event> {
         state_event(
+            room,
             "m.room.join_rules",
             "",
             "@alice:example.org",
@@ -968,6 +965,50 @@ mod tests {
             map.insert(key, ev);
         }
         map
+    }
+
+    /// Invariant: every event produced by these helpers for a given test
+    /// carries the *same* `room_id` as that test's create event. The
+    /// `room_id` for v12 is derived from the create event's reference hash,
+    /// so a non-create event built in isolation (without threading the
+    /// create's room_id through) would carry a *different* room_id — which
+    /// is not how a real room is shaped. This pins the threading so a
+    /// regression that re-introduces a fixed/independent room_id for the
+    /// non-create helpers trips loudly.
+    #[test]
+    fn helpers_share_create_event_room_id() {
+        let create = create_event("@alice:example.org", &[]);
+        let room = create.room_id.as_ref();
+        let member = member_event(
+            room,
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            json!({}),
+        );
+        let message = message_event(room, "@alice:example.org");
+        let pl = power_levels_event(room, "@alice:example.org", json!({}));
+        let jr = join_rules_event(room, "public");
+        let rjr = restricted_join_rules(room);
+        let tpi = third_party_invite_state_event(room, "tok", true);
+        let tpi_inv = tpi_member_invite(room, "@alice:example.org", "@bob:example.org", "tok");
+        let arbitrary_state = state_event(room, "m.room.name", "", "@alice:example.org", json!({}));
+        for ev in [
+            &member,
+            &message,
+            &pl,
+            &jr,
+            &rjr,
+            &tpi,
+            &tpi_inv,
+            &arbitrary_state,
+        ] {
+            assert_eq!(
+                ev.room_id, create.room_id,
+                "fixture event of type `{}` carried room_id {} but create's is {}",
+                ev.event_type, ev.room_id, create.room_id,
+            );
+        }
     }
 
     // ---------- rule 4: federation ----------
@@ -990,13 +1031,14 @@ mod tests {
             .expect("valid create"),
         );
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
         let st = state_map([create.clone(), alice_join]);
-        let msg = message_event("@alice:example.org");
+        let msg = message_event(&create.room_id, "@alice:example.org");
         check_auth_rules(&msg, &st).expect("same-domain sender allowed when federation off");
     }
 
@@ -1014,14 +1056,21 @@ mod tests {
             .expect("valid create"),
         );
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let bob_join = member_event("@bob:other.org", "@bob:other.org", "join", json!({}));
+        let bob_join = member_event(
+            &create.room_id,
+            "@bob:other.org",
+            "@bob:other.org",
+            "join",
+            json!({}),
+        );
         let st = state_map([create.clone(), alice_join, bob_join]);
-        let msg = message_event("@bob:other.org");
+        let msg = message_event(&create.room_id, "@bob:other.org");
         assert!(matches!(
             check_auth_rules(&msg, &st),
             Err(AuthError::Rule4FederationDisallowed { .. })
@@ -1050,7 +1099,7 @@ mod tests {
             .build()
             .expect("valid join"),
         );
-        let st = state_map([create]);
+        let st = state_map([create.clone()]);
         check_auth_rules(&join, &st).expect("first-join after create allowed");
     }
 
@@ -1058,9 +1107,15 @@ mod tests {
     fn rule_5_3_2_join_mismatched_sender_rejected() {
         let create = create_event("@alice:example.org", &[]);
         // Public join_rule so we'd otherwise pass 5.3.4
-        let jr = join_rules_event("public");
-        let join = member_event("@alice:example.org", "@bob:example.org", "join", json!({}));
-        let st = state_map([create, jr]);
+        let jr = join_rules_event(&create.room_id, "public");
+        let join = member_event(
+            &create.room_id,
+            "@alice:example.org",
+            "@bob:example.org",
+            "join",
+            json!({}),
+        );
+        let st = state_map([create.clone(), jr]);
         assert!(matches!(
             check_auth_rules(&join, &st),
             Err(AuthError::Rule5_3_2_JoinSenderMismatch)
@@ -1071,16 +1126,29 @@ mod tests {
     fn rule_5_3_3_join_while_banned_rejected() {
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let bob_banned = member_event("@alice:example.org", "@bob:example.org", "ban", json!({}));
-        let jr = join_rules_event("public");
+        let bob_banned = member_event(
+            &create.room_id,
+            "@alice:example.org",
+            "@bob:example.org",
+            "ban",
+            json!({}),
+        );
+        let jr = join_rules_event(&create.room_id, "public");
         // Need power for alice to have banned bob; rely on creators-have-infinite power.
-        let st = state_map([create, alice_join, bob_banned, jr]);
-        let bob_join = member_event("@bob:example.org", "@bob:example.org", "join", json!({}));
+        let st = state_map([create.clone(), alice_join, bob_banned, jr]);
+        let bob_join = member_event(
+            &create.room_id,
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            json!({}),
+        );
         assert!(matches!(
             check_auth_rules(&bob_join, &st),
             Err(AuthError::Rule5_3_3_JoinWhileBanned)
@@ -1090,9 +1158,15 @@ mod tests {
     #[test]
     fn rule_5_3_4_invite_join_rule_requires_prior_invite() {
         let create = create_event("@alice:example.org", &[]);
-        let jr = join_rules_event("invite");
-        let st = state_map([create, jr]);
-        let join = member_event("@bob:example.org", "@bob:example.org", "join", json!({}));
+        let jr = join_rules_event(&create.room_id, "invite");
+        let st = state_map([create.clone(), jr]);
+        let join = member_event(
+            &create.room_id,
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            json!({}),
+        );
         assert!(matches!(
             check_auth_rules(&join, &st),
             Err(AuthError::Rule5_3_4_JoinNotInvited)
@@ -1102,9 +1176,15 @@ mod tests {
     #[test]
     fn rule_5_3_public_join_rule_allows_anyone() {
         let create = create_event("@alice:example.org", &[]);
-        let jr = join_rules_event("public");
-        let st = state_map([create, jr]);
-        let join = member_event("@bob:example.org", "@bob:example.org", "join", json!({}));
+        let jr = join_rules_event(&create.room_id, "public");
+        let st = state_map([create.clone(), jr]);
+        let join = member_event(
+            &create.room_id,
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            json!({}),
+        );
         check_auth_rules(&join, &st).expect("public join_rule");
     }
 
@@ -1114,14 +1194,16 @@ mod tests {
     fn rule_5_4_invite_by_joined_sender_allowed() {
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let st = state_map([create, alice_join]);
+        let st = state_map([create.clone(), alice_join]);
         // Alice (creator → infinite power) invites bob.
         let invite = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@bob:example.org",
             "invite",
@@ -1133,9 +1215,10 @@ mod tests {
     #[test]
     fn rule_5_4_2_invite_by_non_joined_rejected() {
         let create = create_event("@alice:example.org", &[]);
-        let st = state_map([create]);
+        let st = state_map([create.clone()]);
         // @bob (not a member) tries to invite @carol.
         let invite = member_event(
+            &create.room_id,
             "@bob:example.org",
             "@carol:example.org",
             "invite",
@@ -1151,14 +1234,22 @@ mod tests {
     fn rule_5_4_3_invite_already_joined_rejected() {
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let bob_joined = member_event("@alice:example.org", "@bob:example.org", "join", json!({}));
-        let st = state_map([create, alice_join, bob_joined]);
+        let bob_joined = member_event(
+            &create.room_id,
+            "@alice:example.org",
+            "@bob:example.org",
+            "join",
+            json!({}),
+        );
+        let st = state_map([create.clone(), alice_join, bob_joined]);
         let reinvite = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@bob:example.org",
             "invite",
@@ -1176,13 +1267,15 @@ mod tests {
     fn rule_5_5_1_self_leave_from_join_allowed() {
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let st = state_map([create, alice_join]);
+        let st = state_map([create.clone(), alice_join]);
         let self_leave = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "leave",
@@ -1194,8 +1287,14 @@ mod tests {
     #[test]
     fn rule_5_5_1_self_leave_when_not_in_room_rejected() {
         let create = create_event("@alice:example.org", &[]);
-        let st = state_map([create]);
-        let self_leave = member_event("@bob:example.org", "@bob:example.org", "leave", json!({}));
+        let st = state_map([create.clone()]);
+        let self_leave = member_event(
+            &create.room_id,
+            "@bob:example.org",
+            "@bob:example.org",
+            "leave",
+            json!({}),
+        );
         assert!(matches!(
             check_auth_rules(&self_leave, &st),
             Err(AuthError::Rule5_5_1_SelfLeaveInvalid)
@@ -1206,14 +1305,27 @@ mod tests {
     fn rule_5_5_creator_kick_allowed() {
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let bob_joined = member_event("@alice:example.org", "@bob:example.org", "join", json!({}));
-        let st = state_map([create, alice_join, bob_joined]);
-        let kick = member_event("@alice:example.org", "@bob:example.org", "leave", json!({}));
+        let bob_joined = member_event(
+            &create.room_id,
+            "@alice:example.org",
+            "@bob:example.org",
+            "join",
+            json!({}),
+        );
+        let st = state_map([create.clone(), alice_join, bob_joined]);
+        let kick = member_event(
+            &create.room_id,
+            "@alice:example.org",
+            "@bob:example.org",
+            "leave",
+            json!({}),
+        );
         check_auth_rules(&kick, &st).expect("creator can kick");
     }
 
@@ -1223,22 +1335,41 @@ mod tests {
     fn rule_5_6_creator_ban_allowed() {
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let bob_joined = member_event("@alice:example.org", "@bob:example.org", "join", json!({}));
-        let st = state_map([create, alice_join, bob_joined]);
-        let ban = member_event("@alice:example.org", "@bob:example.org", "ban", json!({}));
+        let bob_joined = member_event(
+            &create.room_id,
+            "@alice:example.org",
+            "@bob:example.org",
+            "join",
+            json!({}),
+        );
+        let st = state_map([create.clone(), alice_join, bob_joined]);
+        let ban = member_event(
+            &create.room_id,
+            "@alice:example.org",
+            "@bob:example.org",
+            "ban",
+            json!({}),
+        );
         check_auth_rules(&ban, &st).expect("creator can ban");
     }
 
     #[test]
     fn rule_5_6_1_non_joined_cannot_ban() {
         let create = create_event("@alice:example.org", &[]);
-        let st = state_map([create]);
-        let ban = member_event("@bob:example.org", "@carol:example.org", "ban", json!({}));
+        let st = state_map([create.clone()]);
+        let ban = member_event(
+            &create.room_id,
+            "@bob:example.org",
+            "@carol:example.org",
+            "ban",
+            json!({}),
+        );
         assert!(matches!(
             check_auth_rules(&ban, &st),
             Err(AuthError::Rule5_6_1_BanSenderNotJoined)
@@ -1250,9 +1381,15 @@ mod tests {
     #[test]
     fn rule_5_7_1_knock_on_non_knockable_room_rejected() {
         let create = create_event("@alice:example.org", &[]);
-        let jr = join_rules_event("invite");
-        let st = state_map([create, jr]);
-        let knock = member_event("@bob:example.org", "@bob:example.org", "knock", json!({}));
+        let jr = join_rules_event(&create.room_id, "invite");
+        let st = state_map([create.clone(), jr]);
+        let knock = member_event(
+            &create.room_id,
+            "@bob:example.org",
+            "@bob:example.org",
+            "knock",
+            json!({}),
+        );
         assert!(matches!(
             check_auth_rules(&knock, &st),
             Err(AuthError::Rule5_7_1_KnockNotKnockable)
@@ -1262,9 +1399,15 @@ mod tests {
     #[test]
     fn rule_5_7_knock_on_knockable_room_allowed() {
         let create = create_event("@alice:example.org", &[]);
-        let jr = join_rules_event("knock");
-        let st = state_map([create, jr]);
-        let knock = member_event("@bob:example.org", "@bob:example.org", "knock", json!({}));
+        let jr = join_rules_event(&create.room_id, "knock");
+        let st = state_map([create.clone(), jr]);
+        let knock = member_event(
+            &create.room_id,
+            "@bob:example.org",
+            "@bob:example.org",
+            "knock",
+            json!({}),
+        );
         check_auth_rules(&knock, &st).expect("knock on knockable room");
     }
 
@@ -1273,8 +1416,9 @@ mod tests {
     #[test]
     fn rule_5_8_unknown_membership_rejected() {
         let create = create_event("@alice:example.org", &[]);
-        let st = state_map([create]);
+        let st = state_map([create.clone()]);
         let weird = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "lurking",
@@ -1291,9 +1435,9 @@ mod tests {
     #[test]
     fn rule_6_sender_not_joined_rejected() {
         let create = create_event("@alice:example.org", &[]);
-        let st = state_map([create]);
+        let st = state_map([create.clone()]);
         // @bob is not a member; tries to send a message.
-        let msg = message_event("@bob:example.org");
+        let msg = message_event(&create.room_id, "@bob:example.org");
         assert!(matches!(
             check_auth_rules(&msg, &st),
             Err(AuthError::Rule6_SenderNotJoined)
@@ -1304,13 +1448,14 @@ mod tests {
     fn rule_6_joined_sender_allowed() {
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let st = state_map([create, alice_join]);
-        let msg = message_event("@alice:example.org");
+        let st = state_map([create.clone(), alice_join]);
+        let msg = message_event(&create.room_id, "@alice:example.org");
         check_auth_rules(&msg, &st).expect("joined sender");
     }
 
@@ -1320,20 +1465,29 @@ mod tests {
     fn rule_8_state_event_below_state_default_rejected() {
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let bob_join = member_event("@bob:example.org", "@bob:example.org", "join", json!({}));
+        let bob_join = member_event(
+            &create.room_id,
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            json!({}),
+        );
         // Power levels with bob at 0 (below state_default=50).
         let pl = power_levels_event(
+            &create.room_id,
             "@alice:example.org",
             json!({ "users": { "@alice:example.org": 100 }, "state_default": 50 }),
         );
-        let st = state_map([create, alice_join, bob_join, pl]);
+        let st = state_map([create.clone(), alice_join, bob_join, pl]);
         // bob tries to set a topic (state event, requires state_default = 50).
         let topic = state_event(
+            &create.room_id,
             "m.room.topic",
             "",
             "@bob:example.org",
@@ -1353,13 +1507,15 @@ mod tests {
         // Don't list alice (creator) in users — that would trip 10.4 first.
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let st = state_map([create, alice_join]);
+        let st = state_map([create.clone(), alice_join]);
         let pl = power_levels_event(
+            &create.room_id,
             "@alice:example.org",
             json!({ "users_default": 0, "state_default": 50 }),
         );
@@ -1370,13 +1526,15 @@ mod tests {
     fn rule_10_4_listing_creator_rejected() {
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let st = state_map([create, alice_join]);
+        let st = state_map([create.clone(), alice_join]);
         let pl = power_levels_event(
+            &create.room_id,
             "@alice:example.org",
             // Alice IS a creator; rule 10.4 forbids naming creators in users.
             json!({ "users": { "@alice:example.org": 100 } }),
@@ -1394,8 +1552,9 @@ mod tests {
     /// Build a `m.room.join_rules` event of type `restricted` (no `allow`
     /// entries — auth checks only verify the authoriser, not allow rules,
     /// matching synapse's `event_auth.py`).
-    fn restricted_join_rules() -> Arc<Event> {
+    fn restricted_join_rules(room: &RoomId) -> Arc<Event> {
         state_event(
+            room,
             "m.room.join_rules",
             "",
             "@alice:example.org",
@@ -1407,15 +1566,17 @@ mod tests {
     fn rule_5_3_5_restricted_join_with_valid_authoriser_allowed() {
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let jr = restricted_join_rules();
-        let st = state_map([create, alice_join, jr]);
+        let jr = restricted_join_rules(&create.room_id);
+        let st = state_map([create.clone(), alice_join, jr]);
         // Alice (creator → infinite power, joined) authorises bob's join.
         let join = member_event(
+            &create.room_id,
             "@bob:example.org",
             "@bob:example.org",
             "join",
@@ -1427,9 +1588,10 @@ mod tests {
     #[test]
     fn rule_5_3_5_restricted_join_missing_authoriser_field_rejected() {
         let create = create_event("@alice:example.org", &[]);
-        let jr = restricted_join_rules();
-        let st = state_map([create, jr]);
+        let jr = restricted_join_rules(&create.room_id);
+        let st = state_map([create.clone(), jr]);
         let join = member_event(
+            &create.room_id,
             "@bob:example.org",
             "@bob:example.org",
             "join",
@@ -1445,9 +1607,10 @@ mod tests {
     #[test]
     fn rule_5_3_5_restricted_join_authoriser_not_joined_rejected() {
         let create = create_event("@alice:example.org", &[]);
-        let jr = restricted_join_rules();
-        let st = state_map([create, jr]);
+        let jr = restricted_join_rules(&create.room_id);
+        let st = state_map([create.clone(), jr]);
         let join = member_event(
+            &create.room_id,
             "@bob:example.org",
             "@bob:example.org",
             "join",
@@ -1464,25 +1627,29 @@ mod tests {
     fn rule_5_3_5_restricted_join_authoriser_below_invite_level_rejected() {
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
         let carol_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@carol:example.org",
             "join",
             json!({}),
         );
-        let jr = restricted_join_rules();
+        let jr = restricted_join_rules(&create.room_id);
         // Carol joined (users_default=0) but invite level is 50.
         let pl = power_levels_event(
+            &create.room_id,
             "@alice:example.org",
             json!({ "invite": 50, "users_default": 0 }),
         );
-        let st = state_map([create, alice_join, carol_join, jr, pl]);
+        let st = state_map([create.clone(), alice_join, carol_join, jr, pl]);
         let join = member_event(
+            &create.room_id,
             "@bob:example.org",
             "@bob:example.org",
             "join",
@@ -1500,12 +1667,17 @@ mod tests {
     /// token, optionally carrying a `public_key`. Sender is alice for these
     /// fixtures so the rule 5.4.1 sender-match check succeeds against an
     /// alice-sent invite.
-    fn third_party_invite_state_event(token: &str, with_public_key: bool) -> Arc<Event> {
+    fn third_party_invite_state_event(
+        room: &RoomId,
+        token: &str,
+        with_public_key: bool,
+    ) -> Arc<Event> {
         let mut content = json!({ "display_name": "example" });
         if with_public_key {
             content["public_key"] = json!("base64-key-here");
         }
         state_event(
+            room,
             "m.room.third_party_invite",
             token,
             "@alice:example.org",
@@ -1513,8 +1685,9 @@ mod tests {
         )
     }
 
-    fn tpi_member_invite(sender: &str, target: &str, token: &str) -> Arc<Event> {
+    fn tpi_member_invite(room: &RoomId, sender: &str, target: &str, token: &str) -> Arc<Event> {
         member_event(
+            room,
             sender,
             target,
             "invite",
@@ -1535,14 +1708,20 @@ mod tests {
     fn rule_5_4_1_third_party_invite_with_matching_invite_allowed() {
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let tpi = third_party_invite_state_event("token-abc", true);
-        let st = state_map([create, alice_join, tpi]);
-        let invite = tpi_member_invite("@alice:example.org", "@bob:example.org", "token-abc");
+        let tpi = third_party_invite_state_event(&create.room_id, "token-abc", true);
+        let st = state_map([create.clone(), alice_join, tpi]);
+        let invite = tpi_member_invite(
+            &create.room_id,
+            "@alice:example.org",
+            "@bob:example.org",
+            "token-abc",
+        );
         check_auth_rules(&invite, &st).expect("third-party invite with matching tpi allowed");
     }
 
@@ -1550,14 +1729,20 @@ mod tests {
     fn rule_5_4_1_third_party_invite_missing_tpi_event_rejected() {
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
         // No m.room.third_party_invite event in state.
-        let st = state_map([create, alice_join]);
-        let invite = tpi_member_invite("@alice:example.org", "@bob:example.org", "token-missing");
+        let st = state_map([create.clone(), alice_join]);
+        let invite = tpi_member_invite(
+            &create.room_id,
+            "@alice:example.org",
+            "@bob:example.org",
+            "token-missing",
+        );
         assert!(matches!(
             check_auth_rules(&invite, &st),
             Err(AuthError::Rule5_4_1_ThirdPartyInviteInvalid(_))
@@ -1568,15 +1753,17 @@ mod tests {
     fn rule_5_4_1_third_party_invite_mxid_mismatch_rejected() {
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let tpi = third_party_invite_state_event("token-abc", true);
-        let st = state_map([create, alice_join, tpi]);
+        let tpi = third_party_invite_state_event(&create.room_id, "token-abc", true);
+        let st = state_map([create.clone(), alice_join, tpi]);
         // Member event's state_key (target) is bob, but `signed.mxid` is carol.
         let invite = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@bob:example.org",
             "invite",
@@ -1599,14 +1786,20 @@ mod tests {
     fn rule_5_4_1_third_party_invite_no_public_key_rejected() {
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let tpi = third_party_invite_state_event("token-abc", false);
-        let st = state_map([create, alice_join, tpi]);
-        let invite = tpi_member_invite("@alice:example.org", "@bob:example.org", "token-abc");
+        let tpi = third_party_invite_state_event(&create.room_id, "token-abc", false);
+        let st = state_map([create.clone(), alice_join, tpi]);
+        let invite = tpi_member_invite(
+            &create.room_id,
+            "@alice:example.org",
+            "@bob:example.org",
+            "token-abc",
+        );
         assert!(matches!(
             check_auth_rules(&invite, &st),
             Err(AuthError::Rule5_4_1_ThirdPartyInviteInvalid(_))
@@ -1619,13 +1812,15 @@ mod tests {
     fn rule_7_creator_can_send_third_party_invite() {
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let st = state_map([create, alice_join]);
+        let st = state_map([create.clone(), alice_join]);
         let tpi_event = state_event(
+            &create.room_id,
             "m.room.third_party_invite",
             "token-xyz",
             "@alice:example.org",
@@ -1638,19 +1833,28 @@ mod tests {
     fn rule_7_low_power_sender_rejected() {
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let bob_join = member_event("@bob:example.org", "@bob:example.org", "join", json!({}));
+        let bob_join = member_event(
+            &create.room_id,
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            json!({}),
+        );
         // Bob has users_default=0, invite level=50.
         let pl = power_levels_event(
+            &create.room_id,
             "@alice:example.org",
             json!({ "invite": 50, "users_default": 0 }),
         );
-        let st = state_map([create, alice_join, bob_join, pl]);
+        let st = state_map([create.clone(), alice_join, bob_join, pl]);
         let tpi_event = state_event(
+            &create.room_id,
             "m.room.third_party_invite",
             "token-xyz",
             "@bob:example.org",
@@ -1671,13 +1875,21 @@ mod tests {
         // `ban` to 40 — current value (80) > sender (50) → 10.6.1.
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let bob_join = member_event("@bob:example.org", "@bob:example.org", "join", json!({}));
+        let bob_join = member_event(
+            &create.room_id,
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            json!({}),
+        );
         let pl1 = power_levels_event(
+            &create.room_id,
             "@alice:example.org",
             json!({
                 "users": { "@bob:example.org": 50 },
@@ -1685,8 +1897,9 @@ mod tests {
                 "state_default": 0,
             }),
         );
-        let st = state_map([create, alice_join, bob_join, pl1]);
+        let st = state_map([create.clone(), alice_join, bob_join, pl1]);
         let pl2 = power_levels_event(
+            &create.room_id,
             "@bob:example.org",
             json!({
                 "users": { "@bob:example.org": 50 },
@@ -1706,13 +1919,21 @@ mod tests {
         // lower it to 50. Current (100) > sender (50) → 10.7.
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let bob_join = member_event("@bob:example.org", "@bob:example.org", "join", json!({}));
+        let bob_join = member_event(
+            &create.room_id,
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            json!({}),
+        );
         let pl1 = power_levels_event(
+            &create.room_id,
             "@alice:example.org",
             json!({
                 "users": { "@bob:example.org": 50 },
@@ -1720,8 +1941,9 @@ mod tests {
                 "state_default": 0,
             }),
         );
-        let st = state_map([create, alice_join, bob_join, pl1]);
+        let st = state_map([create.clone(), alice_join, bob_join, pl1]);
         let pl2 = power_levels_event(
+            &create.room_id,
             "@bob:example.org",
             json!({
                 "users": { "@bob:example.org": 50 },
@@ -1741,21 +1963,30 @@ mod tests {
         // requires current value < sender (strict) for non-self entries.
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let bob_join = member_event("@bob:example.org", "@bob:example.org", "join", json!({}));
+        let bob_join = member_event(
+            &create.room_id,
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            json!({}),
+        );
         let pl1 = power_levels_event(
+            &create.room_id,
             "@alice:example.org",
             json!({
                 "users": { "@bob:example.org": 50, "@carol:example.org": 50 },
                 "state_default": 0,
             }),
         );
-        let st = state_map([create, alice_join, bob_join, pl1]);
+        let st = state_map([create.clone(), alice_join, bob_join, pl1]);
         let pl2 = power_levels_event(
+            &create.room_id,
             "@bob:example.org",
             json!({
                 "users": { "@bob:example.org": 50, "@carol:example.org": 0 },
@@ -1779,15 +2010,23 @@ mod tests {
         // We match.
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let bob_join = member_event("@bob:example.org", "@bob:example.org", "join", json!({}));
+        let bob_join = member_event(
+            &create.room_id,
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            json!({}),
+        );
         // Bob at power 25, below the events_default of 30. `state_default=0`
         // so Bob clears rule 8 to even reach rule 10.
         let pl1 = power_levels_event(
+            &create.room_id,
             "@alice:example.org",
             json!({
                 "users": { "@bob:example.org": 25 },
@@ -1795,8 +2034,9 @@ mod tests {
                 "state_default": 0,
             }),
         );
-        let st = state_map([create, alice_join, bob_join, pl1]);
+        let st = state_map([create.clone(), alice_join, bob_join, pl1]);
         let pl2 = power_levels_event(
+            &create.room_id,
             "@bob:example.org",
             json!({
                 "users": { "@bob:example.org": 25 },
@@ -1820,13 +2060,15 @@ mod tests {
         // does — additional creators are treated identically by the rule.
         let create = create_event("@alice:example.org", &["@bob:example.org"]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let st = state_map([create, alice_join]);
+        let st = state_map([create.clone(), alice_join]);
         let pl = power_levels_event(
+            &create.room_id,
             "@alice:example.org",
             json!({ "users": { "@bob:example.org": 100 } }),
         );
@@ -1846,14 +2088,27 @@ mod tests {
         // i64::MAX < i64::MAX is false, so the kick falls through to 5.5.5.
         let create = create_event("@alice:example.org", &["@bob:example.org"]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let bob_join = member_event("@bob:example.org", "@bob:example.org", "join", json!({}));
-        let st = state_map([create, alice_join, bob_join]);
-        let kick = member_event("@alice:example.org", "@bob:example.org", "leave", json!({}));
+        let bob_join = member_event(
+            &create.room_id,
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            json!({}),
+        );
+        let st = state_map([create.clone(), alice_join, bob_join]);
+        let kick = member_event(
+            &create.room_id,
+            "@alice:example.org",
+            "@bob:example.org",
+            "leave",
+            json!({}),
+        );
         assert!(matches!(
             check_auth_rules(&kick, &st),
             Err(AuthError::Rule5_5_5_KickNotAllowed { .. })
@@ -1866,13 +2121,15 @@ mod tests {
         // target-outranks-sender check, only sender ≥ invite_level.
         let create = create_event("@alice:example.org", &["@bob:example.org"]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let st = state_map([create, alice_join]);
+        let st = state_map([create.clone(), alice_join]);
         let invite = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@bob:example.org",
             "invite",
@@ -1888,24 +2145,39 @@ mod tests {
         // surface both values plus the level.
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let bob_join = member_event("@bob:example.org", "@bob:example.org", "join", json!({}));
+        let bob_join = member_event(
+            &create.room_id,
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            json!({}),
+        );
         let carol_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@carol:example.org",
             "join",
             json!({}),
         );
         let pl = power_levels_event(
+            &create.room_id,
             "@alice:example.org",
             json!({ "kick": 50, "users_default": 0 }),
         );
-        let st = state_map([create, alice_join, bob_join, carol_join, pl]);
-        let kick = member_event("@bob:example.org", "@carol:example.org", "leave", json!({}));
+        let st = state_map([create.clone(), alice_join, bob_join, carol_join, pl]);
+        let kick = member_event(
+            &create.room_id,
+            "@bob:example.org",
+            "@carol:example.org",
+            "leave",
+            json!({}),
+        );
         match check_auth_rules(&kick, &st) {
             Err(AuthError::Rule5_5_5_KickNotAllowed {
                 sender,
@@ -1926,13 +2198,20 @@ mod tests {
     fn invalid_member_state_key_on_invite_rejected() {
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let st = state_map([create, alice_join]);
-        let invite = member_event("@alice:example.org", "not-a-user-id", "invite", json!({}));
+        let st = state_map([create.clone(), alice_join]);
+        let invite = member_event(
+            &create.room_id,
+            "@alice:example.org",
+            "not-a-user-id",
+            "invite",
+            json!({}),
+        );
         assert!(matches!(
             check_auth_rules(&invite, &st),
             Err(AuthError::InvalidMemberStateKey { .. })
@@ -1945,18 +2224,27 @@ mod tests {
         // (power 50) tries to set carol at 100 — exceeds bob's level.
         let create = create_event("@alice:example.org", &[]);
         let alice_join = member_event(
+            &create.room_id,
             "@alice:example.org",
             "@alice:example.org",
             "join",
             json!({}),
         );
-        let bob_join = member_event("@bob:example.org", "@bob:example.org", "join", json!({}));
+        let bob_join = member_event(
+            &create.room_id,
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            json!({}),
+        );
         let pl1 = power_levels_event(
+            &create.room_id,
             "@alice:example.org",
             json!({ "users": { "@bob:example.org": 50 }, "users_default": 0, "state_default": 0 }),
         );
-        let st = state_map([create, alice_join, bob_join, pl1]);
+        let st = state_map([create.clone(), alice_join, bob_join, pl1]);
         let pl2 = power_levels_event(
+            &create.room_id,
             "@bob:example.org",
             json!({ "users": { "@bob:example.org": 50, "@carol:example.org": 100 }, "users_default": 0, "state_default": 0 }),
         );
