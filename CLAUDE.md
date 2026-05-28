@@ -95,6 +95,16 @@ with `find_matching_paren` + arg-aware splitting, designed up-front for
 trailing commas, inline comments, and multi-line calls. Half-baked scripts that
 need 3 iterations cost more than 5 extra min of robust design.
 
+## before declaring code done
+
+after the test suite passes, before saying "done", spend 60 seconds auditing the design:
+
+- every new struct field: is it derivable from another field? if yes, drop it
+- every new method that wraps/adapts existing code: does inner have an optimised version i'm bypassing? if yes, swap-in-the-override-case and delegate
+- every "i know this is slower but…" comment in the diff: turn it into a question — is the slow version actually necessary, or am i avoiding 30 more seconds of thought?
+- every helper with a _with_X, _for_new_Y, _lazy_Z suffix: am i papering over a design hole? could a wrapper / different abstraction collapse the variant?
+- the diff summary: any new struct that grew past one field, any new fn over ~30 lines — what would i delete if i had to halve the diff?
+- this is not "is the code correct" — cargo test does that. this is "is the code actually good".
 
 ## before finishing any task
 1. cargo fmt
@@ -167,3 +177,37 @@ Any task that touches multiple call sites: first action is `references`
 - 20+ sites: write a mechanical rewriter (Python script with `find_matching_paren` + arg-aware `split_args`, designed up-front for
   trailing commas, inline comments, multi-line calls) or delegate to a
   subagent with a clear pattern spec.
+
+## Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
+## Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+```
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+```
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
