@@ -5,9 +5,15 @@
 //! <https://spec.matrix.org/v1.18/server-server-api/#checks-performed-on-receipt-of-a-pdu>.
 //! Reading the spec's numbered list against our implementation:
 //!
-//! - **Step 1** (PDU schema / required fields): upstream of `apply` —
-//!   handled by `validate::parse_event` (Phase 1a) and enforced by
-//!   `EventBuilder::build()` / `Event::from_wire`.
+//! - **Step 1** (PDU schema / required fields): wire-format part is
+//!   upstream of `apply` (`validate::parse_event`, Phase 1a — enforced by
+//!   `EventBuilder::build()` / `Event::from_wire`). The semantic rules
+//!   that don't need a provider (count limits, create structural rules,
+//!   rule 9, per-type content shape) run inside `apply` via
+//!   `validate::validate_pdu` (Phase 1b). Running validate_pdu here
+//!   defensively means a caller that hand-constructs an `Event` (bypassing
+//!   the builder/wire path) still can't smuggle a semantically-malformed
+//!   event past us.
 //! - **Step 2** (signature verification): intentionally skipped per
 //!   `CLAUDE.md` — trusted-network policy.
 //! - **Step 3** (auth check against the event's auth_events): under
@@ -25,7 +31,7 @@
 //! - **Step 6** (state-set check): removed under MSC4242 / state DAGs.
 //!
 //! Local additions on top of the spec list: reference validation (Phase
-//! 1b, `validate::validate_references`) runs before the auth checks to
+//! 1c, `validate::validate_references`) runs before the auth checks to
 //! ensure the room exists and `prev_state_events` are well-formed.
 //!
 //! ## What `apply` mutates
@@ -165,10 +171,15 @@ impl RoomCore {
     /// be persisted. If `event` is already a forward extremity of this
     /// `RoomCore`, returns `Ok(vec![])` (idempotent no-op).
     ///
-    /// **PRECONDITION**: `event` MUST have been constructed via
-    /// `EventBuilder::build()` or `Event::from_wire` — both call
-    /// `validate::parse_event` internally. `apply` does not re-run
-    /// wire-format checks; see `parse_event` for the full list.
+    /// **Assumed but verified**: `event` is the output of
+    /// `EventBuilder::build()` or `Event::from_wire` — both of which run
+    /// `validate::parse_event` (wire format) and `validate::validate_pdu`
+    /// (semantic rules) before yielding an `Event`. `apply` re-runs
+    /// `validate_pdu` defensively so a hand-constructed `Event` that
+    /// bypassed those constructors still can't smuggle a semantically-
+    /// malformed event past the auth pipeline. Wire-format checks
+    /// (`parse_event`) are NOT re-run — they require the raw JSON bytes,
+    /// which `Event` doesn't expose in structured form.
     ///
     /// Note: `apply` does NOT insert the event into `provider`. The caller
     /// is expected to honour `Effect::Persist` by writing through to storage
@@ -197,8 +208,13 @@ impl RoomCore {
             return Ok(Vec::new());
         }
 
-        // Reference validation (Phase 1b — local addition on top of the
-        // spec's PDU-receipt checks).
+        // Phase 1b: semantic rules (no provider). Defence-in-depth — the
+        // builder / wire-parser already ran this, but we re-run so a hand-
+        // constructed `Event` doesn't bypass it.
+        validate::validate_pdu(&event)?;
+
+        // Phase 1c: reference validation (provider lookups) — local
+        // addition on top of the spec's PDU-receipt checks.
         validate::validate_references(&event, provider)?;
 
         // Shared cache for state-before walks: state_before(event) and

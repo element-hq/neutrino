@@ -6,8 +6,10 @@
 //! other modules are noted in their slot rather than dropped, with the
 //! specific function that owns them:
 //!
-//! - Rule 1 (`m.room.create`) — 1.1–1.4 in `validate::parse_event` (and
-//!   `validate::check_create`); 1.5 terminal allow lives here.
+//! - Rule 1 (`m.room.create`) — 1.1 (no prev_events), 1.3 (room_version),
+//!   1.4 (additional_creators) in `validate::validate_pdu`; 1.2 (no
+//!   wire-level room_id) in `validate::parse_event`; 1.5 terminal allow
+//!   lives here.
 //! - Rule 2 (room exists, room_id ↔ create event) —
 //!   `validate::validate_references` (yields `ReferenceError::UnknownRoom`,
 //!   `RoomRejected`, `RoomTypeMismatch`).
@@ -15,12 +17,13 @@
 //!   rejected up front by `validate::parse_event`
 //!   (`FormatError::AuthEventsPresent`); the algorithm now uses
 //!   `auth_events::calculate_auth_events` instead.
-//! - Rule 9 (state_key starts with `@`) — `validate::parse_event` raises
+//! - Rule 9 (state_key starts with `@`) — `validate::validate_pdu` raises
 //!   `FormatError::StateKeyAtSignSenderMismatch`. (Excludes `m.room.member`;
 //!   rule 5 handles that case end-to-end.)
 //! - Rule 10.1–10.3 (`m.room.power_levels` content shape) —
-//!   `validate::check_power_levels` (`FormatError::PowerLevelsBadIntField`,
-//!   `PowerLevelsBadObjectField`, `PowerLevelsBadUsers`).
+//!   `validate::validate_pdu` via `check_power_levels`
+//!   (`FormatError::PowerLevelsBadIntField`, `PowerLevelsBadObjectField`,
+//!   `PowerLevelsBadUsers`).
 //! - Signature checks (rule 5.2, third-party `signed.*`) — skipped per
 //!   `CLAUDE.md` trusted-network policy.
 //!
@@ -41,14 +44,15 @@ use crate::{AuthError, Event, StateMap};
 /// Run the v12 authorization rules against `state` (state-before-event).
 ///
 /// Pre:  `event` has passed `validate::parse_event` (wire format is
-///       well-formed; for `m.room.member` events, `state_key` and
-///       `content.membership` are guaranteed present, so the rule-5
-///       `.expect()`s below are safe). The caller has also called
-///       `validate::validate_references` (room exists, `prev_state_events`
-///       triad ok) — rule 2 references are trusted here. `state` is the
-///       resolved state-before-event keyed by `(type, state_key)`,
-///       materialised by the caller (Phase 6 `apply`) by state-resolving
-///       over `event.prev_state_events` via the `StateProvider`.
+///       well-formed) AND `validate::validate_pdu` (semantic rules: for
+///       `m.room.member` events, `state_key` and `content.membership` are
+///       guaranteed present, so the rule-5 `.expect()`s below are safe).
+///       The caller has also called `validate::validate_references` (room
+///       exists, `prev_state_events` triad ok) — rule 2 references are
+///       trusted here. `state` is the resolved state-before-event keyed by
+///       `(type, state_key)`, materialised by the caller (Phase 6 `apply`)
+///       by state-resolving over `event.prev_state_events` via the
+///       `StateProvider`.
 /// Post: `Ok(())` means the event passes v12 authorization against `state`
 ///       and may be applied. `Err(AuthError::*)` names the specific rule
 ///       that rejected — the event must not be applied. Pure function: no
@@ -58,10 +62,10 @@ use crate::{AuthError, Event, StateMap};
 ///       current state.
 pub fn check_auth_rules(event: &Event, state: &StateMap<Arc<Event>>) -> Result<(), AuthError> {
     // Rule 1 (m.room.create):
-    //   1.1 prev_events absent       → validate::parse_event (CreateHasPrevEvents)
-    //   1.2 room_id absent           → validate::parse_event (CreateHasRoomId)
-    //   1.3 room_version recognised  → validate::check_create (UnrecognisedRoomVersion)
-    //   1.4 additional_creators ok   → validate::check_create (InvalidAdditionalCreators)
+    //   1.1 prev_events absent       → validate::validate_pdu (CreateHasPrevEvents)
+    //   1.2 room_id absent on wire   → validate::parse_event (CreateHasRoomId)
+    //   1.3 room_version recognised  → validate::validate_pdu (UnrecognisedRoomVersion)
+    //   1.4 additional_creators ok   → validate::validate_pdu (InvalidAdditionalCreators)
     //   1.5 terminal allow           → here.
     if event.event_type == "m.room.create" {
         return Ok(());
@@ -78,7 +82,7 @@ pub fn check_auth_rules(event: &Event, state: &StateMap<Arc<Event>>) -> Result<(
 
     // Rule 5 (m.room.member): terminal for membership events; see
     // check_rule_5_member. 5.1 (state_key + content.membership presence) is
-    // already enforced by validate::check_member.
+    // already enforced by validate::validate_pdu (via check_member).
     if event.event_type == "m.room.member" {
         return check_rule_5_member(event, &ctx);
     }
@@ -93,13 +97,13 @@ pub fn check_auth_rules(event: &Event, state: &StateMap<Arc<Event>>) -> Result<(
 
     check_rule_8_required_power_level(event, &ctx)?;
 
-    // Rule 9 (state_key starts with `@`): validate::parse_event raises
+    // Rule 9 (state_key starts with `@`): validate::validate_pdu raises
     // FormatError::StateKeyAtSignSenderMismatch. (Excluded for m.room.member,
     // which rule 5 owns end-to-end.)
 
     // Rule 10 (m.room.power_levels): terminal; see
     // check_rule_10_power_levels. 10.1–10.3 (content shape) live in
-    // validate::check_power_levels.
+    // validate::validate_pdu (via check_power_levels).
     if event.event_type == "m.room.power_levels" {
         return check_rule_10_power_levels(event, &ctx);
     }
@@ -280,18 +284,18 @@ impl PowerLevels {
         };
         let Some(ev) = event else { return out };
         let content = parse_content(ev);
-        // Phase 1a (`validate::check_power_levels`) has rejected non-integer
-        // scalars (`PowerLevelsBadIntField`) and non-`{string: int}` objects
-        // (`PowerLevelsBadObjectField` / `PowerLevelsBadUsers`) — so every
-        // value below either matches its expected shape or the field is
-        // absent. The `.expect`s exist to convert a future Phase 1a
-        // regression into a hard panic at the parse site rather than
-        // silently substituting defaults.
+        // Phase 1b (`validate::validate_pdu`, via `check_power_levels`) has
+        // rejected non-integer scalars (`PowerLevelsBadIntField`) and
+        // non-`{string: int}` objects (`PowerLevelsBadObjectField` /
+        // `PowerLevelsBadUsers`) — so every value below either matches its
+        // expected shape or the field is absent. The `.expect`s exist to
+        // convert a future Phase 1b regression into a hard panic at the
+        // parse site rather than silently substituting defaults.
         let take_scalar = |field: &'static str, slot: &mut i64| {
             if let Some(v) = content.get(field) {
                 *slot = v
                     .as_i64()
-                    .expect("validate::check_power_levels guarantees integer scalar");
+                    .expect("validate::validate_pdu guarantees integer scalar");
             }
         };
         take_scalar("users_default", &mut out.users_default);
@@ -309,11 +313,11 @@ impl PowerLevels {
             if let Some(obj) = content.get(key) {
                 let obj = obj
                     .as_object()
-                    .expect("validate::check_power_levels guarantees map shape");
+                    .expect("validate::validate_pdu guarantees map shape");
                 for (k, v) in obj {
                     let n = v
                         .as_i64()
-                        .expect("validate::check_power_levels guarantees integer map values");
+                        .expect("validate::validate_pdu guarantees integer map values");
                     target.insert(k.clone(), n);
                 }
             }
@@ -822,7 +826,7 @@ fn check_rule_10_power_levels(
         }
         let uid: OwnedUserId = match key.parse() {
             Ok(u) => u,
-            // Phase 1a (validate::check_power_levels via PowerLevelsBadUsers)
+            // Phase 1b (validate::validate_pdu via PowerLevelsBadUsers)
             // already rejects malformed user ids in the `users` map; this
             // arm is unreachable in practice.
             Err(_) => continue,

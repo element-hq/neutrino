@@ -1,8 +1,19 @@
 //! Phase 1: validation.
 //!
-//! Phase 1a — `parse_event`: pure-JSON wire format. No I/O.
-//! Phase 1b — `validate_references`: existential checks that require provider
+//! Phase 1a — `parse_event`: pure-JSON wire format (required fields, JSON
+//! types, ID parsing). No I/O, no semantic-rule decisions.
+//! Phase 1b — `validate_pdu`: semantic rules that work off a parsed `Event`
+//! and need no provider (count limits, create structural rules, rule 9,
+//! per-type content shape).
+//! Phase 1c — `validate_references`: existential checks that require provider
 //! lookups (v12 rule 2 + MSC4242 `prev_state_events` triad).
+//!
+//! `validate_pdu` is split out of `parse_event` so downstream callers
+//! (`RoomCore::apply`) don't have to take "you ran parse_event already" as
+//! a precondition. Both `EventBuilder::build` / `Event::from_wire` and
+//! `RoomCore::apply` run validate_pdu explicitly; apply also runs it
+//! defensively so a hand-constructed `Event` can't bypass the semantic
+//! checks.
 //!
 //! Every check is annotated inline with its spec citation. Anything that
 //! requires resolved room state is deferred to phase 3 (`check_auth_rules`).
@@ -18,9 +29,11 @@ use crate::{Event, FormatError, ReferenceError};
 const MAX_PREV_EVENTS: usize = 20;
 const MAX_PREV_STATE_EVENTS: usize = 20;
 
-/// Parse a raw event JSON into an `Event`, applying every phase-1a check
-/// (wire-format only; no provider lookups). Reference validation —
-/// `prev_state_events` lookup, room-exists check — is `validate_references`.
+/// Parse a raw event JSON into an `Event`. Phase 1a — wire-format only:
+/// required field presence, JSON value types, ID parsing. Semantic rules
+/// (count limits, create structural constraints, rule 9, per-type content
+/// shape) belong to [`validate_pdu`]; reference validation belongs to
+/// [`validate_references`].
 ///
 /// `event_id` is provided by the caller: under v12 it derives from the event's
 /// reference hash, which is computed by a separate event-building step. This
@@ -40,6 +53,8 @@ pub fn parse_event(
     let map: Map<String, Value> = serde_json::from_str(raw.get())?;
 
     // MSC4242: reject any event that includes auth_events on the wire.
+    // Wire-format: the field is forbidden by the protocol, regardless of
+    // what the embedded value would mean.
     if map.contains_key("auth_events") {
         return Err(FormatError::AuthEventsPresent);
     }
@@ -80,56 +95,40 @@ pub fn parse_event(
         }
     }
 
-    // content: required, object.
+    // content: required, object. Shape-only here; per-type content rules
+    // (rules 1.3 / 1.4 / 5.1 / 10.1–10.3) are in `validate_pdu`.
     let content_value = map
         .get("content")
         .ok_or(FormatError::MissingField("content"))?;
-    let content_obj = content_value
-        .as_object()
-        .ok_or(FormatError::InvalidFieldType {
+    if !content_value.is_object() {
+        return Err(FormatError::InvalidFieldType {
             field: "content",
             expected: "object",
-        })?;
+        });
+    }
     let content_raw = serde_json::value::to_raw_value(content_value)?;
 
-    // prev_events: required, array, ≤ MAX_PREV_EVENTS.
+    // prev_events: required, array of valid event ids. Length bound is a
+    // semantic check (see `validate_pdu`).
     let prev_events = parse_event_id_array(&map, "prev_events")?;
-    if prev_events.len() > MAX_PREV_EVENTS {
-        return Err(FormatError::TooManyPrevEvents);
-    }
 
-    // v12 rule 1.1: m.room.create must have no prev_events.
-    if is_create && !prev_events.is_empty() {
-        return Err(FormatError::CreateHasPrevEvents);
-    }
-
-    // prev_state_events: required (MSC4242), array, ≤ MAX_PREV_STATE_EVENTS.
-    // MSC4242 also: m.room.create must not have any.
-    let prev_state_events = if is_create {
-        // Create events MUST NOT have prev_state_events. Treat the field as
-        // absent or empty; any non-empty value is a reject.
-        if let Some(v) = map.get("prev_state_events") {
-            let arr = v.as_array().ok_or(FormatError::InvalidFieldType {
-                field: "prev_state_events",
-                expected: "array",
-            })?;
-            if !arr.is_empty() {
-                return Err(FormatError::CreateHasPrevStateEvents);
-            }
-        }
-        Vec::new()
-    } else {
-        let v = parse_event_id_array(&map, "prev_state_events")?;
-        if v.len() > MAX_PREV_STATE_EVENTS {
-            return Err(FormatError::TooManyPrevStateEvents);
-        }
-        v
+    // prev_state_events: required for non-create events; optional for create
+    // (wire-format allows absent or empty for create). The "create has no
+    // prev_state_events / prev_events" semantic rules and the length bound
+    // are in `validate_pdu`.
+    let prev_state_events = match map.get("prev_state_events") {
+        None if is_create => Vec::new(),
+        None => return Err(FormatError::MissingField("prev_state_events")),
+        Some(_) => parse_event_id_array(&map, "prev_state_events")?,
     };
 
     // room_id:
     //   non-create — required, valid room id.
-    //   create     — v12 rule 1.2 "If the event has a room_id, reject."
-    //                Derived from event_id by sigil swap ($ → !).
+    //   create     — v12 rule 1.2 ("If the event has a `room_id`, reject")
+    //                is a wire-format rule: the field is forbidden on the
+    //                wire and the room_id is derived from event_id post-hash
+    //                ($ → !). Once Event is constructed the wire-presence
+    //                signal is lost, so this check stays in parse_event.
     let room_id = if is_create {
         if map.contains_key("room_id") {
             return Err(FormatError::CreateHasRoomId);
@@ -144,7 +143,7 @@ pub fn parse_event(
             })?
     };
 
-    // state_key (optional in PDU schema, required by some auth rules below).
+    // state_key (optional in PDU schema, required by some auth rules later).
     // Absent => None. Present must be a string — `null` is a wire-format
     // error, not equivalent to absent.
     let state_key = match map.get("state_key") {
@@ -159,30 +158,6 @@ pub fn parse_event(
         ),
     };
 
-    // v12 rule 9: "If the event has a `state_key` that starts with an `@` and
-    // does not match the `sender`, reject."
-    //
-    // Rule 5 (m.room.member) is terminal for membership events and has its
-    // own rules about sender / state_key (the state_key is the *target* user,
-    // not the sender — that's how invites and kicks work). So rule 9 must
-    // not apply to m.room.member events. Synapse's `event_auth.py` does the
-    // same exclusion.
-    if event_type != "m.room.member"
-        && let Some(sk) = &state_key
-        && sk.starts_with('@')
-        && sk != sender.as_str()
-    {
-        return Err(FormatError::StateKeyAtSignSenderMismatch);
-    }
-
-    // Per-type checks.
-    match event_type.as_str() {
-        "m.room.create" => check_create(content_obj)?,
-        "m.room.member" => check_member(content_obj, state_key.as_deref())?,
-        "m.room.power_levels" => check_power_levels(content_obj)?,
-        _ => {}
-    }
-
     Ok(Event {
         event_id,
         room_id,
@@ -196,6 +171,96 @@ pub fn parse_event(
         auth_events,
         raw,
     })
+}
+
+/// Phase 1b: semantic checks that don't need a provider. Runs on a parsed
+/// `Event` (output of [`parse_event`]).
+///
+/// Split out of [`parse_event`] so callers don't have to take "you ran
+/// parse_event" as an implicit precondition for the semantic rules: a
+/// hand-constructed `Event` that bypassed parse_event still has to satisfy
+/// these checks before [`RoomCore::apply`] will accept it.
+///
+/// Checks:
+/// - **MSC4242**: `prev_events` ≤ `MAX_PREV_EVENTS`,
+///   `prev_state_events` ≤ `MAX_PREV_STATE_EVENTS`.
+/// - **v12 rule 1.1**: `m.room.create` has no `prev_events`.
+/// - **MSC4242**: `m.room.create` has no `prev_state_events`.
+/// - **v12 rule 9**: state_key starting with `@` matches sender, except for
+///   `m.room.member` (rule 5 owns that type end-to-end).
+/// - **v12 rule 1.3 / 1.4**: create content's `room_version` is recognised
+///   and `additional_creators` is `[valid_user_id, ...]`.
+/// - **v12 rule 5.1**: member content has a `state_key` and a `membership`.
+/// - **v12 rule 10.1 / 10.2 / 10.3**: power_levels content is well-formed
+///   (numeric fields are ints, events/notifications are objects of ints,
+///   users is `{valid_user_id: int}`).
+///
+/// `Event.content` is re-parsed as a JSON object so the per-type checks can
+/// inspect it. parse_event guarantees content is an object, but the
+/// re-parse means a caller that hand-constructed an `Event` with a
+/// non-object content still gets a typed error here rather than a panic.
+pub fn validate_pdu(event: &Event) -> Result<(), FormatError> {
+    // MSC4242 bounds on DAG fan-in. Cheap up-front guard.
+    if event.prev_events.len() > MAX_PREV_EVENTS {
+        return Err(FormatError::TooManyPrevEvents);
+    }
+    if event.prev_state_events.len() > MAX_PREV_STATE_EVENTS {
+        return Err(FormatError::TooManyPrevStateEvents);
+    }
+
+    let is_create = event.event_type == "m.room.create";
+    if is_create {
+        // v12 rule 1.1.
+        if !event.prev_events.is_empty() {
+            return Err(FormatError::CreateHasPrevEvents);
+        }
+        // MSC4242.
+        if !event.prev_state_events.is_empty() {
+            return Err(FormatError::CreateHasPrevStateEvents);
+        }
+    }
+
+    // v12 rule 9: "If the event has a `state_key` that starts with an `@`
+    // and does not match the `sender`, reject."
+    //
+    // Rule 5 (m.room.member) is terminal for membership events and has its
+    // own rules about sender / state_key (the state_key is the *target*
+    // user, not the sender — that's how invites and kicks work). So rule 9
+    // must not apply to m.room.member events. Synapse's `event_auth.py`
+    // does the same exclusion.
+    if event.event_type != "m.room.member"
+        && let Some(sk) = &event.state_key
+        && sk.starts_with('@')
+        && sk != event.sender.as_str()
+    {
+        return Err(FormatError::StateKeyAtSignSenderMismatch);
+    }
+
+    // Per-type content checks.
+    match event.event_type.as_str() {
+        "m.room.create" => check_create(&content_as_object(&event.content)?)?,
+        "m.room.member" => check_member(
+            &content_as_object(&event.content)?,
+            event.state_key.as_deref(),
+        )?,
+        "m.room.power_levels" => check_power_levels(&content_as_object(&event.content)?)?,
+        _ => {}
+    }
+
+    Ok(())
+}
+
+/// Re-parse `Event.content` as a JSON object. parse_event guarantees this
+/// shape, but validate_pdu doesn't depend on that — a hand-constructed
+/// `Event` with non-object content gets a typed error here, not a panic.
+fn content_as_object(content: &RawValue) -> Result<Map<String, Value>, FormatError> {
+    match serde_json::from_str(content.get())? {
+        Value::Object(map) => Ok(map),
+        _ => Err(FormatError::InvalidFieldType {
+            field: "content",
+            expected: "object",
+        }),
+    }
 }
 
 fn required_string<'a>(
@@ -364,7 +429,7 @@ fn check_power_levels(content: &Map<String, Value>) -> Result<(), FormatError> {
     Ok(())
 }
 
-/// Phase 1b: validate that everything this event refers to actually resolves.
+/// Phase 1c: validate that everything this event refers to actually resolves.
 ///
 /// Checks:
 /// - **v12 rule 2**: the event's `room_id` is the event ID of an accepted
@@ -496,57 +561,61 @@ mod tests {
         ));
     }
 
-    // ---------- F1 / F2: too many prev_(state_)events ----------
+    // ---------- F1 / F2: too many prev_(state_)events (validate_pdu) ----------
     #[test]
-    fn rejects_prev_events_over_20() {
+    fn validate_pdu_rejects_prev_events_over_20() {
         let mut v = base_event();
         v["prev_events"] = json!(
             (0..21)
                 .map(|i| format!("$p{i}:example.org"))
                 .collect::<Vec<_>>()
         );
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![]),
+            validate_pdu(&ev),
             Err(FormatError::TooManyPrevEvents)
         ));
     }
 
     #[test]
-    fn rejects_prev_state_events_over_20() {
+    fn validate_pdu_rejects_prev_state_events_over_20() {
         let mut v = base_event();
         v["prev_state_events"] = json!(
             (0..21)
                 .map(|i| format!("$p{i}:example.org"))
                 .collect::<Vec<_>>()
         );
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![]),
+            validate_pdu(&ev),
             Err(FormatError::TooManyPrevStateEvents)
         ));
     }
 
-    // ---------- F3 / F4: create has prev_(state_)events ----------
+    // ---------- F3 / F4: create has prev_(state_)events (validate_pdu) ----------
     #[test]
-    fn rejects_create_with_prev_events() {
+    fn validate_pdu_rejects_create_with_prev_events() {
         let mut v = base_create();
         v["prev_events"] = json!(["$prev:example.org"]);
+        let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            parse_event(raw(v), eid("$create:example.org"), vec![]),
+            validate_pdu(&ev),
             Err(FormatError::CreateHasPrevEvents)
         ));
     }
 
     #[test]
-    fn rejects_create_with_prev_state_events() {
+    fn validate_pdu_rejects_create_with_prev_state_events() {
         let mut v = base_create();
         v["prev_state_events"] = json!(["$prev:example.org"]);
+        let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            parse_event(raw(v), eid("$create:example.org"), vec![]),
+            validate_pdu(&ev),
             Err(FormatError::CreateHasPrevStateEvents)
         ));
     }
 
-    // ---------- F5: create has room_id ----------
+    // ---------- F5: create has room_id (parse_event — wire-only check) ----------
     #[test]
     fn rejects_create_with_room_id() {
         let mut v = base_create();
@@ -557,116 +626,125 @@ mod tests {
         ));
     }
 
-    // ---------- F6: unrecognised room_version ----------
+    // ---------- F6: unrecognised room_version (validate_pdu) ----------
     #[test]
-    fn rejects_unrecognised_room_version() {
+    fn validate_pdu_rejects_unrecognised_room_version() {
         let mut v = base_create();
         v["content"] = json!({ "room_version": "11" });
+        let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            parse_event(raw(v), eid("$create:example.org"), vec![]),
+            validate_pdu(&ev),
             Err(FormatError::UnrecognisedRoomVersion(_))
         ));
     }
 
     #[test]
-    fn accepts_create_without_room_version_field() {
+    fn validate_pdu_accepts_create_without_room_version_field() {
         // Per Kegan's call on F6: "default value" handling is separate from
-        // "is value valid". When room_version is absent we don't reject here.
+        // "is value valid". When room_version is absent we don't reject.
         let mut v = base_create();
         v["content"] = json!({});
-        parse_event(raw(v), eid("$create:example.org"), vec![])
-            .expect("create without content.room_version is permitted in phase 1");
+        let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
+        validate_pdu(&ev).expect("absent room_version is permitted");
     }
 
-    // ---------- F7: additional_creators ----------
+    // ---------- F7: additional_creators (validate_pdu) ----------
     #[test]
-    fn rejects_additional_creators_non_array() {
+    fn validate_pdu_rejects_additional_creators_non_array() {
         let mut v = base_create();
         v["content"] =
             json!({ "room_version": ROOM_VERSION_ID, "additional_creators": "@bob:example.org" });
+        let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            parse_event(raw(v), eid("$create:example.org"), vec![]),
+            validate_pdu(&ev),
             Err(FormatError::InvalidAdditionalCreators)
         ));
     }
 
     #[test]
-    fn rejects_additional_creators_with_bad_user_id() {
+    fn validate_pdu_rejects_additional_creators_with_bad_user_id() {
         let mut v = base_create();
         v["content"] =
             json!({ "room_version": ROOM_VERSION_ID, "additional_creators": ["not-a-user-id"] });
+        let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            parse_event(raw(v), eid("$create:example.org"), vec![]),
+            validate_pdu(&ev),
             Err(FormatError::InvalidAdditionalCreators)
         ));
     }
 
     #[test]
-    fn accepts_additional_creators_valid() {
+    fn validate_pdu_accepts_additional_creators_valid() {
         let mut v = base_create();
         v["content"] = json!({
             "room_version": ROOM_VERSION_ID,
             "additional_creators": ["@bob:example.org", "@carol:example.org"]
         });
-        parse_event(raw(v), eid("$create:example.org"), vec![]).expect("valid additional_creators");
+        let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
+        validate_pdu(&ev).expect("valid additional_creators");
     }
 
-    // ---------- F8: m.room.member missing parts ----------
+    // ---------- F8: m.room.member missing parts (validate_pdu) ----------
     #[test]
-    fn rejects_member_without_state_key() {
+    fn validate_pdu_rejects_member_without_state_key() {
         let mut v = base_event();
         v["type"] = json!("m.room.member");
         v["content"] = json!({ "membership": "join" });
         // state_key absent
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![]),
+            validate_pdu(&ev),
             Err(FormatError::MemberMissingStateKey)
         ));
     }
 
     #[test]
-    fn rejects_member_without_membership() {
+    fn validate_pdu_rejects_member_without_membership() {
         let mut v = base_event();
         v["type"] = json!("m.room.member");
         v["state_key"] = json!("@alice:example.org");
         v["content"] = json!({});
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![]),
+            validate_pdu(&ev),
             Err(FormatError::MemberMissingMembership)
         ));
     }
 
-    // ---------- F10: rule 9 (@-prefixed state_key must match sender) ----------
+    // ---------- F10: rule 9 (@-prefixed state_key must match sender) (validate_pdu) ----------
     #[test]
-    fn rejects_at_state_key_mismatch() {
+    fn validate_pdu_rejects_at_state_key_mismatch() {
         let mut v = base_event();
         v["type"] = json!("m.some.thing");
         v["state_key"] = json!("@bob:example.org");
         // sender = @alice — mismatch
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![]),
+            validate_pdu(&ev),
             Err(FormatError::StateKeyAtSignSenderMismatch)
         ));
     }
 
     #[test]
-    fn accepts_at_state_key_matching_sender() {
+    fn validate_pdu_accepts_at_state_key_matching_sender() {
         let mut v = base_event();
         v["type"] = json!("m.something");
         v["state_key"] = json!("@alice:example.org");
-        parse_event(raw(v), eid("$e:example.org"), vec![]).expect("state_key matches sender");
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
+        validate_pdu(&ev).expect("state_key matches sender");
     }
 
     #[test]
-    fn accepts_non_at_state_key() {
+    fn validate_pdu_accepts_non_at_state_key() {
         let mut v = base_event();
         v["type"] = json!("m.room.topic");
         v["state_key"] = json!("");
-        parse_event(raw(v), eid("$e:example.org"), vec![]).expect("empty state_key ok");
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
+        validate_pdu(&ev).expect("empty state_key ok");
     }
 
     #[test]
-    fn rule_9_does_not_apply_to_m_room_member() {
+    fn validate_pdu_rule_9_does_not_apply_to_m_room_member() {
         // Invite of @bob by @alice: state_key=@bob, sender=@alice — normal
         // membership operation. Rule 9 would reject naively; rule 5 owns
         // m.room.member end-to-end so rule 9 must skip it.
@@ -674,61 +752,65 @@ mod tests {
         v["type"] = json!("m.room.member");
         v["state_key"] = json!("@bob:example.org");
         v["content"] = json!({ "membership": "invite" });
-        parse_event(raw(v), eid("$e:example.org"), vec![])
-            .expect("m.room.member with different state_key/sender is valid");
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
+        validate_pdu(&ev).expect("m.room.member with different state_key/sender is valid");
     }
 
-    // ---------- F11 / F12 / F13: power_levels content ----------
+    // ---------- F11 / F12 / F13: power_levels content (validate_pdu) ----------
     #[test]
-    fn rejects_power_levels_non_integer_int_field() {
+    fn validate_pdu_rejects_power_levels_non_integer_int_field() {
         let mut v = base_event();
         v["type"] = json!("m.room.power_levels");
         v["state_key"] = json!("");
         v["content"] = json!({ "users_default": "high" });
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![]),
+            validate_pdu(&ev),
             Err(FormatError::PowerLevelsBadIntField("users_default"))
         ));
     }
 
     #[test]
-    fn rejects_power_levels_events_non_int_value() {
+    fn validate_pdu_rejects_power_levels_events_non_int_value() {
         let mut v = base_event();
         v["type"] = json!("m.room.power_levels");
         v["state_key"] = json!("");
         v["content"] = json!({ "events": { "m.room.name": "yes" } });
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![]),
+            validate_pdu(&ev),
             Err(FormatError::PowerLevelsBadObjectField("events"))
         ));
     }
 
     #[test]
-    fn rejects_power_levels_users_bad_user_id() {
+    fn validate_pdu_rejects_power_levels_users_bad_user_id() {
         let mut v = base_event();
         v["type"] = json!("m.room.power_levels");
         v["state_key"] = json!("");
         v["content"] = json!({ "users": { "not-a-user-id": 50 } });
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![]),
+            validate_pdu(&ev),
             Err(FormatError::PowerLevelsBadUsers)
         ));
     }
 
     #[test]
-    fn rejects_power_levels_users_non_int_value() {
+    fn validate_pdu_rejects_power_levels_users_non_int_value() {
         let mut v = base_event();
         v["type"] = json!("m.room.power_levels");
         v["state_key"] = json!("");
         v["content"] = json!({ "users": { "@alice:example.org": "boss" } });
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![]),
+            validate_pdu(&ev),
             Err(FormatError::PowerLevelsBadUsers)
         ));
     }
 
     #[test]
-    fn accepts_valid_power_levels() {
+    fn validate_pdu_accepts_valid_power_levels() {
         let mut v = base_event();
         v["type"] = json!("m.room.power_levels");
         v["state_key"] = json!("");
@@ -744,7 +826,8 @@ mod tests {
             "events": { "m.room.name": 50 },
             "notifications": { "room": 50 }
         });
-        parse_event(raw(v), eid("$e:example.org"), vec![]).expect("valid power_levels");
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
+        validate_pdu(&ev).expect("valid power_levels");
     }
 
     // ---------- F14: malformed IDs ----------
