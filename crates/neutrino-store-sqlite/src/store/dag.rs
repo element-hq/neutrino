@@ -9,9 +9,12 @@
 //! - a parent isn't in the local store, or sits in a different room
 //!   (federation-backfill boundary — [`hydrate_pdu`] returns `None` and
 //!   the walker keeps draining the rest of the frontier); or
-//! - the parent is in the `earliest` exclusion set passed to
-//!   `missing_events` (marked visited, skipped, its own parents are
-//!   never enqueued).
+//! - the parent is in the `excluded` set passed to
+//!   [`walk_prev_events`] (marked visited, skipped, its own parents
+//!   are never enqueued). `events_before` passes an empty set;
+//!   `missing_events` passes `earliest ∪ latest` — `latest` events
+//!   are the boundary the requester already has, per Synapse-style
+//!   `_get_missing_events` semantics.
 //!
 //! So a missing parent in one subtree doesn't stop the BFS — siblings
 //! and the rest of the frontier still get walked.
@@ -61,13 +64,16 @@ fn hydrate_pdu(
 }
 
 /// Fetch a child's parents of a given edge type from `event_edges`,
-/// sorted by `parent_event_id`. This pins the BFS sibling-visit order so
-/// `events_before` / `missing_events` results are deterministic across
-/// runs regardless of the order the parent IDs appeared in the
-/// originating JSON. `event_edges` has a `WITHOUT ROWID PRIMARY KEY
-/// (child_event_id, edge_type, parent_event_id)`, so the explicit
-/// `ORDER BY` matches the natural PK scan — free at runtime, contractual
-/// at the spec boundary.
+/// sorted by `parent_event_id`. Pins each event's sibling-visit order
+/// independent of the order the parent IDs appeared in the originating
+/// JSON, which is what makes single-seed walks (`events_before`)
+/// deterministic. Multi-seed walks (`missing_events`) are also
+/// deterministic given a fixed `latest` slice — the per-seed expansion
+/// follows this sort, and the across-seed interleaving follows caller
+/// order — but the trait doc doesn't fix that as a contract. `event_edges`
+/// has a `WITHOUT ROWID PRIMARY KEY (child_event_id, edge_type,
+/// parent_event_id)`, so the explicit `ORDER BY` matches the natural
+/// PK scan — free at runtime.
 fn fetch_edges(
     conn: &Connection,
     child_event_id: &EventId,
@@ -144,9 +150,9 @@ fn walk_prev_events(
 /// Tests override to a tiny value so the chunk boundary is reachable
 /// from the test suite without persisting hundreds of events per case.
 #[cfg(not(test))]
-const VALIDATE_INPUTS_CHUNK: usize = 256;
+const VALIDATE_EVENTS_EXIST_CHUNK: usize = 256;
 #[cfg(test)]
-const VALIDATE_INPUTS_CHUNK: usize = 4;
+const VALIDATE_EVENTS_EXIST_CHUNK: usize = 4;
 
 /// Confirm `room_id` exists in `rooms`. Standalone so callers that
 /// don't validate event IDs (federation-leaning paths like
@@ -192,7 +198,7 @@ fn validate_events_exist(conn: &Connection, event_ids: &[&OwnedEventId]) -> Resu
     };
 
     let mut found: HashSet<String> = HashSet::with_capacity(unique.len());
-    for window in unique.chunks(VALIDATE_INPUTS_CHUNK) {
+    for window in unique.chunks(VALIDATE_EVENTS_EXIST_CHUNK) {
         let placeholders = vec!["?"; window.len()].join(",");
         let query = format!("SELECT event_id FROM events WHERE event_id IN ({placeholders})");
         let mut stmt = conn.prepare(&query)?;
@@ -524,15 +530,22 @@ mod tests {
         let id_other = ev_other.event_id.clone();
         s.persist_event(&ev_other, &[]).await.unwrap();
 
-        // Seed exists, but in the *other* room. Validation rejects it
-        // because `validate_events_exist` only checks existence in the events
-        // table globally — but the walker scopes by `room_id`, so the seed
-        // hydrates as None and we get an empty result.
+        // Seed exists, but in the *other* room. Both methods return
+        // empty here, for slightly different reasons:
+        //   - `events_before` calls `validate_events_exist`, which
+        //     only checks global existence; that passes. The walk
+        //     then seeds with the cross-room id, `hydrate_pdu`
+        //     room-scopes it to None, and the walk returns empty.
+        //   - `missing_events` no longer validates event IDs
+        //     (Synapse-style), so the seed is fed straight to
+        //     `fetch_edges` — which returns no parents because the
+        //     cross-room event has no `prev_events` here — and the
+        //     BFS frontier starts empty. Even if it did have parents,
+        //     `hydrate_pdu` would room-scope them out.
         //
-        // Note: D19 covers the bogus-seed InvalidInput case. Here the seed
-        // is real (just in the wrong room), and the validator does find
-        // it in events globally, so validation passes and the walk runs
-        // (and returns empty due to room-scoping in hydrate_pdu).
+        // Either way the load-bearing property is room-scoping
+        // (`hydrate_pdu`, not validation), so D19 / D10 cover the
+        // walked-edge cross-room case in more depth.
         let got = s
             .events_before(*ALICE_ROOM_ID, &[&id_other], 10)
             .await
@@ -909,7 +922,7 @@ mod tests {
         assert!(got.is_empty(), "expected empty result, got {got:?}");
     }
 
-    // D23: validator chunks the IN-clause. With VALIDATE_INPUTS_CHUNK=4
+    // D23: validator chunks the IN-clause. With VALIDATE_EVENTS_EXIST_CHUNK=4
     // under cfg(test), six inputs cross at least two chunks; all six
     // resolve, so validation passes and the BFS runs normally. Catches
     // a regression where the chunk loop only writes results from the
@@ -1222,9 +1235,11 @@ mod tests {
     // D17: multi-seed `latest` — two parallel chains c→a and d→b,
     // with latest=[c, d]. Under Synapse-style semantics, c and d are
     // boundary (never returned); the walk expands to their parents
-    // [a, b] and emits them. Order isn't pinned (different from
-    // `events_before` which does pin order); cardinality + set
-    // membership are the load-bearing assertions.
+    // [a, b] and emits them. The implementation produces a
+    // deterministic order (caller's `latest` order + `fetch_edges`'s
+    // parent sort), but `DagStore::missing_events`'s trait doc
+    // doesn't pin the interleaving across seeds — so this test
+    // asserts cardinality + set membership rather than a sequence.
     #[tokio::test]
     async fn missing_events_handles_multiple_latest() {
         let s = store_with_room().await;
