@@ -136,7 +136,7 @@ fn walk_prev_events(
     Ok(results)
 }
 
-/// IN-clause chunk size used by [`validate_inputs`]. Stays well below
+/// IN-clause chunk size used by [`validate_events_exist`]. Stays well below
 /// `SQLITE_LIMIT_VARIABLE_NUMBER` on every SQLite build (the default is
 /// 999 pre-3.32, 32766 since), and small enough that the prepared-
 /// statement compile cost stays bounded even on pathological inputs.
@@ -148,19 +148,10 @@ const VALIDATE_INPUTS_CHUNK: usize = 256;
 #[cfg(test)]
 const VALIDATE_INPUTS_CHUNK: usize = 4;
 
-/// Enforce the precondition documented on `DagStore::events_before` /
-/// `DagStore::missing_events`: `room_id` exists in `rooms`, and every ID
-/// in `event_ids` exists in `events`. Whether each event is in `room_id`
-/// is intentionally *not* checked here — the walk is scoped to `room_id`
-/// via [`hydrate_pdu`], so a cross-room seed naturally produces an empty
-/// result rather than an error. All queries share the read connection
-/// holding the snapshot the subsequent walk runs against, so a concurrent
-/// writer can't sneak rows out from under us between validate and walk.
-fn validate_inputs(
-    conn: &Connection,
-    room_id: &RoomId,
-    event_ids: &[&OwnedEventId],
-) -> Result<(), Error> {
+/// Confirm `room_id` exists in `rooms`. Standalone so callers that
+/// don't validate event IDs (federation-leaning paths like
+/// `missing_events`) can still cheaply 404 on unknown rooms.
+fn validate_room_exists(conn: &Connection, room_id: &RoomId) -> Result<(), Error> {
     let room_exists: Option<i64> = conn
         .query_row(
             "SELECT 1 FROM rooms WHERE room_id = ?",
@@ -173,6 +164,22 @@ fn validate_inputs(
             "room {room_id} does not exist"
         )));
     }
+    Ok(())
+}
+
+/// Confirm every ID in `event_ids` exists in the `events` table
+/// globally. Whether each event is in any particular room is
+/// intentionally *not* checked — the walk is scoped via
+/// [`hydrate_pdu`], so a cross-room seed naturally produces empty
+/// walk output rather than an error here. All queries share the
+/// read connection holding the snapshot the subsequent walk runs
+/// against, so a concurrent writer can't sneak rows out from under
+/// us between validate and walk. Chunked to stay below
+/// `SQLITE_LIMIT_VARIABLE_NUMBER` on every build.
+fn validate_events_exist(
+    conn: &Connection,
+    event_ids: &[&OwnedEventId],
+) -> Result<(), Error> {
     if event_ids.is_empty() {
         return Ok(());
     }
@@ -225,8 +232,9 @@ impl DagStore for SqliteStore {
         let from: Vec<OwnedEventId> = from.iter().map(|&e| e.to_owned()).collect();
 
         self.run_read(move |conn| -> Result<Vec<Event>, Error> {
+            validate_room_exists(conn, &room_id)?;
             let id_refs: Vec<&OwnedEventId> = from.iter().collect();
-            validate_inputs(conn, &room_id, &id_refs)?;
+            validate_events_exist(conn, &id_refs)?;
             walk_prev_events(conn, &room_id, from, &HashSet::new(), limit)
         })
         .await
@@ -244,8 +252,13 @@ impl DagStore for SqliteStore {
         let earliest: Vec<OwnedEventId> = earliest.iter().map(|&e| e.to_owned()).collect();
 
         self.run_read(move |conn| -> Result<Vec<Event>, Error> {
-            let id_refs: Vec<&OwnedEventId> = latest.iter().chain(earliest.iter()).collect();
-            validate_inputs(conn, &room_id, &id_refs)?;
+            validate_room_exists(conn, &room_id)?;
+            // Note: no `validate_events_exist` here. Unknown IDs in
+            // `latest`/`earliest` are tolerated — `latest` hits
+            // produce no walk results (no reachable parents),
+            // `earliest` hits are no-ops (no walked event matches).
+            // Matches Synapse's `_get_missing_events` and the
+            // federation contract in docs/get-missing-events.md.
             let earliest_set: HashSet<OwnedEventId> = earliest.into_iter().collect();
             walk_prev_events(conn, &room_id, latest, &earliest_set, limit)
         })
@@ -255,7 +268,9 @@ impl DagStore for SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use neutrino_store::{DagStore, EventStore, RoomStore};
+    use std::collections::HashSet;
+
+    use neutrino_store::{DagStore, Event, EventStore, RoomStore};
     use ruma::{EventId, OwnedEventId, event_id, room_id};
 
     use crate::SqliteStore;
@@ -483,7 +498,7 @@ mod tests {
         s.persist_event(&ev_other, &[]).await.unwrap();
 
         // Seed exists, but in the *other* room. Validation rejects it
-        // because `validate_inputs` only checks existence in the events
+        // because `validate_events_exist` only checks existence in the events
         // table globally — but the walker scopes by `room_id`, so the seed
         // hydrates as None and we get an empty result.
         //
@@ -847,19 +862,21 @@ mod tests {
         );
     }
 
-    // D21: missing ID in `latest` → InvalidInput. The `earliest` slice
-    // is empty so this isolates the latest-side check.
+    // D21: an unknown `latest_events` reference is treated as a starting
+    // point with no parents in the local store — the walk produces no
+    // events. This mirrors Synapse's `_get_missing_events`
+    // (storage/databases/main/event_federation.py), which performs no
+    // existence pre-check. The previous strict-reject contract
+    // contradicted the federation use case where peers legitimately
+    // hold events we haven't seen.
     #[tokio::test]
-    async fn missing_events_missing_latest_returns_invalid_input() {
+    async fn missing_events_unknown_latest_returns_empty() {
         let s = store_with_room().await;
-        let err = s
+        let got = s
             .missing_events(*ALICE_ROOM_ID, &[event_id!("$nope:e")], &[], 10)
             .await
-            .expect_err("missing latest must reject");
-        assert!(
-            matches!(err, neutrino_store::StorageError::InvalidInput(_)),
-            "expected InvalidInput, got {err:?}"
-        );
+            .expect("unknown latest must not error");
+        assert!(got.is_empty(), "expected empty result, got {got:?}");
     }
 
     // D23: validator chunks the IN-clause. With VALIDATE_INPUTS_CHUNK=4
@@ -917,22 +934,199 @@ mod tests {
         );
     }
 
-    // D22: missing ID in `earliest` → InvalidInput. `latest` resolves
-    // to a real event so the validation only fails on the earliest side.
+    // D22: an unknown `earliest_events` reference is a no-op — no
+    // walked event will ever match it, so the walk proceeds as if
+    // `earliest` were empty. Same rationale as D21.
     #[tokio::test]
-    async fn missing_events_missing_earliest_returns_invalid_input() {
+    async fn missing_events_unknown_earliest_ignored() {
         let s = store_with_room().await;
         let ev_a = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]);
         let id_a = ev_a.event_id.clone();
         s.persist_event(&ev_a, &[]).await.unwrap();
-        let err = s
+        let got = s
             .missing_events(*ALICE_ROOM_ID, &[&id_a], &[event_id!("$nope:e")], 10)
             .await
-            .expect_err("missing earliest must reject");
-        assert!(
-            matches!(err, neutrino_store::StorageError::InvalidInput(_)),
-            "expected InvalidInput, got {err:?}"
+            .expect("unknown earliest must not error");
+        assert_eq!(got.len(), 1, "walk should still return real latest");
+        assert_eq!(got[0].event_id, id_a);
+    }
+
+    // D23a: a single node with 50 prev_events. Catches a regression
+    // where the BFS frontier is bounded or `fetch_edges` truncates the
+    // parent set. The walker returns the head + all 50 leaves under a
+    // generous limit, in some `event_edges`-sorted order — we don't
+    // pin order, only cardinality.
+    #[tokio::test]
+    async fn missing_events_wide_fanout() {
+        let s = store_with_room().await;
+
+        let mut leaf_ids: Vec<OwnedEventId> = Vec::with_capacity(50);
+        for i in 0..50u64 {
+            let ev = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "leaf", i);
+            leaf_ids.push(ev.event_id.clone());
+            s.persist_event(&ev, &[]).await.unwrap();
+        }
+
+        let leaf_refs: Vec<&EventId> = leaf_ids.iter().map(|id| id.as_ref()).collect();
+        let head = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "head", &leaf_refs);
+        let head_id = head.event_id.clone();
+        s.persist_event(&head, &[]).await.unwrap();
+
+        let got = s
+            .missing_events(*ALICE_ROOM_ID, &[&head_id], &[], 100)
+            .await
+            .unwrap();
+
+        // head + 50 leaves
+        assert_eq!(got.len(), 51, "head + 50 leaves all reachable under generous limit");
+    }
+
+    // D23c: DAG shape ported from Synapse's
+    // `_setup_room_for_backfill_tests` (tests/storage/test_event_federation.py).
+    // Synapse uses this shape to test `get_backfill_points_in_room` —
+    // a different primitive — so the assertions here are fresh, not
+    // direct ports. The DAG: a main spine `1 → 2 → 3 → 4 → 5` with
+    // two fan-out branches: events b1/b2/b3 between 2 and 3 merging
+    // via event A, and events b4/b5/b6 between 3 and 4 merging via
+    // event B. We persist the full 13-event DAG locally (Synapse's
+    // test deliberately omits some to model backward extremities,
+    // which is irrelevant to `missing_events`).
+    //
+    // Asserts:
+    //  - walk from 5 with no earliest, generous limit → all 13 events
+    //  - walk from 5 with earliest=[3], generous limit → exactly 5
+    //    events (5, 4, B, b4, b5, b6) — 3 is excluded and its
+    //    transitive ancestors are unreachable past the earliest
+    //    boundary; b4/b5/b6 enqueue but their sole prev (3) is in
+    //    `excluded` so the chain stops.
+    #[tokio::test]
+    async fn missing_events_synapse_backfill_dag_shape() {
+        use crate::tests::make_event;
+        use serde_json::json;
+
+        let s = store_with_room().await;
+
+        // Build leaf-first so each event's prev_events resolve to real
+        // ids. ts is the topological index; not load-bearing for our
+        // walker (event_edges sort is by parent_event_id) but assigns
+        // each event a distinct content hash so event_ids differ.
+        let mk = |body: &str, prev: &[&EventId], ts: u64| -> Event {
+            make_event(
+                *ALICE_ROOM_ID,
+                *ALICE_USER_ID,
+                "m.room.message",
+                None,
+                json!({"body": body, "msgtype": "m.text"}),
+                ts,
+                prev,
+                &[],
+            )
+        };
+
+        let e1 = mk("1", &[], 1);
+        let id1 = e1.event_id.clone();
+        s.persist_event(&e1, &[]).await.unwrap();
+
+        let e2 = mk("2", &[&id1], 2);
+        let id2 = e2.event_id.clone();
+        s.persist_event(&e2, &[]).await.unwrap();
+
+        let b1 = mk("b1", &[&id2], 3);
+        let b2 = mk("b2", &[&id2], 4);
+        let b3 = mk("b3", &[&id2], 5);
+        let id_b1 = b1.event_id.clone();
+        let id_b2 = b2.event_id.clone();
+        let id_b3 = b3.event_id.clone();
+        s.persist_event(&b1, &[]).await.unwrap();
+        s.persist_event(&b2, &[]).await.unwrap();
+        s.persist_event(&b3, &[]).await.unwrap();
+
+        let a = mk("A", &[&id_b1, &id_b2, &id_b3], 6);
+        let id_a = a.event_id.clone();
+        s.persist_event(&a, &[]).await.unwrap();
+
+        let e3 = mk("3", &[&id2, &id_a], 7);
+        let id3 = e3.event_id.clone();
+        s.persist_event(&e3, &[]).await.unwrap();
+
+        let b4 = mk("b4", &[&id3], 8);
+        let b5 = mk("b5", &[&id3], 9);
+        let b6 = mk("b6", &[&id3], 10);
+        let id_b4 = b4.event_id.clone();
+        let id_b5 = b5.event_id.clone();
+        let id_b6 = b6.event_id.clone();
+        s.persist_event(&b4, &[]).await.unwrap();
+        s.persist_event(&b5, &[]).await.unwrap();
+        s.persist_event(&b6, &[]).await.unwrap();
+
+        let b = mk("B", &[&id_b4, &id_b5, &id_b6], 11);
+        let id_b = b.event_id.clone();
+        s.persist_event(&b, &[]).await.unwrap();
+
+        let e4 = mk("4", &[&id3, &id_b], 12);
+        let id4 = e4.event_id.clone();
+        s.persist_event(&e4, &[]).await.unwrap();
+
+        let e5 = mk("5", &[&id4], 13);
+        let id5 = e5.event_id.clone();
+        s.persist_event(&e5, &[]).await.unwrap();
+
+        // Walk from 5 with no earliest, generous limit: all 13 events
+        // are reachable backward from 5.
+        let got_all = s
+            .missing_events(*ALICE_ROOM_ID, &[&id5], &[], 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            got_all.len(),
+            13,
+            "expected 13 reachable events from spine head, got {got_all:?}"
         );
+
+        // Walk from 5 with earliest=[3]: 3 itself is excluded, and
+        // any path through 3 stops there. Reachable: 5, 4, B, b4, b5, b6.
+        let got_bounded = s
+            .missing_events(*ALICE_ROOM_ID, &[&id5], &[&id3], 100)
+            .await
+            .unwrap();
+        let bounded_ids: HashSet<OwnedEventId> =
+            got_bounded.iter().map(|e| e.event_id.clone()).collect();
+        assert_eq!(
+            bounded_ids.len(),
+            6,
+            "expected 6 events between 3 (exclusive) and 5 (inclusive), got {bounded_ids:?}"
+        );
+        assert!(bounded_ids.contains(&id5));
+        assert!(bounded_ids.contains(&id4));
+        assert!(bounded_ids.contains(&id_b));
+        assert!(bounded_ids.contains(&id_b4));
+        assert!(bounded_ids.contains(&id_b5));
+        assert!(bounded_ids.contains(&id_b6));
+        assert!(!bounded_ids.contains(&id3), "earliest must not be in result");
+        assert!(!bounded_ids.contains(&id2));
+        assert!(!bounded_ids.contains(&id1));
+        assert!(!bounded_ids.contains(&id_a));
+    }
+
+    // D23b: limit=1 returns exactly one event — the `latest` itself
+    // (BFS visits the seed first). Boundary between D16 (limit=0 →
+    // empty) and the unbounded case.
+    #[tokio::test]
+    async fn missing_events_limit_one() {
+        let s = store_with_room().await;
+        let ev_a = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]);
+        let id_a = ev_a.event_id.clone();
+        s.persist_event(&ev_a, &[]).await.unwrap();
+        let ev_b = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "b", &[&id_a]);
+        let id_b = ev_b.event_id.clone();
+        s.persist_event(&ev_b, &[]).await.unwrap();
+
+        let got = s
+            .missing_events(*ALICE_ROOM_ID, &[&id_b], &[], 1)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].event_id, id_b);
     }
 
     // D25: schema-level — the FK `event_edges.child_event_id REFERENCES
