@@ -176,10 +176,7 @@ fn validate_room_exists(conn: &Connection, room_id: &RoomId) -> Result<(), Error
 /// against, so a concurrent writer can't sneak rows out from under
 /// us between validate and walk. Chunked to stay below
 /// `SQLITE_LIMIT_VARIABLE_NUMBER` on every build.
-fn validate_events_exist(
-    conn: &Connection,
-    event_ids: &[&OwnedEventId],
-) -> Result<(), Error> {
+fn validate_events_exist(conn: &Connection, event_ids: &[&OwnedEventId]) -> Result<(), Error> {
     if event_ids.is_empty() {
         return Ok(());
     }
@@ -1121,8 +1118,7 @@ mod tests {
             .missing_events(*ALICE_ROOM_ID, &[&id5], &[], 100)
             .await
             .unwrap();
-        let all_ids: HashSet<OwnedEventId> =
-            got_all.iter().map(|e| e.event_id.clone()).collect();
+        let all_ids: HashSet<OwnedEventId> = got_all.iter().map(|e| e.event_id.clone()).collect();
         assert_eq!(
             all_ids.len(),
             12,
@@ -1158,7 +1154,10 @@ mod tests {
         assert!(bounded_ids.contains(&id_b5));
         assert!(bounded_ids.contains(&id_b6));
         assert!(!bounded_ids.contains(&id5), "latest must not be in result");
-        assert!(!bounded_ids.contains(&id3), "earliest must not be in result");
+        assert!(
+            !bounded_ids.contains(&id3),
+            "earliest must not be in result"
+        );
         assert!(!bounded_ids.contains(&id2));
         assert!(!bounded_ids.contains(&id1));
         assert!(!bounded_ids.contains(&id_a));
