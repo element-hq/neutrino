@@ -257,10 +257,20 @@ pub trait DagStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<Event>, StorageError>;
 
-    /// Pre:  all event IDs in `latest` and `earliest` must be valid; `room_id` must exist.
-    /// Post: performs a BFS over `prev_events` starting from `latest`, skipping any event
-    ///       in `earliest`; returns at most `limit` events; events in `earliest` are not
-    ///       included in the result.
+    /// Pre:  `room_id` must exist in the store. Event IDs in `latest` and
+    ///       `earliest` need not exist; unknown IDs in `latest` contribute
+    ///       no parents to expand (empty edges row), unknown IDs in
+    ///       `earliest` are no-ops on the walk.
+    /// Post: BFS over `prev_events` starting from the *parents* of each
+    ///       event in `latest`, skipping any event in `earliest ∪ latest`;
+    ///       returns at most `limit` events. **The events in `latest`
+    ///       themselves are never included in the result** — they are
+    ///       the boundary the requester already has. The events in
+    ///       `earliest` are likewise never included. Events in other
+    ///       rooms (cross-room seeds or corrupt `event_edges`) are
+    ///       treated as if they don't exist — the walk terminates at the
+    ///       boundary rather than leaking PDUs from another room.
+    ///       Mirrors Synapse's `_get_missing_events`.
     async fn missing_events(
         &self,
         room_id: &RoomId,
