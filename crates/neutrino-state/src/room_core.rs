@@ -2,29 +2,26 @@
 //!
 //! `RoomCore::apply(event, provider)` integrates a single incoming event
 //! against the receipt-of-PDU checks the spec defines at
-//! <https://spec.matrix.org/v1.17/server-server-api/#checks-performed-on-receipt-of-a-pdu>.
+//! <https://spec.matrix.org/v1.18/server-server-api/#checks-performed-on-receipt-of-a-pdu>.
 //! Reading the spec's numbered list against our implementation:
 //!
 //! - **Step 1** (PDU schema / required fields): upstream of `apply` —
-//!   handled by `validate::parse_event` (Phase 1a), enforced by
-//!   `EventBuilder::build()` and `Event::from_wire`. By the time `apply`
-//!   receives an `Event` value, the wire-format checks have run. **See
-//!   PRECONDITION on `apply`** below.
+//!   handled by `validate::parse_event` (Phase 1a) and enforced by
+//!   `EventBuilder::build()` / `Event::from_wire`.
 //! - **Step 2** (signature verification): intentionally skipped per
-//!   `CLAUDE.md` — we run in a trusted network and don't carry signatures.
+//!   `CLAUDE.md` — trusted-network policy.
 //! - **Step 3** (auth check against the event's auth_events): under
 //!   MSC4242 the wire-level `auth_events` field is gone; the equivalent
-//!   check is "auth against state-before-event" since auth_events is now
-//!   server-computed from state-before-event via the auth-events-selection
-//!   algorithm. We run that check via `auth_rules::check_auth_rules`
-//!   against state-before-event derived from `prev_state_events`.
-//! - **Step 4** (auth check against the event's state-at-event): removed
-//!   under MSC4242 / state DAGs. Step 3 (state-before-event) subsumes it.
+//!   check is "auth against state-before-event", which we derive from
+//!   `prev_state_events` via `state_res::state_at_heads`.
+//! - **Step 4** (auth check against state-at-event): removed under
+//!   MSC4242 / state DAGs — step 3 subsumes it.
 //! - **Step 5** (soft-fail check against current room state): we run
 //!   `check_auth_rules` against `current_state` for **non-state events
 //!   only**. State events are not soft-failed (matches synapse's behaviour
-//!   in `_check_for_soft_fail`). On failure we emit `MarkSoftFailed` —
-//!   storage keeps the event, but it's not relayed to clients.
+//!   in `_check_for_soft_fail`). A soft-failed event is still persisted
+//!   (Matrix soft-fail semantics) — the `soft_failed` flag on
+//!   `Effect::Persist` lets storage keep it out of client timelines.
 //! - **Step 6** (state-set check): removed under MSC4242 / state DAGs.
 //!
 //! Local additions on top of the spec list: reference validation (Phase
@@ -33,9 +30,9 @@
 //!
 //! ## What `apply` mutates
 //!
-//! On a hard-rejected event (reference invalid, auth fails against
-//! state-before-event), `apply` returns `Err(CoreError)` and does NOT
-//! mutate `RoomCore`. On acceptance:
+//! On a hard-rejected event (room_id mismatch, reference invalid, auth
+//! fails against state-before-event), `apply` returns `Err(CoreError)`
+//! and does NOT mutate `RoomCore`. On acceptance:
 //! - **state events**: forward extremities are updated (parents in
 //!   `prev_state_events` are removed, the new event is inserted), then
 //!   `current_state` is recomputed by state-resolving across the new FE
@@ -48,7 +45,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use neutrino_common::Event;
-use ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedServerName};
+use ruma::{EventId, OwnedEventId, OwnedRoomId};
 
 use crate::auth_rules::check_auth_rules;
 use crate::provider::{EventInfo, StateProvider};
@@ -58,12 +55,9 @@ use crate::{CoreError, StateMap, StateResError};
 
 /// Provider wrapper that transparently resolves a single `local_event` —
 /// the event currently being applied — while delegating everything else to
-/// the inner provider. Lets `apply` reuse the same `state_before` /
+/// the inner provider. Lets `apply` reuse the same `state_at_heads` /
 /// `resolve_state` code paths whether the FE under consideration is an
 /// already-persisted event or the not-yet-persisted local one.
-///
-/// `auth_chain` walks `event.auth_events` via the wrapped `get_event` so
-/// the local event's auth ancestry resolves correctly.
 struct ProviderWithLocal<'a> {
     inner: &'a dyn StateProvider,
     local_event: Arc<Event>,
@@ -96,11 +90,8 @@ impl StateProvider for ProviderWithLocal<'_> {
         // invariant). Swap the local id out of the seed set for those parents
         // and let the inner provider's optimised impl walk the rest. Then add
         // the local event back to the result (the seeds-included property).
-        let mut new_seeds: HashSet<OwnedEventId> = seeds
-            .iter()
-            .filter(|id| *id != local_id)
-            .cloned()
-            .collect();
+        let mut new_seeds: HashSet<OwnedEventId> =
+            seeds.iter().filter(|id| *id != local_id).cloned().collect();
         for parent in &self.local_event.auth_events {
             new_seeds.insert(parent.clone());
         }
@@ -112,33 +103,19 @@ impl StateProvider for ProviderWithLocal<'_> {
 
 /// Side-effects emitted by `RoomCore::apply`. The caller (storage and
 /// federation layers) interprets them sequentially in emission order.
-///
-/// Acceptance path (event passes both reference validation and the
-/// state-before-event auth check) emits at minimum `Persist`; state events
-/// additionally emit `UpdateCurrentState`. Soft-fail (auth-against-
-/// current-state failure on an otherwise-accepted event) emits
-/// `MarkSoftFailed`. Federation outbox enqueue is deferred until a sender
-/// implementation lands.
 #[derive(Debug, Clone)]
 pub enum Effect {
-    /// Persist the event to storage. Always emitted for accepted events.
-    Persist(Arc<Event>),
-    /// Mark a previously-persisted event as soft-failed. Soft-failed events
-    /// stay in storage and DO NOT regress the state update they triggered,
-    /// but they're not relayed to clients (Matrix soft-fail semantics).
-    MarkSoftFailed(OwnedEventId),
+    /// Persist the event to storage. `soft_failed = true` means the event
+    /// passed reference + state-before auth but failed the soft-fail check
+    /// against `current_state`; storage keeps it but it must not be relayed
+    /// to clients (Matrix soft-fail semantics).
+    Persist {
+        event: Arc<Event>,
+        soft_failed: bool,
+    },
     /// Replace `current_state` with this resolved state map. Emitted only
     /// when the accepted event is a state event.
     UpdateCurrentState(StateMap<OwnedEventId>),
-    /// Enqueue the event for federation send to `destinations`. Currently
-    /// emitted with an empty `destinations` list — the federation outbox
-    /// wiring is part of the SSAPI work and will populate this from the
-    /// post-update current_state.
-    #[allow(dead_code)] // not yet emitted by `apply`; placeholder for SSAPI work
-    EnqueueOutbox {
-        event: Arc<Event>,
-        destinations: Vec<OwnedServerName>,
-    },
 }
 
 /// Per-room state machine state: forward extremities of the state DAG and
@@ -184,25 +161,14 @@ impl RoomCore {
 
     /// Integrate a single event into the room. Returns the list of effects
     /// (in emission order) the caller should process. On hard-reject paths
-    /// (`ReferenceError`, `AuthError`, etc.) returns `Err(CoreError)` and
-    /// emits no effects — the event must not be persisted.
+    /// returns `Err(CoreError)` and emits no effects — the event must not
+    /// be persisted. If `event` is already a forward extremity of this
+    /// `RoomCore`, returns `Ok(vec![])` (idempotent no-op).
     ///
-    /// **PRECONDITION**: `event` MUST have been parsed via
-    /// `validate::parse_event` (or constructed via `EventBuilder::build()`
-    /// / `Event::from_wire`, both of which call `parse_event` internally).
-    /// `apply` does not re-run wire-format validation; it assumes:
-    /// - required PDU fields are present and of the right JSON type;
-    /// - `prev_events.len() <= MAX_PREV_EVENTS` and
-    ///   `prev_state_events.len() <= MAX_PREV_STATE_EVENTS`;
-    /// - `m.room.create` events have no `prev_events` / `prev_state_events`
-    ///   / `room_id` (and non-create events do carry a `room_id`);
-    /// - `m.room.member` events have `state_key` and `content.membership`;
-    /// - `m.room.power_levels` content shape is well-formed (rule 10.1–10.3);
-    /// - rule 9 (`@`-prefixed state_key matches sender, for non-member events).
-    ///
-    /// Skipping this precondition shifts those checks into auth via panics
-    /// (`AuthContext` `.expect()`s some Phase-1a invariants) — be safe and
-    /// always call `parse_event` upstream.
+    /// **PRECONDITION**: `event` MUST have been constructed via
+    /// `EventBuilder::build()` or `Event::from_wire` — both call
+    /// `validate::parse_event` internally. `apply` does not re-run
+    /// wire-format checks; see `parse_event` for the full list.
     ///
     /// Note: `apply` does NOT insert the event into `provider`. The caller
     /// is expected to honour `Effect::Persist` by writing through to storage
@@ -212,26 +178,45 @@ impl RoomCore {
         event: Event,
         provider: &dyn StateProvider,
     ) -> Result<Vec<Effect>, CoreError> {
+        // C1: room_id sanity. A RoomCore is per-room; an event whose room_id
+        // doesn't match has no business mutating it, even if the other room
+        // exists in `provider`.
+        if event.room_id != self.room_id {
+            return Err(CoreError::RoomMismatch {
+                expected: self.room_id.clone(),
+                actual: event.room_id.clone(),
+            });
+        }
+
         let event = Arc::new(event);
+
+        // C3: idempotency. If the event is already a forward extremity, this
+        // `RoomCore` has already integrated it. Re-running the pipeline would
+        // emit a duplicate `Persist` and recompute the same `current_state`.
+        if self.state_forward_extremities.contains(&event.event_id) {
+            return Ok(Vec::new());
+        }
 
         // Reference validation (Phase 1b — local addition on top of the
         // spec's PDU-receipt checks).
         validate::validate_references(&event, provider)?;
 
-        // Spec step 3: auth against state-before-event. State-before-event
-        // is derived by state-resolving across state-after of each
-        // prev_state_event.
-        let state_before_ids = state_res::state_before_for_new_event(&event, provider)?;
+        // Shared cache for state-before walks: state_before(event) and
+        // (for state events) state_at_heads(new_fes) overlap heavily on the
+        // old FEs' subgraphs. One cache amortises the duplicate work.
+        let mut cache = state_res::StateBeforeCache::new();
+
+        // Spec step 3: auth against state-before-event.
+        let state_before_ids =
+            state_res::state_at_heads(&event.prev_state_events, provider, &mut cache)?;
         let state_before_events = materialize_state(&state_before_ids, provider)?;
         check_auth_rules(&event, &state_before_events)?;
-
-        let mut effects: Vec<Effect> = vec![Effect::Persist(event.clone())];
 
         let is_state_event = event.state_key.is_some();
         if is_state_event {
             // State-event acceptance: compute new FEs + new current_state into
             // LOCAL bindings, only commit to `self` after every fallible call
-            // has returned `Ok`. Atomic on the error path. Per review I1.
+            // has returned `Ok`. Atomic on the error path.
             //
             // The new event isn't in `provider` yet — wrap with
             // `ProviderWithLocal` so the existing `state_res` paths transparently
@@ -247,31 +232,38 @@ impl RoomCore {
             }
             new_fes.insert(event.event_id.clone());
 
-            let new_current_ids = recompute_current_state(&new_fes, &wrapper)?;
+            let new_fes_slice: Vec<OwnedEventId> = new_fes.iter().cloned().collect();
+            let new_current_ids = state_res::state_at_heads(&new_fes_slice, &wrapper, &mut cache)?;
             let new_current_events = materialize_state(&new_current_ids, &wrapper)?;
 
             // Commit. All fallible work above is done.
             self.state_forward_extremities = new_fes;
             self.current_state = Arc::new(new_current_events);
-            effects.push(Effect::UpdateCurrentState(new_current_ids));
 
-            // State events are not soft-failed (synapse parity). Skip the
-            // second auth check.
+            // State events are not soft-failed (synapse parity).
+            Ok(vec![
+                Effect::Persist {
+                    event,
+                    soft_failed: false,
+                },
+                Effect::UpdateCurrentState(new_current_ids),
+            ])
         } else {
             // Spec step 5: soft-fail against current_state. Non-state events
             // only. State events that pass step 3 are accepted as-is.
-            if check_auth_rules(&event, &self.current_state).is_err() {
-                effects.push(Effect::MarkSoftFailed(event.event_id.clone()));
-            }
+            let soft_failed = check_auth_rules(&event, &self.current_state).is_err();
+            Ok(vec![Effect::Persist { event, soft_failed }])
         }
-
-        Ok(effects)
     }
 }
 
 /// Materialise a `StateMap<OwnedEventId>` into a `StateMap<Arc<Event>>` by
-/// looking up each event_id in `provider`. Errors if any id is missing
-/// (project closure invariant).
+/// looking up each event_id in `provider`. The error case is unreachable in
+/// practice — every id here came out of `state_res::state_at_heads` /
+/// `resolve_state`, which already demanded the same provider to resolve
+/// them. We surface `MissingEvent` rather than panicking because corruption
+/// is recoverable as an error; a panic would tear down the whole apply
+/// pipeline.
 fn materialize_state(
     ids: &StateMap<OwnedEventId>,
     provider: &dyn StateProvider,
@@ -284,31 +276,6 @@ fn materialize_state(
         out.insert(key.clone(), info.event);
     }
     Ok(out)
-}
-
-/// Recompute current_state by state-resolving across state-after of each
-/// forward extremity. `provider` must resolve every FE (use `ProviderWithLocal`
-/// when an in-flight event is among the FEs).
-fn recompute_current_state(
-    forward_extremities: &BTreeSet<OwnedEventId>,
-    provider: &dyn StateProvider,
-) -> Result<StateMap<OwnedEventId>, CoreError> {
-    if forward_extremities.is_empty() {
-        return Ok(StateMap::new());
-    }
-    let mut state_sets: Vec<StateMap<OwnedEventId>> = Vec::with_capacity(forward_extremities.len());
-    for fe in forward_extremities {
-        let info = provider
-            .get_event(fe)
-            .ok_or_else(|| CoreError::StateRes(StateResError::MissingEvent(fe.clone())))?;
-        let mut state_after = state_res::state_before(fe, provider)?;
-        if let Some(sk) = &info.event.state_key {
-            state_after.insert((info.event.event_type.clone(), sk.clone()), fe.clone());
-        }
-        state_sets.push(state_after);
-    }
-    let refs: Vec<&StateMap<OwnedEventId>> = state_sets.iter().collect();
-    Ok(state_res::resolve_state(&refs, provider)?)
 }
 
 #[cfg(test)]
@@ -453,7 +420,10 @@ mod tests {
             .expect("create accepted");
 
         assert_eq!(effects.len(), 2);
-        assert!(matches!(&effects[0], Effect::Persist(e) if e.event_id == create_id));
+        assert!(matches!(
+            &effects[0],
+            Effect::Persist { event, soft_failed: false } if event.event_id == create_id
+        ));
         match &effects[1] {
             Effect::UpdateCurrentState(state) => {
                 assert_eq!(state.len(), 1);
@@ -490,7 +460,13 @@ mod tests {
         let effects = room.apply(join.clone(), &provider).expect("join accepted");
         insert(&mut provider, Arc::new(join));
 
-        assert!(effects.iter().any(|e| matches!(e, Effect::Persist(_))));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::Persist {
+                soft_failed: false,
+                ..
+            }
+        )));
         assert!(
             effects
                 .iter()
@@ -548,7 +524,13 @@ mod tests {
         let effects = room.apply(msg, &provider).expect("message accepted");
 
         // Message events emit Persist but NOT UpdateCurrentState.
-        assert!(effects.iter().any(|e| matches!(e, Effect::Persist(_))));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::Persist {
+                soft_failed: false,
+                ..
+            }
+        )));
         assert!(
             !effects
                 .iter()
@@ -615,6 +597,54 @@ mod tests {
         assert_eq!(room.current_state.len(), snapshot_state_len);
     }
 
+    #[test]
+    fn apply_foreign_room_id_rejected() {
+        // C1: an event whose room_id doesn't match the RoomCore's room_id is
+        // refused upfront, even if the foreign room is well-formed and
+        // present in the provider.
+        let our_create = Arc::new(create_event("@alice:example.org"));
+        let our_room_id = room_id_from_create(&our_create.event_id);
+        let other_create = Arc::new(create_event("@alice:example.org"));
+        let other_room_id = room_id_from_create(&other_create.event_id);
+        assert_ne!(our_room_id, other_room_id);
+
+        let mut provider = InMemoryStateProvider::new();
+        insert(&mut provider, our_create.clone());
+        insert(&mut provider, other_create.clone());
+
+        let mut room = RoomCore::new(our_room_id.clone());
+        room.apply((*our_create).clone(), &provider).expect("ours");
+
+        // Build a member event in the OTHER room.
+        let foreign_join = alice_join_event(&other_create.event_id, &other_room_id);
+        let err = room.apply(foreign_join, &provider).expect_err("wrong room");
+        assert!(matches!(err, CoreError::RoomMismatch { .. }));
+    }
+
+    #[test]
+    fn apply_event_already_in_forward_extremities_is_noop() {
+        // C3: re-applying a state event that is already a forward extremity
+        // returns an empty effects list and does not mutate the RoomCore.
+        let create = Arc::new(create_event("@alice:example.org"));
+        let room_id = room_id_from_create(&create.event_id);
+        let mut provider = InMemoryStateProvider::new();
+        insert(&mut provider, create.clone());
+        let mut room = RoomCore::new(room_id.clone());
+        room.apply((*create).clone(), &provider).expect("create");
+
+        let pre_fe = room.state_forward_extremities.clone();
+        let pre_state = room.current_state.clone();
+
+        // Re-apply the same create event.
+        let effects = room.apply((*create).clone(), &provider).expect("noop");
+        assert!(
+            effects.is_empty(),
+            "expected empty effects, got {effects:?}"
+        );
+        assert_eq!(room.state_forward_extremities, pre_fe);
+        assert!(Arc::ptr_eq(&room.current_state, &pre_state));
+    }
+
     // ----- apply: auth-rule integration (rules 4 / 5.4 / 5.5 / 5.6 / 8 / 10.4) -----
 
     #[test]
@@ -656,7 +686,13 @@ mod tests {
             &room_id,
         );
         let effects = room.apply(invite, &provider).expect("invite accepted");
-        assert!(effects.iter().any(|e| matches!(e, Effect::Persist(_))));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::Persist {
+                soft_failed: false,
+                ..
+            }
+        )));
         assert!(
             effects
                 .iter()
@@ -727,7 +763,13 @@ mod tests {
             &room_id,
         );
         let effects = room.apply(kick, &provider).expect("kick accepted");
-        assert!(effects.iter().any(|e| matches!(e, Effect::Persist(_))));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::Persist {
+                soft_failed: false,
+                ..
+            }
+        )));
         // bob's membership entry now references the kick event.
         let bob_member_key = ("m.room.member".to_string(), "@bob:example.org".to_string());
         let bob_now = room
@@ -777,7 +819,13 @@ mod tests {
             &room_id,
         );
         let effects = room.apply(ban, &provider).expect("ban accepted");
-        assert!(effects.iter().any(|e| matches!(e, Effect::Persist(_))));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::Persist {
+                soft_failed: false,
+                ..
+            }
+        )));
         let bob_now = room
             .current_state
             .get(&("m.room.member".to_string(), "@bob:example.org".to_string()))

@@ -6,9 +6,9 @@ use thiserror::Error;
 
 pub mod auth_events;
 pub mod auth_rules;
-pub mod core;
 pub mod event_id;
 pub mod provider;
+pub mod room_core;
 pub mod state_res;
 pub mod validate;
 
@@ -374,4 +374,12 @@ pub enum CoreError {
     Auth(#[from] AuthError),
     #[error(transparent)]
     StateRes(#[from] StateResError),
+    /// `RoomCore::apply` was called with an event whose `room_id` differs
+    /// from the `RoomCore`'s tracked room. Caller dispatched to the wrong
+    /// per-room state machine; nothing on this `RoomCore` is mutated.
+    #[error("event room_id `{actual}` does not match RoomCore room_id `{expected}`")]
+    RoomMismatch {
+        expected: OwnedRoomId,
+        actual: OwnedRoomId,
+    },
 }

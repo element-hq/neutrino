@@ -584,57 +584,76 @@ pub fn mainline_sort(
     Ok(decorated.into_iter().map(|(_, _, id)| id).collect())
 }
 
-// ----------------- state_before -----------------
+// ----------------- state_before / state_at_heads -----------------
 
-/// Compute state-before-`event_id` by recursively resolving over the
-/// `prev_state_events` of `event_id`.
+/// Memoisation table for `state_at_heads` / `state_before` walks. Threaded
+/// through both calls in `RoomCore::apply` so the overlapping
+/// `prev_state_events` ↔ forward-extremity subgraphs are walked once.
+pub type StateBeforeCache = HashMap<OwnedEventId, Arc<StateMap<OwnedEventId>>>;
+
+/// Resolved state at the merge of `heads` — equivalently, state-before an
+/// imaginary event whose `prev_state_events` are `heads`.
 ///
-/// Spec semantics (v12 + MSC4242): given event E whose `prev_state_events` are
-/// `[P1, P2, ...]`, state-before-E is `resolve_state(state_after(P1),
-/// state_after(P2), ...)`. `state_after(P) = state_before(P) overlaid with
-/// the (type, state_key) → P entry iff P is itself a state event` — message
-/// events leave state unchanged.
+/// Spec semantics (v12 + MSC4242): for `heads = [H1, H2, ...]`, returns
+/// `resolve_state(state_after(H1), state_after(H2), ...)`, where
+/// `state_after(H) = state_before(H) ∪ {(H.type, H.state_key) → H.id}` if H
+/// is itself a state event (message events leave state unchanged).
 ///
-/// Root case: an event with no `prev_state_events` (a create event) has
-/// state-before == empty StateMap.
+/// `cache` is consulted (and populated) for every event_id whose
+/// `state_before` is computed during the walk. Pass a fresh cache for a
+/// one-shot call; share one across multiple calls within the same `apply`
+/// to amortise the overlap.
 ///
-/// The walk is bounded by the DAG's depth and width, and short-circuits
-/// repeated subgraphs via an internal `cache`. For an embedded single-server
-/// room the chain is typically near-linear and resolves in O(N) provider
-/// lookups; on a SQLite-backed provider each lookup is a query — eventual
-/// optimisation is to back this with state groups (deferred).
-///
-/// **Errors**: any unknown event_id traversed (the seed or any
+/// **Errors**: any unknown id traversed (a head, or any
 /// `prev_state_events` ancestor) raises `StateResError::MissingEvent`,
 /// per the strict-closure invariant.
+pub fn state_at_heads(
+    heads: &[OwnedEventId],
+    provider: &dyn StateProvider,
+    cache: &mut StateBeforeCache,
+) -> Result<StateMap<OwnedEventId>, StateResError> {
+    if heads.is_empty() {
+        return Ok(StateMap::new());
+    }
+    let mut state_sets: Vec<StateMap<OwnedEventId>> = Vec::with_capacity(heads.len());
+    for head in heads {
+        let state_before_head = state_before_inner(head, provider, cache)?;
+        let head_info = provider
+            .get_event(head)
+            .ok_or_else(|| StateResError::MissingEvent(head.clone()))?;
+        let mut state_after = (*state_before_head).clone();
+        if let Some(sk) = &head_info.event.state_key {
+            state_after.insert(
+                (head_info.event.event_type.clone(), sk.clone()),
+                head.clone(),
+            );
+        }
+        state_sets.push(state_after);
+    }
+    let refs: Vec<&StateMap<OwnedEventId>> = state_sets.iter().collect();
+    resolve_state(&refs, provider)
+}
+
+/// Compute state-before-`event_id`: `state_at_heads(event.prev_state_events)`
+/// after a `get_event` lookup. Root case (no `prev_state_events`, i.e. a
+/// create event) returns the empty map.
+///
+/// Convenience wrapper that allocates its own cache; for `apply`'s
+/// back-to-back walks, prefer `state_at_heads` with a shared
+/// `StateBeforeCache`.
 pub fn state_before(
     event_id: &EventId,
     provider: &dyn StateProvider,
 ) -> Result<StateMap<OwnedEventId>, StateResError> {
-    let mut cache: HashMap<OwnedEventId, Arc<StateMap<OwnedEventId>>> = HashMap::new();
+    let mut cache = StateBeforeCache::new();
     let arc = state_before_inner(event_id, provider, &mut cache)?;
     Ok((*arc).clone())
-}
-
-/// Same computation as `state_before` but for an event that is **not** yet
-/// in the provider (i.e. the event under consideration in `RoomCore::apply`,
-/// before it's persisted). Walks the event's `prev_state_events` directly.
-///
-/// Useful when the caller has the `Event` value in hand but hasn't inserted
-/// it into the provider yet — `state_before(event_id, provider)` would
-/// require a `get_event(event_id)` lookup which would fail.
-pub fn state_before_for_new_event(
-    event: &Event,
-    provider: &dyn StateProvider,
-) -> Result<StateMap<OwnedEventId>, StateResError> {
-    let mut cache: HashMap<OwnedEventId, Arc<StateMap<OwnedEventId>>> = HashMap::new();
-    state_before_from_prev_state_events(&event.prev_state_events, provider, &mut cache)
 }
 
 fn state_before_inner(
     event_id: &EventId,
     provider: &dyn StateProvider,
-    cache: &mut HashMap<OwnedEventId, Arc<StateMap<OwnedEventId>>>,
+    cache: &mut StateBeforeCache,
 ) -> Result<Arc<StateMap<OwnedEventId>>, StateResError> {
     let owned: OwnedEventId = event_id.to_owned();
     if let Some(cached) = cache.get(&owned) {
@@ -652,41 +671,10 @@ fn state_before_inner(
         return Ok(empty);
     }
 
-    let resolved =
-        state_before_from_prev_state_events(&info.event.prev_state_events, provider, cache)?;
+    let resolved = state_at_heads(&info.event.prev_state_events, provider, cache)?;
     let arc = Arc::new(resolved);
     cache.insert(owned, arc.clone());
     Ok(arc)
-}
-
-/// Core of the state-before computation: given a list of `prev_state_events`,
-/// build state-after for each (via `state_before_inner` + overlay) and
-/// resolve.
-fn state_before_from_prev_state_events(
-    prev_state_events: &[OwnedEventId],
-    provider: &dyn StateProvider,
-    cache: &mut HashMap<OwnedEventId, Arc<StateMap<OwnedEventId>>>,
-) -> Result<StateMap<OwnedEventId>, StateResError> {
-    if prev_state_events.is_empty() {
-        return Ok(StateMap::new());
-    }
-    let mut state_sets: Vec<StateMap<OwnedEventId>> = Vec::with_capacity(prev_state_events.len());
-    for prev_id in prev_state_events {
-        let state_before_prev = state_before_inner(prev_id, provider, cache)?;
-        let prev_info = provider
-            .get_event(prev_id)
-            .ok_or_else(|| StateResError::MissingEvent(prev_id.clone()))?;
-        let mut state_after = (*state_before_prev).clone();
-        if let Some(sk) = &prev_info.event.state_key {
-            state_after.insert(
-                (prev_info.event.event_type.clone(), sk.clone()),
-                prev_id.clone(),
-            );
-        }
-        state_sets.push(state_after);
-    }
-    let refs: Vec<&StateMap<OwnedEventId>> = state_sets.iter().collect();
-    resolve_state(&refs, provider)
 }
 
 // ----------------- resolve_state -----------------
