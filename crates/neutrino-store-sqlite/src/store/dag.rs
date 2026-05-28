@@ -1032,12 +1032,13 @@ mod tests {
     // which is irrelevant to `missing_events`).
     //
     // Asserts:
-    //  - walk from 5 with no earliest, generous limit → all 13 events
+    //  - walk from 5 with no earliest, generous limit → all 12
+    //    ancestors of 5 (the `latest` event itself is excluded)
     //  - walk from 5 with earliest=[3], generous limit → exactly 5
-    //    events (5, 4, B, b4, b5, b6) — 3 is excluded and its
-    //    transitive ancestors are unreachable past the earliest
-    //    boundary; b4/b5/b6 enqueue but their sole prev (3) is in
-    //    `excluded` so the chain stops.
+    //    events (4, B, b4, b5, b6) — `latest` (5) and `earliest`
+    //    (3) are excluded, and 3's transitive ancestors are
+    //    unreachable past the earliest boundary; b4/b5/b6 enqueue
+    //    but their sole prev (3) is in `excluded` so the chain stops.
     #[tokio::test]
     async fn missing_events_synapse_backfill_dag_shape() {
         use crate::tests::make_event;
