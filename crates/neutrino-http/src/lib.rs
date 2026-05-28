@@ -76,13 +76,12 @@ impl AppState {
     }
 
     /// Build an `AppState` around an already-open `SqliteStore`. Used by
-    /// the e2e tests in `tests/e2e_federation_get_missing_events.rs` to
-    /// seed events via the storage trait *before* the router is mounted
-    /// — `DagStore::missing_events` needs a non-flat DAG to walk, and the
-    /// CSAPI `/send` endpoint currently writes events with empty
-    /// `prev_events` (Phase 6 will wire those up). The caller passes the
-    /// tempfile guard so the file stays alive for the lifetime of the
-    /// router.
+    /// the e2e tests in `src/federation/tests.rs` to seed events via the
+    /// storage trait *before* the router is mounted — `DagStore::missing_events`
+    /// needs a non-flat DAG to walk, and the CSAPI `/send` endpoint
+    /// currently writes events with empty `prev_events` (Phase 6 will
+    /// wire those up). The caller passes the tempfile guard so the file
+    /// stays alive for the lifetime of the router.
     fn from_store(config: Config, store: Arc<SqliteStore>, tempfile: NamedTempFile) -> Self {
         let sync_state = Arc::new(SyncState::new(store.clone()));
         let app = App {
@@ -114,13 +113,13 @@ pub async fn router(config: Config) -> Result<Router, StartupError> {
 /// file alive — drop it (e.g. when the test scope ends) and the file is
 /// removed.
 ///
-/// Used by `tests/e2e_federation_get_missing_events.rs` to seed events
-/// via the `StorageBackend` trait directly before the HTTP layer
-/// observes them; the CSAPI `/send` path currently writes flat DAGs
-/// (Phase 6 will fix this), which prevents the BFS-walk tests from
-/// exercising `DagStore::missing_events` over a real chain.
-#[doc(hidden)]
-pub fn router_with_store(
+/// Used by `src/federation/tests.rs` to seed events via the
+/// `StorageBackend` trait directly before the HTTP layer observes them;
+/// the CSAPI `/send` path currently writes flat DAGs (Phase 6 will fix
+/// this), which prevents the BFS-walk tests from exercising
+/// `DagStore::missing_events` over a real chain.
+#[cfg(test)]
+pub(crate) fn router_with_store(
     config: Config,
     store: Arc<SqliteStore>,
     tempfile: NamedTempFile,

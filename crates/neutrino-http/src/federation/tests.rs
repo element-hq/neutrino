@@ -1,4 +1,6 @@
-//! End-to-end tests for `POST /_matrix/federation/v1/get_missing_events/{roomId}`.
+//! End-to-end tests for the federation /get_missing_events endpoint.
+//! Lives in src/ rather than tests/ so the test-only helpers
+//! (`router_with_store`, `AppState::from_store`) can stay pub(crate).
 //!
 //! Two seeding paths:
 //!
@@ -16,12 +18,13 @@
 //!
 //! See `docs/get-missing-events.md` §Tests B for the table this file covers.
 
+#![cfg(test)]
+
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use neutrino_common::{Config, ROOM_VERSION_ID};
-use neutrino_http::{router, router_with_store};
 use neutrino_state::event_id::EventBuilder;
 use neutrino_store::{EventStore, RoomStore};
 use neutrino_store_sqlite::SqliteStore;
@@ -29,6 +32,8 @@ use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use tower::ServiceExt;
+
+use crate::{router, router_with_store};
 
 fn config() -> Config {
     Config {
@@ -266,10 +271,12 @@ async fn unknown_room_returns_404() {
 
 #[tokio::test]
 async fn happy_path_returns_events_between_earliest_and_latest() {
-    // Seed a chain create ← join ← msg[0..5] and ask for the events
-    // strictly between create (earliest) and msg[4] (latest). Expect
-    // msg[3], msg[2], msg[1], msg[0], join in BFS-from-latest's-parents
-    // order.
+    // B5 - happy path. The 4 message events between create (earliest) and
+    // msg 4 (latest) should be reachable. Assert the set of message bodies;
+    // the BFS interleaving order across multiple latest seeds is
+    // implementation detail per `DagStore::missing_events` (trait doc in
+    // neutrino-store/src/lib.rs), so we collect into a `BTreeSet` and
+    // compare set-equality only.
     let (app, room_id, create_id, msgs) = build_seeded_router(5).await;
 
     let (status, body) = post_json(

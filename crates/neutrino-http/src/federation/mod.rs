@@ -19,6 +19,9 @@ use thiserror::Error;
 
 pub(crate) mod get_missing_events;
 
+#[cfg(test)]
+mod tests;
+
 /// Errors any federation handler can surface to the HTTP layer.
 ///
 /// Mirrors `sliding_sync::SyncError`'s mapping pattern: the variant determines
@@ -30,12 +33,18 @@ pub(crate) mod get_missing_events;
 /// - [`FedError::Storage`] → 500 `M_UNKNOWN`
 #[derive(Debug, Error)]
 pub(crate) enum FedError {
-    /// Static reason string. Clients see only the errcode; the string is for
-    /// server logs.
+    /// Static reason string. The string is the human-readable detail
+    /// returned in the response body's `error` field (per the spec's
+    /// `M_INVALID_PARAM` shape).
     #[error("bad request: {0}")]
     BadRequest(&'static str),
+    /// Fixed message — `"room not found"` is returned verbatim in the
+    /// response body's `error` field.
     #[error("room not found")]
     RoomNotFound,
+    /// The wrapped `StorageError`'s `Display` is rendered into the response
+    /// body's `error` field. This is acceptable in Neutrino's trusted-mesh
+    /// model; revisit if the server is ever exposed to untrusted peers.
     #[error("storage: {0}")]
     Storage(#[from] StorageError),
 }

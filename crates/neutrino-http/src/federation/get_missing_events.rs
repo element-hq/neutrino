@@ -70,7 +70,8 @@ pub(crate) struct ResponseBody {
 /// 1. Reject empty `latest_events` (400 M_INVALID_PARAM).
 /// 2. 404 if room is unknown.
 /// 3. Clamp `limit`: default 10, max 20.
-/// 4. Drop `min_depth` (see `RequestBody.min_depth` doc).
+/// 4. Drop `_min_depth` (wire field `min_depth`) on the floor — Neutrino
+///    has no depth column. See `RequestBody._min_depth` doc.
 /// 5. Call `DagStore::missing_events`.
 /// 6. Build response from `Event.raw` verbatim — no enrichment.
 /// 7. Storage errors → 500 M_UNKNOWN via `FedError::Storage`.
@@ -114,7 +115,7 @@ pub(crate) async fn handle(
     // (3) — saturating cap, not a 400.
     let limit = body.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
 
-    // (4) — `min_depth` deliberately ignored.
+    // (4) — `_min_depth` (wire field `min_depth`) deliberately ignored.
 
     // (5)
     let latest: Vec<&ruma::EventId> = body.latest_events.iter().map(|id| id.as_ref()).collect();
