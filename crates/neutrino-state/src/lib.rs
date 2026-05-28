@@ -347,18 +347,20 @@ pub enum ReferenceError {
     PrevStateDifferentRoom(OwnedEventId),
 }
 
-/// Errors raised by state resolution (phase 4) — currently scoped to the
-/// auth-chain traversal contract.
+/// Errors raised by state resolution (Phase 4) and the state-DAG
+/// orchestration (Phase 6).
 #[derive(Debug, Error)]
 pub enum StateResError {
-    /// An event referenced in a seed set or transitively via `auth_events`
-    /// is not in the store. Project invariant: every event we know about
-    /// must have its **complete** auth chain locally resolvable; a missing
-    /// entry indicates corruption or a write-path bug, never a normal
-    /// backfill boundary (we don't do federation backfill of auth chains
-    /// — every event is authored locally or arrives with its full chain).
-    #[error("auth chain references unknown event: {0}")]
-    MissingAuthEvent(OwnedEventId),
+    /// An event referenced by state-res or DAG walks is not in the store.
+    /// The reference may be from a seed set, an `auth_events` traversal,
+    /// or a `prev_state_events` walk. Project invariant: every event we
+    /// know about must have its complete ancestry (auth chain AND
+    /// state-DAG predecessors) locally resolvable; a missing entry
+    /// indicates corruption or a write-path bug, never a normal backfill
+    /// boundary (we don't federate backfill — every event is authored
+    /// locally or arrives with its full chain).
+    #[error("state-res references unknown event: {0}")]
+    MissingEvent(OwnedEventId),
 }
 
 /// Top-level error type returned by the state machine.

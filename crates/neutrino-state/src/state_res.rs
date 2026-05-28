@@ -169,7 +169,7 @@ pub fn power_of_sender(event: &Event, provider: &dyn StateProvider) -> Result<i6
     for aid in &event.auth_events {
         let info = provider
             .get_event(aid)
-            .ok_or_else(|| StateResError::MissingAuthEvent(aid.clone()))?;
+            .ok_or_else(|| StateResError::MissingEvent(aid.clone()))?;
         if info.rejected {
             continue;
         }
@@ -223,7 +223,7 @@ pub fn reverse_topological_power_sort(
     for eid in events {
         let info = provider
             .get_event(eid)
-            .ok_or_else(|| StateResError::MissingAuthEvent(eid.clone()))?;
+            .ok_or_else(|| StateResError::MissingEvent(eid.clone()))?;
         let pl = power_of_sender(&info.event, provider)?;
         event_map.insert(eid.clone(), info.event);
         event_to_pl.insert(eid.clone(), pl);
@@ -307,7 +307,7 @@ pub fn reverse_topological_power_sort(
 /// **Caller contract**: every event_id reachable from this run — every entry
 /// in `sorted`, every id in their `event.auth_events`, and every value in
 /// `initial_state` — must be in `provider`. A missing lookup raises
-/// `StateResError::MissingAuthEvent`. In particular: if `initial_state` is
+/// `StateResError::MissingEvent`. In particular: if `initial_state` is
 /// not empty (i.e. IAC pass 2 in phase 4c), the caller must ensure every
 /// value in it is provider-known. Pass 1 sidesteps this by passing
 /// `StateMap::new()`.
@@ -321,7 +321,7 @@ pub fn iterative_auth_checks(
     for eid in sorted {
         let info = provider
             .get_event(eid)
-            .ok_or_else(|| StateResError::MissingAuthEvent(eid.clone()))?;
+            .ok_or_else(|| StateResError::MissingEvent(eid.clone()))?;
         if info.rejected {
             continue;
         }
@@ -331,7 +331,7 @@ pub fn iterative_auth_checks(
         for aid in &event.auth_events {
             let parent = provider
                 .get_event(aid)
-                .ok_or_else(|| StateResError::MissingAuthEvent(aid.clone()))?;
+                .ok_or_else(|| StateResError::MissingEvent(aid.clone()))?;
             if parent.rejected {
                 continue;
             }
@@ -354,7 +354,7 @@ pub fn iterative_auth_checks(
             if let Some(rs_id) = resolved.get(&key) {
                 let rs_info = provider
                     .get_event(rs_id)
-                    .ok_or_else(|| StateResError::MissingAuthEvent(rs_id.clone()))?;
+                    .ok_or_else(|| StateResError::MissingEvent(rs_id.clone()))?;
                 if !rs_info.rejected {
                     auth_map.insert(key, rs_info.event);
                 }
@@ -408,7 +408,7 @@ pub fn is_power_event(event: &Event) -> bool {
 }
 
 /// Partition `events` into `(power, non_power)` using `is_power_event`.
-/// Every id must resolve through the provider; missing ids → `MissingAuthEvent`.
+/// Every id must resolve through the provider; missing ids → `MissingEvent`.
 pub fn split_power_events(
     events: &HashSet<OwnedEventId>,
     provider: &dyn StateProvider,
@@ -418,7 +418,7 @@ pub fn split_power_events(
     for eid in events {
         let info = provider
             .get_event(eid)
-            .ok_or_else(|| StateResError::MissingAuthEvent(eid.clone()))?;
+            .ok_or_else(|| StateResError::MissingEvent(eid.clone()))?;
         if is_power_event(&info.event) {
             power.insert(eid.clone());
         } else {
@@ -468,7 +468,7 @@ pub fn mainline(
         chain.push(pl_id.clone());
         let info = provider
             .get_event(&pl_id)
-            .ok_or_else(|| StateResError::MissingAuthEvent(pl_id.clone()))?;
+            .ok_or_else(|| StateResError::MissingEvent(pl_id.clone()))?;
         // Find the previous PL in this PL's auth_events. Single-step lookup
         // (no transitive walk): under MSC4242 v12, `calculate_auth_events`
         // emits the immediately-prior PL directly in `auth_events`.
@@ -476,7 +476,7 @@ pub fn mainline(
         for aid in &info.event.auth_events {
             let parent = provider
                 .get_event(aid)
-                .ok_or_else(|| StateResError::MissingAuthEvent(aid.clone()))?;
+                .ok_or_else(|| StateResError::MissingEvent(aid.clone()))?;
             if parent.rejected {
                 continue;
             }
@@ -524,12 +524,12 @@ pub fn mainline_position(
         }
         let info = provider
             .get_event(&current)
-            .ok_or_else(|| StateResError::MissingAuthEvent(current.clone()))?;
+            .ok_or_else(|| StateResError::MissingEvent(current.clone()))?;
         let mut next: Option<OwnedEventId> = None;
         for aid in &info.event.auth_events {
             let parent = provider
                 .get_event(aid)
-                .ok_or_else(|| StateResError::MissingAuthEvent(aid.clone()))?;
+                .ok_or_else(|| StateResError::MissingEvent(aid.clone()))?;
             if parent.rejected {
                 continue;
             }
@@ -576,7 +576,7 @@ pub fn mainline_sort(
     for eid in events {
         let info = provider
             .get_event(eid)
-            .ok_or_else(|| StateResError::MissingAuthEvent(eid.clone()))?;
+            .ok_or_else(|| StateResError::MissingEvent(eid.clone()))?;
         let depth = mainline_position(eid, &mainline_map, mainline_len, provider)?;
         decorated.push((depth, info.event.origin_server_ts, eid.clone()));
     }
@@ -605,7 +605,7 @@ pub fn mainline_sort(
 /// optimisation is to back this with state groups (deferred).
 ///
 /// **Errors**: any unknown event_id traversed (the seed or any
-/// `prev_state_events` ancestor) raises `StateResError::MissingAuthEvent`,
+/// `prev_state_events` ancestor) raises `StateResError::MissingEvent`,
 /// per the strict-closure invariant.
 pub fn state_before(
     event_id: &EventId,
@@ -643,7 +643,7 @@ fn state_before_inner(
 
     let info = provider
         .get_event(event_id)
-        .ok_or_else(|| StateResError::MissingAuthEvent(owned.clone()))?;
+        .ok_or_else(|| StateResError::MissingEvent(owned.clone()))?;
 
     // Root: no prev_state_events (create event) → empty state-before.
     if info.event.prev_state_events.is_empty() {
@@ -675,7 +675,7 @@ fn state_before_from_prev_state_events(
         let state_before_prev = state_before_inner(prev_id, provider, cache)?;
         let prev_info = provider
             .get_event(prev_id)
-            .ok_or_else(|| StateResError::MissingAuthEvent(prev_id.clone()))?;
+            .ok_or_else(|| StateResError::MissingEvent(prev_id.clone()))?;
         let mut state_after = (*state_before_prev).clone();
         if let Some(sk) = &prev_info.event.state_key {
             state_after.insert(
@@ -914,7 +914,7 @@ mod tests {
         let mut seeds = HashSet::new();
         seeds.insert(eid("$a:example.org"));
         let err = conflicted_subgraph(&seeds, &provider).expect_err("unknown seed");
-        assert!(matches!(err, StateResError::MissingAuthEvent(_)));
+        assert!(matches!(err, StateResError::MissingEvent(_)));
     }
 
     #[test]
@@ -1455,7 +1455,7 @@ mod tests {
         let topic = room_topic(&phantom_room, "@alice:example.org", vec![fake_create_id]);
         let topic_id = put(&mut provider, topic);
         let err = iterative_auth_checks(&[topic_id], StateMap::new(), &provider).unwrap_err();
-        assert!(matches!(err, StateResError::MissingAuthEvent(_)));
+        assert!(matches!(err, StateResError::MissingEvent(_)));
     }
 
     // ===== Phase 4c =====
@@ -1958,7 +1958,7 @@ mod tests {
         let provider = InMemoryStateProvider::new();
         let phantom = build_create("@alice:example.org", &[], true);
         let err = state_before(&phantom.event_id, &provider).unwrap_err();
-        assert!(matches!(err, StateResError::MissingAuthEvent(_)));
+        assert!(matches!(err, StateResError::MissingEvent(_)));
     }
 
     #[test]

@@ -1,36 +1,114 @@
 //! Phase 6: per-room state machine orchestration.
 //!
-//! `RoomCore::apply(event, provider)` is the keystone — it wires together
-//! everything from Phases 1–5 to integrate a single incoming event:
+//! `RoomCore::apply(event, provider)` integrates a single incoming event
+//! against the receipt-of-PDU checks the spec defines at
+//! <https://spec.matrix.org/v1.17/server-server-api/#checks-performed-on-receipt-of-a-pdu>.
+//! Reading the spec's numbered list against our implementation:
 //!
-//! 1. Reference validation (`validate::validate_references`, Phase 1b).
-//! 2. State-before-event via `state_res::state_before_for_new_event` over
-//!    the event's `prev_state_events`.
-//! 3. Auth check against state-before-event (`auth_rules::check_auth_rules`,
-//!    Phase 3). Failure → hard reject (error, no effects).
-//! 4. If the event is a state event AND accepted: update forward extremities,
-//!    recompute current_state by state-resolving across the new FE set.
-//! 5. Second auth check against the (possibly updated) current_state.
-//!    Failure → mark soft-failed. State update is NOT undone (matches synapse
-//!    `_check_for_soft_fail`).
-//! 6. Emit `Vec<Effect>` describing what storage and federation should do.
+//! - **Step 1** (PDU schema / required fields): upstream of `apply` —
+//!   handled by `validate::parse_event` (Phase 1a), enforced by
+//!   `EventBuilder::build()` and `Event::from_wire`. By the time `apply`
+//!   receives an `Event` value, the wire-format checks have run. **See
+//!   PRECONDITION on `apply`** below.
+//! - **Step 2** (signature verification): intentionally skipped per
+//!   `CLAUDE.md` — we run in a trusted network and don't carry signatures.
+//! - **Step 3** (auth check against the event's auth_events): under
+//!   MSC4242 the wire-level `auth_events` field is gone; the equivalent
+//!   check is "auth against state-before-event" since auth_events is now
+//!   server-computed from state-before-event via the auth-events-selection
+//!   algorithm. We run that check via `auth_rules::check_auth_rules`
+//!   against state-before-event derived from `prev_state_events`.
+//! - **Step 4** (auth check against the event's state-at-event): removed
+//!   under MSC4242 / state DAGs. Step 3 (state-before-event) subsumes it.
+//! - **Step 5** (soft-fail check against current room state): we run
+//!   `check_auth_rules` against `current_state` for **non-state events
+//!   only**. State events are not soft-failed (matches synapse's behaviour
+//!   in `_check_for_soft_fail`). On failure we emit `MarkSoftFailed` —
+//!   storage keeps the event, but it's not relayed to clients.
+//! - **Step 6** (state-set check): removed under MSC4242 / state DAGs.
 //!
-//! Format validation (Phase 1a / `parse_event`) is upstream of `apply` — by
-//! the time the caller has an `Event` value, the wire shape is already known
-//! good (events come from `EventBuilder::build()` or `Event::from_wire`,
-//! both of which run `parse_event` internally).
+//! Local additions on top of the spec list: reference validation (Phase
+//! 1b, `validate::validate_references`) runs before the auth checks to
+//! ensure the room exists and `prev_state_events` are well-formed.
+//!
+//! ## What `apply` mutates
+//!
+//! On a hard-rejected event (reference invalid, auth fails against
+//! state-before-event), `apply` returns `Err(CoreError)` and does NOT
+//! mutate `RoomCore`. On acceptance:
+//! - **state events**: forward extremities are updated (parents in
+//!   `prev_state_events` are removed, the new event is inserted), then
+//!   `current_state` is recomputed by state-resolving across the new FE
+//!   set. Mutation is committed atomically after every fallible call has
+//!   succeeded.
+//! - **non-state events**: no FE or `current_state` mutation; only the
+//!   soft-fail check runs against the existing `current_state`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use neutrino_common::Event;
-use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName};
+use ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedServerName};
 
 use crate::auth_rules::check_auth_rules;
-use crate::provider::StateProvider;
+use crate::provider::{EventInfo, StateProvider};
 use crate::state_res;
 use crate::validate;
 use crate::{CoreError, StateMap, StateResError};
+
+/// Provider wrapper that transparently resolves a single `local_event` —
+/// the event currently being applied — while delegating everything else to
+/// the inner provider. Lets `apply` reuse the same `state_before` /
+/// `resolve_state` code paths whether the FE under consideration is an
+/// already-persisted event or the not-yet-persisted local one.
+///
+/// `auth_chain` walks `event.auth_events` via the wrapped `get_event` so
+/// the local event's auth ancestry resolves correctly.
+struct ProviderWithLocal<'a> {
+    inner: &'a dyn StateProvider,
+    local_event: Arc<Event>,
+}
+
+impl StateProvider for ProviderWithLocal<'_> {
+    fn get_event(&self, id: &EventId) -> Option<EventInfo> {
+        if id == self.local_event.event_id {
+            return Some(EventInfo {
+                event: self.local_event.clone(),
+                rejected: false,
+            });
+        }
+        self.inner.get_event(id)
+    }
+
+    fn auth_chain(
+        &self,
+        seeds: &HashSet<OwnedEventId>,
+    ) -> Result<HashSet<OwnedEventId>, StateResError> {
+        // If the local event isn't among the seeds, the inner provider's
+        // closure already covers everything — no need to think about the
+        // local event at all.
+        let local_id = &self.local_event.event_id;
+        if !seeds.contains(local_id) {
+            return self.inner.auth_chain(seeds);
+        }
+        // The local event's `auth_events` parents are all already-persisted
+        // events (every event's auth chain is locally resolvable — project
+        // invariant). Swap the local id out of the seed set for those parents
+        // and let the inner provider's optimised impl walk the rest. Then add
+        // the local event back to the result (the seeds-included property).
+        let mut new_seeds: HashSet<OwnedEventId> = seeds
+            .iter()
+            .filter(|id| *id != local_id)
+            .cloned()
+            .collect();
+        for parent in &self.local_event.auth_events {
+            new_seeds.insert(parent.clone());
+        }
+        let mut chain = self.inner.auth_chain(&new_seeds)?;
+        chain.insert(local_id.clone());
+        Ok(chain)
+    }
+}
 
 /// Side-effects emitted by `RoomCore::apply`. The caller (storage and
 /// federation layers) interprets them sequentially in emission order.
@@ -104,12 +182,27 @@ impl RoomCore {
         &self.current_state
     }
 
-    /// Integrate a single event into the room.
+    /// Integrate a single event into the room. Returns the list of effects
+    /// (in emission order) the caller should process. On hard-reject paths
+    /// (`ReferenceError`, `AuthError`, etc.) returns `Err(CoreError)` and
+    /// emits no effects — the event must not be persisted.
     ///
-    /// Returns the list of effects (in emission order) the caller should
-    /// process. On hard-reject paths (`ReferenceError`, `AuthError`, etc.)
-    /// returns `Err(CoreError)` and emits no effects — the event must not
-    /// be persisted.
+    /// **PRECONDITION**: `event` MUST have been parsed via
+    /// `validate::parse_event` (or constructed via `EventBuilder::build()`
+    /// / `Event::from_wire`, both of which call `parse_event` internally).
+    /// `apply` does not re-run wire-format validation; it assumes:
+    /// - required PDU fields are present and of the right JSON type;
+    /// - `prev_events.len() <= MAX_PREV_EVENTS` and
+    ///   `prev_state_events.len() <= MAX_PREV_STATE_EVENTS`;
+    /// - `m.room.create` events have no `prev_events` / `prev_state_events`
+    ///   / `room_id` (and non-create events do carry a `room_id`);
+    /// - `m.room.member` events have `state_key` and `content.membership`;
+    /// - `m.room.power_levels` content shape is well-formed (rule 10.1–10.3);
+    /// - rule 9 (`@`-prefixed state_key matches sender, for non-member events).
+    ///
+    /// Skipping this precondition shifts those checks into auth via panics
+    /// (`AuthContext` `.expect()`s some Phase-1a invariants) — be safe and
+    /// always call `parse_event` upstream.
     ///
     /// Note: `apply` does NOT insert the event into `provider`. The caller
     /// is expected to honour `Effect::Persist` by writing through to storage
@@ -121,53 +214,57 @@ impl RoomCore {
     ) -> Result<Vec<Effect>, CoreError> {
         let event = Arc::new(event);
 
-        // (1) Reference validation: rooms exist, prev_state_events are state
-        // events in the same room, not rejected.
+        // Reference validation (Phase 1b — local addition on top of the
+        // spec's PDU-receipt checks).
         validate::validate_references(&event, provider)?;
 
-        // (2) State-before-event by state-resolving over state-after of each
-        // prev_state_event. Empty for create events (no prev_state_events).
+        // Spec step 3: auth against state-before-event. State-before-event
+        // is derived by state-resolving across state-after of each
+        // prev_state_event.
         let state_before_ids = state_res::state_before_for_new_event(&event, provider)?;
         let state_before_events = materialize_state(&state_before_ids, provider)?;
-
-        // (3) Auth against state-before-event. Hard reject → propagate error.
         check_auth_rules(&event, &state_before_events)?;
 
         let mut effects: Vec<Effect> = vec![Effect::Persist(event.clone())];
 
-        // (4) State-event acceptance path: compute new FEs + new current_state
-        // into LOCAL bindings. Only commit to `self` after every fallible call
-        // has succeeded — keeps RoomCore consistent on the error path (no
-        // partial mutation if e.g. `recompute_current_state` errors after FE
-        // mutation). See review I1.
         let is_state_event = event.state_key.is_some();
-        let auth_check_state: StateMap<Arc<Event>> = if is_state_event {
+        if is_state_event {
+            // State-event acceptance: compute new FEs + new current_state into
+            // LOCAL bindings, only commit to `self` after every fallible call
+            // has returned `Ok`. Atomic on the error path. Per review I1.
+            //
+            // The new event isn't in `provider` yet — wrap with
+            // `ProviderWithLocal` so the existing `state_res` paths transparently
+            // resolve `event.event_id` to the in-flight `event`.
+            let wrapper = ProviderWithLocal {
+                inner: provider,
+                local_event: event.clone(),
+            };
+
             let mut new_fes = self.state_forward_extremities.clone();
             for parent in &event.prev_state_events {
                 new_fes.remove(parent);
             }
             new_fes.insert(event.event_id.clone());
 
-            let new_current_ids = recompute_current_state(&new_fes, provider, Some(event.clone()))?;
-            let new_current_events =
-                materialize_state_with_local(&new_current_ids, provider, Some(event.clone()))?;
+            let new_current_ids = recompute_current_state(&new_fes, &wrapper)?;
+            let new_current_events = materialize_state(&new_current_ids, &wrapper)?;
 
             // Commit. All fallible work above is done.
             self.state_forward_extremities = new_fes;
-            self.current_state = Arc::new(new_current_events.clone());
+            self.current_state = Arc::new(new_current_events);
             effects.push(Effect::UpdateCurrentState(new_current_ids));
-            new_current_events
-        } else {
-            (*self.current_state).clone()
-        };
 
-        // (5) Second auth check against the (possibly updated) current_state.
-        // Failure → soft-fail. Does NOT undo the state update (synapse parity).
-        if check_auth_rules(&event, &auth_check_state).is_err() {
-            effects.push(Effect::MarkSoftFailed(event.event_id.clone()));
+            // State events are not soft-failed (synapse parity). Skip the
+            // second auth check.
+        } else {
+            // Spec step 5: soft-fail against current_state. Non-state events
+            // only. State events that pass step 3 are accepted as-is.
+            if check_auth_rules(&event, &self.current_state).is_err() {
+                effects.push(Effect::MarkSoftFailed(event.event_id.clone()));
+            }
         }
 
-        // (6) Effects emitted; caller persists.
         Ok(effects)
     }
 }
@@ -183,71 +280,30 @@ fn materialize_state(
     for (key, id) in ids {
         let info = provider
             .get_event(id)
-            .ok_or_else(|| CoreError::StateRes(StateResError::MissingAuthEvent(id.clone())))?;
-        out.insert(key.clone(), info.event);
-    }
-    Ok(out)
-}
-
-/// Like `materialize_state` but treats `local_event` as resolvable in
-/// addition to the provider — needed during `apply` because the new event
-/// hasn't been persisted yet but may appear as a value in the recomputed
-/// current_state (when it's a state event and is the latest FE for its key).
-fn materialize_state_with_local(
-    ids: &StateMap<OwnedEventId>,
-    provider: &dyn StateProvider,
-    local_event: Option<Arc<Event>>,
-) -> Result<StateMap<Arc<Event>>, CoreError> {
-    let mut out = StateMap::new();
-    for (key, id) in ids {
-        if let Some(local) = &local_event
-            && &local.event_id == id
-        {
-            out.insert(key.clone(), local.clone());
-            continue;
-        }
-        let info = provider
-            .get_event(id)
-            .ok_or_else(|| CoreError::StateRes(StateResError::MissingAuthEvent(id.clone())))?;
+            .ok_or_else(|| CoreError::StateRes(StateResError::MissingEvent(id.clone())))?;
         out.insert(key.clone(), info.event);
     }
     Ok(out)
 }
 
 /// Recompute current_state by state-resolving across state-after of each
-/// forward extremity. If `local_event` is provided, it's treated as
-/// resolvable when it appears as an FE (used during `apply` before the
-/// event is persisted).
+/// forward extremity. `provider` must resolve every FE (use `ProviderWithLocal`
+/// when an in-flight event is among the FEs).
 fn recompute_current_state(
     forward_extremities: &BTreeSet<OwnedEventId>,
     provider: &dyn StateProvider,
-    local_event: Option<Arc<Event>>,
 ) -> Result<StateMap<OwnedEventId>, CoreError> {
     if forward_extremities.is_empty() {
         return Ok(StateMap::new());
     }
     let mut state_sets: Vec<StateMap<OwnedEventId>> = Vec::with_capacity(forward_extremities.len());
     for fe in forward_extremities {
-        let (state_after, fe_event) = if let Some(local) = &local_event
-            && &local.event_id == fe
-        {
-            // The local (about-to-be-persisted) event is an FE. Compute
-            // state-before via its prev_state_events directly.
-            let sb = state_res::state_before_for_new_event(local, provider)?;
-            (sb, local.clone())
-        } else {
-            let sb = state_res::state_before(fe, provider)?;
-            let info = provider
-                .get_event(fe)
-                .ok_or_else(|| CoreError::StateRes(StateResError::MissingAuthEvent(fe.clone())))?;
-            (sb, info.event)
-        };
-        let mut state_after = state_after;
-        if let Some(sk) = &fe_event.state_key {
-            state_after.insert(
-                (fe_event.event_type.clone(), sk.clone()),
-                fe_event.event_id.clone(),
-            );
+        let info = provider
+            .get_event(fe)
+            .ok_or_else(|| CoreError::StateRes(StateResError::MissingEvent(fe.clone())))?;
+        let mut state_after = state_res::state_before(fe, provider)?;
+        if let Some(sk) = &info.event.state_key {
+            state_after.insert((info.event.event_type.clone(), sk.clone()), fe.clone());
         }
         state_sets.push(state_after);
     }

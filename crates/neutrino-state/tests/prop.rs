@@ -425,7 +425,7 @@ fn placeholder_arc_event(ts: u64, auth_events: Vec<OwnedEventId>) -> Arc<Event> 
 /// regardless.
 ///
 /// Closure is the project invariant for state-res input: a referenced-but-
-/// unknown event is an error (`StateResError::MissingAuthEvent`), not a
+/// unknown event is an error (`StateResError::MissingEvent`), not a
 /// silent backfill boundary. The strategy reflects that.
 ///
 /// Yields the provider **and the list of known ids** (in build order, so
