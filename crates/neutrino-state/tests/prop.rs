@@ -29,7 +29,7 @@ use neutrino_state::event_id::EventBuilder;
 use neutrino_state::provider::{EventInfo, InMemoryStateProvider, StateProvider};
 use neutrino_state::state_res::{
     auth_chain_difference, conflicted_subgraph, iterative_auth_checks, power_of_sender,
-    reverse_topological_power_sort, separate,
+    resolve_state, reverse_topological_power_sort, separate,
 };
 use neutrino_state::validate::parse_event;
 use neutrino_state::{Event, FormatError, StateMap};
@@ -1315,5 +1315,58 @@ proptest! {
         }
         let resolved = iterative_auth_checks(&ids, initial.clone(), &rejected_provider).unwrap();
         prop_assert_eq!(resolved, initial);
+    }
+
+    /// Phase 4c property: `resolve_state` is the identity on a single state
+    /// set. With one input, `separate()` makes everything unconflicted, the
+    /// conflict path is empty, and the final overlay restores the input.
+    #[test]
+    fn resolve_state_identity_for_single_state_set(
+        creators in arb_distinct_user_ids(3),
+    ) {
+        let creator = &creators[0];
+        let create = prop_build_create(creator, &[], true);
+        let create_id = create.event_id.clone();
+        let mut provider = InMemoryStateProvider::new();
+        provider.insert(EventInfo { event: Arc::new(create), rejected: false });
+        let mut s = StateMap::new();
+        s.insert(("m.room.create".to_string(), String::new()), create_id);
+        let resolved = resolve_state(&[&s], &provider).unwrap();
+        prop_assert_eq!(resolved, s);
+    }
+
+    /// Phase 4c property: when N state sets each carry a distinct
+    /// `m.room.create` event (no other entries), `resolve_state` picks one
+    /// of the candidates. Pinning *which* one is the algorithm's job — the
+    /// property only guarantees the resolved value comes from the input
+    /// candidates (no fabrication).
+    #[test]
+    fn resolve_state_with_only_create_events_picks_one_candidate(
+        creators in arb_distinct_user_ids(4),
+    ) {
+        let mut provider = InMemoryStateProvider::new();
+        let mut create_ids: Vec<OwnedEventId> = Vec::new();
+        for c in &creators {
+            let create = prop_build_create(c, &[], true);
+            create_ids.push(create.event_id.clone());
+            provider.insert(EventInfo { event: Arc::new(create), rejected: false });
+        }
+        let state_sets: Vec<StateMap<OwnedEventId>> = create_ids
+            .iter()
+            .map(|id| {
+                let mut s = StateMap::new();
+                s.insert(("m.room.create".to_string(), String::new()), id.clone());
+                s
+            })
+            .collect();
+        let refs: Vec<&StateMap<OwnedEventId>> = state_sets.iter().collect();
+        let resolved = resolve_state(&refs, &provider).unwrap();
+        let picked = resolved
+            .get(&("m.room.create".to_string(), String::new()))
+            .expect("create resolved");
+        prop_assert!(
+            create_ids.contains(picked),
+            "resolved create id {picked} not among input candidates"
+        );
     }
 }

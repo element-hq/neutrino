@@ -371,6 +371,271 @@ pub fn iterative_auth_checks(
     Ok(resolved)
 }
 
+// ----------------- is_power_event / split_power_events -----------------
+
+/// Whether `event` is a "power event" — one of the event types that affects
+/// the room's power structure and therefore goes through the
+/// reverse-topological power sort in `resolve_state`. The complement set
+/// (non-power events) goes through mainline ordering.
+///
+/// Per spec v12 §state resolution + MSC4242 author guidance, the power-event
+/// set is:
+/// - `m.room.create` (creator membership is a power source — v12 addition
+///   over v2.0's predicate set; non-default-creator demotion requires this).
+/// - `m.room.join_rules` (state_key `""`).
+/// - `m.room.power_levels` (state_key `""`).
+/// - `m.room.member` with `content.membership` ∈ {`leave`, `ban`} AND
+///   `sender != state_key` (i.e. kicks and bans — self-leaves, joins,
+///   invites, and knocks are not power events).
+pub fn is_power_event(event: &Event) -> bool {
+    match event.event_type.as_str() {
+        "m.room.create" => true,
+        "m.room.join_rules" | "m.room.power_levels" => event.state_key.as_deref() == Some(""),
+        "m.room.member" => {
+            let Some(state_key) = event.state_key.as_deref() else {
+                return false;
+            };
+            if event.sender.as_str() == state_key {
+                return false;
+            }
+            let content: serde_json::Value =
+                serde_json::from_str(event.content.get()).unwrap_or(serde_json::Value::Null);
+            let membership = content.get("membership").and_then(|v| v.as_str());
+            matches!(membership, Some("leave") | Some("ban"))
+        }
+        _ => false,
+    }
+}
+
+/// Partition `events` into `(power, non_power)` using `is_power_event`.
+/// Every id must resolve through the provider; missing ids → `MissingAuthEvent`.
+pub fn split_power_events(
+    events: &HashSet<OwnedEventId>,
+    provider: &dyn StateProvider,
+) -> Result<(HashSet<OwnedEventId>, HashSet<OwnedEventId>), StateResError> {
+    let mut power = HashSet::new();
+    let mut non_power = HashSet::new();
+    for eid in events {
+        let info = provider
+            .get_event(eid)
+            .ok_or_else(|| StateResError::MissingAuthEvent(eid.clone()))?;
+        if is_power_event(&info.event) {
+            power.insert(eid.clone());
+        } else {
+            non_power.insert(eid.clone());
+        }
+    }
+    Ok((power, non_power))
+}
+
+// ----------------- mainline -----------------
+
+/// Walk the m.room.power_levels chain backwards starting at `seed_pl_id`.
+///
+/// Each step inspects the current PL's `auth_events` for a parent PL
+/// reference. Returns `[current_pl, prev_pl, prev_prev_pl, ...]` head-first
+/// (most recent first), terminating when a PL has no PL ancestor in its
+/// auth_events.
+///
+/// `None` seed → empty mainline. A `None` here is normal: it means IAC pass 1
+/// produced no PL in the resolved state (e.g. the room has never set
+/// power_levels). The mainline-position function treats every event as
+/// "depth == 0" in that case (all equal, ts/id tiebreak only).
+///
+/// Synapse parity: `state/v2.py::_get_mainline_chain`.
+pub fn mainline(
+    seed_pl_id: Option<OwnedEventId>,
+    provider: &dyn StateProvider,
+) -> Result<Vec<OwnedEventId>, StateResError> {
+    let mut chain = Vec::new();
+    let mut current = seed_pl_id;
+    while let Some(pl_id) = current {
+        chain.push(pl_id.clone());
+        let info = provider
+            .get_event(&pl_id)
+            .ok_or_else(|| StateResError::MissingAuthEvent(pl_id.clone()))?;
+        // Find the previous PL in this PL's auth_events. Single-step lookup
+        // (no transitive walk): under MSC4242 v12, `calculate_auth_events`
+        // emits the immediately-prior PL directly in `auth_events`.
+        let mut next: Option<OwnedEventId> = None;
+        for aid in &info.event.auth_events {
+            let parent = provider
+                .get_event(aid)
+                .ok_or_else(|| StateResError::MissingAuthEvent(aid.clone()))?;
+            if parent.rejected {
+                continue;
+            }
+            if parent.event.event_type == "m.room.power_levels"
+                && parent.event.state_key.as_deref() == Some("")
+            {
+                next = Some(aid.clone());
+                break;
+            }
+        }
+        current = next;
+    }
+    Ok(chain)
+}
+
+// ----------------- mainline_position -----------------
+
+/// Mainline depth of `event_id`: the index in `mainline_map` of the nearest
+/// PL ancestor reachable from `event_id` through its `auth_events` chain.
+/// Smaller index = closer to the current (resolved) PL.
+///
+/// If no PL ancestor is found (or the closest PL isn't in the mainline),
+/// returns `mainline_len` — i.e. "this event sorts last among non-power
+/// events" semantics. Synapse parity: `state/v2.py::_get_event_mainline_rank`.
+///
+/// The walk follows each event's `m.room.power_levels` reference in
+/// `auth_events`, recursing into that PL's own auth_events if its id isn't
+/// in `mainline_map`. Visited set guards against cycles (which can't form
+/// in a hash-derived auth chain, but the defence is cheap).
+pub fn mainline_position(
+    event_id: &OwnedEventId,
+    mainline_map: &HashMap<OwnedEventId, usize>,
+    mainline_len: usize,
+    provider: &dyn StateProvider,
+) -> Result<usize, StateResError> {
+    let mut current = event_id.clone();
+    let mut visited: HashSet<OwnedEventId> = HashSet::new();
+    loop {
+        if let Some(&depth) = mainline_map.get(&current) {
+            return Ok(depth);
+        }
+        if !visited.insert(current.clone()) {
+            // Defensive cycle break — shouldn't trigger under hash-derived ids.
+            return Ok(mainline_len);
+        }
+        let info = provider
+            .get_event(&current)
+            .ok_or_else(|| StateResError::MissingAuthEvent(current.clone()))?;
+        let mut next: Option<OwnedEventId> = None;
+        for aid in &info.event.auth_events {
+            let parent = provider
+                .get_event(aid)
+                .ok_or_else(|| StateResError::MissingAuthEvent(aid.clone()))?;
+            if parent.rejected {
+                continue;
+            }
+            if parent.event.event_type == "m.room.power_levels"
+                && parent.event.state_key.as_deref() == Some("")
+            {
+                next = Some(aid.clone());
+                break;
+            }
+        }
+        match next {
+            Some(n) => current = n,
+            None => return Ok(mainline_len),
+        }
+    }
+}
+
+// ----------------- mainline_sort -----------------
+
+/// Sort `events` ascending by `(mainline_position, origin_server_ts, event_id)`.
+///
+/// `resolved_pl_id` is the PL event_id selected by IAC pass 1 (typically
+/// `pass_1.get(("m.room.power_levels", ""))`). If `None`, the mainline is
+/// empty and every event gets depth 0 — the sort collapses to
+/// `(origin_server_ts, event_id)` ascending.
+///
+/// Synapse parity: `state/v2.py::_mainline_sort`. The output is the order
+/// IAC pass 2 processes the non-power conflict set.
+pub fn mainline_sort(
+    events: &HashSet<OwnedEventId>,
+    resolved_pl_id: Option<OwnedEventId>,
+    provider: &dyn StateProvider,
+) -> Result<Vec<OwnedEventId>, StateResError> {
+    let chain = mainline(resolved_pl_id, provider)?;
+    let mainline_map: HashMap<OwnedEventId, usize> = chain
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.clone(), i))
+        .collect();
+    let mainline_len = chain.len();
+
+    // (depth, ts, id) → ascending; OwnedEventId implements Ord.
+    let mut decorated: Vec<(usize, u64, OwnedEventId)> = Vec::with_capacity(events.len());
+    for eid in events {
+        let info = provider
+            .get_event(eid)
+            .ok_or_else(|| StateResError::MissingAuthEvent(eid.clone()))?;
+        let depth = mainline_position(eid, &mainline_map, mainline_len, provider)?;
+        decorated.push((depth, info.event.origin_server_ts, eid.clone()));
+    }
+    decorated.sort();
+    Ok(decorated.into_iter().map(|(_, _, id)| id).collect())
+}
+
+// ----------------- resolve_state -----------------
+
+/// Resolve a list of state sets into a single `StateMap<OwnedEventId>` per
+/// the v12 / state-res v2.1 algorithm.
+///
+/// Steps (spec v12 §state resolution):
+/// 1. `separate` the state sets into unconflicted + conflicted.
+/// 2. Compute the **full conflicted set** = `auth_chain_difference ∪
+///    conflicted_subgraph ∪ conflicted-state-values` (v2.1 adds the subgraph;
+///    v2 used just the diff + conflicted values).
+/// 3. Split the full conflicted set into power events vs non-power events
+///    via `is_power_event`.
+/// 4. Reverse-topological power sort over power events.
+/// 5. **IAC pass 1**: iterative auth checks from the **empty** state (v2.1
+///    divergence from v2.0's "from unconflicted").
+/// 6. Mainline sort over non-power events, anchored on pass-1's resolved PL.
+/// 7. **IAC pass 2**: iterative auth checks seeded with pass-1's result.
+/// 8. Overlay the unconflicted state onto pass-2's result. Keys are disjoint
+///    by construction (unconflicted = keys where every input state set
+///    agrees; the conflict path only touches keys with disagreement), but
+///    the spec mandates "add entries from the unconflicted state map" so
+///    unconflicted wins on the unlikely-collision path.
+pub fn resolve_state(
+    state_sets: &[&StateMap<OwnedEventId>],
+    provider: &dyn StateProvider,
+) -> Result<StateMap<OwnedEventId>, StateResError> {
+    // (1) Separate.
+    let Separated {
+        unconflicted,
+        conflicted,
+    } = separate(state_sets);
+
+    // (2) Full conflicted set.
+    let conflicted_values: HashSet<OwnedEventId> = conflicted.values().flatten().cloned().collect();
+    let auth_diff = auth_chain_difference(state_sets, provider)?;
+    let subgraph = conflicted_subgraph(&conflicted_values, provider)?;
+    let full_conflicted: HashSet<OwnedEventId> = auth_diff
+        .into_iter()
+        .chain(subgraph)
+        .chain(conflicted_values)
+        .collect();
+
+    // (3) Split into power / non-power.
+    let (power_events, non_power_events) = split_power_events(&full_conflicted, provider)?;
+
+    // (4) Reverse-topological power sort + (5) IAC pass 1 from empty.
+    let sorted_power = reverse_topological_power_sort(&power_events, provider)?;
+    let after_pass_1 = iterative_auth_checks(&sorted_power, StateMap::new(), provider)?;
+
+    // (6) Mainline sort over non-power events.
+    let resolved_pl = after_pass_1
+        .get(&("m.room.power_levels".to_string(), String::new()))
+        .cloned();
+    let sorted_non_power = mainline_sort(&non_power_events, resolved_pl, provider)?;
+
+    // (7) IAC pass 2 seeded with pass-1's result.
+    let after_pass_2 = iterative_auth_checks(&sorted_non_power, after_pass_1, provider)?;
+
+    // (8) Overlay unconflicted (disjoint by construction; unconflicted wins
+    // on the unlikely-collision path per spec step 7).
+    let mut final_state = after_pass_2;
+    for (k, v) in unconflicted {
+        final_state.insert(k, v);
+    }
+    Ok(final_state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1071,5 +1336,567 @@ mod tests {
         let topic_id = put(&mut provider, topic);
         let err = iterative_auth_checks(&[topic_id], StateMap::new(), &provider).unwrap_err();
         assert!(matches!(err, StateResError::MissingAuthEvent(_)));
+    }
+
+    // ===== Phase 4c =====
+
+    /// Build an `m.room.join_rules` event with a chosen `join_rule`.
+    fn room_join_rules(
+        room_id: &RoomId,
+        sender: &str,
+        join_rule: &str,
+        auth: Vec<OwnedEventId>,
+    ) -> Event {
+        EventBuilder::new(
+            sender.parse().expect("sender"),
+            "m.room.join_rules".to_owned(),
+        )
+        .room_id(room_id.to_owned())
+        .state_key(String::new())
+        .content(json!({ "join_rule": join_rule }))
+        .auth_events(auth)
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid join_rules")
+    }
+
+    /// Build an `m.room.member` event with chosen target/membership.
+    fn room_member(
+        room_id: &RoomId,
+        sender: &str,
+        target: &str,
+        membership: &str,
+        auth: Vec<OwnedEventId>,
+    ) -> Event {
+        EventBuilder::new(sender.parse().expect("sender"), "m.room.member".to_owned())
+            .room_id(room_id.to_owned())
+            .state_key(target.to_owned())
+            .content(json!({ "membership": membership }))
+            .auth_events(auth)
+            .origin_server_ts(next_ts())
+            .build()
+            .expect("valid member")
+    }
+
+    // ----- is_power_event -----
+
+    #[test]
+    fn is_power_event_create_is_power() {
+        let create = build_create("@alice:example.org", &[], true);
+        assert!(is_power_event(&create));
+    }
+
+    #[test]
+    fn is_power_event_pl_is_power() {
+        let (_, create_id, room_id) = setup_default();
+        let pl = room_pl(&room_id, "@alice:example.org", json!({}), vec![create_id]);
+        assert!(is_power_event(&pl));
+    }
+
+    #[test]
+    fn is_power_event_join_rules_is_power() {
+        let (_, create_id, room_id) = setup_default();
+        let jr = room_join_rules(&room_id, "@alice:example.org", "public", vec![create_id]);
+        assert!(is_power_event(&jr));
+    }
+
+    #[test]
+    fn is_power_event_self_leave_is_not_power() {
+        let (_, create_id, room_id) = setup_default();
+        let self_leave = room_member(
+            &room_id,
+            "@alice:example.org",
+            "@alice:example.org",
+            "leave",
+            vec![create_id],
+        );
+        assert!(!is_power_event(&self_leave));
+    }
+
+    #[test]
+    fn is_power_event_kick_is_power() {
+        let (_, create_id, room_id) = setup_default();
+        let kick = room_member(
+            &room_id,
+            "@alice:example.org",
+            "@bob:example.org",
+            "leave",
+            vec![create_id],
+        );
+        assert!(is_power_event(&kick));
+    }
+
+    #[test]
+    fn is_power_event_ban_is_power() {
+        let (_, create_id, room_id) = setup_default();
+        let ban = room_member(
+            &room_id,
+            "@alice:example.org",
+            "@bob:example.org",
+            "ban",
+            vec![create_id],
+        );
+        assert!(is_power_event(&ban));
+    }
+
+    #[test]
+    fn is_power_event_invite_is_not_power() {
+        let (_, create_id, room_id) = setup_default();
+        let invite = room_member(
+            &room_id,
+            "@alice:example.org",
+            "@bob:example.org",
+            "invite",
+            vec![create_id],
+        );
+        assert!(!is_power_event(&invite));
+    }
+
+    #[test]
+    fn is_power_event_self_join_is_not_power() {
+        let (_, create_id, room_id) = setup_default();
+        let join = room_member(
+            &room_id,
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            vec![create_id],
+        );
+        assert!(!is_power_event(&join));
+    }
+
+    #[test]
+    fn is_power_event_message_is_not_power() {
+        let (_, create_id, room_id) = setup_default();
+        let msg = room_msg(&room_id, "@alice:example.org", vec![create_id]);
+        assert!(!is_power_event(&msg));
+    }
+
+    #[test]
+    fn is_power_event_topic_is_not_power() {
+        let (_, create_id, room_id) = setup_default();
+        let topic = room_topic(&room_id, "@alice:example.org", vec![create_id]);
+        assert!(!is_power_event(&topic));
+    }
+
+    // ----- split_power_events -----
+
+    #[test]
+    fn split_power_events_partitions_correctly() {
+        let (mut provider, create_id, room_id) = setup_default();
+        let pl = room_pl(
+            &room_id,
+            "@alice:example.org",
+            json!({}),
+            vec![create_id.clone()],
+        );
+        let pl_id = put(&mut provider, pl);
+        let topic = room_topic(&room_id, "@alice:example.org", vec![create_id.clone()]);
+        let topic_id = put(&mut provider, topic);
+        let events: HashSet<_> = [create_id.clone(), pl_id.clone(), topic_id.clone()]
+            .into_iter()
+            .collect();
+        let (power, non_power) = split_power_events(&events, &provider).unwrap();
+        assert_eq!(power, HashSet::from([create_id, pl_id]));
+        assert_eq!(non_power, HashSet::from([topic_id]));
+    }
+
+    // ----- mainline -----
+
+    #[test]
+    fn mainline_none_seed_returns_empty() {
+        let provider = InMemoryStateProvider::new();
+        assert!(mainline(None, &provider).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mainline_single_pl_returns_just_that_pl() {
+        let (mut provider, create_id, room_id) = setup_default();
+        let pl = room_pl(&room_id, "@alice:example.org", json!({}), vec![create_id]);
+        let pl_id = put(&mut provider, pl);
+        let chain = mainline(Some(pl_id.clone()), &provider).unwrap();
+        assert_eq!(chain, vec![pl_id]);
+    }
+
+    #[test]
+    fn mainline_walks_pl_chain_head_first() {
+        // PL chain: pl_v1 → pl_v2 → pl_v3. pl_v3's auth_events references pl_v2;
+        // pl_v2's auth_events references pl_v1. Seed at pl_v3, expect [v3, v2, v1].
+        let (mut provider, create_id, room_id) = setup_default();
+        let pl_v1 = room_pl(
+            &room_id,
+            "@alice:example.org",
+            json!({}),
+            vec![create_id.clone()],
+        );
+        let pl_v1_id = put(&mut provider, pl_v1);
+        let pl_v2 = room_pl(
+            &room_id,
+            "@alice:example.org",
+            json!({"users_default": 1}),
+            vec![create_id.clone(), pl_v1_id.clone()],
+        );
+        let pl_v2_id = put(&mut provider, pl_v2);
+        let pl_v3 = room_pl(
+            &room_id,
+            "@alice:example.org",
+            json!({"users_default": 2}),
+            vec![create_id, pl_v2_id.clone()],
+        );
+        let pl_v3_id = put(&mut provider, pl_v3);
+        let chain = mainline(Some(pl_v3_id.clone()), &provider).unwrap();
+        assert_eq!(chain, vec![pl_v3_id, pl_v2_id, pl_v1_id]);
+    }
+
+    #[test]
+    fn mainline_terminates_when_no_prev_pl_in_auth() {
+        // First PL has no PL ancestor (only create); walk terminates after one step.
+        let (mut provider, create_id, room_id) = setup_default();
+        let pl = room_pl(&room_id, "@alice:example.org", json!({}), vec![create_id]);
+        let pl_id = put(&mut provider, pl);
+        let chain = mainline(Some(pl_id.clone()), &provider).unwrap();
+        assert_eq!(chain, vec![pl_id]);
+    }
+
+    #[test]
+    fn mainline_skips_rejected_pl_ancestor() {
+        // pl_v2 → pl_v1 (rejected). The chain finds no non-rejected PL parent
+        // for pl_v2 → terminates after pl_v2.
+        let (mut provider, create_id, room_id) = setup_default();
+        let pl_v1 = room_pl(
+            &room_id,
+            "@alice:example.org",
+            json!({}),
+            vec![create_id.clone()],
+        );
+        let pl_v1_id = put_rejected(&mut provider, pl_v1);
+        let pl_v2 = room_pl(
+            &room_id,
+            "@alice:example.org",
+            json!({"users_default": 1}),
+            vec![create_id, pl_v1_id],
+        );
+        let pl_v2_id = put(&mut provider, pl_v2);
+        let chain = mainline(Some(pl_v2_id.clone()), &provider).unwrap();
+        assert_eq!(chain, vec![pl_v2_id]);
+    }
+
+    // ----- mainline_position -----
+
+    #[test]
+    fn mainline_position_event_with_pl_in_mainline_returns_index() {
+        let (mut provider, create_id, room_id) = setup_default();
+        let pl_v1 = room_pl(
+            &room_id,
+            "@alice:example.org",
+            json!({}),
+            vec![create_id.clone()],
+        );
+        let pl_v1_id = put(&mut provider, pl_v1);
+        let pl_v2 = room_pl(
+            &room_id,
+            "@alice:example.org",
+            json!({"users_default": 1}),
+            vec![create_id.clone(), pl_v1_id.clone()],
+        );
+        let pl_v2_id = put(&mut provider, pl_v2);
+        // Event authored under pl_v1 (auth_events references pl_v1, not pl_v2).
+        let topic = room_topic(
+            &room_id,
+            "@alice:example.org",
+            vec![create_id, pl_v1_id.clone()],
+        );
+        let topic_id = put(&mut provider, topic);
+        let chain = mainline(Some(pl_v2_id.clone()), &provider).unwrap();
+        let map: HashMap<_, _> = chain
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i))
+            .collect();
+        // pl_v2 at depth 0, pl_v1 at depth 1.
+        let depth = mainline_position(&topic_id, &map, chain.len(), &provider).unwrap();
+        assert_eq!(depth, 1);
+    }
+
+    #[test]
+    fn mainline_position_event_with_no_pl_ancestor_returns_len() {
+        // Event whose auth_events contains create only — no PL ancestor.
+        let (mut provider, create_id, room_id) = setup_default();
+        let pl = room_pl(
+            &room_id,
+            "@alice:example.org",
+            json!({}),
+            vec![create_id.clone()],
+        );
+        let pl_id = put(&mut provider, pl);
+        let topic = room_topic(&room_id, "@alice:example.org", vec![create_id]);
+        let topic_id = put(&mut provider, topic);
+        let chain = mainline(Some(pl_id), &provider).unwrap();
+        let map: HashMap<_, _> = chain
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i))
+            .collect();
+        let depth = mainline_position(&topic_id, &map, chain.len(), &provider).unwrap();
+        assert_eq!(depth, chain.len());
+    }
+
+    // ----- mainline_sort -----
+
+    #[test]
+    fn mainline_sort_empty_events_returns_empty() {
+        let provider = InMemoryStateProvider::new();
+        let out = mainline_sort(&HashSet::new(), None, &provider).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn mainline_sort_ts_ascending_when_no_pl() {
+        // No PL anywhere → mainline is empty → every event has depth 0 →
+        // sort is purely (ts, event_id) ascending.
+        let (mut provider, create_id, room_id) = setup_default();
+        let early = room_topic(&room_id, "@alice:example.org", vec![create_id.clone()]);
+        let late = room_topic(&room_id, "@alice:example.org", vec![create_id]);
+        let early_id = put(&mut provider, early);
+        let late_id = put(&mut provider, late);
+        let events: HashSet<_> = [late_id.clone(), early_id.clone()].into_iter().collect();
+        let sorted = mainline_sort(&events, None, &provider).unwrap();
+        assert_eq!(sorted, vec![early_id, late_id]);
+    }
+
+    #[test]
+    fn mainline_sort_depth_orders_before_ts() {
+        // Two events: one under pl_v2 (depth 0), one under pl_v1 (depth 1).
+        // The pl_v1-anchored event has an EARLIER ts than the pl_v2-anchored
+        // one. Without mainline ordering it would come first; mainline depth
+        // pushes it after.
+        let (mut provider, create_id, room_id) = setup_default();
+        let pl_v1 = room_pl(
+            &room_id,
+            "@alice:example.org",
+            json!({}),
+            vec![create_id.clone()],
+        );
+        let pl_v1_id = put(&mut provider, pl_v1);
+        // Earlier-ts event under pl_v1 (depth 1).
+        let topic_under_v1 = room_topic(
+            &room_id,
+            "@alice:example.org",
+            vec![create_id.clone(), pl_v1_id.clone()],
+        );
+        let topic_under_v1_id = put(&mut provider, topic_under_v1);
+        // Later-ts pl_v2.
+        let pl_v2 = room_pl(
+            &room_id,
+            "@alice:example.org",
+            json!({"users_default": 1}),
+            vec![create_id.clone(), pl_v1_id.clone()],
+        );
+        let pl_v2_id = put(&mut provider, pl_v2);
+        // Even-later topic under pl_v2 (depth 0).
+        let topic_under_v2 = room_topic(
+            &room_id,
+            "@alice:example.org",
+            vec![create_id, pl_v2_id.clone()],
+        );
+        let topic_under_v2_id = put(&mut provider, topic_under_v2);
+        let events: HashSet<_> = [topic_under_v1_id.clone(), topic_under_v2_id.clone()]
+            .into_iter()
+            .collect();
+        let sorted = mainline_sort(&events, Some(pl_v2_id), &provider).unwrap();
+        // topic_under_v2 has depth 0, topic_under_v1 has depth 1 → v2 first.
+        assert_eq!(sorted, vec![topic_under_v2_id, topic_under_v1_id]);
+    }
+
+    // ----- resolve_state -----
+
+    #[test]
+    fn resolve_state_single_state_set_returns_it() {
+        // With a single state set, separate() makes everything unconflicted;
+        // resolve_state returns that state set's entries.
+        let (provider, create_id, _room_id) = setup_default();
+        let mut s = StateMap::new();
+        s.insert(
+            ("m.room.create".to_string(), String::new()),
+            create_id.clone(),
+        );
+        let out = resolve_state(&[&s], &provider).unwrap();
+        assert_eq!(out, s);
+    }
+
+    #[test]
+    fn resolve_state_no_conflict_keys_yields_union() {
+        // Two state sets with the same create-event entry → unconflicted →
+        // output equals the shared input.
+        let (provider, create_id, _room_id) = setup_default();
+        let mut s1 = StateMap::new();
+        s1.insert(
+            ("m.room.create".to_string(), String::new()),
+            create_id.clone(),
+        );
+        let s2 = s1.clone();
+        let out = resolve_state(&[&s1, &s2], &provider).unwrap();
+        assert_eq!(out, s1);
+    }
+
+    #[test]
+    fn resolve_state_conflicting_pls_picks_one() {
+        // Two state sets disagree on the PL. Both PLs are authored by alice
+        // (the creator); alice's join is in each PL's auth_events so rule 6
+        // ("sender's current membership state must be join") passes during
+        // IAC pass 1. Reverse-topological power sort processes both PLs;
+        // last-write-wins, with the later origin_server_ts going last.
+        let (mut provider, create_id, room_id) = setup_default();
+        let alice_join = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.member".to_owned(),
+        )
+        .room_id(room_id.clone())
+        .state_key("@alice:example.org".to_owned())
+        .content(json!({ "membership": "join" }))
+        .auth_events(vec![create_id.clone()])
+        .prev_events(vec![create_id.clone()])
+        .prev_state_events(vec![create_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid join");
+        let alice_join_id = put(&mut provider, alice_join);
+
+        let pl_early = room_pl(
+            &room_id,
+            "@alice:example.org",
+            json!({ "users_default": 1 }),
+            vec![create_id.clone(), alice_join_id.clone()],
+        );
+        let pl_early_id = put(&mut provider, pl_early);
+        let pl_late = room_pl(
+            &room_id,
+            "@alice:example.org",
+            json!({ "users_default": 2 }),
+            vec![create_id.clone(), alice_join_id.clone()],
+        );
+        let pl_late_id = put(&mut provider, pl_late);
+
+        // s1 chose pl_early, s2 chose pl_late.
+        let mut s1 = StateMap::new();
+        s1.insert(
+            ("m.room.create".to_string(), String::new()),
+            create_id.clone(),
+        );
+        s1.insert(
+            (
+                "m.room.member".to_string(),
+                "@alice:example.org".to_string(),
+            ),
+            alice_join_id.clone(),
+        );
+        s1.insert(
+            ("m.room.power_levels".to_string(), String::new()),
+            pl_early_id.clone(),
+        );
+        let mut s2 = StateMap::new();
+        s2.insert(
+            ("m.room.create".to_string(), String::new()),
+            create_id.clone(),
+        );
+        s2.insert(
+            (
+                "m.room.member".to_string(),
+                "@alice:example.org".to_string(),
+            ),
+            alice_join_id,
+        );
+        s2.insert(
+            ("m.room.power_levels".to_string(), String::new()),
+            pl_late_id.clone(),
+        );
+
+        let out = resolve_state(&[&s1, &s2], &provider).unwrap();
+        // pl_late has later origin_server_ts → wins.
+        assert_eq!(
+            out.get(&("m.room.power_levels".to_string(), String::new())),
+            Some(&pl_late_id)
+        );
+        // create is unconflicted, preserved unchanged.
+        assert_eq!(
+            out.get(&("m.room.create".to_string(), String::new())),
+            Some(&create_id)
+        );
+    }
+
+    #[test]
+    fn resolve_state_unconflicted_keys_survive() {
+        // s1 has (create, topic_v1); s2 has (create, topic_v2). Topic
+        // conflicts, create doesn't. Resolve picks one topic; create is
+        // preserved.
+        let (mut provider, create_id, room_id) = setup_default();
+        // alice joins (so subsequent topic events pass rule 6).
+        let alice_join = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.member".to_owned(),
+        )
+        .room_id(room_id.clone())
+        .state_key("@alice:example.org".to_owned())
+        .content(json!({ "membership": "join" }))
+        .auth_events(vec![create_id.clone()])
+        .prev_events(vec![create_id.clone()])
+        .prev_state_events(vec![create_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid join");
+        let alice_join_id = put(&mut provider, alice_join);
+        let topic_v1 = room_topic(
+            &room_id,
+            "@alice:example.org",
+            vec![create_id.clone(), alice_join_id.clone()],
+        );
+        let topic_v1_id = put(&mut provider, topic_v1);
+        let topic_v2 = room_topic(
+            &room_id,
+            "@alice:example.org",
+            vec![create_id.clone(), alice_join_id.clone()],
+        );
+        let topic_v2_id = put(&mut provider, topic_v2);
+
+        let mut s1 = StateMap::new();
+        s1.insert(
+            ("m.room.create".to_string(), String::new()),
+            create_id.clone(),
+        );
+        s1.insert(
+            (
+                "m.room.member".to_string(),
+                "@alice:example.org".to_string(),
+            ),
+            alice_join_id.clone(),
+        );
+        s1.insert(
+            ("m.room.topic".to_string(), String::new()),
+            topic_v1_id.clone(),
+        );
+        let mut s2 = s1.clone();
+        s2.insert(
+            ("m.room.topic".to_string(), String::new()),
+            topic_v2_id.clone(),
+        );
+
+        let out = resolve_state(&[&s1, &s2], &provider).unwrap();
+        // create + alice's member are unconflicted, preserved as-is.
+        assert_eq!(
+            out.get(&("m.room.create".to_string(), String::new())),
+            Some(&create_id)
+        );
+        assert_eq!(
+            out.get(&(
+                "m.room.member".to_string(),
+                "@alice:example.org".to_string()
+            )),
+            Some(&alice_join_id)
+        );
+        // Topic is conflicted; resolved value is one of the two candidates.
+        let resolved_topic = out
+            .get(&("m.room.topic".to_string(), String::new()))
+            .expect("topic resolved");
+        assert!(resolved_topic == &topic_v1_id || resolved_topic == &topic_v2_id);
     }
 }
