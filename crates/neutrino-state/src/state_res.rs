@@ -20,7 +20,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
-use ruma::OwnedEventId;
+use ruma::{EventId, OwnedEventId};
 
 use crate::auth_events::auth_event_keys;
 use crate::auth_rules::{AuthContext, check_auth_rules};
@@ -582,6 +582,111 @@ pub fn mainline_sort(
     }
     decorated.sort();
     Ok(decorated.into_iter().map(|(_, _, id)| id).collect())
+}
+
+// ----------------- state_before -----------------
+
+/// Compute state-before-`event_id` by recursively resolving over the
+/// `prev_state_events` of `event_id`.
+///
+/// Spec semantics (v12 + MSC4242): given event E whose `prev_state_events` are
+/// `[P1, P2, ...]`, state-before-E is `resolve_state(state_after(P1),
+/// state_after(P2), ...)`. `state_after(P) = state_before(P) overlaid with
+/// the (type, state_key) → P entry iff P is itself a state event` — message
+/// events leave state unchanged.
+///
+/// Root case: an event with no `prev_state_events` (a create event) has
+/// state-before == empty StateMap.
+///
+/// The walk is bounded by the DAG's depth and width, and short-circuits
+/// repeated subgraphs via an internal `cache`. For an embedded single-server
+/// room the chain is typically near-linear and resolves in O(N) provider
+/// lookups; on a SQLite-backed provider each lookup is a query — eventual
+/// optimisation is to back this with state groups (deferred).
+///
+/// **Errors**: any unknown event_id traversed (the seed or any
+/// `prev_state_events` ancestor) raises `StateResError::MissingAuthEvent`,
+/// per the strict-closure invariant.
+pub fn state_before(
+    event_id: &EventId,
+    provider: &dyn StateProvider,
+) -> Result<StateMap<OwnedEventId>, StateResError> {
+    let mut cache: HashMap<OwnedEventId, Arc<StateMap<OwnedEventId>>> = HashMap::new();
+    let arc = state_before_inner(event_id, provider, &mut cache)?;
+    Ok((*arc).clone())
+}
+
+/// Same computation as `state_before` but for an event that is **not** yet
+/// in the provider (i.e. the event under consideration in `RoomCore::apply`,
+/// before it's persisted). Walks the event's `prev_state_events` directly.
+///
+/// Useful when the caller has the `Event` value in hand but hasn't inserted
+/// it into the provider yet — `state_before(event_id, provider)` would
+/// require a `get_event(event_id)` lookup which would fail.
+pub fn state_before_for_new_event(
+    event: &Event,
+    provider: &dyn StateProvider,
+) -> Result<StateMap<OwnedEventId>, StateResError> {
+    let mut cache: HashMap<OwnedEventId, Arc<StateMap<OwnedEventId>>> = HashMap::new();
+    state_before_from_prev_state_events(&event.prev_state_events, provider, &mut cache)
+}
+
+fn state_before_inner(
+    event_id: &EventId,
+    provider: &dyn StateProvider,
+    cache: &mut HashMap<OwnedEventId, Arc<StateMap<OwnedEventId>>>,
+) -> Result<Arc<StateMap<OwnedEventId>>, StateResError> {
+    let owned: OwnedEventId = event_id.to_owned();
+    if let Some(cached) = cache.get(&owned) {
+        return Ok(cached.clone());
+    }
+
+    let info = provider
+        .get_event(event_id)
+        .ok_or_else(|| StateResError::MissingAuthEvent(owned.clone()))?;
+
+    // Root: no prev_state_events (create event) → empty state-before.
+    if info.event.prev_state_events.is_empty() {
+        let empty = Arc::new(StateMap::new());
+        cache.insert(owned, empty.clone());
+        return Ok(empty);
+    }
+
+    let resolved =
+        state_before_from_prev_state_events(&info.event.prev_state_events, provider, cache)?;
+    let arc = Arc::new(resolved);
+    cache.insert(owned, arc.clone());
+    Ok(arc)
+}
+
+/// Core of the state-before computation: given a list of `prev_state_events`,
+/// build state-after for each (via `state_before_inner` + overlay) and
+/// resolve.
+fn state_before_from_prev_state_events(
+    prev_state_events: &[OwnedEventId],
+    provider: &dyn StateProvider,
+    cache: &mut HashMap<OwnedEventId, Arc<StateMap<OwnedEventId>>>,
+) -> Result<StateMap<OwnedEventId>, StateResError> {
+    if prev_state_events.is_empty() {
+        return Ok(StateMap::new());
+    }
+    let mut state_sets: Vec<StateMap<OwnedEventId>> = Vec::with_capacity(prev_state_events.len());
+    for prev_id in prev_state_events {
+        let state_before_prev = state_before_inner(prev_id, provider, cache)?;
+        let prev_info = provider
+            .get_event(prev_id)
+            .ok_or_else(|| StateResError::MissingAuthEvent(prev_id.clone()))?;
+        let mut state_after = (*state_before_prev).clone();
+        if let Some(sk) = &prev_info.event.state_key {
+            state_after.insert(
+                (prev_info.event.event_type.clone(), sk.clone()),
+                prev_id.clone(),
+            );
+        }
+        state_sets.push(state_after);
+    }
+    let refs: Vec<&StateMap<OwnedEventId>> = state_sets.iter().collect();
+    resolve_state(&refs, provider)
 }
 
 // ----------------- resolve_state -----------------
@@ -1837,6 +1942,129 @@ mod tests {
             out.get(&("m.room.create".to_string(), String::new())),
             Some(&create_id)
         );
+    }
+
+    // ----- state_before -----
+
+    #[test]
+    fn state_before_create_event_is_empty() {
+        let (provider, create_id, _) = setup_default();
+        let out = state_before(&create_id, &provider).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn state_before_unknown_event_errors() {
+        let provider = InMemoryStateProvider::new();
+        let phantom = build_create("@alice:example.org", &[], true);
+        let err = state_before(&phantom.event_id, &provider).unwrap_err();
+        assert!(matches!(err, StateResError::MissingAuthEvent(_)));
+    }
+
+    #[test]
+    fn state_before_linear_state_chain_overlays_each_event() {
+        // create → alice_join (state) → topic (state).
+        // state_before(topic) should contain create + alice_join.
+        let (mut provider, create_id, room_id) = setup_default();
+        let alice_join = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.member".to_owned(),
+        )
+        .room_id(room_id.clone())
+        .state_key("@alice:example.org".to_owned())
+        .content(json!({ "membership": "join" }))
+        .auth_events(vec![create_id.clone()])
+        .prev_events(vec![create_id.clone()])
+        .prev_state_events(vec![create_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid join");
+        let alice_join_id = put(&mut provider, alice_join);
+        let topic = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.topic".to_owned(),
+        )
+        .room_id(room_id.clone())
+        .state_key(String::new())
+        .content(json!({ "topic": "hi" }))
+        .auth_events(vec![create_id.clone(), alice_join_id.clone()])
+        .prev_events(vec![alice_join_id.clone()])
+        .prev_state_events(vec![alice_join_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid topic");
+        let topic_id = put(&mut provider, topic);
+
+        let out = state_before(&topic_id, &provider).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out.get(&("m.room.create".to_string(), String::new())),
+            Some(&create_id)
+        );
+        assert_eq!(
+            out.get(&(
+                "m.room.member".to_string(),
+                "@alice:example.org".to_string()
+            )),
+            Some(&alice_join_id)
+        );
+    }
+
+    #[test]
+    fn state_before_message_event_in_chain_does_not_appear_in_state() {
+        // create → alice_join (state) → message (NOT state) → topic (state).
+        // state_before(topic) should NOT contain the message event.
+        let (mut provider, create_id, room_id) = setup_default();
+        let alice_join = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.member".to_owned(),
+        )
+        .room_id(room_id.clone())
+        .state_key("@alice:example.org".to_owned())
+        .content(json!({ "membership": "join" }))
+        .auth_events(vec![create_id.clone()])
+        .prev_events(vec![create_id.clone()])
+        .prev_state_events(vec![create_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid join");
+        let alice_join_id = put(&mut provider, alice_join);
+        let msg = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.message".to_owned(),
+        )
+        .room_id(room_id.clone())
+        .content(json!({ "msgtype": "m.text", "body": "hi" }))
+        .auth_events(vec![create_id.clone(), alice_join_id.clone()])
+        .prev_events(vec![alice_join_id.clone()])
+        .prev_state_events(vec![alice_join_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid msg");
+        let msg_id = put(&mut provider, msg);
+        let topic = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.topic".to_owned(),
+        )
+        .room_id(room_id.clone())
+        .state_key(String::new())
+        .content(json!({ "topic": "hi" }))
+        .auth_events(vec![create_id.clone(), alice_join_id.clone()])
+        .prev_events(vec![msg_id.clone()])
+        // topic's prev_state_events points past msg to alice_join (msg is not a state event).
+        .prev_state_events(vec![alice_join_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid topic");
+        let topic_id = put(&mut provider, topic);
+
+        let out = state_before(&topic_id, &provider).unwrap();
+        // No m.room.message entry — message events leave state untouched.
+        assert!(!out.contains_key(&("m.room.message".to_string(), String::new())));
+        assert!(out.contains_key(&(
+            "m.room.member".to_string(),
+            "@alice:example.org".to_string()
+        )));
     }
 
     #[test]

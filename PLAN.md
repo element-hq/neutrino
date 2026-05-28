@@ -44,7 +44,9 @@
     - [x] Phase 4b: reverse-topo power sort + IAC pass 1 (`power_of_sender` + `reverse_topological_power_sort` + `iterative_auth_checks` in `state_res.rs`, 19 tests). `AuthContext::new` + `user_power` promoted to `pub(crate)` so creator-set + PL parsing stay defined once.
     - [x] Phase 4c: mainline + IAC pass 2 + unconflicted merge → `resolve_state` (`is_power_event` / `split_power_events` / `mainline` / `mainline_position` / `mainline_sort` / `resolve_state` in `state_res.rs`, 25 case tests + 2 props). End-to-end state-res v2.1 is now in.
     - [x] Phase 5: in-memory `StateProvider` (landed alongside Phase 4a)
-    - [ ] Phase 6: `RoomCore::apply` (orchestrates: 1a → 1b → state-res → 3 → update → effects)
+    - [x] Phase 6a: `state_before(event_id, provider)` + `state_before_for_new_event(event, provider)` free functions in `state_res.rs`. Recursive walk via `prev_state_events` with internal HashMap cache; root case = empty (create events).
+    - [x] Phase 6c: `RoomCore::apply` in `crates/neutrino-state/src/core.rs`. `Effect { Persist, MarkSoftFailed, UpdateCurrentState, EnqueueOutbox }`. Orchestration: validate_references → state_before_for_new_event → check_auth_rules → (state event) update FEs + recompute current_state via resolve_state across new FE set → second auth check vs current_state (soft-fail on failure, doesn't undo state). 5 case tests covering happy path + hard reject + non-state event + auth failure preserving room core.
+    - [ ] Phase 6b: `SqliteStateProvider` — deferred. Blocker: `events` table has no `rejected` column. Schema bump (v1 → v2) + `StateProvider` impl on `SqliteStore` will land in one batch alongside the storage-side `Effect` processor (SSAPI work).
 - [x] Client-Server Sliding Sync MSC4186 implementation
     - wired into the live axum router at `POST /_matrix/client/unstable/org.matrix.simplified_msc3575/sync`
     - 51 unit tests (one ignored — state-removal not synthesizable via the trait) + 9 end-to-end HTTP tests; every test owns its own `SqliteStore` on a `tempfile::NamedTempFile`.
