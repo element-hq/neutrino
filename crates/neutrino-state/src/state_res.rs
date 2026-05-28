@@ -432,6 +432,15 @@ pub fn split_power_events(
 
 /// Walk the m.room.power_levels chain backwards starting at `seed_pl_id`.
 ///
+/// **Caller contract**: `seed_pl_id`, if `Some`, MUST reference an
+/// `m.room.power_levels` event with `state_key == ""` (the canonical PL
+/// state-key). The function does not verify this — it pushes `seed_pl_id`
+/// onto the chain unconditionally and walks `auth_events` from there. A
+/// non-PL seed produces a meaningless chain that breaks `mainline_position`
+/// indexing downstream. In practice `resolve_state` produces the seed via
+/// `after_pass_1.get(("m.room.power_levels", ""))`, which IAC only writes
+/// for accepted PL events; external callers must enforce this themselves.
+///
 /// Each step inspects the current PL's `auth_events` for a parent PL
 /// reference. Returns `[current_pl, prev_pl, prev_prev_pl, ...]` head-first
 /// (most recent first), terminating when a PL has no PL ancestor in its
@@ -441,6 +450,12 @@ pub fn split_power_events(
 /// produced no PL in the resolved state (e.g. the room has never set
 /// power_levels). The mainline-position function treats every event as
 /// "depth == 0" in that case (all equal, ts/id tiebreak only).
+///
+/// The walk is **transitive** across PLs (PL → prev PL → prev-prev PL) but
+/// performs only a **single linear scan** of each PL's `auth_events` vec
+/// looking for a PL parent — first-match-wins. No transitive walk inside a
+/// single PL's auth_events (we never look at a non-PL parent's own
+/// auth_events while building the mainline).
 ///
 /// Synapse parity: `state/v2.py::_get_mainline_chain`.
 pub fn mainline(
