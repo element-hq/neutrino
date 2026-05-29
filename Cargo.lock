@@ -1085,14 +1085,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "neutrino-sqlite"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "serde_json",
-]
-
-[[package]]
 name = "neutrino-state"
 version = "0.1.0"
 dependencies = [

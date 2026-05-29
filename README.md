@@ -51,13 +51,11 @@
 
 Neutrino is split into a number of different modules:
 
-- `neutrino-common` contains the common type definitions and utilites used throughout the project.
+- `neutrino-common` contains the common type definitions and utilities used throughout the project.
 - `neutrino-http` contains the HTTP router for both the C2S and S2S Matrix APIs.
-- `neutrino-sqlite` contains the SQLite database table definitions and logic.
 - `neutrino-main` contains a common entrypoint between the host development and Android-embedded servers.
 
 Two of these are involved in actually building binaries of the server:
 
 - `neutrino` contains the host development binary definition.
 - `neutrino-ffi` contains bindings for Neutrino for use in Android, generated using UniFFI.
->>>>>>> f095723 (Initial commit)

@@ -1,6 +1,7 @@
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-const DEFAULT_FILTER: &str = "neutrino_core=info,neutrino_sqlite=info,neutrino_http=info,neutrino_main=info,neutrino_ffi=info";
+const DEFAULT_FILTER: &str =
+    "neutrino_core=info,neutrino_http=info,neutrino_main=info,neutrino_ffi=info";
 
 pub fn init_tracing() {
     #[cfg(not(target_os = "android"))]
