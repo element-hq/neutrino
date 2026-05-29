@@ -178,6 +178,10 @@ fn build_router(config: Config, state: AppState) -> Router {
             "/_matrix/federation/v1/get_missing_events/{room_id}",
             post(federation::get_missing_events::handle),
         )
+        .route(
+            "/_matrix/federation/v1/backfill/{room_id}",
+            get(federation::backfill::handle),
+        )
         .fallback(default_fallback)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
