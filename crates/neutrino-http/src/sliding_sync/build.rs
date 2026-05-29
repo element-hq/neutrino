@@ -1027,6 +1027,7 @@ mod unit_tests {
             prev_state_events: Vec::new(),
             auth_events: Vec::new(),
             rejected: false,
+            soft_failed: false,
             raw: serde_json::value::to_raw_value(&serde_json::json!({
                 "type": "m.room.name",
                 "state_key": "",

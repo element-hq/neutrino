@@ -132,6 +132,7 @@ pub(crate) fn make_event(
         prev_state_events: prev_state_owned,
         auth_events: Vec::new(),
         rejected: false,
+        soft_failed: false,
         raw,
     }
 }
@@ -172,6 +173,7 @@ pub(crate) fn make_event_with_raw_json(
         prev_state_events: Vec::new(),
         auth_events: Vec::new(),
         rejected: false,
+        soft_failed: false,
         raw,
     }
 }

@@ -12,9 +12,10 @@
 //!   the reference hash of `raw` (see PR 2 / `event-id-design.md`).
 //! - `raw`, the canonical wire bytes of the event.
 //!
-//! See `event-id-design.md` §"Co-location pattern" for the four
+//! See `event-id-design.md` §"Co-location pattern" for the five
 //! server-computed fields that live on the struct but not in `raw`:
-//! `event_id`, `room_id` (create events only), `auth_events`, `rejected`.
+//! `event_id`, `room_id` (create events only), `auth_events`, `rejected`,
+//! `soft_failed`.
 
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 use serde_json::value::RawValue;
@@ -58,6 +59,15 @@ pub struct Event {
     /// `prev_state_events`), but downstream callers typically branch on
     /// the flag. Server-computed, not on the v12 wire.
     pub rejected: bool,
+
+    /// Whether this event was soft-failed: it passed auth against
+    /// state-before-event but failed the auth rules against the room's
+    /// *current* state (Matrix soft-fail semantics). Such an event is still
+    /// persisted and observed by the state machine, but it never becomes a
+    /// forward extremity and must not be relayed to clients. Only non-state
+    /// events are soft-failed (state events that pass step 3 are accepted
+    /// as-is). Server-computed, not on the v12 wire.
+    pub soft_failed: bool,
 
     /// Canonical wire bytes — what gets hashed, federated, and stored.
     pub raw: Box<RawValue>,

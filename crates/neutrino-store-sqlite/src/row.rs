@@ -27,13 +27,13 @@ use crate::error::Error;
 /// `auth_events_json` carries the MSC4242 server-computed auth_events
 /// list — it's not on the wire and not in `json`, so the column is its
 /// authoritative storage. See `event-id-design.md` §"Co-location pattern".
-pub(crate) const EVENT_COLUMNS: &str = "event_id, room_id, event_type, state_key, sender, origin_server_ts, json, auth_events_json, rejected";
+pub(crate) const EVENT_COLUMNS: &str = "event_id, room_id, event_type, state_key, sender, origin_server_ts, json, auth_events_json, rejected, soft_failed";
 
 /// Same as [`EVENT_COLUMNS`] but with an `e.` prefix on each column, for
 /// SELECTs that JOIN `events` aliased as `e` (state, outbox, etc.). Keep
 /// in sync with [`EVENT_COLUMNS`] — one is just the prefixed sibling of
 /// the other.
-pub(crate) const EVENT_COLUMNS_PREFIXED: &str = "e.event_id, e.room_id, e.event_type, e.state_key, e.sender, e.origin_server_ts, e.json, e.auth_events_json, e.rejected";
+pub(crate) const EVENT_COLUMNS_PREFIXED: &str = "e.event_id, e.room_id, e.event_type, e.state_key, e.sender, e.origin_server_ts, e.json, e.auth_events_json, e.rejected, e.soft_failed";
 
 /// Row-shape wrapper around an [`Event`].
 ///
@@ -195,6 +195,7 @@ impl TryFrom<&Row<'_>> for EventRow<'static> {
         let json: String = row.get("json")?;
         let auth_events_json: String = row.get("auth_events_json")?;
         let rejected: bool = row.get("rejected")?;
+        let soft_failed: bool = row.get("soft_failed")?;
 
         let event_id = OwnedEventId::try_from(event_id)
             .map_err(|e| Error::Internal(format!("malformed event_id in DB row: {e}")))?;
@@ -228,6 +229,7 @@ impl TryFrom<&Row<'_>> for EventRow<'static> {
             prev_state_events: extracted.prev_state_events,
             auth_events,
             rejected,
+            soft_failed,
             raw,
         })))
     }
@@ -278,6 +280,16 @@ impl<'a> EventRow<'a> {
     /// checks, and member-event validation still fire — historical
     /// events have to be well-formed for the read paths to function.
     pub fn write_into_tx_historical(&self, tx: &Transaction<'_>) -> Result<i64, Error> {
+        self.write_into_tx_inner(tx, /* update_current_state */ false)
+    }
+
+    /// Resolved-event write: crack JSON, INSERT into `events`, INSERT edges.
+    /// Does NOT upsert `current_state` — the caller drives current state
+    /// explicitly from a resolved delta (see
+    /// `EventStore::persist_resolved_event`). Used when state resolution may
+    /// change current state for keys other than (or instead of) this event's
+    /// own, so a single implicit per-key upsert would be wrong.
+    pub fn write_into_tx_no_current_state(&self, tx: &Transaction<'_>) -> Result<i64, Error> {
         self.write_into_tx_inner(tx, /* update_current_state */ false)
     }
 
@@ -408,8 +420,8 @@ impl<'a> EventRow<'a> {
         })?;
         tx.execute(
             "INSERT INTO events \
-             (event_id, room_id, event_type, state_key, sender, origin_server_ts, json, auth_events_json, rejected) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (event_id, room_id, event_type, state_key, sender, origin_server_ts, json, auth_events_json, rejected, soft_failed) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 self.event_id.as_str(),
                 self.room_id.as_str(),
@@ -420,6 +432,7 @@ impl<'a> EventRow<'a> {
                 self.raw.get(),
                 auth_events_json,
                 self.rejected,
+                self.soft_failed,
             ],
         )?;
         let stream_pos = tx.last_insert_rowid();

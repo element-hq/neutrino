@@ -85,7 +85,15 @@ CREATE TABLE events (
     -- emits `rejected = 1` yet (see `Event.rejected` in
     -- `neutrino-common`).
     rejected          INTEGER NOT NULL DEFAULT 0
-        CHECK (rejected IN (0, 1))
+        CHECK (rejected IN (0, 1)),
+    -- Server-side soft-fail verdict: the event passed auth against
+    -- state-before-event but failed against current room state. It is
+    -- persisted and observed, but never becomes a forward extremity and
+    -- must be kept out of client timelines. Default 0 covers the common
+    -- "accepted, not soft-failed" case. See `Event.soft_failed` in
+    -- `neutrino-common`.
+    soft_failed       INTEGER NOT NULL DEFAULT 0
+        CHECK (soft_failed IN (0, 1))
 ) STRICT;
 
 CREATE INDEX ix_events_room_stream ON events(room_id, stream_pos);

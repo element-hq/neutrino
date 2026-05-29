@@ -123,6 +123,7 @@ pub fn make_event(
         prev_state_events: prev_state_owned,
         auth_events: Vec::new(),
         rejected: false,
+        soft_failed: false,
         raw,
     }
 }

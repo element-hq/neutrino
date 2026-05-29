@@ -203,6 +203,7 @@ mod tests {
             prev_events: Vec::new(),
             prev_state_events: Vec::new(),
             rejected: false,
+            soft_failed: false,
             auth_events: Vec::new(),
             raw,
         }
