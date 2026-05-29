@@ -26,7 +26,7 @@ use neutrino_common::event_id::room_id_from_create;
 use neutrino_state::auth_events::{auth_event_keys, calculate_auth_events};
 use neutrino_state::auth_rules::check_auth_rules;
 use neutrino_state::event_id::EventBuilder;
-use neutrino_state::provider::{EventInfo, InMemoryStateProvider, StateProvider};
+use neutrino_state::provider::{InMemoryStateProvider, StateProvider};
 use neutrino_state::state_res::{
     auth_chain_difference, conflicted_subgraph, iterative_auth_checks, power_of_sender,
     resolve_state, reverse_topological_power_sort, separate,
@@ -455,10 +455,7 @@ fn arb_provider_with_ids() -> impl Strategy<Value = (InMemoryStateProvider, Vec<
                 let ts = 1_700_000_000_000 + (i as u64);
                 let event = placeholder_arc_event(ts, parents);
                 ids.push(event.event_id.clone());
-                provider.insert(EventInfo {
-                    event,
-                    rejected: false,
-                });
+                provider.insert(event);
             }
             (provider, ids)
         })
@@ -493,7 +490,7 @@ fn auth_chain_of(seed: &OwnedEventId, provider: &dyn StateProvider) -> HashSet<O
         if chain.insert(id.clone()) {
             let parents: Vec<OwnedEventId> = provider
                 .get_event(&id)
-                .map(|info| info.event.auth_events.clone())
+                .map(|info| info.auth_events.clone())
                 .unwrap_or_default();
             for parent in &parents {
                 if !chain.contains(parent) {
@@ -720,7 +717,7 @@ proptest! {
         for id in &sg {
             let parents: Vec<OwnedEventId> = provider
                 .get_event(id)
-                .map(|info| info.event.auth_events.clone())
+                .map(|info| info.auth_events.clone())
                 .unwrap_or_default();
             for parent in &parents {
                 prop_assert!(
@@ -869,10 +866,7 @@ fn arb_linear_chain(
             let ts = 1_700_000_000_000 + (i as u64);
             let event = placeholder_arc_event(ts, parents);
             tail_to_head.push(event.event_id.clone());
-            provider.insert(EventInfo {
-                event,
-                rejected: false,
-            });
+            provider.insert(event);
         }
         // Caller expects head-first order (ids[0] is the deepest descendant).
         tail_to_head.reverse();
@@ -907,10 +901,7 @@ fn arb_diamond() -> impl Strategy<Value = (InMemoryStateProvider, [OwnedEventId;
         let root_ev = placeholder_arc_event(4, vec![left.clone(), right.clone()]);
         let root = root_ev.event_id.clone();
         for ev in [bottom_ev, left_ev, right_ev, root_ev] {
-            provider.insert(EventInfo {
-                event: ev,
-                rejected: false,
-            });
+            provider.insert(ev);
         }
         (provider, [root, left, right, bottom])
     })
@@ -965,19 +956,13 @@ proptest! {
         // collected (rebuilding via `placeholder_arc_event` would compute
         // fresh ids and the test invariants would no longer hold).
         for id in &ids_a {
-            if let Some(info) = provider_a.get_event(id) {
-                merged.insert(EventInfo {
-                    event: info.event.clone(),
-                    rejected: info.rejected,
-                });
+            if let Some(event) = provider_a.get_event(id) {
+                merged.insert(event);
             }
         }
         for id in &ids_b {
-            if let Some(info) = provider_b.get_event(id) {
-                merged.insert(EventInfo {
-                    event: info.event.clone(),
-                    rejected: info.rejected,
-                });
+            if let Some(event) = provider_b.get_event(id) {
+                merged.insert(event);
             }
         }
 
@@ -1134,13 +1119,13 @@ proptest! {
         let room_id = room_id_from_create(&create.event_id);
         let create_id = create.event_id.clone();
         let mut provider = InMemoryStateProvider::new();
-        provider.insert(EventInfo { event: Arc::new(create), rejected: false });
+        provider.insert(Arc::new(create));
 
         // PL authored by the primary creator (anyone in `creators` could
         // author it — the choice doesn't affect power_of_sender for senders).
         let pl = prop_build_pl(&room_id, &primary, pl_content(&pl_users, pl_users_default), vec![create_id.clone()]);
         let pl_id = pl.event_id.clone();
-        provider.insert(EventInfo { event: Arc::new(pl), rejected: false });
+        provider.insert(Arc::new(pl));
 
         // Pick any creator as the sender.
         let sender = &creators[creator_idx % creators.len()];
@@ -1165,10 +1150,14 @@ proptest! {
         let room_id_a = room_id_from_create(&create_a.event_id);
         let create_id_a = create_a.event_id.clone();
         let mut provider_a = InMemoryStateProvider::new();
-        provider_a.insert(EventInfo { event: Arc::new(create_a), rejected: false });
+        provider_a.insert(Arc::new(create_a));
         let pl = prop_build_pl(&room_id_a, creator, pl_content(&pl_users, pl_users_default), vec![create_id_a.clone()]);
         let pl_id = pl.event_id.clone();
-        provider_a.insert(EventInfo { event: Arc::new(pl), rejected: true });
+        provider_a.insert({
+            let mut pl = pl;
+            pl.rejected = true;
+            Arc::new(pl)
+        });
         let msg_a = prop_build_msg(&room_id_a, &sender, vec![create_id_a, pl_id]);
 
         // Setup B: create only — no PL in auth_events.
@@ -1176,7 +1165,7 @@ proptest! {
         let room_id_b = room_id_from_create(&create_b.event_id);
         let create_id_b = create_b.event_id.clone();
         let mut provider_b = InMemoryStateProvider::new();
-        provider_b.insert(EventInfo { event: Arc::new(create_b), rejected: false });
+        provider_b.insert(Arc::new(create_b));
         let msg_b = prop_build_msg(&room_id_b, &sender, vec![create_id_b]);
 
         let power_a = power_of_sender(&msg_a, &provider_a).unwrap();
@@ -1202,11 +1191,11 @@ proptest! {
         let room_id = room_id_from_create(&create.event_id);
         let create_id = create.event_id.clone();
         let mut provider = InMemoryStateProvider::new();
-        provider.insert(EventInfo { event: Arc::new(create), rejected: false });
+        provider.insert(Arc::new(create));
 
         let pl = prop_build_pl(&room_id, creator, pl_content(&pl_users, pl_users_default), vec![create_id.clone()]);
         let pl_id = pl.event_id.clone();
-        provider.insert(EventInfo { event: Arc::new(pl), rejected: false });
+        provider.insert(Arc::new(pl));
 
         let msg = prop_build_msg(&room_id, &sender, vec![create_id, pl_id]);
         let power = power_of_sender(&msg, &provider).unwrap();
@@ -1250,7 +1239,7 @@ proptest! {
             .collect();
         for eid in &subset {
             let info = provider.get_event(eid).expect("subset event in provider");
-            for parent in &info.event.auth_events {
+            for parent in &info.auth_events {
                 if subset.contains(parent) {
                     let p_idx = pos[parent];
                     let e_idx = pos[eid];
@@ -1285,7 +1274,7 @@ proptest! {
             let id = create.event_id.clone();
             allowed_keys.insert((create.event_type.clone(), create.state_key.clone().unwrap_or_default()));
             sorted.push(id);
-            provider.insert(EventInfo { event: Arc::new(create), rejected: false });
+            provider.insert(Arc::new(create));
         }
 
         let resolved = iterative_auth_checks(&sorted, initial, &provider).unwrap();
@@ -1311,7 +1300,11 @@ proptest! {
         let mut rejected_provider = InMemoryStateProvider::new();
         for id in &ids {
             let info = provider.get_event(id).expect("provider returned its own id");
-            rejected_provider.insert(EventInfo { event: info.event, rejected: true });
+            rejected_provider.insert({
+                let mut e = (*info).clone();
+                e.rejected = true;
+                Arc::new(e)
+            });
         }
         let resolved = iterative_auth_checks(&ids, initial.clone(), &rejected_provider).unwrap();
         prop_assert_eq!(resolved, initial);
@@ -1328,7 +1321,7 @@ proptest! {
         let create = prop_build_create(creator, &[], true);
         let create_id = create.event_id.clone();
         let mut provider = InMemoryStateProvider::new();
-        provider.insert(EventInfo { event: Arc::new(create), rejected: false });
+        provider.insert(Arc::new(create));
         let mut s = StateMap::new();
         s.insert(("m.room.create".to_string(), String::new()), create_id);
         let resolved = resolve_state(&[&s], &provider).unwrap();
@@ -1349,7 +1342,7 @@ proptest! {
         for c in &creators {
             let create = prop_build_create(c, &[], true);
             create_ids.push(create.event_id.clone());
-            provider.insert(EventInfo { event: Arc::new(create), rejected: false });
+            provider.insert(Arc::new(create));
         }
         let state_sets: Vec<StateMap<OwnedEventId>> = create_ids
             .iter()

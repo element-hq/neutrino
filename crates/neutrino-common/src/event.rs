@@ -12,9 +12,9 @@
 //!   the reference hash of `raw` (see PR 2 / `event-id-design.md`).
 //! - `raw`, the canonical wire bytes of the event.
 //!
-//! See `event-id-design.md` §"Co-location pattern" for the three
+//! See `event-id-design.md` §"Co-location pattern" for the four
 //! server-computed fields that live on the struct but not in `raw`:
-//! `event_id`, `room_id` (create events only), `auth_events`.
+//! `event_id`, `room_id` (create events only), `auth_events`, `rejected`.
 
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 use serde_json::value::RawValue;
@@ -51,6 +51,13 @@ pub struct Event {
     /// **Not** on the v12 wire under MSC4242 — co-located here for
     /// state-res traversal.
     pub auth_events: Vec<OwnedEventId>,
+
+    /// Whether this event was rejected by auth-rule evaluation. The state
+    /// machine still observes the event's existence (e.g. to skip its
+    /// auth-chain in state-res, or reject a child that references it via
+    /// `prev_state_events`), but downstream callers typically branch on
+    /// the flag. Server-computed, not on the v12 wire.
+    pub rejected: bool,
 
     /// Canonical wire bytes — what gets hashed, federated, and stored.
     pub raw: Box<RawValue>,

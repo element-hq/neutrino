@@ -4,7 +4,9 @@
 //!
 //! The trait carries:
 //! - `get_event(id)`: used by `validate::validate_references` (Phase 1b) and
-//!   anywhere downstream that needs the event body / rejection flag.
+//!   anywhere downstream that needs the event body / rejection flag. Rejection
+//!   lives on `Event.rejected` (server-computed, co-located on the struct),
+//!   so the trait surface is just `Option<Arc<Event>>`.
 //! - `auth_chain(seeds)`: used by Phase 4 state resolution. Returns the
 //!   transitive backwards closure of the seeds through their `auth_events`
 //!   (including the seeds themselves). **Errors** if any event in the
@@ -23,22 +25,11 @@ use ruma::{EventId, OwnedEventId};
 
 use crate::StateResError;
 
-/// View of an event known to the store, with its rejection status.
-///
-/// Rejection is tracked separately from the event body because state res
-/// must still observe the existence of a rejected event (e.g. when deciding
-/// not to walk its auth chain), but downstream callers usually need to
-/// branch on the flag.
-#[derive(Debug, Clone)]
-pub struct EventInfo {
-    pub event: Arc<Event>,
-    pub rejected: bool,
-}
-
 /// Lookup interface the state machine uses to read events.
 pub trait StateProvider {
     /// Look up an event by ID, returning `None` if the store does not know it.
-    fn get_event(&self, id: &EventId) -> Option<EventInfo>;
+    /// Rejection status is on `Event.rejected`.
+    fn get_event(&self, id: &EventId) -> Option<Arc<Event>>;
 
     /// Transitive backwards closure of `seeds` via `Event.auth_events`.
     ///
@@ -64,10 +55,10 @@ pub trait StateProvider {
 
 /// In-memory `StateProvider`. Public (not test-cfg) — Phase 6 `apply` uses
 /// it as the storage-free fallback, and unit tests use it directly. Clone
-/// is cheap: events are `Arc`-shared via `EventInfo`.
+/// is cheap: events are `Arc`-shared.
 #[derive(Debug, Default, Clone)]
 pub struct InMemoryStateProvider {
-    events: HashMap<OwnedEventId, EventInfo>,
+    events: HashMap<OwnedEventId, Arc<Event>>,
 }
 
 impl InMemoryStateProvider {
@@ -75,17 +66,17 @@ impl InMemoryStateProvider {
         Self::default()
     }
 
-    /// Insert an event into the provider. `auth_events` lives on the
-    /// `Event` itself (MSC4242 server-side metadata) — the provider
+    /// Insert an event into the provider. `auth_events` and `rejected` live
+    /// on the `Event` itself (server-computed metadata) — the provider
     /// reads them from there.
-    pub fn insert(&mut self, info: EventInfo) {
-        let id = info.event.event_id.clone();
-        self.events.insert(id, info);
+    pub fn insert(&mut self, event: Arc<Event>) {
+        let id = event.event_id.clone();
+        self.events.insert(id, event);
     }
 }
 
 impl StateProvider for InMemoryStateProvider {
-    fn get_event(&self, id: &EventId) -> Option<EventInfo> {
+    fn get_event(&self, id: &EventId) -> Option<Arc<Event>> {
         self.events.get(id).cloned()
     }
 
@@ -101,11 +92,11 @@ impl StateProvider for InMemoryStateProvider {
             }
             // Strict closure invariant: every id we visit (seed or
             // transitively discovered) must resolve. Missing => error.
-            let info = self
+            let event = self
                 .events
                 .get(&id)
                 .ok_or_else(|| StateResError::MissingEvent(id.clone()))?;
-            for parent in &info.event.auth_events {
+            for parent in &event.auth_events {
                 if !visited.contains(parent) {
                     stack.push(parent.clone());
                 }

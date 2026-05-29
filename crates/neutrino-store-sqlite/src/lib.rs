@@ -40,6 +40,8 @@ mod row;
 mod schema;
 mod store;
 
+pub use crate::store::SqliteStateProvider;
+
 #[cfg(test)]
 mod tests;
 

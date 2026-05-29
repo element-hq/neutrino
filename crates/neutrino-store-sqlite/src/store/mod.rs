@@ -7,3 +7,6 @@ mod inbox;
 mod outbox;
 mod rooms;
 mod state;
+mod state_provider;
+
+pub use state_provider::SqliteStateProvider;

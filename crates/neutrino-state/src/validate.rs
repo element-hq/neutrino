@@ -169,6 +169,9 @@ pub fn parse_event(
         prev_events,
         prev_state_events,
         auth_events,
+        // Fresh from the wire-format pass — rejection is a downstream
+        // verdict from auth-rule evaluation, not a wire-format property.
+        rejected: false,
         raw,
     })
 }
@@ -452,28 +455,28 @@ pub fn validate_references(
     // v12 rule 2.
     let derived_create_id = derive_create_event_id(&event.room_id)
         .ok_or_else(|| ReferenceError::UnknownRoom(event.room_id.clone()))?;
-    let info = provider
+    let create = provider
         .get_event(&derived_create_id)
         .ok_or_else(|| ReferenceError::UnknownRoom(event.room_id.clone()))?;
-    if info.rejected {
+    if create.rejected {
         return Err(ReferenceError::RoomRejected(event.room_id.clone()));
     }
-    if info.event.event_type != "m.room.create" {
+    if create.event_type != "m.room.create" {
         return Err(ReferenceError::RoomTypeMismatch(derived_create_id));
     }
 
     // MSC4242 prev_state_events triad.
     for psid in &event.prev_state_events {
-        let info = provider
+        let ps = provider
             .get_event(psid)
             .ok_or_else(|| ReferenceError::PrevStateNotFound(psid.clone()))?;
-        if info.rejected {
+        if ps.rejected {
             return Err(ReferenceError::PrevStateRejected(psid.clone()));
         }
-        if info.event.state_key.is_none() {
+        if ps.state_key.is_none() {
             return Err(ReferenceError::PrevStateNotStateEvent(psid.clone()));
         }
-        if info.event.room_id != event.room_id {
+        if ps.room_id != event.room_id {
             return Err(ReferenceError::PrevStateDifferentRoom(psid.clone()));
         }
     }
@@ -1027,26 +1030,27 @@ mod tests {
     // =====================================================================
 
     use crate::ReferenceError;
-    use crate::provider::{EventInfo, InMemoryStateProvider};
+    use crate::provider::InMemoryStateProvider;
     use std::sync::Arc;
 
     /// Helper around `InMemoryStateProvider::insert` for the validate tests.
     /// `validate_references` only calls `get_event`, so the embedded
     /// `Event.auth_events` is irrelevant here (left empty by `parse_event`
-    /// callers).
-    fn insert_event(provider: &mut InMemoryStateProvider, info: EventInfo) {
-        provider.insert(info);
+    /// callers). `rejected` is set on the `Event` before insertion.
+    fn insert_event(provider: &mut InMemoryStateProvider, mut event: Event, rejected: bool) {
+        event.rejected = rejected;
+        provider.insert(Arc::new(event));
     }
 
-    fn make_event(json: Value, event_id: &str) -> Arc<Event> {
-        Arc::new(parse_event(raw(json), eid(event_id), vec![]).expect("test event valid"))
+    fn make_event(json: Value, event_id: &str) -> Event {
+        parse_event(raw(json), eid(event_id), vec![]).expect("test event valid")
     }
 
-    fn make_create(event_id: &str) -> Arc<Event> {
+    fn make_create(event_id: &str) -> Event {
         make_event(base_create(), event_id)
     }
 
-    fn make_message(room_id: &str, prev_state: Vec<&str>, event_id: &str) -> Arc<Event> {
+    fn make_message(room_id: &str, prev_state: Vec<&str>, event_id: &str) -> Event {
         let mut v = base_event();
         v["room_id"] = json!(room_id);
         v["prev_state_events"] = json!(
@@ -1058,7 +1062,7 @@ mod tests {
         make_event(v, event_id)
     }
 
-    fn make_state_event(room_id: &str, event_id: &str) -> Arc<Event> {
+    fn make_state_event(room_id: &str, event_id: &str) -> Event {
         // A state event in `room_id` (m.room.topic with state_key "").
         let mut v = base_event();
         v["type"] = json!("m.room.topic");
@@ -1078,13 +1082,7 @@ mod tests {
     #[test]
     fn refs_happy_path_known_room() {
         let mut provider = InMemoryStateProvider::new();
-        insert_event(
-            &mut provider,
-            EventInfo {
-                event: make_create("$create:example.org"),
-                rejected: false,
-            },
-        );
+        insert_event(&mut provider, make_create("$create:example.org"), false);
         let msg = make_message("!create:example.org", vec![], "$msg:example.org");
         validate_references(&msg, &provider).expect("known room");
     }
@@ -1104,13 +1102,7 @@ mod tests {
     #[test]
     fn refs_rejected_create_rejects_event() {
         let mut provider = InMemoryStateProvider::new();
-        insert_event(
-            &mut provider,
-            EventInfo {
-                event: make_create("$create:example.org"),
-                rejected: true,
-            },
-        );
+        insert_event(&mut provider, make_create("$create:example.org"), true);
         let msg = make_message("!create:example.org", vec![], "$msg:example.org");
         assert!(matches!(
             validate_references(&msg, &provider),
@@ -1125,10 +1117,8 @@ mod tests {
         // Store a non-create event at id "$create:example.org".
         insert_event(
             &mut provider,
-            EventInfo {
-                event: make_state_event("!somewhere:example.org", "$create:example.org"),
-                rejected: false,
-            },
+            make_state_event("!somewhere:example.org", "$create:example.org"),
+            false,
         );
         let msg = make_message("!create:example.org", vec![], "$msg:example.org");
         assert!(matches!(
@@ -1141,13 +1131,7 @@ mod tests {
     #[test]
     fn refs_prev_state_not_found_rejected() {
         let mut provider = InMemoryStateProvider::new();
-        insert_event(
-            &mut provider,
-            EventInfo {
-                event: make_create("$create:example.org"),
-                rejected: false,
-            },
-        );
+        insert_event(&mut provider, make_create("$create:example.org"), false);
         let msg = make_message(
             "!create:example.org",
             vec!["$missing:example.org"],
@@ -1163,19 +1147,11 @@ mod tests {
     #[test]
     fn refs_prev_state_rejected_rejects_event() {
         let mut provider = InMemoryStateProvider::new();
+        insert_event(&mut provider, make_create("$create:example.org"), false);
         insert_event(
             &mut provider,
-            EventInfo {
-                event: make_create("$create:example.org"),
-                rejected: false,
-            },
-        );
-        insert_event(
-            &mut provider,
-            EventInfo {
-                event: make_state_event("!create:example.org", "$rejected:example.org"),
-                rejected: true,
-            },
+            make_state_event("!create:example.org", "$rejected:example.org"),
+            true,
         );
         let msg = make_message(
             "!create:example.org",
@@ -1192,22 +1168,10 @@ mod tests {
     #[test]
     fn refs_prev_state_non_state_event_rejected() {
         let mut provider = InMemoryStateProvider::new();
-        insert_event(
-            &mut provider,
-            EventInfo {
-                event: make_create("$create:example.org"),
-                rejected: false,
-            },
-        );
+        insert_event(&mut provider, make_create("$create:example.org"), false);
         // make_message() produces an m.room.message without state_key.
         let non_state = make_message("!create:example.org", vec![], "$msg-ref:example.org");
-        insert_event(
-            &mut provider,
-            EventInfo {
-                event: non_state,
-                rejected: false,
-            },
-        );
+        insert_event(&mut provider, non_state, false);
         let msg = make_message(
             "!create:example.org",
             vec!["$msg-ref:example.org"],
@@ -1223,20 +1187,12 @@ mod tests {
     #[test]
     fn refs_prev_state_different_room_rejected() {
         let mut provider = InMemoryStateProvider::new();
-        insert_event(
-            &mut provider,
-            EventInfo {
-                event: make_create("$create:example.org"),
-                rejected: false,
-            },
-        );
+        insert_event(&mut provider, make_create("$create:example.org"), false);
         // A state event whose room_id is a different room.
         insert_event(
             &mut provider,
-            EventInfo {
-                event: make_state_event("!other:example.org", "$other-state:example.org"),
-                rejected: false,
-            },
+            make_state_event("!other:example.org", "$other-state:example.org"),
+            false,
         );
         let msg = make_message(
             "!create:example.org",
@@ -1252,26 +1208,16 @@ mod tests {
     #[test]
     fn refs_multiple_prev_state_all_valid() {
         let mut provider = InMemoryStateProvider::new();
+        insert_event(&mut provider, make_create("$create:example.org"), false);
         insert_event(
             &mut provider,
-            EventInfo {
-                event: make_create("$create:example.org"),
-                rejected: false,
-            },
+            make_state_event("!create:example.org", "$state1:example.org"),
+            false,
         );
         insert_event(
             &mut provider,
-            EventInfo {
-                event: make_state_event("!create:example.org", "$state1:example.org"),
-                rejected: false,
-            },
-        );
-        insert_event(
-            &mut provider,
-            EventInfo {
-                event: make_state_event("!create:example.org", "$state2:example.org"),
-                rejected: false,
-            },
+            make_state_event("!create:example.org", "$state2:example.org"),
+            false,
         );
         let msg = make_message(
             "!create:example.org",

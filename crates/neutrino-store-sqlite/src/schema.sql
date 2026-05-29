@@ -62,7 +62,17 @@ CREATE TABLE events (
     -- denormalised `event_edges WHERE edge_type='auth'` rows below are
     -- derivable from this column; see `event-id-design.md` §"What
     -- event_edges is doing".
-    auth_events_json  TEXT    NOT NULL DEFAULT '[]'
+    auth_events_json  TEXT    NOT NULL DEFAULT '[]',
+    -- Server-side rejection verdict from auth-rule evaluation. Rejected
+    -- events MUST still be observable so state-res can skip their
+    -- auth-chains and child events can detect a rejected
+    -- `prev_state_events` ancestor; the flag gates downstream
+    -- visibility (client relay, etc.). Default 0 covers the common
+    -- "freshly persisted, accepted" case — no production write path
+    -- emits `rejected = 1` yet (see `Event.rejected` in
+    -- `neutrino-common`).
+    rejected          INTEGER NOT NULL DEFAULT 0
+        CHECK (rejected IN (0, 1))
 ) STRICT;
 
 CREATE INDEX ix_events_room_stream ON events(room_id, stream_pos);

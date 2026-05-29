@@ -361,6 +361,13 @@ pub enum StateResError {
     /// locally or arrives with its full chain).
     #[error("state-res references unknown event: {0}")]
     MissingEvent(OwnedEventId),
+    /// Storage-side fault while serving a provider lookup — SQL driver
+    /// error, malformed row, JSON serialisation, anything that isn't a
+    /// missing-event signal. In-memory providers never produce this; the
+    /// SQLite-backed provider surfaces driver / hydration faults here so
+    /// state-res can bubble them up the call stack rather than panic.
+    #[error("state-res internal error: {0}")]
+    Internal(String),
 }
 
 /// Top-level error type returned by the state machine.

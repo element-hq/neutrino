@@ -1124,6 +1124,7 @@ dependencies = [
  "deadpool-sqlite",
  "lazy_static",
  "neutrino-common",
+ "neutrino-state",
  "neutrino-store",
  "ruma",
  "serde",

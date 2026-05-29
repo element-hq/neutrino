@@ -173,15 +173,12 @@ pub fn power_of_sender(event: &Event, provider: &dyn StateProvider) -> Result<i6
         if info.rejected {
             continue;
         }
-        match info.event.event_type.as_str() {
+        match info.event_type.as_str() {
             "m.room.create" => {
-                state.insert(("m.room.create".to_owned(), String::new()), info.event);
+                state.insert(("m.room.create".to_owned(), String::new()), info);
             }
             "m.room.power_levels" => {
-                state.insert(
-                    ("m.room.power_levels".to_owned(), String::new()),
-                    info.event,
-                );
+                state.insert(("m.room.power_levels".to_owned(), String::new()), info);
             }
             _ => {}
         }
@@ -224,8 +221,8 @@ pub fn reverse_topological_power_sort(
         let info = provider
             .get_event(eid)
             .ok_or_else(|| StateResError::MissingEvent(eid.clone()))?;
-        let pl = power_of_sender(&info.event, provider)?;
-        event_map.insert(eid.clone(), info.event);
+        let pl = power_of_sender(&info, provider)?;
+        event_map.insert(eid.clone(), info);
         event_to_pl.insert(eid.clone(), pl);
     }
 
@@ -325,7 +322,7 @@ pub fn iterative_auth_checks(
         if info.rejected {
             continue;
         }
-        let event = info.event;
+        let event = info;
 
         let mut auth_map: StateMap<Arc<Event>> = HashMap::new();
         for aid in &event.auth_events {
@@ -340,12 +337,11 @@ pub fn iterative_auth_checks(
             // produced a malformed auth chain. Surface loudly rather than
             // inserting under `(type, "")` and masking the corruption.
             let sk = parent
-                .event
                 .state_key
                 .clone()
                 .expect("auth_events entries are state events (state_key present)");
-            let key = (parent.event.event_type.clone(), sk);
-            auth_map.insert(key, parent.event);
+            let key = (parent.event_type.clone(), sk);
+            auth_map.insert(key, parent);
         }
 
         // Iterative step: overlay resolved-state entries for the keys this
@@ -356,7 +352,7 @@ pub fn iterative_auth_checks(
                     .get_event(rs_id)
                     .ok_or_else(|| StateResError::MissingEvent(rs_id.clone()))?;
                 if !rs_info.rejected {
-                    auth_map.insert(key, rs_info.event);
+                    auth_map.insert(key, rs_info);
                 }
             }
         }
@@ -419,7 +415,7 @@ pub fn split_power_events(
         let info = provider
             .get_event(eid)
             .ok_or_else(|| StateResError::MissingEvent(eid.clone()))?;
-        if is_power_event(&info.event) {
+        if is_power_event(&info) {
             power.insert(eid.clone());
         } else {
             non_power.insert(eid.clone());
@@ -473,15 +469,14 @@ pub fn mainline(
         // (no transitive walk): under MSC4242 v12, `calculate_auth_events`
         // emits the immediately-prior PL directly in `auth_events`.
         let mut next: Option<OwnedEventId> = None;
-        for aid in &info.event.auth_events {
+        for aid in &info.auth_events {
             let parent = provider
                 .get_event(aid)
                 .ok_or_else(|| StateResError::MissingEvent(aid.clone()))?;
             if parent.rejected {
                 continue;
             }
-            if parent.event.event_type == "m.room.power_levels"
-                && parent.event.state_key.as_deref() == Some("")
+            if parent.event_type == "m.room.power_levels" && parent.state_key.as_deref() == Some("")
             {
                 next = Some(aid.clone());
                 break;
@@ -526,15 +521,14 @@ pub fn mainline_position(
             .get_event(&current)
             .ok_or_else(|| StateResError::MissingEvent(current.clone()))?;
         let mut next: Option<OwnedEventId> = None;
-        for aid in &info.event.auth_events {
+        for aid in &info.auth_events {
             let parent = provider
                 .get_event(aid)
                 .ok_or_else(|| StateResError::MissingEvent(aid.clone()))?;
             if parent.rejected {
                 continue;
             }
-            if parent.event.event_type == "m.room.power_levels"
-                && parent.event.state_key.as_deref() == Some("")
+            if parent.event_type == "m.room.power_levels" && parent.state_key.as_deref() == Some("")
             {
                 next = Some(aid.clone());
                 break;
@@ -578,7 +572,7 @@ pub fn mainline_sort(
             .get_event(eid)
             .ok_or_else(|| StateResError::MissingEvent(eid.clone()))?;
         let depth = mainline_position(eid, &mainline_map, mainline_len, provider)?;
-        decorated.push((depth, info.event.origin_server_ts, eid.clone()));
+        decorated.push((depth, info.origin_server_ts, eid.clone()));
     }
     decorated.sort();
     Ok(decorated.into_iter().map(|(_, _, id)| id).collect())
@@ -622,11 +616,8 @@ pub fn state_at_heads(
             .get_event(head)
             .ok_or_else(|| StateResError::MissingEvent(head.clone()))?;
         let mut state_after = (*state_before_head).clone();
-        if let Some(sk) = &head_info.event.state_key {
-            state_after.insert(
-                (head_info.event.event_type.clone(), sk.clone()),
-                head.clone(),
-            );
+        if let Some(sk) = &head_info.state_key {
+            state_after.insert((head_info.event_type.clone(), sk.clone()), head.clone());
         }
         state_sets.push(state_after);
     }
@@ -665,13 +656,13 @@ fn state_before_inner(
         .ok_or_else(|| StateResError::MissingEvent(owned.clone()))?;
 
     // Root: no prev_state_events (create event) → empty state-before.
-    if info.event.prev_state_events.is_empty() {
+    if info.prev_state_events.is_empty() {
         let empty = Arc::new(StateMap::new());
         cache.insert(owned, empty.clone());
         return Ok(empty);
     }
 
-    let resolved = state_at_heads(&info.event.prev_state_events, provider, cache)?;
+    let resolved = state_at_heads(&info.prev_state_events, provider, cache)?;
     let arc = Arc::new(resolved);
     cache.insert(owned, arc.clone());
     Ok(arc)
@@ -749,7 +740,7 @@ mod tests {
     use super::*;
     use crate::Event;
     use crate::event_id::EventBuilder;
-    use crate::provider::{EventInfo, InMemoryStateProvider};
+    use crate::provider::InMemoryStateProvider;
     use crate::test_utils::next_ts;
     use ruma::{room_id, user_id};
     use serde_json::json;
@@ -800,10 +791,7 @@ mod tests {
             .collect();
         let (id, ev) = placeholder(auth_chain);
         bag.insert(label, id);
-        provider.insert(EventInfo {
-            event: ev,
-            rejected: false,
-        });
+        provider.insert(ev);
     }
 
     /// Build a state map from `(type, state_key, label)` triples — the label
@@ -1142,21 +1130,16 @@ mod tests {
     /// id.
     fn put(provider: &mut InMemoryStateProvider, ev: Event) -> OwnedEventId {
         let id = ev.event_id.clone();
-        provider.insert(EventInfo {
-            event: Arc::new(ev),
-            rejected: false,
-        });
+        provider.insert(Arc::new(ev));
         id
     }
 
     /// Insert an event into the provider as `rejected: true` (skipped by
     /// downstream consumers).
-    fn put_rejected(provider: &mut InMemoryStateProvider, ev: Event) -> OwnedEventId {
+    fn put_rejected(provider: &mut InMemoryStateProvider, mut ev: Event) -> OwnedEventId {
+        ev.rejected = true;
         let id = ev.event_id.clone();
-        provider.insert(EventInfo {
-            event: Arc::new(ev),
-            rejected: true,
-        });
+        provider.insert(Arc::new(ev));
         id
     }
 
