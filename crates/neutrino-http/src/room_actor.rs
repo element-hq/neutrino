@@ -198,6 +198,12 @@ impl RoomActor {
 
 /// Registry of per-room actors. Looks up (or lazily bootstraps + spawns) the
 /// single actor for a room and forwards commands to it.
+///
+/// The map grows monotonically: an entry (and its spawned task) is created on
+/// first access to a room and is never evicted. This is intentional for the
+/// embedded single-user homeserver — the live room set is small and bounded by
+/// the device's own membership, so there's no idle-eviction / LRU policy. If
+/// this ever backs a multi-tenant deployment, add one.
 pub struct RoomRegistry {
     store: Arc<SqliteStore>,
     actors: Mutex<HashMap<OwnedRoomId, mpsc::Sender<Command>>>,

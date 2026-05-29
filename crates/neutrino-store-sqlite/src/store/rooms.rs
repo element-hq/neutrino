@@ -147,7 +147,7 @@ impl RoomStore for SqliteStore {
 
             tx.commit()?;
 
-            // 4. One watch advance for the whole batch — clients waking
+            // 5. One watch advance for the whole batch — clients waking
             //    up will fetch all the new events via a single
             //    `events_after`.
             SqliteStore::notify_watch(&watch_tx, last_pos);
