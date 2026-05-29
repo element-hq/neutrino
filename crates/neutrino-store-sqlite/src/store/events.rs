@@ -1,9 +1,11 @@
 //! `EventStore` impl on `SqliteStore`.
 
+use std::collections::BTreeSet;
+
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{OptionalExtension, params, params_from_iter};
 use neutrino_store::{Direction, Event, EventStore, PaginationToken, StorageError, StreamPos};
-use ruma::{EventId, OwnedServerName, RoomId, ServerName};
+use ruma::{EventId, OwnedEventId, OwnedServerName, RoomId, ServerName};
 use tokio::sync::watch;
 
 use crate::{
@@ -74,6 +76,49 @@ impl EventStore for SqliteStore {
             // Watch still advances so subscribers waiting on stream
             // changes can discover the new history (e.g. a paginating
             // client refetching `room_messages`).
+            SqliteStore::notify_watch(&watch_tx, stream_pos);
+
+            Ok(())
+        })
+        .await
+    }
+
+    async fn persist_resolved_event(
+        &self,
+        event: &Event,
+        timeline_fes: &BTreeSet<OwnedEventId>,
+        state_fes: &BTreeSet<OwnedEventId>,
+    ) -> Result<(), StorageError> {
+        // event_id <-> raw consistency asserted inside `EventRow::from`.
+        let event = EventRow::from(event).to_owned();
+        let timeline_json = fe_json(timeline_fes)?;
+        let state_json = fe_json(state_fes)?;
+        let watch_tx = self.watch_tx.clone();
+
+        self.run_write(move |conn| -> Result<(), Error> {
+            let tx = conn.transaction()?;
+
+            // Event row + DAG edges + (for a state event) its own
+            // `current_state` key upserted — `write_into_tx` already does all
+            // three. An accepted event changes at most its own state key, so
+            // the per-key upsert is the whole current-state delta here; the
+            // full resolved-map replacement is only needed once federation
+            // state-merge lands (it can change several keys at once).
+            let stream_pos = event.write_into_tx(&tx)?;
+
+            // Replace the room's two head-sets. The `events.room_id` FK that
+            // `write_into_tx` just satisfied guarantees the room exists, so
+            // this UPDATE always matches its row.
+            tx.execute(
+                "UPDATE rooms \
+                 SET forward_extremities = ?, state_dag_forward_extremities = ? \
+                 WHERE room_id = ?",
+                params![timeline_json, state_json, event.room_id.as_str()],
+            )?;
+
+            tx.commit()?;
+
+            // Notify after commit, like `persist_event`.
             SqliteStore::notify_watch(&watch_tx, stream_pos);
 
             Ok(())
@@ -273,11 +318,24 @@ impl EventStore for SqliteStore {
     }
 }
 
+/// Serialise a forward-extremity set to the JSON-array form stored in the
+/// `rooms` columns. Mirror of `parse_event_id_set` in `rooms.rs`.
+/// Serialisation of a list of typed ids can't fail in practice; any error
+/// maps to `Internal`.
+fn fe_json(fes: &BTreeSet<OwnedEventId>) -> Result<String, Error> {
+    serde_json::to_string(&fes.iter().map(|id| id.as_str()).collect::<Vec<_>>())
+        .map_err(|e| Error::Internal(format!("serialising forward_extremities: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use deadpool_sqlite::rusqlite::params;
     use neutrino_common::Event;
-    use neutrino_store::{Direction, EventStore, PaginationToken, StorageError, StreamPos};
+    use neutrino_store::{
+        Direction, EventStore, PaginationToken, RoomStore, StateStore, StorageError, StreamPos,
+    };
     use ruma::{EventId, OwnedEventId, event_id, room_id, server_name};
     use serde_json::json;
 
@@ -300,6 +358,64 @@ mod tests {
     /// Convenience wrapper for tests that don't need the create event id.
     async fn store_with_room() -> SqliteStore {
         store_with_room_and_create().await.0
+    }
+
+    // EZ1: persist_resolved_event writes the event + its current_state key
+    // (per-key upsert) and replaces both forward-extremity columns. The load
+    // half (`forward_extremities`) round-trips the head-sets.
+    #[tokio::test]
+    async fn persist_resolved_event_state_event_updates_state_and_fe_columns() {
+        let (s, create) = store_with_room_and_create().await;
+        let name = name_event(*ALICE_ROOM_ID, *ALICE_USER_ID, "Room");
+        let name_id = name.event_id.clone();
+        let timeline: BTreeSet<OwnedEventId> = [name_id.clone()].into_iter().collect();
+        let state: BTreeSet<OwnedEventId> = [create.event_id.clone(), name_id.clone()]
+            .into_iter()
+            .collect();
+
+        s.persist_resolved_event(&name, &timeline, &state)
+            .await
+            .unwrap();
+
+        assert_eq!(s.get_events(&[&name_id]).await.unwrap().len(), 1);
+        let cs = s
+            .current_state_event(*ALICE_ROOM_ID, "m.room.name", "")
+            .await
+            .unwrap();
+        assert_eq!(cs.map(|e| e.event_id), Some(name_id));
+        let (tl, st) = s
+            .forward_extremities(*ALICE_ROOM_ID)
+            .await
+            .unwrap()
+            .expect("room exists");
+        assert_eq!(tl, timeline);
+        assert_eq!(st, state);
+    }
+
+    // EZ2: persist_resolved_event for a non-state event moves the timeline
+    // column but writes no current_state row (a message has no state_key).
+    #[tokio::test]
+    async fn persist_resolved_event_non_state_event_writes_no_current_state() {
+        let (s, create) = store_with_room_and_create().await;
+        let msg = message(*ALICE_ROOM_ID, *ALICE_USER_ID, "hi");
+        let msg_id = msg.event_id.clone();
+        let timeline: BTreeSet<OwnedEventId> = [msg_id.clone()].into_iter().collect();
+        let state: BTreeSet<OwnedEventId> = [create.event_id.clone()].into_iter().collect();
+
+        s.persist_resolved_event(&msg, &timeline, &state)
+            .await
+            .unwrap();
+
+        let (tl, st) = s
+            .forward_extremities(*ALICE_ROOM_ID)
+            .await
+            .unwrap()
+            .expect("room exists");
+        assert_eq!(tl, timeline);
+        assert_eq!(st, state);
+
+        let current = s.current_room_state(*ALICE_ROOM_ID).await.unwrap();
+        assert!(!current.values().any(|e| e.event_id == msg_id));
     }
 
     // E2: persist_event for unknown room → InvalidInput (FK violation)

@@ -174,6 +174,26 @@ impl RoomCore {
         }
     }
 
+    /// Rebuild a `RoomCore` from state previously persisted to storage: the
+    /// two head-sets and the resolved current state. Bootstraps a room's
+    /// in-memory state machine on first access (e.g. after a restart) — the
+    /// inverse of persisting `apply`'s effects. `timeline_fes` are the
+    /// timeline-DAG heads (`forward_extremities`), `state_fes` the state-DAG
+    /// heads (`state_forward_extremities`).
+    pub fn hydrate(
+        room_id: OwnedRoomId,
+        timeline_fes: BTreeSet<OwnedEventId>,
+        state_fes: BTreeSet<OwnedEventId>,
+        current_state: StateMap<Arc<Event>>,
+    ) -> Self {
+        Self {
+            room_id,
+            forward_extremities: timeline_fes,
+            state_forward_extremities: state_fes,
+            current_state: Arc::new(current_state),
+        }
+    }
+
     /// The room this state machine is tracking.
     pub fn room_id(&self) -> &ruma::RoomId {
         &self.room_id
@@ -847,6 +867,36 @@ mod tests {
             "expected empty effects, got {effects:?}"
         );
         assert_eq!(room.forward_extremities, pre_fe);
+    }
+
+    #[test]
+    fn hydrate_round_trips_supplied_state() {
+        // `hydrate` is the inverse of persisting apply's effects: it rebuilds
+        // a RoomCore from the two head-sets and current_state read out of
+        // storage. Assert each piece lands on the right field.
+        let create = create_event("@alice:example.org");
+        let room_id = room_id_from_create(&create.event_id);
+        let create_id = create.event_id.clone();
+        let timeline: BTreeSet<OwnedEventId> = [create_id.clone()].into_iter().collect();
+        let state: BTreeSet<OwnedEventId> = [create_id.clone()].into_iter().collect();
+        let mut current: StateMap<Arc<Event>> = StateMap::new();
+        current.insert(
+            ("m.room.create".to_string(), String::new()),
+            Arc::new(create),
+        );
+
+        let room = RoomCore::hydrate(room_id.clone(), timeline.clone(), state.clone(), current);
+
+        assert_eq!(room.room_id(), &*room_id);
+        assert_eq!(room.forward_extremities(), &timeline);
+        assert_eq!(room.state_forward_extremities(), &state);
+        assert_eq!(room.current_state().len(), 1);
+        assert_eq!(
+            room.current_state()
+                .get(&("m.room.create".to_string(), String::new()))
+                .map(|e| e.event_id.clone()),
+            Some(create_id)
+        );
     }
 
     #[test]
