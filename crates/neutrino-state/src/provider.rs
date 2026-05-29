@@ -27,9 +27,17 @@ use crate::StateResError;
 
 /// Lookup interface the state machine uses to read events.
 pub trait StateProvider {
-    /// Look up an event by ID, returning `None` if the store does not know it.
-    /// Rejection status is on `Event.rejected`.
-    fn get_event(&self, id: &EventId) -> Option<Arc<Event>>;
+    /// Look up an event by ID.
+    ///
+    /// - `Ok(Some(event))` — found. Rejection status is on `Event.rejected`.
+    /// - `Ok(None)` — the store genuinely does not know the id. Callers map
+    ///   this to their own semantic verdict (`MissingEvent`, `UnknownRoom`,
+    ///   `PrevStateNotFound`, …).
+    /// - `Err(StateResError::Internal)` — the lookup itself failed (SQL /
+    ///   hydration fault). This must propagate as a fault, never be conflated
+    ///   with "absent": a transient DB error is not a verdict about the event.
+    ///   In-memory impls never return `Err`.
+    fn get_event(&self, id: &EventId) -> Result<Option<Arc<Event>>, StateResError>;
 
     /// Transitive backwards closure of `seeds` via `Event.auth_events`.
     ///
@@ -76,8 +84,8 @@ impl InMemoryStateProvider {
 }
 
 impl StateProvider for InMemoryStateProvider {
-    fn get_event(&self, id: &EventId) -> Option<Arc<Event>> {
-        self.events.get(id).cloned()
+    fn get_event(&self, id: &EventId) -> Result<Option<Arc<Event>>, StateResError> {
+        Ok(self.events.get(id).cloned())
     }
 
     fn auth_chain(

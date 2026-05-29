@@ -456,7 +456,7 @@ pub fn validate_references(
     let derived_create_id = derive_create_event_id(&event.room_id)
         .ok_or_else(|| ReferenceError::UnknownRoom(event.room_id.clone()))?;
     let create = provider
-        .get_event(&derived_create_id)
+        .get_event(&derived_create_id)?
         .ok_or_else(|| ReferenceError::UnknownRoom(event.room_id.clone()))?;
     if create.rejected {
         return Err(ReferenceError::RoomRejected(event.room_id.clone()));
@@ -468,7 +468,7 @@ pub fn validate_references(
     // MSC4242 prev_state_events triad.
     for psid in &event.prev_state_events {
         let ps = provider
-            .get_event(psid)
+            .get_event(psid)?
             .ok_or_else(|| ReferenceError::PrevStateNotFound(psid.clone()))?;
         if ps.rejected {
             return Err(ReferenceError::PrevStateRejected(psid.clone()));

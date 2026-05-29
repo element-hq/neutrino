@@ -15,6 +15,29 @@
 //! }).await
 //! ```
 //!
+//! The deferred apply+persist step needs the state-res read *and* the
+//! persist write to be atomic — i.e. share one write transaction. The
+//! `&Connection` borrow composes with that: a [`rusqlite::Transaction`]
+//! derefs to `&Connection`, so the provider is built from `&tx`, used for
+//! reads, then dropped before the `tx` is consumed by `commit`:
+//!
+//! ```text
+//! storage.run_write(move |conn| {
+//!     let tx = conn.transaction()?;
+//!     let effects = {
+//!         let provider = SqliteStateProvider::new(&tx); // Transaction: Deref<Connection>
+//!         room_core::apply(&provider, event)?           // reads via provider
+//!     };                                                // provider dropped here
+//!     // ... apply `effects`: writes via the *same* `tx` ...
+//!     tx.commit()?;                                     // consumes `tx`
+//! }).await
+//! ```
+//!
+//! The provider's shared `&Connection` borrow and the `tx`'s own writes
+//! (`tx.execute`, also `&self`) coexist as shared borrows; only `commit`
+//! takes `tx` by value, which is why the provider lives in an inner scope.
+//! `provider_usable_inside_write_transaction` in the tests pins this down.
+//!
 //! Two trait methods, both single-query:
 //!
 //! - [`get_event`]: one SELECT against `events`, hydrating the row through
@@ -69,15 +92,12 @@ impl<'a> SqliteStateProvider<'a> {
 }
 
 impl StateProvider for SqliteStateProvider<'_> {
-    fn get_event(&self, id: &EventId) -> Option<Arc<Event>> {
-        // Surface SQL / hydration errors as None — the trait has no
-        // fallible return shape here. State-res handles the missing case
-        // (it then errors with `MissingEvent` at the right call site),
-        // so we don't lose error context: a genuine DB fault and an
-        // unknown-id both lead to the same downstream MissingEvent error,
-        // which is the right level of detail for the caller. The
-        // alternative (panicking on hydration failure) would tear down
-        // the whole apply pipeline for a recoverable corruption signal.
+    fn get_event(&self, id: &EventId) -> Result<Option<Arc<Event>>, StateResError> {
+        // `Ok(None)` is reserved for a genuine miss (no row). SQL driver
+        // and row-hydration faults are real failures, not "absent", and
+        // must surface as `Internal` so callers never mistake a transient
+        // DB error for an unknown event (which, in `validate_references`,
+        // would hard-reject an otherwise-valid event).
         let query = format!("SELECT {EVENT_COLUMNS} FROM events WHERE event_id = ?");
         let row: Option<Result<Event, Error>> = self
             .conn
@@ -85,9 +105,14 @@ impl StateProvider for SqliteStateProvider<'_> {
                 Ok(EventRow::try_from(row).map(EventRow::into_event))
             })
             .optional()
-            .ok()?;
-        let event = row?.ok()?;
-        Some(Arc::new(event))
+            .map_err(|e| Self::into_internal(Error::Sqlite(e)))?;
+        match row {
+            None => Ok(None),
+            Some(hydrated) => {
+                let event = hydrated.map_err(Self::into_internal)?;
+                Ok(Some(Arc::new(event)))
+            }
+        }
     }
 
     fn auth_chain(
@@ -207,7 +232,7 @@ mod tests {
         let (s, create) = store_with_room_and_create().await;
         let create_id = create.event_id.clone();
         let got = with_provider(&s, move |p| p.get_event(&create_id)).await;
-        let got = got.expect("create event present");
+        let got = got.expect("lookup ok").expect("create event present");
         assert_eq!(got.event_id, create.event_id);
         assert_eq!(got.room_id, create.room_id);
         assert_eq!(got.event_type, "m.room.create");
@@ -218,7 +243,9 @@ mod tests {
     async fn get_event_returns_none_for_unknown_id() {
         let s = store_with_room_and_create().await.0;
         let got = with_provider(&s, |p| {
-            p.get_event(event_id!("$nope:example.org")).is_none()
+            p.get_event(event_id!("$nope:example.org"))
+                .expect("lookup ok")
+                .is_none()
         })
         .await;
         assert!(got, "unknown id must return None");
@@ -243,7 +270,7 @@ mod tests {
         .unwrap();
         let create_id = create.event_id.clone();
         let got = with_provider(&s, move |p| p.get_event(&create_id)).await;
-        assert!(got.expect("event present").rejected);
+        assert!(got.expect("lookup ok").expect("event present").rejected);
     }
 
     // -------- auth_chain --------
@@ -373,6 +400,98 @@ mod tests {
                 assert_eq!(id.as_str(), "$ghost:example.org");
             }
             other => panic!("expected MissingEvent, got {other:?}"),
+        }
+    }
+
+    // -------- usage inside a write transaction (forward-looking) --------
+
+    #[tokio::test]
+    async fn provider_usable_inside_write_transaction() {
+        // The deferred apply+persist step builds the provider and writes in
+        // ONE write transaction (atomic apply). The provider borrows
+        // `&Connection`; a `Transaction` derefs to one, so it's constructed
+        // from `&tx`, used for reads, then dropped before `commit` consumes
+        // the `tx`. This pins that borrow pattern so the future wiring can't
+        // regress into a borrow-checker dead end.
+        let (s, create) = store_with_room_and_create().await;
+        let create_id = create.event_id.clone();
+        let present = s
+            .run_write(move |conn| -> Result<bool, Error> {
+                let tx = conn.transaction()?;
+                let present = {
+                    let provider = SqliteStateProvider::new(&tx);
+                    provider
+                        .get_event(&create_id)
+                        .map_err(|e| Error::Internal(e.to_string()))?
+                        .is_some()
+                };
+                // A write on the same `tx`, after the provider read — proves
+                // the shared `&Connection` borrow coexists with `tx.execute`.
+                tx.execute(
+                    "UPDATE events SET rejected = 0 WHERE event_id = ?",
+                    params![create_id.as_str()],
+                )?;
+                tx.commit()?;
+                Ok(present)
+            })
+            .await
+            .unwrap();
+        assert!(present, "provider must read the create event inside the tx");
+    }
+
+    // -------- denormalisation invariant (I3) --------
+
+    #[tokio::test]
+    async fn auth_edges_mirror_auth_events_json() {
+        // State-res correctness now rests on the auth subset of `event_edges`
+        // being a faithful mirror of `auth_events_json`: `get_event` reads the
+        // column, `auth_chain` walks the edges, and both must agree for the
+        // SQLite provider to match the in-memory one. Both are written from
+        // `Event.auth_events` in one transaction; this pins that they agree
+        // per-event so a future writer touching one encoding and not the
+        // other can't drift silently (nothing structural — FK / trigger /
+        // generated column — enforces it).
+        let (s, create) = store_with_room_and_create().await;
+
+        let a = message_with_auth("a", 1, vec![create.event_id.clone()]);
+        let a_id = a.event_id.clone();
+        s.persist_event(&a, &[]).await.unwrap();
+
+        let b = message_with_auth("b", 2, vec![create.event_id.clone(), a_id.clone()]);
+        let b_id = b.event_id.clone();
+        s.persist_event(&b, &[]).await.unwrap();
+
+        // create: [] · a: [create] · b: [create, a].
+        for id in [create.event_id.clone(), a_id, b_id] {
+            let id_str = id.as_str().to_owned();
+            let (column, edges) = s
+                .run_read(move |conn| -> Result<(Vec<String>, Vec<String>), Error> {
+                    let json: String = conn.query_row(
+                        "SELECT auth_events_json FROM events WHERE event_id = ?",
+                        params![id_str],
+                        |row| row.get(0),
+                    )?;
+                    let column: Vec<String> =
+                        serde_json::from_str(&json).map_err(|e| Error::Internal(e.to_string()))?;
+                    let mut stmt = conn.prepare(
+                        "SELECT parent_event_id FROM event_edges \
+                         WHERE child_event_id = ? AND edge_type = 'auth'",
+                    )?;
+                    let edges: Vec<String> = stmt
+                        .query_map(params![id_str], |row| row.get(0))?
+                        .collect::<Result<_, _>>()?;
+                    Ok((column, edges))
+                })
+                .await
+                .unwrap();
+            // The column is an ordered list; edge rows have no guaranteed
+            // order — compare as sets.
+            let column_set: HashSet<String> = column.into_iter().collect();
+            let edges_set: HashSet<String> = edges.into_iter().collect();
+            assert_eq!(
+                column_set, edges_set,
+                "auth edges disagree with auth_events_json for {id}"
+            );
         }
     }
 }

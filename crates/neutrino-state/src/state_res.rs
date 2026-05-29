@@ -168,7 +168,7 @@ pub fn power_of_sender(event: &Event, provider: &dyn StateProvider) -> Result<i6
     let mut state: StateMap<Arc<Event>> = HashMap::new();
     for aid in &event.auth_events {
         let info = provider
-            .get_event(aid)
+            .get_event(aid)?
             .ok_or_else(|| StateResError::MissingEvent(aid.clone()))?;
         if info.rejected {
             continue;
@@ -219,7 +219,7 @@ pub fn reverse_topological_power_sort(
     let mut event_to_pl: HashMap<OwnedEventId, i64> = HashMap::with_capacity(events.len());
     for eid in events {
         let info = provider
-            .get_event(eid)
+            .get_event(eid)?
             .ok_or_else(|| StateResError::MissingEvent(eid.clone()))?;
         let pl = power_of_sender(&info, provider)?;
         event_map.insert(eid.clone(), info);
@@ -317,7 +317,7 @@ pub fn iterative_auth_checks(
 
     for eid in sorted {
         let info = provider
-            .get_event(eid)
+            .get_event(eid)?
             .ok_or_else(|| StateResError::MissingEvent(eid.clone()))?;
         if info.rejected {
             continue;
@@ -327,7 +327,7 @@ pub fn iterative_auth_checks(
         let mut auth_map: StateMap<Arc<Event>> = HashMap::new();
         for aid in &event.auth_events {
             let parent = provider
-                .get_event(aid)
+                .get_event(aid)?
                 .ok_or_else(|| StateResError::MissingEvent(aid.clone()))?;
             if parent.rejected {
                 continue;
@@ -349,7 +349,7 @@ pub fn iterative_auth_checks(
         for key in auth_event_keys(&event) {
             if let Some(rs_id) = resolved.get(&key) {
                 let rs_info = provider
-                    .get_event(rs_id)
+                    .get_event(rs_id)?
                     .ok_or_else(|| StateResError::MissingEvent(rs_id.clone()))?;
                 if !rs_info.rejected {
                     auth_map.insert(key, rs_info);
@@ -413,7 +413,7 @@ pub fn split_power_events(
     let mut non_power = HashSet::new();
     for eid in events {
         let info = provider
-            .get_event(eid)
+            .get_event(eid)?
             .ok_or_else(|| StateResError::MissingEvent(eid.clone()))?;
         if is_power_event(&info) {
             power.insert(eid.clone());
@@ -463,7 +463,7 @@ pub fn mainline(
     while let Some(pl_id) = current {
         chain.push(pl_id.clone());
         let info = provider
-            .get_event(&pl_id)
+            .get_event(&pl_id)?
             .ok_or_else(|| StateResError::MissingEvent(pl_id.clone()))?;
         // Find the previous PL in this PL's auth_events. Single-step lookup
         // (no transitive walk): under MSC4242 v12, `calculate_auth_events`
@@ -471,7 +471,7 @@ pub fn mainline(
         let mut next: Option<OwnedEventId> = None;
         for aid in &info.auth_events {
             let parent = provider
-                .get_event(aid)
+                .get_event(aid)?
                 .ok_or_else(|| StateResError::MissingEvent(aid.clone()))?;
             if parent.rejected {
                 continue;
@@ -518,12 +518,12 @@ pub fn mainline_position(
             return Ok(mainline_len);
         }
         let info = provider
-            .get_event(&current)
+            .get_event(&current)?
             .ok_or_else(|| StateResError::MissingEvent(current.clone()))?;
         let mut next: Option<OwnedEventId> = None;
         for aid in &info.auth_events {
             let parent = provider
-                .get_event(aid)
+                .get_event(aid)?
                 .ok_or_else(|| StateResError::MissingEvent(aid.clone()))?;
             if parent.rejected {
                 continue;
@@ -569,7 +569,7 @@ pub fn mainline_sort(
     let mut decorated: Vec<(usize, u64, OwnedEventId)> = Vec::with_capacity(events.len());
     for eid in events {
         let info = provider
-            .get_event(eid)
+            .get_event(eid)?
             .ok_or_else(|| StateResError::MissingEvent(eid.clone()))?;
         let depth = mainline_position(eid, &mainline_map, mainline_len, provider)?;
         decorated.push((depth, info.origin_server_ts, eid.clone()));
@@ -613,7 +613,7 @@ pub fn state_at_heads(
     for head in heads {
         let state_before_head = state_before_inner(head, provider, cache)?;
         let head_info = provider
-            .get_event(head)
+            .get_event(head)?
             .ok_or_else(|| StateResError::MissingEvent(head.clone()))?;
         let mut state_after = (*state_before_head).clone();
         if let Some(sk) = &head_info.state_key {
@@ -652,7 +652,7 @@ fn state_before_inner(
     }
 
     let info = provider
-        .get_event(event_id)
+        .get_event(event_id)?
         .ok_or_else(|| StateResError::MissingEvent(owned.clone()))?;
 
     // Root: no prev_state_events (create event) → empty state-before.

@@ -70,12 +70,12 @@ struct ProviderWithLocal<'a> {
 }
 
 impl StateProvider for ProviderWithLocal<'_> {
-    fn get_event(&self, id: &EventId) -> Option<Arc<Event>> {
+    fn get_event(&self, id: &EventId) -> Result<Option<Arc<Event>>, StateResError> {
         if id == self.local_event.event_id {
             // The local event is in-flight — by definition not rejected
             // yet (apply returns Err on hard-reject, never reaches this
             // resolver), so we hand it back as-is.
-            return Some(self.local_event.clone());
+            return Ok(Some(self.local_event.clone()));
         }
         self.inner.get_event(id)
     }
@@ -287,7 +287,7 @@ fn materialize_state(
     let mut out = StateMap::new();
     for (key, id) in ids {
         let info = provider
-            .get_event(id)
+            .get_event(id)?
             .ok_or_else(|| CoreError::StateRes(StateResError::MissingEvent(id.clone())))?;
         out.insert(key.clone(), info);
     }

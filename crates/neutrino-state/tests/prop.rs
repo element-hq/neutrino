@@ -490,6 +490,8 @@ fn auth_chain_of(seed: &OwnedEventId, provider: &dyn StateProvider) -> HashSet<O
         if chain.insert(id.clone()) {
             let parents: Vec<OwnedEventId> = provider
                 .get_event(&id)
+                .ok()
+                .flatten()
                 .map(|info| info.auth_events.clone())
                 .unwrap_or_default();
             for parent in &parents {
@@ -717,6 +719,8 @@ proptest! {
         for id in &sg {
             let parents: Vec<OwnedEventId> = provider
                 .get_event(id)
+                .ok()
+                .flatten()
                 .map(|info| info.auth_events.clone())
                 .unwrap_or_default();
             for parent in &parents {
@@ -956,12 +960,12 @@ proptest! {
         // collected (rebuilding via `placeholder_arc_event` would compute
         // fresh ids and the test invariants would no longer hold).
         for id in &ids_a {
-            if let Some(event) = provider_a.get_event(id) {
+            if let Ok(Some(event)) = provider_a.get_event(id) {
                 merged.insert(event);
             }
         }
         for id in &ids_b {
-            if let Some(event) = provider_b.get_event(id) {
+            if let Ok(Some(event)) = provider_b.get_event(id) {
                 merged.insert(event);
             }
         }
@@ -1238,7 +1242,10 @@ proptest! {
             .map(|(i, id)| (id.clone(), i))
             .collect();
         for eid in &subset {
-            let info = provider.get_event(eid).expect("subset event in provider");
+            let info = provider
+                .get_event(eid)
+                .expect("lookup ok")
+                .expect("subset event in provider");
             for parent in &info.auth_events {
                 if subset.contains(parent) {
                     let p_idx = pos[parent];
@@ -1299,7 +1306,10 @@ proptest! {
         // strategy returned them all as accepted; we override.
         let mut rejected_provider = InMemoryStateProvider::new();
         for id in &ids {
-            let info = provider.get_event(id).expect("provider returned its own id");
+            let info = provider
+                .get_event(id)
+                .expect("lookup ok")
+                .expect("provider returned its own id");
             rejected_provider.insert({
                 let mut e = (*info).clone();
                 e.rejected = true;

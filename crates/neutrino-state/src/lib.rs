@@ -345,6 +345,13 @@ pub enum ReferenceError {
     /// reject."
     #[error("prev_state_event belongs to a different room: {0}")]
     PrevStateDifferentRoom(OwnedEventId),
+
+    /// The store failed to serve a lookup while resolving references (SQL /
+    /// hydration fault). Not a verdict about the event — surfaced as a fault
+    /// so a transient error is never mistaken for an unknown room or a
+    /// missing `prev_state_event`.
+    #[error("event lookup failed during reference validation: {0}")]
+    Lookup(#[from] StateResError),
 }
 
 /// Errors raised by state resolution (Phase 4) and the state-DAG
