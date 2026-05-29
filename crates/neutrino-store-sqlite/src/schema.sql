@@ -35,9 +35,22 @@
 -- duplicated here rather than templated because it's both a schema-level
 -- invariant *and* a stability promise — if/when the value ever changes
 -- the schema needs an explicit migration, not a silent code edit.
+-- `forward_extremities` / `state_dag_forward_extremities` persist the two
+-- head-sets of a room's `RoomCore` (neutrino-state) so the per-room actor
+-- can be rebuilt after a restart without replaying the whole DAG:
+--   * `forward_extremities`           — timeline-DAG heads (events not yet
+--                                       referenced by any event's `prev_events`).
+--   * `state_dag_forward_extremities` — state-DAG heads (state events not yet
+--                                       referenced by any `prev_state_events`).
+-- Both are JSON arrays of event ids. `DEFAULT '[]'` covers the create-time
+-- INSERT (which omits them); the storage-side apply+persist path is what
+-- maintains them thereafter. No `user_version` bump — no live data, schema
+-- amended in place (same policy as the `events.rejected` column).
 CREATE TABLE rooms (
     room_id        TEXT NOT NULL PRIMARY KEY,
-    room_version   TEXT NOT NULL CHECK (room_version = 'org.matrix.msc4242.12')
+    room_version   TEXT NOT NULL CHECK (room_version = 'org.matrix.msc4242.12'),
+    forward_extremities            TEXT NOT NULL DEFAULT '[]',
+    state_dag_forward_extremities  TEXT NOT NULL DEFAULT '[]'
 ) STRICT, WITHOUT ROWID;
 
 -- ----------------------------------------------------------------------------
