@@ -51,7 +51,7 @@
 
 Neutrino is split into a number of different modules:
 
-- `neutrino-common` contains the common type definitions and utilites used throughout the project.
+- `neutrino-common` contains the common type definitions and utilities used throughout the project.
 - `neutrino-http` contains the HTTP router for both the C2S and S2S Matrix APIs.
 - `neutrino-main` contains a common entrypoint between the host development and Android-embedded servers.
 
