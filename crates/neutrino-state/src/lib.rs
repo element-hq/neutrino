@@ -345,6 +345,13 @@ pub enum ReferenceError {
     /// reject."
     #[error("prev_state_event belongs to a different room: {0}")]
     PrevStateDifferentRoom(OwnedEventId),
+
+    /// The store failed to serve a lookup while resolving references (SQL /
+    /// hydration fault). Not a verdict about the event — surfaced as a fault
+    /// so a transient error is never mistaken for an unknown room or a
+    /// missing `prev_state_event`.
+    #[error("event lookup failed during reference validation: {0}")]
+    Lookup(#[from] StateResError),
 }
 
 /// Errors raised by state resolution (Phase 4) and the state-DAG
@@ -361,6 +368,13 @@ pub enum StateResError {
     /// locally or arrives with its full chain).
     #[error("state-res references unknown event: {0}")]
     MissingEvent(OwnedEventId),
+    /// Storage-side fault while serving a provider lookup — SQL driver
+    /// error, malformed row, JSON serialisation, anything that isn't a
+    /// missing-event signal. In-memory providers never produce this; the
+    /// SQLite-backed provider surfaces driver / hydration faults here so
+    /// state-res can bubble them up the call stack rather than panic.
+    #[error("state-res internal error: {0}")]
+    Internal(String),
 }
 
 /// Top-level error type returned by the state machine.

@@ -111,6 +111,7 @@ fn build_stored_event(
         prev_events: Vec::new(),
         prev_state_events: Vec::new(),
         auth_events: Vec::new(),
+        rejected: false,
         raw,
     }
 }

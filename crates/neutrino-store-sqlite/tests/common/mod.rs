@@ -122,6 +122,7 @@ pub fn make_event(
         prev_events: prev_events_owned,
         prev_state_events: prev_state_owned,
         auth_events: Vec::new(),
+        rejected: false,
         raw,
     }
 }

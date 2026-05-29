@@ -14,6 +14,7 @@ thiserror.workspace = true
 tokio.workspace = true
 
 neutrino-common = { path = "../neutrino-common" }
+neutrino-state = { path = "../neutrino-state" }
 neutrino-store = { path = "../neutrino-store" }
 uuid = { version = "1.23.1", features = ["v4"] }
 

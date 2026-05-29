@@ -27,14 +27,13 @@ use crate::error::Error;
 /// `auth_events_json` carries the MSC4242 server-computed auth_events
 /// list — it's not on the wire and not in `json`, so the column is its
 /// authoritative storage. See `event-id-design.md` §"Co-location pattern".
-pub(crate) const EVENT_COLUMNS: &str =
-    "event_id, room_id, event_type, state_key, sender, origin_server_ts, json, auth_events_json";
+pub(crate) const EVENT_COLUMNS: &str = "event_id, room_id, event_type, state_key, sender, origin_server_ts, json, auth_events_json, rejected";
 
 /// Same as [`EVENT_COLUMNS`] but with an `e.` prefix on each column, for
 /// SELECTs that JOIN `events` aliased as `e` (state, outbox, etc.). Keep
 /// in sync with [`EVENT_COLUMNS`] — one is just the prefixed sibling of
 /// the other.
-pub(crate) const EVENT_COLUMNS_PREFIXED: &str = "e.event_id, e.room_id, e.event_type, e.state_key, e.sender, e.origin_server_ts, e.json, e.auth_events_json";
+pub(crate) const EVENT_COLUMNS_PREFIXED: &str = "e.event_id, e.room_id, e.event_type, e.state_key, e.sender, e.origin_server_ts, e.json, e.auth_events_json, e.rejected";
 
 /// Row-shape wrapper around an [`Event`].
 ///
@@ -195,6 +194,7 @@ impl TryFrom<&Row<'_>> for EventRow<'static> {
         let origin_server_ts: i64 = row.get("origin_server_ts")?;
         let json: String = row.get("json")?;
         let auth_events_json: String = row.get("auth_events_json")?;
+        let rejected: bool = row.get("rejected")?;
 
         let event_id = OwnedEventId::try_from(event_id)
             .map_err(|e| Error::Internal(format!("malformed event_id in DB row: {e}")))?;
@@ -227,6 +227,7 @@ impl TryFrom<&Row<'_>> for EventRow<'static> {
             prev_events: extracted.prev_events,
             prev_state_events: extracted.prev_state_events,
             auth_events,
+            rejected,
             raw,
         })))
     }
@@ -407,8 +408,8 @@ impl<'a> EventRow<'a> {
         })?;
         tx.execute(
             "INSERT INTO events \
-             (event_id, room_id, event_type, state_key, sender, origin_server_ts, json, auth_events_json) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             (event_id, room_id, event_type, state_key, sender, origin_server_ts, json, auth_events_json, rejected) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 self.event_id.as_str(),
                 self.room_id.as_str(),
@@ -418,6 +419,7 @@ impl<'a> EventRow<'a> {
                 origin_server_ts,
                 self.raw.get(),
                 auth_events_json,
+                self.rejected,
             ],
         )?;
         let stream_pos = tx.last_insert_rowid();

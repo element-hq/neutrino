@@ -54,7 +54,7 @@ use neutrino_common::Event;
 use ruma::{EventId, OwnedEventId, OwnedRoomId};
 
 use crate::auth_rules::check_auth_rules;
-use crate::provider::{EventInfo, StateProvider};
+use crate::provider::StateProvider;
 use crate::state_res;
 use crate::validate;
 use crate::{CoreError, StateMap, StateResError};
@@ -70,12 +70,12 @@ struct ProviderWithLocal<'a> {
 }
 
 impl StateProvider for ProviderWithLocal<'_> {
-    fn get_event(&self, id: &EventId) -> Option<EventInfo> {
+    fn get_event(&self, id: &EventId) -> Result<Option<Arc<Event>>, StateResError> {
         if id == self.local_event.event_id {
-            return Some(EventInfo {
-                event: self.local_event.clone(),
-                rejected: false,
-            });
+            // The local event is in-flight — by definition not rejected
+            // yet (apply returns Err on hard-reject, never reaches this
+            // resolver), so we hand it back as-is.
+            return Ok(Some(self.local_event.clone()));
         }
         self.inner.get_event(id)
     }
@@ -287,9 +287,9 @@ fn materialize_state(
     let mut out = StateMap::new();
     for (key, id) in ids {
         let info = provider
-            .get_event(id)
+            .get_event(id)?
             .ok_or_else(|| CoreError::StateRes(StateResError::MissingEvent(id.clone())))?;
-        out.insert(key.clone(), info.event);
+        out.insert(key.clone(), info);
     }
     Ok(out)
 }
@@ -298,7 +298,7 @@ fn materialize_state(
 mod tests {
     use super::*;
     use crate::event_id::EventBuilder;
-    use crate::provider::{EventInfo, InMemoryStateProvider};
+    use crate::provider::InMemoryStateProvider;
     use crate::test_utils::next_ts;
     use neutrino_common::ROOM_VERSION_ID;
     use neutrino_common::event_id::room_id_from_create;
@@ -415,10 +415,7 @@ mod tests {
     }
 
     fn insert(provider: &mut InMemoryStateProvider, event: Arc<Event>) {
-        provider.insert(EventInfo {
-            event,
-            rejected: false,
-        });
+        provider.insert(event);
     }
 
     // ----- apply (happy path) -----
