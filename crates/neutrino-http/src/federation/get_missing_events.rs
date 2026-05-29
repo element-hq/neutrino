@@ -137,7 +137,7 @@ pub(crate) async fn handle(
     // (6) — wire bytes verbatim, oldest-first. `missing_events` walks back
     // from `latest`, so it yields newest-first; reverse to the topological
     // (oldest-first) order federation receivers expect — matches Synapse,
-    // which reverses its BFS before responding. The reference hash that
+    // which reverses its walk before responding. The reference hash that
     // produced each event_id was computed over `event.raw`, so peers MUST
     // receive those exact bytes for the event_id to round-trip.
     let events: Vec<Box<RawJsonValue>> = events.into_iter().rev().map(|e| e.raw).collect();

@@ -257,7 +257,10 @@ pub trait StateStore: Send + Sync {
 pub trait DagStore: Send + Sync {
     /// Pre:  all event IDs in `from` must exist in the store; `room_id` must exist.
     /// Post: walks `prev_events` backwards from `from`, returning up to `limit` distinct
-    ///       events in reverse-chronological order; each `Event` has `prev_events` and
+    ///       events in reverse-chronological order — newest `origin_server_ts` first,
+    ///       ties broken by ascending `event_id` (a max-priority-queue walk, so a
+    ///       multi-seed or forked walk merges branches in true newest-first order, not
+    ///       per-seed BFS-level order); each `Event` has `prev_events` and
     ///       `prev_state_events` pre-parsed for further DAG traversal; events already
     ///       known to the caller can be excluded by stopping the walk early.
     async fn events_before(
@@ -271,11 +274,13 @@ pub trait DagStore: Send + Sync {
     ///       `earliest` need not exist; unknown IDs in `latest` contribute
     ///       no parents to expand (empty edges row), unknown IDs in
     ///       `earliest` are no-ops on the walk.
-    /// Post: BFS over `prev_events` starting from the *parents* of each
+    /// Post: walks `prev_events` backward starting from the *parents* of each
     ///       event in `latest`, skipping any event in `earliest ∪ latest`;
-    ///       returns at most `limit` events. **The events in `latest`
-    ///       themselves are never included in the result** — they are
-    ///       the boundary the requester already has. The events in
+    ///       returns at most `limit` events in reverse-chronological order
+    ///       (newest `origin_server_ts` first, ties by ascending `event_id` —
+    ///       the same priority-queue walk as `events_before`). **The events
+    ///       in `latest` themselves are never included in the result** — they
+    ///       are the boundary the requester already has. The events in
     ///       `earliest` are likewise never included. Events in other
     ///       rooms (cross-room seeds or corrupt `event_edges`) are
     ///       treated as if they don't exist — the walk terminates at the

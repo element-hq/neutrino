@@ -11,7 +11,7 @@
 //! - **Direct storage seeding** via [`build_seeded_router`] — used by tests
 //!   that need a *non-flat* DAG. The CSAPI `/send` path currently writes
 //!   events with empty `prev_events` (Phase 6 will wire the head pointer),
-//!   so the BFS walker has nothing to traverse. These tests open a fresh
+//!   so the DAG walker has nothing to traverse. These tests open a fresh
 //!   `SqliteStore`, build chains with explicit `prev_events`, persist them
 //!   via the trait, then mount the router on top with
 //!   `router_with_store`.
@@ -273,7 +273,7 @@ async fn unknown_room_returns_404() {
 async fn happy_path_returns_events_between_earliest_and_latest() {
     // B5 - happy path. The 4 message events between create (earliest) and
     // msg 4 (latest) should be reachable. Assert the set of message bodies;
-    // the BFS interleaving order across multiple latest seeds is
+    // the ordering across multiple latest seeds is an
     // implementation detail per `DagStore::missing_events` (trait doc in
     // neutrino-store/src/lib.rs), so we collect into a `BTreeSet` and
     // compare set-equality only.
@@ -745,6 +745,260 @@ async fn missing_earliest_events_returns_400() {
         &json!({
             "latest_events": [msgs[1].as_str()],
         }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(
+        body.get("errcode").and_then(Value::as_str),
+        Some("M_INVALID_PARAM"),
+        "body = {body}"
+    );
+}
+
+// === GET /_matrix/federation/v1/backfill/{roomId} ======================
+
+/// Drive a GET against the router. Mirrors [`post_json`] for query-param
+/// endpoints.
+async fn get(app: &axum::Router, path: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(path)
+        .body(Body::empty())
+        .unwrap();
+    drive(app, req).await
+}
+
+/// Build a `/backfill` URL. Each `v` is percent-encoded the way ruma's
+/// client serialises the query (`$` → `%24`), so the tests exercise the
+/// handler's percent-decoding end-to-end. Base64url id chars (`-`, `_`,
+/// alphanumerics) are unreserved and pass through untouched.
+fn backfill_path(room_id: &str, v: &[&str], limit: Option<u32>) -> String {
+    let mut q: Vec<String> = v
+        .iter()
+        .map(|id| format!("v={}", id.replace('$', "%24")))
+        .collect();
+    if let Some(l) = limit {
+        q.push(format!("limit={l}"));
+    }
+    format!("/_matrix/federation/v1/backfill/{room_id}?{}", q.join("&"))
+}
+
+/// Collect the `content.body` of every PDU that carries one (i.e. the
+/// message events), in response order. Lets a test pin newest-first
+/// ordering without knowing the create/join event ids (their wire bytes
+/// carry no `body`).
+fn pdu_bodies(body: &Value) -> Vec<String> {
+    body.get("pdus")
+        .and_then(Value::as_array)
+        .expect("pdus array")
+        .iter()
+        .filter_map(|p| p.pointer("/content/body").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+// BF1: walk back from the chain head returns every ancestor plus the head
+// itself, newest-first. create ← join ← msg0 ← msg1 ← msg2; backfill from
+// msg2 yields all 5 events. The three message bodies must appear
+// newest-first.
+#[tokio::test]
+async fn backfill_returns_chain_newest_first() {
+    let (app, room_id, _create_id, msgs) = build_seeded_router(3).await;
+
+    let (status, body) = get(
+        &app,
+        &backfill_path(room_id.as_str(), &[msgs[2].as_str()], Some(50)),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let pdus = body.get("pdus").and_then(Value::as_array).expect("pdus");
+    // create + join + msg0 + msg1 + msg2 = 5 events, seed included.
+    assert_eq!(pdus.len(), 5, "expected full chain incl. seed: {body}");
+    assert_eq!(
+        pdu_bodies(&body),
+        vec!["msg 2".to_owned(), "msg 1".to_owned(), "msg 0".to_owned()],
+        "messages must be newest-first"
+    );
+}
+
+// BF2: limit is a hard cap on the number of PDUs returned. Backfill from
+// msg2 with limit=2 yields exactly the seed and its immediate parent.
+#[tokio::test]
+async fn backfill_respects_limit() {
+    let (app, room_id, _create_id, msgs) = build_seeded_router(3).await;
+
+    let (status, body) = get(
+        &app,
+        &backfill_path(room_id.as_str(), &[msgs[2].as_str()], Some(2)),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let pdus = body.get("pdus").and_then(Value::as_array).expect("pdus");
+    assert_eq!(pdus.len(), 2, "limit=2 must cap the result");
+    assert_eq!(
+        pdu_bodies(&body),
+        vec!["msg 2".to_owned(), "msg 1".to_owned()]
+    );
+}
+
+// BF3: the transaction envelope carries `origin` (our server name) and a
+// numeric `origin_server_ts` alongside `pdus`, per the ruma /
+// Synapse backfill response shape.
+#[tokio::test]
+async fn backfill_response_has_transaction_envelope() {
+    let (app, room_id, _create_id, msgs) = build_seeded_router(1).await;
+
+    let (status, body) = get(
+        &app,
+        &backfill_path(room_id.as_str(), &[msgs[0].as_str()], Some(10)),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(
+        body.get("origin").and_then(Value::as_str),
+        Some("example.org"),
+        "origin must be our server name: {body}"
+    );
+    assert!(
+        body.get("origin_server_ts")
+            .and_then(Value::as_u64)
+            .is_some(),
+        "origin_server_ts must be a number: {body}"
+    );
+    assert!(body.get("pdus").and_then(Value::as_array).is_some());
+}
+
+// BF4: wire bytes verbatim — v12 / MSC4242 PDUs never carry `event_id`
+// (it's derived from the reference hash). Federation peers must receive the
+// exact bytes that produced the id, so no enrichment is applied.
+#[tokio::test]
+async fn backfill_ships_wire_bytes_without_event_id() {
+    let (app, room_id, _create_id, msgs) = build_seeded_router(2).await;
+
+    let (status, body) = get(
+        &app,
+        &backfill_path(room_id.as_str(), &[msgs[1].as_str()], Some(50)),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let pdus = body.get("pdus").and_then(Value::as_array).expect("pdus");
+    assert!(!pdus.is_empty());
+    for pdu in pdus {
+        assert!(
+            pdu.get("event_id").is_none(),
+            "federation wire bytes must not carry event_id: {pdu}"
+        );
+    }
+}
+
+// BF5: unknown room → 404 M_NOT_FOUND (spec-required), not a 500 or the
+// bare-text fallback.
+#[tokio::test]
+async fn backfill_unknown_room_returns_404() {
+    let (app, _room_id, _create_id, msgs) = build_seeded_router(1).await;
+    let unknown = "!nope:example.org";
+
+    let (status, body) = get(&app, &backfill_path(unknown, &[msgs[0].as_str()], Some(10))).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "body = {body}");
+    assert_eq!(
+        body.get("errcode").and_then(Value::as_str),
+        Some("M_NOT_FOUND"),
+        "body = {body}"
+    );
+}
+
+// BF6: a request with no `v` parameter is rejected — there's nothing to walk
+// back from. 400 M_INVALID_PARAM, mirroring the empty-`latest_events`
+// rejection on the sibling endpoint.
+#[tokio::test]
+async fn backfill_missing_v_returns_400() {
+    let (app, room_id, _create_id, _msgs) = build_seeded_router(1).await;
+
+    let (status, body) = get(&app, &backfill_path(room_id.as_str(), &[], Some(10))).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(
+        body.get("errcode").and_then(Value::as_str),
+        Some("M_INVALID_PARAM"),
+        "body = {body}"
+    );
+}
+
+// BF7: a `v` event we don't hold is skipped, not 500'd. `events_before`
+// would reject an unknown seed with InvalidInput; the handler pre-filters
+// via `get_events` so an unknown seed yields an empty (200) backfill.
+#[tokio::test]
+async fn backfill_unknown_v_is_skipped_not_500() {
+    let (app, room_id, _create_id, _msgs) = build_seeded_router(1).await;
+    // Syntactically valid v12 id (43 base64url chars) that isn't in the room.
+    let ghost = "$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    let (status, body) = get(&app, &backfill_path(room_id.as_str(), &[ghost], Some(10))).await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let pdus = body.get("pdus").and_then(Value::as_array).expect("pdus");
+    assert!(pdus.is_empty(), "unknown seed must yield no events: {body}");
+}
+
+// BF8: a raw (un-percent-encoded) `$` in the query still resolves. Proves
+// the decoder is lenient about already-decoded sigils as well as `%24`.
+#[tokio::test]
+async fn backfill_accepts_raw_dollar_sigil_in_query() {
+    let (app, room_id, _create_id, msgs) = build_seeded_router(1).await;
+    // Build the path with the sigil left raw.
+    let path = format!(
+        "/_matrix/federation/v1/backfill/{}?v={}&limit=10",
+        room_id.as_str(),
+        msgs[0].as_str()
+    );
+
+    let (status, body) = get(&app, &path).await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(
+        pdu_bodies(&body),
+        vec!["msg 0".to_owned()],
+        "raw-sigil seed must resolve: {body}"
+    );
+}
+
+// BF9 (I1): a present-but-blank `?v=` is rejected like a wholly-missing `v`.
+// It must NOT slip past the empty-`v` guard as an empty-string seed and
+// return a misleading 200 with no PDUs.
+#[tokio::test]
+async fn backfill_blank_v_returns_400() {
+    let (app, room_id, _create_id, _msgs) = build_seeded_router(1).await;
+    let path = format!(
+        "/_matrix/federation/v1/backfill/{}?v=&limit=10",
+        room_id.as_str()
+    );
+
+    let (status, body) = get(&app, &path).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(
+        body.get("errcode").and_then(Value::as_str),
+        Some("M_INVALID_PARAM"),
+        "body = {body}"
+    );
+}
+
+// BF10 (I3): an explicit `limit=0` is rejected (400), matching Synapse's
+// `if not limit: return 400` — asking for zero events is a client bug, not
+// a valid empty backfill. (A *missing* limit still defaults to 10.)
+#[tokio::test]
+async fn backfill_limit_zero_returns_400() {
+    let (app, room_id, _create_id, msgs) = build_seeded_router(1).await;
+
+    let (status, body) = get(
+        &app,
+        &backfill_path(room_id.as_str(), &[msgs[0].as_str()], Some(0)),
     )
     .await;
 

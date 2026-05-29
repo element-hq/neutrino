@@ -17,6 +17,7 @@ use neutrino_store::StorageError;
 use serde_json::json;
 use thiserror::Error;
 
+pub(crate) mod backfill;
 pub(crate) mod get_missing_events;
 
 #[cfg(test)]

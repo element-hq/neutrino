@@ -1,10 +1,17 @@
 //! `DagStore` impl on `SqliteStore`.
 //!
-//! Both methods do a BFS over `event_edges` (`edge_type = 'prev'`). The
-//! BFS frontier is queue-based; a `visited` set defends against malformed
-//! cycles (MSC4242 says the DAG is acyclic, but we don't trust it). The
-//! walk as a whole terminates only on `limit` or an empty frontier;
-//! individual branches are *pruned* (not terminated) when:
+//! Both methods walk `event_edges` (`edge_type = 'prev'`) backward from a
+//! set of seeds. The frontier is a **max-priority-queue keyed on
+//! `origin_server_ts`** (newest popped first), tie-broken on `event_id`
+//! for determinism — mirroring Synapse's depth-descending backfill walk,
+//! with `origin_server_ts` standing in for `depth` (this server stores no
+//! `depth`; see `neutrino-state`'s `validate.rs`). Popping highest-ts-first
+//! means a multi-seed or forked walk merges branches in true
+//! newest-first order rather than per-seed BFS-level order. A `visited`
+//! set defends against malformed cycles (MSC4242 says the DAG is acyclic,
+//! but we don't trust it). The walk as a whole terminates only on `limit`
+//! or an empty frontier; individual branches are *pruned* (not terminated)
+//! when:
 //!
 //! - a parent isn't in the local store, or sits in a different room
 //!   (federation-backfill boundary — [`hydrate_pdu`] returns `None` and
@@ -16,10 +23,11 @@
 //!   are the boundary the requester already has, per Synapse-style
 //!   `_get_missing_events` semantics.
 //!
-//! So a missing parent in one subtree doesn't stop the BFS — siblings
+//! So a missing parent in one subtree doesn't stop the walk — siblings
 //! and the rest of the frontier still get walked.
 
-use std::collections::{HashSet, VecDeque};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashSet};
 
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{Connection, OptionalExtension, params, params_from_iter};
@@ -58,19 +66,18 @@ fn hydrate_pdu(
     // `prev_events` and `prev_state_events` are populated by row hydration
     // from the canonical JSON in `events.json` — no edge-table lookup
     // needed for the per-event view. `event_edges` still exists for graph
-    // queries (BFS in `events_before` / `missing_events`); see the
+    // queries (the priority-queue walk in `events_before` /
+    // `missing_events`); see the
     // "denormalisation" note in `event-id-design.md`.
     Ok(Some(inner?))
 }
 
 /// Fetch a child's parents of a given edge type from `event_edges`,
-/// sorted by `parent_event_id`. Pins each event's sibling-visit order
-/// independent of the order the parent IDs appeared in the originating
-/// JSON, which is what makes single-seed walks (`events_before`)
-/// deterministic. Multi-seed walks (`missing_events`) are also
-/// deterministic given a fixed `latest` slice — the per-seed expansion
-/// follows this sort, and the across-seed interleaving follows caller
-/// order — but the trait doc doesn't fix that as a contract. `event_edges`
+/// sorted by `parent_event_id`. Used by `missing_events` to gather the
+/// initial frontier (parents of `latest`); the sort is no longer
+/// load-bearing for the *walk* order — [`walk_prev_events`] re-orders the
+/// whole frontier by `origin_server_ts` in its priority queue — but the
+/// deterministic read keeps the seed-gathering reproducible. `event_edges`
 /// has a `WITHOUT ROWID PRIMARY KEY (child_event_id, edge_type,
 /// parent_event_id)`, so the explicit `ORDER BY` matches the natural
 /// PK scan — free at runtime.
@@ -97,13 +104,89 @@ fn fetch_edges(
     Ok(out)
 }
 
-/// BFS over `prev_events` edges from `start`, stopping at `limit` or when
-/// no more parents resolve in the local store. `excluded` IDs are skipped
-/// (and don't seed traversal). The walk is scoped to `room_id` — events
-/// from any other room are treated as if they don't exist, so a corrupt
-/// cross-room `event_edges` row terminates the walk rather than leaking
-/// PDUs from a different room. The result preserves traversal order
-/// (reverse-chronological).
+/// One entry in [`walk_prev_events`]' priority queue. Ordered so the
+/// `BinaryHeap` (a max-heap) pops the **newest** event first: highest
+/// `origin_server_ts` wins, and equal timestamps (forks, clock ties) fall
+/// back to the **lowest** `event_id` for a deterministic, reproducible
+/// order. `origin_server_ts` is this server's stand-in for Synapse's
+/// `depth` (see `neutrino-state`'s `validate.rs`).
+#[derive(PartialEq, Eq)]
+struct WalkEntry {
+    origin_server_ts: i64,
+    event_id: OwnedEventId,
+}
+
+impl Ord for WalkEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Max-heap pops the greatest element: rank higher ts as greater so
+        // the newest event pops first. On equal ts, rank the *lower*
+        // event_id as greater (reverse the id comparison) so ties pop in
+        // ascending event_id order.
+        self.origin_server_ts
+            .cmp(&other.origin_server_ts)
+            .then_with(|| other.event_id.cmp(&self.event_id))
+    }
+}
+
+impl PartialOrd for WalkEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// `origin_server_ts` of `event_id`, or `None` if it isn't in the local
+/// `events` table. Used to prime the priority queue with seed timestamps;
+/// a seed we don't hold contributes nothing — the same outcome as the old
+/// "enqueue then `hydrate_pdu` → `None`" path.
+fn fetch_event_ts(conn: &Connection, event_id: &EventId) -> Result<Option<i64>, Error> {
+    let ts: Option<i64> = conn
+        .query_row(
+            "SELECT origin_server_ts FROM events WHERE event_id = ?",
+            params![event_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(ts)
+}
+
+/// Parents of `child_event_id` via `prev` edges, each paired with the
+/// parent's `origin_server_ts` so the priority-queue walk can enqueue them
+/// in newest-first order. `INNER JOIN events`: a parent we don't hold is
+/// omitted (it can't be hydrated or expanded — same outcome as the old
+/// enqueue-then-skip path). No room filter — a parent in another room is
+/// still returned so the walk enqueues it and `hydrate_pdu` terminates the
+/// branch at the room boundary, exactly as before (see D10).
+fn fetch_prev_parents_with_ts(
+    conn: &Connection,
+    child_event_id: &EventId,
+) -> Result<Vec<(i64, OwnedEventId)>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT e.origin_server_ts, ed.parent_event_id \
+         FROM event_edges ed \
+         JOIN events e ON e.event_id = ed.parent_event_id \
+         WHERE ed.child_event_id = ? AND ed.edge_type = 'prev'",
+    )?;
+    let rows = stmt.query_map(params![child_event_id.as_str()], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        let (ts, s) = r?;
+        let id = OwnedEventId::try_from(s)
+            .map_err(|e| Error::Internal(format!("malformed parent_event_id in DB: {e}")))?;
+        out.push((ts, id));
+    }
+    Ok(out)
+}
+
+/// Walk `prev_events` edges backward from `start` via a max-priority-queue
+/// keyed on `origin_server_ts` (newest popped first), stopping at `limit`
+/// or when no more parents resolve in the local store. `excluded` IDs are
+/// skipped (and don't seed traversal). The walk is scoped to `room_id` —
+/// events from any other room are treated as if they don't exist, so a
+/// corrupt cross-room `event_edges` row terminates the walk rather than
+/// leaking PDUs from a different room. The result is reverse-chronological
+/// (highest `origin_server_ts` first; ties broken by ascending `event_id`).
 fn walk_prev_events(
     conn: &Connection,
     room_id: &RoomId,
@@ -112,10 +195,20 @@ fn walk_prev_events(
     limit: usize,
 ) -> Result<Vec<Event>, Error> {
     let mut visited: HashSet<OwnedEventId> = HashSet::new();
-    let mut frontier: VecDeque<OwnedEventId> = start.into_iter().collect();
+    let mut frontier: BinaryHeap<WalkEntry> = BinaryHeap::new();
+    // Prime the queue with the seeds we actually hold, carrying their
+    // timestamps so the heap can order across seeds from the first pop.
+    for event_id in start {
+        if let Some(origin_server_ts) = fetch_event_ts(conn, &event_id)? {
+            frontier.push(WalkEntry {
+                origin_server_ts,
+                event_id,
+            });
+        }
+    }
     let mut results = Vec::new();
 
-    while let Some(id) = frontier.pop_front() {
+    while let Some(WalkEntry { event_id: id, .. }) = frontier.pop() {
         if results.len() >= limit {
             break;
         }
@@ -130,12 +223,15 @@ fn walk_prev_events(
             // way, federation-backfill / wrong-room boundary.
             continue;
         };
-        // Walk via event_edges (sorted by parent_event_id) rather than
-        // the JSON-derived `pdu.prev_events` — the SQL-side sort is what
-        // pins BFS determinism across runs; the JSON order is whatever
-        // the sender chose and not guaranteed stable.
-        for parent in fetch_edges(conn, &id, "prev")? {
-            frontier.push_back(parent);
+        // Enqueue parents with their timestamps. Walk via `event_edges`
+        // rather than the JSON-derived `pdu.prev_events` — the edge table
+        // is the canonical graph and the JSON order is whatever the sender
+        // chose. The heap, not insertion order, decides the visit order.
+        for (origin_server_ts, parent) in fetch_prev_parents_with_ts(conn, &id)? {
+            frontier.push(WalkEntry {
+                origin_server_ts,
+                event_id: parent,
+            });
         }
         results.push(pdu);
     }
@@ -310,6 +406,30 @@ mod tests {
         s
     }
 
+    /// Message event with an explicit `origin_server_ts` and `prev_events`.
+    /// The walk orders by `origin_server_ts` (the depth proxy), so DAG tests
+    /// that pin a *sequence* assign ascending timestamps along causal order
+    /// to make the expected newest-first order unambiguous. `ts` also
+    /// disambiguates otherwise-identical message bodies into distinct ids.
+    fn chain_msg(
+        room_id: &ruma::RoomId,
+        sender: &ruma::UserId,
+        body: &str,
+        ts: u64,
+        prev_events: &[&EventId],
+    ) -> Event {
+        crate::tests::make_event(
+            room_id,
+            sender,
+            "m.room.message",
+            None,
+            serde_json::json!({"body": body, "msgtype": "m.text"}),
+            ts,
+            prev_events,
+            &[],
+        )
+    }
+
     // D1: empty `from` → empty result.
     #[tokio::test]
     async fn events_before_empty_from_returns_empty() {
@@ -318,17 +438,20 @@ mod tests {
         assert!(got.is_empty());
     }
 
-    // D2: chain a → b → c; walk from [c] returns [c, b, a].
+    // D2: chain a → b → c with ascending timestamps; walk from [c] returns
+    // newest-first [c, b, a]. The chain's `origin_server_ts` increases with
+    // causal order (the normal case for a single-server timeline), so the
+    // ts-priority-queue walk yields the same order a topological walk would.
     #[tokio::test]
     async fn events_before_walks_prev_events_chain() {
         let s = store_with_room().await;
-        let ev_a = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", &[]);
+        let ev_a = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", 1, &[]);
         let id_a = ev_a.event_id.clone();
         s.persist_event(&ev_a, &[]).await.unwrap();
-        let ev_b = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "b", &[&id_a]);
+        let ev_b = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "b", 2, &[&id_a]);
         let id_b = ev_b.event_id.clone();
         s.persist_event(&ev_b, &[]).await.unwrap();
-        let ev_c = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "c", &[&id_b]);
+        let ev_c = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "c", 3, &[&id_b]);
         let id_c = ev_c.event_id.clone();
         s.persist_event(&ev_c, &[]).await.unwrap();
 
@@ -376,34 +499,27 @@ mod tests {
         );
     }
 
-    // D4: event with two `prev_events` → BFS visits both parents.
+    // D4: event with two `prev_events` → the walk visits both parents,
+    // newest (highest origin_server_ts) first. a(ts=1), b(ts=2), c(ts=3)
+    // with c declaring prev=[a, b]: c is the seed, then b (newer) before a.
     #[tokio::test]
     async fn events_before_handles_branching() {
         let s = store_with_room().await;
-        // a and b have no prev_events; their bodies get stripped by v12
-        // redaction (m.room.message has no content keep-list), so they
-        // must differ via origin_server_ts to get distinct event_ids.
-        let ev_a = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", 0);
+        let ev_a = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", 1, &[]);
         let id_a = ev_a.event_id.clone();
         s.persist_event(&ev_a, &[]).await.unwrap();
-        let ev_b = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "b", 1);
+        let ev_b = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "b", 2, &[]);
         let id_b = ev_b.event_id.clone();
         s.persist_event(&ev_b, &[]).await.unwrap();
-        let ev_c = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "c", &[&id_a, &id_b]);
+        let ev_c = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "c", 3, &[&id_a, &id_b]);
         let id_c = ev_c.event_id.clone();
         s.persist_event(&ev_c, &[]).await.unwrap();
 
         let got = s.events_before(*ALICE_ROOM_ID, &[&id_c], 10).await.unwrap();
         let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
-        // Deterministic order: c is the seed; its prev_events come back
-        // from `fetch_edges` sorted by `parent_event_id` (lex order on the
-        // computed event_id strings), so the BFS pops in that order.
-        let mut parents_sorted = vec![id_a.as_str(), id_b.as_str()];
-        parents_sorted.sort();
-        let expected: Vec<&str> = std::iter::once(id_c.as_str())
-            .chain(parents_sorted)
-            .collect();
-        assert_eq!(ids, expected);
+        // c (seed) first, then its parents newest-first: b (ts 2) before a
+        // (ts 1).
+        assert_eq!(ids, [id_c.as_str(), id_b.as_str(), id_a.as_str()]);
     }
 
     // D5: event's prev_events references an ID not in the local store →
@@ -540,7 +656,7 @@ mod tests {
         //     (Synapse-style), so the seed is fed straight to
         //     `fetch_edges` — which returns no parents because the
         //     cross-room event has no `prev_events` here — and the
-        //     BFS frontier starts empty. Even if it did have parents,
+        //     walk frontier starts empty. Even if it did have parents,
         //     `hydrate_pdu` would room-scope them out.
         //
         // Either way the load-bearing property is room-scoping
@@ -559,7 +675,7 @@ mod tests {
         assert!(got.is_empty(), "missing_events leaked cross-room PDU");
     }
 
-    // D10: BFS in R1 follows a `prev_events` edge whose parent_event_id
+    // D10: the walk in R1 follows a `prev_events` edge whose parent_event_id
     // resolves to a real event in R2. D9 covered "seed is in the wrong
     // room"; this covers the harder shape — the seed is legitimately in
     // R1, but its declared parent points across the room boundary.
@@ -621,41 +737,23 @@ mod tests {
         assert!(got.is_empty());
     }
 
-    // D12: BFS with multiple disjoint seeds. The frontier interleaves
-    // seeds at each level — pop seed1, push its parents, pop seed2, etc.
-    // Build two parallel single-parent chains so the expected order is
-    // unambiguous: [c, d, a, b].
+    // D12: multiple disjoint seeds. The priority queue merges the two
+    // chains into one global newest-first stream — it does NOT interleave
+    // by seed. Two parallel single-parent chains a(1) ← c(3) and
+    // b(2) ← d(4); seeds [c, d] come back ordered purely by ts: d, c, b, a.
     #[tokio::test]
     async fn events_before_handles_multiple_seeds() {
         let s = store_with_room().await;
-        let ev_a = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "x", 0);
+        let ev_a = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", 1, &[]);
         let id_a = ev_a.event_id.clone();
         s.persist_event(&ev_a, &[]).await.unwrap();
-        let ev_b = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "x", 1);
+        let ev_b = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "b", 2, &[]);
         let id_b = ev_b.event_id.clone();
         s.persist_event(&ev_b, &[]).await.unwrap();
-        let ev_c = crate::tests::make_event(
-            *ALICE_ROOM_ID,
-            *ALICE_USER_ID,
-            "m.room.message",
-            None,
-            serde_json::json!({"body": "c", "msgtype": "m.text"}),
-            0,
-            &[&id_a],
-            &[],
-        );
+        let ev_c = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "c", 3, &[&id_a]);
         let id_c = ev_c.event_id.clone();
         s.persist_event(&ev_c, &[]).await.unwrap();
-        let ev_d = crate::tests::make_event(
-            *ALICE_ROOM_ID,
-            *ALICE_USER_ID,
-            "m.room.message",
-            None,
-            serde_json::json!({"body": "d", "msgtype": "m.text"}),
-            0,
-            &[&id_b],
-            &[],
-        );
+        let ev_d = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "d", 4, &[&id_b]);
         let id_d = ev_d.event_id.clone();
         s.persist_event(&ev_d, &[]).await.unwrap();
 
@@ -664,145 +762,126 @@ mod tests {
             .await
             .unwrap();
         let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
-        // BFS interleaves seeds. Seeds pop in the order passed (c, d);
-        // their parents (a, b respectively) pop in the order pushed.
+        // Global newest-first across both seeds: d(4), c(3), b(2), a(1).
         assert_eq!(
             ids,
-            [id_c.as_str(), id_d.as_str(), id_a.as_str(), id_b.as_str()]
+            [id_d.as_str(), id_c.as_str(), id_b.as_str(), id_a.as_str()]
         );
     }
 
+    // D12b: multi-seed walk with a `limit` returns the *globally* newest
+    // events, not one level per seed. This is the property the priority
+    // queue buys over the old FIFO BFS: with seeds [c(3), d(4)] across two
+    // forks and limit=2, the result is [d, c] (the two newest by ts) — a
+    // FIFO would have returned [c, d] (seed order) or [d, c] but then, at
+    // limit=3, leaked an older event before a newer one on the other fork.
+    #[tokio::test]
+    async fn events_before_multi_seed_limit_returns_globally_newest() {
+        let s = store_with_room().await;
+        let ev_a = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", 1, &[]);
+        let id_a = ev_a.event_id.clone();
+        s.persist_event(&ev_a, &[]).await.unwrap();
+        let ev_b = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "b", 2, &[]);
+        let id_b = ev_b.event_id.clone();
+        s.persist_event(&ev_b, &[]).await.unwrap();
+        let ev_c = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "c", 3, &[&id_a]);
+        let id_c = ev_c.event_id.clone();
+        s.persist_event(&ev_c, &[]).await.unwrap();
+        let ev_d = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "d", 4, &[&id_b]);
+        let id_d = ev_d.event_id.clone();
+        s.persist_event(&ev_d, &[]).await.unwrap();
+
+        let got = s
+            .events_before(*ALICE_ROOM_ID, &[&id_c, &id_d], 2)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
+        assert_eq!(ids, [id_d.as_str(), id_c.as_str()], "two newest by ts");
+    }
+
     // D13: diamond DAG — the `visited` set must dedup shared ancestors
-    // so they appear exactly once in the result. a → b, a → c, b → d,
-    // c → d; walking from [d] should yield d, b, c, a — never a twice
-    // even though both b and c reach it.
+    // so they appear exactly once in the result. a ← b, a ← c, {b,c} ← d
+    // with ascending ts a(1), b(2), c(3), d(4); walking from [d] yields
+    // d, c, b, a (newest-first) — never a twice even though both b and c
+    // reach it.
     #[tokio::test]
     async fn events_before_dedups_shared_ancestors_in_diamond() {
         let s = store_with_room().await;
-        let ev_a = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", 0);
+        let ev_a = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "a", 1, &[]);
         let id_a = ev_a.event_id.clone();
         s.persist_event(&ev_a, &[]).await.unwrap();
-        // b and c share prev=[a] and body collapses on redaction → use ts
-        // to disambiguate.
-        let ev_b = crate::tests::make_event(
-            *ALICE_ROOM_ID,
-            *ALICE_USER_ID,
-            "m.room.message",
-            None,
-            serde_json::json!({"body": "b", "msgtype": "m.text"}),
-            1,
-            &[&id_a],
-            &[],
-        );
+        let ev_b = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "b", 2, &[&id_a]);
         let id_b = ev_b.event_id.clone();
         s.persist_event(&ev_b, &[]).await.unwrap();
-        let ev_c = crate::tests::make_event(
-            *ALICE_ROOM_ID,
-            *ALICE_USER_ID,
-            "m.room.message",
-            None,
-            serde_json::json!({"body": "c", "msgtype": "m.text"}),
-            2,
-            &[&id_a],
-            &[],
-        );
+        let ev_c = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "c", 3, &[&id_a]);
         let id_c = ev_c.event_id.clone();
         s.persist_event(&ev_c, &[]).await.unwrap();
-        let ev_d = message_with_prev(*ALICE_ROOM_ID, *ALICE_USER_ID, "d", &[&id_b, &id_c]);
+        let ev_d = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "d", 4, &[&id_b, &id_c]);
         let id_d = ev_d.event_id.clone();
         s.persist_event(&ev_d, &[]).await.unwrap();
 
         let got = s.events_before(*ALICE_ROOM_ID, &[&id_d], 10).await.unwrap();
         let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
-        // BFS: d -> sorted(b, c) -> a (deduped). Sort b/c lex.
-        let mut bc_sorted = vec![id_b.as_str(), id_c.as_str()];
-        bc_sorted.sort();
-        let expected: Vec<&str> = std::iter::once(id_d.as_str())
-            .chain(bc_sorted)
-            .chain(std::iter::once(id_a.as_str()))
-            .collect();
-        assert_eq!(ids, expected);
+        // Newest-first: d(4), c(3), b(2), a(1) — a surfaces exactly once.
+        assert_eq!(
+            ids,
+            [id_d.as_str(), id_c.as_str(), id_b.as_str(), id_a.as_str()]
+        );
         assert_eq!(ids.len(), 4, "shared ancestor surfaced more than once");
     }
 
-    // D14: determinism applies at every BFS level, not just one hop
-    // from the seed. D4 only verified the sort works for the seed's
-    // direct parents. Build two layers and intentionally insert
-    // `prev_events` arrays in reverse lex order — `fetch_edges` must
-    // still sort them on read, otherwise the result order changes
-    // depending on JSON-side insertion order.
+    // D14: determinism applies at every level, not just one hop from the
+    // seed. D4 only verified ordering for the seed's direct parents. Build
+    // two layers with distinct, ascending timestamps and intentionally
+    // insert each `prev_events` array in reverse lex order — the priority
+    // queue orders by `(origin_server_ts, event_id)`, so the JSON-side
+    // insertion order must not affect the result.
     #[tokio::test]
     async fn events_before_determinism_holds_at_every_level() {
         let s = store_with_room().await;
-        let ev_g1 = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "x", 0);
+        let ev_g1 = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "g1", 1, &[]);
         let id_g1 = ev_g1.event_id.clone();
         s.persist_event(&ev_g1, &[]).await.unwrap();
-        let ev_g2 = crate::tests::message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "x", 1);
+        let ev_g2 = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "g2", 2, &[]);
         let id_g2 = ev_g2.event_id.clone();
         s.persist_event(&ev_g2, &[]).await.unwrap();
-        // Parents both reference grandparents in REVERSE lex order
-        // (whichever id sorts higher first). `fetch_edges` sorts on read
-        // so the BFS still visits in lex order regardless of insertion.
+        // Parents both reference grandparents in REVERSE lex order; the
+        // heap orders by ts (g2 newer than g1) regardless of insertion.
         let mut gs_reversed = [id_g1.clone(), id_g2.clone()];
         gs_reversed.sort_by(|a, b| b.as_str().cmp(a.as_str())); // descending
         let gs_refs: Vec<&EventId> = gs_reversed.iter().map(|i| i.as_ref()).collect();
-        let ev_p1 = crate::tests::make_event(
-            *ALICE_ROOM_ID,
-            *ALICE_USER_ID,
-            "m.room.message",
-            None,
-            serde_json::json!({"body": "p1", "msgtype": "m.text"}),
-            10,
-            &gs_refs,
-            &[],
-        );
+        let ev_p1 = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "p1", 10, &gs_refs);
         let id_p1 = ev_p1.event_id.clone();
         s.persist_event(&ev_p1, &[]).await.unwrap();
-        let ev_p2 = crate::tests::make_event(
-            *ALICE_ROOM_ID,
-            *ALICE_USER_ID,
-            "m.room.message",
-            None,
-            serde_json::json!({"body": "p2", "msgtype": "m.text"}),
-            11,
-            &gs_refs,
-            &[],
-        );
+        let ev_p2 = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "p2", 11, &gs_refs);
         let id_p2 = ev_p2.event_id.clone();
         s.persist_event(&ev_p2, &[]).await.unwrap();
         // Child references parents in reverse lex order too.
         let mut ps_reversed = [id_p1.clone(), id_p2.clone()];
         ps_reversed.sort_by(|a, b| b.as_str().cmp(a.as_str()));
         let ps_refs: Vec<&EventId> = ps_reversed.iter().map(|i| i.as_ref()).collect();
-        let ev_c = crate::tests::make_event(
-            *ALICE_ROOM_ID,
-            *ALICE_USER_ID,
-            "m.room.message",
-            None,
-            serde_json::json!({"body": "c", "msgtype": "m.text"}),
-            0,
-            &ps_refs,
-            &[],
-        );
+        let ev_c = chain_msg(*ALICE_ROOM_ID, *ALICE_USER_ID, "c", 20, &ps_refs);
         let id_c = ev_c.event_id.clone();
         s.persist_event(&ev_c, &[]).await.unwrap();
 
         let got = s.events_before(*ALICE_ROOM_ID, &[&id_c], 10).await.unwrap();
         let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
-        // Expected: c, sorted(p1,p2), sorted(g1,g2).
-        let mut ps_sorted = vec![id_p1.as_str(), id_p2.as_str()];
-        ps_sorted.sort();
-        let mut gs_sorted = vec![id_g1.as_str(), id_g2.as_str()];
-        gs_sorted.sort();
-        let expected: Vec<&str> = std::iter::once(id_c.as_str())
-            .chain(ps_sorted)
-            .chain(gs_sorted)
-            .collect();
-        assert_eq!(ids, expected);
+        // Strict ts-descending at every level: c(20), then p2(11), p1(10),
+        // then g2(2), g1(1) — independent of the reversed JSON insertion.
+        assert_eq!(
+            ids,
+            [
+                id_c.as_str(),
+                id_p2.as_str(),
+                id_p1.as_str(),
+                id_g2.as_str(),
+                id_g1.as_str(),
+            ]
+        );
     }
 
     // D15: `hydrate_pdu` populates `prev_state_events` on the returned
-    // `Event`. The BFS itself only follows `prev` edges (MSC4242
+    // `Event`. The walk itself only follows `prev` edges (MSC4242
     // state DAG is walked separately), but downstream callers — state
     // resolution, etc. — rely on `prev_state_events` being present on
     // the PDUs `events_before` hands back. Build a message with both
@@ -812,7 +891,7 @@ mod tests {
         let s = store_with_room().await;
         // Build a message whose JSON declares both prev_events and
         // prev_state_events pointing at the room's create event. The
-        // create event is real, so the BFS will hydrate it.
+        // create event is real, so the walk will hydrate it.
         let create_event_id: OwnedEventId = {
             // Recreate the create event to learn its computed id.
             let ce = create_event(*ALICE_ROOM_ID, *ALICE_USER_ID);
@@ -924,7 +1003,7 @@ mod tests {
 
     // D23: validator chunks the IN-clause. With VALIDATE_EVENTS_EXIST_CHUNK=4
     // under cfg(test), six inputs cross at least two chunks; all six
-    // resolve, so validation passes and the BFS runs normally. Catches
+    // resolve, so validation passes and the walk runs normally. Catches
     // a regression where the chunk loop only writes results from the
     // last window into the `found` set (or only checks the first).
     #[tokio::test]
@@ -1001,7 +1080,7 @@ mod tests {
     }
 
     // D23a: a single node with 50 prev_events. Catches a regression
-    // where the BFS frontier is bounded or `fetch_edges` truncates the
+    // where the walk frontier is bounded or `fetch_edges` truncates the
     // parent set. Under Synapse-style semantics, head is excluded
     // (latest = boundary), so the result is just the 50 leaves.
     #[tokio::test]
