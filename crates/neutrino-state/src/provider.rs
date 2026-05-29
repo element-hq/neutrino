@@ -43,7 +43,7 @@ pub trait StateProvider {
     /// Transitive backwards closure of `seeds` via `Event.auth_events`.
     ///
     /// Returns every id reachable backwards from the seeds (seeds included
-    /// in the result). **Errors** with `StateResError::MissingAuthEvent` if
+    /// in the result). **Errors** with `StateResError::MissingEvent` if
     /// any id — seed or transitively discovered — isn't in the store.
     ///
     /// The project invariant: every event we know about has its **complete**
@@ -104,7 +104,7 @@ impl StateProvider for InMemoryStateProvider {
             let info = self
                 .events
                 .get(&id)
-                .ok_or_else(|| StateResError::MissingAuthEvent(id.clone()))?;
+                .ok_or_else(|| StateResError::MissingEvent(id.clone()))?;
             for parent in &info.event.auth_events {
                 if !visited.contains(parent) {
                     stack.push(parent.clone());

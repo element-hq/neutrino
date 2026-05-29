@@ -5,13 +5,14 @@
 //! - [`EventBuilder::build`] assembles a v12 / MSC4242 PDU, computes the
 //!   content hash, inserts it into the event, computes the reference hash,
 //!   derives the event_id, and (for `m.room.create`) lets [`parse_event`]
-//!   derive the room_id from the event_id. It runs `parse_event` as a final
-//!   defence-in-depth check so the bytes we just produced are guaranteed to
-//!   round-trip through the validator.
+//!   derive the room_id from the event_id. It runs `parse_event` (wire
+//!   format) and then `validate_pdu` (semantic rules) as final
+//!   defence-in-depth checks so the bytes we just produced are guaranteed
+//!   to round-trip through both validators.
 //!
 //! - [`from_wire`] is the inbound counterpart: it reads the canonical bytes
 //!   as the source of truth, computes the reference hash to derive the
-//!   event_id, then runs the same `parse_event` pass.
+//!   event_id, then runs the same `parse_event` + `validate_pdu` pair.
 //!
 //! See `event-id-design.md` §"Updated `EventBuilder`".
 
@@ -27,7 +28,7 @@ use serde::Serialize;
 use serde_json::value::{RawValue, to_raw_value};
 use serde_json::{Map, Value};
 
-use crate::validate::parse_event;
+use crate::validate::{parse_event, validate_pdu};
 use crate::{Event, FormatError};
 
 /// Builder for server-authored Matrix v12 PDUs.
@@ -214,17 +215,21 @@ impl EventBuilder {
 
         let raw = serialise_canonical(&canon);
 
-        // Defence-in-depth: round-trip through the wire-format validator.
-        // For create events, parse_event derives room_id from event_id (sigil
+        // Defence-in-depth: round-trip through the wire-format validator
+        // (parse_event) then the semantic validator (validate_pdu). For
+        // create events, parse_event derives room_id from event_id (sigil
         // swap), so we don't need to do that here.
         //
-        // Failures here are caller bugs (not builder bugs): the builder doesn't
-        // validate every field `parse_event` does — `state_key` for member
-        // events must parse as a user id (`MalformedId`), `content` shape for
-        // `m.room.create` / `m.room.power_levels` is rule-checked, etc. Bubble
-        // the `FormatError` up so the caller sees the specific reason rather
-        // than a panic from inside the builder.
-        parse_event(raw, event_id, self.auth_events)
+        // Failures here are caller bugs (not builder bugs): the builder
+        // doesn't validate every field validate_pdu does — content shape
+        // for `m.room.create` / `m.room.member` / `m.room.power_levels` is
+        // rule-checked, count limits on `prev_events` /
+        // `prev_state_events`, rule 9 (`@`-prefixed state_key vs sender)
+        // etc. Bubble the `FormatError` up so the caller sees the specific
+        // reason rather than a panic from inside the builder.
+        let event = parse_event(raw, event_id, self.auth_events)?;
+        validate_pdu(&event)?;
+        Ok(event)
     }
 }
 
@@ -274,7 +279,9 @@ pub fn from_wire(raw: Box<RawValue>, auth_events: Vec<OwnedEventId>) -> Result<E
         let s = String::from_utf8(bytes).expect("canonical JSON is valid UTF-8");
         RawValue::from_string(s).expect("canonical JSON parses as a RawValue")
     };
-    parse_event(raw_to_parse, event_id, auth_events)
+    let event = parse_event(raw_to_parse, event_id, auth_events)?;
+    validate_pdu(&event)?;
+    Ok(event)
 }
 
 fn ref_hash_error_to_format_error(err: ruma::canonical_json::RedactionError) -> FormatError {

@@ -20,7 +20,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
-use ruma::OwnedEventId;
+use ruma::{EventId, OwnedEventId};
 
 use crate::auth_events::auth_event_keys;
 use crate::auth_rules::{AuthContext, check_auth_rules};
@@ -169,7 +169,7 @@ pub fn power_of_sender(event: &Event, provider: &dyn StateProvider) -> Result<i6
     for aid in &event.auth_events {
         let info = provider
             .get_event(aid)
-            .ok_or_else(|| StateResError::MissingAuthEvent(aid.clone()))?;
+            .ok_or_else(|| StateResError::MissingEvent(aid.clone()))?;
         if info.rejected {
             continue;
         }
@@ -223,7 +223,7 @@ pub fn reverse_topological_power_sort(
     for eid in events {
         let info = provider
             .get_event(eid)
-            .ok_or_else(|| StateResError::MissingAuthEvent(eid.clone()))?;
+            .ok_or_else(|| StateResError::MissingEvent(eid.clone()))?;
         let pl = power_of_sender(&info.event, provider)?;
         event_map.insert(eid.clone(), info.event);
         event_to_pl.insert(eid.clone(), pl);
@@ -307,7 +307,7 @@ pub fn reverse_topological_power_sort(
 /// **Caller contract**: every event_id reachable from this run — every entry
 /// in `sorted`, every id in their `event.auth_events`, and every value in
 /// `initial_state` — must be in `provider`. A missing lookup raises
-/// `StateResError::MissingAuthEvent`. In particular: if `initial_state` is
+/// `StateResError::MissingEvent`. In particular: if `initial_state` is
 /// not empty (i.e. IAC pass 2 in phase 4c), the caller must ensure every
 /// value in it is provider-known. Pass 1 sidesteps this by passing
 /// `StateMap::new()`.
@@ -321,7 +321,7 @@ pub fn iterative_auth_checks(
     for eid in sorted {
         let info = provider
             .get_event(eid)
-            .ok_or_else(|| StateResError::MissingAuthEvent(eid.clone()))?;
+            .ok_or_else(|| StateResError::MissingEvent(eid.clone()))?;
         if info.rejected {
             continue;
         }
@@ -331,7 +331,7 @@ pub fn iterative_auth_checks(
         for aid in &event.auth_events {
             let parent = provider
                 .get_event(aid)
-                .ok_or_else(|| StateResError::MissingAuthEvent(aid.clone()))?;
+                .ok_or_else(|| StateResError::MissingEvent(aid.clone()))?;
             if parent.rejected {
                 continue;
             }
@@ -354,7 +354,7 @@ pub fn iterative_auth_checks(
             if let Some(rs_id) = resolved.get(&key) {
                 let rs_info = provider
                     .get_event(rs_id)
-                    .ok_or_else(|| StateResError::MissingAuthEvent(rs_id.clone()))?;
+                    .ok_or_else(|| StateResError::MissingEvent(rs_id.clone()))?;
                 if !rs_info.rejected {
                     auth_map.insert(key, rs_info.event);
                 }
@@ -408,7 +408,7 @@ pub fn is_power_event(event: &Event) -> bool {
 }
 
 /// Partition `events` into `(power, non_power)` using `is_power_event`.
-/// Every id must resolve through the provider; missing ids → `MissingAuthEvent`.
+/// Every id must resolve through the provider; missing ids → `MissingEvent`.
 pub fn split_power_events(
     events: &HashSet<OwnedEventId>,
     provider: &dyn StateProvider,
@@ -418,7 +418,7 @@ pub fn split_power_events(
     for eid in events {
         let info = provider
             .get_event(eid)
-            .ok_or_else(|| StateResError::MissingAuthEvent(eid.clone()))?;
+            .ok_or_else(|| StateResError::MissingEvent(eid.clone()))?;
         if is_power_event(&info.event) {
             power.insert(eid.clone());
         } else {
@@ -468,7 +468,7 @@ pub fn mainline(
         chain.push(pl_id.clone());
         let info = provider
             .get_event(&pl_id)
-            .ok_or_else(|| StateResError::MissingAuthEvent(pl_id.clone()))?;
+            .ok_or_else(|| StateResError::MissingEvent(pl_id.clone()))?;
         // Find the previous PL in this PL's auth_events. Single-step lookup
         // (no transitive walk): under MSC4242 v12, `calculate_auth_events`
         // emits the immediately-prior PL directly in `auth_events`.
@@ -476,7 +476,7 @@ pub fn mainline(
         for aid in &info.event.auth_events {
             let parent = provider
                 .get_event(aid)
-                .ok_or_else(|| StateResError::MissingAuthEvent(aid.clone()))?;
+                .ok_or_else(|| StateResError::MissingEvent(aid.clone()))?;
             if parent.rejected {
                 continue;
             }
@@ -524,12 +524,12 @@ pub fn mainline_position(
         }
         let info = provider
             .get_event(&current)
-            .ok_or_else(|| StateResError::MissingAuthEvent(current.clone()))?;
+            .ok_or_else(|| StateResError::MissingEvent(current.clone()))?;
         let mut next: Option<OwnedEventId> = None;
         for aid in &info.event.auth_events {
             let parent = provider
                 .get_event(aid)
-                .ok_or_else(|| StateResError::MissingAuthEvent(aid.clone()))?;
+                .ok_or_else(|| StateResError::MissingEvent(aid.clone()))?;
             if parent.rejected {
                 continue;
             }
@@ -576,12 +576,105 @@ pub fn mainline_sort(
     for eid in events {
         let info = provider
             .get_event(eid)
-            .ok_or_else(|| StateResError::MissingAuthEvent(eid.clone()))?;
+            .ok_or_else(|| StateResError::MissingEvent(eid.clone()))?;
         let depth = mainline_position(eid, &mainline_map, mainline_len, provider)?;
         decorated.push((depth, info.event.origin_server_ts, eid.clone()));
     }
     decorated.sort();
     Ok(decorated.into_iter().map(|(_, _, id)| id).collect())
+}
+
+// ----------------- state_before / state_at_heads -----------------
+
+/// Memoisation table for `state_at_heads` / `state_before` walks. Threaded
+/// through both calls in `RoomCore::apply` so the overlapping
+/// `prev_state_events` ↔ forward-extremity subgraphs are walked once.
+pub type StateBeforeCache = HashMap<OwnedEventId, Arc<StateMap<OwnedEventId>>>;
+
+/// Resolved state at the merge of `heads` — equivalently, state-before an
+/// imaginary event whose `prev_state_events` are `heads`.
+///
+/// Spec semantics (v12 + MSC4242): for `heads = [H1, H2, ...]`, returns
+/// `resolve_state(state_after(H1), state_after(H2), ...)`, where
+/// `state_after(H) = state_before(H) ∪ {(H.type, H.state_key) → H.id}` if H
+/// is itself a state event (message events leave state unchanged).
+///
+/// `cache` is consulted (and populated) for every event_id whose
+/// `state_before` is computed during the walk. Pass a fresh cache for a
+/// one-shot call; share one across multiple calls within the same `apply`
+/// to amortise the overlap.
+///
+/// **Errors**: any unknown id traversed (a head, or any
+/// `prev_state_events` ancestor) raises `StateResError::MissingEvent`,
+/// per the strict-closure invariant.
+pub fn state_at_heads(
+    heads: &[OwnedEventId],
+    provider: &dyn StateProvider,
+    cache: &mut StateBeforeCache,
+) -> Result<StateMap<OwnedEventId>, StateResError> {
+    if heads.is_empty() {
+        return Ok(StateMap::new());
+    }
+    let mut state_sets: Vec<StateMap<OwnedEventId>> = Vec::with_capacity(heads.len());
+    for head in heads {
+        let state_before_head = state_before_inner(head, provider, cache)?;
+        let head_info = provider
+            .get_event(head)
+            .ok_or_else(|| StateResError::MissingEvent(head.clone()))?;
+        let mut state_after = (*state_before_head).clone();
+        if let Some(sk) = &head_info.event.state_key {
+            state_after.insert(
+                (head_info.event.event_type.clone(), sk.clone()),
+                head.clone(),
+            );
+        }
+        state_sets.push(state_after);
+    }
+    let refs: Vec<&StateMap<OwnedEventId>> = state_sets.iter().collect();
+    resolve_state(&refs, provider)
+}
+
+/// Compute state-before-`event_id`: `state_at_heads(event.prev_state_events)`
+/// after a `get_event` lookup. Root case (no `prev_state_events`, i.e. a
+/// create event) returns the empty map.
+///
+/// Convenience wrapper that allocates its own cache; for `apply`'s
+/// back-to-back walks, prefer `state_at_heads` with a shared
+/// `StateBeforeCache`.
+pub fn state_before(
+    event_id: &EventId,
+    provider: &dyn StateProvider,
+) -> Result<StateMap<OwnedEventId>, StateResError> {
+    let mut cache = StateBeforeCache::new();
+    let arc = state_before_inner(event_id, provider, &mut cache)?;
+    Ok((*arc).clone())
+}
+
+fn state_before_inner(
+    event_id: &EventId,
+    provider: &dyn StateProvider,
+    cache: &mut StateBeforeCache,
+) -> Result<Arc<StateMap<OwnedEventId>>, StateResError> {
+    let owned: OwnedEventId = event_id.to_owned();
+    if let Some(cached) = cache.get(&owned) {
+        return Ok(cached.clone());
+    }
+
+    let info = provider
+        .get_event(event_id)
+        .ok_or_else(|| StateResError::MissingEvent(owned.clone()))?;
+
+    // Root: no prev_state_events (create event) → empty state-before.
+    if info.event.prev_state_events.is_empty() {
+        let empty = Arc::new(StateMap::new());
+        cache.insert(owned, empty.clone());
+        return Ok(empty);
+    }
+
+    let resolved = state_at_heads(&info.event.prev_state_events, provider, cache)?;
+    let arc = Arc::new(resolved);
+    cache.insert(owned, arc.clone());
+    Ok(arc)
 }
 
 // ----------------- resolve_state -----------------
@@ -809,7 +902,7 @@ mod tests {
         let mut seeds = HashSet::new();
         seeds.insert(eid("$a:example.org"));
         let err = conflicted_subgraph(&seeds, &provider).expect_err("unknown seed");
-        assert!(matches!(err, StateResError::MissingAuthEvent(_)));
+        assert!(matches!(err, StateResError::MissingEvent(_)));
     }
 
     #[test]
@@ -1350,7 +1443,7 @@ mod tests {
         let topic = room_topic(&phantom_room, "@alice:example.org", vec![fake_create_id]);
         let topic_id = put(&mut provider, topic);
         let err = iterative_auth_checks(&[topic_id], StateMap::new(), &provider).unwrap_err();
-        assert!(matches!(err, StateResError::MissingAuthEvent(_)));
+        assert!(matches!(err, StateResError::MissingEvent(_)));
     }
 
     // ===== Phase 4c =====
@@ -1837,6 +1930,129 @@ mod tests {
             out.get(&("m.room.create".to_string(), String::new())),
             Some(&create_id)
         );
+    }
+
+    // ----- state_before -----
+
+    #[test]
+    fn state_before_create_event_is_empty() {
+        let (provider, create_id, _) = setup_default();
+        let out = state_before(&create_id, &provider).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn state_before_unknown_event_errors() {
+        let provider = InMemoryStateProvider::new();
+        let phantom = build_create("@alice:example.org", &[], true);
+        let err = state_before(&phantom.event_id, &provider).unwrap_err();
+        assert!(matches!(err, StateResError::MissingEvent(_)));
+    }
+
+    #[test]
+    fn state_before_linear_state_chain_overlays_each_event() {
+        // create → alice_join (state) → topic (state).
+        // state_before(topic) should contain create + alice_join.
+        let (mut provider, create_id, room_id) = setup_default();
+        let alice_join = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.member".to_owned(),
+        )
+        .room_id(room_id.clone())
+        .state_key("@alice:example.org".to_owned())
+        .content(json!({ "membership": "join" }))
+        .auth_events(vec![create_id.clone()])
+        .prev_events(vec![create_id.clone()])
+        .prev_state_events(vec![create_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid join");
+        let alice_join_id = put(&mut provider, alice_join);
+        let topic = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.topic".to_owned(),
+        )
+        .room_id(room_id.clone())
+        .state_key(String::new())
+        .content(json!({ "topic": "hi" }))
+        .auth_events(vec![create_id.clone(), alice_join_id.clone()])
+        .prev_events(vec![alice_join_id.clone()])
+        .prev_state_events(vec![alice_join_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid topic");
+        let topic_id = put(&mut provider, topic);
+
+        let out = state_before(&topic_id, &provider).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out.get(&("m.room.create".to_string(), String::new())),
+            Some(&create_id)
+        );
+        assert_eq!(
+            out.get(&(
+                "m.room.member".to_string(),
+                "@alice:example.org".to_string()
+            )),
+            Some(&alice_join_id)
+        );
+    }
+
+    #[test]
+    fn state_before_message_event_in_chain_does_not_appear_in_state() {
+        // create → alice_join (state) → message (NOT state) → topic (state).
+        // state_before(topic) should NOT contain the message event.
+        let (mut provider, create_id, room_id) = setup_default();
+        let alice_join = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.member".to_owned(),
+        )
+        .room_id(room_id.clone())
+        .state_key("@alice:example.org".to_owned())
+        .content(json!({ "membership": "join" }))
+        .auth_events(vec![create_id.clone()])
+        .prev_events(vec![create_id.clone()])
+        .prev_state_events(vec![create_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid join");
+        let alice_join_id = put(&mut provider, alice_join);
+        let msg = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.message".to_owned(),
+        )
+        .room_id(room_id.clone())
+        .content(json!({ "msgtype": "m.text", "body": "hi" }))
+        .auth_events(vec![create_id.clone(), alice_join_id.clone()])
+        .prev_events(vec![alice_join_id.clone()])
+        .prev_state_events(vec![alice_join_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid msg");
+        let msg_id = put(&mut provider, msg);
+        let topic = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.topic".to_owned(),
+        )
+        .room_id(room_id.clone())
+        .state_key(String::new())
+        .content(json!({ "topic": "hi" }))
+        .auth_events(vec![create_id.clone(), alice_join_id.clone()])
+        .prev_events(vec![msg_id.clone()])
+        // topic's prev_state_events points past msg to alice_join (msg is not a state event).
+        .prev_state_events(vec![alice_join_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid topic");
+        let topic_id = put(&mut provider, topic);
+
+        let out = state_before(&topic_id, &provider).unwrap();
+        // No m.room.message entry — message events leave state untouched.
+        assert!(!out.contains_key(&("m.room.message".to_string(), String::new())));
+        assert!(out.contains_key(&(
+            "m.room.member".to_string(),
+            "@alice:example.org".to_string()
+        )));
     }
 
     #[test]
