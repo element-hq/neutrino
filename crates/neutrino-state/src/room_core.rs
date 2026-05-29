@@ -26,8 +26,8 @@
 //!   `check_auth_rules` against `current_state` for **non-state events
 //!   only**. State events are not soft-failed (matches synapse's behaviour
 //!   in `_check_for_soft_fail`). A soft-failed event is still persisted
-//!   (Matrix soft-fail semantics) — the `soft_failed` flag on
-//!   `Effect::Persist` lets storage keep it out of client timelines.
+//!   (Matrix soft-fail semantics) — the `soft_failed` flag on the persisted
+//!   `Event` lets storage keep it out of client timelines.
 //! - **Step 6** (state-set check): removed under MSC4242 / state DAGs.
 //!
 //! Local additions on top of the spec list: reference validation (Phase
@@ -64,7 +64,7 @@ use crate::auth_rules::check_auth_rules;
 use crate::provider::StateProvider;
 use crate::state_res;
 use crate::validate;
-use crate::{CoreError, StateMap, StateResError};
+use crate::{CoreError, StateDelta, StateMap, StateResError};
 
 /// Provider wrapper that transparently resolves a single `local_event` —
 /// the event currently being applied — while delegating everything else to
@@ -118,17 +118,21 @@ impl StateProvider for ProviderWithLocal<'_> {
 /// federation layers) interprets them sequentially in emission order.
 #[derive(Debug, Clone)]
 pub enum Effect {
-    /// Persist the event to storage. `soft_failed = true` means the event
-    /// passed reference + state-before auth but failed the soft-fail check
-    /// against `current_state`; storage keeps it but it must not be relayed
-    /// to clients (Matrix soft-fail semantics).
-    Persist {
-        event: Arc<Event>,
-        soft_failed: bool,
-    },
-    /// Replace `current_state` with this resolved state map. Emitted only
-    /// when the accepted event is a state event.
-    UpdateCurrentState(StateMap<OwnedEventId>),
+    /// Persist the event to storage. Whether the event was soft-failed is
+    /// carried on the event itself (`Event.soft_failed`) — a soft-failed
+    /// event passed reference + state-before auth but failed the soft-fail
+    /// check against `current_state`; storage keeps it but it must not be
+    /// relayed to clients (Matrix soft-fail semantics).
+    Persist { event: Arc<Event> },
+    /// Apply this delta to the persisted `current_state`. Emitted only when
+    /// the accepted event is a state event. Each entry is keyed by
+    /// `(event_type, state_key)`: `Some(id)` sets/replaces that key, `None`
+    /// removes it. The delta — not a full map — is the difference between
+    /// the old current state and the recomputed one; for a locally-accepted
+    /// state event on a linear DAG it is a single `Some` entry (the event's
+    /// own key), but a federation state-merge may set or remove several keys
+    /// at once.
+    UpdateCurrentState(StateDelta),
 }
 
 /// Per-room state machine state: the two head-sets of the room's DAGs and
@@ -171,6 +175,26 @@ impl RoomCore {
             forward_extremities: BTreeSet::new(),
             state_forward_extremities: BTreeSet::new(),
             current_state: Arc::new(StateMap::new()),
+        }
+    }
+
+    /// Rebuild a `RoomCore` from state previously persisted to storage: the
+    /// two head-sets and the resolved current state. Bootstraps a room's
+    /// in-memory state machine on first access (e.g. after a restart) — the
+    /// inverse of persisting `apply`'s effects. `timeline_fes` are the
+    /// timeline-DAG heads (`forward_extremities`), `state_fes` the state-DAG
+    /// heads (`state_forward_extremities`).
+    pub fn hydrate(
+        room_id: OwnedRoomId,
+        timeline_fes: BTreeSet<OwnedEventId>,
+        state_fes: BTreeSet<OwnedEventId>,
+        current_state: StateMap<Arc<Event>>,
+    ) -> Self {
+        Self {
+            room_id,
+            forward_extremities: timeline_fes,
+            state_forward_extremities: state_fes,
+            current_state: Arc::new(current_state),
         }
     }
 
@@ -306,18 +330,21 @@ impl RoomCore {
             // DAG like any other event. Pure; computed before the commit.
             let new_timeline_fes = self.next_forward_extremities(&event);
 
+            // Delta between the old current state and the recomputed one,
+            // computed before we overwrite `self.current_state`. This is what
+            // the persist layer applies — see `Effect::UpdateCurrentState`.
+            let delta = current_state_delta(&self.current_state, &new_current_ids);
+
             // Commit. All fallible work above is done.
             self.forward_extremities = new_timeline_fes;
             self.state_forward_extremities = new_fes;
             self.current_state = Arc::new(new_current_events);
 
-            // State events are not soft-failed (synapse parity).
+            // State events are not soft-failed (synapse parity) — `event`
+            // keeps its default `soft_failed = false`.
             Ok(vec![
-                Effect::Persist {
-                    event,
-                    soft_failed: false,
-                },
-                Effect::UpdateCurrentState(new_current_ids),
+                Effect::Persist { event },
+                Effect::UpdateCurrentState(delta),
             ])
         } else {
             // Spec step 5: soft-fail against current_state. Non-state events
@@ -339,7 +366,16 @@ impl RoomCore {
                 self.forward_extremities = self.next_forward_extremities(&event);
             }
 
-            Ok(vec![Effect::Persist { event, soft_failed }])
+            // Stamp the verdict onto the event so it persists with the row
+            // (the `soft_failed` column). The `Arc` is unique here — it was
+            // created at the top of `apply` and not cloned on this branch —
+            // so `make_mut` mutates in place without copying.
+            let mut event = event;
+            if soft_failed {
+                Arc::make_mut(&mut event).soft_failed = true;
+            }
+
+            Ok(vec![Effect::Persist { event }])
         }
     }
 
@@ -376,6 +412,26 @@ fn materialize_state(
         out.insert(key.clone(), info);
     }
     Ok(out)
+}
+
+/// Diff the old current state against the recomputed one, producing the
+/// minimal set of changes (see [`StateDelta`]). A key whose pointer changed
+/// or is newly present maps to `Some(new_id)`; a key present in `old` but
+/// absent from `new` maps to `None` (removal). Keys whose pointer is
+/// unchanged are omitted.
+fn current_state_delta(old: &StateMap<Arc<Event>>, new: &StateMap<OwnedEventId>) -> StateDelta {
+    let mut delta = StateDelta::new();
+    for (key, new_id) in new {
+        if old.get(key).map(|e| &e.event_id) != Some(new_id) {
+            delta.insert(key.clone(), Some(new_id.clone()));
+        }
+    }
+    for key in old.keys() {
+        if !new.contains_key(key) {
+            delta.insert(key.clone(), None);
+        }
+    }
+    delta
 }
 
 #[cfg(test)]
@@ -519,14 +575,17 @@ mod tests {
         assert_eq!(effects.len(), 2);
         assert!(matches!(
             &effects[0],
-            Effect::Persist { event, soft_failed: false } if event.event_id == create_id
+            Effect::Persist { event } if event.event_id == create_id && !event.soft_failed
         ));
         match &effects[1] {
-            Effect::UpdateCurrentState(state) => {
-                assert_eq!(state.len(), 1);
+            // First event in the room: old current_state is empty, so the
+            // delta equals the full state — a single Some entry for the
+            // create key.
+            Effect::UpdateCurrentState(delta) => {
+                assert_eq!(delta.len(), 1);
                 assert_eq!(
-                    state.get(&("m.room.create".to_string(), String::new())),
-                    Some(&create_id)
+                    delta.get(&("m.room.create".to_string(), String::new())),
+                    Some(&Some(create_id.clone()))
                 );
             }
             other => panic!("expected UpdateCurrentState, got {other:?}"),
@@ -559,10 +618,7 @@ mod tests {
 
         assert!(effects.iter().any(|e| matches!(
             e,
-            Effect::Persist {
-                soft_failed: false,
-                ..
-            }
+            Effect::Persist { event } if !event.soft_failed
         )));
         assert!(
             effects
@@ -623,10 +679,7 @@ mod tests {
         // Message events emit Persist but NOT UpdateCurrentState.
         assert!(effects.iter().any(|e| matches!(
             e,
-            Effect::Persist {
-                soft_failed: false,
-                ..
-            }
+            Effect::Persist { event } if !event.soft_failed
         )));
         assert!(
             !effects
@@ -850,6 +903,36 @@ mod tests {
     }
 
     #[test]
+    fn hydrate_round_trips_supplied_state() {
+        // `hydrate` is the inverse of persisting apply's effects: it rebuilds
+        // a RoomCore from the two head-sets and current_state read out of
+        // storage. Assert each piece lands on the right field.
+        let create = create_event("@alice:example.org");
+        let room_id = room_id_from_create(&create.event_id);
+        let create_id = create.event_id.clone();
+        let timeline: BTreeSet<OwnedEventId> = [create_id.clone()].into_iter().collect();
+        let state: BTreeSet<OwnedEventId> = [create_id.clone()].into_iter().collect();
+        let mut current: StateMap<Arc<Event>> = StateMap::new();
+        current.insert(
+            ("m.room.create".to_string(), String::new()),
+            Arc::new(create),
+        );
+
+        let room = RoomCore::hydrate(room_id.clone(), timeline.clone(), state.clone(), current);
+
+        assert_eq!(room.room_id(), &*room_id);
+        assert_eq!(room.forward_extremities(), &timeline);
+        assert_eq!(room.state_forward_extremities(), &state);
+        assert_eq!(room.current_state().len(), 1);
+        assert_eq!(
+            room.current_state()
+                .get(&("m.room.create".to_string(), String::new()))
+                .map(|e| e.event_id.clone()),
+            Some(create_id)
+        );
+    }
+
+    #[test]
     fn apply_soft_failed_event_does_not_advance_timeline_head() {
         // I1 / synapse#5269: a soft-failed event is persisted but must NOT
         // become a forward extremity nor drop the parents it references.
@@ -890,10 +973,7 @@ mod tests {
         assert!(
             matches!(
                 effects.as_slice(),
-                [Effect::Persist {
-                    soft_failed: true,
-                    ..
-                }]
+                [Effect::Persist { event }] if event.soft_failed
             ),
             "expected a single soft-failed Persist, got {effects:?}"
         );
@@ -947,10 +1027,7 @@ mod tests {
         let effects = room.apply(invite, &provider).expect("invite accepted");
         assert!(effects.iter().any(|e| matches!(
             e,
-            Effect::Persist {
-                soft_failed: false,
-                ..
-            }
+            Effect::Persist { event } if !event.soft_failed
         )));
         assert!(
             effects
@@ -1024,10 +1101,7 @@ mod tests {
         let effects = room.apply(kick, &provider).expect("kick accepted");
         assert!(effects.iter().any(|e| matches!(
             e,
-            Effect::Persist {
-                soft_failed: false,
-                ..
-            }
+            Effect::Persist { event } if !event.soft_failed
         )));
         // bob's membership entry now references the kick event.
         let bob_member_key = ("m.room.member".to_string(), "@bob:example.org".to_string());
@@ -1080,10 +1154,7 @@ mod tests {
         let effects = room.apply(ban, &provider).expect("ban accepted");
         assert!(effects.iter().any(|e| matches!(
             e,
-            Effect::Persist {
-                soft_failed: false,
-                ..
-            }
+            Effect::Persist { event } if !event.soft_failed
         )));
         let bob_now = room
             .current_state

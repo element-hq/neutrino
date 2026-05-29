@@ -1,12 +1,13 @@
 //! `RoomStore` impl on `SqliteStore`.
 
+use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{OptionalExtension, params};
 use neutrino_common::ROOM_VERSION_ID;
 use neutrino_store::{Event, RoomStore, StorageError};
-use ruma::{RoomId, RoomVersionId};
+use ruma::{OwnedEventId, RoomId, RoomVersionId};
 use serde_json::Value;
 
 use crate::{SqliteStore, error::Error, row::EventRow};
@@ -164,6 +165,51 @@ impl RoomStore for SqliteStore {
         })
         .await
     }
+
+    async fn forward_extremities(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Option<(BTreeSet<OwnedEventId>, BTreeSet<OwnedEventId>)>, StorageError> {
+        let room_id = room_id.to_owned();
+
+        self.run_read(
+            move |conn| -> Result<Option<(BTreeSet<OwnedEventId>, BTreeSet<OwnedEventId>)>, Error> {
+                let row: Option<(String, String)> = conn
+                    .query_row(
+                        "SELECT forward_extremities, state_dag_forward_extremities \
+                         FROM rooms WHERE room_id = ?",
+                        params![room_id.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+
+                match row {
+                    None => Ok(None),
+                    Some((timeline_json, state_json)) => Ok(Some((
+                        parse_event_id_set(&timeline_json)?,
+                        parse_event_id_set(&state_json)?,
+                    ))),
+                }
+            },
+        )
+        .await
+    }
+}
+
+/// Parse a JSON array of event ids (as stored in the `rooms`
+/// forward-extremity columns) into a `BTreeSet`. A malformed column or a
+/// non-parseable id is DB corruption, surfaced as `Internal` rather than
+/// swallowed.
+fn parse_event_id_set(json: &str) -> Result<BTreeSet<OwnedEventId>, Error> {
+    let ids: Vec<String> = serde_json::from_str(json)
+        .map_err(|e| Error::Internal(format!("malformed forward_extremities json: {e}")))?;
+    ids.into_iter()
+        .map(|s| {
+            OwnedEventId::try_from(s).map_err(|e| {
+                Error::Internal(format!("malformed event_id in forward_extremities: {e}"))
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -773,5 +819,33 @@ mod tests {
             msg.contains("CHECK constraint failed"),
             "expected CHECK violation, got: {msg}"
         );
+    }
+
+    // FE1: forward_extremities for an unknown room → None.
+    #[tokio::test]
+    async fn forward_extremities_unknown_room_is_none() {
+        let store = store().await;
+        let got = store
+            .forward_extremities(room_id!("!nope:example.com"))
+            .await
+            .unwrap();
+        assert!(got.is_none());
+    }
+
+    // FE2: a freshly created room reads back as two empty head-sets — the
+    // columns default to '[]' until persist_resolved_event populates them
+    // (createRoom population is deferred, see PLAN 6d).
+    #[tokio::test]
+    async fn forward_extremities_fresh_room_is_empty_pair() {
+        let store = store().await;
+        let ce = create_event(*ALICE_ROOM_ID, *ALICE_USER_ID);
+        store.create_room(&ce, &[]).await.unwrap();
+        let (timeline, state) = store
+            .forward_extremities(*ALICE_ROOM_ID)
+            .await
+            .unwrap()
+            .expect("room exists");
+        assert!(timeline.is_empty());
+        assert!(state.is_empty());
     }
 }

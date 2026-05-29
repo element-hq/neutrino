@@ -169,9 +169,11 @@ pub fn parse_event(
         prev_events,
         prev_state_events,
         auth_events,
-        // Fresh from the wire-format pass — rejection is a downstream
-        // verdict from auth-rule evaluation, not a wire-format property.
+        // Fresh from the wire-format pass — rejection and soft-fail are
+        // downstream verdicts from auth-rule evaluation, not wire-format
+        // properties.
         rejected: false,
+        soft_failed: false,
         raw,
     })
 }

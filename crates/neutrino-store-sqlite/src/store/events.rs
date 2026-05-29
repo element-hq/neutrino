@@ -1,9 +1,11 @@
 //! `EventStore` impl on `SqliteStore`.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use async_trait::async_trait;
-use deadpool_sqlite::rusqlite::{OptionalExtension, params, params_from_iter};
+use deadpool_sqlite::rusqlite::{OptionalExtension, Transaction, params, params_from_iter};
 use neutrino_store::{Direction, Event, EventStore, PaginationToken, StorageError, StreamPos};
-use ruma::{EventId, OwnedServerName, RoomId, ServerName};
+use ruma::{EventId, OwnedEventId, OwnedServerName, RoomId, ServerName};
 use tokio::sync::watch;
 
 use crate::{
@@ -74,6 +76,60 @@ impl EventStore for SqliteStore {
             // Watch still advances so subscribers waiting on stream
             // changes can discover the new history (e.g. a paginating
             // client refetching `room_messages`).
+            SqliteStore::notify_watch(&watch_tx, stream_pos);
+
+            Ok(())
+        })
+        .await
+    }
+
+    async fn persist_resolved_event(
+        &self,
+        event: &Event,
+        timeline_fes: &BTreeSet<OwnedEventId>,
+        state_fes: &BTreeSet<OwnedEventId>,
+        current_state_delta: &BTreeMap<(String, String), Option<OwnedEventId>>,
+    ) -> Result<(), StorageError> {
+        // event_id <-> raw consistency asserted inside `EventRow::from`.
+        let event = EventRow::from(event).to_owned();
+        let room_id = event.room_id.clone();
+        let timeline_json = fe_json(timeline_fes)?;
+        let state_json = fe_json(state_fes)?;
+        let delta = current_state_delta.clone();
+        let watch_tx = self.watch_tx.clone();
+
+        self.run_write(move |conn| -> Result<(), Error> {
+            let tx = conn.transaction()?;
+
+            // Event row + DAG edges only — current_state is NOT touched here.
+            // State resolution may change current-state keys other than (or
+            // instead of) this event's own, so we drive current_state from
+            // the explicit `current_state_delta` below rather than via
+            // `write_into_tx`'s implicit single-key upsert.
+            let stream_pos = event.write_into_tx_no_current_state(&tx)?;
+
+            // Apply the current-state delta. `Some(id)` upserts the key to
+            // point at `id`; `None` removes the key. The pointer's metadata
+            // (membership for `m.room.member`) is derived from the
+            // already-persisted `events` row via `INSERT ... SELECT`, so the
+            // delta only needs to carry the event id — and 0 affected rows on
+            // an upsert means the referenced event isn't persisted, which is
+            // a caller-contract violation we surface rather than swallow.
+            apply_current_state_delta(&tx, room_id.as_str(), &delta)?;
+
+            // Replace the room's two head-sets. The `events.room_id` FK that
+            // the event write just satisfied guarantees the room exists, so
+            // this UPDATE always matches its row.
+            tx.execute(
+                "UPDATE rooms \
+                 SET forward_extremities = ?, state_dag_forward_extremities = ? \
+                 WHERE room_id = ?",
+                params![timeline_json, state_json, room_id.as_str()],
+            )?;
+
+            tx.commit()?;
+
+            // Notify after commit, like `persist_event`.
             SqliteStore::notify_watch(&watch_tx, stream_pos);
 
             Ok(())
@@ -273,11 +329,68 @@ impl EventStore for SqliteStore {
     }
 }
 
+/// Serialise a forward-extremity set to the JSON-array form stored in the
+/// `rooms` columns. Mirror of `parse_event_id_set` in `rooms.rs`.
+/// Serialisation of a list of typed ids can't fail in practice; any error
+/// maps to `Internal`.
+fn fe_json(fes: &BTreeSet<OwnedEventId>) -> Result<String, Error> {
+    serde_json::to_string(&fes.iter().map(|id| id.as_str()).collect::<Vec<_>>())
+        .map_err(|e| Error::Internal(format!("serialising forward_extremities: {e}")))
+}
+
+/// Apply a resolved current-state delta within `tx`. Each `Some(id)` upserts
+/// the `(room_id, event_type, state_key)` row to point at `id`; each `None`
+/// removes the row. The upsert derives `event_id`'s `event_type` /
+/// `state_key` / `membership` straight from the already-persisted `events`
+/// row, so the delta need only carry the id. An upsert that affects zero rows
+/// means the referenced event isn't persisted — a violation of the method's
+/// pre-condition — surfaced as `Internal` rather than silently dropped.
+fn apply_current_state_delta(
+    tx: &Transaction<'_>,
+    room_id: &str,
+    delta: &BTreeMap<(String, String), Option<OwnedEventId>>,
+) -> Result<(), Error> {
+    for ((event_type, state_key), change) in delta {
+        match change {
+            Some(event_id) => {
+                let affected = tx.execute(
+                    "INSERT INTO current_state \
+                         (room_id, event_type, state_key, event_id, membership) \
+                     SELECT room_id, event_type, state_key, event_id, \
+                            json_extract(json, '$.content.membership') \
+                     FROM events WHERE event_id = ? \
+                     ON CONFLICT(room_id, event_type, state_key) DO UPDATE SET \
+                         event_id = excluded.event_id, \
+                         membership = excluded.membership",
+                    params![event_id.as_str()],
+                )?;
+                if affected == 0 {
+                    return Err(Error::Internal(format!(
+                        "current_state delta references unpersisted event {event_id}"
+                    )));
+                }
+            }
+            None => {
+                tx.execute(
+                    "DELETE FROM current_state \
+                     WHERE room_id = ? AND event_type = ? AND state_key = ?",
+                    params![room_id, event_type, state_key],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use deadpool_sqlite::rusqlite::params;
     use neutrino_common::Event;
-    use neutrino_store::{Direction, EventStore, PaginationToken, StorageError, StreamPos};
+    use neutrino_store::{
+        Direction, EventStore, PaginationToken, RoomStore, StateStore, StorageError, StreamPos,
+    };
     use ruma::{EventId, OwnedEventId, event_id, room_id, server_name};
     use serde_json::json;
 
@@ -300,6 +413,152 @@ mod tests {
     /// Convenience wrapper for tests that don't need the create event id.
     async fn store_with_room() -> SqliteStore {
         store_with_room_and_create().await.0
+    }
+
+    /// A single-entry "set" delta for `(event_type, state_key)` → `id`.
+    fn set_delta(
+        event_type: &str,
+        state_key: &str,
+        id: &OwnedEventId,
+    ) -> BTreeMap<(String, String), Option<OwnedEventId>> {
+        BTreeMap::from([(
+            (event_type.to_string(), state_key.to_string()),
+            Some(id.clone()),
+        )])
+    }
+
+    // EZ1: persist_resolved_event writes the event and applies a one-key
+    // "set" delta to current_state, then replaces both forward-extremity
+    // columns. The load half (`forward_extremities`) round-trips the
+    // head-sets.
+    #[tokio::test]
+    async fn persist_resolved_event_state_event_updates_state_and_fe_columns() {
+        let (s, create) = store_with_room_and_create().await;
+        let name = name_event(*ALICE_ROOM_ID, *ALICE_USER_ID, "Room");
+        let name_id = name.event_id.clone();
+        let timeline: BTreeSet<OwnedEventId> = [name_id.clone()].into_iter().collect();
+        let state: BTreeSet<OwnedEventId> = [create.event_id.clone(), name_id.clone()]
+            .into_iter()
+            .collect();
+        let delta = set_delta("m.room.name", "", &name_id);
+
+        s.persist_resolved_event(&name, &timeline, &state, &delta)
+            .await
+            .unwrap();
+
+        assert_eq!(s.get_events(&[&name_id]).await.unwrap().len(), 1);
+        let cs = s
+            .current_state_event(*ALICE_ROOM_ID, "m.room.name", "")
+            .await
+            .unwrap();
+        assert_eq!(cs.map(|e| e.event_id), Some(name_id));
+        let (tl, st) = s
+            .forward_extremities(*ALICE_ROOM_ID)
+            .await
+            .unwrap()
+            .expect("room exists");
+        assert_eq!(tl, timeline);
+        assert_eq!(st, state);
+    }
+
+    // EZ2: persist_resolved_event for a non-state event (empty delta) moves
+    // the timeline column but writes no current_state row.
+    #[tokio::test]
+    async fn persist_resolved_event_non_state_event_writes_no_current_state() {
+        let (s, create) = store_with_room_and_create().await;
+        let msg = message(*ALICE_ROOM_ID, *ALICE_USER_ID, "hi");
+        let msg_id = msg.event_id.clone();
+        let timeline: BTreeSet<OwnedEventId> = [msg_id.clone()].into_iter().collect();
+        let state: BTreeSet<OwnedEventId> = [create.event_id.clone()].into_iter().collect();
+
+        s.persist_resolved_event(&msg, &timeline, &state, &BTreeMap::new())
+            .await
+            .unwrap();
+
+        let (tl, st) = s
+            .forward_extremities(*ALICE_ROOM_ID)
+            .await
+            .unwrap()
+            .expect("room exists");
+        assert_eq!(tl, timeline);
+        assert_eq!(st, state);
+
+        let current = s.current_room_state(*ALICE_ROOM_ID).await.unwrap();
+        assert!(!current.values().any(|e| e.event_id == msg_id));
+    }
+
+    // EZ3: a `None` delta entry removes the current_state row. Set a name,
+    // then persist a later event whose delta removes the name key, and
+    // confirm the key is gone. (The carrier event is incidental — the test
+    // exercises the delete branch of the delta applier.)
+    #[tokio::test]
+    async fn persist_resolved_event_delta_none_removes_current_state_key() {
+        let (s, create) = store_with_room_and_create().await;
+        let name = name_event(*ALICE_ROOM_ID, *ALICE_USER_ID, "Room");
+        let name_id = name.event_id.clone();
+        let fe1: BTreeSet<OwnedEventId> = [name_id.clone()].into_iter().collect();
+        s.persist_resolved_event(&name, &fe1, &fe1, &set_delta("m.room.name", "", &name_id))
+            .await
+            .unwrap();
+        assert!(
+            s.current_state_event(*ALICE_ROOM_ID, "m.room.name", "")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let msg = message(*ALICE_ROOM_ID, *ALICE_USER_ID, "hi");
+        let msg_id = msg.event_id.clone();
+        let fe2: BTreeSet<OwnedEventId> = [msg_id].into_iter().collect();
+        let state_fe: BTreeSet<OwnedEventId> = [create.event_id.clone()].into_iter().collect();
+        let remove: BTreeMap<(String, String), Option<OwnedEventId>> =
+            BTreeMap::from([(("m.room.name".to_string(), String::new()), None)]);
+        s.persist_resolved_event(&msg, &fe2, &state_fe, &remove)
+            .await
+            .unwrap();
+
+        assert!(
+            s.current_state_event(*ALICE_ROOM_ID, "m.room.name", "")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // EZ4: a "set" delta referencing an event that isn't persisted is a
+    // pre-condition violation → Internal (0 rows affected by the upsert).
+    #[tokio::test]
+    async fn persist_resolved_event_delta_unpersisted_target_errors() {
+        let (s, _create) = store_with_room_and_create().await;
+        let msg = message(*ALICE_ROOM_ID, *ALICE_USER_ID, "hi");
+        let msg_id = msg.event_id.clone();
+        let fe: BTreeSet<OwnedEventId> = [msg_id].into_iter().collect();
+        let ghost = event_id!("$ghost:example.org").to_owned();
+        let delta = set_delta("m.room.name", "", &ghost);
+
+        let result = s.persist_resolved_event(&msg, &fe, &fe, &delta).await;
+        assert!(
+            matches!(result, Err(StorageError::Internal(_))),
+            "{result:?}"
+        );
+    }
+
+    // EZ5: the soft_failed verdict round-trips through the event row.
+    #[tokio::test]
+    async fn persist_resolved_event_round_trips_soft_failed_flag() {
+        let s = store_with_room().await;
+        let mut msg = message(*ALICE_ROOM_ID, *ALICE_USER_ID, "hi");
+        msg.soft_failed = true;
+        let msg_id = msg.event_id.clone();
+        let fe: BTreeSet<OwnedEventId> = [msg_id.clone()].into_iter().collect();
+
+        s.persist_resolved_event(&msg, &fe, &fe, &BTreeMap::new())
+            .await
+            .unwrap();
+
+        let got = s.get_events(&[&msg_id]).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].soft_failed);
     }
 
     // E2: persist_event for unknown room → InvalidInput (FK violation)

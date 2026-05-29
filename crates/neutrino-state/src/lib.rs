@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use ruma::canonical_json::CanonicalJsonError;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
@@ -36,6 +36,15 @@ pub use neutrino_common::Event;
 
 /// Resolved room state: one entry per `(event_type, state_key)` pair.
 pub type StateMap<V> = HashMap<(String, String), V>;
+
+/// A change to apply to the resolved current state, keyed by
+/// `(event_type, state_key)`. `Some(id)` sets or replaces the pointer for
+/// that key (the referenced event is already persisted); `None` removes the
+/// key entirely. Emitted by `RoomCore::apply` as the delta between the old
+/// and recomputed current state — the persist layer applies it verbatim. A
+/// `BTreeMap` (not `HashMap`) so the iteration order the persist layer sees
+/// is deterministic.
+pub type StateDelta = BTreeMap<(String, String), Option<OwnedEventId>>;
 
 /// Errors raised by format validation (phase 1) — wire-format violations that
 /// reject the event outright, before any state lookup happens.

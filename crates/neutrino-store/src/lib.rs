@@ -1,9 +1,10 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use async_trait::async_trait;
 pub use neutrino_common::Event;
 use ruma::{
-    EventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, RoomVersionId, ServerName, UserId,
+    EventId, OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, RoomVersionId,
+    ServerName, UserId,
 };
 use thiserror::Error;
 use tokio::sync::watch;
@@ -107,6 +108,20 @@ pub trait RoomStore: Send + Sync {
     /// Pre:  none.
     /// Post: returns the number of rooms registered via `create_room`.
     async fn room_count(&self) -> Result<u64, StorageError>;
+
+    /// Pre:  none.
+    /// Post: returns the room's two forward-extremity sets as
+    ///       `(timeline_fes, state_fes)` — the timeline-DAG heads and the
+    ///       state-DAG heads persisted alongside the room — or `None` if the
+    ///       room does not exist. A room that exists but whose heads have not
+    ///       yet been written by `persist_resolved_event` reads back as two
+    ///       empty sets (the columns default to `[]`); the caller treats that
+    ///       as "not yet populated". Used to bootstrap an in-memory
+    ///       `RoomCore` (see `neutrino_state::RoomCore::hydrate`).
+    async fn forward_extremities(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Option<(BTreeSet<OwnedEventId>, BTreeSet<OwnedEventId>)>, StorageError>;
 }
 
 #[async_trait]
@@ -142,6 +157,32 @@ pub trait EventStore: Send + Sync {
     /// forward extension where the new event has been resolved into the room's
     /// current state by the caller.
     async fn persist_historical_event(&self, event: &Event) -> Result<(), StorageError>;
+
+    /// Pre:  `event.room_id` must exist; `event` is the just-accepted output
+    ///       of `neutrino_state::RoomCore::apply`; `timeline_fes` /
+    ///       `state_fes` are the head-sets that apply produced (read off the
+    ///       post-apply `RoomCore`); and `current_state_delta` is the
+    ///       `Effect::UpdateCurrentState` payload apply emitted (empty for a
+    ///       non-state event). Every event id referenced by a `Some(_)` entry
+    ///       in the delta MUST already be persisted (the just-persisted
+    ///       `event`, or a prior event) — the impl asserts this.
+    /// Post: in a single write transaction — the event is persisted with a
+    ///       new `StreamPos` (event row + DAG edges); the current-state delta
+    ///       is applied (each `Some(id)` upserts that `(event_type,
+    ///       state_key)` row to point at `id`, each `None` deletes the row);
+    ///       and the room's forward-extremity columns are replaced with
+    ///       `timeline_fes` / `state_fes`. The `subscribe()` watch advances
+    ///       after commit. No outbox rows are written — federation delivery
+    ///       is layered on separately (Server-Server /send). This is the
+    ///       persist half of the storage⇄`RoomCore` bridge;
+    ///       `forward_extremities` is the load half.
+    async fn persist_resolved_event(
+        &self,
+        event: &Event,
+        timeline_fes: &BTreeSet<OwnedEventId>,
+        state_fes: &BTreeSet<OwnedEventId>,
+        current_state_delta: &BTreeMap<(String, String), Option<OwnedEventId>>,
+    ) -> Result<(), StorageError>;
 
     /// Pre:  none.
     /// Post: returns one `Event` per ID that exists in the store; IDs with no
