@@ -25,9 +25,12 @@ use crate::federation::FedError;
 use crate::{AppState, lock_app};
 
 /// Spec/Synapse default for `limit` when the requester omits it. Backfill's
-/// `limit` is nominally required (ruma types it `UInt`), but we mirror the
-/// `get_missing_events` sibling's lenient default rather than 400 on a
-/// missing/garbled value — friendlier in the trusted single-user mesh.
+/// `limit` is nominally required (ruma types it `UInt`), but a *missing* or
+/// un-parseable `limit` defaults here rather than 400 — friendlier in the
+/// trusted single-user mesh. An *explicit* `limit=0` is still rejected (see
+/// the handler): that matches Synapse, whose backfill servlet does
+/// `if not limit: return 400` — asking for zero events is a client bug, not
+/// a valid empty backfill.
 const DEFAULT_LIMIT: u32 = 10;
 /// Hard cap on returned PDUs. Matches Synapse's `min(limit, 100)` in its
 /// backfill handler; the v1.18 spec sets no maximum. Saturating, not a 400.
@@ -50,8 +53,9 @@ pub(crate) struct ResponseBody {
 ///
 /// 1. Parse `room_id` manually (400 JSON, not axum's plain-text default).
 /// 2. Reject an empty `v` (400) — nothing to walk back from.
-/// 3. 404 if the room is unknown (pre-checked via `RoomStore::room_exists`).
-/// 4. Clamp `limit`: default 10, max 100 (Synapse parity).
+/// 3. Reject an explicit `limit=0` (400) — Synapse parity (`if not limit`).
+/// 4. 404 if the room is unknown (pre-checked via `RoomStore::room_exists`).
+/// 5. Clamp `limit`: default 10 if absent, max 100 (Synapse parity).
 /// 5. Pre-filter `v` to the seeds we actually hold (so an unknown seed is
 ///    skipped, not a 500 — `events_before` rejects unknown seeds).
 /// 6. Walk back via `DagStore::events_before` (seeds included, newest-first).
@@ -67,9 +71,17 @@ pub(crate) async fn handle(
 
     let (v_raw, limit_raw) = parse_backfill_query(raw_query.as_deref());
 
-    // (2)
+    // (2) — a present-but-blank `?v=` parses to no values (the parser drops
+    // empty entries), so this also catches the blank case, not just the
+    // wholly-absent one.
     if v_raw.is_empty() {
         return Err(FedError::BadRequest("missing v parameter"));
+    }
+
+    // (3) — explicit `limit=0` is a client bug, not a valid empty backfill;
+    // reject it like Synapse's `if not limit`. A missing limit defaults (5).
+    if limit_raw == Some(0) {
+        return Err(FedError::BadRequest("limit must be a positive integer"));
     }
 
     let (store, origin) = {
@@ -77,15 +89,16 @@ pub(crate) async fn handle(
         (app.store.clone(), app.config.server_name.clone())
     };
 
-    // (3)
+    // (4)
     if !store.room_exists(&room_id).await? {
         return Err(FedError::RoomNotFound);
     }
 
-    // (4) — saturating cap, not a 400.
+    // (5) — default 10 if absent; saturating upper cap (explicit 0 already
+    // rejected in (3)).
     let limit = limit_raw.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
 
-    // (5) — parse seed ids, dropping any that aren't syntactically valid
+    // (6) — parse seed ids, dropping any that aren't syntactically valid
     // (a garbled seed is treated like an unknown one: skipped). Then filter
     // to the seeds we actually hold in this room via `get_events` (which
     // silently omits absent ids). `events_before` rejects a seed it doesn't
@@ -105,7 +118,7 @@ pub(crate) async fn handle(
         .map(|e| e.event_id)
         .collect();
 
-    // (6) + (7) — reverse-chronological (newest-first), seeds included: the
+    // (7) + (8) — reverse-chronological (newest-first), seeds included: the
     // order `events_before` yields and the order Synapse's backfill returns.
     // No `.rev()` (unlike get_missing_events, which serves oldest-first).
     // Wire bytes verbatim so each event's reference hash round-trips on the
@@ -136,9 +149,11 @@ pub(crate) async fn handle(
 /// axum's `Query<HashMap<_, _>>` (serde_urlencoded) collapses repeated keys,
 /// so `?v=…&v=…` would lose all but one — hence the hand-rolled walk over
 /// `RawQuery`. Unknown keys are ignored; a `limit` that doesn't parse as a
-/// `u32` yields `None` (the caller defaults it). `v` values that fail to
-/// percent-decode are dropped (the caller treats an unknown/garbled seed as
-/// "not held").
+/// `u32` yields `None` (the caller defaults it). `v` values that are *empty*
+/// (a blank `?v=`) or fail to percent-decode are dropped — so a request that
+/// supplies no non-empty `v` yields an empty list, which the caller turns
+/// into a 400, and an unknown/garbled non-empty seed is treated as "not
+/// held" (skipped).
 fn parse_backfill_query(raw: Option<&str>) -> (Vec<String>, Option<u32>) {
     let mut vs = Vec::new();
     let mut limit = None;
@@ -151,8 +166,11 @@ fn parse_backfill_query(raw: Option<&str>) -> (Vec<String>, Option<u32>) {
         }
         let (key, val) = pair.split_once('=').unwrap_or((pair, ""));
         match key {
+            // Drop empty values: a blank `?v=` is a missing seed, not a seed
+            // that happens to be the empty string. The caller's empty-`v`
+            // check then 400s instead of silently returning an empty walk.
             "v" => {
-                if let Some(decoded) = percent_decode(val) {
+                if let Some(decoded) = percent_decode(val).filter(|d| !d.is_empty()) {
                     vs.push(decoded);
                 }
             }
@@ -166,8 +184,12 @@ fn parse_backfill_query(raw: Option<&str>) -> (Vec<String>, Option<u32>) {
 }
 
 /// Percent-decode a single `application/x-www-form-urlencoded` value: `%XX`
-/// hex escapes and `+` → space. Returns `None` if a `%XX` escape is malformed
-/// or the result isn't valid UTF-8.
+/// hex escapes and `+` → space. Returns `None` if a complete `%XX` escape has
+/// a non-hex digit, or if the decoded bytes aren't valid UTF-8. A trailing
+/// `%` not followed by two more characters (a *truncated* escape at the end
+/// of the input) is passed through as a literal `%` rather than rejected —
+/// these inputs come from our own router, not untrusted peers, so lenient
+/// pass-through is fine.
 fn percent_decode(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -242,6 +264,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_blank_v_value_is_dropped() {
+        // A present-but-blank `?v=` yields no seeds (the handler turns the
+        // empty list into a 400) — it must not become an empty-string seed.
+        let (vs, limit) = parse_backfill_query(Some("v=&limit=10"));
+        assert!(vs.is_empty(), "blank v must be dropped: {vs:?}");
+        assert_eq!(limit, Some(10));
+        // A blank `v` alongside a real one keeps only the real seed.
+        let (vs, _) = parse_backfill_query(Some("v=&v=%24a"));
+        assert_eq!(vs, vec!["$a".to_owned()]);
+    }
+
+    #[test]
+    fn parse_explicit_limit_zero_is_some_zero() {
+        // The parser surfaces `limit=0` as `Some(0)` so the handler can
+        // distinguish it from a missing limit and 400 (Synapse parity).
+        let (_, limit) = parse_backfill_query(Some("v=%24a&limit=0"));
+        assert_eq!(limit, Some(0));
+    }
+
+    #[test]
     fn percent_decode_handles_sigil_and_plus() {
         // %24 → '$', '+' → ' ' (form-encoding), unreserved chars untouched.
         assert_eq!(percent_decode("%24abc-_").as_deref(), Some("$abc-_"));
@@ -251,5 +293,13 @@ mod tests {
     #[test]
     fn percent_decode_rejects_malformed_escape() {
         assert_eq!(percent_decode("%2g"), None);
+    }
+
+    #[test]
+    fn percent_decode_truncated_escape_is_literal() {
+        // A `%` with fewer than two trailing chars is passed through as a
+        // literal `%`, not rejected (documented lenient behaviour).
+        assert_eq!(percent_decode("ab%").as_deref(), Some("ab%"));
+        assert_eq!(percent_decode("a%2").as_deref(), Some("a%2"));
     }
 }

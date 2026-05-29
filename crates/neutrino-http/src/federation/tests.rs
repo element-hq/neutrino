@@ -967,3 +967,45 @@ async fn backfill_accepts_raw_dollar_sigil_in_query() {
         "raw-sigil seed must resolve: {body}"
     );
 }
+
+// BF9 (I1): a present-but-blank `?v=` is rejected like a wholly-missing `v`.
+// It must NOT slip past the empty-`v` guard as an empty-string seed and
+// return a misleading 200 with no PDUs.
+#[tokio::test]
+async fn backfill_blank_v_returns_400() {
+    let (app, room_id, _create_id, _msgs) = build_seeded_router(1).await;
+    let path = format!(
+        "/_matrix/federation/v1/backfill/{}?v=&limit=10",
+        room_id.as_str()
+    );
+
+    let (status, body) = get(&app, &path).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(
+        body.get("errcode").and_then(Value::as_str),
+        Some("M_INVALID_PARAM"),
+        "body = {body}"
+    );
+}
+
+// BF10 (I3): an explicit `limit=0` is rejected (400), matching Synapse's
+// `if not limit: return 400` — asking for zero events is a client bug, not
+// a valid empty backfill. (A *missing* limit still defaults to 10.)
+#[tokio::test]
+async fn backfill_limit_zero_returns_400() {
+    let (app, room_id, _create_id, msgs) = build_seeded_router(1).await;
+
+    let (status, body) = get(
+        &app,
+        &backfill_path(room_id.as_str(), &[msgs[0].as_str()], Some(0)),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(
+        body.get("errcode").and_then(Value::as_str),
+        Some("M_INVALID_PARAM"),
+        "body = {body}"
+    );
+}
