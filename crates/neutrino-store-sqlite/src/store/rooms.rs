@@ -118,9 +118,32 @@ impl RoomStore for SqliteStore {
             let mut last_pos = create_event.write_into_tx(&tx)?;
 
             // 3. Write every initial event in order.
-            for ev in initial_events {
+            for ev in &initial_events {
                 last_pos = ev.write_into_tx(&tx)?;
             }
+
+            // 4. Seed the room's forward extremities. createRoom writes a
+            //    linear chain of state events (create → power_levels →
+            //    creator-join → …), so the last event written is the sole
+            //    head of *both* the timeline DAG and the state DAG; an empty
+            //    `initial_events` leaves the create event as that head. This
+            //    is what lets the per-room actor bootstrap a freshly created
+            //    room (a `[]` head-set would give a new local event no
+            //    `prev_events`). A non-linear / non-state initial batch would
+            //    need the resolved heads computed via apply — out of scope
+            //    while createRoom only emits linear state chains.
+            let head = initial_events
+                .last()
+                .map(|e| e.event_id.as_str())
+                .unwrap_or_else(|| create_event.event_id.as_str());
+            let head_json = serde_json::to_string(&[head])
+                .map_err(|e| Error::Internal(format!("serialising forward_extremities: {e}")))?;
+            tx.execute(
+                "UPDATE rooms \
+                 SET forward_extremities = ?, state_dag_forward_extremities = ? \
+                 WHERE room_id = ?",
+                params![head_json, head_json, create_event.room_id.as_str()],
+            )?;
 
             tx.commit()?;
 
@@ -832,20 +855,21 @@ mod tests {
         assert!(got.is_none());
     }
 
-    // FE2: a freshly created room reads back as two empty head-sets — the
-    // columns default to '[]' until persist_resolved_event populates them
-    // (createRoom population is deferred, see PLAN 6d).
+    // FE2: a freshly created room (create event only) seeds both head-sets
+    // to the create event — createRoom writes a linear state chain whose last
+    // event is the sole head of both DAGs.
     #[tokio::test]
-    async fn forward_extremities_fresh_room_is_empty_pair() {
+    async fn forward_extremities_fresh_room_is_create_event() {
         let store = store().await;
         let ce = create_event(*ALICE_ROOM_ID, *ALICE_USER_ID);
+        let create_id = ce.event_id.clone();
         store.create_room(&ce, &[]).await.unwrap();
         let (timeline, state) = store
             .forward_extremities(*ALICE_ROOM_ID)
             .await
             .unwrap()
             .expect("room exists");
-        assert!(timeline.is_empty());
-        assert!(state.is_empty());
+        assert_eq!(timeline, [create_id.clone()].into_iter().collect());
+        assert_eq!(state, [create_id].into_iter().collect());
     }
 }

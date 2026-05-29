@@ -14,6 +14,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use deadpool_sqlite::{Config, Hook, HookError, Pool, Runtime, rusqlite::Connection};
+use neutrino_state::room_core::{Effect, RoomCore};
+use neutrino_state::{CoreError, Event};
 use neutrino_store::{StorageError, StreamPos};
 use tokio::sync::watch;
 
@@ -216,6 +218,32 @@ impl SqliteStore {
                 "write timed out after {WRITE_TIMEOUT:?}"
             ))),
         }
+    }
+
+    /// Run [`RoomCore::apply`] against a provider backed by this store, on a
+    /// reader connection. `room` is taken by value and handed back (mutated
+    /// by a successful apply) so the caller — the per-room actor — can adopt
+    /// it only after the follow-up `persist_resolved_event` commits. The
+    /// inner `Result` is apply's own verdict (`CoreError` = hard reject); the
+    /// outer `Result` is a storage/connection fault. apply only *reads*
+    /// (immutable events + auth chains), so this needs no write transaction.
+    ///
+    /// This is the connection-bridging half of the actor's apply step:
+    /// `run_read` and `SqliteStateProvider` are `pub(crate)`/connection-bound,
+    /// so the orchestration in `neutrino-http` can't build a provider itself.
+    pub async fn apply_event(
+        &self,
+        mut room: RoomCore,
+        event: Event,
+    ) -> Result<(RoomCore, Result<Vec<Effect>, CoreError>), StorageError> {
+        self.run_read(
+            move |conn| -> Result<(RoomCore, Result<Vec<Effect>, CoreError>), Error> {
+                let provider = crate::store::SqliteStateProvider::new(conn);
+                let verdict = room.apply(event, &provider);
+                Ok((room, verdict))
+            },
+        )
+        .await
     }
 }
 

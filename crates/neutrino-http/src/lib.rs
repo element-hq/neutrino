@@ -26,6 +26,7 @@ use tracing::info;
 
 mod federation;
 mod legacy_sync;
+mod room_actor;
 mod sliding_sync;
 
 use sliding_sync::{SyncError, SyncState};
