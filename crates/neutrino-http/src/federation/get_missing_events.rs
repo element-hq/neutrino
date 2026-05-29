@@ -18,9 +18,11 @@ use crate::{AppState, lock_app};
 
 /// Spec default for `limit` when the client omits it.
 const DEFAULT_LIMIT: u32 = 10;
-/// Spec maximum: <https://spec.matrix.org/v1.18/server-server-api/#post_matrixfederationv1get_missing_eventsroomid>
-/// — *"This endpoint MUST return no more than 20 events in a single response."*
-/// Saturating cap, not a 400.
+/// Hard cap on the number of events returned. The v1.18 spec sets *no* maximum
+/// on `limit` (the field is documented only as "Defaults to 10":
+/// <https://spec.matrix.org/v1.18/server-server-api/#post_matrixfederationv1get_missing_eventsroomid>).
+/// This 20-event ceiling matches Synapse's `min(limit, 20)` in
+/// `_get_missing_events` and bounds per-request work. Saturating cap, not a 400.
 const MAX_LIMIT: u32 = 20;
 
 /// Body of the federation request.
@@ -34,8 +36,8 @@ const MAX_LIMIT: u32 = 20;
 #[derive(Deserialize)]
 struct RequestBody {
     /// Optional. Saturates to [`DEFAULT_LIMIT`] when missing, capped at
-    /// [`MAX_LIMIT`].
-    #[serde(default)]
+    /// [`MAX_LIMIT`]. No `#[serde(default)]` — serde already deserializes a
+    /// missing `Option` field to `None`.
     limit: Option<u32>,
     /// Parsed for spec compliance (so a malformed `min_depth` still 400s
     /// via serde) then dropped on the floor — Neutrino stores no depth
@@ -45,11 +47,13 @@ struct RequestBody {
     /// signed integer; using `u64` would reject negative values at serde
     /// and contradict the accept-but-ignore intent. The underscore prefix
     /// tells `dead_code` the field is intentionally unused after
-    /// deserialization.
-    #[serde(default, rename = "min_depth")]
+    /// deserialization. No `#[serde(default)]` — a missing `Option` field
+    /// already deserializes to `None`.
+    #[serde(rename = "min_depth")]
     _min_depth: Option<i64>,
     /// Boundary the requester already has; never appears in the response.
-    #[serde(default)]
+    /// Required per the spec (same as `latest_events`): a body omitting it
+    /// 400s at deserialization, not silently treated as empty.
     earliest_events: Vec<ruma::OwnedEventId>,
     /// Events the requester wants to walk back from. Required and non-empty.
     latest_events: Vec<ruma::OwnedEventId>,
@@ -71,12 +75,13 @@ pub(crate) struct ResponseBody {
 ///
 /// Algorithm (cross-ref `docs/get-missing-events.md` §Handler/Algorithm):
 /// 1. Reject empty `latest_events` (400 M_INVALID_PARAM).
-/// 2. 404 if room is unknown.
+/// 2. 404 if room is unknown (pre-checked via `RoomStore::room_exists`).
 /// 3. Clamp `limit`: default 10, max 20.
 /// 4. Drop `_min_depth` (wire field `min_depth`) on the floor — Neutrino
 ///    has no depth column. See `RequestBody._min_depth` doc.
 /// 5. Call `DagStore::missing_events`.
-/// 6. Build response from `Event.raw` verbatim — no enrichment.
+/// 6. Build response from `Event.raw` verbatim (no enrichment), reversed to
+///    oldest-first.
 /// 7. Storage errors → 500 M_UNKNOWN via `FedError::Storage`.
 pub(crate) async fn handle(
     State(state): State<AppState>,
@@ -110,14 +115,10 @@ pub(crate) async fn handle(
         app.store.clone()
     };
 
-    // (2) — load-bearing: the inner `missing_events` call below also
-    // checks room existence via `validate_room_exists`, but its
-    // `StorageError::InvalidInput` maps to 500 `M_UNKNOWN`. Without this
-    // pre-check, an unknown room would surface as 500 instead of the
-    // spec-required 404. If `StorageError` ever distinguishes "unknown
-    // room" from other invalid-input cases, collapse this into a single
-    // call.
-    if store.get_room_version(&room_id).await?.is_none() {
+    // (2) — `missing_events` surfaces an unknown room as
+    // `StorageError::InvalidInput` (→ 500), so we pre-check existence via
+    // `RoomStore::room_exists` and map absence to the spec-required 404.
+    if !store.room_exists(&room_id).await? {
         return Err(FedError::RoomNotFound);
     }
 
@@ -133,10 +134,13 @@ pub(crate) async fn handle(
         .missing_events(&room_id, &latest, &earliest, limit)
         .await?;
 
-    // (6) — wire bytes verbatim. The reference hash that produced each
-    // event_id was computed over `event.raw`, so peers MUST receive those
-    // exact bytes for the event_id to round-trip.
-    let events: Vec<Box<RawJsonValue>> = events.into_iter().map(|e| e.raw).collect();
+    // (6) — wire bytes verbatim, oldest-first. `missing_events` walks back
+    // from `latest`, so it yields newest-first; reverse to the topological
+    // (oldest-first) order federation receivers expect — matches Synapse,
+    // which reverses its BFS before responding. The reference hash that
+    // produced each event_id was computed over `event.raw`, so peers MUST
+    // receive those exact bytes for the event_id to round-trip.
+    let events: Vec<Box<RawJsonValue>> = events.into_iter().rev().map(|e| e.raw).collect();
 
     Ok(Json(ResponseBody { events }))
 }

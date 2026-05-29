@@ -545,3 +545,213 @@ async fn wire_bytes_passthrough() {
         );
     }
 }
+
+// --- B13 (I4: result ordering) -----------------------------------------
+
+#[tokio::test]
+async fn events_returned_oldest_first() {
+    // The handler reverses `missing_events`' newest-first walk so the
+    // response is in topological (oldest-first) order, matching Synapse.
+    // Linear chain create ← join ← msg0 ← msg1 ← msg2 ← msg3; walk back
+    // from msg3 with no earliest. The message-bodied events must appear
+    // oldest-first — msg 0, msg 1, msg 2 (msg3 is the excluded boundary,
+    // create/join carry no "msg N" body). Asserts a *sequence*, not a set,
+    // so a regression to newest-first fails here.
+    let (app, room_id, _create_id, msgs) = build_seeded_router(4).await;
+
+    let (status, body) = post_json(
+        &app,
+        &fed_path(room_id.as_str()),
+        &json!({
+            "earliest_events": [],
+            "latest_events": [msgs[3].as_str()],
+            "limit": 20,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    let ordered: Vec<&str> = body
+        .get("events")
+        .and_then(Value::as_array)
+        .expect("events array")
+        .iter()
+        .filter_map(|e| e.pointer("/content/body").and_then(Value::as_str))
+        .filter(|s| s.starts_with("msg "))
+        .collect();
+    assert_eq!(
+        ordered,
+        ["msg 0", "msg 1", "msg 2"],
+        "events must be returned oldest-first"
+    );
+}
+
+// --- B14 (I5: earliest boundary is excluded at the HTTP layer) ---------
+
+#[tokio::test]
+async fn earliest_message_boundary_is_excluded() {
+    // B5 used the create event (no body) as `earliest`, so a leak of the
+    // earliest boundary would slip past its body-prefix filter. Here the
+    // earliest boundary is a *message* event (detectable by body): with
+    // latest=msg3, earliest=msg1, only msg2 is strictly between them.
+    // msg1 (earliest) and everything below it must NOT appear.
+    let (app, room_id, _create_id, msgs) = build_seeded_router(4).await;
+
+    let (status, body) = post_json(
+        &app,
+        &fed_path(room_id.as_str()),
+        &json!({
+            "earliest_events": [msgs[1].as_str()],
+            "latest_events": [msgs[3].as_str()],
+            "limit": 20,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    let bodies: std::collections::BTreeSet<&str> = body
+        .get("events")
+        .and_then(Value::as_array)
+        .expect("events array")
+        .iter()
+        .filter_map(|e| e.pointer("/content/body").and_then(Value::as_str))
+        .filter(|s| s.starts_with("msg "))
+        .collect();
+    assert_eq!(
+        bodies,
+        std::collections::BTreeSet::from(["msg 2"]),
+        "only msg 2 is strictly between earliest=msg1 and latest=msg3; \
+         the earliest boundary must not leak into the response"
+    );
+}
+
+// --- B15 (I6: malformed min_depth still 400s via serde) ----------------
+
+#[tokio::test]
+async fn malformed_min_depth_returns_400() {
+    // `min_depth` is parsed (then ignored). A non-integer value must still
+    // 400 at serde — the whole reason the field is typed rather than
+    // dropped. Pins the doc claim on `RequestBody._min_depth`.
+    let (app, room_id, _create_id, msgs) = build_seeded_router(2).await;
+
+    let (status, body) = post_json(
+        &app,
+        &fed_path(room_id.as_str()),
+        &json!({
+            "earliest_events": [],
+            "latest_events": [msgs[1].as_str()],
+            "min_depth": "not-an-integer",
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(
+        body.get("errcode").and_then(Value::as_str),
+        Some("M_INVALID_PARAM"),
+        "body = {body}"
+    );
+}
+
+// --- B16 (I6: malformed event id in latest 400s) ----------------------
+
+#[tokio::test]
+async fn malformed_event_id_in_latest_returns_400() {
+    // A `latest_events` entry that isn't a valid event ID fails
+    // `OwnedEventId` deserialization → 400, before the store is touched.
+    let (app, room_id, _create_id, _msgs) = build_seeded_router(1).await;
+
+    let (status, body) = post_json(
+        &app,
+        &fed_path(room_id.as_str()),
+        &json!({
+            "earliest_events": [],
+            "latest_events": ["not-an-event-id"],
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(
+        body.get("errcode").and_then(Value::as_str),
+        Some("M_INVALID_PARAM"),
+        "body = {body}"
+    );
+}
+
+// --- B17 (I6: wrong content-type 400s) --------------------------------
+
+#[tokio::test]
+async fn wrong_content_type_returns_400() {
+    // A body sent with a non-JSON content-type is rejected by the `Json`
+    // extractor; the handler maps that rejection to 400 M_INVALID_PARAM
+    // rather than letting axum's default (415/422) through.
+    let (app, room_id, _create_id, msgs) = build_seeded_router(2).await;
+
+    let payload = serde_json::to_vec(&json!({
+        "earliest_events": [],
+        "latest_events": [msgs[1].as_str()],
+    }))
+    .unwrap();
+    let (status, body) = post_raw(&app, &fed_path(room_id.as_str()), payload, "text/plain").await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(
+        body.get("errcode").and_then(Value::as_str),
+        Some("M_INVALID_PARAM"),
+        "body = {body}"
+    );
+}
+
+// --- B18 (I6: explicit limit=0 returns empty) -------------------------
+
+#[tokio::test]
+async fn explicit_limit_zero_returns_empty() {
+    // An explicit `limit: 0` is honored as 0 (matching Synapse's
+    // `min(limit, 20)`); the handler returns 200 with an empty `events`
+    // array rather than substituting the default of 10.
+    let (app, room_id, _create_id, msgs) = build_seeded_router(3).await;
+
+    let (status, body) = post_json(
+        &app,
+        &fed_path(room_id.as_str()),
+        &json!({
+            "earliest_events": [],
+            "latest_events": [msgs[2].as_str()],
+            "limit": 0,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let events = body
+        .get("events")
+        .and_then(Value::as_array)
+        .expect("events array");
+    assert!(events.is_empty(), "explicit limit=0 must return no events");
+}
+
+// --- B19 (I3: earliest_events is required per spec) -------------------
+
+#[tokio::test]
+async fn missing_earliest_events_returns_400() {
+    // `earliest_events` is Required per the spec; omitting it 400s at
+    // deserialization rather than being silently treated as empty.
+    let (app, room_id, _create_id, msgs) = build_seeded_router(2).await;
+
+    let (status, body) = post_json(
+        &app,
+        &fed_path(room_id.as_str()),
+        &json!({
+            "latest_events": [msgs[1].as_str()],
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(
+        body.get("errcode").and_then(Value::as_str),
+        Some("M_INVALID_PARAM"),
+        "body = {body}"
+    );
+}
