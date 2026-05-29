@@ -59,4 +59,3 @@ Two of these are involved in actually building binaries of the server:
 
 - `neutrino` contains the host development binary definition.
 - `neutrino-ffi` contains bindings for Neutrino for use in Android, generated using UniFFI.
->>>>>>> f095723 (Initial commit)
