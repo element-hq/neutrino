@@ -32,7 +32,7 @@ const MAX_LIMIT: u32 = 20;
 /// path-extracted `room_id` in the handler. Mirrors the `SyncRequestBody`
 /// pattern in `lib.rs::build_sync_request`.
 #[derive(Deserialize)]
-pub(crate) struct RequestBody {
+struct RequestBody {
     /// Optional. Saturates to [`DEFAULT_LIMIT`] when missing, capped at
     /// [`MAX_LIMIT`].
     #[serde(default)]
@@ -41,10 +41,13 @@ pub(crate) struct RequestBody {
     /// via serde) then dropped on the floor — Neutrino stores no depth
     /// column, per the 2026-05-22 PLAN.md decision. See
     /// `docs/get-missing-events.md` §"Trust model & spec deviations".
-    /// The underscore prefix tells `dead_code` the field is intentionally
-    /// unused after deserialization.
+    /// Typed `i64` (not `u64`) because the spec defines `depth` as a
+    /// signed integer; using `u64` would reject negative values at serde
+    /// and contradict the accept-but-ignore intent. The underscore prefix
+    /// tells `dead_code` the field is intentionally unused after
+    /// deserialization.
     #[serde(default, rename = "min_depth")]
-    _min_depth: Option<u64>,
+    _min_depth: Option<i64>,
     /// Boundary the requester already has; never appears in the response.
     #[serde(default)]
     earliest_events: Vec<ruma::OwnedEventId>,
@@ -107,7 +110,13 @@ pub(crate) async fn handle(
         app.store.clone()
     };
 
-    // (2)
+    // (2) — load-bearing: the inner `missing_events` call below also
+    // checks room existence via `validate_room_exists`, but its
+    // `StorageError::InvalidInput` maps to 500 `M_UNKNOWN`. Without this
+    // pre-check, an unknown room would surface as 500 instead of the
+    // spec-required 404. If `StorageError` ever distinguishes "unknown
+    // room" from other invalid-input cases, collapse this into a single
+    // call.
     if store.get_room_version(&room_id).await?.is_none() {
         return Err(FedError::RoomNotFound);
     }
