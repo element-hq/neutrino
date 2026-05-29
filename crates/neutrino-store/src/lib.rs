@@ -95,6 +95,16 @@ pub trait RoomStore: Send + Sync {
     ) -> Result<Option<RoomVersionId>, StorageError>;
 
     /// Pre:  none.
+    /// Post: returns `true` if the room exists, `false` otherwise.
+    ///
+    /// Default impl derives existence from [`RoomStore::get_room_version`]; a
+    /// backend with a cheaper existence probe (e.g. a bare `SELECT 1`) may
+    /// override.
+    async fn room_exists(&self, room_id: &RoomId) -> Result<bool, StorageError> {
+        Ok(self.get_room_version(room_id).await?.is_some())
+    }
+
+    /// Pre:  none.
     /// Post: returns the number of rooms registered via `create_room`.
     async fn room_count(&self) -> Result<u64, StorageError>;
 }

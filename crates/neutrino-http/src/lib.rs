@@ -24,6 +24,7 @@ use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+mod federation;
 mod legacy_sync;
 mod sliding_sync;
 
@@ -71,6 +72,17 @@ impl AppState {
         // the `open_in_memory` doc-comment.
         let tempfile = NamedTempFile::new()?;
         let store = Arc::new(SqliteStore::open(tempfile.path()).await?);
+        Ok(Self::from_store(config, store, tempfile))
+    }
+
+    /// Build an `AppState` around an already-open `SqliteStore`. Used by
+    /// the e2e tests in `src/federation/tests.rs` to seed events via the
+    /// storage trait *before* the router is mounted — `DagStore::missing_events`
+    /// needs a non-flat DAG to walk, and the CSAPI `/send` endpoint
+    /// currently writes events with empty `prev_events` (Phase 6 will
+    /// wire those up). The caller passes the tempfile guard so the file
+    /// stays alive for the lifetime of the router.
+    fn from_store(config: Config, store: Arc<SqliteStore>, tempfile: NamedTempFile) -> Self {
         let sync_state = Arc::new(SyncState::new(store.clone()));
         let app = App {
             store,
@@ -79,7 +91,7 @@ impl AppState {
             config,
             _db_tempfile: tempfile,
         };
-        Ok(AppState(Arc::new(Mutex::new(app))))
+        AppState(Arc::new(Mutex::new(app)))
     }
 }
 
@@ -93,9 +105,33 @@ pub async fn serve(listener: TcpListener, config: Config) -> Result<(), StartupE
 
 pub async fn router(config: Config) -> Result<Router, StartupError> {
     let state = AppState::new(config.clone()).await?;
+    Ok(build_router(config, state))
+}
+
+/// Test-only constructor that mounts the same router over an externally-
+/// provided `SqliteStore`. The tempfile guard keeps the underlying db
+/// file alive — drop it (e.g. when the test scope ends) and the file is
+/// removed.
+///
+/// Used by `src/federation/tests.rs` to seed events via the
+/// `StorageBackend` trait directly before the HTTP layer observes them;
+/// the CSAPI `/send` path currently writes flat DAGs (Phase 6 will fix
+/// this), which prevents the BFS-walk tests from exercising
+/// `DagStore::missing_events` over a real chain.
+#[cfg(test)]
+pub(crate) fn router_with_store(
+    config: Config,
+    store: Arc<SqliteStore>,
+    tempfile: NamedTempFile,
+) -> Router {
+    let state = AppState::from_store(config.clone(), store, tempfile);
+    build_router(config, state)
+}
+
+fn build_router(config: Config, state: AppState) -> Router {
     let user_id = config.user_id();
 
-    let router = Router::new()
+    Router::new()
         .route("/", get(root))
         .route("/_matrix/client/versions", get(versions))
         .route(
@@ -138,10 +174,13 @@ pub async fn router(config: Config) -> Result<Router, StartupError> {
         )
         .route("/_matrix/client/v3/pushers/set", post(pushers_set))
         .route("/_matrix/client/v3/capabilities", get(get_capabilities))
+        .route(
+            "/_matrix/federation/v1/get_missing_events/{room_id}",
+            post(federation::get_missing_events::handle),
+        )
         .fallback(default_fallback)
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
-    Ok(router)
+        .with_state(state)
 }
 
 async fn root() -> &'static str {
