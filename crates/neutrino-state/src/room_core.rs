@@ -39,18 +39,20 @@
 //! On a hard-rejected event (room_id mismatch, reference invalid, auth
 //! fails against state-before-event), `apply` returns `Err(CoreError)`
 //! and does NOT mutate `RoomCore`. On acceptance:
-//! - **every accepted event** advances the timeline forward extremities
-//!   (`forward_extremities`): the parents listed in the event's
+//! - **every accepted, non-soft-failed event** advances the timeline forward
+//!   extremities (`forward_extremities`): the parents listed in the event's
 //!   `prev_events` are removed and the event itself is inserted. This holds
-//!   for state and non-state events alike — both sit in the timeline DAG.
+//!   for state and non-state events alike — both sit in the timeline DAG. A
+//!   soft-failed event is the exception: it is persisted but does NOT advance
+//!   the timeline heads (Synapse parity, synapse#5269 / #5274).
 //! - **state events** additionally advance the state forward extremities
 //!   (parents in `prev_state_events` removed, the new event inserted), then
 //!   recompute `current_state` by state-resolving across the new state-FE
 //!   set. Mutation is committed atomically after every fallible call has
-//!   succeeded.
+//!   succeeded. State events that pass auth are never soft-failed.
 //! - **non-state events** run the soft-fail check against the existing
-//!   `current_state` (which they do not change) on top of the timeline-FE
-//!   advance.
+//!   `current_state` (which they do not change); only if the event is not
+//!   soft-failed do the timeline heads advance.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -134,10 +136,11 @@ pub enum Effect {
 /// events.
 ///
 /// - `forward_extremities` — timeline-DAG heads (events not yet referenced
-///   by any event's `prev_events`). Every accepted event advances this,
-///   state and non-state alike, because every event sits in the timeline
-///   DAG. This is the set a locally-originated event draws its `prev_events`
-///   from.
+///   by any event's `prev_events`). Every accepted, non-soft-failed event
+///   advances this, state and non-state alike, because every such event sits
+///   in the timeline DAG. (A soft-failed event is persisted but never becomes
+///   a head — see `apply`.) This is the set a locally-originated event draws
+///   its `prev_events` from.
 /// - `state_forward_extremities` — state-DAG heads (state events not yet
 ///   referenced by any `prev_state_events`). Only state events advance it.
 ///   A locally-originated event draws its `prev_state_events` from here.
@@ -236,10 +239,19 @@ impl RoomCore {
         // emit a duplicate `Persist`. Both sets are checked because they
         // diverge: a state event can remain a state-DAG head after a later
         // non-state event has dropped it from the timeline heads (and vice
-        // versa). This guard only catches re-delivery of events that are
-        // still heads — one already built upon in both DAGs is in neither
-        // set, and the storage layer's `events.event_id` UNIQUE constraint
-        // is the backstop for that case.
+        // versa).
+        //
+        // NOTE (I2 / coupling): head-membership is a proxy for "already
+        // integrated", not the real question ("already persisted"). It only
+        // catches re-delivery of events that are *still* heads. An event
+        // already built upon in both DAGs is in neither set, so this guard
+        // misses it and `apply` re-runs — `next_forward_extremities` would
+        // then RE-INSERT it as a head and re-drop its parents, corrupting the
+        // head-sets. The real backstop is the storage layer's
+        // `events.event_id` UNIQUE constraint, which rejects the duplicate
+        // persist; that lands in PR3. Until then this guard's correctness
+        // rests on the actor delivering each event to `apply` exactly once,
+        // in causal order — a single-owner invariant, not a defended one.
         if self.forward_extremities.contains(&event.event_id)
             || self.state_forward_extremities.contains(&event.event_id)
         {
@@ -312,11 +324,20 @@ impl RoomCore {
             // only. State events that pass step 3 are accepted as-is.
             let soft_failed = check_auth_rules(&event, &self.current_state).is_err();
 
-            // Non-state events don't touch the state DAG or current_state,
-            // but they do extend the timeline DAG — advance the timeline
-            // heads. (Soft-failed events still count: they are persisted and
-            // sit in the DAG, so later events can build on them.)
-            self.forward_extremities = self.next_forward_extremities(&event);
+            // Non-state events don't touch the state DAG or current_state, but
+            // an *accepted* one extends the timeline DAG — advance the timeline
+            // heads. A SOFT-FAILED event does NOT: it is persisted and sits in
+            // the DAG, but it must not become a forward extremity and must not
+            // drop the parents it references from the head-set. Otherwise a
+            // locally-originated event would draw its `prev_events` from a
+            // soft-failed event — exactly what soft-fail exists to prevent —
+            // and the referenced extremity would leak. The parent extremities
+            // are cleared only later, when a non-soft-failed successor that
+            // references this event arrives. (Synapse parity: matrix-org/
+            // synapse#5269, fixed by #5274.)
+            if !soft_failed {
+                self.forward_extremities = self.next_forward_extremities(&event);
+            }
 
             Ok(vec![Effect::Persist { event, soft_failed }])
         }
@@ -826,6 +847,61 @@ mod tests {
             "expected empty effects, got {effects:?}"
         );
         assert_eq!(room.forward_extremities, pre_fe);
+    }
+
+    #[test]
+    fn apply_soft_failed_event_does_not_advance_timeline_head() {
+        // I1 / synapse#5269: a soft-failed event is persisted but must NOT
+        // become a forward extremity nor drop the parents it references.
+        // Setup: alice joins, then leaves. A message that claims its
+        // state-before is the (stale) join passes step-3 auth but soft-fails
+        // against current_state (alice has left). The timeline head must stay
+        // at the leave, not advance to the message.
+        let (mut room, mut provider, create_id, join_id, room_id) = alice_creates_and_joins(true);
+
+        let leave = Arc::new(member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "leave",
+            vec![join_id.clone()],
+            &room_id,
+        ));
+        let leave_id = leave.event_id.clone();
+        room.apply((*leave).clone(), &provider)
+            .expect("alice leave");
+        insert(&mut provider, leave);
+
+        // Message auths against the join (joined) but soft-fails against
+        // current_state (left). prev_events points at the leave.
+        let msg = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.message".to_owned(),
+        )
+        .room_id(room_id)
+        .content(json!({ "msgtype": "m.text", "body": "hi" }))
+        .auth_events(vec![create_id, join_id.clone()])
+        .prev_events(vec![leave_id.clone()])
+        .prev_state_events(vec![join_id])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid message");
+
+        let effects = room.apply(msg, &provider).expect("message accepted");
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Persist {
+                    soft_failed: true,
+                    ..
+                }]
+            ),
+            "expected a single soft-failed Persist, got {effects:?}"
+        );
+        assert_eq!(
+            room.forward_extremities,
+            [leave_id].into_iter().collect(),
+            "soft-failed event must not advance the timeline head off the leave"
+        );
     }
 
     // ----- apply: auth-rule integration (rules 4 / 5.4 / 5.5 / 5.6 / 8 / 10.4) -----
