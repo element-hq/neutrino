@@ -39,13 +39,20 @@
 //! On a hard-rejected event (room_id mismatch, reference invalid, auth
 //! fails against state-before-event), `apply` returns `Err(CoreError)`
 //! and does NOT mutate `RoomCore`. On acceptance:
-//! - **state events**: forward extremities are updated (parents in
-//!   `prev_state_events` are removed, the new event is inserted), then
-//!   `current_state` is recomputed by state-resolving across the new FE
+//! - **every accepted, non-soft-failed event** advances the timeline forward
+//!   extremities (`forward_extremities`): the parents listed in the event's
+//!   `prev_events` are removed and the event itself is inserted. This holds
+//!   for state and non-state events alike — both sit in the timeline DAG. A
+//!   soft-failed event is the exception: it is persisted but does NOT advance
+//!   the timeline heads (Synapse parity, synapse#5269 / #5274).
+//! - **state events** additionally advance the state forward extremities
+//!   (parents in `prev_state_events` removed, the new event inserted), then
+//!   recompute `current_state` by state-resolving across the new state-FE
 //!   set. Mutation is committed atomically after every fallible call has
-//!   succeeded.
-//! - **non-state events**: no FE or `current_state` mutation; only the
-//!   soft-fail check runs against the existing `current_state`.
+//!   succeeded. State events that pass auth are never soft-failed.
+//! - **non-state events** run the soft-fail check against the existing
+//!   `current_state` (which they do not change); only if the event is not
+//!   soft-failed do the timeline heads advance.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -124,8 +131,24 @@ pub enum Effect {
     UpdateCurrentState(StateMap<OwnedEventId>),
 }
 
-/// Per-room state machine state: forward extremities of the state DAG and
-/// the current resolved state. `apply` mutates both as it accepts events.
+/// Per-room state machine state: the two head-sets of the room's DAGs and
+/// the current resolved state. `apply` mutates all three as it accepts
+/// events.
+///
+/// - `forward_extremities` — timeline-DAG heads (events not yet referenced
+///   by any event's `prev_events`). Every accepted, non-soft-failed event
+///   advances this, state and non-state alike, because every such event sits
+///   in the timeline DAG. (A soft-failed event is persisted but never becomes
+///   a head — see `apply`.) This is the set a locally-originated event draws
+///   its `prev_events` from.
+/// - `state_forward_extremities` — state-DAG heads (state events not yet
+///   referenced by any `prev_state_events`). Only state events advance it.
+///   A locally-originated event draws its `prev_state_events` from here.
+///
+/// The two sets diverge: a non-state event references a state event via
+/// `prev_events` (dropping it from the timeline heads) without referencing
+/// it via `prev_state_events` (so it stays a state head). They are tracked
+/// separately for exactly that reason.
 ///
 /// Cheap to clone — events are `Arc`-shared. State groups are deferred per
 /// the project plan; until they land, `current_state` is materialised
@@ -133,6 +156,7 @@ pub enum Effect {
 #[derive(Debug, Clone)]
 pub struct RoomCore {
     pub(crate) room_id: OwnedRoomId,
+    pub(crate) forward_extremities: BTreeSet<OwnedEventId>,
     pub(crate) state_forward_extremities: BTreeSet<OwnedEventId>,
     pub(crate) current_state: Arc<StateMap<Arc<Event>>>,
 }
@@ -144,6 +168,7 @@ impl RoomCore {
     pub fn new(room_id: OwnedRoomId) -> Self {
         Self {
             room_id,
+            forward_extremities: BTreeSet::new(),
             state_forward_extremities: BTreeSet::new(),
             current_state: Arc::new(StateMap::new()),
         }
@@ -154,8 +179,16 @@ impl RoomCore {
         &self.room_id
     }
 
-    /// Current forward extremities of the state DAG. Read-only view; mutation
-    /// is the exclusive responsibility of `apply`.
+    /// Current forward extremities of the timeline DAG (the events a new
+    /// local event would list in its `prev_events`). Read-only view;
+    /// mutation is the exclusive responsibility of `apply`.
+    pub fn forward_extremities(&self) -> &BTreeSet<OwnedEventId> {
+        &self.forward_extremities
+    }
+
+    /// Current forward extremities of the state DAG (the events a new local
+    /// event would list in its `prev_state_events`). Read-only view;
+    /// mutation is the exclusive responsibility of `apply`.
     pub fn state_forward_extremities(&self) -> &BTreeSet<OwnedEventId> {
         &self.state_forward_extremities
     }
@@ -201,10 +234,27 @@ impl RoomCore {
 
         let event = Arc::new(event);
 
-        // C3: idempotency. If the event is already a forward extremity, this
-        // `RoomCore` has already integrated it. Re-running the pipeline would
-        // emit a duplicate `Persist` and recompute the same `current_state`.
-        if self.state_forward_extremities.contains(&event.event_id) {
+        // C3: idempotency. If the event is still a head of either DAG, this
+        // `RoomCore` has already integrated it; re-running the pipeline would
+        // emit a duplicate `Persist`. Both sets are checked because they
+        // diverge: a state event can remain a state-DAG head after a later
+        // non-state event has dropped it from the timeline heads (and vice
+        // versa).
+        //
+        // NOTE (I2 / coupling): head-membership is a proxy for "already
+        // integrated", not the real question ("already persisted"). It only
+        // catches re-delivery of events that are *still* heads. An event
+        // already built upon in both DAGs is in neither set, so this guard
+        // misses it and `apply` re-runs — `next_forward_extremities` would
+        // then RE-INSERT it as a head and re-drop its parents, corrupting the
+        // head-sets. The real backstop is the storage layer's
+        // `events.event_id` UNIQUE constraint, which rejects the duplicate
+        // persist; that lands in PR3. Until then this guard's correctness
+        // rests on the actor delivering each event to `apply` exactly once,
+        // in causal order — a single-owner invariant, not a defended one.
+        if self.forward_extremities.contains(&event.event_id)
+            || self.state_forward_extremities.contains(&event.event_id)
+        {
             return Ok(Vec::new());
         }
 
@@ -252,7 +302,12 @@ impl RoomCore {
             let new_current_ids = state_res::state_at_heads(&new_fes_slice, &wrapper, &mut cache)?;
             let new_current_events = materialize_state(&new_current_ids, &wrapper)?;
 
+            // Timeline heads advance too — a state event sits in the timeline
+            // DAG like any other event. Pure; computed before the commit.
+            let new_timeline_fes = self.next_forward_extremities(&event);
+
             // Commit. All fallible work above is done.
+            self.forward_extremities = new_timeline_fes;
             self.state_forward_extremities = new_fes;
             self.current_state = Arc::new(new_current_events);
 
@@ -268,8 +323,37 @@ impl RoomCore {
             // Spec step 5: soft-fail against current_state. Non-state events
             // only. State events that pass step 3 are accepted as-is.
             let soft_failed = check_auth_rules(&event, &self.current_state).is_err();
+
+            // Non-state events don't touch the state DAG or current_state, but
+            // an *accepted* one extends the timeline DAG — advance the timeline
+            // heads. A SOFT-FAILED event does NOT: it is persisted and sits in
+            // the DAG, but it must not become a forward extremity and must not
+            // drop the parents it references from the head-set. Otherwise a
+            // locally-originated event would draw its `prev_events` from a
+            // soft-failed event — exactly what soft-fail exists to prevent —
+            // and the referenced extremity would leak. The parent extremities
+            // are cleared only later, when a non-soft-failed successor that
+            // references this event arrives. (Synapse parity: matrix-org/
+            // synapse#5269, fixed by #5274.)
+            if !soft_failed {
+                self.forward_extremities = self.next_forward_extremities(&event);
+            }
+
             Ok(vec![Effect::Persist { event, soft_failed }])
         }
+    }
+
+    /// Timeline forward extremities after accepting `event`: drop the
+    /// parents it lists in `prev_events`, insert the event itself. Pure —
+    /// the caller commits the result to `self` only once all fallible work
+    /// has succeeded.
+    fn next_forward_extremities(&self, event: &Event) -> BTreeSet<OwnedEventId> {
+        let mut fes = self.forward_extremities.clone();
+        for parent in &event.prev_events {
+            fes.remove(parent);
+        }
+        fes.insert(event.event_id.clone());
+        fes
     }
 }
 
@@ -656,6 +740,168 @@ mod tests {
         );
         assert_eq!(room.state_forward_extremities, pre_fe);
         assert!(Arc::ptr_eq(&room.current_state, &pre_state));
+    }
+
+    // ----- apply: timeline forward extremities -----
+
+    #[test]
+    fn apply_create_sets_both_head_sets() {
+        // The create event is the sole head of both the timeline and the
+        // state DAG.
+        let create = create_event("@alice:example.org");
+        let room_id = room_id_from_create(&create.event_id);
+        let create_id = create.event_id.clone();
+        let provider = InMemoryStateProvider::new();
+        let mut room = RoomCore::new(room_id);
+        room.apply(create, &provider).expect("create accepted");
+
+        assert_eq!(
+            room.forward_extremities,
+            [create_id.clone()].into_iter().collect()
+        );
+        assert_eq!(
+            room.state_forward_extremities,
+            [create_id].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn apply_join_advances_both_head_sets() {
+        // alice's join lists create in both prev_events and prev_state_events,
+        // so both head-sets advance create → join in lockstep.
+        let (room, _provider, _create_id, join_id, _room_id) = alice_creates_and_joins(true);
+
+        assert_eq!(
+            room.forward_extremities,
+            [join_id.clone()].into_iter().collect()
+        );
+        assert_eq!(
+            room.state_forward_extremities,
+            [join_id].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn apply_message_advances_timeline_head_only() {
+        // A message lists `join` in prev_events but is not a state event, so
+        // the timeline head moves to the message while the state head stays
+        // at the join. This divergence is the reason the two head-sets are
+        // tracked separately.
+        let (mut room, provider, create_id, join_id, room_id) = alice_creates_and_joins(true);
+
+        let msg = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.message".to_owned(),
+        )
+        .room_id(room_id)
+        .content(json!({ "msgtype": "m.text", "body": "hi" }))
+        .auth_events(vec![create_id, join_id.clone()])
+        .prev_events(vec![join_id.clone()])
+        .prev_state_events(vec![join_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid message");
+        let msg_id = msg.event_id.clone();
+
+        room.apply(msg, &provider).expect("message accepted");
+
+        assert_eq!(
+            room.forward_extremities,
+            [msg_id].into_iter().collect(),
+            "timeline head must advance to the message"
+        );
+        assert_eq!(
+            room.state_forward_extremities,
+            [join_id].into_iter().collect(),
+            "state head must remain at the join — a message is not a state event"
+        );
+    }
+
+    #[test]
+    fn apply_redelivered_non_state_event_is_noop() {
+        // A re-delivered non-state event that is still a timeline head is a
+        // no-op via the timeline-FE arm of the idempotency guard (the
+        // state-FE set never contains a non-state event, so the old
+        // state-only guard would have re-processed it).
+        let (mut room, provider, create_id, join_id, room_id) = alice_creates_and_joins(true);
+
+        let msg = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.message".to_owned(),
+        )
+        .room_id(room_id)
+        .content(json!({ "msgtype": "m.text", "body": "hi" }))
+        .auth_events(vec![create_id, join_id.clone()])
+        .prev_events(vec![join_id.clone()])
+        .prev_state_events(vec![join_id])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid message");
+
+        room.apply(msg.clone(), &provider).expect("first apply");
+        let pre_fe = room.forward_extremities.clone();
+
+        let effects = room.apply(msg, &provider).expect("redelivery noop");
+        assert!(
+            effects.is_empty(),
+            "expected empty effects, got {effects:?}"
+        );
+        assert_eq!(room.forward_extremities, pre_fe);
+    }
+
+    #[test]
+    fn apply_soft_failed_event_does_not_advance_timeline_head() {
+        // I1 / synapse#5269: a soft-failed event is persisted but must NOT
+        // become a forward extremity nor drop the parents it references.
+        // Setup: alice joins, then leaves. A message that claims its
+        // state-before is the (stale) join passes step-3 auth but soft-fails
+        // against current_state (alice has left). The timeline head must stay
+        // at the leave, not advance to the message.
+        let (mut room, mut provider, create_id, join_id, room_id) = alice_creates_and_joins(true);
+
+        let leave = Arc::new(member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "leave",
+            vec![join_id.clone()],
+            &room_id,
+        ));
+        let leave_id = leave.event_id.clone();
+        room.apply((*leave).clone(), &provider)
+            .expect("alice leave");
+        insert(&mut provider, leave);
+
+        // Message auths against the join (joined) but soft-fails against
+        // current_state (left). prev_events points at the leave.
+        let msg = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.message".to_owned(),
+        )
+        .room_id(room_id)
+        .content(json!({ "msgtype": "m.text", "body": "hi" }))
+        .auth_events(vec![create_id, join_id.clone()])
+        .prev_events(vec![leave_id.clone()])
+        .prev_state_events(vec![join_id])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid message");
+
+        let effects = room.apply(msg, &provider).expect("message accepted");
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Persist {
+                    soft_failed: true,
+                    ..
+                }]
+            ),
+            "expected a single soft-failed Persist, got {effects:?}"
+        );
+        assert_eq!(
+            room.forward_extremities,
+            [leave_id].into_iter().collect(),
+            "soft-failed event must not advance the timeline head off the leave"
+        );
     }
 
     // ----- apply: auth-rule integration (rules 4 / 5.4 / 5.5 / 5.6 / 8 / 10.4) -----
