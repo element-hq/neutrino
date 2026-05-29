@@ -78,6 +78,13 @@ Unlocks the room/state read/write surface that PLAN.md already plans:
 - `csapi/apidoc_room_history_visibility_test.go::TestFetchEvent`
 - `csapi/txnid_test.go::TestTxnInEvent` (also blocked on txn dedup, deleted 2026-05-26)
 
+### Need state-res (Phase 4c/6) — federation `/get_missing_events` tests
+The endpoint itself landed (2026-05-28); the two Complement tests targeting it remain blocked because both reach the endpoint via a federated join, which needs state-res:
+- `tests/federation_room_join_test.go::TestInboundCanReturnMissingEvents` — requires `charlie` to federate-join the room before the endpoint is reached. Federated join needs state-res (Phase 4c) and accept-on-`send_join` (Phase 6). Also asserts history-visibility redaction, which Neutrino defers per trusted-mesh model.
+- `tests/federation_room_get_missing_events_test.go::TestGetMissingEventsGapFilling` — outbound test (SUT calls `/get_missing_events` on the peer). Requires us to receive a federation `/send` transaction, detect the gap, and call out — state-res-blocked.
+
+Do not add to `complement/allowlist.txt` until Phase 4c + 6 land.
+
 ### Need `POST /user/{uid}/filter` (could be a no-op opaque-ID stub)
 The translator already ignores `?filter=` — a minimal stub returning any filter_id would unlock the largest tranche of legacy-sync tests against the new translator:
 - `csapi/TestSync/parallel/Can_sync_a_joined_room`
