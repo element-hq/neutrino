@@ -413,7 +413,7 @@ async fn keys_query(state: State<AppState>, body: Json<Value>) -> Json<Value> {
     if let Some(keys) = &lock_app(&state.0).keys {
         info!(
             "Returning stored keys: {}",
-            serde_json::to_string(&keys).unwrap()
+            serde_json::to_string(&keys).unwrap_or_default()
         );
         Json(keys.clone())
     } else {
@@ -429,11 +429,13 @@ async fn keys_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
     let mut app = lock_app(&state.0);
     let body = body.0;
 
-    if app.keys.is_none() {
+    if app.keys.is_none()
+        && let Some(device_keys) = body.pointer("/device_keys")
+    {
         let user_id = app.config.user_id();
         app.keys = Some(json!({
             "device_keys": {
-                user_id: { "DEVICEID": body.pointer("/device_keys").unwrap().clone() }
+                user_id: { "DEVICEID": device_keys.clone() }
             }
         }));
     }
@@ -449,12 +451,18 @@ async fn device_signing_upload(state: State<AppState>, body: Json<Value>) -> Jso
     let mut app = lock_app(&state.0);
 
     let mut body = body.0;
-    body.as_object_mut().unwrap().remove("auth");
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("auth");
+    }
 
-    if let Some(keys) = &mut app.keys {
-        keys.as_object_mut()
-            .unwrap()
-            .extend(body.as_object().unwrap().clone());
+    // Merge the (auth-stripped) cross-signing keys into the stored blob.
+    // No-op unless a prior `keys_upload` created `app.keys` as an object and
+    // the body is itself an object — a malformed body must not panic the
+    // stub handler.
+    if let Some(keys) = app.keys.as_mut().and_then(Value::as_object_mut)
+        && let Some(body_obj) = body.as_object()
+    {
+        keys.extend(body_obj.clone());
     }
 
     Json(json!({}))
@@ -465,26 +473,29 @@ async fn signatures_upload(state: State<AppState>, body: Json<Value>) -> Json<Va
     let mut app = lock_app(&state.0);
     let user_id = app.config.user_id();
 
+    // Extract the uploaded signatures map. Absent/malformed path → nothing to
+    // merge; return the stub without touching stored keys.
     let sigs = body
         .pointer(&format!("/{0}/DEVICEID/signatures/{0}", user_id))
-        .unwrap()
-        .as_object()
-        .unwrap()
-        .clone();
+        .and_then(Value::as_object)
+        .cloned();
 
-    if let Some(keys) = &mut app.keys {
+    if let Some(sigs) = sigs
+        && let Some(keys) = &mut app.keys
+    {
         info!(
             "Adding signatures to stored keys {:?}",
-            serde_json::to_string(keys).unwrap()
+            serde_json::to_string(keys).unwrap_or_default()
         );
-        keys.pointer_mut(&format!(
-            "/device_keys/{0}/DEVICEID/signatures/{0}",
-            user_id
-        ))
-        .unwrap()
-        .as_object_mut()
-        .unwrap()
-        .extend(sigs);
+        if let Some(target) = keys
+            .pointer_mut(&format!(
+                "/device_keys/{0}/DEVICEID/signatures/{0}",
+                user_id
+            ))
+            .and_then(Value::as_object_mut)
+        {
+            target.extend(sigs);
+        }
     }
 
     Json(json!({}))
