@@ -66,7 +66,8 @@ fn hydrate_pdu(
     // `prev_events` and `prev_state_events` are populated by row hydration
     // from the canonical JSON in `events.json` — no edge-table lookup
     // needed for the per-event view. `event_edges` still exists for graph
-    // queries (BFS in `events_before` / `missing_events`); see the
+    // queries (the priority-queue walk in `events_before` /
+    // `missing_events`); see the
     // "denormalisation" note in `event-id-design.md`.
     Ok(Some(inner?))
 }
@@ -655,7 +656,7 @@ mod tests {
         //     (Synapse-style), so the seed is fed straight to
         //     `fetch_edges` — which returns no parents because the
         //     cross-room event has no `prev_events` here — and the
-        //     BFS frontier starts empty. Even if it did have parents,
+        //     walk frontier starts empty. Even if it did have parents,
         //     `hydrate_pdu` would room-scope them out.
         //
         // Either way the load-bearing property is room-scoping
@@ -674,7 +675,7 @@ mod tests {
         assert!(got.is_empty(), "missing_events leaked cross-room PDU");
     }
 
-    // D10: BFS in R1 follows a `prev_events` edge whose parent_event_id
+    // D10: the walk in R1 follows a `prev_events` edge whose parent_event_id
     // resolves to a real event in R2. D9 covered "seed is in the wrong
     // room"; this covers the harder shape — the seed is legitimately in
     // R1, but its declared parent points across the room boundary.
@@ -880,7 +881,7 @@ mod tests {
     }
 
     // D15: `hydrate_pdu` populates `prev_state_events` on the returned
-    // `Event`. The BFS itself only follows `prev` edges (MSC4242
+    // `Event`. The walk itself only follows `prev` edges (MSC4242
     // state DAG is walked separately), but downstream callers — state
     // resolution, etc. — rely on `prev_state_events` being present on
     // the PDUs `events_before` hands back. Build a message with both
@@ -890,7 +891,7 @@ mod tests {
         let s = store_with_room().await;
         // Build a message whose JSON declares both prev_events and
         // prev_state_events pointing at the room's create event. The
-        // create event is real, so the BFS will hydrate it.
+        // create event is real, so the walk will hydrate it.
         let create_event_id: OwnedEventId = {
             // Recreate the create event to learn its computed id.
             let ce = create_event(*ALICE_ROOM_ID, *ALICE_USER_ID);
@@ -1002,7 +1003,7 @@ mod tests {
 
     // D23: validator chunks the IN-clause. With VALIDATE_EVENTS_EXIST_CHUNK=4
     // under cfg(test), six inputs cross at least two chunks; all six
-    // resolve, so validation passes and the BFS runs normally. Catches
+    // resolve, so validation passes and the walk runs normally. Catches
     // a regression where the chunk loop only writes results from the
     // last window into the `found` set (or only checks the first).
     #[tokio::test]
@@ -1079,7 +1080,7 @@ mod tests {
     }
 
     // D23a: a single node with 50 prev_events. Catches a regression
-    // where the BFS frontier is bounded or `fetch_edges` truncates the
+    // where the walk frontier is bounded or `fetch_edges` truncates the
     // parent set. Under Synapse-style semantics, head is excluded
     // (latest = boundary), so the result is just the 50 leaves.
     #[tokio::test]

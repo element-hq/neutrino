@@ -11,7 +11,7 @@
 //! - **Direct storage seeding** via [`build_seeded_router`] — used by tests
 //!   that need a *non-flat* DAG. The CSAPI `/send` path currently writes
 //!   events with empty `prev_events` (Phase 6 will wire the head pointer),
-//!   so the BFS walker has nothing to traverse. These tests open a fresh
+//!   so the DAG walker has nothing to traverse. These tests open a fresh
 //!   `SqliteStore`, build chains with explicit `prev_events`, persist them
 //!   via the trait, then mount the router on top with
 //!   `router_with_store`.
@@ -273,7 +273,7 @@ async fn unknown_room_returns_404() {
 async fn happy_path_returns_events_between_earliest_and_latest() {
     // B5 - happy path. The 4 message events between create (earliest) and
     // msg 4 (latest) should be reachable. Assert the set of message bodies;
-    // the BFS interleaving order across multiple latest seeds is
+    // the ordering across multiple latest seeds is an
     // implementation detail per `DagStore::missing_events` (trait doc in
     // neutrino-store/src/lib.rs), so we collect into a `BTreeSet` and
     // compare set-equality only.

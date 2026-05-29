@@ -274,11 +274,13 @@ pub trait DagStore: Send + Sync {
     ///       `earliest` need not exist; unknown IDs in `latest` contribute
     ///       no parents to expand (empty edges row), unknown IDs in
     ///       `earliest` are no-ops on the walk.
-    /// Post: BFS over `prev_events` starting from the *parents* of each
+    /// Post: walks `prev_events` backward starting from the *parents* of each
     ///       event in `latest`, skipping any event in `earliest ∪ latest`;
-    ///       returns at most `limit` events. **The events in `latest`
-    ///       themselves are never included in the result** — they are
-    ///       the boundary the requester already has. The events in
+    ///       returns at most `limit` events in reverse-chronological order
+    ///       (newest `origin_server_ts` first, ties by ascending `event_id` —
+    ///       the same priority-queue walk as `events_before`). **The events
+    ///       in `latest` themselves are never included in the result** — they
+    ///       are the boundary the requester already has. The events in
     ///       `earliest` are likewise never included. Events in other
     ///       rooms (cross-room seeds or corrupt `event_edges`) are
     ///       treated as if they don't exist — the walk terminates at the

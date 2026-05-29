@@ -116,7 +116,7 @@ pub async fn router(config: Config) -> Result<Router, StartupError> {
 /// Used by `src/federation/tests.rs` to seed events via the
 /// `StorageBackend` trait directly before the HTTP layer observes them;
 /// the CSAPI `/send` path currently writes flat DAGs (Phase 6 will fix
-/// this), which prevents the BFS-walk tests from exercising
+/// this), which prevents the DAG-walk tests from exercising
 /// `DagStore::missing_events` over a real chain.
 #[cfg(test)]
 pub(crate) fn router_with_store(

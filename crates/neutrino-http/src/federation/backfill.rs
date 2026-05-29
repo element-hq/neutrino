@@ -5,8 +5,9 @@
 //! federation transaction envelope `{ origin, origin_server_ts, pdus }`.
 //!
 //! Reuses `DagStore::events_before` (the seeds-included reverse-chronological
-//! BFS) rather than a dedicated storage method — see the 2026-05-29 PLAN.md
-//! decision. Trusted-mesh deviations match the `get_missing_events` sibling:
+//! priority-queue walk) rather than a dedicated storage method — see the
+//! 2026-05-29 PLAN.md decision. Trusted-mesh deviations match the
+//! `get_missing_events` sibling:
 //! no X-Matrix auth, no signature verification, no history-visibility /
 //! redaction filtering.
 
@@ -184,12 +185,11 @@ fn parse_backfill_query(raw: Option<&str>) -> (Vec<String>, Option<u32>) {
 }
 
 /// Percent-decode a single `application/x-www-form-urlencoded` value: `%XX`
-/// hex escapes and `+` → space. Returns `None` if a complete `%XX` escape has
-/// a non-hex digit, or if the decoded bytes aren't valid UTF-8. A trailing
-/// `%` not followed by two more characters (a *truncated* escape at the end
-/// of the input) is passed through as a literal `%` rather than rejected —
-/// these inputs come from our own router, not untrusted peers, so lenient
-/// pass-through is fine.
+/// hex escapes and `+` → space. Returns `None` for any malformed `%` escape —
+/// whether the two following characters aren't hex digits *or* the escape is
+/// incomplete (a trailing `%`, or `%` followed by only one character) — and
+/// for output that isn't valid UTF-8. Malformed input is rejected, not
+/// silently passed through.
 fn percent_decode(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -200,9 +200,12 @@ fn percent_decode(s: &str) -> Option<String> {
                 out.push(b' ');
                 i += 1;
             }
-            b'%' if i + 2 < bytes.len() => {
-                let hi = (bytes[i + 1] as char).to_digit(16)?;
-                let lo = (bytes[i + 2] as char).to_digit(16)?;
+            b'%' => {
+                // Require exactly two trailing hex digits; an incomplete
+                // escape (no/one trailing char) or a non-hex digit makes
+                // `?` short-circuit to `None`.
+                let hi = bytes.get(i + 1).and_then(|b| (*b as char).to_digit(16))?;
+                let lo = bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16))?;
                 out.push((hi * 16 + lo) as u8);
                 i += 3;
             }
@@ -270,6 +273,9 @@ mod tests {
         let (vs, limit) = parse_backfill_query(Some("v=&limit=10"));
         assert!(vs.is_empty(), "blank v must be dropped: {vs:?}");
         assert_eq!(limit, Some(10));
+        // A bare `?v` with no `=` is likewise empty and dropped.
+        let (vs, _) = parse_backfill_query(Some("v&limit=10"));
+        assert!(vs.is_empty(), "bare v must be dropped: {vs:?}");
         // A blank `v` alongside a real one keeps only the real seed.
         let (vs, _) = parse_backfill_query(Some("v=&v=%24a"));
         assert_eq!(vs, vec!["$a".to_owned()]);
@@ -296,10 +302,10 @@ mod tests {
     }
 
     #[test]
-    fn percent_decode_truncated_escape_is_literal() {
-        // A `%` with fewer than two trailing chars is passed through as a
-        // literal `%`, not rejected (documented lenient behaviour).
-        assert_eq!(percent_decode("ab%").as_deref(), Some("ab%"));
-        assert_eq!(percent_decode("a%2").as_deref(), Some("a%2"));
+    fn percent_decode_rejects_incomplete_escape() {
+        // A `%` with fewer than two trailing characters is malformed and
+        // rejected (not passed through as a literal `%`).
+        assert_eq!(percent_decode("ab%"), None);
+        assert_eq!(percent_decode("a%2"), None);
     }
 }
