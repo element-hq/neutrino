@@ -11,8 +11,11 @@ use axum::{
     response::IntoResponse,
     routing::{get, post, put},
 };
-use neutrino_common::{Config, ROOM_VERSION_ID};
+use neutrino_common::{Config, Event, ROOM_VERSION_ID};
 use neutrino_state::event_id::EventBuilder;
+use neutrino_state::provider::InMemoryStateProvider;
+use neutrino_state::room_core::RoomCore;
+use neutrino_state::{CoreError, FormatError};
 use neutrino_store::{RoomStore, StateStore, StorageError};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5;
@@ -560,16 +563,14 @@ async fn create_room(state: State<AppState>, body: Json<Value>) -> axum::respons
         }
     };
 
-    // v12 / MSC4242: the creator is implicit (taken from `sender`); the
-    // explicit `content.creator` field v11 carried is deprecated. The
-    // builder computes the create event's event_id from the reference
-    // hash, and `parse_event` derives `room_id` from it via the sigil swap.
-    let create = match EventBuilder::new(sender.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-    {
-        Ok(ev) => ev,
+    // Build the spec-mandated initial-state batch (create → join →
+    // power_levels → join_rules, plus name/topic when requested). Each event
+    // is built on the running heads, server-side `auth_events` selected, and
+    // verified through `RoomCore::apply` before it's persisted — see
+    // `build_initial_events`. Any failure here is a server bug (the events are
+    // server-authored), so it maps to 500.
+    let (create, initial) = match build_initial_events(&sender, &body.0) {
+        Ok(batch) => batch,
         Err(e) => {
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -579,55 +580,12 @@ async fn create_room(state: State<AppState>, body: Json<Value>) -> axum::respons
         }
     };
     let room_id = create.room_id.clone();
-    let create_event_id = create.event_id.clone();
-
-    // Self-join. References the create event as both `prev_events` (DAG
-    // parent) and `prev_state_events` (state-DAG parent, MSC4242).
-    let join = match EventBuilder::new(sender.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(sender.as_str().to_owned())
-        .content(json!({ "membership": "join", "displayname": "Alice" }))
-        .prev_events(vec![create_event_id.clone()])
-        .prev_state_events(vec![create_event_id.clone()])
-        .build()
-    {
-        Ok(ev) => ev,
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "M_UNKNOWN",
-                &e.to_string(),
-            );
-        }
-    };
-
-    let mut initial = vec![join];
-
-    if let Some(n) = body.0.pointer("/name").and_then(|v| v.as_str()) {
-        let name = match EventBuilder::new(sender, "m.room.name".to_owned())
-            .room_id(room_id.clone())
-            .state_key(String::new())
-            .content(json!({ "name": n }))
-            .prev_events(vec![initial[0].event_id.clone()])
-            .prev_state_events(vec![create_event_id.clone()])
-            .build()
-        {
-            Ok(ev) => ev,
-            Err(e) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "M_UNKNOWN",
-                    &e.to_string(),
-                );
-            }
-        };
-        initial.push(name);
-    }
 
     // SqliteStore requires `create_room` to register the room before any
     // `persist_event` calls succeed. The create event lands via the trait's
-    // dedicated path; member-join + (optional) name come through alongside
-    // as `initial_events` so the whole thing is one transaction.
+    // dedicated path; the rest of the batch comes through alongside as
+    // `initial_events` so the whole thing is one transaction. The chain is
+    // linear, so `create_room`'s `last()` forward-extremity seeding is correct.
     if let Err(e) = store.create_room(&create, &initial).await {
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -637,6 +595,100 @@ async fn create_room(state: State<AppState>, body: Json<Value>) -> axum::respons
     }
 
     (StatusCode::OK, Json(json!({"room_id": room_id}))).into_response()
+}
+
+/// Error building the createRoom initial-state batch. Every event is
+/// server-authored, so any failure is an internal bug rather than client
+/// input — all variants surface as 500.
+#[derive(Debug, thiserror::Error)]
+enum CreateRoomError {
+    #[error("building initial event: {0}")]
+    Build(#[from] FormatError),
+    #[error("initial event rejected by auth rules: {0}")]
+    Apply(#[from] CoreError),
+}
+
+/// Build the spec-mandated initial-state sequence for a new room, returning
+/// the create event and the ordered tail (join → power_levels → join_rules,
+/// then optional name/topic). Drives a transient `RoomCore` + in-memory
+/// provider so every event is built on the real heads, carries
+/// server-computed `auth_events`, and is auth-checked via `apply` before it's
+/// persisted. The chain is linear (each event sits on the single current
+/// head), so the last event is the sole head of both DAGs.
+///
+/// History visibility and aliases are intentionally omitted for now; preset /
+/// visibility parsing is a non-goal, so `join_rules` defaults to `invite`.
+fn build_initial_events(
+    sender: &OwnedUserId,
+    body: &Value,
+) -> Result<(Event, Vec<Event>), CreateRoomError> {
+    // create is special: no parents, room_id derived from its own event_id.
+    let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()?;
+
+    let mut room = RoomCore::new(create.room_id.clone());
+    let mut provider = InMemoryStateProvider::new();
+    room.apply(create.clone(), &provider)?;
+    provider.insert(Arc::new(create.clone()));
+
+    let mut initial: Vec<Event> = Vec::new();
+    let mut add =
+        |event_type: &str, state_key: &str, content: Value| -> Result<(), CreateRoomError> {
+            let ev = room.build_local_event(
+                sender.clone(),
+                event_type.to_owned(),
+                Some(state_key.to_owned()),
+                content,
+            )?;
+            room.apply(ev.clone(), &provider)?;
+            provider.insert(Arc::new(ev.clone()));
+            initial.push(ev);
+            Ok(())
+        };
+
+    add(
+        "m.room.member",
+        sender.as_str(),
+        json!({ "membership": "join" }),
+    )?;
+    add("m.room.power_levels", "", default_power_levels())?;
+    add("m.room.join_rules", "", json!({ "join_rule": "invite" }))?;
+    if let Some(n) = body.pointer("/name").and_then(|v| v.as_str()) {
+        add("m.room.name", "", json!({ "name": n }))?;
+    }
+    if let Some(t) = body.pointer("/topic").and_then(|v| v.as_str()) {
+        add("m.room.topic", "", json!({ "topic": t }))?;
+    }
+
+    Ok((create, initial))
+}
+
+/// Spec-default `m.room.power_levels` content for a new room. Room v12 makes
+/// the creator implicitly all-powerful (and rule 10.4 forbids naming a creator
+/// in `users`), so `users` is left empty rather than pinning the creator at a
+/// numeric level.
+fn default_power_levels() -> Value {
+    json!({
+        "ban": 50,
+        "events": {
+            "m.room.name": 50,
+            "m.room.power_levels": 100,
+            "m.room.history_visibility": 100,
+            "m.room.canonical_alias": 50,
+            "m.room.tombstone": 100,
+            "m.room.server_acl": 100,
+        },
+        "events_default": 0,
+        "invite": 0,
+        "kick": 50,
+        "redact": 50,
+        "state_default": 50,
+        "users": {},
+        "users_default": 0,
+        "notifications": { "room": 50 },
+    })
 }
 
 async fn members(

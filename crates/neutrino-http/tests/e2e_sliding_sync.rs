@@ -198,6 +198,49 @@ async fn put_state_event_returns_event_id() {
 }
 
 #[tokio::test]
+async fn create_room_with_name_then_send_succeeds() {
+    // Regression for I1: a room created *with a name* (and topic) must still
+    // accept a subsequent send. createRoom now emits a linear, auth-verified
+    // state chain (create → join → power_levels → join_rules → name → topic),
+    // so when the actor bootstraps it sees the creator's join in the state
+    // before the event and the send passes auth. The pre-fix createRoom built
+    // a non-linear state DAG whose seeded head omitted the join, which made
+    // the bootstrapped state miss the creator's membership and rejected this
+    // send with 403.
+    let app = router(config()).await.expect("router init");
+
+    let (status, body) = post(
+        &app,
+        "/_matrix/client/v3/createRoom",
+        None,
+        &json!({ "name": "Named", "topic": "A topic" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "createRoom with name+topic: {body:?}"
+    );
+    let room_id = body
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+    // Message send (non-state) — routes through the actor, which bootstraps
+    // the room from storage and auth-checks against the resolved state.
+    let path = format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/txn1");
+    let (status, resp) = put(&app, &path, &json!({ "msgtype": "m.text", "body": "hi" })).await;
+    assert_eq!(status, StatusCode::OK, "message send accepted: {resp:?}");
+    assert!(resp.get("event_id").and_then(|v| v.as_str()).is_some());
+
+    // And a follow-up state event (sets the topic again) also passes.
+    let path = format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.topic");
+    let (status, resp) = put(&app, &path, &json!({ "topic": "Changed" })).await;
+    assert_eq!(status, StatusCode::OK, "state send accepted: {resp:?}");
+}
+
+#[tokio::test]
 async fn put_event_then_sliding_sync_returns_event_with_event_id() {
     // Regression test mirroring the legacy /sync version: events delivered
     // via the v5 sliding-sync endpoint must carry the same event_id that

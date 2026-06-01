@@ -31,13 +31,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use neutrino_common::Event;
-use neutrino_state::auth_events::calculate_auth_events;
-use neutrino_state::event_id::EventBuilder;
 use neutrino_state::room_core::{Effect, RoomCore};
 use neutrino_state::{CoreError, FormatError, StateDelta, StateMap};
 use neutrino_store::{EventStore, RoomStore, StateStore, StorageError};
 use neutrino_store_sqlite::SqliteStore;
-use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId};
+use ruma::{OwnedRoomId, OwnedUserId, RoomId};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
@@ -108,45 +106,6 @@ impl RoomActor {
         }
     }
 
-    /// Build a locally-originated event against the room's current heads —
-    /// all in memory. `prev_events`/`prev_state_events` come from the two
-    /// head-sets; `auth_events` are calculated server-side from
-    /// state-before-event, which for an event sitting on the current heads is
-    /// `current_state`.
-    fn build_event(
-        &self,
-        sender: OwnedUserId,
-        event_type: String,
-        state_key: Option<String>,
-        content: Value,
-    ) -> Result<Event, FormatError> {
-        let prev_events: Vec<OwnedEventId> =
-            self.room.forward_extremities().iter().cloned().collect();
-        let prev_state_events: Vec<OwnedEventId> = self
-            .room
-            .state_forward_extremities()
-            .iter()
-            .cloned()
-            .collect();
-        let mut builder = EventBuilder::new(sender, event_type)
-            .room_id(self.room.room_id().to_owned())
-            .content(content)
-            .prev_events(prev_events)
-            .prev_state_events(prev_state_events);
-        if let Some(sk) = state_key {
-            builder = builder.state_key(sk);
-        }
-        let mut event = builder.build()?;
-        let current_ids: StateMap<OwnedEventId> = self
-            .room
-            .current_state()
-            .iter()
-            .map(|(key, ev)| (key.clone(), ev.event_id.clone()))
-            .collect();
-        event.auth_events = calculate_auth_events(&event, &current_ids);
-        Ok(event)
-    }
-
     async fn handle_send(
         &mut self,
         sender: OwnedUserId,
@@ -154,7 +113,12 @@ impl RoomActor {
         state_key: Option<String>,
         content: Value,
     ) -> Result<Arc<Event>, RoomActorError> {
-        let event = self.build_event(sender, event_type, state_key, content)?;
+        // Build the event on the room's current heads — the state machine owns
+        // the builder (`RoomCore::build_local_event`) so the actor and the
+        // createRoom batch share one construction path.
+        let event = self
+            .room
+            .build_local_event(sender, event_type, state_key, content)?;
 
         // Apply against a clone — adopt it only once the persist commits.
         // The store hands us a read-only provider; the apply (state-machine
@@ -297,6 +261,7 @@ impl RoomRegistry {
 mod tests {
     use super::*;
     use neutrino_common::ROOM_VERSION_ID;
+    use neutrino_state::event_id::EventBuilder;
     use neutrino_store::RoomStore;
     use serde_json::json;
 
