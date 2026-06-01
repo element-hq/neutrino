@@ -23,16 +23,8 @@
 //! after the persist commits, so an apply hard-reject or a storage fault
 //! leaves the in-memory state untouched.
 //!
-//! Scope (PLAN 6d PR3): the actor + registry, driven directly. Wiring the
-//! CSAPI handlers through it is a later step; until then nothing constructs a
-//! [`RoomRegistry`] in the live router, so the module is exercised only by
-//! its own tests.
-
-// Until the CSAPI handlers are wired through the registry (PLAN 6d PR4) the
-// public surface here has no non-test caller. Allow dead_code module-wide
-// rather than peppering each item; remove when the router constructs a
-// `RoomRegistry`.
-#![allow(dead_code)]
+//! The CSAPI write handlers (`/send`, `/state`) drive this via the
+//! `RoomRegistry` held in `AppState`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

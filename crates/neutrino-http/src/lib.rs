@@ -13,7 +13,7 @@ use axum::{
 };
 use neutrino_common::{Config, ROOM_VERSION_ID};
 use neutrino_state::event_id::EventBuilder;
-use neutrino_store::{EventStore, RoomStore, StateStore, StorageError};
+use neutrino_store::{RoomStore, StateStore, StorageError};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5;
 use ruma::{OwnedRoomId, OwnedUserId};
@@ -29,10 +29,14 @@ mod legacy_sync;
 mod room_actor;
 mod sliding_sync;
 
+use room_actor::{RoomActorError, RoomRegistry};
 use sliding_sync::{SyncError, SyncState};
 
 struct App {
     store: Arc<SqliteStore>,
+    /// Per-room state-machine actors. CSAPI writes go through here so they
+    /// are DAG-linked, auth-checked, and state-resolved.
+    room_registry: Arc<RoomRegistry>,
     sync_state: Arc<SyncState<SqliteStore>>,
     keys: Option<Value>,
     config: Config,
@@ -79,14 +83,16 @@ impl AppState {
     /// Build an `AppState` around an already-open `SqliteStore`. Used by
     /// the e2e tests in `src/federation/tests.rs` to seed events via the
     /// storage trait *before* the router is mounted — `DagStore::missing_events`
-    /// needs a non-flat DAG to walk, and the CSAPI `/send` endpoint
-    /// currently writes events with empty `prev_events` (Phase 6 will
-    /// wire those up). The caller passes the tempfile guard so the file
+    /// needs specific multi-event DAG shapes (gaps, branches) that are
+    /// simplest to construct directly through the trait rather than via the
+    /// CSAPI write path. The caller passes the tempfile guard so the file
     /// stays alive for the lifetime of the router.
     fn from_store(config: Config, store: Arc<SqliteStore>, tempfile: NamedTempFile) -> Self {
         let sync_state = Arc::new(SyncState::new(store.clone()));
+        let room_registry = Arc::new(RoomRegistry::new(store.clone()));
         let app = App {
             store,
+            room_registry,
             sync_state,
             keys: None,
             config,
@@ -115,10 +121,9 @@ pub async fn router(config: Config) -> Result<Router, StartupError> {
 /// removed.
 ///
 /// Used by `src/federation/tests.rs` to seed events via the
-/// `StorageBackend` trait directly before the HTTP layer observes them;
-/// the CSAPI `/send` path currently writes flat DAGs (Phase 6 will fix
-/// this), which prevents the DAG-walk tests from exercising
-/// `DagStore::missing_events` over a real chain.
+/// `StorageBackend` trait directly before the HTTP layer observes them —
+/// the DAG-walk tests need arbitrary chain/gap shapes that are simplest to
+/// construct through the trait rather than via the CSAPI write path.
 #[cfg(test)]
 pub(crate) fn router_with_store(
     config: Config,
@@ -172,6 +177,14 @@ fn build_router(config: Config, state: AppState) -> Router {
         .route(
             "/_matrix/client/v3/rooms/{room_id}/send/{type}/{msg_id}",
             put(put_event),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/state/{type}/{state_key}",
+            put(put_state),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/state/{type}",
+            put(put_state_empty_key),
         )
         .route("/_matrix/client/v3/pushers/set", post(pushers_set))
         .route("/_matrix/client/v3/capabilities", get(get_capabilities))
@@ -661,6 +674,7 @@ async fn members(
     (StatusCode::OK, Json(json!({"chunk": chunk}))).into_response()
 }
 
+/// `PUT /rooms/{room}/send/{type}/{txn}` — a message (non-state) event.
 async fn put_event(
     state: State<AppState>,
     axum::extract::Path((room_id, event_type, _msg_id)): axum::extract::Path<(
@@ -670,11 +684,47 @@ async fn put_event(
     )>,
     body: Json<Value>,
 ) -> axum::response::Response {
-    let (store, user_id) = {
-        let app = lock_app(&state.0);
-        (app.store.clone(), app.config.user_id())
-    };
+    send_via_actor(&state.0, room_id, event_type, None, body.0).await
+}
 
+/// `PUT /rooms/{room}/state/{type}/{stateKey}` — a state event.
+async fn put_state(
+    state: State<AppState>,
+    axum::extract::Path((room_id, event_type, state_key)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+    body: Json<Value>,
+) -> axum::response::Response {
+    send_via_actor(&state.0, room_id, event_type, Some(state_key), body.0).await
+}
+
+/// `PUT /rooms/{room}/state/{type}` — a state event with the empty state key
+/// (the common case for `m.room.name`, `m.room.topic`, …).
+async fn put_state_empty_key(
+    state: State<AppState>,
+    axum::extract::Path((room_id, event_type)): axum::extract::Path<(String, String)>,
+    body: Json<Value>,
+) -> axum::response::Response {
+    send_via_actor(&state.0, room_id, event_type, Some(String::new()), body.0).await
+}
+
+/// Shared body for the CSAPI write endpoints: build + apply + persist the
+/// event through the room's actor (DAG-linked, auth-checked, state-resolved)
+/// and return `{ event_id }`. `state_key = None` for a message event,
+/// `Some(_)` for a state event.
+async fn send_via_actor(
+    state: &AppState,
+    room_id: String,
+    event_type: String,
+    state_key: Option<String>,
+    content: Value,
+) -> axum::response::Response {
+    let (registry, user_id) = {
+        let app = lock_app(state);
+        (app.room_registry.clone(), app.config.user_id())
+    };
     let sender: OwnedUserId = match user_id.parse() {
         Ok(s) => s,
         Err(e) => {
@@ -692,29 +742,26 @@ async fn put_event(
         }
     };
 
-    // `prev_events` intentionally empty for now — wiring the DAG against the
-    // room's current head is state-machine work (PLAN.md Phase 6) and not
-    // in scope here. Matches the pre-B6 behaviour of this handler.
-    let event = match EventBuilder::new(sender, event_type)
-        .room_id(parsed_room_id)
-        .content(body.0)
-        .build()
+    match registry
+        .send_event(&parsed_room_id, sender, event_type, state_key, content)
+        .await
     {
-        Ok(ev) => ev,
-        Err(e) => {
-            return error_response(StatusCode::BAD_REQUEST, "M_BAD_JSON", &e.to_string());
+        Ok(event) => (StatusCode::OK, Json(json!({ "event_id": event.event_id }))).into_response(),
+        Err(e) => room_actor_response(e),
+    }
+}
+
+/// Map a [`RoomActorError`] to a CSAPI error response.
+fn room_actor_response(e: RoomActorError) -> axum::response::Response {
+    let (status, code) = match &e {
+        RoomActorError::UnknownRoom => (StatusCode::NOT_FOUND, "M_NOT_FOUND"),
+        RoomActorError::Build(_) => (StatusCode::BAD_REQUEST, "M_BAD_JSON"),
+        RoomActorError::Apply(_) => (StatusCode::FORBIDDEN, "M_FORBIDDEN"),
+        RoomActorError::Storage(_) | RoomActorError::NotApplied | RoomActorError::ActorGone => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN")
         }
     };
-    let event_id = event.event_id.clone();
-    if let Err(e) = store.persist_event(&event, &[]).await {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "M_UNKNOWN",
-            &e.to_string(),
-        );
-    }
-
-    (StatusCode::OK, Json(json!({"event_id": event_id}))).into_response()
+    error_response(status, code, &e.to_string())
 }
 
 async fn pushers_set() -> (StatusCode, Json<Value>) {

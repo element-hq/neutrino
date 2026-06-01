@@ -175,6 +175,29 @@ async fn put_event_then_sync_delivers_it_in_timeline() {
 }
 
 #[tokio::test]
+async fn put_state_event_returns_event_id() {
+    let app = router(config()).await.expect("router init");
+
+    let (_, body) = post(&app, "/_matrix/client/v3/createRoom", None, &json!({})).await;
+    let room_id = body
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+    // Set the room name via the state endpoint (empty state key). The creator
+    // has the power to set it, so the actor builds + applies + persists it and
+    // returns the resolved event_id — proving the route → actor wiring.
+    let path = format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.name");
+    let (status, resp) = put(&app, &path, &json!({ "name": "My Room" })).await;
+    assert_eq!(status, StatusCode::OK, "state PUT accepted: {resp:?}");
+    assert!(
+        resp.get("event_id").and_then(|v| v.as_str()).is_some(),
+        "event_id returned: {resp:?}"
+    );
+}
+
+#[tokio::test]
 async fn put_event_then_sliding_sync_returns_event_with_event_id() {
     // Regression test mirroring the legacy /sync version: events delivered
     // via the v5 sliding-sync endpoint must carry the same event_id that
