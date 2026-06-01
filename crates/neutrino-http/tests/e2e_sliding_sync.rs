@@ -175,6 +175,102 @@ async fn put_event_then_sync_delivers_it_in_timeline() {
 }
 
 #[tokio::test]
+async fn put_state_event_returns_event_id() {
+    let app = router(config()).await.expect("router init");
+
+    let (_, body) = post(&app, "/_matrix/client/v3/createRoom", None, &json!({})).await;
+    let room_id = body
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+    // Set the room name via the state endpoint (empty state key). The creator
+    // has the power to set it, so the actor builds + applies + persists it and
+    // returns the resolved event_id — proving the route → actor wiring.
+    let path = format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.name");
+    let (status, resp) = put(&app, &path, &json!({ "name": "My Room" })).await;
+    assert_eq!(status, StatusCode::OK, "state PUT accepted: {resp:?}");
+    assert!(
+        resp.get("event_id").and_then(|v| v.as_str()).is_some(),
+        "event_id returned: {resp:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_room_with_name_then_send_succeeds() {
+    // Regression for I1: a room created *with a name* (and topic) must still
+    // accept a subsequent send. createRoom now emits a linear, auth-verified
+    // state chain (create → join → power_levels → join_rules → name → topic),
+    // so when the actor bootstraps it sees the creator's join in the state
+    // before the event and the send passes auth. The pre-fix createRoom built
+    // a non-linear state DAG whose seeded head omitted the join, which made
+    // the bootstrapped state miss the creator's membership and rejected this
+    // send with 403.
+    let app = router(config()).await.expect("router init");
+
+    let (status, body) = post(
+        &app,
+        "/_matrix/client/v3/createRoom",
+        None,
+        &json!({ "name": "Named", "topic": "A topic" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "createRoom with name+topic: {body:?}"
+    );
+    let room_id = body
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+    // Message send (non-state) — routes through the actor, which bootstraps
+    // the room from storage and auth-checks against the resolved state.
+    let path = format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/txn1");
+    let (status, resp) = put(&app, &path, &json!({ "msgtype": "m.text", "body": "hi" })).await;
+    assert_eq!(status, StatusCode::OK, "message send accepted: {resp:?}");
+    assert!(resp.get("event_id").and_then(|v| v.as_str()).is_some());
+
+    // And a follow-up state event (sets the topic again) also passes.
+    let path = format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.topic");
+    let (status, resp) = put(&app, &path, &json!({ "topic": "Changed" })).await;
+    assert_eq!(status, StatusCode::OK, "state send accepted: {resp:?}");
+}
+
+#[tokio::test]
+async fn create_public_room_then_send_succeeds() {
+    // `preset: public_chat` makes createRoom emit `m.room.join_rules` with
+    // `join_rule: public` (plus the `m.room.history_visibility` event). The
+    // whole batch is auth-checked through `apply` before persistence, so a
+    // successful createRoom + subsequent send proves the public join-rule and
+    // history-visibility events are well-formed and accepted by the state
+    // machine. (The preset → join_rule mapping itself is unit-tested in
+    // `lib.rs`.)
+    let app = router(config()).await.expect("router init");
+
+    let (status, body) = post(
+        &app,
+        "/_matrix/client/v3/createRoom",
+        None,
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "createRoom public_chat: {body:?}");
+    let room_id = body
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+    let path = format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/txn1");
+    let (status, resp) = put(&app, &path, &json!({ "msgtype": "m.text", "body": "hi" })).await;
+    assert_eq!(status, StatusCode::OK, "message send accepted: {resp:?}");
+}
+
+#[tokio::test]
 async fn put_event_then_sliding_sync_returns_event_with_event_id() {
     // Regression test mirroring the legacy /sync version: events delivered
     // via the v5 sliding-sync endpoint must carry the same event_id that

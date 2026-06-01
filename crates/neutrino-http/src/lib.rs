@@ -11,9 +11,12 @@ use axum::{
     response::IntoResponse,
     routing::{get, post, put},
 };
-use neutrino_common::{Config, ROOM_VERSION_ID};
+use neutrino_common::{Config, Event, ROOM_VERSION_ID};
 use neutrino_state::event_id::EventBuilder;
-use neutrino_store::{EventStore, RoomStore, StateStore, StorageError};
+use neutrino_state::provider::InMemoryStateProvider;
+use neutrino_state::room_core::RoomCore;
+use neutrino_state::{CoreError, FormatError};
+use neutrino_store::{RoomStore, StateStore, StorageError};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5;
 use ruma::{OwnedRoomId, OwnedUserId};
@@ -26,12 +29,17 @@ use tracing::info;
 
 mod federation;
 mod legacy_sync;
+mod room_actor;
 mod sliding_sync;
 
+use room_actor::{RoomActorError, RoomRegistry};
 use sliding_sync::{SyncError, SyncState};
 
 struct App {
     store: Arc<SqliteStore>,
+    /// Per-room state-machine actors. CSAPI writes go through here so they
+    /// are DAG-linked, auth-checked, and state-resolved.
+    room_registry: Arc<RoomRegistry>,
     sync_state: Arc<SyncState<SqliteStore>>,
     keys: Option<Value>,
     config: Config,
@@ -78,14 +86,16 @@ impl AppState {
     /// Build an `AppState` around an already-open `SqliteStore`. Used by
     /// the e2e tests in `src/federation/tests.rs` to seed events via the
     /// storage trait *before* the router is mounted — `DagStore::missing_events`
-    /// needs a non-flat DAG to walk, and the CSAPI `/send` endpoint
-    /// currently writes events with empty `prev_events` (Phase 6 will
-    /// wire those up). The caller passes the tempfile guard so the file
+    /// needs specific multi-event DAG shapes (gaps, branches) that are
+    /// simplest to construct directly through the trait rather than via the
+    /// CSAPI write path. The caller passes the tempfile guard so the file
     /// stays alive for the lifetime of the router.
     fn from_store(config: Config, store: Arc<SqliteStore>, tempfile: NamedTempFile) -> Self {
         let sync_state = Arc::new(SyncState::new(store.clone()));
+        let room_registry = Arc::new(RoomRegistry::new(store.clone()));
         let app = App {
             store,
+            room_registry,
             sync_state,
             keys: None,
             config,
@@ -114,10 +124,9 @@ pub async fn router(config: Config) -> Result<Router, StartupError> {
 /// removed.
 ///
 /// Used by `src/federation/tests.rs` to seed events via the
-/// `StorageBackend` trait directly before the HTTP layer observes them;
-/// the CSAPI `/send` path currently writes flat DAGs (Phase 6 will fix
-/// this), which prevents the DAG-walk tests from exercising
-/// `DagStore::missing_events` over a real chain.
+/// `StorageBackend` trait directly before the HTTP layer observes them —
+/// the DAG-walk tests need arbitrary chain/gap shapes that are simplest to
+/// construct through the trait rather than via the CSAPI write path.
 #[cfg(test)]
 pub(crate) fn router_with_store(
     config: Config,
@@ -171,6 +180,14 @@ fn build_router(config: Config, state: AppState) -> Router {
         .route(
             "/_matrix/client/v3/rooms/{room_id}/send/{type}/{msg_id}",
             put(put_event),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/state/{type}/{state_key}",
+            put(put_state),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/state/{type}",
+            put(put_state_empty_key),
         )
         .route("/_matrix/client/v3/pushers/set", post(pushers_set))
         .route("/_matrix/client/v3/capabilities", get(get_capabilities))
@@ -546,16 +563,14 @@ async fn create_room(state: State<AppState>, body: Json<Value>) -> axum::respons
         }
     };
 
-    // v12 / MSC4242: the creator is implicit (taken from `sender`); the
-    // explicit `content.creator` field v11 carried is deprecated. The
-    // builder computes the create event's event_id from the reference
-    // hash, and `parse_event` derives `room_id` from it via the sigil swap.
-    let create = match EventBuilder::new(sender.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-    {
-        Ok(ev) => ev,
+    // Build the spec-mandated initial-state batch (create → join →
+    // power_levels → join_rules, plus name/topic when requested). Each event
+    // is built on the running heads, server-side `auth_events` selected, and
+    // verified through `RoomCore::apply` before it's persisted — see
+    // `build_initial_events`. Any failure here is a server bug (the events are
+    // server-authored), so it maps to 500.
+    let (create, initial) = match build_initial_events(&sender, &body.0) {
+        Ok(batch) => batch,
         Err(e) => {
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -565,55 +580,12 @@ async fn create_room(state: State<AppState>, body: Json<Value>) -> axum::respons
         }
     };
     let room_id = create.room_id.clone();
-    let create_event_id = create.event_id.clone();
-
-    // Self-join. References the create event as both `prev_events` (DAG
-    // parent) and `prev_state_events` (state-DAG parent, MSC4242).
-    let join = match EventBuilder::new(sender.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(sender.as_str().to_owned())
-        .content(json!({ "membership": "join", "displayname": "Alice" }))
-        .prev_events(vec![create_event_id.clone()])
-        .prev_state_events(vec![create_event_id.clone()])
-        .build()
-    {
-        Ok(ev) => ev,
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "M_UNKNOWN",
-                &e.to_string(),
-            );
-        }
-    };
-
-    let mut initial = vec![join];
-
-    if let Some(n) = body.0.pointer("/name").and_then(|v| v.as_str()) {
-        let name = match EventBuilder::new(sender, "m.room.name".to_owned())
-            .room_id(room_id.clone())
-            .state_key(String::new())
-            .content(json!({ "name": n }))
-            .prev_events(vec![initial[0].event_id.clone()])
-            .prev_state_events(vec![create_event_id.clone()])
-            .build()
-        {
-            Ok(ev) => ev,
-            Err(e) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "M_UNKNOWN",
-                    &e.to_string(),
-                );
-            }
-        };
-        initial.push(name);
-    }
 
     // SqliteStore requires `create_room` to register the room before any
     // `persist_event` calls succeed. The create event lands via the trait's
-    // dedicated path; member-join + (optional) name come through alongside
-    // as `initial_events` so the whole thing is one transaction.
+    // dedicated path; the rest of the batch comes through alongside as
+    // `initial_events` so the whole thing is one transaction. The chain is
+    // linear, so `create_room`'s `last()` forward-extremity seeding is correct.
     if let Err(e) = store.create_room(&create, &initial).await {
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -623,6 +595,127 @@ async fn create_room(state: State<AppState>, body: Json<Value>) -> axum::respons
     }
 
     (StatusCode::OK, Json(json!({"room_id": room_id}))).into_response()
+}
+
+/// Error building the createRoom initial-state batch. Every event is
+/// server-authored, so any failure is an internal bug rather than client
+/// input — all variants surface as 500.
+#[derive(Debug, thiserror::Error)]
+enum CreateRoomError {
+    #[error("building initial event: {0}")]
+    Build(#[from] FormatError),
+    #[error("initial event rejected by auth rules: {0}")]
+    Apply(#[from] CoreError),
+}
+
+/// Build the spec-mandated initial-state sequence for a new room, returning
+/// the create event and the ordered tail (join → power_levels → join_rules →
+/// history_visibility, then optional name/topic). Drives a transient
+/// `RoomCore` + in-memory provider so every event is built on the real heads,
+/// carries server-computed `auth_events`, and is auth-checked via `apply`
+/// before it's persisted. The chain is linear (each event sits on the single
+/// current head), so the last event is the sole head of both DAGs.
+///
+/// `join_rules` is taken from the request's `preset` (or `visibility` when no
+/// preset is given — see [`join_rule_for`]); `history_visibility` is `shared`,
+/// which every standard preset agrees on. Aliases, guest access, and arbitrary
+/// `initial_state` / `power_level_content_override` overrides are not honoured.
+fn build_initial_events(
+    sender: &OwnedUserId,
+    body: &Value,
+) -> Result<(Event, Vec<Event>), CreateRoomError> {
+    // create is special: no parents, room_id derived from its own event_id.
+    let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()?;
+
+    let mut room = RoomCore::new(create.room_id.clone());
+    let mut provider = InMemoryStateProvider::new();
+    room.apply(create.clone(), &provider)?;
+    provider.insert(Arc::new(create.clone()));
+
+    let mut initial: Vec<Event> = Vec::new();
+    let mut add =
+        |event_type: &str, state_key: &str, content: Value| -> Result<(), CreateRoomError> {
+            let ev = room.build_local_event(
+                sender.clone(),
+                event_type.to_owned(),
+                Some(state_key.to_owned()),
+                content,
+            )?;
+            room.apply(ev.clone(), &provider)?;
+            provider.insert(Arc::new(ev.clone()));
+            initial.push(ev);
+            Ok(())
+        };
+
+    add(
+        "m.room.member",
+        sender.as_str(),
+        json!({ "membership": "join" }),
+    )?;
+    add("m.room.power_levels", "", default_power_levels())?;
+    add(
+        "m.room.join_rules",
+        "",
+        json!({ "join_rule": join_rule_for(body) }),
+    )?;
+    add(
+        "m.room.history_visibility",
+        "",
+        json!({ "history_visibility": "shared" }),
+    )?;
+    if let Some(n) = body.pointer("/name").and_then(|v| v.as_str()) {
+        add("m.room.name", "", json!({ "name": n }))?;
+    }
+    if let Some(t) = body.pointer("/topic").and_then(|v| v.as_str()) {
+        add("m.room.topic", "", json!({ "topic": t }))?;
+    }
+
+    Ok((create, initial))
+}
+
+/// Spec-default `m.room.power_levels` content for a new room. Room v12 makes
+/// the creator implicitly all-powerful (and rule 10.4 forbids naming a creator
+/// in `users`), so `users` is left empty rather than pinning the creator at a
+/// numeric level.
+fn default_power_levels() -> Value {
+    json!({
+        "ban": 50,
+        "events": {
+            "m.room.name": 50,
+            "m.room.power_levels": 100,
+            "m.room.history_visibility": 100,
+            "m.room.canonical_alias": 50,
+            "m.room.tombstone": 100,
+            "m.room.server_acl": 100,
+        },
+        "events_default": 0,
+        "invite": 0,
+        "kick": 50,
+        "redact": 50,
+        "state_default": 50,
+        "users": {},
+        "users_default": 0,
+        "notifications": { "room": 50 },
+    })
+}
+
+/// Resolve the `join_rule` for a new room from the createRoom request, per
+/// <https://spec.matrix.org/v1.18/client-server-api/#post_matrixclientv3createroom>.
+/// An explicit `preset` wins; otherwise it's derived from `visibility`
+/// (`public` ⇒ `public_chat`, else `private_chat`). Only `public_chat` opens
+/// the room (`public`); `private_chat` / `trusted_private_chat` (and any
+/// unrecognised preset) stay invite-only. The `trusted_private_chat`
+/// invitee-power bump is not modelled — createRoom does not process the
+/// `invite` list.
+fn join_rule_for(body: &Value) -> &'static str {
+    let is_public = match body.pointer("/preset").and_then(Value::as_str) {
+        Some(preset) => preset == "public_chat",
+        None => body.pointer("/visibility").and_then(Value::as_str) == Some("public"),
+    };
+    if is_public { "public" } else { "invite" }
 }
 
 async fn members(
@@ -660,6 +753,7 @@ async fn members(
     (StatusCode::OK, Json(json!({"chunk": chunk}))).into_response()
 }
 
+/// `PUT /rooms/{room}/send/{type}/{txn}` — a message (non-state) event.
 async fn put_event(
     state: State<AppState>,
     axum::extract::Path((room_id, event_type, _msg_id)): axum::extract::Path<(
@@ -669,11 +763,47 @@ async fn put_event(
     )>,
     body: Json<Value>,
 ) -> axum::response::Response {
-    let (store, user_id) = {
-        let app = lock_app(&state.0);
-        (app.store.clone(), app.config.user_id())
-    };
+    send_via_actor(&state.0, room_id, event_type, None, body.0).await
+}
 
+/// `PUT /rooms/{room}/state/{type}/{stateKey}` — a state event.
+async fn put_state(
+    state: State<AppState>,
+    axum::extract::Path((room_id, event_type, state_key)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+    body: Json<Value>,
+) -> axum::response::Response {
+    send_via_actor(&state.0, room_id, event_type, Some(state_key), body.0).await
+}
+
+/// `PUT /rooms/{room}/state/{type}` — a state event with the empty state key
+/// (the common case for `m.room.name`, `m.room.topic`, …).
+async fn put_state_empty_key(
+    state: State<AppState>,
+    axum::extract::Path((room_id, event_type)): axum::extract::Path<(String, String)>,
+    body: Json<Value>,
+) -> axum::response::Response {
+    send_via_actor(&state.0, room_id, event_type, Some(String::new()), body.0).await
+}
+
+/// Shared body for the CSAPI write endpoints: build + apply + persist the
+/// event through the room's actor (DAG-linked, auth-checked, state-resolved)
+/// and return `{ event_id }`. `state_key = None` for a message event,
+/// `Some(_)` for a state event.
+async fn send_via_actor(
+    state: &AppState,
+    room_id: String,
+    event_type: String,
+    state_key: Option<String>,
+    content: Value,
+) -> axum::response::Response {
+    let (registry, user_id) = {
+        let app = lock_app(state);
+        (app.room_registry.clone(), app.config.user_id())
+    };
     let sender: OwnedUserId = match user_id.parse() {
         Ok(s) => s,
         Err(e) => {
@@ -691,29 +821,26 @@ async fn put_event(
         }
     };
 
-    // `prev_events` intentionally empty for now — wiring the DAG against the
-    // room's current head is state-machine work (PLAN.md Phase 6) and not
-    // in scope here. Matches the pre-B6 behaviour of this handler.
-    let event = match EventBuilder::new(sender, event_type)
-        .room_id(parsed_room_id)
-        .content(body.0)
-        .build()
+    match registry
+        .send_event(&parsed_room_id, sender, event_type, state_key, content)
+        .await
     {
-        Ok(ev) => ev,
-        Err(e) => {
-            return error_response(StatusCode::BAD_REQUEST, "M_BAD_JSON", &e.to_string());
+        Ok(event) => (StatusCode::OK, Json(json!({ "event_id": event.event_id }))).into_response(),
+        Err(e) => room_actor_response(e),
+    }
+}
+
+/// Map a [`RoomActorError`] to a CSAPI error response.
+fn room_actor_response(e: RoomActorError) -> axum::response::Response {
+    let (status, code) = match &e {
+        RoomActorError::UnknownRoom => (StatusCode::NOT_FOUND, "M_NOT_FOUND"),
+        RoomActorError::Build(_) => (StatusCode::BAD_REQUEST, "M_BAD_JSON"),
+        RoomActorError::Apply(_) => (StatusCode::FORBIDDEN, "M_FORBIDDEN"),
+        RoomActorError::Storage(_) | RoomActorError::NotApplied | RoomActorError::ActorGone => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN")
         }
     };
-    let event_id = event.event_id.clone();
-    if let Err(e) = store.persist_event(&event, &[]).await {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "M_UNKNOWN",
-            &e.to_string(),
-        );
-    }
-
-    (StatusCode::OK, Json(json!({"event_id": event_id}))).into_response()
+    error_response(status, code, &e.to_string())
 }
 
 async fn pushers_set() -> (StatusCode, Json<Value>) {
@@ -742,4 +869,44 @@ async fn default_fallback(request: axum::extract::Request) -> (StatusCode, &'sta
         StatusCode::NOT_FOUND,
         "The requested resource was not found.",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::join_rule_for;
+    use serde_json::json;
+
+    #[test]
+    fn join_rule_explicit_preset_wins_over_visibility() {
+        // An explicit preset overrides visibility entirely.
+        assert_eq!(
+            join_rule_for(&json!({ "preset": "public_chat", "visibility": "private" })),
+            "public"
+        );
+        assert_eq!(
+            join_rule_for(&json!({ "preset": "private_chat", "visibility": "public" })),
+            "invite"
+        );
+        assert_eq!(
+            join_rule_for(&json!({ "preset": "trusted_private_chat" })),
+            "invite"
+        );
+    }
+
+    #[test]
+    fn join_rule_derived_from_visibility_when_no_preset() {
+        assert_eq!(join_rule_for(&json!({ "visibility": "public" })), "public");
+        assert_eq!(join_rule_for(&json!({ "visibility": "private" })), "invite");
+    }
+
+    #[test]
+    fn join_rule_defaults_to_invite() {
+        // No preset, no visibility ⇒ private (invite-only), and an
+        // unrecognised preset is treated conservatively as invite-only.
+        assert_eq!(join_rule_for(&json!({})), "invite");
+        assert_eq!(
+            join_rule_for(&json!({ "preset": "weird_preset" })),
+            "invite"
+        );
+    }
 }

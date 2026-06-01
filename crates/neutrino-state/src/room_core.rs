@@ -58,13 +58,16 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use neutrino_common::Event;
-use ruma::{EventId, OwnedEventId, OwnedRoomId};
+use ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId};
+use serde_json::Value;
 
+use crate::auth_events::calculate_auth_events;
 use crate::auth_rules::check_auth_rules;
+use crate::event_id::EventBuilder;
 use crate::provider::StateProvider;
 use crate::state_res;
 use crate::validate;
-use crate::{CoreError, StateDelta, StateMap, StateResError};
+use crate::{CoreError, FormatError, StateDelta, StateMap, StateResError};
 
 /// Provider wrapper that transparently resolves a single `local_event` —
 /// the event currently being applied — while delegating everything else to
@@ -220,6 +223,41 @@ impl RoomCore {
     /// Current resolved state. Read-only; mutate only through `apply`.
     pub fn current_state(&self) -> &Arc<StateMap<Arc<Event>>> {
         &self.current_state
+    }
+
+    /// Build a locally-originated event sitting on the room's current heads —
+    /// all in memory. `prev_events` / `prev_state_events` come from the two
+    /// head-sets; `auth_events` are calculated server-side from
+    /// state-before-event, which for an event sitting on the current heads is
+    /// `current_state`. `state_key = None` builds a message event, `Some(_)`
+    /// a state event. The result is ready to feed straight back into
+    /// [`apply`](Self::apply) (or to persist as part of an initial batch).
+    pub fn build_local_event(
+        &self,
+        sender: OwnedUserId,
+        event_type: String,
+        state_key: Option<String>,
+        content: Value,
+    ) -> Result<Event, FormatError> {
+        let prev_events: Vec<OwnedEventId> = self.forward_extremities.iter().cloned().collect();
+        let prev_state_events: Vec<OwnedEventId> =
+            self.state_forward_extremities.iter().cloned().collect();
+        let mut builder = EventBuilder::new(sender, event_type)
+            .room_id(self.room_id.clone())
+            .content(content)
+            .prev_events(prev_events)
+            .prev_state_events(prev_state_events);
+        if let Some(sk) = state_key {
+            builder = builder.state_key(sk);
+        }
+        let mut event = builder.build()?;
+        let current_ids: StateMap<OwnedEventId> = self
+            .current_state
+            .iter()
+            .map(|(key, ev)| (key.clone(), ev.event_id.clone()))
+            .collect();
+        event.auth_events = calculate_auth_events(&event, &current_ids);
+        Ok(event)
     }
 
     /// Integrate a single event into the room. Returns the list of effects
