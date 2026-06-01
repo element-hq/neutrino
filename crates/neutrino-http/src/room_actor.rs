@@ -13,9 +13,10 @@
 //!   current_state) in memory. Single owner ⇒ no concurrent writer.
 //! - `RoomCore::apply` reads only immutable data (persisted events + auth
 //!   chains) through a provider, so it needs no write transaction. The
-//!   provider is connection-bound and `pub(crate)`, so the actor reaches it
-//!   via [`SqliteStore::apply_event`] (the thin bridge that runs apply on a
-//!   reader connection).
+//!   provider is connection-bound and `pub(crate)`, so the actor borrows one
+//!   for the apply via [`SqliteStore::with_state_provider`] — the store opens
+//!   a reader connection and hands back a `&dyn StateProvider`; the apply
+//!   itself stays here in the actor.
 //! - Persisting the accepted event + new head-sets is the one short write
 //!   transaction — `EventStore::persist_resolved_event`.
 //!
@@ -156,7 +157,17 @@ impl RoomActor {
         let event = self.build_event(sender, event_type, state_key, content)?;
 
         // Apply against a clone — adopt it only once the persist commits.
-        let (next, verdict) = self.store.apply_event(self.room.clone(), event).await?;
+        // The store hands us a read-only provider; the apply (state-machine
+        // logic) stays here in the actor.
+        let room = self.room.clone();
+        let (next, verdict) = self
+            .store
+            .with_state_provider(move |provider| {
+                let mut room = room;
+                let verdict = room.apply(event, provider);
+                (room, verdict)
+            })
+            .await?;
         let effects = verdict?;
 
         // Collect the event to persist and the current-state delta. An

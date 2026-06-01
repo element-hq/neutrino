@@ -14,8 +14,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use deadpool_sqlite::{Config, Hook, HookError, Pool, Runtime, rusqlite::Connection};
-use neutrino_state::room_core::{Effect, RoomCore};
-use neutrino_state::{CoreError, Event};
+use neutrino_state::provider::StateProvider;
 use neutrino_store::{StorageError, StreamPos};
 use tokio::sync::watch;
 
@@ -220,29 +219,29 @@ impl SqliteStore {
         }
     }
 
-    /// Run [`RoomCore::apply`] against a provider backed by this store, on a
-    /// reader connection. `room` is taken by value and handed back (mutated
-    /// by a successful apply) so the caller — the per-room actor — can adopt
-    /// it only after the follow-up `persist_resolved_event` commits. The
-    /// inner `Result` is apply's own verdict (`CoreError` = hard reject); the
-    /// outer `Result` is a storage/connection fault. apply only *reads*
-    /// (immutable events + auth chains), so this needs no write transaction.
+    /// Run a closure with a read-only [`StateProvider`] backed by this store,
+    /// on a reader connection. This is the connection-bridging primitive the
+    /// per-room actor uses to drive `RoomCore::apply`: `run_read` and
+    /// `SqliteStateProvider` are `pub(crate)`/connection-bound, so the
+    /// orchestration in `neutrino-http` can't build a provider itself — but it
+    /// owns the state machine. `f` runs the apply (a read: immutable events +
+    /// auth chains, no write transaction) and returns whatever the caller
+    /// needs, typically `(RoomCore, Result<Vec<Effect>, CoreError>)`.
     ///
-    /// This is the connection-bridging half of the actor's apply step:
-    /// `run_read` and `SqliteStateProvider` are `pub(crate)`/connection-bound,
-    /// so the orchestration in `neutrino-http` can't build a provider itself.
-    pub async fn apply_event(
-        &self,
-        mut room: RoomCore,
-        event: Event,
-    ) -> Result<(RoomCore, Result<Vec<Effect>, CoreError>), StorageError> {
-        self.run_read(
-            move |conn| -> Result<(RoomCore, Result<Vec<Effect>, CoreError>), Error> {
-                let provider = crate::store::SqliteStateProvider::new(conn);
-                let verdict = room.apply(event, &provider);
-                Ok((room, verdict))
-            },
-        )
+    /// `R` must own its result: the provider lives only for the duration of
+    /// `f`, so a returned value cannot borrow from it. Keeping the apply types
+    /// (`RoomCore` / `Effect` / `CoreError`) in `R` means this crate never
+    /// names them — storage stays ignorant of the state machine, knowing only
+    /// the `StateProvider` trait it already implements.
+    pub async fn with_state_provider<F, R>(&self, f: F) -> Result<R, StorageError>
+    where
+        F: for<'a> FnOnce(&'a dyn StateProvider) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.run_read(move |conn| {
+            let provider = crate::store::SqliteStateProvider::new(conn);
+            Ok(f(&provider))
+        })
         .await
     }
 }
