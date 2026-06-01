@@ -78,7 +78,7 @@ the extractor returns the configured `@alice` user and no token map exists.
 
 ```rust
 #[cfg(feature = "multi-user-shim")]
-user_tokens: std::collections::HashMap<String, ruma::OwnedUserId>,
+user_tokens: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, ruma::OwnedUserId>>>,
 ```
 
 - Keyed by the opaque access-token string; value is the resolved user id.
@@ -138,8 +138,8 @@ stubs).
   absent from the body, fall back to the configured default localpart — i.e.
   the current single-user behaviour — rather than erroring. Complement always
   supplies one; this just keeps the unauthed-default case sane.
-- **Token format:** `syt_<uuid v4>` (the `uuid` crate is already a workspace
-  dep). Uniqueness is guaranteed by the uuid; no collision handling needed.
+- **Token format:** `syt_<32 alnum>` (32 random alphanumerics).
+  Uniqueness is probabilistic and more than sufficient for a test-only server; no collision handling needed.
 
 A small private helper module (e.g. `multi_user`, gated by the feature) holds
 the token-store type alias, the mint/insert helper, and the
