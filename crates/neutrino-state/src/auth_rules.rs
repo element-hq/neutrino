@@ -34,10 +34,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use ruma::{OwnedUserId, UserId};
+use ruma::{OwnedUserId, RoomId, UserId};
 use serde_json::Value;
 
-use crate::{AuthError, Event, StateMap};
+use crate::provider::StateProvider;
+use crate::validate::derive_create_event_id;
+use crate::{AuthError, Event, StateMap, StateResError};
 
 // ----------------- public API -----------------
 
@@ -60,7 +62,11 @@ use crate::{AuthError, Event, StateMap};
 ///       the caller's concern — Phase 6 `apply` runs this function twice,
 ///       once against state-before-event and once against the post-update
 ///       current state.
-pub fn check_auth_rules(event: &Event, state: &StateMap<Arc<Event>>) -> Result<(), AuthError> {
+pub fn check_auth_rules(
+    event: &Event,
+    state: &StateMap<Arc<Event>>,
+    provider: &dyn StateProvider,
+) -> Result<(), AuthError> {
     // Rule 1 (m.room.create):
     //   1.1 prev_events absent       → validate::validate_pdu (CreateHasPrevEvents)
     //   1.2 room_id absent on wire   → validate::parse_event (CreateHasRoomId)
@@ -76,7 +82,12 @@ pub fn check_auth_rules(event: &Event, state: &StateMap<Arc<Event>>) -> Result<(
     // validate::parse_event (AuthEventsPresent); state-res uses
     // auth_events::calculate_auth_events instead.
 
-    let ctx = AuthContext::new(state);
+    // AuthContext owns "create is implicit in v12": it resolves the room's
+    // create event from `state`, falling back to deriving it from `room_id`
+    // and fetching via `provider`. A failure to resolve create is surfaced as
+    // a verdict (the event can't be authorized without its room's create).
+    let ctx = AuthContext::new(&event.room_id, state, provider)
+        .map_err(|_| AuthError::CreateUnavailable)?;
 
     check_rule_4_federation(event, &ctx)?;
 
@@ -122,7 +133,7 @@ pub fn check_auth_rules(event: &Event, state: &StateMap<Arc<Event>>) -> Result<(
 /// 2-entry map (create + latest PL) derived from `event.auth_events`.
 pub(crate) struct AuthContext<'a> {
     state: &'a StateMap<Arc<Event>>,
-    create_event: &'a Arc<Event>,
+    create_event: Arc<Event>,
     creators: HashSet<OwnedUserId>,
     power_levels: PowerLevels,
     /// `true` if state-before-event has an `m.room.power_levels` event.
@@ -137,17 +148,33 @@ pub(crate) struct AuthContext<'a> {
 }
 
 impl<'a> AuthContext<'a> {
-    pub(crate) fn new(state: &'a StateMap<Arc<Event>>) -> Self {
-        // `validate::validate_references` (phase 1b) has already verified
-        // that this room's create event is in state; reaching auth without
-        // it is a state-machine invariant violation by the caller.
-        let create_event = state
-            .get(&("m.room.create".to_string(), String::new()))
-            .expect(
-                "validate::validate_references guarantees m.room.create is in state-before-event",
-            );
+    /// Build the auth context. The room's `m.room.create` event is resolved
+    /// first from `state` (the common case — state-before-event and the normal
+    /// apply path always include it), then by deriving its id from `room_id`
+    /// and fetching it from `provider`. v12 **excludes** create from
+    /// `auth_events`, so state-res's restricted auth maps (built from
+    /// `event.auth_events`) do not carry it — this is the single place that
+    /// makes create implicit, so no caller has to remember to inject it.
+    /// Errors with [`StateResError`] if create is resolvable from neither.
+    pub(crate) fn new(
+        room_id: &RoomId,
+        state: &'a StateMap<Arc<Event>>,
+        provider: &dyn StateProvider,
+    ) -> Result<Self, StateResError> {
+        let create_key = ("m.room.create".to_string(), String::new());
+        let create_event = match state.get(&create_key) {
+            Some(ev) => ev.clone(),
+            None => {
+                let create_id = derive_create_event_id(&room_id.to_owned()).ok_or_else(|| {
+                    StateResError::Internal(format!("malformed room_id {room_id}"))
+                })?;
+                provider
+                    .get_event(&create_id)?
+                    .ok_or(StateResError::MissingEvent(create_id))?
+            }
+        };
 
-        let create_content = parse_content(create_event);
+        let create_content = parse_content(&create_event);
         let mut creators: HashSet<OwnedUserId> = HashSet::new();
         creators.insert(create_event.sender.clone());
         if let Some(arr) = create_content
@@ -177,7 +204,7 @@ impl<'a> AuthContext<'a> {
         let present_power_levels = pl_event.is_some();
         let power_levels = PowerLevels::parse(pl_event.map(Arc::as_ref));
 
-        Self {
+        Ok(Self {
             state,
             create_event,
             creators,
@@ -185,7 +212,7 @@ impl<'a> AuthContext<'a> {
             present_power_levels,
             federate,
             create_domain,
-        }
+        })
     }
 
     /// User's effective power level. Creators have `i64::MAX` ("cannot be
@@ -865,6 +892,7 @@ fn check_rule_10_power_levels(
 mod tests {
     use super::*;
     use crate::event_id::EventBuilder;
+    use crate::provider::InMemoryStateProvider;
     use crate::test_utils::next_ts;
     use neutrino_common::ROOM_VERSION_ID;
     use ruma::RoomId;
@@ -1047,7 +1075,8 @@ mod tests {
         );
         let st = state_map([create.clone(), alice_join]);
         let msg = message_event(&create.room_id, "@alice:example.org");
-        check_auth_rules(&msg, &st).expect("same-domain sender allowed when federation off");
+        check_auth_rules(&msg, &st, &InMemoryStateProvider::new())
+            .expect("same-domain sender allowed when federation off");
     }
 
     #[test]
@@ -1080,7 +1109,7 @@ mod tests {
         let st = state_map([create.clone(), alice_join, bob_join]);
         let msg = message_event(&create.room_id, "@bob:other.org");
         assert!(matches!(
-            check_auth_rules(&msg, &st),
+            check_auth_rules(&msg, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule4FederationDisallowed { .. })
         ));
     }
@@ -1108,7 +1137,8 @@ mod tests {
             .expect("valid join"),
         );
         let st = state_map([create.clone()]);
-        check_auth_rules(&join, &st).expect("first-join after create allowed");
+        check_auth_rules(&join, &st, &InMemoryStateProvider::new())
+            .expect("first-join after create allowed");
     }
 
     #[test]
@@ -1125,7 +1155,7 @@ mod tests {
         );
         let st = state_map([create.clone(), jr]);
         assert!(matches!(
-            check_auth_rules(&join, &st),
+            check_auth_rules(&join, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule5_3_2_JoinSenderMismatch)
         ));
     }
@@ -1158,7 +1188,7 @@ mod tests {
             json!({}),
         );
         assert!(matches!(
-            check_auth_rules(&bob_join, &st),
+            check_auth_rules(&bob_join, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule5_3_3_JoinWhileBanned)
         ));
     }
@@ -1176,7 +1206,7 @@ mod tests {
             json!({}),
         );
         assert!(matches!(
-            check_auth_rules(&join, &st),
+            check_auth_rules(&join, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule5_3_4_JoinNotInvited)
         ));
     }
@@ -1193,7 +1223,7 @@ mod tests {
             "join",
             json!({}),
         );
-        check_auth_rules(&join, &st).expect("public join_rule");
+        check_auth_rules(&join, &st, &InMemoryStateProvider::new()).expect("public join_rule");
     }
 
     // ---------- rule 5.4: invite ----------
@@ -1217,7 +1247,7 @@ mod tests {
             "invite",
             json!({}),
         );
-        check_auth_rules(&invite, &st).expect("creator invite");
+        check_auth_rules(&invite, &st, &InMemoryStateProvider::new()).expect("creator invite");
     }
 
     #[test]
@@ -1233,7 +1263,7 @@ mod tests {
             json!({}),
         );
         assert!(matches!(
-            check_auth_rules(&invite, &st),
+            check_auth_rules(&invite, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule5_4_2_InviteSenderNotJoined)
         ));
     }
@@ -1264,7 +1294,7 @@ mod tests {
             json!({}),
         );
         assert!(matches!(
-            check_auth_rules(&reinvite, &st),
+            check_auth_rules(&reinvite, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule5_4_3_InviteTargetJoinedOrBanned)
         ));
     }
@@ -1289,7 +1319,8 @@ mod tests {
             "leave",
             json!({}),
         );
-        check_auth_rules(&self_leave, &st).expect("self-leave from join");
+        check_auth_rules(&self_leave, &st, &InMemoryStateProvider::new())
+            .expect("self-leave from join");
     }
 
     #[test]
@@ -1304,7 +1335,7 @@ mod tests {
             json!({}),
         );
         assert!(matches!(
-            check_auth_rules(&self_leave, &st),
+            check_auth_rules(&self_leave, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule5_5_1_SelfLeaveInvalid)
         ));
     }
@@ -1334,7 +1365,7 @@ mod tests {
             "leave",
             json!({}),
         );
-        check_auth_rules(&kick, &st).expect("creator can kick");
+        check_auth_rules(&kick, &st, &InMemoryStateProvider::new()).expect("creator can kick");
     }
 
     // ---------- rule 5.6: ban ----------
@@ -1364,7 +1395,7 @@ mod tests {
             "ban",
             json!({}),
         );
-        check_auth_rules(&ban, &st).expect("creator can ban");
+        check_auth_rules(&ban, &st, &InMemoryStateProvider::new()).expect("creator can ban");
     }
 
     #[test]
@@ -1379,7 +1410,7 @@ mod tests {
             json!({}),
         );
         assert!(matches!(
-            check_auth_rules(&ban, &st),
+            check_auth_rules(&ban, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule5_6_1_BanSenderNotJoined)
         ));
     }
@@ -1399,7 +1430,7 @@ mod tests {
             json!({}),
         );
         assert!(matches!(
-            check_auth_rules(&knock, &st),
+            check_auth_rules(&knock, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule5_7_1_KnockNotKnockable)
         ));
     }
@@ -1416,7 +1447,8 @@ mod tests {
             "knock",
             json!({}),
         );
-        check_auth_rules(&knock, &st).expect("knock on knockable room");
+        check_auth_rules(&knock, &st, &InMemoryStateProvider::new())
+            .expect("knock on knockable room");
     }
 
     // ---------- rule 5.8: unknown membership ----------
@@ -1433,7 +1465,7 @@ mod tests {
             json!({}),
         );
         assert!(matches!(
-            check_auth_rules(&weird, &st),
+            check_auth_rules(&weird, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule5_8_UnknownMembership(m)) if m == "lurking"
         ));
     }
@@ -1447,7 +1479,7 @@ mod tests {
         // @bob is not a member; tries to send a message.
         let msg = message_event(&create.room_id, "@bob:example.org");
         assert!(matches!(
-            check_auth_rules(&msg, &st),
+            check_auth_rules(&msg, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule6_SenderNotJoined)
         ));
     }
@@ -1464,7 +1496,7 @@ mod tests {
         );
         let st = state_map([create.clone(), alice_join]);
         let msg = message_event(&create.room_id, "@alice:example.org");
-        check_auth_rules(&msg, &st).expect("joined sender");
+        check_auth_rules(&msg, &st, &InMemoryStateProvider::new()).expect("joined sender");
     }
 
     // ---------- rule 8: required power ----------
@@ -1502,7 +1534,7 @@ mod tests {
             json!({ "topic": "spam" }),
         );
         assert!(matches!(
-            check_auth_rules(&topic, &st),
+            check_auth_rules(&topic, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule8_RequiredPowerInsufficient { .. })
         ));
     }
@@ -1527,7 +1559,8 @@ mod tests {
             "@alice:example.org",
             json!({ "users_default": 0, "state_default": 50 }),
         );
-        check_auth_rules(&pl, &st).expect("first power_levels event");
+        check_auth_rules(&pl, &st, &InMemoryStateProvider::new())
+            .expect("first power_levels event");
     }
 
     #[test]
@@ -1550,7 +1583,7 @@ mod tests {
         // 10.4 (creator-in-users) is checked before 10.5 (first-PL allow),
         // so this rejects even with no prior power_levels event in state.
         assert!(matches!(
-            check_auth_rules(&pl, &st),
+            check_auth_rules(&pl, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule10_4_CreatorInUsers(_))
         ));
     }
@@ -1590,7 +1623,8 @@ mod tests {
             "join",
             json!({ "join_authorised_via_users_server": "@alice:example.org" }),
         );
-        check_auth_rules(&join, &st).expect("restricted join with valid authoriser");
+        check_auth_rules(&join, &st, &InMemoryStateProvider::new())
+            .expect("restricted join with valid authoriser");
     }
 
     #[test]
@@ -1607,7 +1641,7 @@ mod tests {
             json!({}),
         );
         assert!(matches!(
-            check_auth_rules(&join, &st),
+            check_auth_rules(&join, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule5_3_5_RestrictedAuthoriserInvalid)
         ));
     }
@@ -1626,7 +1660,7 @@ mod tests {
             json!({ "join_authorised_via_users_server": "@carol:example.org" }),
         );
         assert!(matches!(
-            check_auth_rules(&join, &st),
+            check_auth_rules(&join, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule5_3_5_RestrictedAuthoriserInvalid)
         ));
     }
@@ -1664,7 +1698,7 @@ mod tests {
             json!({ "join_authorised_via_users_server": "@carol:example.org" }),
         );
         assert!(matches!(
-            check_auth_rules(&join, &st),
+            check_auth_rules(&join, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule5_3_5_RestrictedAuthoriserInvalid)
         ));
     }
@@ -1730,7 +1764,8 @@ mod tests {
             "@bob:example.org",
             "token-abc",
         );
-        check_auth_rules(&invite, &st).expect("third-party invite with matching tpi allowed");
+        check_auth_rules(&invite, &st, &InMemoryStateProvider::new())
+            .expect("third-party invite with matching tpi allowed");
     }
 
     #[test]
@@ -1752,7 +1787,7 @@ mod tests {
             "token-missing",
         );
         assert!(matches!(
-            check_auth_rules(&invite, &st),
+            check_auth_rules(&invite, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule5_4_1_ThirdPartyInviteInvalid(_))
         ));
     }
@@ -1785,7 +1820,7 @@ mod tests {
             }),
         );
         assert!(matches!(
-            check_auth_rules(&invite, &st),
+            check_auth_rules(&invite, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule5_4_1_ThirdPartyInviteInvalid(_))
         ));
     }
@@ -1809,7 +1844,7 @@ mod tests {
             "token-abc",
         );
         assert!(matches!(
-            check_auth_rules(&invite, &st),
+            check_auth_rules(&invite, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule5_4_1_ThirdPartyInviteInvalid(_))
         ));
     }
@@ -1834,7 +1869,8 @@ mod tests {
             "@alice:example.org",
             json!({ "display_name": "example", "public_key": "base64" }),
         );
-        check_auth_rules(&tpi_event, &st).expect("creator (infinite power) ≥ invite level");
+        check_auth_rules(&tpi_event, &st, &InMemoryStateProvider::new())
+            .expect("creator (infinite power) ≥ invite level");
     }
 
     #[test]
@@ -1869,7 +1905,7 @@ mod tests {
             json!({ "display_name": "example", "public_key": "base64" }),
         );
         assert!(matches!(
-            check_auth_rules(&tpi_event, &st),
+            check_auth_rules(&tpi_event, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule7_ThirdPartyInviteInsufficient { .. })
         ));
     }
@@ -1916,7 +1952,7 @@ mod tests {
             }),
         );
         assert!(matches!(
-            check_auth_rules(&pl2, &st),
+            check_auth_rules(&pl2, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule10_6_1_CurrentDefaultAboveSender { .. })
         ));
     }
@@ -1960,7 +1996,7 @@ mod tests {
             }),
         );
         assert!(matches!(
-            check_auth_rules(&pl2, &st),
+            check_auth_rules(&pl2, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule10_7_CurrentEventEntryAboveSender { .. })
         ));
     }
@@ -2002,7 +2038,7 @@ mod tests {
             }),
         );
         assert!(matches!(
-            check_auth_rules(&pl2, &st),
+            check_auth_rules(&pl2, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule10_9_CurrentUsersEntryAtOrAboveSender { .. })
         ));
     }
@@ -2054,7 +2090,7 @@ mod tests {
             }),
         );
         assert!(matches!(
-            check_auth_rules(&pl2, &st),
+            check_auth_rules(&pl2, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule10_8_NewEventEntryAboveSender { .. })
         ));
     }
@@ -2080,7 +2116,8 @@ mod tests {
             "@alice:example.org",
             json!({ "users": { "@bob:example.org": 100 } }),
         );
-        let err = check_auth_rules(&pl, &st).expect_err("10.4 fires on additional creator");
+        let err = check_auth_rules(&pl, &st, &InMemoryStateProvider::new())
+            .expect_err("10.4 fires on additional creator");
         match err {
             AuthError::Rule10_4_CreatorInUsers(uid) => {
                 assert_eq!(uid.as_str(), "@bob:example.org");
@@ -2118,7 +2155,7 @@ mod tests {
             json!({}),
         );
         assert!(matches!(
-            check_auth_rules(&kick, &st),
+            check_auth_rules(&kick, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule5_5_5_KickNotAllowed { .. })
         ));
     }
@@ -2143,7 +2180,8 @@ mod tests {
             "invite",
             json!({}),
         );
-        check_auth_rules(&invite, &st).expect("creator can invite additional creator");
+        check_auth_rules(&invite, &st, &InMemoryStateProvider::new())
+            .expect("creator can invite additional creator");
     }
 
     #[test]
@@ -2186,7 +2224,7 @@ mod tests {
             "leave",
             json!({}),
         );
-        match check_auth_rules(&kick, &st) {
+        match check_auth_rules(&kick, &st, &InMemoryStateProvider::new()) {
             Err(AuthError::Rule5_5_5_KickNotAllowed {
                 sender,
                 target,
@@ -2221,7 +2259,7 @@ mod tests {
             json!({}),
         );
         assert!(matches!(
-            check_auth_rules(&invite, &st),
+            check_auth_rules(&invite, &st, &InMemoryStateProvider::new()),
             Err(AuthError::InvalidMemberStateKey { .. })
         ));
     }
@@ -2257,7 +2295,7 @@ mod tests {
             json!({ "users": { "@bob:example.org": 50, "@carol:example.org": 100 }, "users_default": 0, "state_default": 0 }),
         );
         assert!(matches!(
-            check_auth_rules(&pl2, &st),
+            check_auth_rules(&pl2, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule10_10_NewUsersEntryAboveSender { .. })
         ));
     }

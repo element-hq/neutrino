@@ -490,7 +490,7 @@ pub fn validate_references(
 /// for `$`. Returns `None` if the room_id is somehow malformed (shouldn't
 /// happen for a value that already passed `OwnedRoomId` parsing, but the
 /// graceful fallback keeps `validate_references` panic-free).
-fn derive_create_event_id(room_id: &OwnedRoomId) -> Option<OwnedEventId> {
+pub(crate) fn derive_create_event_id(room_id: &OwnedRoomId) -> Option<OwnedEventId> {
     let rest = room_id.as_str().strip_prefix('!')?;
     format!("${rest}").parse().ok()
 }

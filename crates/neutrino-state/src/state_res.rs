@@ -184,10 +184,10 @@ pub fn power_of_sender(event: &Event, provider: &dyn StateProvider) -> Result<i6
         }
     }
 
-    if !state.contains_key(&("m.room.create".to_owned(), String::new())) {
-        return Ok(0);
-    }
-    let ctx = AuthContext::new(&state);
+    // AuthContext resolves the create event itself (v12 excludes it from
+    // auth_events, so it may be absent from the mini-state built above) —
+    // deriving it from the room_id and fetching via the provider.
+    let ctx = AuthContext::new(&event.room_id, &state, provider)?;
     Ok(ctx.user_power(&event.sender))
 }
 
@@ -357,7 +357,7 @@ pub fn iterative_auth_checks(
             }
         }
 
-        if check_auth_rules(&event, &auth_map).is_ok()
+        if check_auth_rules(&event, &auth_map, provider).is_ok()
             && let Some(sk) = &event.state_key
         {
             resolved.insert((event.event_type.clone(), sk.clone()), eid.clone());
@@ -769,6 +769,28 @@ mod tests {
         .expect("placeholder event");
         let id = ev.event_id.clone();
         (id, Arc::new(ev))
+    }
+
+    /// Seed the create event for the placeholder room (`!room:example.org`)
+    /// into `provider` so `power_of_sender` (via `AuthContext`) can resolve
+    /// the creator. The event_id is forced to the room_id's derived create id
+    /// (`$room:example.org`); power-of-sender only consults the create's id,
+    /// sender, and content. Needed by the reverse-topological-power-sort tests,
+    /// which otherwise build a room with no create — an unrealistic shape that
+    /// used to silently yield power 0 for everyone.
+    fn seed_placeholder_create(provider: &mut InMemoryStateProvider) {
+        let mut create = EventBuilder::new(
+            user_id!("@alice:example.org").to_owned(),
+            "m.room.create".to_owned(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("create");
+        create.event_id = eid("$room:example.org");
+        create.room_id = room_id!("!room:example.org").to_owned();
+        provider.insert(Arc::new(create));
     }
 
     /// Register a labelled placeholder in `bag` and the provider. The label
@@ -1240,6 +1262,7 @@ mod tests {
         // c (no auth) → b (auth = [c]) → a (auth = [b]). Sort yields [c, b, a].
         let mut provider = InMemoryStateProvider::new();
         let mut bag = HashMap::new();
+        seed_placeholder_create(&mut provider);
         insert(&mut provider, &mut bag, "c", &[]);
         insert(&mut provider, &mut bag, "b", &["c"]);
         insert(&mut provider, &mut bag, "a", &["b"]);
@@ -1298,6 +1321,7 @@ mod tests {
         // Expected: d first, then {a, b} in tiebreak order, then top.
         let mut provider = InMemoryStateProvider::new();
         let mut bag = HashMap::new();
+        seed_placeholder_create(&mut provider);
         insert(&mut provider, &mut bag, "d", &[]);
         insert(&mut provider, &mut bag, "a", &["d"]);
         insert(&mut provider, &mut bag, "b", &["d"]);
@@ -1311,9 +1335,9 @@ mod tests {
         .into_iter()
         .collect();
         let sorted = reverse_topological_power_sort(&events, &provider).unwrap();
-        // Don't pin a/b order (both have power 0 from placeholder + same
-        // sender; id-tiebreak depends on hash-derived ids). Pin only the
-        // structural property: d first, top last.
+        // Don't pin a/b order (both have equal power — same creator sender —
+        // so id-tiebreak decides, and that depends on hash-derived ids). Pin
+        // only the structural property: d first, top last.
         assert_eq!(sorted.len(), 4);
         assert_eq!(sorted[0], bag["d"]);
         assert_eq!(sorted[3], bag["top"]);
@@ -1330,6 +1354,7 @@ mod tests {
         // never reach outdegree 0 and the sort would stall.
         let mut provider = InMemoryStateProvider::new();
         let mut bag = HashMap::new();
+        seed_placeholder_create(&mut provider);
         insert(&mut provider, &mut bag, "outside", &[]);
         insert(&mut provider, &mut bag, "inside", &["outside"]);
         let events: HashSet<_> = [bag["inside"].clone()].into_iter().collect();

@@ -51,6 +51,14 @@ pub enum RoomActorError {
     Build(#[from] FormatError),
     #[error("event rejected: {0}")]
     Apply(#[from] CoreError),
+    /// A locally-originated event passed the pipeline but was *rejected* by
+    /// the auth rules (REJECT disposition). Distinct from [`Self::Apply`]
+    /// (a retryable/missing-data `CoreError`): a reject is a verdict, surfaced
+    /// to the client as 403, and the event is NOT persisted (Synapse parity —
+    /// locally-refused events are never stored). Federation PDUs take the
+    /// opposite policy and persist their rejects, so this never arises there.
+    #[error("event rejected by auth rules")]
+    Rejected,
     #[error("storage: {0}")]
     Storage(#[from] StorageError),
     /// Apply produced no event to persist. A freshly built event (unique
@@ -74,6 +82,22 @@ enum Command {
         state_key: Option<String>,
         content: Value,
         reply: oneshot::Sender<Result<Arc<Event>, RoomActorError>>,
+    },
+    /// Apply a fully-formed PDU received over federation. Unlike [`Self::Send`]
+    /// there is nothing to build — the event arrives complete — and the
+    /// federation persist policy applies: an accepted, soft-failed, or rejected
+    /// event is all persisted (rejects are recorded, not dropped); only a
+    /// missing-ancestry / fault `CoreError` propagates so the caller can
+    /// backfill and re-deliver. `event` is boxed to keep the `Command` enum
+    /// small (an `Event` dwarfs `Send`'s fields).
+    ///
+    /// Driven by [`RoomRegistry::apply_pdu`]; the federation `PUT /send/{txn}`
+    /// handler that calls it lands with the "Server-Server /send" work, so
+    /// until then it is exercised only by unit tests.
+    #[allow(dead_code)]
+    ApplyPdu {
+        event: Box<Event>,
+        reply: oneshot::Sender<Result<(), RoomActorError>>,
     },
 }
 
@@ -102,8 +126,29 @@ impl RoomActor {
                     // that's fine — the apply already committed or didn't.
                     let _ = reply.send(outcome);
                 }
+                Command::ApplyPdu { event, reply } => {
+                    let outcome = self.handle_apply_pdu(*event).await;
+                    let _ = reply.send(outcome);
+                }
             }
         }
+    }
+
+    /// Run `apply_pdu` against a *clone* of the live `RoomCore`, off to the
+    /// side. The store hands us a read-only provider; the state-machine logic
+    /// stays here in the actor. Returns the post-apply core (adopted by the
+    /// caller only after any persist commits) and the emitted effects.
+    async fn run_apply(&self, event: Event) -> Result<(RoomCore, Vec<Effect>), RoomActorError> {
+        let room = self.room.clone();
+        let (next, verdict) = self
+            .store
+            .with_state_provider(move |provider| {
+                let mut room = room;
+                let verdict = room.apply_pdu(event, provider);
+                (room, verdict)
+            })
+            .await?;
+        Ok((next, verdict?))
     }
 
     async fn handle_send(
@@ -120,33 +165,17 @@ impl RoomActor {
             .room
             .build_local_event(sender, event_type, state_key, content)?;
 
-        // Apply against a clone — adopt it only once the persist commits.
-        // The store hands us a read-only provider; the apply (state-machine
-        // logic) stays here in the actor.
-        let room = self.room.clone();
-        let (next, verdict) = self
-            .store
-            .with_state_provider(move |provider| {
-                let mut room = room;
-                let verdict = room.apply(event, provider);
-                (room, verdict)
-            })
-            .await?;
-        let effects = verdict?;
-
-        // Collect the event to persist and the current-state delta. An
-        // accepted event emits exactly one `Persist`; a state event
-        // additionally emits `UpdateCurrentState` (a non-state event leaves
-        // the delta empty). The returned event carries `soft_failed` itself.
-        let mut persisted: Option<Arc<Event>> = None;
-        let mut delta = StateDelta::new();
-        for effect in effects {
-            match effect {
-                Effect::Persist { event } => persisted = Some(event),
-                Effect::UpdateCurrentState(d) => delta = d,
-            }
-        }
+        let (next, effects) = self.run_apply(event).await?;
+        let (persisted, delta) = collect_effects(effects);
         let event = persisted.ok_or(RoomActorError::NotApplied)?;
+
+        // Local policy: a rejected event is surfaced to the client as 403 and
+        // is NOT persisted (Synapse never stores a locally-refused event). The
+        // post-apply clone is discarded — `apply_pdu` doesn't mutate on reject,
+        // so `self.room` is already correct.
+        if event.rejected {
+            return Err(RoomActorError::Rejected);
+        }
 
         self.store
             .persist_resolved_event(
@@ -161,6 +190,50 @@ impl RoomActor {
 
         Ok(event)
     }
+
+    /// Integrate a fully-formed federation PDU. The federation persist policy:
+    /// an accepted, soft-failed, or rejected event is all persisted (a reject
+    /// is recorded so it can be referenced and is never re-requested). A
+    /// re-delivered PDU that is already persisted is an idempotent no-op
+    /// (`apply_pdu` returns no effects). A missing-ancestry / fault `CoreError`
+    /// propagates so the caller can backfill and re-deliver.
+    async fn handle_apply_pdu(&mut self, event: Event) -> Result<(), RoomActorError> {
+        let (next, effects) = self.run_apply(event).await?;
+        // Idempotent no-op: the PDU is already persisted. Nothing to commit.
+        if effects.is_empty() {
+            return Ok(());
+        }
+        let (persisted, delta) = collect_effects(effects);
+        let event = persisted.ok_or(RoomActorError::NotApplied)?;
+
+        self.store
+            .persist_resolved_event(
+                &event,
+                next.forward_extremities(),
+                next.state_forward_extremities(),
+                &delta,
+            )
+            .await?;
+        self.room = next;
+        Ok(())
+    }
+}
+
+/// Split `apply_pdu`'s effects into the event to persist and the current-state
+/// delta. An accepted event emits exactly one `Persist`; a state event that
+/// changes current_state additionally emits `UpdateCurrentState` (others leave
+/// the delta empty). The returned event carries its own `soft_failed` /
+/// `rejected` flags.
+fn collect_effects(effects: Vec<Effect>) -> (Option<Arc<Event>>, StateDelta) {
+    let mut persisted: Option<Arc<Event>> = None;
+    let mut delta = StateDelta::new();
+    for effect in effects {
+        match effect {
+            Effect::Persist { event } => persisted = Some(event),
+            Effect::UpdateCurrentState(d) => delta = d,
+        }
+    }
+    (persisted, delta)
 }
 
 /// Registry of per-room actors. Looks up (or lazily bootstraps + spawns) the
@@ -202,6 +275,30 @@ impl RoomRegistry {
                 event_type,
                 state_key,
                 content,
+                reply,
+            })
+            .await
+            .map_err(|_| RoomActorError::ActorGone)?;
+        rx.await.map_err(|_| RoomActorError::ActorGone)?
+    }
+
+    /// Integrate a fully-formed PDU received over federation into `room_id`
+    /// and await its outcome. Bootstraps + spawns the room's actor on first
+    /// use. `Ok(())` covers acceptance, soft-fail, rejection (all persisted),
+    /// and idempotent re-delivery; an `Err` carrying a retryable `CoreError`
+    /// (see [`CoreError::is_retryable`]) signals the caller to backfill the
+    /// missing ancestry and re-deliver.
+    ///
+    /// Not yet wired to an HTTP route — the federation `PUT /send/{txn}`
+    /// handler lands with the "Server-Server /send" work. Exercised by unit
+    /// tests until then.
+    #[allow(dead_code)]
+    pub async fn apply_pdu(&self, room_id: &RoomId, event: Event) -> Result<(), RoomActorError> {
+        let actor = self.actor_for(room_id).await?;
+        let (reply, rx) = oneshot::channel();
+        actor
+            .send(Command::ApplyPdu {
+                event: Box::new(event),
                 reply,
             })
             .await
@@ -378,7 +475,7 @@ mod tests {
             )
             .await
             .expect_err("unauthorized topic rejected");
-        assert!(matches!(err, RoomActorError::Apply(_)), "got {err:?}");
+        assert!(matches!(err, RoomActorError::Rejected), "got {err:?}");
 
         // Nothing persisted: heads unchanged.
         let (timeline_after, _) = store.forward_extremities(&room_id).await.unwrap().unwrap();
@@ -465,6 +562,120 @@ mod tests {
             )
             .await
             .expect_err("uninvited bob rejected in an invite-only room");
-        assert!(matches!(err, RoomActorError::Apply(_)), "got {err:?}");
+        assert!(matches!(err, RoomActorError::Rejected), "got {err:?}");
+    }
+
+    // ----- apply_pdu (federation receive) -----
+
+    /// Build a room with just the create event and return the registry, store,
+    /// room id, creator id, and the create event's id — enough to author a
+    /// federation PDU that references the create as its parent.
+    async fn setup_with_create_id() -> (
+        RoomRegistry,
+        Arc<SqliteStore>,
+        OwnedRoomId,
+        OwnedUserId,
+        ruma::OwnedEventId,
+    ) {
+        let store = Arc::new(SqliteStore::open_in_memory().await.expect("open store"));
+        let alice: OwnedUserId = ALICE.parse().expect("alice");
+        let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
+            .state_key(String::new())
+            .content(json!({ "room_version": ROOM_VERSION_ID }))
+            .build()
+            .expect("build create");
+        let room_id = create.room_id.clone();
+        let create_id = create.event_id.clone();
+        store.create_room(&create, &[]).await.expect("create_room");
+        let registry = RoomRegistry::new(store.clone());
+        (registry, store, room_id, alice, create_id)
+    }
+
+    #[tokio::test]
+    async fn apply_pdu_accepts_state_event_and_persists() {
+        // alice's self-join arrives as a fully-formed federation PDU (no
+        // auth_events on the wire — apply_pdu computes them).
+        let (registry, store, room_id, alice, create_id) = setup_with_create_id().await;
+
+        let join = EventBuilder::new(alice.clone(), "m.room.member".to_owned())
+            .room_id(room_id.clone())
+            .state_key(alice.to_string())
+            .content(json!({ "membership": "join" }))
+            .prev_events(vec![create_id.clone()])
+            .prev_state_events(vec![create_id])
+            .build()
+            .expect("build join pdu");
+        let join_id = join.event_id.clone();
+
+        registry
+            .apply_pdu(&room_id, join)
+            .await
+            .expect("pdu accepted");
+
+        let member = store
+            .current_state_event(&room_id, "m.room.member", alice.as_str())
+            .await
+            .unwrap()
+            .expect("alice member row");
+        assert_eq!(member.event_id, join_id);
+        let (timeline, state) = store.forward_extremities(&room_id).await.unwrap().unwrap();
+        assert_eq!(timeline, [join_id.clone()].into_iter().collect());
+        assert_eq!(state, [join_id].into_iter().collect());
+    }
+
+    #[tokio::test]
+    async fn apply_pdu_persists_rejected_event_without_advancing_heads() {
+        // alice joins (locally); then bob — never invited — sends a join PDU
+        // over federation. It fails auth in an invite-only room → REJECT.
+        // Federation policy: the rejected event is persisted, but it does not
+        // advance the heads or enter current_state.
+        let (registry, store, room_id, alice, _create_id) = setup_with_create_id().await;
+        let alice_join = registry
+            .send_event(
+                &room_id,
+                alice.clone(),
+                "m.room.member".to_owned(),
+                Some(alice.to_string()),
+                json!({ "membership": "join" }),
+            )
+            .await
+            .expect("alice join");
+
+        let bob: OwnedUserId = BOB.parse().unwrap();
+        let bob_join = EventBuilder::new(bob.clone(), "m.room.member".to_owned())
+            .room_id(room_id.clone())
+            .state_key(bob.to_string())
+            .content(json!({ "membership": "join" }))
+            .prev_events(vec![alice_join.event_id.clone()])
+            .prev_state_events(vec![alice_join.event_id.clone()])
+            .build()
+            .expect("build bob join pdu");
+        let bob_join_id = bob_join.event_id.clone();
+
+        let (timeline_before, state_before) =
+            store.forward_extremities(&room_id).await.unwrap().unwrap();
+
+        // Federation accepts the PDU into the store even though it's rejected.
+        registry
+            .apply_pdu(&room_id, bob_join)
+            .await
+            .expect("federation persists a reject (Ok, not Err)");
+
+        // Heads unchanged; bob absent from current_state.
+        let (timeline_after, state_after) =
+            store.forward_extremities(&room_id).await.unwrap().unwrap();
+        assert_eq!(timeline_before, timeline_after);
+        assert_eq!(state_before, state_after);
+        assert!(
+            store
+                .current_state_event(&room_id, "m.room.member", bob.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // But the event itself is persisted, marked rejected.
+        let fetched = store.get_events(&[&bob_join_id]).await.unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert!(fetched[0].rejected);
     }
 }
