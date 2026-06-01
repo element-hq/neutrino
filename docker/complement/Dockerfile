@@ -25,7 +25,7 @@ RUN cargo chef cook --release --recipe-path recipe.json --bin neutrino
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY tools ./tools
-RUN cargo build --release --bin neutrino
+RUN cargo build --release --bin neutrino --features multi-user-shim
 
 # Runtime: nginx sidecar terminates TLS on 8448 and proxies plain HTTP on 8008.
 FROM debian:bookworm-slim AS runtime

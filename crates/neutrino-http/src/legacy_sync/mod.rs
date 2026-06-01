@@ -36,23 +36,10 @@ pub mod translate;
 /// M_INVALID_PARAM, `Storage` / `EventConversion` → 500 M_UNKNOWN).
 pub(crate) async fn handle(
     state: State<AppState>,
+    crate::AuthUser(user_id): crate::AuthUser,
     query: Query<HashMap<String, String>>,
 ) -> axum::response::Response {
-    let (sync_state, user_id_str) = {
-        let app = lock_app(&state.0);
-        (app.sync_state.clone(), app.config.user_id())
-    };
-
-    let user_id: OwnedUserId = match user_id_str.as_str().try_into() {
-        Ok(u) => u,
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "M_UNKNOWN",
-                &e.to_string(),
-            );
-        }
-    };
+    let sync_state = lock_app(&state.0).sync_state.clone();
 
     let legacy_query = parse_legacy_query(&query.0);
     let req = synthesize_v5_request(&legacy_query);

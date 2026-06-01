@@ -3,6 +3,12 @@ name = "neutrino-http"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Testing-only multi-user identity shim. Enables per-request Bearer-token →
+# user resolution and per-user /register + /login. OFF in the Android/FFI
+# build; ON for the local dev binary and the Complement image.
+multi-user-shim = []
+
 [dependencies]
 axum = "0.8.7"
 tower-http = { version = "0.6.6", features = ["trace"] }
