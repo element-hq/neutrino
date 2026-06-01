@@ -1478,7 +1478,8 @@ mod tests {
         // A prev_state_events entry absent from the store is RETRY (missing
         // ancestry), not REJECT — it propagates as a retryable `Err`.
         let (mut room, provider, _create_id, _join_id, room_id) = alice_creates_and_joins(true);
-        let phantom: OwnedEventId = "$phantom_missing_event:example.org"
+        // A v12 event id (no `:server` suffix) the provider doesn't know.
+        let phantom: OwnedEventId = "$WadCIT8wxAK3K7zCT9OmewBHyQFIzTRLo15lobAE3zE"
             .parse()
             .expect("event id");
         let orphan = member_event(

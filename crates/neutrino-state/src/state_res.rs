@@ -771,13 +771,12 @@ mod tests {
         (id, Arc::new(ev))
     }
 
-    /// Seed the create event for the placeholder room (`!room:example.org`)
-    /// into `provider` so `power_of_sender` (via `AuthContext`) can resolve
-    /// the creator. The event_id is forced to the room_id's derived create id
-    /// (`$room:example.org`); power-of-sender only consults the create's id,
-    /// sender, and content. Needed by the reverse-topological-power-sort tests,
-    /// which otherwise build a room with no create — an unrealistic shape that
-    /// used to silently yield power 0 for everyone.
+    /// Seed the create event for the placeholder room into `provider` so
+    /// `power_of_sender` (via `AuthContext`) can resolve the creator. The id is
+    /// forced to that room's derived create id; power-of-sender only consults
+    /// the create's id, sender, and content. Needed by the reverse-topological-
+    /// power-sort tests, which otherwise build a room with no create — an
+    /// unrealistic shape that used to silently yield power 0 for everyone.
     fn seed_placeholder_create(provider: &mut InMemoryStateProvider) {
         let mut create = EventBuilder::new(
             user_id!("@alice:example.org").to_owned(),
@@ -788,8 +787,11 @@ mod tests {
         .origin_server_ts(next_ts())
         .build()
         .expect("create");
-        create.event_id = eid("$room:example.org");
-        create.room_id = room_id!("!room:example.org").to_owned();
+        // The placeholder helpers build events in this room; the create id is
+        // its room_id's derived create id (sigil swap).
+        let room = room_id!("!room:example.org").to_owned();
+        create.event_id = crate::validate::derive_create_event_id(&room).expect("derive create id");
+        create.room_id = room;
         provider.insert(Arc::new(create));
     }
 

@@ -446,11 +446,17 @@ mod core_error_tests {
     use super::*;
 
     fn eid() -> OwnedEventId {
-        "$abc:example.org".parse().expect("event id")
+        // v12 event id: `$` + base64url hash, no `:server` suffix.
+        "$Fw7pQdLu79h74bsZabn1UKXoXo7-q5M-cOwQxQxfh2c"
+            .parse()
+            .expect("event id")
     }
 
     fn rid() -> OwnedRoomId {
-        "!room:example.org".parse().expect("room id")
+        // v12 room id: `!` + the create event's hash, no `:server` suffix.
+        "!Fw7pQdLu79h74bsZabn1UKXoXo7-q5M-cOwQxQxfh2c"
+            .parse()
+            .expect("room id")
     }
 
     #[test]
