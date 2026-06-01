@@ -241,6 +241,36 @@ async fn create_room_with_name_then_send_succeeds() {
 }
 
 #[tokio::test]
+async fn create_public_room_then_send_succeeds() {
+    // `preset: public_chat` makes createRoom emit `m.room.join_rules` with
+    // `join_rule: public` (plus the `m.room.history_visibility` event). The
+    // whole batch is auth-checked through `apply` before persistence, so a
+    // successful createRoom + subsequent send proves the public join-rule and
+    // history-visibility events are well-formed and accepted by the state
+    // machine. (The preset → join_rule mapping itself is unit-tested in
+    // `lib.rs`.)
+    let app = router(config()).await.expect("router init");
+
+    let (status, body) = post(
+        &app,
+        "/_matrix/client/v3/createRoom",
+        None,
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "createRoom public_chat: {body:?}");
+    let room_id = body
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+    let path = format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/txn1");
+    let (status, resp) = put(&app, &path, &json!({ "msgtype": "m.text", "body": "hi" })).await;
+    assert_eq!(status, StatusCode::OK, "message send accepted: {resp:?}");
+}
+
+#[tokio::test]
 async fn put_event_then_sliding_sync_returns_event_with_event_id() {
     // Regression test mirroring the legacy /sync version: events delivered
     // via the v5 sliding-sync endpoint must carry the same event_id that

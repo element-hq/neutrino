@@ -384,4 +384,87 @@ mod tests {
         let (timeline_after, _) = store.forward_extremities(&room_id).await.unwrap().unwrap();
         assert_eq!(timeline_before, timeline_after);
     }
+
+    #[tokio::test]
+    async fn public_room_allows_join_without_invite() {
+        // Demonstrates the `public` join rule: a user who was never invited can
+        // join. alice (creator) joins and opens the room to public; bob — never
+        // invited — then joins successfully. This can't be driven over HTTP
+        // (the CSAPI write path hardwires the sender to the single embedded
+        // user), so it goes through the actor, which takes an explicit sender.
+        let (registry, store, room_id, alice) = setup().await;
+
+        registry
+            .send_event(
+                &room_id,
+                alice.clone(),
+                "m.room.member".to_owned(),
+                Some(alice.to_string()),
+                json!({ "membership": "join" }),
+            )
+            .await
+            .expect("alice join");
+        registry
+            .send_event(
+                &room_id,
+                alice.clone(),
+                "m.room.join_rules".to_owned(),
+                Some(String::new()),
+                json!({ "join_rule": "public" }),
+            )
+            .await
+            .expect("alice opens the room to public");
+
+        let bob: OwnedUserId = BOB.parse().unwrap();
+        let join = registry
+            .send_event(
+                &room_id,
+                bob.clone(),
+                "m.room.member".to_owned(),
+                Some(bob.to_string()),
+                json!({ "membership": "join" }),
+            )
+            .await
+            .expect("bob joins a public room without an invite");
+        assert!(!join.soft_failed);
+
+        // bob's join is now the current membership for him.
+        let member = store
+            .current_state_event(&room_id, "m.room.member", bob.as_str())
+            .await
+            .unwrap()
+            .expect("bob membership in state");
+        assert_eq!(member.event_id, join.event_id);
+    }
+
+    #[tokio::test]
+    async fn invite_only_room_rejects_join_without_invite() {
+        // Contrast to the public case: with no `m.room.join_rules` the default
+        // is `invite`, so an uninvited bob is rejected — proving the public
+        // join above isn't being accepted for some unrelated reason.
+        let (registry, _store, room_id, alice) = setup().await;
+        registry
+            .send_event(
+                &room_id,
+                alice.clone(),
+                "m.room.member".to_owned(),
+                Some(alice.to_string()),
+                json!({ "membership": "join" }),
+            )
+            .await
+            .expect("alice join");
+
+        let bob: OwnedUserId = BOB.parse().unwrap();
+        let err = registry
+            .send_event(
+                &room_id,
+                bob.clone(),
+                "m.room.member".to_owned(),
+                Some(bob.to_string()),
+                json!({ "membership": "join" }),
+            )
+            .await
+            .expect_err("uninvited bob rejected in an invite-only room");
+        assert!(matches!(err, RoomActorError::Apply(_)), "got {err:?}");
+    }
 }

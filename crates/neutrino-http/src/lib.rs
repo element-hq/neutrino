@@ -609,15 +609,17 @@ enum CreateRoomError {
 }
 
 /// Build the spec-mandated initial-state sequence for a new room, returning
-/// the create event and the ordered tail (join → power_levels → join_rules,
-/// then optional name/topic). Drives a transient `RoomCore` + in-memory
-/// provider so every event is built on the real heads, carries
-/// server-computed `auth_events`, and is auth-checked via `apply` before it's
-/// persisted. The chain is linear (each event sits on the single current
-/// head), so the last event is the sole head of both DAGs.
+/// the create event and the ordered tail (join → power_levels → join_rules →
+/// history_visibility, then optional name/topic). Drives a transient
+/// `RoomCore` + in-memory provider so every event is built on the real heads,
+/// carries server-computed `auth_events`, and is auth-checked via `apply`
+/// before it's persisted. The chain is linear (each event sits on the single
+/// current head), so the last event is the sole head of both DAGs.
 ///
-/// History visibility and aliases are intentionally omitted for now; preset /
-/// visibility parsing is a non-goal, so `join_rules` defaults to `invite`.
+/// `join_rules` is taken from the request's `preset` (or `visibility` when no
+/// preset is given — see [`join_rule_for`]); `history_visibility` is `shared`,
+/// which every standard preset agrees on. Aliases, guest access, and arbitrary
+/// `initial_state` / `power_level_content_override` overrides are not honoured.
 fn build_initial_events(
     sender: &OwnedUserId,
     body: &Value,
@@ -654,7 +656,16 @@ fn build_initial_events(
         json!({ "membership": "join" }),
     )?;
     add("m.room.power_levels", "", default_power_levels())?;
-    add("m.room.join_rules", "", json!({ "join_rule": "invite" }))?;
+    add(
+        "m.room.join_rules",
+        "",
+        json!({ "join_rule": join_rule_for(body) }),
+    )?;
+    add(
+        "m.room.history_visibility",
+        "",
+        json!({ "history_visibility": "shared" }),
+    )?;
     if let Some(n) = body.pointer("/name").and_then(|v| v.as_str()) {
         add("m.room.name", "", json!({ "name": n }))?;
     }
@@ -689,6 +700,22 @@ fn default_power_levels() -> Value {
         "users_default": 0,
         "notifications": { "room": 50 },
     })
+}
+
+/// Resolve the `join_rule` for a new room from the createRoom request, per
+/// <https://spec.matrix.org/v1.18/client-server-api/#post_matrixclientv3createroom>.
+/// An explicit `preset` wins; otherwise it's derived from `visibility`
+/// (`public` ⇒ `public_chat`, else `private_chat`). Only `public_chat` opens
+/// the room (`public`); `private_chat` / `trusted_private_chat` (and any
+/// unrecognised preset) stay invite-only. The `trusted_private_chat`
+/// invitee-power bump is not modelled — createRoom does not process the
+/// `invite` list.
+fn join_rule_for(body: &Value) -> &'static str {
+    let is_public = match body.pointer("/preset").and_then(Value::as_str) {
+        Some(preset) => preset == "public_chat",
+        None => body.pointer("/visibility").and_then(Value::as_str) == Some("public"),
+    };
+    if is_public { "public" } else { "invite" }
 }
 
 async fn members(
@@ -842,4 +869,44 @@ async fn default_fallback(request: axum::extract::Request) -> (StatusCode, &'sta
         StatusCode::NOT_FOUND,
         "The requested resource was not found.",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::join_rule_for;
+    use serde_json::json;
+
+    #[test]
+    fn join_rule_explicit_preset_wins_over_visibility() {
+        // An explicit preset overrides visibility entirely.
+        assert_eq!(
+            join_rule_for(&json!({ "preset": "public_chat", "visibility": "private" })),
+            "public"
+        );
+        assert_eq!(
+            join_rule_for(&json!({ "preset": "private_chat", "visibility": "public" })),
+            "invite"
+        );
+        assert_eq!(
+            join_rule_for(&json!({ "preset": "trusted_private_chat" })),
+            "invite"
+        );
+    }
+
+    #[test]
+    fn join_rule_derived_from_visibility_when_no_preset() {
+        assert_eq!(join_rule_for(&json!({ "visibility": "public" })), "public");
+        assert_eq!(join_rule_for(&json!({ "visibility": "private" })), "invite");
+    }
+
+    #[test]
+    fn join_rule_defaults_to_invite() {
+        // No preset, no visibility ⇒ private (invite-only), and an
+        // unrecognised preset is treated conservatively as invite-only.
+        assert_eq!(join_rule_for(&json!({})), "invite");
+        assert_eq!(
+            join_rule_for(&json!({ "preset": "weird_preset" })),
+            "invite"
+        );
+    }
 }
