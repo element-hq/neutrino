@@ -6,22 +6,38 @@
 //! deliberate spec deviations under the trusted-mesh assumption).
 //!
 //! New federation endpoints land as sibling modules and register their
-//! routes in `lib.rs::build_router`.
+//! routes in [`routes`].
 
 use axum::{
-    Json,
+    Json, Router,
     http::StatusCode,
     response::{IntoResponse, Response},
+    routing::{get, post},
 };
 use neutrino_store::StorageError;
 use serde_json::json;
 use thiserror::Error;
+
+use crate::AppState;
 
 pub(crate) mod backfill;
 pub(crate) mod get_missing_events;
 
 #[cfg(test)]
 mod tests;
+
+/// All Server-Server (federation) routes, merged into one sub-router.
+pub(crate) fn routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/_matrix/federation/v1/get_missing_events/{room_id}",
+            post(get_missing_events::handle),
+        )
+        .route(
+            "/_matrix/federation/v1/backfill/{room_id}",
+            get(backfill::handle),
+        )
+}
 
 /// Errors any federation handler can surface to the HTTP layer.
 ///

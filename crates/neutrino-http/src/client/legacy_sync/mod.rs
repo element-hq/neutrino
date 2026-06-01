@@ -19,11 +19,9 @@ use axum::{
 use neutrino_store::{Membership, StorageBackend};
 use ruma::{OwnedRoomId, OwnedUserId};
 
+use self::translate::{parse_legacy_query, synthesize_v5_request, translate_response};
+use super::sliding_sync::{self, SyncError, SyncState};
 use crate::{AppState, error_response, lock_app};
-use crate::{
-    legacy_sync::translate::{parse_legacy_query, synthesize_v5_request, translate_response},
-    sliding_sync::{self, SyncError, SyncState},
-};
 
 pub mod translate;
 
