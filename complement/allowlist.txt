@@ -32,3 +32,24 @@ TestRoomCreate/Parallel/POST_/createRoom_makes_a_public_room$
 TestRoomCreate/Parallel/Can_/sync_newly_created_room$
 TestRoomCreationReportsEventsToMyself/parallel/Room_creation_reports_m.room.create_to_myself$
 TestRoomCreationReportsEventsToMyself/parallel/Room_creation_reports_m.room.member_to_myself$
+
+# Membership flows unlocked by the global POST /v3/join/{roomIdOrAlias} endpoint
+# (2026-06-02) + the multi-user shim. Each is verified statically (read-back via
+# /members or /sync only — no GET /state, /event, /messages, or /filter) but was
+# NOT run locally: the authoring env has no docker/go, so CI is the empirical gate.
+# See VIABLE-TESTS.md. Trailing `$` anchors each name against prefix-siblings.
+TestCumulativeJoinLeaveJoinSync$
+TestGetRoomMembers$
+TestMembersLocal/Parallel/New_room_members_see_their_own_join_event$
+TestMembersLocal/Parallel/Existing_members_see_new_members'_join_events$
+TestRoomMembers/Parallel/POST_/rooms/:room_id/join_can_join_a_room$
+TestRoomMembers/Parallel/POST_/join/:room_id_can_join_a_room$
+TestRoomsInvite/Parallel/Can_invite_users_to_invite-only_rooms$
+TestRoomsInvite/Parallel/Uninvited_users_cannot_join_the_room$
+TestRoomsInvite/Parallel/Invited_user_can_reject_invite$
+TestRoomsInvite/Parallel/Invited_user_can_reject_invite_for_empty_room$
+TestRoomsInvite/Parallel/Users_cannot_invite_themselves_to_a_room$
+TestRoomsInvite/Parallel/Users_cannot_invite_a_user_that_is_already_in_the_room$
+TestCannotKickNonPresentUser$
+TestCannotKickLeftUser$
+TestNotPresentUserCannotBanOthers$
