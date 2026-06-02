@@ -115,10 +115,15 @@ message events to exercise timeline-vs-state head divergence. Lives in
   random subset in any order → current_state + head-sets unchanged (federation
   re-send reality). Cheap co-check on the existing generator (`apply_pdu`'s
   persisted-check guards it); land after P2.
-- **P4 — rejection (separate adversarial generator). [TODO — needs shadow model]**
-  Rejected-verdict is order-independent; rejection cascades through
-  `prev_state_events`; a rejected event never appears in `current_state`. Requires
-  the multi-user shadow-auth generator (next milestone), not the creator-only profile.
+- **P4 — rejection (separate adversarial generator). [GENERATOR DONE 2026-06-02;
+  properties = Phase 2]** Rejected-verdict is order-independent; rejection cascades
+  through `prev_state_events`; a rejected event never appears in `current_state`.
+  The multi-user shadow-auth generator (`build_adv_dag`) now exists and the
+  coverage corpus confirms it produces rejects, cascades and soft-fails; the
+  rejection-determinism / cascade-isolation *properties* land in Phase 2. NOTE:
+  soft-fail verdicts are NOT order-independent (checked against live
+  `current_state`, `room_core.rs:433`) — only reject is. Phase 2 order-independence
+  must therefore cover {`current_state`, `state_fes`, reject-verdicts} only.
 - **P5 — message-event invariants. [DONE, creator-only]** A non-state event never
   touches `current_state` or state FEs, only timeline FEs; timeline-vs-state FE
   divergence ⊆ {messages, soft-failed}. The creator-only generator already emits
@@ -249,7 +254,14 @@ Open generator question (deferred past M1): whether the shadow model's branch-me
 must be faithful enough to keep yield high on deeper forks, or whether approximate-
 merge + bounded size is sufficient. Decide empirically from the coverage corpus.
 
-### Next milestone (SCOPED, future session) — shadow auth model + multi-user + adversarial
+### Next milestone (GENERATOR LANDED 2026-06-02; properties = Phase 2) — shadow auth model + multi-user + adversarial
+
+STATUS: the generator + verdict-aware oracle (Phase 0) and the multi-user
+shadow-auth adversarial generator + coverage corpus (Phase 1) have landed —
+see the 2026-06-02 decisions-log entry. `build_adv_dag` / `apply_adv_dag` /
+`Shadow` / `AdvOp` / `Verdict` are in `crates/neutrino-state/tests/prop.rs`.
+What remains (Phase 2) is the *properties* below, pending a fresh-context
+subagent review of the generator first.
 
 Goal: lift the creator-only generator to **multiple users with real membership /
 power-level transitions and deliberate unauthorised events**, then re-run
@@ -340,6 +352,8 @@ never use .unwrap() in handler code.
  ## decisions log
 
 Decided to use Claude.
+
+2026-06-02: Shadow-auth multi-user adversarial generator — Phase 0 + Phase 1 (`crates/neutrino-state/tests/prop.rs`; properties = Phase 2, deferred). **Phase 0**: `Dag` now carries a parallel `verdicts: Vec<Verdict>` (`Accepted`/`Rejected`/`SoftFailed`), and `expected_heads` is verdict-aware — only an `Accepted` event is head-eligible or drops the parents it names, mirroring `apply_pdu` exactly (a `Rejected` event mutates no head-set; a `SoftFailed` non-state event is persisted but is neither a timeline head nor drops its `prev_events` parents — synapse#5269). On the creator-only profile every verdict is `Accepted`, so it reduces to the original "FE = unreferenced event" rule (existing 3 creator-only tests unchanged = the gate). **Phase 1**: a second generator (`build_adv_dag`) that drives a *real* `RoomCore` in build order — heads tracked from reality, the real accept/reject/soft-fail verdict recorded per event, output still a pure replayable `Dag`. The shadow model (`Shadow::from_state`, an auth-relevant projection of resolved `current_state`) is **only a yield helper** for intent selection; a wrong guess lowers accepted-event yield but never corrupts the DAG, since verdicts come from `apply_pdu`. User pool alice(creator)+bob/carol/dave; intent-tagged ops (`Join|Invite|Leave|Kick|Ban|Unban|Topic|Name|PlPromote|PlDemote`) crossed with head-selection (`Extend|Fork|Merge|ConflictFork`), plus `Cascade`/`Unauthorised`/`Message`/`StaleMessage`. fork-width ≤4, ≤~20 events/DAG. Coverage primitives: `ConflictFork` (two PL siblings editing one user to different levels) + a later `Merge` ⇒ PL-conflict merge; `Unauthorised` (power-0 non-creator sets a name) ⇒ reliable rejects; `Cascade` (child's `prev_state_events` names the last reject) ⇒ reference-rejection cascade; `StaleMessage` (join victim → kick → victim messages off the *pre-kick* heads) ⇒ a deterministic soft-fail. Two checks: `adv_build_order_reproduces_verdicts_and_heads` (replaying the persisted events in build order reproduces the recorded verdicts + verdict-aware `expected_heads`; rejects never reach `current_state`) and `adv_generator_coverage_corpus` (2000-case deterministic floors: multihead ≥15% [measured 31%], pl-conflict ≥12% [29%], rejected-with-child ≥18% [36%], soft-failed-msg ≥20% [42%] — closes the three `TODO(P4)` buckets). **Recorded for Phase 2**: `reject` is order-independent (pure function of `prev_state_events` ancestry) but `soft-fail` is NOT — `apply_pdu` checks it against the live resolved `current_state` (`room_core.rs:433`), which depends on application order. So Phase 2 order-independence must assert invariance only over {`current_state`, `state_fes`, reject-verdicts}, not the timeline side / soft-fail verdicts. fmt + clippy -p neutrino-state --tests -D warnings + cargo test -p neutrino-state clean (216 lib + 40 prop). Pending fresh-context subagent review before Phase 2.
 
 2026-06-02: P5 (message-event invariants) + coverage corpus test landed on the creator-only fork/merge generator (`crates/neutrino-state/tests/prop.rs`). **P5** folded into `creator_only_fork_merge_dag_accepts_every_event` (rides P2's existing `outcome` + `expected_heads`, no extra build/apply): asserts no message id leaks into `current_state` or the state forward extremities, and the *one-directional* `timeline_fes \ state_fes ⊆ {messages}`. Decision: assert only that direction, not the symmetric difference — the reverse (`state_fes \ timeline_fes`) legitimately contains *state* events: a state head that a later `m.room.message` named in `prev_events` stays a state FE but drops out of the timeline FEs (the message permanently forks the timeline DAG), so a symmetric-difference⊆messages claim would be false. **Coverage corpus** = new `fork_merge_generator_coverage_corpus`, a plain `#[test]` (not `proptest!`) driving `dag_op()` 2000× against `TestRunner::deterministic()`, classifying each DAG, and asserting floor *fractions* (≥1 wouldn't catch erosion, only disappearance): real ≥2-head merge ≥30% (measured 54%), multi-head ≥3-head merge ≥5% (measured 25%), DAG-has-a-message ≥30% (measured 69%). Two enabling generator tweaks: (a) **`DagOp::Merge` now merges *all* live state heads**, not just the first two — so a merge off ≥3 concurrent heads is a genuine multi-head merge (review TEST4/SPEC7: ≥3-way merges were previously impossible); (b) **`Message` weight 1→2** so the P5 timeline/state divergence is exercised more often. The PL-conflict / rejected-with-child / soft-failed-message corpus buckets are `TODO(P4)`: they need the multi-user shadow model (alice is omnipotent + always joined, so nothing rejects or soft-fails here). fmt + clippy -p neutrino-state --tests -D warnings + cargo test -p neutrino-state clean (216 lib + 38 prop).
 

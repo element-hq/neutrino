@@ -1486,20 +1486,18 @@ fn build_create() -> Event {
 }
 
 /// Alice's self-join, rule-5.3.1 shape: `prev_events == prev_state_events ==
-/// [create_id]`. `auth_events` is left for `apply_pdu` to compute.
+/// [create_id]`. `auth_events` is left for `apply_pdu` to compute. Thin
+/// `FORK_MERGE_SENDER` specialisation of the general `adv_state_event`.
 fn build_join(room: &RoomId, create_id: &OwnedEventId, ts: u64) -> Event {
-    EventBuilder::new(
-        FORK_MERGE_SENDER.parse().expect("user"),
-        "m.room.member".to_owned(),
+    adv_state_event(
+        room,
+        FORK_MERGE_SENDER,
+        "m.room.member",
+        FORK_MERGE_SENDER,
+        json!({ "membership": "join" }),
+        ts,
+        vec![create_id.clone()],
     )
-    .room_id(room.to_owned())
-    .state_key(FORK_MERGE_SENDER.to_owned())
-    .content(json!({ "membership": "join" }))
-    .prev_events(vec![create_id.clone()])
-    .prev_state_events(vec![create_id.clone()])
-    .origin_server_ts(ts)
-    .build()
-    .expect("join builds")
 }
 
 /// A topic state event on the given state heads (used for both `prev_events`
@@ -1507,18 +1505,15 @@ fn build_join(room: &RoomId, create_id: &OwnedEventId, ts: u64) -> Event {
 /// state events). `topic` content is redaction-stripped, so distinct ids rely
 /// on the monotonic `ts`.
 fn build_topic(room: &RoomId, ts: u64, prev: Vec<OwnedEventId>) -> Event {
-    EventBuilder::new(
-        FORK_MERGE_SENDER.parse().expect("user"),
-        "m.room.topic".to_owned(),
+    adv_state_event(
+        room,
+        FORK_MERGE_SENDER,
+        "m.room.topic",
+        "",
+        json!({ "topic": format!("t{ts}") }),
+        ts,
+        prev,
     )
-    .room_id(room.to_owned())
-    .state_key(String::new())
-    .content(json!({ "topic": format!("t{ts}") }))
-    .prev_events(prev.clone())
-    .prev_state_events(prev)
-    .origin_server_ts(ts)
-    .build()
-    .expect("topic builds")
 }
 
 /// A message on the current timeline heads. Carries the state heads in
@@ -1530,24 +1525,40 @@ fn build_message(
     timeline_heads: Vec<OwnedEventId>,
     state_heads: Vec<OwnedEventId>,
 ) -> Event {
-    EventBuilder::new(
-        FORK_MERGE_SENDER.parse().expect("user"),
-        "m.room.message".to_owned(),
-    )
-    .room_id(room.to_owned())
-    .content(json!({ "msgtype": "m.text", "body": format!("m{ts}") }))
-    .prev_events(timeline_heads)
-    .prev_state_events(state_heads)
-    .origin_server_ts(ts)
-    .build()
-    .expect("message builds")
+    adv_message_event(room, FORK_MERGE_SENDER, ts, timeline_heads, state_heads)
+}
+
+/// The verdict `apply_pdu` reaches on an event, in build order. Drives the
+/// generalised `expected_heads` oracle: only an `Accepted` event becomes a
+/// forward extremity or drops its parents from the head-sets. A `Rejected`
+/// event mutates no head-set (apply_pdu returns before any advance); a
+/// `SoftFailed` (non-state) event is persisted but never becomes a timeline
+/// head and never drops its `prev_events` parents (synapse#5269). State events
+/// never soft-fail, so `SoftFailed` only ever tags a non-state event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Accepted,
+    Rejected,
+    SoftFailed,
 }
 
 /// A built DAG: the room id and the events in build order (which is itself a
-/// valid topological order over `prev_events ∪ prev_state_events`).
+/// valid topological order over `prev_events ∪ prev_state_events`). Each stored
+/// event is the *persisted* form, so its `rejected` / `soft_failed` flags carry
+/// the verdict the generator observed — `verdict(i)` recovers it via `classify`
+/// rather than storing a parallel array (which would risk length-desync). For
+/// the creator-only generator the stored events are pre-apply (flags false), so
+/// every verdict is `Accepted`.
 struct Dag {
     room_id: OwnedRoomId,
     events: Vec<Event>,
+}
+
+impl Dag {
+    /// The verdict for event `i`, derived from its persisted flags.
+    fn verdict(&self, i: usize) -> Verdict {
+        classify(&self.events[i])
+    }
 }
 
 /// Builds a creator-only fork/merge DAG from a recipe — purely, with no
@@ -1650,6 +1661,11 @@ impl DagBuilder {
             events,
             ..
         } = self;
+        // The creator-only generator is all-accepted by construction (alice is
+        // omnipotent and always joined): the stored events are pre-apply, so
+        // their flags are false and `verdict(i)` is uniformly `Accepted` —
+        // `expected_heads` then reduces to the original "FE = unreferenced
+        // event" rule.
         let dag = Dag { room_id, events };
         // Cross-check the builder's own running head bookkeeping (`heads_after`,
         // used only to pick parents) against the structural oracle. Without this
@@ -1705,27 +1721,23 @@ fn apply_dag(dag: &Dag, order: &[usize]) -> Result<Outcome, TestCaseError> {
         let effects = room.apply_pdu(event, &provider).map_err(|e| {
             TestCaseError::fail(format!("apply_pdu errored on {id} (broken ancestry?): {e}"))
         })?;
-        let mut persisted = None;
+        let persisted = persist_effect(&effects).ok_or_else(|| {
+            TestCaseError::fail(format!("apply_pdu emitted no Persist effect for {id}"))
+        })?;
         for effect in effects {
-            match effect {
-                Effect::Persist { event } => persisted = Some(event),
-                Effect::UpdateCurrentState(delta) => {
-                    for (key, value) in delta {
-                        match value {
-                            Some(eid) => {
-                                accumulated.insert(key, eid);
-                            }
-                            None => {
-                                accumulated.remove(&key);
-                            }
+            if let Effect::UpdateCurrentState(delta) = effect {
+                for (key, value) in delta {
+                    match value {
+                        Some(eid) => {
+                            accumulated.insert(key, eid);
+                        }
+                        None => {
+                            accumulated.remove(&key);
                         }
                     }
                 }
             }
         }
-        let persisted = persisted.ok_or_else(|| {
-            TestCaseError::fail(format!("apply_pdu emitted no Persist effect for {id}"))
-        })?;
         prop_assert!(
             !persisted.rejected,
             "creator-authored event {id} was rejected — generator flaw"
@@ -1801,17 +1813,30 @@ fn random_topo_order(dag: &Dag, entropy: &[usize]) -> Vec<usize> {
 }
 
 /// Recompute both head-sets straight from the raw DAG structure, independent of
-/// `RoomCore` (P2's oracle). A *timeline* forward extremity is an event named in
-/// no event's `prev_events`; a *state* forward extremity is a state event named
-/// in no state event's `prev_state_events`. Only state events advance the state
-/// DAG — a message carries `prev_state_events` but never supersedes a state head
-/// — so message references are excluded from the state side. The "minus
-/// soft-failed" clause of the timeline rule is vacuous on the creator-only
-/// profile (nothing soft-fails), so it is not modelled here.
+/// `RoomCore` (P2's oracle). A *timeline* forward extremity is an accepted event
+/// named in no *accepted* event's `prev_events`; a *state* forward extremity is
+/// an accepted state event named in no *accepted state* event's
+/// `prev_state_events`. Only state events advance the state DAG — a message
+/// carries `prev_state_events` but never supersedes a state head — so message
+/// references are excluded from the state side.
+///
+/// Verdict-aware (mirrors `apply_pdu`'s head bookkeeping exactly): a `Rejected`
+/// event mutates no head-set, so it is neither a head nor does it drop its
+/// parents; a `SoftFailed` event (non-state only) is likewise neither a timeline
+/// head nor drops its `prev_events` parents (synapse#5269 — the parents stay
+/// extremities until a *non*-soft-failed successor references them). Only an
+/// `Accepted` event is head-eligible and removes the parents it names. On the
+/// creator-only profile every verdict is `Accepted`, so this reduces to the
+/// plain "FE = unreferenced event" rule.
 fn expected_heads(dag: &Dag) -> (BTreeSet<OwnedEventId>, BTreeSet<OwnedEventId>) {
     let mut referenced_timeline: HashSet<&str> = HashSet::new();
     let mut referenced_state: HashSet<&str> = HashSet::new();
     for e in &dag.events {
+        // Only an accepted event advances the head-sets, and only an advancing
+        // event drops the parents it references.
+        if classify(e) != Verdict::Accepted {
+            continue;
+        }
         for p in &e.prev_events {
             referenced_timeline.insert(p.as_str());
         }
@@ -1821,18 +1846,19 @@ fn expected_heads(dag: &Dag) -> (BTreeSet<OwnedEventId>, BTreeSet<OwnedEventId>)
             }
         }
     }
-    let timeline_fes = dag
-        .events
-        .iter()
-        .filter(|e| !referenced_timeline.contains(e.event_id.as_str()))
-        .map(|e| e.event_id.clone())
-        .collect();
-    let state_fes = dag
-        .events
-        .iter()
-        .filter(|e| e.state_key.is_some() && !referenced_state.contains(e.event_id.as_str()))
-        .map(|e| e.event_id.clone())
-        .collect();
+    let mut timeline_fes = BTreeSet::new();
+    let mut state_fes = BTreeSet::new();
+    for e in &dag.events {
+        if classify(e) != Verdict::Accepted {
+            continue;
+        }
+        if !referenced_timeline.contains(e.event_id.as_str()) {
+            timeline_fes.insert(e.event_id.clone());
+        }
+        if e.state_key.is_some() && !referenced_state.contains(e.event_id.as_str()) {
+            state_fes.insert(e.event_id.clone());
+        }
+    }
     (timeline_fes, state_fes)
 }
 
@@ -2015,4 +2041,893 @@ fn fork_merge_generator_coverage_corpus() {
         with_message >= floor(30),
         "messages only in {with_message}/{SAMPLE} DAGs — P5 divergence under-exercised"
     );
+}
+
+// ======================================================================
+// Phase 1: multi-user shadow-auth adversarial generator
+// ======================================================================
+//
+// Lifts the creator-only generator to a bounded user pool with real
+// membership / power-level transitions and deliberately unauthorised events,
+// so the DAGs now contain genuine rejects, soft-fails and power-level conflict
+// merges. The construction strategy (settled in PLAN.md) is to drive a *real*
+// `RoomCore` in build order during construction: heads are tracked from
+// reality (advance only on the real verdict, mirroring `apply_pdu`'s
+// drop-rejected-from-heads), the verdict of every event is recorded as it is
+// applied, and the output is still a pure replayable `Dag` (now carrying its
+// per-event `Verdict`s). The shadow model below is therefore only a *yield*
+// helper for intent selection — a wrong guess lowers the accepted-event yield
+// but never corrupts the DAG, because the verdict comes from `apply_pdu`, not
+// the shadow.
+//
+// NOTE on order-(in)dependence (relevant to the Phase 2 properties, recorded
+// here so the next session sees it): `reject` is order-independent (it is a
+// pure function of the event's `prev_state_events` ancestry), but `soft-fail`
+// is NOT — `apply_pdu` checks soft-fail against the room's *resolved*
+// `current_state` at apply time (room_core.rs:433), which depends on which
+// concurrent events have been applied. So `current_state` and the *state*
+// forward extremities are order-independent, but the *timeline* forward
+// extremities and soft-fail verdicts are not. Phase 2's order-independence
+// property must therefore assert order-invariance only over
+// {current_state, state_fes, reject-verdicts}, not over the timeline side.
+
+/// The user pool. Index 0 (alice) is the room creator — omnipotent under v12
+/// implicit power, and the sender of the create + initial join. The others
+/// start with no power (users_default 0) and must be invited / promoted to do
+/// anything privileged, which is exactly what drives the reject / soft-fail
+/// coverage.
+const ADV_POOL: [&str; 4] = [
+    "@alice:example.org",
+    "@bob:example.org",
+    "@carol:example.org",
+    "@dave:example.org",
+];
+const ADV_CREATOR: usize = 0;
+/// Fork-width cap (concurrent state heads) — keeps DAGs shallow so shrunk
+/// counterexamples stay readable and shadow desync stays bounded.
+const ADV_MAX_FORK_WIDTH: usize = 4;
+/// Soft cap on total events per DAG (checked per-op, so a compound op may
+/// overshoot slightly).
+const ADV_MAX_EVENTS: usize = 20;
+
+/// The verdict `apply_pdu` reaches on a persisted event.
+fn classify(event: &Event) -> Verdict {
+    if event.rejected {
+        Verdict::Rejected
+    } else if event.soft_failed {
+        Verdict::SoftFailed
+    } else {
+        Verdict::Accepted
+    }
+}
+
+/// The persisted event from one `apply_pdu` effect list (the last `Persist`
+/// wins, matching `apply_pdu`'s single-`Persist` contract; the `Arc` clone is
+/// cheap). `None` only on the idempotency short-circuit (empty effects) — every
+/// caller treats that as a failure. Borrows so `apply_dag` can still fold the
+/// `UpdateCurrentState` deltas from the same list. Shared by the build path
+/// (`AdvCtx::apply`) and both replay paths (`apply_dag` / `apply_adv_dag`).
+fn persist_effect(effects: &[Effect]) -> Option<Arc<Event>> {
+    effects.iter().rev().find_map(|effect| match effect {
+        Effect::Persist { event } => Some(event.clone()),
+        _ => None,
+    })
+}
+
+/// Auth-relevant projection of the resolved `current_state` — the shadow model.
+/// Coverage device only (see the module note): used to *realise* an intent into
+/// a concrete sender/target the model believes is valid (or, for the
+/// `Unauthorised` path, one it believes fails). Defaults mirror
+/// `auth_rules::PowerLevels::parse`.
+struct Shadow {
+    members: HashMap<String, String>,
+    pl_users: HashMap<String, i64>,
+    users_default: i64,
+    events_default: i64,
+    state_default: i64,
+    ban: i64,
+    kick: i64,
+    invite: i64,
+}
+
+impl Shadow {
+    fn from_state(state: &StateMap<Arc<Event>>) -> Self {
+        let mut shadow = Shadow {
+            members: HashMap::new(),
+            pl_users: HashMap::new(),
+            users_default: 0,
+            events_default: 0,
+            state_default: 50,
+            ban: 50,
+            kick: 50,
+            invite: 0,
+        };
+        for ((etype, sk), ev) in state.iter() {
+            let content: Value = serde_json::from_str(ev.content.get()).unwrap_or(Value::Null);
+            match etype.as_str() {
+                "m.room.member" => {
+                    if let Some(m) = content.get("membership").and_then(Value::as_str) {
+                        shadow.members.insert(sk.clone(), m.to_owned());
+                    }
+                }
+                "m.room.power_levels" => {
+                    if let Some(users) = content.get("users").and_then(Value::as_object) {
+                        for (u, v) in users {
+                            if let Some(n) = v.as_i64() {
+                                shadow.pl_users.insert(u.clone(), n);
+                            }
+                        }
+                    }
+                    let get = |key: &str, def: i64| {
+                        content.get(key).and_then(Value::as_i64).unwrap_or(def)
+                    };
+                    shadow.users_default = get("users_default", 0);
+                    shadow.events_default = get("events_default", 0);
+                    shadow.state_default = get("state_default", 50);
+                    shadow.ban = get("ban", 50);
+                    shadow.kick = get("kick", 50);
+                    shadow.invite = get("invite", 0);
+                }
+                _ => {}
+            }
+        }
+        shadow
+    }
+
+    /// Implicit-infinite for the creator (v12), else the user's explicit level
+    /// or `users_default`.
+    fn power(&self, user: &str) -> i64 {
+        if user == ADV_POOL[ADV_CREATOR] {
+            i64::MAX
+        } else {
+            self.pl_users
+                .get(user)
+                .copied()
+                .unwrap_or(self.users_default)
+        }
+    }
+
+    fn joined(&self, user: &str) -> bool {
+        self.members.get(user).map(String::as_str) == Some("join")
+    }
+
+    /// A joined user, biased by `seed`; falls back to the creator (always
+    /// joined after the initial self-join) so realisation never stalls.
+    fn pick_joined(&self, seed: usize) -> &'static str {
+        let joined: Vec<&'static str> = ADV_POOL
+            .iter()
+            .copied()
+            .filter(|u| self.joined(u))
+            .collect();
+        if joined.is_empty() {
+            ADV_POOL[ADV_CREATOR]
+        } else {
+            joined[seed % joined.len()]
+        }
+    }
+
+    /// The highest-power joined user (the creator if joined) — the actor most
+    /// likely to be authorised for a kick/ban.
+    fn strongest_joined(&self) -> &'static str {
+        ADV_POOL
+            .iter()
+            .copied()
+            .filter(|u| self.joined(u))
+            .max_by_key(|u| self.power(u))
+            .unwrap_or(ADV_POOL[ADV_CREATOR])
+    }
+
+    /// A full `m.room.power_levels` content equal to the current one with
+    /// `edits` applied to the `users` map. The creator is omnipotent regardless
+    /// of this map, so it always retains the authority to make the next edit.
+    fn pl_content(&self, edits: &[(&str, i64)]) -> Value {
+        let mut users = self.pl_users.clone();
+        for (target, level) in edits {
+            users.insert((*target).to_owned(), *level);
+        }
+        json!({
+            "users": users,
+            "users_default": self.users_default,
+            "events_default": self.events_default,
+            "state_default": self.state_default,
+            "ban": self.ban,
+            "kick": self.kick,
+            "invite": self.invite,
+        })
+    }
+}
+
+/// One state-event intent. The head-selection dimension (extend / fork / merge)
+/// is orthogonal and lives in `AdvOp`.
+#[derive(Debug, Clone)]
+enum StateIntent {
+    Join,
+    Invite,
+    Leave,
+    Kick,
+    Ban,
+    Unban,
+    Topic,
+    Name,
+    PlPromote,
+    PlDemote,
+}
+
+/// Realise an intent into `(sender, event_type, state_key, content)` using the
+/// shadow's view of who is joined / powerful. Never fails: a poorly-matched
+/// actor just yields a reject, which is wanted.
+fn realise(
+    intent: &StateIntent,
+    shadow: &Shadow,
+    a: usize,
+    b: usize,
+) -> (&'static str, &'static str, String, Value) {
+    let non_creator = ADV_POOL[1 + b % 3];
+    match intent {
+        StateIntent::Join => {
+            let u = ADV_POOL[a % 4];
+            (
+                u,
+                "m.room.member",
+                u.to_owned(),
+                json!({ "membership": "join" }),
+            )
+        }
+        StateIntent::Invite => {
+            let s = shadow.pick_joined(a);
+            (
+                s,
+                "m.room.member",
+                non_creator.to_owned(),
+                json!({ "membership": "invite" }),
+            )
+        }
+        StateIntent::Leave => {
+            let u = shadow.pick_joined(a);
+            (
+                u,
+                "m.room.member",
+                u.to_owned(),
+                json!({ "membership": "leave" }),
+            )
+        }
+        StateIntent::Kick => {
+            let s = shadow.strongest_joined();
+            (
+                s,
+                "m.room.member",
+                non_creator.to_owned(),
+                json!({ "membership": "leave" }),
+            )
+        }
+        StateIntent::Ban => {
+            let s = shadow.strongest_joined();
+            (
+                s,
+                "m.room.member",
+                non_creator.to_owned(),
+                json!({ "membership": "ban" }),
+            )
+        }
+        StateIntent::Unban => {
+            let s = shadow.strongest_joined();
+            (
+                s,
+                "m.room.member",
+                non_creator.to_owned(),
+                json!({ "membership": "leave" }),
+            )
+        }
+        StateIntent::Topic => {
+            let s = shadow.pick_joined(a);
+            (
+                s,
+                "m.room.topic",
+                String::new(),
+                json!({ "topic": format!("t{a}-{b}") }),
+            )
+        }
+        StateIntent::Name => {
+            let s = shadow.pick_joined(a);
+            (
+                s,
+                "m.room.name",
+                String::new(),
+                json!({ "name": format!("n{a}-{b}") }),
+            )
+        }
+        StateIntent::PlPromote => {
+            let level = 25 + (a as i64 % 3) * 25; // 25 / 50 / 75
+            (
+                ADV_POOL[ADV_CREATOR],
+                "m.room.power_levels",
+                String::new(),
+                shadow.pl_content(&[(non_creator, level)]),
+            )
+        }
+        StateIntent::PlDemote => (
+            ADV_POOL[ADV_CREATOR],
+            "m.room.power_levels",
+            String::new(),
+            shadow.pl_content(&[(non_creator, 0)]),
+        ),
+    }
+}
+
+fn adv_state_event(
+    room: &RoomId,
+    sender: &str,
+    event_type: &str,
+    state_key: &str,
+    content: Value,
+    ts: u64,
+    prev: Vec<OwnedEventId>,
+) -> Event {
+    EventBuilder::new(
+        sender.parse().expect("valid user id"),
+        event_type.to_owned(),
+    )
+    .room_id(room.to_owned())
+    .state_key(state_key.to_owned())
+    .content(content)
+    .prev_events(prev.clone())
+    .prev_state_events(prev)
+    .origin_server_ts(ts)
+    .build()
+    .expect("adversarial state event builds")
+}
+
+fn adv_message_event(
+    room: &RoomId,
+    sender: &str,
+    ts: u64,
+    timeline_prev: Vec<OwnedEventId>,
+    state_prev: Vec<OwnedEventId>,
+) -> Event {
+    EventBuilder::new(
+        sender.parse().expect("valid user id"),
+        "m.room.message".to_owned(),
+    )
+    .room_id(room.to_owned())
+    .content(json!({ "msgtype": "m.text", "body": format!("m{ts}") }))
+    .prev_events(timeline_prev)
+    .prev_state_events(state_prev)
+    .origin_server_ts(ts)
+    .build()
+    .expect("adversarial message builds")
+}
+
+/// A generator op. Head-selection (Extend / Fork / Merge / ConflictFork) is
+/// orthogonal to the state intent; `Cascade`, `Message`, `Unauthorised` and
+/// `StaleMessage` are self-contained shapes targeting specific coverage
+/// buckets.
+#[derive(Debug, Clone)]
+enum AdvOp {
+    /// One event on a single chosen state head.
+    Extend {
+        intent: StateIntent,
+        head: u8,
+        a: u8,
+        b: u8,
+    },
+    /// Two events on the *same* chosen head — widens the state DAG by one head
+    /// (degrades to a single Extend when already at the fork-width cap).
+    Fork {
+        intent: StateIntent,
+        head: u8,
+        a: u8,
+        b: u8,
+    },
+    /// One event referencing up to `ADV_MAX_FORK_WIDTH` live state heads.
+    Merge { intent: StateIntent, a: u8, b: u8 },
+    /// Two `m.room.power_levels` siblings off one head editing the *same* user
+    /// to different levels — a guaranteed power-level conflict that a later
+    /// `Merge` resolves via the mainline sort.
+    ConflictFork { a: u8 },
+    /// A state event whose `prev_state_events` names the most recent rejected
+    /// event, forcing a reference-rejection (rejection cascade). Falls back to
+    /// creating a fresh reject when none exists yet.
+    Cascade,
+    /// A deliberately unauthorised state event (a non-creator setting a name) —
+    /// usually rejected, since the sender starts at power 0 (below the
+    /// `state_default` of 50); it only slips through if an earlier `PlPromote`
+    /// happened to raise that user.
+    Unauthorised { a: u8, b: u8 },
+    /// A message on the current timeline heads (soft-fails if its sender is not
+    /// joined in the resolved current_state).
+    Message { a: u8 },
+    /// A scripted soft-fail: ensure a victim is joined, kick them, then have
+    /// them send a message whose `prev_state_events` are the pre-kick heads —
+    /// authorised against state-before-event but soft-failed against the
+    /// post-kick current_state.
+    StaleMessage { a: u8 },
+}
+
+fn state_intent() -> impl Strategy<Value = StateIntent> {
+    prop_oneof![
+        Just(StateIntent::Join),
+        Just(StateIntent::Invite),
+        Just(StateIntent::Leave),
+        Just(StateIntent::Kick),
+        Just(StateIntent::Ban),
+        Just(StateIntent::Unban),
+        Just(StateIntent::Topic),
+        Just(StateIntent::Name),
+        Just(StateIntent::PlPromote),
+        Just(StateIntent::PlDemote),
+    ]
+}
+
+fn adv_op() -> impl Strategy<Value = AdvOp> {
+    prop_oneof![
+        4 => (state_intent(), any::<u8>(), any::<u8>(), any::<u8>())
+            .prop_map(|(intent, head, a, b)| AdvOp::Extend { intent, head, a, b }),
+        3 => (state_intent(), any::<u8>(), any::<u8>(), any::<u8>())
+            .prop_map(|(intent, head, a, b)| AdvOp::Fork { intent, head, a, b }),
+        3 => (state_intent(), any::<u8>(), any::<u8>())
+            .prop_map(|(intent, a, b)| AdvOp::Merge { intent, a, b }),
+        2 => any::<u8>().prop_map(|a| AdvOp::ConflictFork { a }),
+        2 => Just(AdvOp::Cascade),
+        2 => (any::<u8>(), any::<u8>()).prop_map(|(a, b)| AdvOp::Unauthorised { a, b }),
+        2 => any::<u8>().prop_map(|a| AdvOp::Message { a }),
+        2 => any::<u8>().prop_map(|a| AdvOp::StaleMessage { a }),
+    ]
+}
+
+/// Construction state: a real `RoomCore` driven in build order, plus the
+/// accumulating event list and the most-recent reject (for the cascade
+/// primitive). Owns everything so `build_adv_dag` can move the parts straight
+/// into the `Dag`.
+struct AdvCtx {
+    room_id: OwnedRoomId,
+    room: RoomCore,
+    provider: InMemoryStateProvider,
+    events: Vec<Event>,
+    ts: u64,
+    last_rejected: Option<OwnedEventId>,
+}
+
+impl AdvCtx {
+    fn new(room_id: OwnedRoomId) -> Self {
+        AdvCtx {
+            room: RoomCore::new(room_id.clone()),
+            room_id,
+            provider: InMemoryStateProvider::new(),
+            events: Vec::new(),
+            ts: FORK_MERGE_TS_BASE,
+            last_rejected: None,
+        }
+    }
+
+    fn next_ts(&mut self) -> u64 {
+        self.ts += 1;
+        self.ts
+    }
+
+    fn state_heads(&self) -> Vec<OwnedEventId> {
+        self.room
+            .state_forward_extremities()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    fn timeline_heads(&self) -> Vec<OwnedEventId> {
+        self.room.forward_extremities().iter().cloned().collect()
+    }
+
+    fn shadow(&self) -> Shadow {
+        Shadow::from_state(self.room.current_state())
+    }
+
+    /// Apply one event through the real `RoomCore`, store the persisted form,
+    /// and track the most-recent reject. `apply_pdu` only errors on a
+    /// programming fault (room mismatch / missing ancestry) — impossible here,
+    /// since every reference is a head or a recorded reject already in the
+    /// provider — so an error is a generator bug and panics loudly.
+    fn apply(&mut self, event: Event) {
+        let id = event.event_id.clone();
+        let effects = self
+            .room
+            .apply_pdu(event, &self.provider)
+            .expect("adversarial build: apply_pdu must not error (ancestry always present)");
+        let persisted = persist_effect(&effects)
+            .expect("adversarial build: every applied event yields a Persist");
+        if classify(&persisted) == Verdict::Rejected {
+            self.last_rejected = Some(id);
+        }
+        self.events.push((*persisted).clone());
+        self.provider.insert(persisted);
+    }
+
+    fn emit_state(
+        &mut self,
+        sender: &str,
+        event_type: &str,
+        state_key: &str,
+        content: Value,
+        prev: Vec<OwnedEventId>,
+    ) {
+        let ts = self.next_ts();
+        let event = adv_state_event(
+            &self.room_id,
+            sender,
+            event_type,
+            state_key,
+            content,
+            ts,
+            prev,
+        );
+        self.apply(event);
+    }
+
+    fn emit_message(
+        &mut self,
+        sender: &str,
+        timeline_prev: Vec<OwnedEventId>,
+        state_prev: Vec<OwnedEventId>,
+    ) {
+        let ts = self.next_ts();
+        let event = adv_message_event(&self.room_id, sender, ts, timeline_prev, state_prev);
+        self.apply(event);
+    }
+
+    fn run_op(&mut self, op: AdvOp) {
+        let state_heads = self.state_heads();
+        if state_heads.is_empty() {
+            return; // unreachable: create + alice's join are always present
+        }
+        let shadow = self.shadow();
+        match op {
+            AdvOp::Extend { intent, head, a, b } => {
+                let prev = vec![state_heads[head as usize % state_heads.len()].clone()];
+                let (s, et, sk, c) = realise(&intent, &shadow, a as usize, b as usize);
+                self.emit_state(s, et, &sk, c, prev);
+            }
+            AdvOp::Fork { intent, head, a, b } => {
+                let tip = state_heads[head as usize % state_heads.len()].clone();
+                if state_heads.len() >= ADV_MAX_FORK_WIDTH {
+                    let (s, et, sk, c) = realise(&intent, &shadow, a as usize, b as usize);
+                    self.emit_state(s, et, &sk, c, vec![tip]);
+                } else {
+                    let (s1, et1, sk1, c1) = realise(&intent, &shadow, a as usize, b as usize);
+                    self.emit_state(s1, et1, &sk1, c1, vec![tip.clone()]);
+                    let (s2, et2, sk2, c2) =
+                        realise(&intent, &shadow, a as usize + 1, b as usize + 1);
+                    self.emit_state(s2, et2, &sk2, c2, vec![tip]);
+                }
+            }
+            AdvOp::Merge { intent, a, b } => {
+                let width = state_heads.len().min(ADV_MAX_FORK_WIDTH);
+                let prev = state_heads[..width].to_vec();
+                let (s, et, sk, c) = realise(&intent, &shadow, a as usize, b as usize);
+                self.emit_state(s, et, &sk, c, prev);
+            }
+            AdvOp::ConflictFork { a } => {
+                let target = ADV_POOL[1 + a as usize % 3];
+                let creator = ADV_POOL[ADV_CREATOR];
+                if state_heads.len() >= ADV_MAX_FORK_WIDTH {
+                    let c = shadow.pl_content(&[(target, 50)]);
+                    self.emit_state(
+                        creator,
+                        "m.room.power_levels",
+                        "",
+                        c,
+                        vec![state_heads[0].clone()],
+                    );
+                } else {
+                    let tip = state_heads[a as usize % state_heads.len()].clone();
+                    let c_lo = shadow.pl_content(&[(target, 30)]);
+                    self.emit_state(creator, "m.room.power_levels", "", c_lo, vec![tip.clone()]);
+                    let c_hi = shadow.pl_content(&[(target, 70)]);
+                    self.emit_state(creator, "m.room.power_levels", "", c_hi, vec![tip]);
+                }
+            }
+            AdvOp::Cascade => match self.last_rejected.clone() {
+                Some(rejected) => {
+                    let mut prev = state_heads;
+                    if !prev.contains(&rejected) {
+                        prev.push(rejected);
+                    }
+                    self.emit_state(
+                        ADV_POOL[ADV_CREATOR],
+                        "m.room.topic",
+                        "",
+                        json!({ "topic": "cascade" }),
+                        prev,
+                    );
+                }
+                None => {
+                    // No reject to chain off yet — manufacture one so a later
+                    // Cascade has a parent (a power-0 non-creator sets a name).
+                    self.emit_state(
+                        ADV_POOL[1],
+                        "m.room.name",
+                        "",
+                        json!({ "name": "unauth" }),
+                        vec![state_heads[0].clone()],
+                    );
+                }
+            },
+            AdvOp::Unauthorised { a, b } => {
+                let sender = ADV_POOL[1 + a as usize % 3];
+                let prev = vec![state_heads[b as usize % state_heads.len()].clone()];
+                self.emit_state(sender, "m.room.name", "", json!({ "name": "unauth" }), prev);
+            }
+            AdvOp::Message { a } => {
+                let sender = ADV_POOL[a as usize % 4];
+                self.emit_message(sender, self.timeline_heads(), state_heads);
+            }
+            AdvOp::StaleMessage { a } => {
+                let victim = ADV_POOL[1 + a as usize % 3];
+                let creator = ADV_POOL[ADV_CREATOR];
+                if !shadow.joined(victim) {
+                    self.emit_state(
+                        creator,
+                        "m.room.member",
+                        victim,
+                        json!({ "membership": "invite" }),
+                        self.state_heads(),
+                    );
+                    self.emit_state(
+                        victim,
+                        "m.room.member",
+                        victim,
+                        json!({ "membership": "join" }),
+                        self.state_heads(),
+                    );
+                }
+                // Pre-kick heads: the victim is joined in the state they resolve
+                // to. Capture before the kick advances the heads.
+                let pre_kick = self.state_heads();
+                self.emit_state(
+                    creator,
+                    "m.room.member",
+                    victim,
+                    json!({ "membership": "leave" }),
+                    pre_kick.clone(),
+                );
+                // The message is authorised against its (pre-kick) state-before
+                // but soft-failed against the post-kick current_state.
+                self.emit_message(victim, self.timeline_heads(), pre_kick);
+            }
+        }
+    }
+}
+
+/// Build an adversarial DAG from a recipe by driving a real `RoomCore` in build
+/// order. Always seeds the create + alice's self-join (both accepted), then
+/// runs the ops until the event cap. Returns a pure, replayable `Dag` whose
+/// stored events carry their persisted verdict flags.
+fn build_adv_dag(ops: Vec<AdvOp>) -> Dag {
+    let create = build_create();
+    let create_id = create.event_id.clone();
+    let room_id = room_id_from_create(&create.event_id);
+    let mut ctx = AdvCtx::new(room_id);
+    ctx.apply(create);
+    let join_ts = ctx.next_ts();
+    let join = build_join(&ctx.room_id, &create_id, join_ts);
+    ctx.apply(join);
+    for op in ops {
+        if ctx.events.len() >= ADV_MAX_EVENTS {
+            break;
+        }
+        ctx.run_op(op);
+    }
+    let AdvCtx {
+        room_id, events, ..
+    } = ctx;
+    Dag { room_id, events }
+}
+
+/// The order-sensitive result of applying an adversarial DAG: resolved state,
+/// both head-sets, and each event's *replay* verdict (indexed parallel to
+/// `dag.events`). The verdicts here are an independent re-measurement from a
+/// fresh `apply_pdu` pass — NOT derived from the stored `dag` events — which is
+/// what lets `adv_build_order_reproduces_verdicts_and_heads` check that replay
+/// reproduces the build-time verdicts rather than restating them.
+struct AdvOutcome {
+    current_state: StateMap<OwnedEventId>,
+    state_fes: BTreeSet<OwnedEventId>,
+    timeline_fes: BTreeSet<OwnedEventId>,
+    verdicts: Vec<Verdict>,
+}
+
+/// Apply `dag.events` in `order` to a fresh `RoomCore`, returning the resolved
+/// state, both head-sets, and each event's replay verdict (indexed parallel to
+/// `dag.events`). Unlike `apply_dag` this asserts nothing about acceptance —
+/// the adversarial DAG contains rejects and soft-fails by design.
+fn apply_adv_dag(dag: &Dag, order: &[usize]) -> Result<AdvOutcome, TestCaseError> {
+    let mut room = RoomCore::new(dag.room_id.clone());
+    let mut provider = InMemoryStateProvider::new();
+    let mut verdict_of: HashMap<&str, Verdict> = HashMap::new();
+    for &i in order {
+        let event = dag.events[i].clone();
+        let id = event.event_id.clone();
+        let effects = room
+            .apply_pdu(event, &provider)
+            .map_err(|e| TestCaseError::fail(format!("apply_pdu errored on {id}: {e}")))?;
+        let persisted = persist_effect(&effects)
+            .ok_or_else(|| TestCaseError::fail(format!("apply_pdu emitted no Persist for {id}")))?;
+        verdict_of.insert(dag.events[i].event_id.as_str(), classify(&persisted));
+        provider.insert(persisted);
+    }
+    let verdicts = dag
+        .events
+        .iter()
+        .map(|e| verdict_of[e.event_id.as_str()])
+        .collect();
+    let current_state: StateMap<OwnedEventId> = room
+        .current_state()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.event_id.clone()))
+        .collect();
+    Ok(AdvOutcome {
+        current_state,
+        state_fes: room.state_forward_extremities().clone(),
+        timeline_fes: room.forward_extremities().clone(),
+        verdicts,
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Phase 1 generator-soundness property: the verdicts recorded during
+    /// construction (a RoomCore in build order) must be exactly reproduced by
+    /// replaying the *persisted* events on a fresh RoomCore in the same order,
+    /// and the resulting head-sets must match the verdict-aware structural
+    /// oracle. This pins the generator + the verdict-aware `expected_heads`
+    /// end-to-end without yet asserting order-independence (Phase 2).
+    #[test]
+    fn adv_build_order_reproduces_verdicts_and_heads(
+        ops in prop::collection::vec(adv_op(), 1..16),
+    ) {
+        let dag = build_adv_dag(ops);
+        let build_order: Vec<usize> = (0..dag.events.len()).collect();
+        let replay = apply_adv_dag(&dag, &build_order)?;
+        // Build-time verdicts come from the stored persisted flags; the replay
+        // verdicts are an independent re-measurement — so this is a genuine
+        // reproduction check, not a restatement.
+        let build_verdicts: Vec<Verdict> = (0..dag.events.len()).map(|i| dag.verdict(i)).collect();
+        prop_assert_eq!(
+            &replay.verdicts,
+            &build_verdicts,
+            "replaying the DAG in build order produced different verdicts than construction"
+        );
+        let (expected_timeline, expected_state) = expected_heads(&dag);
+        prop_assert_eq!(
+            &replay.timeline_fes,
+            &expected_timeline,
+            "timeline forward extremities diverged from the verdict-aware oracle"
+        );
+        prop_assert_eq!(
+            &replay.state_fes,
+            &expected_state,
+            "state forward extremities diverged from the verdict-aware oracle"
+        );
+        // A rejected event never appears in the resolved current_state.
+        let rejected: HashSet<&str> = dag
+            .events
+            .iter()
+            .filter(|e| classify(e) == Verdict::Rejected)
+            .map(|e| e.event_id.as_str())
+            .collect();
+        for id in replay.current_state.values() {
+            prop_assert!(
+                !rejected.contains(id.as_str()),
+                "rejected event {id} leaked into current_state"
+            );
+        }
+    }
+}
+
+/// Coverage corpus for the adversarial generator — the multi-user analogue of
+/// `fork_merge_generator_coverage_corpus`. Asserts the four PLAN-listed shapes
+/// the creator-only profile could not reach now appear in a floor fraction of a
+/// deterministic sample, so the (future) rejection / soft-fail / conflict-merge
+/// properties cannot pass vacuously.
+#[test]
+fn adv_generator_coverage_corpus() {
+    const SAMPLE: usize = 2000;
+    let strat = prop::collection::vec(adv_op(), 1..16);
+    let mut runner = TestRunner::deterministic();
+
+    let (mut multihead, mut pl_conflict_merge, mut rejected_with_child, mut soft_failed_msg) =
+        (0usize, 0usize, 0usize, 0usize);
+    for _ in 0..SAMPLE {
+        let ops = strat
+            .new_tree(&mut runner)
+            .expect("strategy produces a value")
+            .current();
+        let dag = build_adv_dag(ops);
+        let idx_of: HashMap<&str, usize> = dag
+            .events
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.event_id.as_str(), i))
+            .collect();
+
+        let mut saw_multihead = false;
+        let mut saw_pl_conflict = false;
+        for e in &dag.events {
+            if e.state_key.is_none() {
+                continue;
+            }
+            let distinct: HashSet<&str> = e.prev_state_events.iter().map(|p| p.as_str()).collect();
+            if distinct.len() >= 3 {
+                saw_multihead = true;
+            }
+            // A merge resolving a power-level conflict: ≥2 of its parents are
+            // accepted m.room.power_levels events (the ConflictFork siblings).
+            if distinct.len() >= 2 {
+                let pl_parents = distinct
+                    .iter()
+                    .filter_map(|p| idx_of.get(*p))
+                    .filter(|&&i| {
+                        dag.events[i].event_type == "m.room.power_levels"
+                            && dag.verdict(i) == Verdict::Accepted
+                    })
+                    .count();
+                if pl_parents >= 2 {
+                    saw_pl_conflict = true;
+                }
+            }
+        }
+
+        let rejected_ids: HashSet<&str> = dag
+            .events
+            .iter()
+            .filter(|e| classify(e) == Verdict::Rejected)
+            .map(|e| e.event_id.as_str())
+            .collect();
+        let saw_rejected_child = dag.events.iter().any(|e| {
+            e.prev_state_events
+                .iter()
+                .any(|p| rejected_ids.contains(p.as_str()))
+        });
+        // Require the soft-failed event to be a message (non-state) — production
+        // only soft-fails non-state events, so this also documents the bucket.
+        let saw_soft_fail = dag
+            .events
+            .iter()
+            .any(|e| e.state_key.is_none() && classify(e) == Verdict::SoftFailed);
+
+        multihead += usize::from(saw_multihead);
+        pl_conflict_merge += usize::from(saw_pl_conflict);
+        rejected_with_child += usize::from(saw_rejected_child);
+        soft_failed_msg += usize::from(saw_soft_fail);
+    }
+
+    // Floors (deterministic sample → reproducible). Measured rates at authoring
+    // time were higher — multihead 31%, pl_conflict 29%, rejected_with_child
+    // 36%, soft_failed_msg 42% — and the floors sit at roughly half of those, so
+    // they catch disappearance and gross erosion (not fine drift).
+    let floor = |pct: usize| SAMPLE * pct / 100;
+    assert!(
+        multihead >= floor(15),
+        "multi-head (≥3-head) merges only in {multihead}/{SAMPLE} DAGs — coverage eroded"
+    );
+    assert!(
+        pl_conflict_merge >= floor(12),
+        "power-level conflict merges only in {pl_conflict_merge}/{SAMPLE} DAGs — coverage eroded"
+    );
+    assert!(
+        rejected_with_child >= floor(18),
+        "rejected-with-dependent-child only in {rejected_with_child}/{SAMPLE} DAGs — coverage eroded"
+    );
+    assert!(
+        soft_failed_msg >= floor(20),
+        "soft-failed messages only in {soft_failed_msg}/{SAMPLE} DAGs — coverage eroded"
+    );
+}
+
+/// Load-bearing invariant: the adversarial generator seeds the create + join
+/// via `build_create`/`build_join` (which use `FORK_MERGE_SENDER`) while
+/// `Shadow::power` treats `ADV_POOL[ADV_CREATOR]` as the omnipotent creator. If
+/// those two identities diverged, the seeded creator would not be the shadow's
+/// omnipotent user and the generator would mis-realise every intent.
+#[test]
+fn adv_creator_is_fork_merge_sender() {
+    assert_eq!(ADV_POOL[ADV_CREATOR], FORK_MERGE_SENDER);
 }
