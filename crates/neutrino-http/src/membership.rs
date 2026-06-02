@@ -204,6 +204,21 @@ pub(crate) async fn leave(
     }
 }
 
+/// `POST /join/{roomIdOrAlias}` — the global join endpoint most clients (and
+/// Complement's `MustJoinRoom`) use; it is the same operation as the room-scoped
+/// [`join`] under a different path, so it delegates straight to it. We resolve
+/// room *ids* only: an alias (`#…`) fails [`parse_room`] with 400, since alias
+/// resolution is unimplemented. The `server_name` query param is accepted and
+/// ignored (single-server, trusted mesh).
+pub(crate) async fn join_by_id_or_alias(
+    state: State<AppState>,
+    auth: AuthUser,
+    Path(room_id_or_alias): Path<String>,
+    body: Option<Json<Value>>,
+) -> axum::response::Response {
+    join(state, auth, Path(room_id_or_alias), body).await
+}
+
 /// Shared body for the target-from-body endpoints (`invite`/`kick`/`ban`):
 /// resolve the required `user_id` target, lift an optional `reason`, emit the
 /// member event, and return `{}` on success.

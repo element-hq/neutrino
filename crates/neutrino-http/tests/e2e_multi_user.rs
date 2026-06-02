@@ -270,6 +270,65 @@ async fn join_public_room_without_invite_succeeds() {
     );
 }
 
+/// The global `POST /_matrix/client/v3/join/{roomIdOrAlias}` endpoint (the one
+/// Complement's `MustJoinRoom` uses) joins by room id and echoes `{room_id}`,
+/// just like the room-scoped `/rooms/{id}/join`. The `server_name` query param
+/// is accepted and ignored (single-server).
+#[tokio::test]
+async fn global_join_by_room_id_succeeds() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (bob_id, bob_tok) = register(&app, "bob").await;
+
+    let (s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    let (s, body) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/join/{room_id}?server_name=example.org"),
+        Some(&bob_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["room_id"], room_id, "global join echoes the room id");
+    assert_eq!(
+        member_membership(&app, &room_id, &bob_id).await.as_deref(),
+        Some("join"),
+        "bob should be joined after the global-join call"
+    );
+}
+
+/// The global join endpoint resolves room ids only; a room *alias* (`#…`) is
+/// rejected with 400 `M_INVALID_PARAM` because alias resolution is unimplemented
+/// (documents the limitation so adding alias support is a deliberate change).
+#[tokio::test]
+async fn global_join_by_alias_is_rejected() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+
+    // `%23` is `#`, the alias sigil; axum percent-decodes it before the handler.
+    let (s, body) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/join/%23somealias:example.org",
+        Some(&alice_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], json!("M_INVALID_PARAM"), "{body}");
+}
+
 /// A joined user leaving themselves moves their membership to `leave`.
 #[tokio::test]
 async fn self_leave_sets_membership_to_leave() {
