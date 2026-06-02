@@ -52,16 +52,19 @@ use crate::{AuthError, Event, StateMap, StateResError};
 ///       The caller has also called `validate::validate_references` (room
 ///       exists, `prev_state_events` triad ok) — rule 2 references are
 ///       trusted here. `state` is the resolved state-before-event keyed by
-///       `(type, state_key)`, materialised by the caller (Phase 6 `apply`)
+///       `(type, state_key)`, materialised by the caller (`apply_pdu`)
 ///       by state-resolving over `event.prev_state_events` via the
 ///       `StateProvider`.
 /// Post: `Ok(())` means the event passes v12 authorization against `state`
 ///       and may be applied. `Err(AuthError::*)` names the specific rule
-///       that rejected — the event must not be applied. Pure function: no
-///       mutation, no I/O. Soft-fail handling (auth-vs-current-state) is
-///       the caller's concern — Phase 6 `apply` runs this function twice,
-///       once against state-before-event and once against the post-update
-///       current state.
+///       that rejected — the event must not be applied — or
+///       `AuthError::CreateUnavailable` if the room's create event could not
+///       be resolved at all. Reads `provider` only to resolve the create
+///       event when it is absent from `state` (v12 keeps create out of
+///       `auth_events`); no mutation. Soft-fail handling
+///       (auth-vs-current-state) is the caller's concern — `apply_pdu` runs
+///       this function twice, once against state-before-event and once
+///       against the post-update current state.
 pub fn check_auth_rules(
     event: &Event,
     state: &StateMap<Arc<Event>>,

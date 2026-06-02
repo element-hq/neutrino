@@ -328,6 +328,14 @@ pub enum AuthError {
 /// preconditions.
 #[derive(Debug, Error)]
 pub enum ReferenceError {
+    /// The event's `room_id` is not a well-formed v12 room id, so no create
+    /// event id can be derived from it. A property of the event itself, not
+    /// of the store: re-applying after backfill cannot change the outcome,
+    /// so this is a DROP (non-retryable, never persisted), distinct from
+    /// [`Self::UnknownRoom`] (create simply not fetched yet — retryable).
+    #[error("malformed room_id, cannot derive create event id: {0}")]
+    MalformedRoomId(OwnedRoomId),
+
     /// v12 rule 2: the event's `room_id` does not correspond to any known
     /// `m.room.create` event.
     #[error("room not known: no create event with id derived from {0}")]

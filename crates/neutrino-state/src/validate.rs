@@ -456,7 +456,7 @@ pub fn validate_references(
 
     // v12 rule 2.
     let derived_create_id = derive_create_event_id(&event.room_id)
-        .ok_or_else(|| ReferenceError::UnknownRoom(event.room_id.clone()))?;
+        .ok_or_else(|| ReferenceError::MalformedRoomId(event.room_id.clone()))?;
     let create = provider
         .get_event(&derived_create_id)?
         .ok_or_else(|| ReferenceError::UnknownRoom(event.room_id.clone()))?;

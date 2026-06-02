@@ -315,6 +315,14 @@ pub fn iterative_auth_checks(
 ) -> Result<StateMap<OwnedEventId>, StateResError> {
     let mut resolved = initial_state;
 
+    // The room's create event is the same for every event in this run (state-
+    // res is per-room) but v12 keeps create out of `auth_events`, so the auth
+    // map built below never carries it and each `AuthContext` would otherwise
+    // re-derive + re-fetch it. Resolve it once and seed it into every auth map;
+    // `AuthContext` still resolves create itself when this misses, so the seed
+    // is a pure optimisation, not a correctness dependency.
+    let mut create: Option<Arc<Event>> = None;
+
     for eid in sorted {
         let info = provider
             .get_event(eid)?
@@ -323,6 +331,12 @@ pub fn iterative_auth_checks(
             continue;
         }
         let event = info;
+
+        if create.is_none()
+            && let Some(create_id) = crate::validate::derive_create_event_id(&event.room_id)
+        {
+            create = provider.get_event(&create_id)?;
+        }
 
         let mut auth_map: StateMap<Arc<Event>> = HashMap::new();
         for aid in &event.auth_events {
@@ -355,6 +369,12 @@ pub fn iterative_auth_checks(
                     auth_map.insert(key, rs_info);
                 }
             }
+        }
+
+        if let Some(create) = &create {
+            auth_map
+                .entry(("m.room.create".to_owned(), String::new()))
+                .or_insert_with(|| create.clone());
         }
 
         if check_auth_rules(&event, &auth_map, provider).is_ok()
