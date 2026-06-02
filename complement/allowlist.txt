@@ -34,14 +34,13 @@ TestRoomCreationReportsEventsToMyself/parallel/Room_creation_reports_m.room.crea
 TestRoomCreationReportsEventsToMyself/parallel/Room_creation_reports_m.room.member_to_myself$
 
 # Membership flows unlocked by the global POST /v3/join/{roomIdOrAlias} endpoint
-# (2026-06-02) + the multi-user shim. Each is verified statically (read-back via
-# /members or /sync only — no GET /state, /event, /messages, or /filter) but was
-# NOT run locally: the authoring env has no docker/go, so CI is the empirical gate.
-# See VIABLE-TESTS.md. Trailing `$` anchors each name against prefix-siblings.
-TestCumulativeJoinLeaveJoinSync$
+# (2026-06-02) + the multi-user shim, confirmed against a Complement run. The
+# join/kick/ban entries needed three server fixes from that run (empty-body
+# extractor, kick non-member 403, trailing-slash empty state key). Two parked,
+# see VIABLE-TESTS.md: TestCumulativeJoinLeaveJoinSync (legacy /sync replay of a
+# stale since token → M_UNKNOWN_POS) and TestMembersLocal (its fixture sets
+# presence, an out-of-scope EDU). Trailing `$` anchors each name.
 TestGetRoomMembers$
-TestMembersLocal/Parallel/New_room_members_see_their_own_join_event$
-TestMembersLocal/Parallel/Existing_members_see_new_members'_join_events$
 TestRoomMembers/Parallel/POST_/rooms/:room_id/join_can_join_a_room$
 TestRoomMembers/Parallel/POST_/join/:room_id_can_join_a_room$
 TestRoomsInvite/Parallel/Can_invite_users_to_invite-only_rooms$
