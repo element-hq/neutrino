@@ -909,8 +909,8 @@ fn default_power_levels() -> Value {
 /// (`public` ⇒ `public_chat`, else `private_chat`). Only `public_chat` opens
 /// the room (`public`); `private_chat` / `trusted_private_chat` (and any
 /// unrecognised preset) stay invite-only. The `trusted_private_chat`
-/// invitee-power bump is not modelled — createRoom does not process the
-/// `invite` list.
+/// invitee-power bump is not modelled, though the `invite` list itself is
+/// honoured by [`build_initial_events`].
 fn join_rule_for(body: &Value) -> &'static str {
     let is_public = match body.pointer("/preset").and_then(Value::as_str) {
         Some(preset) => preset == "public_chat",

@@ -329,7 +329,7 @@ async fn self_leave_sets_membership_to_leave() {
 /// Read the current `m.room.member` membership of `user_id` in `room_id` via
 /// the unauthenticated `GET /members` endpoint.
 async fn member_membership(app: &axum::Router, room_id: &str, user_id: &str) -> Option<String> {
-    let (_s, members) = send(
+    let (s, members) = send(
         app,
         "GET",
         &format!("/_matrix/client/v3/rooms/{room_id}/members"),
@@ -337,6 +337,10 @@ async fn member_membership(app: &axum::Router, room_id: &str, user_id: &str) -> 
         &json!({}),
     )
     .await;
+    // A non-OK /members response means the read itself failed; surfacing that
+    // as `None` (no membership) would silently mask a broken endpoint and let
+    // membership assertions pass against a 404/500. Fail loudly instead.
+    assert_eq!(s, StatusCode::OK, "GET /members failed: {members}");
     members["chunk"].as_array()?.iter().find_map(|ev| {
         if ev["state_key"] == json!(user_id) {
             ev["content"]["membership"].as_str().map(str::to_owned)
@@ -597,4 +601,146 @@ async fn createroom_invite_list_invites_listed_users() {
             .unwrap_or(false),
         "bob should see the invited room in sync: {bob_sync}"
     );
+}
+
+/// `/leave` is a no-op success when the caller is not in the room. The spec
+/// only defines leaving from invite/join/knock; for a user who never joined,
+/// the auth rules would reject the self-leave event (rule 5.5.1), so the
+/// handler must short-circuit to 200 rather than surface a 403.
+#[tokio::test]
+async fn leave_when_not_in_room_succeeds() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (bob_id, bob_tok) = register(&app, "bob").await;
+
+    let (_s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    // Bob never joined; leaving still succeeds and writes no member event.
+    let (s, body) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+        Some(&bob_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(member_membership(&app, &room_id, &bob_id).await, None);
+}
+
+/// `/unban` on a user who is not currently banned is rejected with 400
+/// `M_BAD_STATE` and, crucially, does NOT mutate their membership. Without the
+/// precheck the handler would emit a bare `leave`, which the auth rules accept
+/// as a *kick* of a joined member — a destructive wrong action.
+#[tokio::test]
+async fn unban_non_banned_member_is_rejected_and_does_not_kick() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (bob_id, bob_tok) = register(&app, "bob").await;
+
+    let (_s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    let (s, _) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+        Some(&bob_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, body) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{room_id}/unban"),
+        Some(&alice_tok),
+        &json!({ "user_id": bob_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], json!("M_BAD_STATE"), "{body}");
+    // Bob is still joined — the unban must not have kicked him.
+    assert_eq!(
+        member_membership(&app, &room_id, &bob_id).await.as_deref(),
+        Some("join"),
+        "unban of a non-banned user must not change membership"
+    );
+}
+
+/// A `reason` supplied to `/unban` is copied onto the resulting member event,
+/// per the spec's optional `reason` parameter.
+#[tokio::test]
+async fn unban_propagates_reason() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (bob_id, bob_tok) = register(&app, "bob").await;
+
+    let (_s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    for (tok, path, body) in [
+        (&bob_tok, "join", json!({})),
+        (&alice_tok, "ban", json!({ "user_id": bob_id })),
+    ] {
+        let (s, b) = send(
+            &app,
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/{path}"),
+            Some(tok),
+            &body,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+    }
+
+    let (s, body) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{room_id}/unban"),
+        Some(&alice_tok),
+        &json!({ "user_id": bob_id, "reason": "appeal granted" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+
+    let (s, members) = send(
+        &app,
+        "GET",
+        &format!("/_matrix/client/v3/rooms/{room_id}/members"),
+        None,
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{members}");
+    let reason = members["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ev| ev["state_key"] == json!(bob_id))
+        .and_then(|ev| ev["content"]["reason"].as_str());
+    assert_eq!(reason, Some("appeal granted"), "{members}");
 }

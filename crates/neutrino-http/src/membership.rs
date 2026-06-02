@@ -10,50 +10,40 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use ruma::{OwnedRoomId, OwnedUserId};
+use neutrino_store::StateStore;
+use ruma::{OwnedUserId, RoomId, UserId};
 use serde_json::{Value, json};
 
 use crate::{AppState, AuthUser, error_response, lock_app, room_actor_response};
 
-/// Emit one `m.room.member` event through the room actor. `target` is the
-/// state_key (the user whose membership changes); `membership` is the
-/// resulting membership string; `reason`, when present, is copied into
-/// content. Returns `Ok(())` on accept, or a ready HTTP error response
-/// (400 for a bad room id, otherwise the actor's standard mapping).
-async fn change_membership(
-    state: &AppState,
-    sender: OwnedUserId,
-    room_id: &str,
-    target: &OwnedUserId,
-    membership: &str,
-    reason: Option<&str>,
-) -> Result<(), axum::response::Response> {
-    let registry = lock_app(state).room_registry.clone();
-    let room: OwnedRoomId = match room_id.parse() {
-        Ok(r) => r,
-        Err(e) => {
-            return Err(error_response(
+/// Parse a room id from a path segment, returning a ready 400 response when
+/// it is malformed.
+// A built HTTP `Response` is the deliberate error payload here (mirroring the
+// async helpers below); boxing every client-error response just to satisfy the
+// large-Err heuristic would add noise for no real benefit on a per-request path.
+#[allow(clippy::result_large_err)]
+fn parse_room(room_id: &str) -> Result<ruma::OwnedRoomId, axum::response::Response> {
+    room_id.parse().map_err(|e: ruma::IdParseError| {
+        error_response(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", &e.to_string())
+    })
+}
+
+/// Lift the required `user_id` target out of a request body, returning a ready
+/// 400 response when it is missing or malformed.
+#[allow(clippy::result_large_err)] // see `parse_room`
+fn body_target(body: Option<&Value>) -> Result<OwnedUserId, axum::response::Response> {
+    let raw = body
+        .and_then(|b| b.pointer("/user_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            error_response(
                 StatusCode::BAD_REQUEST,
-                "M_INVALID_PARAM",
-                &e.to_string(),
-            ));
-        }
-    };
-    let mut content = json!({ "membership": membership });
-    if let Some(r) = reason {
-        content["reason"] = json!(r);
-    }
-    registry
-        .send_event(
-            &room,
-            sender,
-            "m.room.member".to_owned(),
-            Some(target.to_string()),
-            content,
-        )
-        .await
-        .map(|_| ())
-        .map_err(room_actor_response)
+                "M_MISSING_PARAM",
+                "Missing required parameter: user_id",
+            )
+        })?;
+    OwnedUserId::try_from(raw)
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", &e.to_string()))
 }
 
 /// Lift an optional `reason` string from the request body.
@@ -62,6 +52,63 @@ fn body_reason(body: Option<&Value>) -> Option<String> {
         .pointer("/reason")
         .and_then(Value::as_str)
         .map(str::to_owned)
+}
+
+/// The current `content.membership` of `target` in `room`, or `None` when the
+/// user has no member event. Maps a storage failure to a ready 500 response.
+async fn current_membership(
+    state: &AppState,
+    room: &RoomId,
+    target: &UserId,
+) -> Result<Option<String>, axum::response::Response> {
+    let store = lock_app(state).store.clone();
+    let event = store
+        .current_state_event(room, "m.room.member", target.as_str())
+        .await
+        .map_err(|e| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            )
+        })?;
+    Ok(event
+        .and_then(|e| serde_json::from_str::<Value>(e.raw.get()).ok())
+        .and_then(|v| {
+            v.pointer("/content/membership")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }))
+}
+
+/// Emit one `m.room.member` event through the room actor. `target` is the
+/// state_key (the user whose membership changes); `membership` is the
+/// resulting membership string; `reason`, when present, is copied into
+/// content. Returns `Ok(())` on accept, or the actor's standard error response.
+async fn change_membership(
+    state: &AppState,
+    sender: OwnedUserId,
+    room: &RoomId,
+    target: &UserId,
+    membership: &str,
+    reason: Option<&str>,
+) -> Result<(), axum::response::Response> {
+    let registry = lock_app(state).room_registry.clone();
+    let mut content = json!({ "membership": membership });
+    if let Some(r) = reason {
+        content["reason"] = json!(r);
+    }
+    registry
+        .send_event(
+            room,
+            sender,
+            "m.room.member".to_owned(),
+            Some(target.to_string()),
+            content,
+        )
+        .await
+        .map(|_| ())
+        .map_err(room_actor_response)
 }
 
 /// `POST /rooms/{roomId}/join` — the caller joins the room. Returns the room
@@ -74,22 +121,30 @@ pub(crate) async fn join(
 ) -> axum::response::Response {
     let body = body.as_ref().map(|j| &j.0);
     let reason = body_reason(body);
+    let room = match parse_room(&room_id) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     match change_membership(
         &state.0,
         sender.clone(),
-        &room_id,
+        &room,
         &sender,
         "join",
         reason.as_deref(),
     )
     .await
     {
-        Ok(()) => (StatusCode::OK, Json(json!({ "room_id": room_id }))).into_response(),
+        Ok(()) => (StatusCode::OK, Json(json!({ "room_id": room }))).into_response(),
         Err(resp) => resp,
     }
 }
 
-/// `POST /rooms/{roomId}/leave` — the caller leaves the room.
+/// `POST /rooms/{roomId}/leave` — the caller leaves the room. Leaving is only
+/// defined from `invite`/`join`/`knock`; from any other state (never joined,
+/// already left, banned) the spec treats the call as a no-op success, so the
+/// handler short-circuits rather than emit an event the auth rules would
+/// reject as an invalid self-leave (rule 5.5.1 → 403).
 pub(crate) async fn leave(
     state: State<AppState>,
     AuthUser(sender): AuthUser,
@@ -98,10 +153,19 @@ pub(crate) async fn leave(
 ) -> axum::response::Response {
     let body = body.as_ref().map(|j| &j.0);
     let reason = body_reason(body);
+    let room = match parse_room(&room_id) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    match current_membership(&state.0, &room, &sender).await {
+        Ok(Some(m)) if matches!(m.as_str(), "invite" | "join" | "knock") => {}
+        Ok(_) => return (StatusCode::OK, Json(json!({}))).into_response(),
+        Err(resp) => return resp,
+    }
     match change_membership(
         &state.0,
         sender.clone(),
-        &room_id,
+        &room,
         &sender,
         "leave",
         reason.as_deref(),
@@ -113,47 +177,26 @@ pub(crate) async fn leave(
     }
 }
 
-/// Shared body for the target-from-body endpoints (`invite`/`kick`/`ban`/
-/// `unban`): resolve the required `user_id` target, optionally lift `reason`,
-/// emit the member event, and return `{}` on success.
+/// Shared body for the target-from-body endpoints (`invite`/`kick`/`ban`):
+/// resolve the required `user_id` target, lift an optional `reason`, emit the
+/// member event, and return `{}` on success.
 async fn targeted(
     state: &AppState,
     sender: OwnedUserId,
     room_id: &str,
     body: Option<&Value>,
     membership: &str,
-    with_reason: bool,
 ) -> axum::response::Response {
-    let raw = match body
-        .and_then(|b| b.pointer("/user_id"))
-        .and_then(Value::as_str)
-    {
-        Some(s) => s,
-        None => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "M_MISSING_PARAM",
-                "Missing required parameter: user_id",
-            );
-        }
+    let target = match body_target(body) {
+        Ok(t) => t,
+        Err(resp) => return resp,
     };
-    let target = match OwnedUserId::try_from(raw) {
-        Ok(u) => u,
-        Err(e) => {
-            return error_response(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", &e.to_string());
-        }
+    let room = match parse_room(room_id) {
+        Ok(r) => r,
+        Err(resp) => return resp,
     };
-    let reason = if with_reason { body_reason(body) } else { None };
-    match change_membership(
-        state,
-        sender,
-        room_id,
-        &target,
-        membership,
-        reason.as_deref(),
-    )
-    .await
-    {
+    let reason = body_reason(body);
+    match change_membership(state, sender, &room, &target, membership, reason.as_deref()).await {
         Ok(()) => (StatusCode::OK, Json(json!({}))).into_response(),
         Err(resp) => resp,
     }
@@ -172,7 +215,6 @@ pub(crate) async fn invite(
         &room_id,
         body.as_ref().map(|j| &j.0),
         "invite",
-        true,
     )
     .await
 }
@@ -190,7 +232,6 @@ pub(crate) async fn kick(
         &room_id,
         body.as_ref().map(|j| &j.0),
         "leave",
-        true,
     )
     .await
 }
@@ -208,28 +249,46 @@ pub(crate) async fn ban(
         &room_id,
         body.as_ref().map(|j| &j.0),
         "ban",
-        true,
     )
     .await
 }
 
 /// `POST /rooms/{roomId}/unban` — lift a ban on `body.user_id` (membership
-/// returns to `leave`). The unban-vs-kick auth arm (rule 5.5.3 vs 5.5.4) is
-/// selected by `RoomCore` from the target's current membership, so this emits
-/// the same `leave` membership as `kick`.
+/// returns to `leave`). Unban is defined purely as removing a ban, so the
+/// target must currently be `ban`: emitting a bare `leave` against a joined
+/// user would otherwise be accepted by the auth rules as a *kick* (the
+/// kick-vs-unban arm of rule 5.5 is selected from the target's current
+/// membership). We pre-check and reject the non-ban case with 400
+/// `M_BAD_STATE` rather than silently kick.
 pub(crate) async fn unban(
     state: State<AppState>,
     AuthUser(sender): AuthUser,
     Path(room_id): Path<String>,
     body: Option<Json<Value>>,
 ) -> axum::response::Response {
-    targeted(
-        &state.0,
-        sender,
-        &room_id,
-        body.as_ref().map(|j| &j.0),
-        "leave",
-        false,
-    )
-    .await
+    let body = body.as_ref().map(|j| &j.0);
+    let target = match body_target(body) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    let room = match parse_room(&room_id) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    match current_membership(&state.0, &room, &target).await {
+        Ok(Some(m)) if m == "ban" => {}
+        Ok(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "M_BAD_STATE",
+                "Cannot unban a user who is not banned",
+            );
+        }
+        Err(resp) => return resp,
+    }
+    let reason = body_reason(body);
+    match change_membership(&state.0, sender, &room, &target, "leave", reason.as_deref()).await {
+        Ok(()) => (StatusCode::OK, Json(json!({}))).into_response(),
+        Err(resp) => resp,
+    }
 }
