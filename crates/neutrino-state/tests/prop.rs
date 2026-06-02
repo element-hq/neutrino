@@ -18,7 +18,7 @@
 //! `#[test]` that loops over `REQUIRED_FIELDS` — sweeping a fixed array
 //! doesn't need proptest entropy.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use neutrino_common::ROOM_VERSION_ID;
@@ -27,6 +27,7 @@ use neutrino_state::auth_events::{auth_event_keys, calculate_auth_events};
 use neutrino_state::auth_rules::check_auth_rules;
 use neutrino_state::event_id::EventBuilder;
 use neutrino_state::provider::{InMemoryStateProvider, StateProvider};
+use neutrino_state::room_core::{Effect, RoomCore};
 use neutrino_state::state_res::{
     auth_chain_difference, conflicted_subgraph, iterative_auth_checks, power_of_sender,
     resolve_state, reverse_topological_power_sort, separate,
@@ -34,7 +35,9 @@ use neutrino_state::state_res::{
 use neutrino_state::validate::parse_event;
 use neutrino_state::{Event, FormatError, StateMap};
 use proptest::prelude::*;
-use ruma::{OwnedEventId, OwnedUserId, RoomId, room_id};
+use proptest::strategy::ValueTree;
+use proptest::test_runner::{TestCaseError, TestRunner};
+use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, room_id};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
@@ -1397,4 +1400,619 @@ proptest! {
             "resolved create id {picked} not among input candidates"
         );
     }
+}
+
+// ---------- RoomCore state-DAG forks & merges: "every event accepted" ----------
+//
+// A *structural* generator for state-DAG forks and merges driven through
+// `RoomCore::apply_pdu`. Alice is the sole sender and the room creator, so she
+// holds implicit maximum power (v12 rule 10.4): every state event (topic) and
+// message event she authors passes auth, and state events are never
+// soft-failed. The oracle is therefore trivial — `apply_pdu` must *accept*
+// every generated event (none `rejected`, none `soft_failed`). Any rejection
+// is unambiguously a generator flaw (broken `prev_events` / `prev_state_events`
+// linkage, a topological-order violation, a timestamp collision yielding a
+// duplicate event_id, or head-set mistracking) rather than an auth-engine
+// verdict — exactly what we want to surface first, before the auth-aware
+// generator (which needs a faithful shadow model) is layered on top.
+//
+// The generator tracks the two head-sets the same way `apply_pdu` does —
+// accepting an event E updates a head-set as `(heads \ E.prevs) ∪ {E}`. A fork
+// is two events naming the same parent in `prev_state_events`; a merge is one
+// event naming two parents. Timestamps are a pure function of build order
+// (`base + counter`) so event_ids are distinct and reproducible, and every
+// event is built exactly once. Construction is split from application
+// (`build_dag` → `apply_dag`) so the same DAG can be replayed in many
+// topological orders; build order is one such order, by construction.
+//
+// Two properties run over the generated DAGs: every event is accepted (the
+// structural-generator oracle), and the result is independent of application
+// order (`apply_dag` in random topological orders converges on the same
+// resolved state and head-sets — `state_at_heads` is a pure function of the DAG
+// and the final head-sets are "events unreferenced by any applied event").
+
+const FORK_MERGE_SENDER: &str = "@alice:example.org";
+const FORK_MERGE_TS_BASE: u64 = 1_700_000_000_000;
+
+/// One generator step. `Extend`/`Fork` carry a head selector applied modulo the
+/// live state-head count; `Merge` collapses *all* live state heads into one
+/// event (falling back to a linear extend when fewer than two exist), so a merge
+/// off ≥3 concurrent heads produces a genuine multi-head merge.
+#[derive(Debug, Clone)]
+enum DagOp {
+    Extend(usize),
+    Fork(usize),
+    Merge,
+    Message,
+}
+
+fn dag_op() -> impl Strategy<Value = DagOp> {
+    prop_oneof![
+        3 => any::<u8>().prop_map(|i| DagOp::Extend(i as usize)),
+        3 => any::<u8>().prop_map(|i| DagOp::Fork(i as usize)),
+        3 => Just(DagOp::Merge),
+        2 => Just(DagOp::Message),
+    ]
+}
+
+/// `(heads \ remove) ∪ {add}`, preserving order and avoiding duplicates —
+/// mirrors the head-set update `apply_pdu` performs on acceptance.
+fn heads_after(
+    heads: &[OwnedEventId],
+    remove: &[OwnedEventId],
+    add: &OwnedEventId,
+) -> Vec<OwnedEventId> {
+    let mut out: Vec<OwnedEventId> = heads
+        .iter()
+        .filter(|h| !remove.contains(h))
+        .cloned()
+        .collect();
+    if !out.contains(add) {
+        out.push(add.clone());
+    }
+    out
+}
+
+fn build_create() -> Event {
+    EventBuilder::new(
+        FORK_MERGE_SENDER.parse().expect("user"),
+        "m.room.create".to_owned(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .origin_server_ts(FORK_MERGE_TS_BASE)
+    .build()
+    .expect("create builds")
+}
+
+/// Alice's self-join, rule-5.3.1 shape: `prev_events == prev_state_events ==
+/// [create_id]`. `auth_events` is left for `apply_pdu` to compute.
+fn build_join(room: &RoomId, create_id: &OwnedEventId, ts: u64) -> Event {
+    EventBuilder::new(
+        FORK_MERGE_SENDER.parse().expect("user"),
+        "m.room.member".to_owned(),
+    )
+    .room_id(room.to_owned())
+    .state_key(FORK_MERGE_SENDER.to_owned())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create_id.clone()])
+    .prev_state_events(vec![create_id.clone()])
+    .origin_server_ts(ts)
+    .build()
+    .expect("join builds")
+}
+
+/// A topic state event on the given state heads (used for both `prev_events`
+/// and `prev_state_events` so the timeline DAG mirrors the state DAG through
+/// state events). `topic` content is redaction-stripped, so distinct ids rely
+/// on the monotonic `ts`.
+fn build_topic(room: &RoomId, ts: u64, prev: Vec<OwnedEventId>) -> Event {
+    EventBuilder::new(
+        FORK_MERGE_SENDER.parse().expect("user"),
+        "m.room.topic".to_owned(),
+    )
+    .room_id(room.to_owned())
+    .state_key(String::new())
+    .content(json!({ "topic": format!("t{ts}") }))
+    .prev_events(prev.clone())
+    .prev_state_events(prev)
+    .origin_server_ts(ts)
+    .build()
+    .expect("topic builds")
+}
+
+/// A message on the current timeline heads. Carries the state heads in
+/// `prev_state_events` so state-before-event resolves to the live state and
+/// the soft-fail check passes (alice is joined).
+fn build_message(
+    room: &RoomId,
+    ts: u64,
+    timeline_heads: Vec<OwnedEventId>,
+    state_heads: Vec<OwnedEventId>,
+) -> Event {
+    EventBuilder::new(
+        FORK_MERGE_SENDER.parse().expect("user"),
+        "m.room.message".to_owned(),
+    )
+    .room_id(room.to_owned())
+    .content(json!({ "msgtype": "m.text", "body": format!("m{ts}") }))
+    .prev_events(timeline_heads)
+    .prev_state_events(state_heads)
+    .origin_server_ts(ts)
+    .build()
+    .expect("message builds")
+}
+
+/// A built DAG: the room id and the events in build order (which is itself a
+/// valid topological order over `prev_events ∪ prev_state_events`).
+struct Dag {
+    room_id: OwnedRoomId,
+    events: Vec<Event>,
+}
+
+/// Builds a creator-only fork/merge DAG from a recipe — purely, with no
+/// `RoomCore`. Tracks the two head-sets via `heads_after` so each event lands
+/// on the right parents; `apply_pdu`'s head bookkeeping is mirrored here, not
+/// consulted. Separating construction from application is what lets the same
+/// DAG be replayed in many orders.
+struct DagBuilder {
+    room_id: OwnedRoomId,
+    state_heads: Vec<OwnedEventId>,
+    timeline_heads: Vec<OwnedEventId>,
+    ts: u64,
+    events: Vec<Event>,
+}
+
+impl DagBuilder {
+    fn new() -> Self {
+        let create = build_create();
+        let room_id = room_id_from_create(&create.event_id);
+        let create_id = create.event_id.clone();
+        let mut builder = DagBuilder {
+            room_id,
+            state_heads: Vec::new(),
+            timeline_heads: Vec::new(),
+            ts: FORK_MERGE_TS_BASE,
+            events: vec![create],
+        };
+        let join_ts = builder.next_ts();
+        let join = build_join(&builder.room_id, &create_id, join_ts);
+        let join_id = join.event_id.clone();
+        builder.events.push(join);
+        builder.state_heads = vec![join_id.clone()];
+        builder.timeline_heads = vec![join_id];
+        builder
+    }
+
+    fn next_ts(&mut self) -> u64 {
+        self.ts += 1;
+        self.ts
+    }
+
+    /// Append a topic state event on `prev` (a subset of the state heads) and
+    /// advance both head-sets exactly as `apply_pdu` does for an accepted state
+    /// event.
+    fn push_state_event(&mut self, prev: Vec<OwnedEventId>) {
+        let ts = self.next_ts();
+        let event = build_topic(&self.room_id, ts, prev.clone());
+        let id = event.event_id.clone();
+        self.events.push(event);
+        self.state_heads = heads_after(&self.state_heads, &prev, &id);
+        self.timeline_heads = heads_after(&self.timeline_heads, &prev, &id);
+    }
+
+    fn run_op(&mut self, op: DagOp) {
+        let len = self.state_heads.len();
+        match op {
+            DagOp::Extend(i) => {
+                let tip = self.state_heads[i % len].clone();
+                self.push_state_event(vec![tip]);
+            }
+            DagOp::Fork(i) => {
+                let tip = self.state_heads[i % len].clone();
+                self.push_state_event(vec![tip.clone()]);
+                self.push_state_event(vec![tip]);
+            }
+            DagOp::Merge => {
+                if len >= 2 {
+                    // Merge every live state head, so a merge off ≥3 concurrent
+                    // heads is a genuine multi-head merge (≥3 prev_state_events).
+                    let heads = self.state_heads.clone();
+                    self.push_state_event(heads);
+                } else {
+                    let tip = self.state_heads[0].clone();
+                    self.push_state_event(vec![tip]);
+                }
+            }
+            DagOp::Message => {
+                let ts = self.next_ts();
+                let event = build_message(
+                    &self.room_id,
+                    ts,
+                    self.timeline_heads.clone(),
+                    self.state_heads.clone(),
+                );
+                let id = event.event_id.clone();
+                self.events.push(event);
+                // A message advances only the timeline DAG, and references every
+                // timeline head, so that head-set collapses to just the message.
+                let prev = self.timeline_heads.clone();
+                self.timeline_heads = heads_after(&self.timeline_heads, &prev, &id);
+            }
+        }
+    }
+
+    fn finish(self) -> Dag {
+        let DagBuilder {
+            room_id,
+            state_heads,
+            timeline_heads,
+            events,
+            ..
+        } = self;
+        let dag = Dag { room_id, events };
+        // Cross-check the builder's own running head bookkeeping (`heads_after`,
+        // used only to pick parents) against the structural oracle. Without this
+        // a `heads_after` bug would silently emit a different-but-valid DAG that
+        // both RoomCore and `expected_heads` still agree on, masking it — there
+        // are three implementations of the FE rule and P2 alone only cross-checks
+        // two of them.
+        let (expected_timeline, expected_state) = expected_heads(&dag);
+        let builder_timeline: BTreeSet<OwnedEventId> = timeline_heads.into_iter().collect();
+        let builder_state: BTreeSet<OwnedEventId> = state_heads.into_iter().collect();
+        assert_eq!(
+            builder_timeline, expected_timeline,
+            "DagBuilder timeline heads diverged from the raw-DAG oracle"
+        );
+        assert_eq!(
+            builder_state, expected_state,
+            "DagBuilder state heads diverged from the raw-DAG oracle"
+        );
+        dag
+    }
+}
+
+fn build_dag(ops: Vec<DagOp>) -> Dag {
+    let mut builder = DagBuilder::new();
+    for op in ops {
+        builder.run_op(op);
+    }
+    builder.finish()
+}
+
+/// The order-invariant result of applying a DAG: the resolved state and both
+/// head-sets. These are pure functions of the DAG, so any difference across
+/// application orders is a bug.
+#[derive(Debug, PartialEq, Eq)]
+struct Outcome {
+    current_state: StateMap<OwnedEventId>,
+    state_fes: BTreeSet<OwnedEventId>,
+    timeline_fes: BTreeSet<OwnedEventId>,
+}
+
+/// Apply `dag.events` in `order` to a fresh `RoomCore`, asserting every event
+/// is accepted (not rejected, not soft-failed) and that the folded
+/// `UpdateCurrentState` deltas reconstruct the resolved current_state. Inserts
+/// the accepted (auth_events-stamped) form into the provider so later
+/// `auth_chain` walks resolve. Returns the resolved state and both head-sets.
+fn apply_dag(dag: &Dag, order: &[usize]) -> Result<Outcome, TestCaseError> {
+    let mut room = RoomCore::new(dag.room_id.clone());
+    let mut provider = InMemoryStateProvider::new();
+    let mut accumulated: StateMap<OwnedEventId> = StateMap::new();
+    for &i in order {
+        let event = dag.events[i].clone();
+        let id = event.event_id.clone();
+        let effects = room.apply_pdu(event, &provider).map_err(|e| {
+            TestCaseError::fail(format!("apply_pdu errored on {id} (broken ancestry?): {e}"))
+        })?;
+        let mut persisted = None;
+        for effect in effects {
+            match effect {
+                Effect::Persist { event } => persisted = Some(event),
+                Effect::UpdateCurrentState(delta) => {
+                    for (key, value) in delta {
+                        match value {
+                            Some(eid) => {
+                                accumulated.insert(key, eid);
+                            }
+                            None => {
+                                accumulated.remove(&key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let persisted = persisted.ok_or_else(|| {
+            TestCaseError::fail(format!("apply_pdu emitted no Persist effect for {id}"))
+        })?;
+        prop_assert!(
+            !persisted.rejected,
+            "creator-authored event {id} was rejected — generator flaw"
+        );
+        prop_assert!(
+            !persisted.soft_failed,
+            "creator-authored event {id} was soft-failed — generator flaw"
+        );
+        provider.insert(persisted);
+    }
+    let current_state: StateMap<OwnedEventId> = room
+        .current_state()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.event_id.clone()))
+        .collect();
+    prop_assert_eq!(
+        &accumulated,
+        &current_state,
+        "accumulated UpdateCurrentState deltas diverged from the resolved current_state"
+    );
+    Ok(Outcome {
+        current_state,
+        state_fes: room.state_forward_extremities().clone(),
+        timeline_fes: room.forward_extremities().clone(),
+    })
+}
+
+/// A random topological order of the DAG over `prev_events ∪ prev_state_events`
+/// edges — every parent emitted before its child. Both edge kinds matter: if a
+/// child were applied before a parent, `apply_pdu`'s head removal (`heads \
+/// prevs`) would miss that parent and the final head-sets would diverge. Kahn's
+/// algorithm with the ready-set pick driven by `entropy` (cycled if short).
+fn random_topo_order(dag: &Dag, entropy: &[usize]) -> Vec<usize> {
+    let n = dag.events.len();
+    let mut index_of: HashMap<&str, usize> = HashMap::with_capacity(n);
+    for (i, e) in dag.events.iter().enumerate() {
+        index_of.insert(e.event_id.as_str(), i);
+    }
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut indegree = vec![0usize; n];
+    for (i, e) in dag.events.iter().enumerate() {
+        let mut parents: HashSet<usize> = HashSet::new();
+        for p in e.prev_events.iter().chain(e.prev_state_events.iter()) {
+            if let Some(&j) = index_of.get(p.as_str()) {
+                parents.insert(j);
+            }
+        }
+        indegree[i] = parents.len();
+        for j in parents {
+            children[j].push(i);
+        }
+    }
+    let mut ready: Vec<usize> = (0..n).filter(|&i| indegree[i] == 0).collect();
+    let mut order = Vec::with_capacity(n);
+    let mut step = 0usize;
+    while !ready.is_empty() {
+        let pick = if entropy.is_empty() {
+            0
+        } else {
+            entropy[step % entropy.len()] % ready.len()
+        };
+        let node = ready.swap_remove(pick);
+        order.push(node);
+        step += 1;
+        for &c in &children[node] {
+            indegree[c] -= 1;
+            if indegree[c] == 0 {
+                ready.push(c);
+            }
+        }
+    }
+    order
+}
+
+/// Recompute both head-sets straight from the raw DAG structure, independent of
+/// `RoomCore` (P2's oracle). A *timeline* forward extremity is an event named in
+/// no event's `prev_events`; a *state* forward extremity is a state event named
+/// in no state event's `prev_state_events`. Only state events advance the state
+/// DAG — a message carries `prev_state_events` but never supersedes a state head
+/// — so message references are excluded from the state side. The "minus
+/// soft-failed" clause of the timeline rule is vacuous on the creator-only
+/// profile (nothing soft-fails), so it is not modelled here.
+fn expected_heads(dag: &Dag) -> (BTreeSet<OwnedEventId>, BTreeSet<OwnedEventId>) {
+    let mut referenced_timeline: HashSet<&str> = HashSet::new();
+    let mut referenced_state: HashSet<&str> = HashSet::new();
+    for e in &dag.events {
+        for p in &e.prev_events {
+            referenced_timeline.insert(p.as_str());
+        }
+        if e.state_key.is_some() {
+            for p in &e.prev_state_events {
+                referenced_state.insert(p.as_str());
+            }
+        }
+    }
+    let timeline_fes = dag
+        .events
+        .iter()
+        .filter(|e| !referenced_timeline.contains(e.event_id.as_str()))
+        .map(|e| e.event_id.clone())
+        .collect();
+    let state_fes = dag
+        .events
+        .iter()
+        .filter(|e| e.state_key.is_some() && !referenced_state.contains(e.event_id.as_str()))
+        .map(|e| e.event_id.clone())
+        .collect();
+    (timeline_fes, state_fes)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// A creator-only fork/merge DAG: every generated event must be accepted by
+    /// `apply_pdu`, and folding the emitted `UpdateCurrentState` deltas must
+    /// reconstruct the resolved current_state.
+    #[test]
+    fn creator_only_fork_merge_dag_accepts_every_event(
+        ops in prop::collection::vec(dag_op(), 1..14),
+    ) {
+        let dag = build_dag(ops);
+        let build_order: Vec<usize> = (0..dag.events.len()).collect();
+        let outcome = apply_dag(&dag, &build_order)?;
+        // The create event and alice's membership are always resolved.
+        prop_assert!(
+            outcome
+                .current_state
+                .contains_key(&("m.room.create".to_string(), String::new())),
+            "create event missing from current_state"
+        );
+        prop_assert!(
+            outcome
+                .current_state
+                .contains_key(&("m.room.member".to_string(), FORK_MERGE_SENDER.to_string())),
+            "alice's membership missing from current_state"
+        );
+        // P2 — head-set bookkeeping: RoomCore's tracked forward extremities must
+        // match the sets recomputed directly from the raw DAG structure. P1
+        // proves the head-sets are *consistent* across orders; this proves they
+        // are *correct*. The oracle is order-independent, so asserting it on the
+        // build order plus P1 establishes it for every order.
+        let (expected_timeline, expected_state) = expected_heads(&dag);
+        prop_assert_eq!(
+            &outcome.timeline_fes,
+            &expected_timeline,
+            "timeline forward extremities diverged from the raw-DAG oracle"
+        );
+        prop_assert_eq!(
+            &outcome.state_fes,
+            &expected_state,
+            "state forward extremities diverged from the raw-DAG oracle"
+        );
+
+        // P5 — message-event invariants. A non-state event never touches
+        // current_state or the state DAG: it appears in neither current_state
+        // nor the state forward extremities, only (possibly) the timeline ones.
+        // Equivalently, every timeline FE that is *not* a state FE is a message.
+        // (The reverse direction — a state FE that is not a timeline FE — is
+        // expected and is *not* a message: a state head a later message
+        // referenced in `prev_events` stays a state head but drops out of the
+        // timeline heads.) The "soft-failed" half of the divergence rule is
+        // vacuous here — nothing soft-fails in the creator-only profile.
+        let message_ids: HashSet<&str> = dag
+            .events
+            .iter()
+            .filter(|e| e.state_key.is_none())
+            .map(|e| e.event_id.as_str())
+            .collect();
+        for id in outcome.current_state.values() {
+            prop_assert!(
+                !message_ids.contains(id.as_str()),
+                "message event {id} leaked into current_state"
+            );
+        }
+        for id in &outcome.state_fes {
+            prop_assert!(
+                !message_ids.contains(id.as_str()),
+                "message event {id} leaked into the state forward extremities"
+            );
+        }
+        for id in outcome.timeline_fes.difference(&outcome.state_fes) {
+            prop_assert!(
+                message_ids.contains(id.as_str()),
+                "timeline FE {id} diverges from the state FEs but is not a message"
+            );
+        }
+    }
+
+    /// Order-independence: the same fork/merge DAG applied in different
+    /// topological orders must yield identical resolved state and head-sets.
+    /// State resolution is a pure function of the DAG and the final head-sets
+    /// are "events unreferenced by any applied event", so order cannot matter —
+    /// any divergence is a real state-res or head-tracking bug.
+    #[test]
+    fn creator_only_fork_merge_order_independent(
+        ops in prop::collection::vec(dag_op(), 1..14),
+        entropies in prop::collection::vec(
+            prop::collection::vec(any::<u8>().prop_map(|b| b as usize), 1..40),
+            2..5,
+        ),
+    ) {
+        let dag = build_dag(ops);
+        let build_order: Vec<usize> = (0..dag.events.len()).collect();
+        let baseline = apply_dag(&dag, &build_order)?;
+        for entropy in &entropies {
+            let order = random_topo_order(&dag, entropy);
+            prop_assert_eq!(order.len(), dag.events.len(), "topo order dropped events");
+            let outcome = apply_dag(&dag, &order)?;
+            prop_assert_eq!(
+                &outcome,
+                &baseline,
+                "fork/merge result depended on application order"
+            );
+        }
+    }
+}
+
+/// Coverage corpus (non-shrinking generator-saturation guard). NOT a property
+/// test: it asserts the `dag_op()` strategy *actually produces* the interesting
+/// DAG shapes often enough, across a large deterministic sample, that the
+/// properties above are not passing vacuously on degenerate linear chains.
+///
+/// A property test asserts "invariant P holds on every case"; this asserts
+/// "across the sample, each shape appears in at least a floor fraction of
+/// cases". It is non-shrinking on purpose — a shrunk single DAG lacking a shape
+/// tells you nothing; the signal is the aggregate count. The floors are set
+/// well below the measured rates so a generator tweak that *erodes* (not just
+/// eliminates) coverage trips them, while leaving slack against benign drift.
+///
+/// Buckets covered now (creator-only profile):
+/// - a real merge (a state event whose `prev_state_events` names ≥2 heads),
+/// - a multi-head merge (≥3 heads in one event),
+/// - a DAG containing a message (drives the P5 timeline/state divergence).
+///
+/// TODO(P4 shadow model): the remaining PLAN-listed shapes — a merge resolving a
+/// power-level conflict, a rejected event with a dependent child, and a
+/// soft-failed message — require the multi-user adversarial generator and cannot
+/// occur in the creator-only profile (alice is omnipotent and always joined, so
+/// nothing rejects or soft-fails). Add their floors when that generator lands.
+#[test]
+fn fork_merge_generator_coverage_corpus() {
+    const SAMPLE: usize = 2000;
+    let strat = prop::collection::vec(dag_op(), 1..14);
+    let mut runner = TestRunner::deterministic();
+
+    let (mut real_merge, mut multihead_merge, mut with_message) = (0usize, 0usize, 0usize);
+    for _ in 0..SAMPLE {
+        let ops = strat
+            .new_tree(&mut runner)
+            .expect("strategy produces a value")
+            .current();
+        let dag = build_dag(ops);
+        let mut saw_real_merge = false;
+        let mut saw_multihead = false;
+        let mut saw_message = false;
+        for e in &dag.events {
+            if e.state_key.is_none() {
+                saw_message = true;
+                continue;
+            }
+            let distinct: HashSet<&str> = e.prev_state_events.iter().map(|p| p.as_str()).collect();
+            if distinct.len() >= 2 {
+                saw_real_merge = true;
+            }
+            if distinct.len() >= 3 {
+                saw_multihead = true;
+            }
+        }
+        real_merge += usize::from(saw_real_merge);
+        multihead_merge += usize::from(saw_multihead);
+        with_message += usize::from(saw_message);
+    }
+
+    // Floors (deterministic sample, so these are reproducible). Measured rates
+    // at authoring time were far higher — real_merge 54%, multi-head 25%,
+    // message 69% — so these guard against erosion, not just disappearance.
+    let floor = |pct: usize| SAMPLE * pct / 100;
+    assert!(
+        real_merge >= floor(30),
+        "real (≥2-head) merges only in {real_merge}/{SAMPLE} DAGs — generator coverage eroded"
+    );
+    assert!(
+        multihead_merge >= floor(5),
+        "multi-head (≥3-head) merges only in {multihead_merge}/{SAMPLE} DAGs — generator coverage eroded"
+    );
+    assert!(
+        with_message >= floor(30),
+        "messages only in {with_message}/{SAMPLE} DAGs — P5 divergence under-exercised"
+    );
 }
