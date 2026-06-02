@@ -48,7 +48,7 @@ MSC4222 reference: <https://github.com/matrix-org/matrix-spec-proposals/pull/422
 
 | v3 query param | v5::Request field | Notes |
 |---|---|---|
-| `since` | `pos` | Pass through verbatim. Both opaque strings; sliding-sync's pos format happens to be a stringified `u64`, but clients don't care. |
+| `since` | `pos` | Pass through verbatim. Both opaque strings; sliding-sync's pos format happens to be a stringified `u64`, but clients don't care. **Durable-token caveat:** sliding-sync's `pos` is an *ephemeral, single-cursor* per-connection value — it rejects anything but the last-issued value with `UnknownPos`. Legacy `since` tokens are durable (a client may replay any past token). To bridge the mismatch, an unknown/stale `since` does **not** 400 with `M_UNKNOWN_POS`; `handle` retries once with `pos = None`, i.e. a full initial sync that returns current state under a fresh token. A stale token therefore collapses to "state now" rather than a faithful cumulative delta — adequate for the embedded single client and for `TestCumulativeJoinLeaveJoinSync` (which only asserts current membership), but real incremental replay would need a durable stream-position token decoupled from sliding-sync's `pos`. |
 | `timeout` (ms) | `timeout` (`Duration`) | Default 0 if absent. |
 | `filter` | dropped | Legacy passes JSON or a numeric server-side filter id. Incompatible model. Most complement tests don't rely on filter behavior. |
 | `full_state=true` | noop | We already emit current state on every sync via the wildcard `required_state`. |

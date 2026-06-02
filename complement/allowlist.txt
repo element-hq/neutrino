@@ -33,13 +33,15 @@ TestRoomCreate/Parallel/Can_/sync_newly_created_room$
 TestRoomCreationReportsEventsToMyself/parallel/Room_creation_reports_m.room.create_to_myself$
 TestRoomCreationReportsEventsToMyself/parallel/Room_creation_reports_m.room.member_to_myself$
 
-# Membership flows unlocked by the global POST /v3/join/{roomIdOrAlias} endpoint
-# (2026-06-02) + the multi-user shim, confirmed against a Complement run. The
-# join/kick/ban entries needed three server fixes from that run (empty-body
-# extractor, kick non-member 403, trailing-slash empty state key). Two parked,
-# see VIABLE-TESTS.md: TestCumulativeJoinLeaveJoinSync (legacy /sync replay of a
-# stale since token → M_UNKNOWN_POS) and TestMembersLocal (its fixture sets
-# presence, an out-of-scope EDU). Trailing `$` anchors each name.
+# Membership/sync flows unlocked by the global POST /v3/join/{roomIdOrAlias}
+# endpoint (2026-06-02) + the multi-user shim, confirmed against a Complement
+# run. Four server fixes came out of that run: empty-body extractor, kick
+# non-member 403, trailing-slash empty state key, and legacy /sync recovering a
+# stale since token via a full re-sync instead of M_UNKNOWN_POS (the last
+# un-parks TestCumulativeJoinLeaveJoinSync). One test dropped as not viable, see
+# VIABLE-TESTS.md: TestMembersLocal (its fixture sets presence, an out-of-scope
+# EDU). Trailing `$` anchors each name.
+TestCumulativeJoinLeaveJoinSync$
 TestGetRoomMembers$
 TestRoomMembers/Parallel/POST_/rooms/:room_id/join_can_join_a_room$
 TestRoomMembers/Parallel/POST_/join/:room_id_can_join_a_room$
