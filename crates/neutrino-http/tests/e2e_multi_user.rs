@@ -230,3 +230,371 @@ async fn login_with_malformed_identifier_is_400() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["errcode"], "M_INVALID_USERNAME");
 }
+
+/// Joining a public room needs no prior invite: the join is authorised by the
+/// `public` join rule, and the room then appears in the joiner's sync.
+#[tokio::test]
+async fn join_public_room_without_invite_succeeds() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (_bob_id, bob_tok) = register(&app, "bob").await;
+
+    let (s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    let (s, body) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+        Some(&bob_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["room_id"], room_id, "join echoes the room id");
+
+    let (s, bob_sync) = send(&app, "POST", SYNC_PATH, Some(&bob_tok), &sync_body()).await;
+    assert_eq!(s, StatusCode::OK, "{bob_sync}");
+    let rooms = bob_sync["rooms"].as_object().cloned().unwrap_or_default();
+    assert!(
+        rooms.contains_key(&room_id),
+        "bob should see the joined room: {bob_sync}"
+    );
+}
+
+/// A joined user leaving themselves moves their membership to `leave`.
+#[tokio::test]
+async fn self_leave_sets_membership_to_leave() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (bob_id, bob_tok) = register(&app, "bob").await;
+
+    let (_s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    let (s, _) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+        Some(&bob_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, body) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+        Some(&bob_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+
+    // GET /members reflects bob's membership as `leave`.
+    let (s, members) = send(
+        &app,
+        "GET",
+        &format!("/_matrix/client/v3/rooms/{room_id}/members"),
+        None,
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{members}");
+    let membership = members["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ev| ev["state_key"] == json!(bob_id))
+        .and_then(|ev| ev["content"]["membership"].as_str());
+    assert_eq!(membership, Some("leave"), "{members}");
+}
+
+/// Read the current `m.room.member` membership of `user_id` in `room_id` via
+/// the unauthenticated `GET /members` endpoint.
+async fn member_membership(app: &axum::Router, room_id: &str, user_id: &str) -> Option<String> {
+    let (_s, members) = send(
+        app,
+        "GET",
+        &format!("/_matrix/client/v3/rooms/{room_id}/members"),
+        None,
+        &json!({}),
+    )
+    .await;
+    members["chunk"].as_array()?.iter().find_map(|ev| {
+        if ev["state_key"] == json!(user_id) {
+            ev["content"]["membership"].as_str().map(str::to_owned)
+        } else {
+            None
+        }
+    })
+}
+
+/// In an invite-only room, an invited user can see the room as an invite, then
+/// join; after joining `GET /members` reports their membership as `join`.
+#[tokio::test]
+async fn invite_then_join_makes_room_visible() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (bob_id, bob_tok) = register(&app, "bob").await;
+
+    let (_s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "private_chat" }),
+    )
+    .await;
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    // Alice invites bob.
+    let (s, body) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{room_id}/invite"),
+        Some(&alice_tok),
+        &json!({ "user_id": bob_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+
+    // Bob's sync surfaces the room (as an invite).
+    let (s, bob_sync) = send(&app, "POST", SYNC_PATH, Some(&bob_tok), &sync_body()).await;
+    assert_eq!(s, StatusCode::OK, "{bob_sync}");
+    assert!(
+        bob_sync["rooms"]
+            .as_object()
+            .map(|r| r.contains_key(&room_id))
+            .unwrap_or(false),
+        "bob should see the invited room: {bob_sync}"
+    );
+
+    // Bob joins.
+    let (s, body) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+        Some(&bob_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+
+    let membership = member_membership(&app, &room_id, &bob_id).await;
+    assert_eq!(membership.as_deref(), Some("join"));
+}
+
+/// Joining an invite-only room with no prior invite is rejected.
+#[tokio::test]
+async fn join_invite_only_without_invite_is_403() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (_bob_id, bob_tok) = register(&app, "bob").await;
+
+    let (_s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "private_chat" }),
+    )
+    .await;
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    let (s, body) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+        Some(&bob_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN");
+}
+
+/// A room creator (power 50 ≥ default kick level) can kick a joined member;
+/// the target's membership becomes `leave`.
+#[tokio::test]
+async fn kick_sets_target_membership_to_leave() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (bob_id, bob_tok) = register(&app, "bob").await;
+
+    let (_s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    let (s, _) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+        Some(&bob_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        member_membership(&app, &room_id, &bob_id).await.as_deref(),
+        Some("join")
+    );
+
+    let (s, body) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{room_id}/kick"),
+        Some(&alice_tok),
+        &json!({ "user_id": bob_id, "reason": "spam" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(
+        member_membership(&app, &room_id, &bob_id).await.as_deref(),
+        Some("leave")
+    );
+}
+
+/// Banning a member sets `ban` and blocks rejoin; unbanning returns them to
+/// `leave` and lets them join again (public room).
+#[tokio::test]
+async fn ban_blocks_rejoin_until_unban() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (bob_id, bob_tok) = register(&app, "bob").await;
+
+    let (_s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    // Bob joins, then alice bans him.
+    let (s, _) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+        Some(&bob_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, body) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{room_id}/ban"),
+        Some(&alice_tok),
+        &json!({ "user_id": bob_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(
+        member_membership(&app, &room_id, &bob_id).await.as_deref(),
+        Some("ban")
+    );
+
+    // A banned user cannot rejoin.
+    let (s, body) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+        Some(&bob_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+
+    // Alice unbans bob → membership back to leave.
+    let (s, body) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{room_id}/unban"),
+        Some(&alice_tok),
+        &json!({ "user_id": bob_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(
+        member_membership(&app, &room_id, &bob_id).await.as_deref(),
+        Some("leave")
+    );
+
+    // Bob can join the public room again.
+    let (s, body) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+        Some(&bob_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(
+        member_membership(&app, &room_id, &bob_id).await.as_deref(),
+        Some("join")
+    );
+}
+
+/// `/createRoom` with an `invite` list emits a creator-authored invite member
+/// event per listed user, so the invitee sees the room in sync without any
+/// explicit `/invite` call and `GET /members` reports them as `invite`.
+#[tokio::test]
+async fn createroom_invite_list_invites_listed_users() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (bob_id, bob_tok) = register(&app, "bob").await;
+
+    let (s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "private_chat", "invite": [bob_id] }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    assert_eq!(
+        member_membership(&app, &room_id, &bob_id).await.as_deref(),
+        Some("invite"),
+        "bob should be invited by createRoom"
+    );
+
+    let (s, bob_sync) = send(&app, "POST", SYNC_PATH, Some(&bob_tok), &sync_body()).await;
+    assert_eq!(s, StatusCode::OK, "{bob_sync}");
+    assert!(
+        bob_sync["rooms"]
+            .as_object()
+            .map(|r| r.contains_key(&room_id))
+            .unwrap_or(false),
+        "bob should see the invited room in sync: {bob_sync}"
+    );
+}
