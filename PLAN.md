@@ -119,11 +119,16 @@ message events to exercise timeline-vs-state head divergence. Lives in
   Rejected-verdict is order-independent; rejection cascades through
   `prev_state_events`; a rejected event never appears in `current_state`. Requires
   the multi-user shadow-auth generator (next milestone), not the creator-only profile.
-- **P5 — message-event invariants. [TODO — rides P1's DAG]** A non-state event never
+- **P5 — message-event invariants. [DONE, creator-only]** A non-state event never
   touches `current_state` or state FEs, only timeline FEs; timeline-vs-state FE
   divergence ⊆ {messages, soft-failed}. The creator-only generator already emits
   messages (`DagOp::Message`), so this is another free co-check; pairs naturally with
-  P2.
+  P2. Implemented as a block inside `creator_only_fork_merge_dag_accepts_every_event`
+  (rides P2's `outcome` + `expected_heads`, no extra build/apply). Asserted as the
+  *one-directional* `timeline_fes \ state_fes ⊆ {messages}` — the reverse direction
+  (a state FE that is not a timeline FE) is expected and is *not* a message: a state
+  head a later message named in `prev_events` stays a state head but drops out of the
+  timeline heads. The "soft-failed" clause is vacuous on the creator-only profile.
 
 The "incremental == batch" idea (current_state == fresh `state_at_heads(state FEs)`)
 is deliberately NOT a property here: it's tautological against `RoomCore`, which sets
@@ -135,7 +140,7 @@ sqlite persist layer (current_state built purely from deltas, never recomputed);
 wanted, it belongs in a store-sqlite test, not these RoomCore proptests.
 
 P1+P2+P3+P5 all ride one creator-only DAG/strategy; P4 wants its own adversarial
-profile. **Recommended order: P2 ✅ → P5 → P3 → (milestone) shadow model + P4.**
+profile. **Recommended order: P2 ✅ → P5 ✅ → P3 → (milestone) shadow model + P4.**
 
 ### Generator design
 
@@ -198,11 +203,19 @@ proptest shrinks the recipe, not raw events), realised left-to-right against a
   sender outranks the new level). Demote: lower a user (rule 10 forbids demoting at/
   above your own level → generate both the creator-demotes-lesser valid case and the
   peer-demotes-peer invalid case).
-- **Coverage assertions.** A separate non-shrinking corpus test must confirm the
-  generator actually produced: a merge resolving a PL conflict, a rejected event with
-  a dependent child, a soft-failed message, a multi-head merge. Otherwise the
-  rejection / conflict-merge coverage (P4, P5) passes vacuously on linear
-  all-accepted chains.
+- **Coverage assertions. [DONE for the creator-only buckets]** A separate
+  non-shrinking corpus test must confirm the generator actually produced: a merge
+  resolving a PL conflict, a rejected event with a dependent child, a soft-failed
+  message, a multi-head merge. Otherwise the rejection / conflict-merge coverage (P4,
+  P5) passes vacuously on linear all-accepted chains. Implemented as
+  `fork_merge_generator_coverage_corpus` — a plain `#[test]` that drives `dag_op()`
+  `2000`× against a `TestRunner::deterministic()` runner, classifies each DAG, and
+  asserts floor *fractions* (not ≥1, which wouldn't catch erosion). Live buckets:
+  real ≥2-head merge (floor 30%, measured 54%), multi-head ≥3-head merge (floor 5%,
+  measured 25%), DAG-contains-a-message (floor 30%, measured 69%). The PL-conflict,
+  rejected-with-child, and soft-failed-message buckets are deferred to the P4 shadow
+  model — they cannot occur in the creator-only profile (alice is omnipotent and
+  always joined) — and are marked `TODO(P4)` in the test.
 
 ### First milestone (DONE) — validate the structural generator before the shadow model
 
@@ -327,6 +340,8 @@ never use .unwrap() in handler code.
  ## decisions log
 
 Decided to use Claude.
+
+2026-06-02: P5 (message-event invariants) + coverage corpus test landed on the creator-only fork/merge generator (`crates/neutrino-state/tests/prop.rs`). **P5** folded into `creator_only_fork_merge_dag_accepts_every_event` (rides P2's existing `outcome` + `expected_heads`, no extra build/apply): asserts no message id leaks into `current_state` or the state forward extremities, and the *one-directional* `timeline_fes \ state_fes ⊆ {messages}`. Decision: assert only that direction, not the symmetric difference — the reverse (`state_fes \ timeline_fes`) legitimately contains *state* events: a state head that a later `m.room.message` named in `prev_events` stays a state FE but drops out of the timeline FEs (the message permanently forks the timeline DAG), so a symmetric-difference⊆messages claim would be false. **Coverage corpus** = new `fork_merge_generator_coverage_corpus`, a plain `#[test]` (not `proptest!`) driving `dag_op()` 2000× against `TestRunner::deterministic()`, classifying each DAG, and asserting floor *fractions* (≥1 wouldn't catch erosion, only disappearance): real ≥2-head merge ≥30% (measured 54%), multi-head ≥3-head merge ≥5% (measured 25%), DAG-has-a-message ≥30% (measured 69%). Two enabling generator tweaks: (a) **`DagOp::Merge` now merges *all* live state heads**, not just the first two — so a merge off ≥3 concurrent heads is a genuine multi-head merge (review TEST4/SPEC7: ≥3-way merges were previously impossible); (b) **`Message` weight 1→2** so the P5 timeline/state divergence is exercised more often. The PL-conflict / rejected-with-child / soft-failed-message corpus buckets are `TODO(P4)`: they need the multi-user shadow model (alice is omnipotent + always joined, so nothing rejects or soft-fails here). fmt + clippy -p neutrino-state --tests -D warnings + cargo test -p neutrino-state clean (216 lib + 38 prop).
 
 2026-06-02: Order-independence proptest for RoomCore fork/merge — `creator_only_fork_merge_order_independent` in `crates/neutrino-state/tests/prop.rs`. Refactored the generator to split **construction from application**: `build_dag(ops) -> Dag` builds the event list purely (no RoomCore; mirrors `apply_pdu`'s head bookkeeping via `heads_after`), and `apply_dag(dag, order) -> Outcome` drives a fresh RoomCore applying events in a given index order, returning the order-invariant quantities (`current_state` id-map + both head-sets) plus the per-event accept + delta-accumulation assertions. The property: build the DAG once, apply it in 2–4 random topological orders (Kahn with an entropy-driven ready-set pick) and assert all `Outcome`s match the build-order baseline. **Key correctness point: topo-sort over `prev_events ∪ prev_state_events` (both edge kinds), not just state edges** — `apply_pdu`'s head removal is `heads \ prevs`, so a child applied before a parent would fail to drop that parent and the final head-sets would diverge; ordering every parent first makes the head-sets a pure structural function (events unreferenced by any applied event) and hence order-invariant. Soundness rests on creator-only ⇒ nothing soft-failed (soft-fail is the one thing that *would* make head advancement order-sensitive). Non-vacuity confirmed (forks create concurrent ready heads ⇒ entropy genuinely reorders; verified a forky DAG yields distinct orders). The earlier `apply_state`/`apply_accepted`/`verify` methods on the old `ForkMergeRun` collapsed into `DagBuilder` (build) + `apply_dag` (apply). fmt + clippy -p neutrino-state --tests -D warnings + cargo test -p neutrino-state clean (216 lib + 37 prop; 2500-case order-independence run green).
 

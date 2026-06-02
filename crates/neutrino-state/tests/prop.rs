@@ -35,7 +35,8 @@ use neutrino_state::state_res::{
 use neutrino_state::validate::parse_event;
 use neutrino_state::{Event, FormatError, StateMap};
 use proptest::prelude::*;
-use proptest::test_runner::TestCaseError;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::{TestCaseError, TestRunner};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, room_id};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
@@ -1434,8 +1435,9 @@ const FORK_MERGE_SENDER: &str = "@alice:example.org";
 const FORK_MERGE_TS_BASE: u64 = 1_700_000_000_000;
 
 /// One generator step. `Extend`/`Fork` carry a head selector applied modulo the
-/// live state-head count; `Merge` collapses the first two state heads (falling
-/// back to a linear extend when fewer than two exist).
+/// live state-head count; `Merge` collapses *all* live state heads into one
+/// event (falling back to a linear extend when fewer than two exist), so a merge
+/// off ≥3 concurrent heads produces a genuine multi-head merge.
 #[derive(Debug, Clone)]
 enum DagOp {
     Extend(usize),
@@ -1449,7 +1451,7 @@ fn dag_op() -> impl Strategy<Value = DagOp> {
         3 => any::<u8>().prop_map(|i| DagOp::Extend(i as usize)),
         3 => any::<u8>().prop_map(|i| DagOp::Fork(i as usize)),
         3 => Just(DagOp::Merge),
-        1 => Just(DagOp::Message),
+        2 => Just(DagOp::Message),
     ]
 }
 
@@ -1613,9 +1615,10 @@ impl DagBuilder {
             }
             DagOp::Merge => {
                 if len >= 2 {
-                    let a = self.state_heads[0].clone();
-                    let b = self.state_heads[1].clone();
-                    self.push_state_event(vec![a, b]);
+                    // Merge every live state head, so a merge off ≥3 concurrent
+                    // heads is a genuine multi-head merge (≥3 prev_state_events).
+                    let heads = self.state_heads.clone();
+                    self.push_state_event(heads);
                 } else {
                     let tip = self.state_heads[0].clone();
                     self.push_state_event(vec![tip]);
@@ -1875,6 +1878,40 @@ proptest! {
             &expected_state,
             "state forward extremities diverged from the raw-DAG oracle"
         );
+
+        // P5 — message-event invariants. A non-state event never touches
+        // current_state or the state DAG: it appears in neither current_state
+        // nor the state forward extremities, only (possibly) the timeline ones.
+        // Equivalently, every timeline FE that is *not* a state FE is a message.
+        // (The reverse direction — a state FE that is not a timeline FE — is
+        // expected and is *not* a message: a state head a later message
+        // referenced in `prev_events` stays a state head but drops out of the
+        // timeline heads.) The "soft-failed" half of the divergence rule is
+        // vacuous here — nothing soft-fails in the creator-only profile.
+        let message_ids: HashSet<&str> = dag
+            .events
+            .iter()
+            .filter(|e| e.state_key.is_none())
+            .map(|e| e.event_id.as_str())
+            .collect();
+        for id in outcome.current_state.values() {
+            prop_assert!(
+                !message_ids.contains(id.as_str()),
+                "message event {id} leaked into current_state"
+            );
+        }
+        for id in &outcome.state_fes {
+            prop_assert!(
+                !message_ids.contains(id.as_str()),
+                "message event {id} leaked into the state forward extremities"
+            );
+        }
+        for id in outcome.timeline_fes.difference(&outcome.state_fes) {
+            prop_assert!(
+                message_ids.contains(id.as_str()),
+                "timeline FE {id} diverges from the state FEs but is not a message"
+            );
+        }
     }
 
     /// Order-independence: the same fork/merge DAG applied in different
@@ -1904,4 +1941,78 @@ proptest! {
             );
         }
     }
+}
+
+/// Coverage corpus (non-shrinking generator-saturation guard). NOT a property
+/// test: it asserts the `dag_op()` strategy *actually produces* the interesting
+/// DAG shapes often enough, across a large deterministic sample, that the
+/// properties above are not passing vacuously on degenerate linear chains.
+///
+/// A property test asserts "invariant P holds on every case"; this asserts
+/// "across the sample, each shape appears in at least a floor fraction of
+/// cases". It is non-shrinking on purpose — a shrunk single DAG lacking a shape
+/// tells you nothing; the signal is the aggregate count. The floors are set
+/// well below the measured rates so a generator tweak that *erodes* (not just
+/// eliminates) coverage trips them, while leaving slack against benign drift.
+///
+/// Buckets covered now (creator-only profile):
+/// - a real merge (a state event whose `prev_state_events` names ≥2 heads),
+/// - a multi-head merge (≥3 heads in one event),
+/// - a DAG containing a message (drives the P5 timeline/state divergence).
+///
+/// TODO(P4 shadow model): the remaining PLAN-listed shapes — a merge resolving a
+/// power-level conflict, a rejected event with a dependent child, and a
+/// soft-failed message — require the multi-user adversarial generator and cannot
+/// occur in the creator-only profile (alice is omnipotent and always joined, so
+/// nothing rejects or soft-fails). Add their floors when that generator lands.
+#[test]
+fn fork_merge_generator_coverage_corpus() {
+    const SAMPLE: usize = 2000;
+    let strat = prop::collection::vec(dag_op(), 1..14);
+    let mut runner = TestRunner::deterministic();
+
+    let (mut real_merge, mut multihead_merge, mut with_message) = (0usize, 0usize, 0usize);
+    for _ in 0..SAMPLE {
+        let ops = strat
+            .new_tree(&mut runner)
+            .expect("strategy produces a value")
+            .current();
+        let dag = build_dag(ops);
+        let mut saw_real_merge = false;
+        let mut saw_multihead = false;
+        let mut saw_message = false;
+        for e in &dag.events {
+            if e.state_key.is_none() {
+                saw_message = true;
+                continue;
+            }
+            let distinct: HashSet<&str> = e.prev_state_events.iter().map(|p| p.as_str()).collect();
+            if distinct.len() >= 2 {
+                saw_real_merge = true;
+            }
+            if distinct.len() >= 3 {
+                saw_multihead = true;
+            }
+        }
+        real_merge += usize::from(saw_real_merge);
+        multihead_merge += usize::from(saw_multihead);
+        with_message += usize::from(saw_message);
+    }
+
+    // Floors (deterministic sample, so these are reproducible). Measured rates
+    // at authoring time were far higher — real_merge 54%, multi-head 25%,
+    // message 69% — so these guard against erosion, not just disappearance.
+    let floor = |pct: usize| SAMPLE * pct / 100;
+    assert!(
+        real_merge >= floor(30),
+        "real (≥2-head) merges only in {real_merge}/{SAMPLE} DAGs — generator coverage eroded"
+    );
+    assert!(
+        multihead_merge >= floor(5),
+        "multi-head (≥3-head) merges only in {multihead_merge}/{SAMPLE} DAGs — generator coverage eroded"
+    );
+    assert!(
+        with_message >= floor(30),
+        "messages only in {with_message}/{SAMPLE} DAGs — P5 divergence under-exercised"
+    );
 }
