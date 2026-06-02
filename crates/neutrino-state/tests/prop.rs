@@ -1640,10 +1640,32 @@ impl DagBuilder {
     }
 
     fn finish(self) -> Dag {
-        Dag {
-            room_id: self.room_id,
-            events: self.events,
-        }
+        let DagBuilder {
+            room_id,
+            state_heads,
+            timeline_heads,
+            events,
+            ..
+        } = self;
+        let dag = Dag { room_id, events };
+        // Cross-check the builder's own running head bookkeeping (`heads_after`,
+        // used only to pick parents) against the structural oracle. Without this
+        // a `heads_after` bug would silently emit a different-but-valid DAG that
+        // both RoomCore and `expected_heads` still agree on, masking it — there
+        // are three implementations of the FE rule and P2 alone only cross-checks
+        // two of them.
+        let (expected_timeline, expected_state) = expected_heads(&dag);
+        let builder_timeline: BTreeSet<OwnedEventId> = timeline_heads.into_iter().collect();
+        let builder_state: BTreeSet<OwnedEventId> = state_heads.into_iter().collect();
+        assert_eq!(
+            builder_timeline, expected_timeline,
+            "DagBuilder timeline heads diverged from the raw-DAG oracle"
+        );
+        assert_eq!(
+            builder_state, expected_state,
+            "DagBuilder state heads diverged from the raw-DAG oracle"
+        );
+        dag
     }
 }
 
