@@ -29,6 +29,7 @@ use tracing::info;
 
 mod federation;
 mod legacy_sync;
+mod membership;
 mod room_actor;
 mod sliding_sync;
 
@@ -238,6 +239,30 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/_matrix/client/v3/rooms/{room_id}/state/{type}",
             put(put_state_empty_key),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/join",
+            post(membership::join),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/leave",
+            post(membership::leave),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/invite",
+            post(membership::invite),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/kick",
+            post(membership::kick),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/ban",
+            post(membership::ban),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/unban",
+            post(membership::unban),
         )
         .route("/_matrix/client/v3/pushers/set", post(pushers_set))
         .route("/_matrix/client/v3/capabilities", get(get_capabilities))
@@ -826,6 +851,29 @@ fn build_initial_events(
         add("m.room.topic", "", json!({ "topic": t }))?;
     }
 
+    // Honour the request's `invite` list (the membership follow-up to the
+    // multi-user shim): emit one invite member event per well-formed, non-self
+    // target, authored by the creator — who is joined with implicit MAX power,
+    // so rule 5.4 accepts it. Malformed entries are skipped rather than failing
+    // room creation (test server, best-effort). `is_direct` is propagated onto
+    // the invite content when the request sets it.
+    if let Some(invitees) = body.pointer("/invite").and_then(Value::as_array) {
+        let is_direct = body.pointer("/is_direct").and_then(Value::as_bool) == Some(true);
+        for entry in invitees {
+            let Some(target) = entry.as_str() else {
+                continue;
+            };
+            if target == sender.as_str() || OwnedUserId::try_from(target).is_err() {
+                continue;
+            }
+            let mut content = json!({ "membership": "invite" });
+            if is_direct {
+                content["is_direct"] = json!(true);
+            }
+            add("m.room.member", target, content)?;
+        }
+    }
+
     Ok((create, initial))
 }
 
@@ -861,8 +909,8 @@ fn default_power_levels() -> Value {
 /// (`public` ⇒ `public_chat`, else `private_chat`). Only `public_chat` opens
 /// the room (`public`); `private_chat` / `trusted_private_chat` (and any
 /// unrecognised preset) stay invite-only. The `trusted_private_chat`
-/// invitee-power bump is not modelled — createRoom does not process the
-/// `invite` list.
+/// invitee-power bump is not modelled, though the `invite` list itself is
+/// honoured by [`build_initial_events`].
 fn join_rule_for(body: &Value) -> &'static str {
     let is_public = match body.pointer("/preset").and_then(Value::as_str) {
         Some(preset) => preset == "public_chat",

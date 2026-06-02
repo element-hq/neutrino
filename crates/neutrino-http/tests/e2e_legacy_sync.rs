@@ -9,6 +9,11 @@
 //!   (`translate::translate_response`).
 //! - The full `sliding_sync::handle` pipeline behind it (long-poll, pos
 //!   validation, idempotency cache).
+//!
+//! Gated off under `multi-user-shim`: every test seeds via tokenless CSAPI
+//! (`createRoom` / `/send`), which the shim rejects (401). These run in the
+//! default build; the shim's coverage lives in `tests/e2e_multi_user.rs`.
+#![cfg(not(feature = "multi-user-shim"))]
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
