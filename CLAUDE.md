@@ -119,6 +119,49 @@ if a task is ambiguous or conflicts with these rules, stop and ask.
 do not make assumptions about intent and proceed silently.
 one clarifying question is better than a wrong implementation.
 
+## Reviewing the git diff
+When asked to "review the current git diff" (or "review the diff" / "review my changes" / "review this branch"), ALWAYS delegate to fresh-context subagents. Do NOT review inline, and do NOT use the `/code-review` or `/security-review` skills for this — those run in the main session's context, and the whole point is fresh eyes with no knowledge of the implementation discussion.
+
+Procedure:
+
+- In a SINGLE message, spawn three general-purpose subagents in parallel (one Agent tool block each):
+     - code review — correctness bugs + reuse / simplification / efficiency. Prefix findings REVIEW*.
+     - security review — auth, input validation, state-res / auth-rule soundness, anything that could mask a security-relevant bug.
+       Prefix findings SEC*.
+
+     - spec-conformance review — verify behaviour against the targeted spec:
+       Matrix v1.18 (Client-Server + Server-Server API), MSC4242 (State DAGs),
+       room version 12. MUST consult the actual normative text (WebFetch the spec
+       section / MSC, or cite it) and check the diff clause by clause: MUST/REJECT
+       rules, event auth rules, wire/PDU format, redaction algorithm, state-res
+       steps, M_* error codes. Flag behaviour that is plausible but not what the
+       spec mandates, AND anything implemented that the spec doesn't require
+       (over-implementation). Out-of-scope per this file (signatures, EDUs, E2EE,
+       pagination, auth): note if the diff touches them, don't review them.
+       Prefix findings SPEC*.
+
+     - test-quality review — assess the TESTS in the diff, not production-code
+       correctness. Are new tests meaningful or tautological/vacuous (an oracle
+       that restates the code under test, an assertion that can't fail)? Do they
+       pin the invariant the change is actually about? Is coverage adequate (happy
+       path only, or error/rejection/edge paths too)? Any #[ignore]d, over-broad,
+       or wrong-thing assertions? For property tests: can the generator actually
+       produce the inputs the property claims to cover, or does it pass vacuously?
+       Prefix findings TEST*.
+
+     - architecture review — module boundaries, trait/type design, coupling, and
+       whether the change fits the crate structure documented in this file. PLUS
+       duplication & consolidation: actively search the wider codebase (rust-
+       analyzer references/definition, grep) for existing code this diff duplicates
+       or could delegate to — flag "this is the same as X, merge/delegate" and
+       "this field/method is derivable from an existing one". Project rule: derive
+       don't duplicate; delegate to inner rather than reimplement an optimised
+       method; collapse _with_X / _for_Y variant helpers into one abstraction.
+       This requires reading beyond the diff. Prefix findings ARCH*.
+
+- Give every subagent: the scope (`git diff HEAD` unless told otherwise — they run it themselves), the "Code Review" rubric below, and these constraints: report EVERY finding numbered (with subagent prefix) with confidence (low/medium/high/certain) + severity (nit/minor/major/critical); read surrounding source to verify claims; do NOT edit files; return findings as the final message.
+- On return, synthesize: filter/rank, drop false positives (state WHY), present the merged list. Do NOT apply any fix without asking first.
+
 ## Code Review
 
 Report every issue you find, including ones you are uncertain about or consider low-severity.
