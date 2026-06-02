@@ -18,7 +18,7 @@
 //! `#[test]` that loops over `REQUIRED_FIELDS` — sweeping a fixed array
 //! doesn't need proptest entropy.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use neutrino_common::ROOM_VERSION_ID;
@@ -36,7 +36,7 @@ use neutrino_state::validate::parse_event;
 use neutrino_state::{Event, FormatError, StateMap};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
-use ruma::{OwnedEventId, OwnedUserId, RoomId, room_id};
+use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, room_id};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
@@ -1420,8 +1420,15 @@ proptest! {
 // is two events naming the same parent in `prev_state_events`; a merge is one
 // event naming two parents. Timestamps are a pure function of build order
 // (`base + counter`) so event_ids are distinct and reproducible, and every
-// event is built exactly once. Applies run in build order, which is a valid
-// topological order by construction (order-independence is a later milestone).
+// event is built exactly once. Construction is split from application
+// (`build_dag` → `apply_dag`) so the same DAG can be replayed in many
+// topological orders; build order is one such order, by construction.
+//
+// Two properties run over the generated DAGs: every event is accepted (the
+// structural-generator oracle), and the result is independent of application
+// order (`apply_dag` in random topological orders converges on the same
+// resolved state and head-sets — `state_at_heads` is a pure function of the DAG
+// and the final head-sets are "events unreferenced by any applied event").
 
 const FORK_MERGE_SENDER: &str = "@alice:example.org";
 const FORK_MERGE_TS_BASE: u64 = 1_700_000_000_000;
@@ -1534,42 +1541,45 @@ fn build_message(
     .expect("message builds")
 }
 
-/// Drives a generated recipe through a real `RoomCore`, maintaining a shadow
-/// copy of the two head-sets so each event is built on the right parents.
-struct ForkMergeRun {
-    room: RoomCore,
-    provider: InMemoryStateProvider,
+/// A built DAG: the room id and the events in build order (which is itself a
+/// valid topological order over `prev_events ∪ prev_state_events`).
+struct Dag {
+    room_id: OwnedRoomId,
+    events: Vec<Event>,
+}
+
+/// Builds a creator-only fork/merge DAG from a recipe — purely, with no
+/// `RoomCore`. Tracks the two head-sets via `heads_after` so each event lands
+/// on the right parents; `apply_pdu`'s head bookkeeping is mirrored here, not
+/// consulted. Separating construction from application is what lets the same
+/// DAG be replayed in many orders.
+struct DagBuilder {
+    room_id: OwnedRoomId,
     state_heads: Vec<OwnedEventId>,
     timeline_heads: Vec<OwnedEventId>,
     ts: u64,
-    /// Running fold of every `Effect::UpdateCurrentState` delta the run emits
-    /// (start `{}`; `Some`→set, `None`→remove). Reconstructs current_state via
-    /// the delta path — a genuinely different computation from the
-    /// `state_at_heads` recompute `apply_pdu` stores, so comparing the two
-    /// exercises delta completeness (the invariant the persist layer relies on)
-    /// rather than re-running the same resolution.
-    accumulated: StateMap<OwnedEventId>,
+    events: Vec<Event>,
 }
 
-impl ForkMergeRun {
-    fn bootstrap() -> Result<Self, TestCaseError> {
+impl DagBuilder {
+    fn new() -> Self {
         let create = build_create();
         let room_id = room_id_from_create(&create.event_id);
-        let mut run = ForkMergeRun {
-            room: RoomCore::new(room_id),
-            provider: InMemoryStateProvider::new(),
+        let create_id = create.event_id.clone();
+        let mut builder = DagBuilder {
+            room_id,
             state_heads: Vec::new(),
             timeline_heads: Vec::new(),
             ts: FORK_MERGE_TS_BASE,
-            accumulated: StateMap::new(),
+            events: vec![create],
         };
-        let create_id = run.apply_accepted(create)?.event_id.clone();
-        let join_ts = run.next_ts();
-        let join = build_join(run.room.room_id(), &create_id, join_ts);
-        let join_id = run.apply_accepted(join)?.event_id.clone();
-        run.state_heads = vec![join_id.clone()];
-        run.timeline_heads = vec![join_id];
-        Ok(run)
+        let join_ts = builder.next_ts();
+        let join = build_join(&builder.room_id, &create_id, join_ts);
+        let join_id = join.event_id.clone();
+        builder.events.push(join);
+        builder.state_heads = vec![join_id.clone()];
+        builder.timeline_heads = vec![join_id];
+        builder
     }
 
     fn next_ts(&mut self) -> u64 {
@@ -1577,16 +1587,98 @@ impl ForkMergeRun {
         self.ts
     }
 
-    /// Apply one event, assert it was accepted (not rejected, not soft-failed),
-    /// fold any emitted `UpdateCurrentState` delta into `accumulated`, persist
-    /// the accepted form (with its computed `auth_events`, so later `auth_chain`
-    /// walks resolve) into the provider, and return it.
-    fn apply_accepted(&mut self, event: Event) -> Result<Arc<Event>, TestCaseError> {
+    /// Append a topic state event on `prev` (a subset of the state heads) and
+    /// advance both head-sets exactly as `apply_pdu` does for an accepted state
+    /// event.
+    fn push_state_event(&mut self, prev: Vec<OwnedEventId>) {
+        let ts = self.next_ts();
+        let event = build_topic(&self.room_id, ts, prev.clone());
         let id = event.event_id.clone();
-        let effects = self.room.apply_pdu(event, &self.provider).map_err(|e| {
-            TestCaseError::fail(format!(
-                "apply_pdu errored on a creator-authored event {id} (broken ancestry?): {e}"
-            ))
+        self.events.push(event);
+        self.state_heads = heads_after(&self.state_heads, &prev, &id);
+        self.timeline_heads = heads_after(&self.timeline_heads, &prev, &id);
+    }
+
+    fn run_op(&mut self, op: DagOp) {
+        let len = self.state_heads.len();
+        match op {
+            DagOp::Extend(i) => {
+                let tip = self.state_heads[i % len].clone();
+                self.push_state_event(vec![tip]);
+            }
+            DagOp::Fork(i) => {
+                let tip = self.state_heads[i % len].clone();
+                self.push_state_event(vec![tip.clone()]);
+                self.push_state_event(vec![tip]);
+            }
+            DagOp::Merge => {
+                if len >= 2 {
+                    let a = self.state_heads[0].clone();
+                    let b = self.state_heads[1].clone();
+                    self.push_state_event(vec![a, b]);
+                } else {
+                    let tip = self.state_heads[0].clone();
+                    self.push_state_event(vec![tip]);
+                }
+            }
+            DagOp::Message => {
+                let ts = self.next_ts();
+                let event = build_message(
+                    &self.room_id,
+                    ts,
+                    self.timeline_heads.clone(),
+                    self.state_heads.clone(),
+                );
+                let id = event.event_id.clone();
+                self.events.push(event);
+                // A message advances only the timeline DAG, and references every
+                // timeline head, so that head-set collapses to just the message.
+                let prev = self.timeline_heads.clone();
+                self.timeline_heads = heads_after(&self.timeline_heads, &prev, &id);
+            }
+        }
+    }
+
+    fn finish(self) -> Dag {
+        Dag {
+            room_id: self.room_id,
+            events: self.events,
+        }
+    }
+}
+
+fn build_dag(ops: Vec<DagOp>) -> Dag {
+    let mut builder = DagBuilder::new();
+    for op in ops {
+        builder.run_op(op);
+    }
+    builder.finish()
+}
+
+/// The order-invariant result of applying a DAG: the resolved state and both
+/// head-sets. These are pure functions of the DAG, so any difference across
+/// application orders is a bug.
+#[derive(Debug, PartialEq, Eq)]
+struct Outcome {
+    current_state: StateMap<OwnedEventId>,
+    state_fes: BTreeSet<OwnedEventId>,
+    timeline_fes: BTreeSet<OwnedEventId>,
+}
+
+/// Apply `dag.events` in `order` to a fresh `RoomCore`, asserting every event
+/// is accepted (not rejected, not soft-failed) and that the folded
+/// `UpdateCurrentState` deltas reconstruct the resolved current_state. Inserts
+/// the accepted (auth_events-stamped) form into the provider so later
+/// `auth_chain` walks resolve. Returns the resolved state and both head-sets.
+fn apply_dag(dag: &Dag, order: &[usize]) -> Result<Outcome, TestCaseError> {
+    let mut room = RoomCore::new(dag.room_id.clone());
+    let mut provider = InMemoryStateProvider::new();
+    let mut accumulated: StateMap<OwnedEventId> = StateMap::new();
+    for &i in order {
+        let event = dag.events[i].clone();
+        let id = event.event_id.clone();
+        let effects = room.apply_pdu(event, &provider).map_err(|e| {
+            TestCaseError::fail(format!("apply_pdu errored on {id} (broken ancestry?): {e}"))
         })?;
         let mut persisted = None;
         for effect in effects {
@@ -1596,10 +1688,10 @@ impl ForkMergeRun {
                     for (key, value) in delta {
                         match value {
                             Some(eid) => {
-                                self.accumulated.insert(key, eid);
+                                accumulated.insert(key, eid);
                             }
                             None => {
-                                self.accumulated.remove(&key);
+                                accumulated.remove(&key);
                             }
                         }
                     }
@@ -1617,94 +1709,70 @@ impl ForkMergeRun {
             !persisted.soft_failed,
             "creator-authored event {id} was soft-failed — generator flaw"
         );
-        self.provider.insert(persisted.clone());
-        Ok(persisted)
+        provider.insert(persisted);
     }
+    let current_state: StateMap<OwnedEventId> = room
+        .current_state()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.event_id.clone()))
+        .collect();
+    prop_assert_eq!(
+        &accumulated,
+        &current_state,
+        "accumulated UpdateCurrentState deltas diverged from the resolved current_state"
+    );
+    Ok(Outcome {
+        current_state,
+        state_fes: room.state_forward_extremities().clone(),
+        timeline_fes: room.forward_extremities().clone(),
+    })
+}
 
-    /// Apply a topic event on `prev` (a subset of the state heads) and advance
-    /// both head-sets exactly as `apply_pdu` does for an accepted state event.
-    fn apply_state(&mut self, prev: Vec<OwnedEventId>) -> Result<(), TestCaseError> {
-        let ts = self.next_ts();
-        let event = build_topic(self.room.room_id(), ts, prev.clone());
-        let id = self.apply_accepted(event)?.event_id.clone();
-        self.state_heads = heads_after(&self.state_heads, &prev, &id);
-        self.timeline_heads = heads_after(&self.timeline_heads, &prev, &id);
-        Ok(())
+/// A random topological order of the DAG over `prev_events ∪ prev_state_events`
+/// edges — every parent emitted before its child. Both edge kinds matter: if a
+/// child were applied before a parent, `apply_pdu`'s head removal (`heads \
+/// prevs`) would miss that parent and the final head-sets would diverge. Kahn's
+/// algorithm with the ready-set pick driven by `entropy` (cycled if short).
+fn random_topo_order(dag: &Dag, entropy: &[usize]) -> Vec<usize> {
+    let n = dag.events.len();
+    let mut index_of: HashMap<&str, usize> = HashMap::with_capacity(n);
+    for (i, e) in dag.events.iter().enumerate() {
+        index_of.insert(e.event_id.as_str(), i);
     }
-
-    fn run_op(&mut self, op: DagOp) -> Result<(), TestCaseError> {
-        let len = self.state_heads.len();
-        match op {
-            DagOp::Extend(i) => {
-                let tip = self.state_heads[i % len].clone();
-                self.apply_state(vec![tip])?;
-            }
-            DagOp::Fork(i) => {
-                let tip = self.state_heads[i % len].clone();
-                self.apply_state(vec![tip.clone()])?;
-                self.apply_state(vec![tip])?;
-            }
-            DagOp::Merge => {
-                if len >= 2 {
-                    let a = self.state_heads[0].clone();
-                    let b = self.state_heads[1].clone();
-                    self.apply_state(vec![a, b])?;
-                } else {
-                    let tip = self.state_heads[0].clone();
-                    self.apply_state(vec![tip])?;
-                }
-            }
-            DagOp::Message => {
-                let ts = self.next_ts();
-                let event = build_message(
-                    self.room.room_id(),
-                    ts,
-                    self.timeline_heads.clone(),
-                    self.state_heads.clone(),
-                );
-                let id = self.apply_accepted(event)?.event_id.clone();
-                // A message advances only the timeline DAG, and references every
-                // timeline head, so the head-set collapses to just the message.
-                let prev = self.timeline_heads.clone();
-                self.timeline_heads = heads_after(&self.timeline_heads, &prev, &id);
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut indegree = vec![0usize; n];
+    for (i, e) in dag.events.iter().enumerate() {
+        let mut parents: HashSet<usize> = HashSet::new();
+        for p in e.prev_events.iter().chain(e.prev_state_events.iter()) {
+            if let Some(&j) = index_of.get(p.as_str()) {
+                parents.insert(j);
             }
         }
-        Ok(())
+        indegree[i] = parents.len();
+        for j in parents {
+            children[j].push(i);
+        }
     }
-
-    /// Post-run invariants beyond per-event acceptance.
-    fn verify(&self) -> Result<(), TestCaseError> {
-        // Folding the emitted `UpdateCurrentState` deltas must reconstruct the
-        // current_state `apply_pdu` resolved. This is the invariant the persist
-        // layer relies on: the delta stream is complete and correctly encoded
-        // (no missed key, no stale Some/None). It travels a different path from
-        // the `state_at_heads` recompute, so it is not tautological.
-        let resolved: StateMap<OwnedEventId> = self
-            .room
-            .current_state()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.event_id.clone()))
-            .collect();
-        prop_assert_eq!(
-            &self.accumulated,
-            &resolved,
-            "accumulated UpdateCurrentState deltas diverged from the resolved current_state"
-        );
-        // The create event and alice's membership are always resolved.
-        prop_assert!(
-            self.room
-                .current_state()
-                .contains_key(&("m.room.create".to_string(), String::new())),
-            "create event missing from current_state"
-        );
-        prop_assert!(
-            self.room
-                .current_state()
-                .contains_key(&("m.room.member".to_string(), FORK_MERGE_SENDER.to_string())),
-            "alice's membership missing from current_state"
-        );
-        Ok(())
+    let mut ready: Vec<usize> = (0..n).filter(|&i| indegree[i] == 0).collect();
+    let mut order = Vec::with_capacity(n);
+    let mut step = 0usize;
+    while !ready.is_empty() {
+        let pick = if entropy.is_empty() {
+            0
+        } else {
+            entropy[step % entropy.len()] % ready.len()
+        };
+        let node = ready.swap_remove(pick);
+        order.push(node);
+        step += 1;
+        for &c in &children[node] {
+            indegree[c] -= 1;
+            if indegree[c] == 0 {
+                ready.push(c);
+            }
+        }
     }
+    order
 }
 
 proptest! {
@@ -1717,10 +1785,49 @@ proptest! {
     fn creator_only_fork_merge_dag_accepts_every_event(
         ops in prop::collection::vec(dag_op(), 1..14),
     ) {
-        let mut run = ForkMergeRun::bootstrap()?;
-        for op in ops {
-            run.run_op(op)?;
+        let dag = build_dag(ops);
+        let build_order: Vec<usize> = (0..dag.events.len()).collect();
+        let outcome = apply_dag(&dag, &build_order)?;
+        // The create event and alice's membership are always resolved.
+        prop_assert!(
+            outcome
+                .current_state
+                .contains_key(&("m.room.create".to_string(), String::new())),
+            "create event missing from current_state"
+        );
+        prop_assert!(
+            outcome
+                .current_state
+                .contains_key(&("m.room.member".to_string(), FORK_MERGE_SENDER.to_string())),
+            "alice's membership missing from current_state"
+        );
+    }
+
+    /// Order-independence: the same fork/merge DAG applied in different
+    /// topological orders must yield identical resolved state and head-sets.
+    /// State resolution is a pure function of the DAG and the final head-sets
+    /// are "events unreferenced by any applied event", so order cannot matter —
+    /// any divergence is a real state-res or head-tracking bug.
+    #[test]
+    fn creator_only_fork_merge_order_independent(
+        ops in prop::collection::vec(dag_op(), 1..14),
+        entropies in prop::collection::vec(
+            prop::collection::vec(any::<u8>().prop_map(|b| b as usize), 1..40),
+            2..5,
+        ),
+    ) {
+        let dag = build_dag(ops);
+        let build_order: Vec<usize> = (0..dag.events.len()).collect();
+        let baseline = apply_dag(&dag, &build_order)?;
+        for entropy in &entropies {
+            let order = random_topo_order(&dag, entropy);
+            prop_assert_eq!(order.len(), dag.events.len(), "topo order dropped events");
+            let outcome = apply_dag(&dag, &order)?;
+            prop_assert_eq!(
+                &outcome,
+                &baseline,
+                "fork/merge result depended on application order"
+            );
         }
-        run.verify()?;
     }
 }

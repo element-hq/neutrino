@@ -180,7 +180,8 @@ proptest shrinks the recipe, not raw events), realised left-to-right against a
 ### First milestone (DONE) — validate the structural generator before the shadow model
 
 Implemented as `creator_only_fork_merge_dag_accepts_every_event` in
-`crates/neutrino-state/tests/prop.rs`.
+`crates/neutrino-state/tests/prop.rs`. Order-independence (the flagship property)
+also landed on the same generator as `creator_only_fork_merge_order_independent`.
 
 Start with ONE property that drives the full machinery (DAG gen → forks → merges →
 `build_local_event`/`apply_pdu` → head-sets → current_state) but whose oracle is
@@ -207,6 +208,72 @@ Open generator question (deferred past M1): whether the shadow model's branch-me
 must be faithful enough to keep yield high on deeper forks, or whether approximate-
 merge + bounded size is sufficient. Decide empirically from the coverage corpus.
 
+### Next milestone (SCOPED, future session) — shadow auth model + multi-user + adversarial
+
+Goal: lift the creator-only generator to **multiple users with real membership /
+power-level transitions and deliberate unauthorised events**, then re-run
+order-independence + add idempotency + rejection properties on the richer DAGs.
+This is where PL/membership *conflict merges* (the mainline-sort path) and
+rejection semantics actually get exercised.
+
+**Reusable as-is** (in `crates/neutrino-state/tests/prop.rs`): `Dag`,
+`apply_dag(dag, order) -> Outcome`, `random_topo_order` (Kahn over
+`prev_events ∪ prev_state_events`), `Outcome`, `heads_after`, the deterministic
+topo-index timestamps, and the build-once/replay split. The order-independence
+property re-runs unchanged on the new generator. What changes is `DagBuilder` /
+`build_dag` (event selection) and the per-event oracle.
+
+**Recommended construction strategy (settled in discussion):** have `build_dag`
+drive a **real `RoomCore` in build order during construction** to get true
+accept/reject/soft-fail verdicts, and track heads from *reality* (advance only on
+the real verdict, mirroring `apply_pdu`'s drop-rejected-from-heads). This removes
+head-tracking from the shadow model's burden entirely — the DAG is structurally
+valid by construction even with rejects, and a wrong shadow guess only lowers
+*yield* (an extra reject), never corrupts structure. The shadow model is then a
+lightweight *yield helper* for intent selection only. (Note: this re-introduces a
+RoomCore into construction — fine, it still outputs a pure `Dag` for replay.)
+
+**Shadow model** (auth-relevant projection, per head): `members:
+Map<UserId,Membership>`, `power_levels`, `join_rule`, creator. Used to *realise*
+intents (pick a sender/target that the model says is valid, or for `Unauthorised`
+one it says fails). Coverage device, not correctness device — see the M1 notes;
+branch-merge may be approximate.
+
+**Generator changes:**
+- **Bounded user pool** (alice=creator + bob/carol/dave), `sample::select`.
+- **Intent-tagged ops**: `Join | Invite | Leave | Kick | Ban | Unban | Topic |
+  Name | PLPromote | PLDemote | Message | Unauthorised(kind)` (replaces today's
+  topic-only `Extend`/`Fork`/`Merge`/`Message`; fork/merge become a head-selection
+  dimension orthogonal to intent).
+- **Explicit conflict-fork primitive**: off one head, two branches mutate the
+  *same* key (same membership target or same PL `users` entry), then a merge —
+  guarantees the mainline-sort / IAC conflict path is hit (random head-selection
+  rarely collides).
+- **PLPromote/PLDemote**: both valid (creator raises/lowers a lesser user) and
+  invalid (peer demotes a peer at/above own level — rule 10 forbids).
+
+**Properties on the richer DAGs:**
+- **Order-independence** (reuse `creator_only_…_order_independent` shape): holds
+  regardless of accept/reject; verdicts are a pure function of DAG ancestry.
+- **Rejection determinism**: each event's verdict (accept / reject / soft-fail) is
+  identical across all application orders.
+- **Rejection cascade + isolation**: an event whose `prev_state_events` names a
+  rejected event is itself rejected; a rejected event never appears in
+  `current_state`.
+- **Idempotency**: after applying the DAG, re-apply a random subset in any order →
+  `current_state` + head-sets unchanged (the persisted-check guards this).
+- The M1 "every event accepted" oracle is **dropped** (we now make rejects on
+  purpose); replace with "real verdict == shadow prediction" as a *yield/coverage*
+  check, not a hard correctness gate.
+
+**Coverage corpus** (separate non-shrinking test): assert the generator actually
+produced a PL-conflict merge, a rejected-with-dependent-child, a soft-failed
+message, and a multi-head merge — else the properties pass vacuously.
+
+**Bounds & open question:** keep DAGs small (≤ ~20 events, fork-width ≤ ~3) as the
+primary desync control; decide empirically (from the coverage corpus) whether the
+shadow branch-merge needs to be faithful or approximate-merge suffices.
+
 ## open questions
 - how should low bandwidth CBOR/CoAP integrate with HTTP/JSON? As a separate crate/proxy or baked into the Event / Request / Response types? How does this affect working with Ruma?
 
@@ -232,6 +299,8 @@ never use .unwrap() in handler code.
  ## decisions log
 
 Decided to use Claude.
+
+2026-06-02: Order-independence proptest for RoomCore fork/merge — `creator_only_fork_merge_order_independent` in `crates/neutrino-state/tests/prop.rs`. Refactored the generator to split **construction from application**: `build_dag(ops) -> Dag` builds the event list purely (no RoomCore; mirrors `apply_pdu`'s head bookkeeping via `heads_after`), and `apply_dag(dag, order) -> Outcome` drives a fresh RoomCore applying events in a given index order, returning the order-invariant quantities (`current_state` id-map + both head-sets) plus the per-event accept + delta-accumulation assertions. The property: build the DAG once, apply it in 2–4 random topological orders (Kahn with an entropy-driven ready-set pick) and assert all `Outcome`s match the build-order baseline. **Key correctness point: topo-sort over `prev_events ∪ prev_state_events` (both edge kinds), not just state edges** — `apply_pdu`'s head removal is `heads \ prevs`, so a child applied before a parent would fail to drop that parent and the final head-sets would diverge; ordering every parent first makes the head-sets a pure structural function (events unreferenced by any applied event) and hence order-invariant. Soundness rests on creator-only ⇒ nothing soft-failed (soft-fail is the one thing that *would* make head advancement order-sensitive). Non-vacuity confirmed (forks create concurrent ready heads ⇒ entropy genuinely reorders; verified a forky DAG yields distinct orders). The earlier `apply_state`/`apply_accepted`/`verify` methods on the old `ForkMergeRun` collapsed into `DagBuilder` (build) + `apply_dag` (apply). fmt + clippy -p neutrino-state --tests -D warnings + cargo test -p neutrino-state clean (216 lib + 37 prop; 2500-case order-independence run green).
 
 2026-06-02: First RoomCore fork/merge proptest landed — `creator_only_fork_merge_dag_accepts_every_event` in `crates/neutrino-state/tests/prop.rs`. Structural-generator-only (alice is sole sender + creator ⇒ implicit max power ⇒ every event auth-passes), so the oracle is trivial: `apply_pdu` must accept every generated event (none `rejected`, none `soft_failed`) — any rejection is unambiguously a generator flaw (bad prev_events/prev_state_events linkage, topo-order violation, ts collision → duplicate event_id, head mistracking) rather than an auth verdict. A `DagOp` recipe (`Extend`/`Fork`/`Merge`/`Message`, weighted 3/3/3/1, length 1..14) drives a real `RoomCore`; the generator mirrors `apply_pdu`'s head bookkeeping as `(heads \ prevs) ∪ {E}`. Two decisions worth recording: (a) **insert the `Effect::Persist` event, not the original** — `apply_pdu` stamps the computed `auth_events` (MSC4242 sole authority) and `InMemoryStateProvider::auth_chain` walks them, so inserting the pre-apply event (auth_events empty) would break state-res over merge heads; (b) **timestamps are `base + counter`, monotonic and built once** — origin_server_ts is in the reference hash so distinct ts ⇒ distinct ids, and a global mutable counter would be proptest-non-reproducible. Co-check: folding every emitted `Effect::UpdateCurrentState` delta (start `{}`; `Some`→set, `None`→remove) must reconstruct the resolved `current_state`. (The first cut compared `current_state` to a fresh `state_at_heads(state_forward_extremities)`, but Kegan flagged that as near-tautological: `apply_pdu` already *sets* `current_state = state_at_heads(new_fes)` on every state event — a full recompute, not delta-maintained — so the check was `state_at_heads` warm-cache vs fresh-cache, i.e. only cache-invariance. The delta-fold travels a genuinely different path and tests delta completeness — the invariant the persist layer relies on. The true storage-layer incremental==batch — driving deltas into the sqlite `current_state` table vs a from-scratch resolution — is a separate later milestone.) The shadow auth model + adversarial profile + order-independence/idempotency/rejection properties layer on next. fmt + clippy -p neutrino-state --tests -D warnings + cargo test -p neutrino-state clean (36 prop tests; 2000-case run green).
 
