@@ -87,29 +87,51 @@ message events to exercise timeline-vs-state head divergence. Lives in
 
 ### Properties
 
-- **P1 — order-independence (flagship).** One generated DAG, applied to N fresh
-  `RoomCore`s in N random *topological* orders, must yield identical
-  `current_state` + both head-sets. The defining property of state-res; forks and
-  merges fall out of the DAG shape for free. Topo-order is mandatory anyway —
-  `apply_pdu` returns retryable-`Err` when ancestry is absent.
-- **P2 — head-set bookkeeping (free co-check on P1's DAG).** Recompute from raw DAG
-  structure: timeline FEs = events referenced by no applied `prev_events`, minus
-  soft-failed; state FEs = state events referenced by no `prev_state_events`.
-  Assert == RoomCore's tracked sets. Independent of state-res (covers
-  synapse#5269 soft-fail-extremity).
-- **P3 — incremental == batch.** At end (and optionally after each apply),
-  `current_state` == fresh `state_at_heads(state_forward_extremities)`. Pins the
-  delta-driven maintenance against from-scratch resolution.
-- **P4 — idempotency.** After applying the DAG, replay any random subset in any
-  order → current_state + head-sets unchanged (federation re-send reality).
-- **P5 — rejection (separate adversarial generator).** Rejected-verdict is
-  order-independent; rejection cascades through `prev_state_events`; a rejected
-  event never appears in `current_state`.
-- **P6 — message-event invariants.** A non-state event never touches
-  `current_state` or state FEs, only timeline FEs; timeline-vs-state FE divergence
-  ⊆ {messages, soft-failed}.
+- **P1 — order-independence (flagship). [DONE, creator-only]** One generated DAG,
+  applied to N fresh `RoomCore`s in N random *topological* orders, must yield
+  identical `current_state` + both head-sets. The defining property of state-res;
+  forks and merges fall out of the DAG shape for free. Topo-order is mandatory anyway
+  — `apply_pdu` returns retryable-`Err` when ancestry is absent. Implemented as
+  `creator_only_fork_merge_order_independent`.
+- **P2 — head-set bookkeeping (free co-check on P1's DAG). [DONE, creator-only]**
+  Recompute from raw DAG structure: timeline FEs = events referenced by no applied
+  `prev_events`, minus soft-failed; state FEs = state events referenced by no
+  *state event's* `prev_state_events`. Assert == RoomCore's tracked sets. Independent
+  of state-res (covers synapse#5269 soft-fail-extremity). Implemented as the
+  `expected_heads` oracle, asserted inside `creator_only_fork_merge_dag_accepts_every_event`
+  (oracle is order-independent, so build-order + P1 establishes it for all orders).
+  **Why it mattered:** P1 only proves the
+  head-sets are *consistent* across orders, never that they're *correct* — a
+  systematically-wrong-but-deterministic head-tracking bug sails through P1. P2 is
+  the independent structural oracle that closes that gap, and it rides the existing
+  `Dag` with zero new generator work (the soft-failed clause is vacuous on the
+  creator-only profile but the core "FE = unreferenced event" is exercised by every
+  fork/merge/message). Foundation for everything downstream.
+- **P3 — idempotency. [TODO — rides P1's DAG]** After applying the DAG, replay any
+  random subset in any order → current_state + head-sets unchanged (federation
+  re-send reality). Cheap co-check on the existing generator (`apply_pdu`'s
+  persisted-check guards it); land after P2.
+- **P4 — rejection (separate adversarial generator). [TODO — needs shadow model]**
+  Rejected-verdict is order-independent; rejection cascades through
+  `prev_state_events`; a rejected event never appears in `current_state`. Requires
+  the multi-user shadow-auth generator (next milestone), not the creator-only profile.
+- **P5 — message-event invariants. [TODO — rides P1's DAG]** A non-state event never
+  touches `current_state` or state FEs, only timeline FEs; timeline-vs-state FE
+  divergence ⊆ {messages, soft-failed}. The creator-only generator already emits
+  messages (`DagOp::Message`), so this is another free co-check; pairs naturally with
+  P2.
 
-P1+P2+P3 share one DAG/strategy; P5 wants its own profile.
+The "incremental == batch" idea (current_state == fresh `state_at_heads(state FEs)`)
+is deliberately NOT a property here: it's tautological against `RoomCore`, which sets
+`current_state = state_at_heads(new_fes)` on every state apply (`room_core.rs:399`).
+The meaningful part — that the emitted `StateDelta` stream telescopes to the resolved
+`current_state` — is already asserted inside `apply_dag` (folded deltas ==
+`room.current_state()`). An independent batch-vs-delta check only has signal at the
+sqlite persist layer (current_state built purely from deltas, never recomputed); if
+wanted, it belongs in a store-sqlite test, not these RoomCore proptests.
+
+P1+P2+P3+P5 all ride one creator-only DAG/strategy; P4 wants its own adversarial
+profile. **Recommended order: P2 ✅ → P5 → P3 → (milestone) shadow model + P4.**
 
 ### Generator design
 
@@ -124,12 +146,12 @@ proptest shrinks the recipe, not raw events), realised left-to-right against a
   device — P1/P2/P3 hold regardless of whether events are accepted or rejected, so
   the model only needs to be good enough to keep the *accepted-event yield* high.
   It may merge branch states approximately (e.g. last-writer-by-ts); a wrong guess
-  just produces an extra reject, which P5 absorbs.
+  just produces an extra reject, which P4 absorbs.
   - **Mirror the real drop-rejected-from-heads rule.** `apply_pdu` drops a rejected
     event from *both* head-sets (returns at `room_core.rs:375` before any head
     advance), so a head-following generator never references a reject in
     `prev_state_events` — the prev-state-reference cascade does NOT arise naturally;
-    it is opt-in (deliberately wiring a child to a known reject, for P5). The shadow
+    it is opt-in (deliberately wiring a child to a known reject, for P4). The shadow
     model must therefore *also* drop predicted-rejects from its heads and apply
     post-reject state. The cascade that DOES compound naturally is **semantic**: a
     rejected `m.room.member` join leaves the actor un-joined, so its later events
@@ -174,8 +196,9 @@ proptest shrinks the recipe, not raw events), realised left-to-right against a
   peer-demotes-peer invalid case).
 - **Coverage assertions.** A separate non-shrinking corpus test must confirm the
   generator actually produced: a merge resolving a PL conflict, a rejected event with
-  a dependent child, a soft-failed message, a multi-head merge. Otherwise P1–P3 pass
-  vacuously on linear all-accepted chains.
+  a dependent child, a soft-failed message, a multi-head merge. Otherwise the
+  rejection / conflict-merge coverage (P4, P5) passes vacuously on linear
+  all-accepted chains.
 
 ### First milestone (DONE) — validate the structural generator before the shadow model
 
@@ -196,13 +219,14 @@ creator is omnipotent (rule-10 implicit-max power), auth *cannot* fail, so:
 - Oracle: every `apply_pdu` returns accepted — no `rejected`, no `soft_failed`. Any
   reject ⇒ a structural generator bug (broken `prev_events`/`prev_state_events`
   linkage, topo-order violation, ts collision → duplicate event_id, head mistracking).
-- Cheap co-check (P3-lite): final `current_state` == `state_at_heads(state FEs)` and
-  holds exactly one entry per emitted `(type, state_key)`.
+- Cheap co-check: folded `UpdateCurrentState` deltas == `room.current_state()` (the
+  delta-stream-completeness invariant the persist layer relies on), and the create
+  event + alice's membership are always resolved.
 
 Crucially M1 needs only the **structural** generator (head tracking, topo build,
 deterministic ts/id, build-once/reuse) — NOT the shadow auth model. It isolates and
-hardens the foundation first; the shadow model + adversarial profile + P1/P4/P5 layer
-on once M1 is green.
+hardens the foundation first; the remaining properties (P2/P3/P5) plus the shadow
+model + adversarial profile + P4 layer on once M1 is green.
 
 Open generator question (deferred past M1): whether the shadow model's branch-merge
 must be faithful enough to keep yield high on deeper forks, or whether approximate-

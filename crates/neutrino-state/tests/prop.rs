@@ -1775,6 +1775,42 @@ fn random_topo_order(dag: &Dag, entropy: &[usize]) -> Vec<usize> {
     order
 }
 
+/// Recompute both head-sets straight from the raw DAG structure, independent of
+/// `RoomCore` (P2's oracle). A *timeline* forward extremity is an event named in
+/// no event's `prev_events`; a *state* forward extremity is a state event named
+/// in no state event's `prev_state_events`. Only state events advance the state
+/// DAG — a message carries `prev_state_events` but never supersedes a state head
+/// — so message references are excluded from the state side. The "minus
+/// soft-failed" clause of the timeline rule is vacuous on the creator-only
+/// profile (nothing soft-fails), so it is not modelled here.
+fn expected_heads(dag: &Dag) -> (BTreeSet<OwnedEventId>, BTreeSet<OwnedEventId>) {
+    let mut referenced_timeline: HashSet<&str> = HashSet::new();
+    let mut referenced_state: HashSet<&str> = HashSet::new();
+    for e in &dag.events {
+        for p in &e.prev_events {
+            referenced_timeline.insert(p.as_str());
+        }
+        if e.state_key.is_some() {
+            for p in &e.prev_state_events {
+                referenced_state.insert(p.as_str());
+            }
+        }
+    }
+    let timeline_fes = dag
+        .events
+        .iter()
+        .filter(|e| !referenced_timeline.contains(e.event_id.as_str()))
+        .map(|e| e.event_id.clone())
+        .collect();
+    let state_fes = dag
+        .events
+        .iter()
+        .filter(|e| e.state_key.is_some() && !referenced_state.contains(e.event_id.as_str()))
+        .map(|e| e.event_id.clone())
+        .collect();
+    (timeline_fes, state_fes)
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -1800,6 +1836,22 @@ proptest! {
                 .current_state
                 .contains_key(&("m.room.member".to_string(), FORK_MERGE_SENDER.to_string())),
             "alice's membership missing from current_state"
+        );
+        // P2 — head-set bookkeeping: RoomCore's tracked forward extremities must
+        // match the sets recomputed directly from the raw DAG structure. P1
+        // proves the head-sets are *consistent* across orders; this proves they
+        // are *correct*. The oracle is order-independent, so asserting it on the
+        // build order plus P1 establishes it for every order.
+        let (expected_timeline, expected_state) = expected_heads(&dag);
+        prop_assert_eq!(
+            &outcome.timeline_fes,
+            &expected_timeline,
+            "timeline forward extremities diverged from the raw-DAG oracle"
+        );
+        prop_assert_eq!(
+            &outcome.state_fes,
+            &expected_state,
+            "state forward extremities diverged from the raw-DAG oracle"
         );
     }
 
