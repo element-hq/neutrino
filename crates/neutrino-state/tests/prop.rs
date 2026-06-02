@@ -29,8 +29,8 @@ use neutrino_state::event_id::EventBuilder;
 use neutrino_state::provider::{InMemoryStateProvider, StateProvider};
 use neutrino_state::room_core::{Effect, RoomCore};
 use neutrino_state::state_res::{
-    StateBeforeCache, auth_chain_difference, conflicted_subgraph, iterative_auth_checks,
-    power_of_sender, resolve_state, reverse_topological_power_sort, separate, state_at_heads,
+    auth_chain_difference, conflicted_subgraph, iterative_auth_checks, power_of_sender,
+    resolve_state, reverse_topological_power_sort, separate,
 };
 use neutrino_state::validate::parse_event;
 use neutrino_state::{Event, FormatError, StateMap};
@@ -1542,6 +1542,13 @@ struct ForkMergeRun {
     state_heads: Vec<OwnedEventId>,
     timeline_heads: Vec<OwnedEventId>,
     ts: u64,
+    /// Running fold of every `Effect::UpdateCurrentState` delta the run emits
+    /// (start `{}`; `Some`→set, `None`→remove). Reconstructs current_state via
+    /// the delta path — a genuinely different computation from the
+    /// `state_at_heads` recompute `apply_pdu` stores, so comparing the two
+    /// exercises delta completeness (the invariant the persist layer relies on)
+    /// rather than re-running the same resolution.
+    accumulated: StateMap<OwnedEventId>,
 }
 
 impl ForkMergeRun {
@@ -1554,6 +1561,7 @@ impl ForkMergeRun {
             state_heads: Vec::new(),
             timeline_heads: Vec::new(),
             ts: FORK_MERGE_TS_BASE,
+            accumulated: StateMap::new(),
         };
         let create_id = run.apply_accepted(create)?.event_id.clone();
         let join_ts = run.next_ts();
@@ -1570,8 +1578,9 @@ impl ForkMergeRun {
     }
 
     /// Apply one event, assert it was accepted (not rejected, not soft-failed),
-    /// persist the accepted form (with its computed `auth_events`, so later
-    /// `auth_chain` walks resolve) into the provider, and return it.
+    /// fold any emitted `UpdateCurrentState` delta into `accumulated`, persist
+    /// the accepted form (with its computed `auth_events`, so later `auth_chain`
+    /// walks resolve) into the provider, and return it.
     fn apply_accepted(&mut self, event: Event) -> Result<Arc<Event>, TestCaseError> {
         let id = event.event_id.clone();
         let effects = self.room.apply_pdu(event, &self.provider).map_err(|e| {
@@ -1579,14 +1588,27 @@ impl ForkMergeRun {
                 "apply_pdu errored on a creator-authored event {id} (broken ancestry?): {e}"
             ))
         })?;
-        let persisted = match effects.first() {
-            Some(Effect::Persist { event }) => event.clone(),
-            other => {
-                return Err(TestCaseError::fail(format!(
-                    "expected a Persist effect for {id}, got {other:?}"
-                )));
+        let mut persisted = None;
+        for effect in effects {
+            match effect {
+                Effect::Persist { event } => persisted = Some(event),
+                Effect::UpdateCurrentState(delta) => {
+                    for (key, value) in delta {
+                        match value {
+                            Some(eid) => {
+                                self.accumulated.insert(key, eid);
+                            }
+                            None => {
+                                self.accumulated.remove(&key);
+                            }
+                        }
+                    }
+                }
             }
-        };
+        }
+        let persisted = persisted.ok_or_else(|| {
+            TestCaseError::fail(format!("apply_pdu emitted no Persist effect for {id}"))
+        })?;
         prop_assert!(
             !persisted.rejected,
             "creator-authored event {id} was rejected — generator flaw"
@@ -1652,27 +1674,21 @@ impl ForkMergeRun {
 
     /// Post-run invariants beyond per-event acceptance.
     fn verify(&self) -> Result<(), TestCaseError> {
-        // The incrementally-maintained current_state must equal a from-scratch
-        // resolution at the live state heads (incremental == batch).
-        let mut cache = StateBeforeCache::new();
-        let heads: Vec<OwnedEventId> = self
-            .room
-            .state_forward_extremities()
-            .iter()
-            .cloned()
-            .collect();
-        let fresh = state_at_heads(&heads, &self.provider, &mut cache)
-            .map_err(|e| TestCaseError::fail(format!("state_at_heads failed: {e}")))?;
-        let incremental: StateMap<OwnedEventId> = self
+        // Folding the emitted `UpdateCurrentState` deltas must reconstruct the
+        // current_state `apply_pdu` resolved. This is the invariant the persist
+        // layer relies on: the delta stream is complete and correctly encoded
+        // (no missed key, no stale Some/None). It travels a different path from
+        // the `state_at_heads` recompute, so it is not tautological.
+        let resolved: StateMap<OwnedEventId> = self
             .room
             .current_state()
             .iter()
             .map(|(k, v)| (k.clone(), v.event_id.clone()))
             .collect();
         prop_assert_eq!(
-            &incremental,
-            &fresh,
-            "current_state diverged from a fresh resolution at the state heads"
+            &self.accumulated,
+            &resolved,
+            "accumulated UpdateCurrentState deltas diverged from the resolved current_state"
         );
         // The create event and alice's membership are always resolved.
         prop_assert!(
@@ -1695,8 +1711,8 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     /// A creator-only fork/merge DAG: every generated event must be accepted by
-    /// `apply_pdu`, and the resolved state stays consistent with a from-scratch
-    /// resolution at the state heads.
+    /// `apply_pdu`, and folding the emitted `UpdateCurrentState` deltas must
+    /// reconstruct the resolved current_state.
     #[test]
     fn creator_only_fork_merge_dag_accepts_every_event(
         ops in prop::collection::vec(dag_op(), 1..14),
