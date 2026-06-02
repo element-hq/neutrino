@@ -69,8 +69,10 @@ Holds the six handlers and one shared helper. Consistent with the existing
 submodule layout (`legacy_sync`, `federation`, `room_actor`, `sliding_sync`,
 `multi_user`). Keeps `lib.rs` (already ~1k lines) from growing.
 
-`lib.rs::room_actor_response` is promoted from private to `pub(crate)` so the
-membership handlers can reuse the exact `RoomActorError → HTTP` mapping
+`lib.rs::room_actor_response` stays private; the `membership` submodule reaches
+it through Rust's module privacy (a child module may use an ancestor module's
+private items), so no visibility change is needed. The membership handlers reuse
+the exact `RoomActorError → HTTP` mapping
 (`UnknownRoom`→404 `M_NOT_FOUND`, `Build`→400 `M_BAD_JSON`,
 `Apply`/`Rejected`→403 `M_FORBIDDEN`, else→500 `M_UNKNOWN`). The handlers do
 **not** reuse `send_via_actor` because that hardcodes a `{ "event_id": … }`
@@ -104,7 +106,11 @@ parse error (400 `M_INVALID_PARAM`) distinctly from actor errors.
 
 ### 3. The six handlers
 
-All `async fn (State<AppState>, AuthUser(sender), Path(...), Json<Value>)`.
+All `async fn (State<AppState>, AuthUser(sender), Path(...), Option<Json<Value>>)`.
+The body extractor is `Option<Json<Value>>`, not `Json<Value>`: these POSTs are
+routinely sent with no body (`/join`, `/leave`), and a bare `Json<Value>` would
+reject a bodyless request with 400 before the handler runs. `Option` makes the
+body genuinely optional; handlers read it as `body.as_ref().map(|j| &j.0)`.
 
 | Endpoint (POST) | target (state_key) | membership | success body |
 |---|---|---|---|
@@ -119,8 +125,9 @@ All `async fn (State<AppState>, AuthUser(sender), Path(...), Json<Value>)`.
   caller); `leave` still lifts an optional `reason`.
 - `invite` / `kick` / `ban` / `unban` read `body.user_id` (required) and parse
   it as an `OwnedUserId`; absent or malformed → 400 (`M_MISSING_PARAM` /
-  `M_INVALID_PARAM`). They also lift an optional `reason` (not `unban`, which
-  per spec takes only `user_id`).
+  `M_INVALID_PARAM`). All four also lift an optional `reason` and copy it onto
+  the emitted member event (including `unban` — the implementation propagates
+  `reason` for every targeted endpoint).
 - `unban` and `kick` both emit `membership: leave`; the auth-rule arm that
   applies (5.5.3 unban vs 5.5.4 kick) is selected by `RoomCore` from the
   target's current membership, so the endpoints need no extra signalling.
@@ -216,8 +223,8 @@ CI: covered by the existing `--features multi-user-shim` lane (build + clippy
 
 - `crates/neutrino-http/src/membership.rs` (new) — six handlers + helper.
 - `crates/neutrino-http/src/lib.rs` — `mod membership;`, six routes,
-  `room_actor_response` → `pub(crate)`, `build_initial_events` invite-list
-  extension.
+  `build_initial_events` invite-list extension. (`room_actor_response` stays
+  private — reused via child-module privacy, no visibility change.)
 - `crates/neutrino-http/tests/e2e_multi_user.rs` — new membership e2e tests.
 - `PLAN.md` / `LOG.md` — status + decision/summary entries per project rules.
 

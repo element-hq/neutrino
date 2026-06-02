@@ -636,10 +636,55 @@ async fn leave_when_not_in_room_succeeds() {
     assert_eq!(member_membership(&app, &room_id, &bob_id).await, None);
 }
 
-/// `/unban` on a user who is not currently banned is rejected with 400
-/// `M_BAD_STATE` and, crucially, does NOT mutate their membership. Without the
-/// precheck the handler would emit a bare `leave`, which the auth rules accept
-/// as a *kick* of a joined member — a destructive wrong action.
+/// `/leave` for a room that was never created is `404 M_NOT_FOUND`, not a
+/// 200 no-op. Synapse 404s ("Not a known room") when the server is not in the
+/// room and the caller has no local membership (`room_member.py:1135-1152`);
+/// the no-op success is only for a room that exists but the caller never joined.
+#[tokio::test]
+async fn leave_on_nonexistent_room_is_404() {
+    let app = router(config()).await.expect("router init");
+    let (_bob_id, bob_tok) = register(&app, "bob").await;
+
+    let (s, body) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/rooms/!nonexistent:example.org/leave",
+        Some(&bob_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["errcode"], json!("M_NOT_FOUND"), "{body}");
+}
+
+/// `/unban` for a room that was never created is `404 M_NOT_FOUND`, not
+/// `M_BAD_STATE`. In Synapse unban is internally a leave (`room_member.py:842`),
+/// so it hits the same not-a-known-room 404 before the unban-specific bad-state
+/// check is ever reached.
+#[tokio::test]
+async fn unban_on_nonexistent_room_is_404() {
+    let app = router(config()).await.expect("router init");
+    let (bob_id, _bob_tok) = register(&app, "bob").await;
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+
+    let (s, body) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/rooms/!nonexistent:example.org/unban",
+        Some(&alice_tok),
+        &json!({ "user_id": bob_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["errcode"], json!("M_NOT_FOUND"), "{body}");
+}
+
+/// `/unban` on a user who is not currently banned is rejected with 403
+/// `M_BAD_STATE` and, crucially, does NOT mutate their membership. Synapse
+/// raises `SynapseError(403, ..., errcode=BAD_STATE)` here
+/// (`room_member.py:1000-1006`). Without the precheck the handler would emit a
+/// bare `leave`, which the auth rules accept as a *kick* of a joined member — a
+/// destructive wrong action.
 #[tokio::test]
 async fn unban_non_banned_member_is_rejected_and_does_not_kick() {
     let app = router(config()).await.expect("router init");
@@ -674,7 +719,7 @@ async fn unban_non_banned_member_is_rejected_and_does_not_kick() {
         &json!({ "user_id": bob_id }),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["errcode"], json!("M_BAD_STATE"), "{body}");
     // Bob is still joined — the unban must not have kicked him.
     assert_eq!(

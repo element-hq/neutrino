@@ -10,7 +10,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use neutrino_store::StateStore;
+use neutrino_store::{RoomStore, StateStore};
 use ruma::{OwnedUserId, RoomId, UserId};
 use serde_json::{Value, json};
 
@@ -81,6 +81,29 @@ async fn current_membership(
         }))
 }
 
+/// Return a ready `404 M_NOT_FOUND` ("Not a known room") when `room` was never
+/// created. Mirrors Synapse, which 404s a leave/unban for a room the server is
+/// not in (`room_member.py:1135-1152`) before any membership-state check; only
+/// a room that *exists* falls through to the no-op / bad-state handling. Maps a
+/// storage failure to a ready 500.
+#[allow(clippy::result_large_err)] // see `parse_room`
+async fn require_room(state: &AppState, room: &RoomId) -> Result<(), axum::response::Response> {
+    let store = lock_app(state).store.clone();
+    match store.room_exists(room).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(error_response(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "Not a known room",
+        )),
+        Err(e) => Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &e.to_string(),
+        )),
+    }
+}
+
 /// Emit one `m.room.member` event through the room actor. `target` is the
 /// state_key (the user whose membership changes); `membership` is the
 /// resulting membership string; `reason`, when present, is copied into
@@ -140,11 +163,12 @@ pub(crate) async fn join(
     }
 }
 
-/// `POST /rooms/{roomId}/leave` — the caller leaves the room. Leaving is only
-/// defined from `invite`/`join`/`knock`; from any other state (never joined,
-/// already left, banned) the spec treats the call as a no-op success, so the
-/// handler short-circuits rather than emit an event the auth rules would
-/// reject as an invalid self-leave (rule 5.5.1 → 403).
+/// `POST /rooms/{roomId}/leave` — the caller leaves the room. A room that was
+/// never created is `404 M_NOT_FOUND` (see [`require_room`]). For a room that
+/// exists, leaving is only defined from `invite`/`join`/`knock`; from any other
+/// state (never joined, already left, banned) the spec treats the call as a
+/// no-op success, so the handler short-circuits rather than emit an event the
+/// auth rules would reject as an invalid self-leave (rule 5.5.1 → 403).
 pub(crate) async fn leave(
     state: State<AppState>,
     AuthUser(sender): AuthUser,
@@ -157,6 +181,9 @@ pub(crate) async fn leave(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    if let Err(resp) = require_room(&state.0, &room).await {
+        return resp;
+    }
     match current_membership(&state.0, &room, &sender).await {
         Ok(Some(m)) if matches!(m.as_str(), "invite" | "join" | "knock") => {}
         Ok(_) => return (StatusCode::OK, Json(json!({}))).into_response(),
@@ -254,12 +281,14 @@ pub(crate) async fn ban(
 }
 
 /// `POST /rooms/{roomId}/unban` — lift a ban on `body.user_id` (membership
-/// returns to `leave`). Unban is defined purely as removing a ban, so the
-/// target must currently be `ban`: emitting a bare `leave` against a joined
-/// user would otherwise be accepted by the auth rules as a *kick* (the
-/// kick-vs-unban arm of rule 5.5 is selected from the target's current
-/// membership). We pre-check and reject the non-ban case with 400
-/// `M_BAD_STATE` rather than silently kick.
+/// returns to `leave`). A room that was never created is `404 M_NOT_FOUND` (see
+/// [`require_room`]): Synapse treats unban as a leave internally, so it hits the
+/// not-a-known-room 404 before any state check. For a room that exists, unban is
+/// defined purely as removing a ban, so the target must currently be `ban`:
+/// emitting a bare `leave` against a joined user would otherwise be accepted by
+/// the auth rules as a *kick* (the kick-vs-unban arm of rule 5.5 is selected
+/// from the target's current membership). We pre-check and reject the non-ban
+/// case with `403 M_BAD_STATE` (matching Synapse) rather than silently kick.
 pub(crate) async fn unban(
     state: State<AppState>,
     AuthUser(sender): AuthUser,
@@ -275,11 +304,14 @@ pub(crate) async fn unban(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    if let Err(resp) = require_room(&state.0, &room).await {
+        return resp;
+    }
     match current_membership(&state.0, &room, &target).await {
         Ok(Some(m)) if m == "ban" => {}
         Ok(_) => {
             return error_response(
-                StatusCode::BAD_REQUEST,
+                StatusCode::FORBIDDEN,
                 "M_BAD_STATE",
                 "Cannot unban a user who is not banned",
             );
