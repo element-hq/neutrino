@@ -180,3 +180,53 @@ async fn unknown_token_is_401_unknown() {
     assert_eq!(s, StatusCode::UNAUTHORIZED, "{body}");
     assert_eq!(body["errcode"], "M_UNKNOWN_TOKEN");
 }
+
+/// A successful `/login` must mint a token that actually resolves — i.e. the
+/// returned token is usable on a subsequent authenticated request, not a
+/// hardcoded constant that was never stored.
+#[tokio::test]
+async fn login_mints_a_resolvable_token() {
+    let app = router(config()).await.expect("router init");
+    let (s, body) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/login",
+        None,
+        &json!({ "type": "m.login.password", "identifier": { "user": "bob" } }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["user_id"], "@bob:example.org");
+    let token = body["access_token"].as_str().unwrap().to_owned();
+
+    // The minted token must be honoured by an authed endpoint.
+    let (s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&token),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "minted token must resolve: {room}");
+}
+
+/// A `/login` identifier that cannot form a valid user id must surface a 400,
+/// never a 200 carrying an unregistered token (which would 401 on the next
+/// authenticated request). A localpart that overflows the 255-byte MXID limit
+/// is rejected regardless of ruma's (lenient) charset grammar.
+#[tokio::test]
+async fn login_with_malformed_identifier_is_400() {
+    let app = router(config()).await.expect("router init");
+    let oversized = "a".repeat(300);
+    let (s, body) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/login",
+        None,
+        &json!({ "type": "m.login.password", "identifier": { "user": oversized } }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_INVALID_USERNAME");
+}

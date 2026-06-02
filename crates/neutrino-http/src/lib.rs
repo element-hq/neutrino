@@ -308,8 +308,21 @@ async fn post_register(state: State<AppState>, body: Json<Value>) -> (StatusCode
                 app.config.user_id(),
             )
         };
-        let requested = body.0.pointer("/username").and_then(|v| v.as_str());
-        match multi_user::provision(&tokens, &server_name, &default_user_id, requested) {
+        // The UIA flow is stateless — this shim stores no per-session state, so
+        // the client must resend `username` on the auth-completion request (as
+        // Complement does); absent here, `provision` falls back to the default
+        // user. `localpart_of` lets a full MXID through too, matching `/login`.
+        let requested = body
+            .0
+            .pointer("/username")
+            .and_then(|v| v.as_str())
+            .map(localpart_of);
+        match multi_user::provision(
+            &tokens,
+            &server_name,
+            &default_user_id,
+            requested.as_deref(),
+        ) {
             Ok((user_id, token)) => (
                 StatusCode::OK,
                 Json(json!({
@@ -344,7 +357,7 @@ async fn post_register(state: State<AppState>, body: Json<Value>) -> (StatusCode
 async fn post_login(
     state: State<AppState>,
     #[cfg(feature = "multi-user-shim")] body: Json<Value>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     info!("Logged in");
 
     #[cfg(feature = "multi-user-shim")]
@@ -369,30 +382,37 @@ async fn post_login(
             &default_user_id,
             requested.as_deref(),
         ) {
-            Ok((user_id, token)) => Json(json!({
-                "user_id": user_id,
-                "access_token": token,
-                "home_server": server_name,
-                "device_id": "DEVICEID",
-            })),
-            Err(_) => Json(json!({
-                "user_id": default_user_id,
-                "access_token": "syt_1234567890abcdef",
-                "home_server": server_name,
-                "device_id": "DEVICEID",
-            })),
+            Ok((user_id, token)) => (
+                StatusCode::OK,
+                Json(json!({
+                    "user_id": user_id,
+                    "access_token": token,
+                    "home_server": server_name,
+                    "device_id": "DEVICEID",
+                })),
+            ),
+            // Mirror `/register`: a malformed identifier is a 400, not a 200
+            // carrying a token that was never inserted into the map (which would
+            // then 401 on the very next authenticated request).
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "errcode": "M_INVALID_USERNAME", "error": e })),
+            ),
         }
     }
 
     #[cfg(not(feature = "multi-user-shim"))]
     {
         let app = lock_app(&state.0);
-        Json(json!({
-            "user_id": app.config.user_id(),
-            "access_token": "syt_1234567890abcdef",
-            "home_server": app.config.server_name,
-            "device_id": "DEVICEID",
-        }))
+        (
+            StatusCode::OK,
+            Json(json!({
+                "user_id": app.config.user_id(),
+                "access_token": "syt_1234567890abcdef",
+                "home_server": app.config.server_name,
+                "device_id": "DEVICEID",
+            })),
+        )
     }
 }
 

@@ -33,7 +33,11 @@ everything else and is independently testable.
 - Multiple local users can register/login, each receiving a distinct access
   token, and every authenticated request is attributed to the right user.
 - The single-user production/Android path is **unchanged and byte-identical**
-  when the shim is disabled.
+  when the shim is disabled — with the one documented exception of the
+  profile/account-data routes, which are de-hardcoded to `{user_id}`
+  unconditionally (see §5). Feature-off this only widens those two routes to
+  match any user id (returning the same stub bodies); the embedded client only
+  ever queries its own user, so there is no observable change in production.
 - Spec-correct `401` on missing/unknown tokens (so Complement auth-error
   assertions pass).
 
