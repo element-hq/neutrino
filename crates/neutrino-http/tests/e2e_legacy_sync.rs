@@ -268,18 +268,86 @@ async fn legacy_sync_passes_since_through_v5_pos() {
 }
 
 #[tokio::test]
-async fn legacy_sync_bad_since_returns_m_unknown_pos() {
+async fn legacy_sync_unknown_since_falls_back_to_initial() {
     let app = router(config()).await.expect("router init");
 
-    // Garbage `since` — sliding_sync's pos parser is u64, so a non-numeric
-    // value fails fast with `SyncError::UnknownPos`, which the legacy
-    // wrapper maps to 400 M_UNKNOWN_POS (mirrors the MSC4186 wrapper).
+    // Garbage `since` — sliding_sync's pos parser is u64, so a non-numeric value
+    // fails with `SyncError::UnknownPos`. Legacy `since` tokens are durable, so
+    // rather than 400 (a sliding-sync-only reconnect signal) the wrapper falls
+    // back to a full initial sync: 200 with a fresh `next_batch`.
     let (status, body) = get(&app, LEGACY_SYNC_PATH, Some("since=garbage")).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        body.get("errcode").and_then(|v| v.as_str()),
-        Some("M_UNKNOWN_POS"),
-        "errcode pass-through: {body}",
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("next_batch").and_then(|v| v.as_str()).is_some(),
+        "fallback initial sync issues a fresh next_batch: {body}",
+    );
+}
+
+/// A stale legacy `since` token — one the connection has since advanced past —
+/// is recovered as a full sync (not a 400) and reflects *current* state: after
+/// join→leave→join the room appears in `rooms.join`, never `rooms.leave`.
+/// Single-user mirror of Complement's `TestCumulativeJoinLeaveJoinSync`.
+#[tokio::test]
+async fn legacy_sync_cumulative_join_leave_join() {
+    let app = router(config()).await.expect("router init");
+
+    // A token from before the room exists; the connection advances past it.
+    let (s, before) = get(&app, LEGACY_SYNC_PATH, Some("timeout=0")).await;
+    assert_eq!(s, StatusCode::OK, "{before}");
+    let old = before["next_batch"]
+        .as_str()
+        .expect("next_batch")
+        .to_owned();
+
+    let (s, room) = post(
+        &app,
+        "/_matrix/client/v3/createRoom",
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    // Walk the connection forward: join (via create) → leave → join, syncing
+    // with the latest token each time so `old` is left well behind.
+    let (_s, b1) = get(&app, LEGACY_SYNC_PATH, Some(&format!("since={old}"))).await;
+    let t1 = b1["next_batch"].as_str().unwrap().to_owned();
+
+    let (s, _) = post(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (_s, b2) = get(&app, LEGACY_SYNC_PATH, Some(&format!("since={t1}"))).await;
+    let t2 = b2["next_batch"].as_str().unwrap().to_owned();
+
+    let (s, _) = post(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let _ = get(&app, LEGACY_SYNC_PATH, Some(&format!("since={t2}"))).await;
+
+    // Replay the now-stale `old` token: must not 400, and must show current
+    // state — room joined, absent from the leave section.
+    let (s, body) = get(
+        &app,
+        LEGACY_SYNC_PATH,
+        Some(&format!("since={old}&timeout=0")),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "stale token must not 400: {body}");
+    assert!(
+        body.pointer(&format!("/rooms/leave/{room_id}")).is_none(),
+        "join→leave→join room must not appear in rooms.leave: {body}"
+    );
+    assert!(
+        body.pointer(&format!("/rooms/join/{room_id}")).is_some(),
+        "current membership is join, so it must appear in rooms.join: {body}"
     );
 }
 

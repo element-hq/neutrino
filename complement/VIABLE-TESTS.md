@@ -45,10 +45,11 @@ From `crates/neutrino-http/src/lib.rs:201-277`. The Complement image is built wi
 
 ## Newly allowlisted, now that global `/join` (+ membership endpoints + multi-user shim) landed
 
-Confirmed against a Complement run (2026-06-02). 12 entries are now in `allowlist.txt`; 2 tests are parked (below). The empirical run surfaced three server fixes (all applied) — these are not test-selection issues, they were real gaps:
+Confirmed against a Complement run (2026-06-02). 13 entries are now in `allowlist.txt`; 1 test dropped as not viable (below). The empirical run surfaced four server fixes (all applied) — these are not test-selection issues, they were real gaps:
 - **empty-body POST → 400**: a bare `POST …/join` sends a 0-byte body with `application/json`; `Option<Json<_>>` 400s it. Replaced with an `OptionalBody` extractor that treats an empty body as `None`.
 - **kick of a non-member → 200**: now `403 M_FORBIDDEN` ("The target user is not in the room") via a current-membership pre-check, mirroring Synapse `room_member.py:1027-1045`.
 - **`PUT /state/{type}/` (trailing slash, empty key) → 404**: added the trailing-slash route (spec: "when an empty string, the trailing slash … is optional").
+- **stale legacy `since` token → `400 M_UNKNOWN_POS`**: legacy `/sync` maps `since` onto sliding-sync's *ephemeral* per-connection `pos`, which rejects anything but the last-issued value. Legacy tokens are durable, so the wrapper now recovers an unknown/stale token with a full initial sync instead of 400ing (`legacy_sync/mod.rs`). Stale tokens collapse to "state now" rather than a faithful cumulative delta — option C (stream-position tokens) is the eventual fix; see `docs/legacy-sync-stub.md`.
 
 | Test | Verifies via | Needed fix |
 |---|---|---|
@@ -59,10 +60,10 @@ Confirmed against a Complement run (2026-06-02). 12 entries are now in `allowlis
 | `TestCannotKickNonPresentUser` | kick 403 | kick non-member 403 |
 | `TestCannotKickLeftUser` | `/sync` + kick 403 | kick non-member 403 |
 | `TestNotPresentUserCannotBanOthers` | PUT power_levels + ban 403 | trailing-slash state route |
+| `TestCumulativeJoinLeaveJoinSync` | `/sync` join+leave sections, stale-token replay | legacy stale-since full-resync |
 
-### Parked (failed the run; not a quick fix)
-- **`TestCumulativeJoinLeaveJoinSync`** — re-syncs with a stale `since` token after join→leave→join; legacy `/sync` reuses sliding-sync's *ephemeral* `pos`, so the old token → `400 M_UNKNOWN_POS` (`legacy_sync/mod.rs:66`). Needs a durable legacy stream-position token (or tolerating a stale pos as an initial sync) — see the `GET` of room state / sync-token work, not a one-liner.
-- **`TestMembersLocal/*`** — *not viable*: the test fixture does `PUT /presence/{user}/status` before any subtest (`rooms_members_local_test.go:26`); presence is an out-of-scope EDU. Dropped, not parked.
+### Dropped — not viable
+- **`TestMembersLocal/*`** — the test fixture does `PUT /presence/{user}/status` before any subtest (`rooms_members_local_test.go:26`); presence is an out-of-scope EDU.
 
 Lower-confidence candidates not yet added (would need verifying they don't read `GET /state`):
 - `TestRoomsInvite/Parallel/Test_that_we_can_be_reinvited_to_a_room_we_created`

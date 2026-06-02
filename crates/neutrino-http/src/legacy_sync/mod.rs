@@ -58,12 +58,30 @@ pub(crate) async fn handle(
         }
     };
 
-    match sliding_sync::handle(&sync_state, &user_id, req).await {
+    // Legacy `since` tokens are durable: a client may sync from any past token
+    // forever. Sliding-sync's `pos`, which we map `since` onto, is the opposite
+    // — a single-cursor per-connection value that rejects anything but the
+    // last-issued one with `UnknownPos` (a v5-only reconnect signal). So on an
+    // unknown/stale token we don't 400; we fall back to a full initial sync,
+    // which returns current state under a fresh token. (Stale tokens collapse to
+    // "state now" rather than a true cumulative delta — see docs/legacy-sync-stub.md.)
+    let resp = match sliding_sync::handle(&sync_state, &user_id, req).await {
+        Err(SyncError::UnknownPos) => {
+            let mut initial = synthesize_v5_request(&legacy_query);
+            initial.pos = None;
+            sliding_sync::handle(&sync_state, &user_id, initial).await
+        }
+        other => other,
+    };
+
+    match resp {
         Ok(v5_resp) => {
             let body = translate_response(v5_resp, &memberships);
             (StatusCode::OK, Json(body)).into_response()
         }
         Err(SyncError::UnknownPos) => {
+            // Unreachable in practice: an initial sync (pos = None) never raises
+            // this. Kept as a defensive mapping.
             error_response(StatusCode::BAD_REQUEST, "M_UNKNOWN_POS", "Unknown position")
         }
         Err(SyncError::BadRequest(msg)) => {
