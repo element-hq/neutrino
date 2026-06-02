@@ -240,6 +240,15 @@ fn build_router(state: AppState) -> Router {
             "/_matrix/client/v3/rooms/{room_id}/state/{type}",
             put(put_state_empty_key),
         )
+        // Empty state key may be sent with a trailing slash; the spec marks it
+        // optional ("when an empty string, the trailing slash on this endpoint
+        // is optional"), and clients (e.g. Complement setting power_levels) use
+        // it. axum treats `…/state/{type}/` as a path distinct from
+        // `…/state/{type}`, so it needs its own route.
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/state/{type}/",
+            put(put_state_empty_key),
+        )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/join",
             post(membership::join),

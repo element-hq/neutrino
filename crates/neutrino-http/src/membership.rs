@@ -6,7 +6,8 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    body::Bytes,
+    extract::{FromRequest, Path, Request, State},
     http::StatusCode,
     response::IntoResponse,
 };
@@ -15,6 +16,33 @@ use ruma::{OwnedUserId, RoomAliasId, RoomId, UserId};
 use serde_json::{Value, json};
 
 use crate::{AppState, AuthUser, error_response, lock_app, room_actor_response};
+
+/// Body extractor for the membership endpoints, whose request body is optional.
+/// `Option<Json<T>>` is not sufficient: axum yields `None` only when the
+/// `Content-Type` is absent, but rejects an **empty** body sent *with*
+/// `application/json` as a 400 — it runs `serde_json` on zero bytes (axum
+/// `json.rs`). Several clients (and Complement's bare `POST …/join`) send
+/// exactly that, so we treat an empty body as "no body" and otherwise parse
+/// leniently.
+pub(crate) struct OptionalBody(Option<Value>);
+
+impl<S: Send + Sync> FromRequest<S> for OptionalBody {
+    type Rejection = axum::response::Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let bytes = Bytes::from_request(req, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        if bytes.is_empty() {
+            return Ok(Self(None));
+        }
+        serde_json::from_slice(&bytes)
+            .map(|v| Self(Some(v)))
+            .map_err(|e: serde_json::Error| {
+                error_response(StatusCode::BAD_REQUEST, "M_NOT_JSON", &e.to_string())
+            })
+    }
+}
 
 /// Parse a room id from a path segment, returning a ready 400 response when
 /// it is malformed.
@@ -145,9 +173,9 @@ pub(crate) async fn join(
     state: State<AppState>,
     AuthUser(sender): AuthUser,
     Path(room_id): Path<String>,
-    body: Option<Json<Value>>,
+    OptionalBody(body): OptionalBody,
 ) -> axum::response::Response {
-    let body = body.as_ref().map(|j| &j.0);
+    let body = body.as_ref();
     let reason = body_reason(body);
     let room = match parse_room(&room_id) {
         Ok(r) => r,
@@ -185,9 +213,9 @@ pub(crate) async fn leave(
     state: State<AppState>,
     AuthUser(sender): AuthUser,
     Path(room_id): Path<String>,
-    body: Option<Json<Value>>,
+    OptionalBody(body): OptionalBody,
 ) -> axum::response::Response {
-    let body = body.as_ref().map(|j| &j.0);
+    let body = body.as_ref();
     let reason = body_reason(body);
     let room = match parse_room(&room_id) {
         Ok(r) => r,
@@ -229,7 +257,7 @@ pub(crate) async fn join_by_id_or_alias(
     state: State<AppState>,
     auth: AuthUser,
     Path(room_id_or_alias): Path<String>,
-    body: Option<Json<Value>>,
+    body: OptionalBody,
 ) -> axum::response::Response {
     if RoomAliasId::parse(&room_id_or_alias).is_ok() {
         return error_response(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No such room alias");
@@ -267,33 +295,49 @@ pub(crate) async fn invite(
     state: State<AppState>,
     AuthUser(sender): AuthUser,
     Path(room_id): Path<String>,
-    body: Option<Json<Value>>,
+    OptionalBody(body): OptionalBody,
 ) -> axum::response::Response {
-    targeted(
-        &state.0,
-        sender,
-        &room_id,
-        body.as_ref().map(|j| &j.0),
-        "invite",
-    )
-    .await
+    targeted(&state.0, sender, &room_id, body.as_ref(), "invite").await
 }
 
-/// `POST /rooms/{roomId}/kick` — force `body.user_id` to `leave`.
+/// `POST /rooms/{roomId}/kick` — force `body.user_id` to `leave`. A kick is only
+/// valid against a user who is in the room: if the target's current membership
+/// is `leave`/`ban` or they have no member event, Synapse 403s ("The target
+/// user is not in the room", `room_member.py:1027-1045`) rather than emitting a
+/// redundant `leave` (which v12 auth would otherwise accept from a powerful
+/// sender). We mirror that with a current-membership pre-check; only
+/// `join`/`invite`/`knock` are kickable.
 pub(crate) async fn kick(
     state: State<AppState>,
     AuthUser(sender): AuthUser,
     Path(room_id): Path<String>,
-    body: Option<Json<Value>>,
+    OptionalBody(body): OptionalBody,
 ) -> axum::response::Response {
-    targeted(
-        &state.0,
-        sender,
-        &room_id,
-        body.as_ref().map(|j| &j.0),
-        "leave",
-    )
-    .await
+    let body = body.as_ref();
+    let target = match body_target(body) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    let room = match parse_room(&room_id) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    match current_membership(&state.0, &room, &target).await {
+        Ok(Some(m)) if matches!(m.as_str(), "join" | "invite" | "knock") => {}
+        Ok(_) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "M_FORBIDDEN",
+                "The target user is not in the room",
+            );
+        }
+        Err(resp) => return resp,
+    }
+    let reason = body_reason(body);
+    match change_membership(&state.0, sender, &room, &target, "leave", reason.as_deref()).await {
+        Ok(()) => (StatusCode::OK, Json(json!({}))).into_response(),
+        Err(resp) => resp,
+    }
 }
 
 /// `POST /rooms/{roomId}/ban` — ban `body.user_id` from the room.
@@ -301,16 +345,9 @@ pub(crate) async fn ban(
     state: State<AppState>,
     AuthUser(sender): AuthUser,
     Path(room_id): Path<String>,
-    body: Option<Json<Value>>,
+    OptionalBody(body): OptionalBody,
 ) -> axum::response::Response {
-    targeted(
-        &state.0,
-        sender,
-        &room_id,
-        body.as_ref().map(|j| &j.0),
-        "ban",
-    )
-    .await
+    targeted(&state.0, sender, &room_id, body.as_ref(), "ban").await
 }
 
 /// `POST /rooms/{roomId}/unban` — lift a ban on `body.user_id` (membership
@@ -326,9 +363,9 @@ pub(crate) async fn unban(
     state: State<AppState>,
     AuthUser(sender): AuthUser,
     Path(room_id): Path<String>,
-    body: Option<Json<Value>>,
+    OptionalBody(body): OptionalBody,
 ) -> axum::response::Response {
-    let body = body.as_ref().map(|j| &j.0);
+    let body = body.as_ref();
     let target = match body_target(body) {
         Ok(t) => t,
         Err(resp) => return resp,

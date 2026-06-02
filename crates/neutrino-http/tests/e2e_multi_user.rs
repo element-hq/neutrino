@@ -394,6 +394,109 @@ async fn repeated_global_join_is_idempotent() {
     );
 }
 
+/// A membership POST with a genuinely empty body (0 bytes) sent with an
+/// `application/json` content-type must still succeed. `Option<Json<_>>` would
+/// 400 this (axum runs serde on zero bytes); the `OptionalBody` extractor treats
+/// it as "no body". Regression for the Complement bare `POST …/join` failure.
+#[tokio::test]
+async fn global_join_with_empty_body_succeeds() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (bob_id, bob_tok) = register(&app, "bob").await;
+
+    let (s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    // Empty body + application/json — exactly what Complement's bare POST sends.
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/_matrix/client/v3/join/{room_id}"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {bob_tok}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "empty-body join should succeed"
+    );
+    assert_eq!(
+        member_membership(&app, &room_id, &bob_id).await.as_deref(),
+        Some("join"),
+    );
+}
+
+/// Kicking a user who is not in the room (no member event, or already `leave`)
+/// is `403 M_FORBIDDEN`, not a silent no-op `leave` (Synapse parity).
+#[tokio::test]
+async fn kick_user_not_in_room_is_forbidden() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (bob_id, _bob_tok) = register(&app, "bob").await;
+
+    let (s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    let (s, body) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{room_id}/kick"),
+        Some(&alice_tok),
+        &json!({ "user_id": bob_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["errcode"], json!("M_FORBIDDEN"), "{body}");
+}
+
+/// `PUT /state/{type}/` with a trailing slash (empty state key) is accepted —
+/// the spec marks the trailing slash optional for an empty state key, and
+/// clients use it (Complement sets `m.room.power_levels` this way).
+#[tokio::test]
+async fn put_state_trailing_slash_empty_key_succeeds() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+
+    let (s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    let (s, body) = send(
+        &app,
+        "PUT",
+        &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.topic/"),
+        Some(&alice_tok),
+        &json!({ "topic": "hello" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert!(body["event_id"].is_string(), "{body}");
+}
+
 /// A joined user leaving themselves moves their membership to `leave`.
 #[tokio::test]
 async fn self_leave_sets_membership_to_leave() {

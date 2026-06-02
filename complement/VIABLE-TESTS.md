@@ -1,120 +1,102 @@
-# Viable Complement tests given the new `/v3/sync` translator
+# Viable Complement tests
 
-Audit date: 2026-05-27. Branch: `kaylendog/tests/complement` (delta vs `main`: legacy `/v3/sync` → sliding-sync translator only, +1715 LOC).
+Audit date: 2026-06-02. Re-audited after the **global `POST /_matrix/client/v3/join/{roomIdOrAlias}`** endpoint landed (the path Complement's `MustJoinRoom`/`JoinRoom` actually use — `complement-main/client/client.go:236-239`). Supersedes the 2026-05-27 audit, which predated the membership endpoints, the `/state` write routes, and the multi-user shim.
 
 ## Ground truth: what the axum router actually wires today
 
-From `crates/neutrino-http/src/lib.rs:99-144`:
+From `crates/neutrino-http/src/lib.rs:201-277`. The Complement image is built with **`--features multi-user-shim`** (`docker/complement/Dockerfile`), so distinct registered users get distinct tokens/identities — multi-user flows work.
 
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/_matrix/client/versions` | advertises `org.matrix.simplified_msc3575` + `org.matrix.msc4222` |
-| GET/POST | `/_matrix/client/{version}/login` | fixed-credential single-user stub |
-| POST | `/_matrix/client/{version}/register` | single-user stub |
+| GET/POST | `/_matrix/client/{version}/login` | per-user token stub (shim on) |
+| POST | `/_matrix/client/{version}/register` | two-step UIA stub, per-user token |
 | POST | `/_matrix/client/unstable/org.matrix.simplified_msc3575/sync` | MSC4186 |
-| GET | `/_matrix/client/v3/sync` | **NEW on this branch** — translates to MSC4186 |
-| POST | `/_matrix/client/v3/keys/{query,upload,device_signing/upload,signatures/upload}` | stubs |
-| GET | `/_matrix/client/v3/profile/{self}` | stub |
-| GET | `/_matrix/client/v3/user/{self}/account_data/{type}` | stub |
-| GET | `/_matrix/client/v3/room_keys/version` | stub |
-| POST | `/_matrix/client/v3/createRoom` | basic; **drops** `preset`, `topic`, `visibility`, `creation_content`, `initial_state`, `invite`, `room_alias_name`, `power_level_content_override`, `room_version` |
-| GET | `/_matrix/client/v3/capabilities` | advertises `m.room_versions.default = "12"`, `available = {"12": "stable"}` (see PLAN.md 2026-05-27 — the wire `room_version` is the MSC4242 unstable id, the advertised string is the stable `"12"` to keep `gomatrixserverlib.MustGetRoomVersion` happy) |
-| GET | `/_matrix/client/v3/rooms/{room_id}/members` | ignores `at`/`membership` filters |
-| PUT | `/_matrix/client/v3/rooms/{room_id}/send/{type}/{msg_id}` | the only write endpoint |
-| POST | `/_matrix/client/v3/pushers/set` | stub |
+| GET | `/_matrix/client/v3/sync` | legacy → MSC4186 translator; MSC4222 `state_after` dual-emitted; `invite`/`leave`+`ban`/`knock` buckets handled; **ignores `?filter=`** |
+| POST | `/_matrix/client/v3/createRoom` | honours `preset`/`visibility`/`invite[]`(+`is_direct`)/`name`/`topic`; **drops** `room_alias_name`, arbitrary `initial_state`, `power_level_content_override`, `creation_content`, `room_version` (no rejection — unknown versions still 200) |
+| GET | `/_matrix/client/v3/capabilities` | `m.room_versions.default = "12"` |
+| GET | `/_matrix/client/v3/rooms/{room_id}/members` | **ignores** `at` / `membership` / `not_membership` filters |
+| PUT | `/_matrix/client/v3/rooms/{room_id}/send/{type}/{msg_id}` | message events |
+| PUT | `/_matrix/client/v3/rooms/{room_id}/state/{type}/{state_key}` | state **write** |
+| PUT | `/_matrix/client/v3/rooms/{room_id}/state/{type}` | state write, empty key |
+| POST | `/_matrix/client/v3/rooms/{room_id}/join` | room-scoped join |
+| POST | `/_matrix/client/v3/join/{room_id_or_alias}` | **NEW** — global join; room **ids only** (valid alias → 404 `M_NOT_FOUND`), `server_name` ignored; idempotent re-join |
+| POST | `/_matrix/client/v3/rooms/{room_id}/{leave,invite,kick,ban,unban}` | `m.room.member` via the room actor; real v12 auth (rule 5) + state-res |
+| GET/POST | keys/*, profile (self), account_data (GET self), room_keys/version, pushers/set | stubs |
 
-PLAN.md lists `/state/{type}/{key}` PUT, `/state` GET, `/state/{type}/{key}` GET, `/event/{eventId}` GET, `/invite` POST, `/leave` POST — **none are wired**. The 404 fallback returns plain text, not `{"errcode": "M_UNRECOGNIZED", ...}`.
+**Still NOT wired** (these gate tests below):
+- **No GET of room state**: no `GET /rooms/{room}/state`, no `GET /rooms/{room}/state/{type}/{key}`. State is readable only via `/sync` or `GET /members`.
+- No `GET /rooms/{room}/event/{eventId}`, `GET /rooms/{room}/messages`.
+- No `POST /user/{uid}/filter` (+ `GET …/filter/{id}`) — blocks the large filtered-`/sync` tranche.
+- No `/joined_members`, `/joined_rooms`, `/publicRooms`, `/directory/room/{alias}` (no room directory).
+- No `/forget`, `/redact`, `/upgrade`, `/typing`, profile/displayname/avatar writes, account_data writes.
+- 404 fallback returns plain text, not `{"errcode":"M_UNRECOGNIZED"}`.
+- No EDUs / E2EE / receipts / presence / push rules; no working cross-server federation join.
 
-This drastically narrows what is genuinely viable. Complement's `MustJoinRoom` calls `POST /v3/join/{…}` (`client.go:226-239`) and `SendEventSynced` routes via `/state/…` whenever `StateKey != nil` (`client.go:419-429`) — both 404.
+**Harness constraint:** `scripts/complement.sh` runs `go test … ./tests/csapi/...` only. Tests outside `csapi` — `tests/msc4222/*` (the MSC4222 dual-emission suite), `tests/v12_test.go`, all `tests/federation_*` — are **not executed by the allowlist loop**. Running them needs a harness change (extra package globs), not just an allowlist line.
 
 ---
 
-## VIABLE today (zero code changes)
+## Already allowlisted (`complement/allowlist.txt`)
 
-### Already in `complement/allowlist.txt`
-1. `csapi/TestVersionStructure`
-2. `csapi/TestLogin/parallel/GET_/login_yields_a_set_of_flows`
-3. `csapi/TestLogin/parallel/POST_/login_can_login_as_user`
-4. `csapi/TestLogin/parallel/POST_/login_can_log_in_as_a_user_with_just_the_local_part_of_the_id`
-5. `csapi/TestRegistration/parallel/POST_{}_returns_a_set_of_flows`
-6. `csapi/TestRegistration/parallel/POST_/register_can_create_a_user`
-7. `csapi/TestRegistration/parallel/POST_/register_returns_the_same_device_id_as_that_in_the_request`
-8. `csapi/TestRegistration/parallel/POST_/register_allows_registration_of_usernames_with_$`
-9. `csapi/TestRegistration/parallel/Registration_accepts_non-ascii_passwords`
-10. `csapi/TestRoomCreate/Parallel/POST_/createRoom_makes_a_private_room`
-11. `csapi/TestRoomCreate/Parallel/POST_/createRoom_makes_a_private_room_with_invites`
-12. `csapi/TestRoomCreate/Parallel/POST_/createRoom_makes_a_public_room`
+`TestVersionStructure`; 3× `TestLogin/parallel/*`; 5× `TestRegistration/parallel/*`; `TestRoomCreate/Parallel/{makes_a_private_room, …_private_room_with_invites, …_public_room, Can_/sync_newly_created_room}`; 2× `TestRoomCreationReportsEventsToMyself/parallel/{m.room.create, m.room.member}`.
 
-### Candidates to add (single user; no second-user join, no `/state/…`, no `/event/…`)
-| Test | What it asserts | Risk |
+---
+
+## Newly allowlisted, now that global `/join` (+ membership endpoints + multi-user shim) landed
+
+Confirmed against a Complement run (2026-06-02). 12 entries are now in `allowlist.txt`; 2 tests are parked (below). The empirical run surfaced three server fixes (all applied) — these are not test-selection issues, they were real gaps:
+- **empty-body POST → 400**: a bare `POST …/join` sends a 0-byte body with `application/json`; `Option<Json<_>>` 400s it. Replaced with an `OptionalBody` extractor that treats an empty body as `None`.
+- **kick of a non-member → 200**: now `403 M_FORBIDDEN` ("The target user is not in the room") via a current-membership pre-check, mirroring Synapse `room_member.py:1027-1045`.
+- **`PUT /state/{type}/` (trailing slash, empty key) → 404**: added the trailing-slash route (spec: "when an empty string, the trailing slash … is optional").
+
+| Test | Verifies via | Needed fix |
 |---|---|---|
-| `csapi/TestRoomCreate/Parallel/Can_/sync_newly_created_room` | After `createRoom`+`PUT /send`, the message appears in `/sync` | Low — exercises exactly the new translator end-to-end |
-| `csapi/TestRoomCreationReportsEventsToMyself/parallel/Room_creation_reports_m.room.create_to_myself` | Self sees create event in `/sync` | Low — pure single-user create+sync |
-| `csapi/TestRoomCreationReportsEventsToMyself/parallel/Room_creation_reports_m.room.member_to_myself` | Self sees own join member event in `/sync` | Low — same shape |
+| `TestRoomsInvite/Parallel/{Can_invite…, Uninvited…, Invited_user_can_reject_invite, …reject_invite_for_empty_room, Users_cannot_invite_themselves…, …already_in_the_room}` | `/sync` invite/join/leave + 403s | none (passed as-is) |
+| `TestGetRoomMembers` | `GET /members` | none |
+| `TestRoomMembers/Parallel/POST_/rooms/:room_id/join_can_join_a_room` | join 200 + `/sync` | empty-body extractor |
+| `TestRoomMembers/Parallel/POST_/join/:room_id_can_join_a_room` | join 200 + `/sync` (global path) | empty-body extractor |
+| `TestCannotKickNonPresentUser` | kick 403 | kick non-member 403 |
+| `TestCannotKickLeftUser` | `/sync` + kick 403 | kick non-member 403 |
+| `TestNotPresentUserCannotBanOthers` | PUT power_levels + ban 403 | trailing-slash state route |
 
-These three are the highest-value adds because they directly validate the new `/v3/sync` translator's join-bucket shape on a single user, without needing any unimplemented endpoint. Recommend running them empirically first; if they pass, allowlist.
+### Parked (failed the run; not a quick fix)
+- **`TestCumulativeJoinLeaveJoinSync`** — re-syncs with a stale `since` token after join→leave→join; legacy `/sync` reuses sliding-sync's *ephemeral* `pos`, so the old token → `400 M_UNKNOWN_POS` (`legacy_sync/mod.rs:66`). Needs a durable legacy stream-position token (or tolerating a stale pos as an initial sync) — see the `GET` of room state / sync-token work, not a one-liner.
+- **`TestMembersLocal/*`** — *not viable*: the test fixture does `PUT /presence/{user}/status` before any subtest (`rooms_members_local_test.go:26`); presence is an out-of-scope EDU. Dropped, not parked.
+
+Lower-confidence candidates not yet added (would need verifying they don't read `GET /state`):
+- `TestRoomsInvite/Parallel/Test_that_we_can_be_reinvited_to_a_room_we_created`
+- `TestTentativeEventualJoiningAfterRejecting`
 
 ---
 
-## NOT VIABLE without further endpoint work
+## Still blocked, grouped by the one missing capability
 
-Grouped by what would need to land.
+### `GET` of room state (`GET /rooms/{room}/state[/{type}/{key}]`) — the biggest remaining unlock
+The whole read-back surface: most of `rooms_state_test.go` and `apidoc_room_state_test.go`, all of `power_levels_test.go`, `apidoc_room_create_test.go`'s name/topic/version subtests, `TestRoomsInvite/…/Invited_user_can_see_room_metadata`, the `apidoc_room_members` invite/ban/leave/reinvite subtests, and `TestLeftRoomFixture/Can_get_…state…`. These PUT or createRoom fine but then `GET /state` to assert — which 404s.
 
-### Need `POST /_matrix/client/v3/join/{roomIdOrAlias}` (the biggest unlock)
-Without this, every multi-user test 404s on `MustJoinRoom`. Affects ~80% of the room/state/membership suite:
-- `csapi/TestCumulativeJoinLeaveJoinSync`, `csapi/TestSyncLeaveSection` subtests, `csapi/TestLeaveEventInviteRejection`
-- `msc4222/TestSync/*` (both `public_room` and `private_room` subtests) — these would otherwise be the marquee validation for the new translator + MSC4222 dual-emission
-- All of `csapi/room_members_test.go`, `csapi/rooms_invite_test.go`, `csapi/rooms_members_local_test.go`, `csapi/apidoc_room_members_test.go`
+### `POST /user/{uid}/filter` (could be a no-op opaque-id stub)
+Blocks nearly all of `sync_test.go` and `sync_archive_test.go` (`TestSync/*`, `TestSyncLeaveSection/*`, `TestArchivedRoomsHistory/*`, `TestLeaveEventInviteRejection`, …) — they create a filter first and pass its id to `/sync`. A stub returning any id + `GET …/filter/{id} → {}` would unlock the tranche cheaply, since the translator already ignores `?filter=`.
 
-### Need `PUT /rooms/{}/state/{type}/{state_key}` + `GET /rooms/{}/state[/...]`
-Unlocks the room/state read/write surface that PLAN.md already plans:
-- `csapi/TestRoomCreate/Parallel/…makes_a_room_with_a_{name,topic}`, `…initial_state` variants
-- `csapi/rooms_state_test.go` — most subtests
-- `csapi/apidoc_room_state_test.go` — most subtests
-- `csapi/power_levels_test.go`
-- `tests/v12_test.go::TestMSC4291RoomIDAsHashOfCreateEvent` — would be the cleanest v12/MSC4242 smoke test (pure local, no federation)
+### `GET /rooms/{room}/event/{eventId}` / `GET /rooms/{room}/messages`
+`apidoc_room_history_visibility_test.go::TestFetchEvent`; `txnid_test.go::TestTxnInEvent`; `power_levels_test.go` (reads the PL event by id); `TestLeftRoomFixture/Can_get_…messages…`.
 
-### Need `GET /rooms/{}/event/{eventId}`
-- `csapi/apidoc_room_history_visibility_test.go::TestFetchEvent`
-- `csapi/txnid_test.go::TestTxnInEvent` (also blocked on txn dedup, deleted 2026-05-26)
+### `/members` query filters (`at`, `membership`, `not_membership`)
+`TestGetRoomMembersAtPoint`, all `TestGetFilteredRoomMembers/*` — we ignore the filters, so the asserted subset is wrong.
 
-### Need state-res (Phase 4c/6) — federation `/get_missing_events` tests
-The endpoint itself landed (2026-05-28); the two Complement tests targeting it remain blocked because both reach the endpoint via a federated join, which needs state-res:
-- `tests/federation_room_join_test.go::TestInboundCanReturnMissingEvents` — requires `charlie` to federate-join the room before the endpoint is reached. Federated join needs state-res (Phase 4c) and accept-on-`send_join` (Phase 6). Also asserts history-visibility redaction, which Neutrino defers per trusted-mesh model.
-- `tests/federation_room_get_missing_events_test.go::TestGetMissingEventsGapFilling` — outbound test (SUT calls `/get_missing_events` on the peer). Requires us to receive a federation `/send` transaction, detect the gap, and call out — state-res-blocked.
+### createRoom fidelity (`room_version` rejection, `initial_state`, `power_level_content_override`, `room_alias_name`)
+`TestRoomCreate/…/{with a name, with a topic[…], given version, rejects …versions}`, `TestDemotingUsersViaUsersDefault`, `TestRoomState/…/GET /directory/room…`. createRoom silently drops these (and never 400s an unknown version).
 
-Do not add to `complement/allowlist.txt` until Phase 4c + 6 land.
-
-### Need `POST /user/{uid}/filter` (could be a no-op opaque-ID stub)
-The translator already ignores `?filter=` — a minimal stub returning any filter_id would unlock the largest tranche of legacy-sync tests against the new translator:
-- `csapi/TestSync/parallel/Can_sync_a_joined_room`
-- `csapi/TestSync/parallel/Full_state_sync_includes_joined_rooms`
-- `csapi/TestSync/parallel/Newly_joined_room_is_included_in_an_incremental_sync`
-- `csapi/TestSyncLeaveSection/Left_rooms_appear_in_the_leave_section_of_sync` (also needs join)
-- `csapi/TestSyncLeaveSection/Newly_left_rooms_appear_in_the_leave_section_of_incremental_sync` (also needs join)
-
-The stub need only `POST /user/{uid}/filter → {"filter_id": "<uuid>"}` and `GET /user/{uid}/filter/{id} → {}`.
-
-### Hard NO (out of scope per CLAUDE.md / PLAN.md)
-- All federation tests (`tests/federation_*`, `tests/msc3902`, `TestMSC4297StateResolutionV2_1_*`, `TestMSC4291…AuthEventsOmitsCreateEvent`, `TestComplementCanCreateValidV12Rooms`, `TestMSC4311FullCreateEventOnStrippedState`)
-- All E2EE / device-list / cross-signing / key-backup tests
-- All EDU tests (typing, presence, receipts, to-device)
-- Account data, push rules, ignored users
-- Media, search, user directory, public-rooms directory
-- Room aliases, hierarchy/spaces
-- `/messages`, `/redact`, `/forget`, `/upgrade`, `/kick`, `/ban`, `/unban`, `/typing`, `/devices`
-- Profile per-user APIs
-- All `tests/msc{2836,3391,3757,3874,3890,3930,3967,4140,4155,4306}` directories
+### Presence / EDU / federation (out of scope per CLAUDE.md / PLAN.md)
+`TestMembersLocal/…presence…`, `TestPresenceSyncDifferentRooms`, `TestSync/…presence/device-list…`, `TestSyncTimelineGap` (remote events), all `tests/federation_*`, E2EE/device-list/key-backup, account-data/push/ignored-users, media/search/directory, aliases/spaces, `/forget`/`/redact`/`/upgrade`/`/typing`.
 
 ---
 
 ## Cheap-win ordering (impact / effort)
 
-1. **Try `Can_/sync_newly_created_room` + the two `TestRoomCreationReportsEventsToMyself` create/member subtests as-is.** If green, allowlist them — three direct validations of the new translator with no new endpoints. (Effort: 0.)
-2. **Add a no-op `POST /user/{uid}/filter` stub** → unlocks 3–5 `TestSync/*` subtests once `/v3/join` lands. (Effort: ~30 lines.)
-3. **Add `POST /_matrix/client/v3/join/{roomIdOrAlias}`** → unlocks `msc4222/TestSync/*` (the marquee MSC4222 dual-emission validation), `TestCumulativeJoinLeaveJoinSync`, and the rest of the sync surveyor's PARTIAL list.
-4. **Add `PUT /state/{type}/{key}` + `GET /state[/...]`** → unlocks v12/MSC4291 hash-as-ID test plus the room-state read/write tranche.
-5. **Add `GET /rooms/{}/event/{eventId}`** → unlocks history-visibility fetch tests.
-6. **Make the 404 fallback emit `{"errcode": "M_UNRECOGNIZED", ...}`** → unlocks `TestUnknownEndpoints/Client-server_endpoints` (and is just generally right per the spec).
-
-A pure-local Rust regression test asserting that events emitted by `createRoom` carry `prev_state_events` and no on-wire `auth_events` (the MSC4242 contract) would close a real coverage gap that Complement does not cover at the CSAPI layer.
+1. **Empirically run the 15 "newly viable" candidates above; allowlist the green ones.** Headline: `TestCumulativeJoinLeaveJoinSync` + the `TestRoomsInvite/Parallel` invite-flow subtests. (Effort: 0 code; one Complement run.)
+2. **No-op `POST /user/{uid}/filter` stub** → unlocks the `TestSync/*` + `TestSyncLeaveSection/*` tranche. (~30 lines.)
+3. **`GET /rooms/{room}/state[/{type}/{key}]`** → unlocks the entire state read-back surface (`rooms_state`, `apidoc_room_state`, `power_levels`, createRoom name/topic, apidoc_room_members invite/ban/leave). Largest single unlock.
+4. **`GET /rooms/{room}/event/{eventId}`** → history-visibility fetch + power-levels-by-id tests.
+5. **Teach `scripts/complement.sh` to also run `./tests/msc4222/...`** → the marquee MSC4222 `state_after` dual-emission validation (`tests/msc4222/TestSync/*`), currently unreachable because the runner is csapi-only.
+6. **404 fallback → `{"errcode":"M_UNRECOGNIZED"}`** → `TestUnknownEndpoints/*`, and correct per spec.
