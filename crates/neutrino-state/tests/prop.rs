@@ -27,13 +27,15 @@ use neutrino_state::auth_events::{auth_event_keys, calculate_auth_events};
 use neutrino_state::auth_rules::check_auth_rules;
 use neutrino_state::event_id::EventBuilder;
 use neutrino_state::provider::{InMemoryStateProvider, StateProvider};
+use neutrino_state::room_core::{Effect, RoomCore};
 use neutrino_state::state_res::{
-    auth_chain_difference, conflicted_subgraph, iterative_auth_checks, power_of_sender,
-    resolve_state, reverse_topological_power_sort, separate,
+    StateBeforeCache, auth_chain_difference, conflicted_subgraph, iterative_auth_checks,
+    power_of_sender, resolve_state, reverse_topological_power_sort, separate, state_at_heads,
 };
 use neutrino_state::validate::parse_event;
 use neutrino_state::{Event, FormatError, StateMap};
 use proptest::prelude::*;
+use proptest::test_runner::TestCaseError;
 use ruma::{OwnedEventId, OwnedUserId, RoomId, room_id};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
@@ -1396,5 +1398,313 @@ proptest! {
             create_ids.contains(picked),
             "resolved create id {picked} not among input candidates"
         );
+    }
+}
+
+// ---------- RoomCore state-DAG forks & merges: "every event accepted" ----------
+//
+// A *structural* generator for state-DAG forks and merges driven through
+// `RoomCore::apply_pdu`. Alice is the sole sender and the room creator, so she
+// holds implicit maximum power (v12 rule 10.4): every state event (topic) and
+// message event she authors passes auth, and state events are never
+// soft-failed. The oracle is therefore trivial — `apply_pdu` must *accept*
+// every generated event (none `rejected`, none `soft_failed`). Any rejection
+// is unambiguously a generator flaw (broken `prev_events` / `prev_state_events`
+// linkage, a topological-order violation, a timestamp collision yielding a
+// duplicate event_id, or head-set mistracking) rather than an auth-engine
+// verdict — exactly what we want to surface first, before the auth-aware
+// generator (which needs a faithful shadow model) is layered on top.
+//
+// The generator tracks the two head-sets the same way `apply_pdu` does —
+// accepting an event E updates a head-set as `(heads \ E.prevs) ∪ {E}`. A fork
+// is two events naming the same parent in `prev_state_events`; a merge is one
+// event naming two parents. Timestamps are a pure function of build order
+// (`base + counter`) so event_ids are distinct and reproducible, and every
+// event is built exactly once. Applies run in build order, which is a valid
+// topological order by construction (order-independence is a later milestone).
+
+const FORK_MERGE_SENDER: &str = "@alice:example.org";
+const FORK_MERGE_TS_BASE: u64 = 1_700_000_000_000;
+
+/// One generator step. `Extend`/`Fork` carry a head selector applied modulo the
+/// live state-head count; `Merge` collapses the first two state heads (falling
+/// back to a linear extend when fewer than two exist).
+#[derive(Debug, Clone)]
+enum DagOp {
+    Extend(usize),
+    Fork(usize),
+    Merge,
+    Message,
+}
+
+fn dag_op() -> impl Strategy<Value = DagOp> {
+    prop_oneof![
+        3 => any::<u8>().prop_map(|i| DagOp::Extend(i as usize)),
+        3 => any::<u8>().prop_map(|i| DagOp::Fork(i as usize)),
+        3 => Just(DagOp::Merge),
+        1 => Just(DagOp::Message),
+    ]
+}
+
+/// `(heads \ remove) ∪ {add}`, preserving order and avoiding duplicates —
+/// mirrors the head-set update `apply_pdu` performs on acceptance.
+fn heads_after(
+    heads: &[OwnedEventId],
+    remove: &[OwnedEventId],
+    add: &OwnedEventId,
+) -> Vec<OwnedEventId> {
+    let mut out: Vec<OwnedEventId> = heads
+        .iter()
+        .filter(|h| !remove.contains(h))
+        .cloned()
+        .collect();
+    if !out.contains(add) {
+        out.push(add.clone());
+    }
+    out
+}
+
+fn build_create() -> Event {
+    EventBuilder::new(
+        FORK_MERGE_SENDER.parse().expect("user"),
+        "m.room.create".to_owned(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .origin_server_ts(FORK_MERGE_TS_BASE)
+    .build()
+    .expect("create builds")
+}
+
+/// Alice's self-join, rule-5.3.1 shape: `prev_events == prev_state_events ==
+/// [create_id]`. `auth_events` is left for `apply_pdu` to compute.
+fn build_join(room: &RoomId, create_id: &OwnedEventId, ts: u64) -> Event {
+    EventBuilder::new(
+        FORK_MERGE_SENDER.parse().expect("user"),
+        "m.room.member".to_owned(),
+    )
+    .room_id(room.to_owned())
+    .state_key(FORK_MERGE_SENDER.to_owned())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create_id.clone()])
+    .prev_state_events(vec![create_id.clone()])
+    .origin_server_ts(ts)
+    .build()
+    .expect("join builds")
+}
+
+/// A topic state event on the given state heads (used for both `prev_events`
+/// and `prev_state_events` so the timeline DAG mirrors the state DAG through
+/// state events). `topic` content is redaction-stripped, so distinct ids rely
+/// on the monotonic `ts`.
+fn build_topic(room: &RoomId, ts: u64, prev: Vec<OwnedEventId>) -> Event {
+    EventBuilder::new(
+        FORK_MERGE_SENDER.parse().expect("user"),
+        "m.room.topic".to_owned(),
+    )
+    .room_id(room.to_owned())
+    .state_key(String::new())
+    .content(json!({ "topic": format!("t{ts}") }))
+    .prev_events(prev.clone())
+    .prev_state_events(prev)
+    .origin_server_ts(ts)
+    .build()
+    .expect("topic builds")
+}
+
+/// A message on the current timeline heads. Carries the state heads in
+/// `prev_state_events` so state-before-event resolves to the live state and
+/// the soft-fail check passes (alice is joined).
+fn build_message(
+    room: &RoomId,
+    ts: u64,
+    timeline_heads: Vec<OwnedEventId>,
+    state_heads: Vec<OwnedEventId>,
+) -> Event {
+    EventBuilder::new(
+        FORK_MERGE_SENDER.parse().expect("user"),
+        "m.room.message".to_owned(),
+    )
+    .room_id(room.to_owned())
+    .content(json!({ "msgtype": "m.text", "body": format!("m{ts}") }))
+    .prev_events(timeline_heads)
+    .prev_state_events(state_heads)
+    .origin_server_ts(ts)
+    .build()
+    .expect("message builds")
+}
+
+/// Drives a generated recipe through a real `RoomCore`, maintaining a shadow
+/// copy of the two head-sets so each event is built on the right parents.
+struct ForkMergeRun {
+    room: RoomCore,
+    provider: InMemoryStateProvider,
+    state_heads: Vec<OwnedEventId>,
+    timeline_heads: Vec<OwnedEventId>,
+    ts: u64,
+}
+
+impl ForkMergeRun {
+    fn bootstrap() -> Result<Self, TestCaseError> {
+        let create = build_create();
+        let room_id = room_id_from_create(&create.event_id);
+        let mut run = ForkMergeRun {
+            room: RoomCore::new(room_id),
+            provider: InMemoryStateProvider::new(),
+            state_heads: Vec::new(),
+            timeline_heads: Vec::new(),
+            ts: FORK_MERGE_TS_BASE,
+        };
+        let create_id = run.apply_accepted(create)?.event_id.clone();
+        let join_ts = run.next_ts();
+        let join = build_join(run.room.room_id(), &create_id, join_ts);
+        let join_id = run.apply_accepted(join)?.event_id.clone();
+        run.state_heads = vec![join_id.clone()];
+        run.timeline_heads = vec![join_id];
+        Ok(run)
+    }
+
+    fn next_ts(&mut self) -> u64 {
+        self.ts += 1;
+        self.ts
+    }
+
+    /// Apply one event, assert it was accepted (not rejected, not soft-failed),
+    /// persist the accepted form (with its computed `auth_events`, so later
+    /// `auth_chain` walks resolve) into the provider, and return it.
+    fn apply_accepted(&mut self, event: Event) -> Result<Arc<Event>, TestCaseError> {
+        let id = event.event_id.clone();
+        let effects = self.room.apply_pdu(event, &self.provider).map_err(|e| {
+            TestCaseError::fail(format!(
+                "apply_pdu errored on a creator-authored event {id} (broken ancestry?): {e}"
+            ))
+        })?;
+        let persisted = match effects.first() {
+            Some(Effect::Persist { event }) => event.clone(),
+            other => {
+                return Err(TestCaseError::fail(format!(
+                    "expected a Persist effect for {id}, got {other:?}"
+                )));
+            }
+        };
+        prop_assert!(
+            !persisted.rejected,
+            "creator-authored event {id} was rejected — generator flaw"
+        );
+        prop_assert!(
+            !persisted.soft_failed,
+            "creator-authored event {id} was soft-failed — generator flaw"
+        );
+        self.provider.insert(persisted.clone());
+        Ok(persisted)
+    }
+
+    /// Apply a topic event on `prev` (a subset of the state heads) and advance
+    /// both head-sets exactly as `apply_pdu` does for an accepted state event.
+    fn apply_state(&mut self, prev: Vec<OwnedEventId>) -> Result<(), TestCaseError> {
+        let ts = self.next_ts();
+        let event = build_topic(self.room.room_id(), ts, prev.clone());
+        let id = self.apply_accepted(event)?.event_id.clone();
+        self.state_heads = heads_after(&self.state_heads, &prev, &id);
+        self.timeline_heads = heads_after(&self.timeline_heads, &prev, &id);
+        Ok(())
+    }
+
+    fn run_op(&mut self, op: DagOp) -> Result<(), TestCaseError> {
+        let len = self.state_heads.len();
+        match op {
+            DagOp::Extend(i) => {
+                let tip = self.state_heads[i % len].clone();
+                self.apply_state(vec![tip])?;
+            }
+            DagOp::Fork(i) => {
+                let tip = self.state_heads[i % len].clone();
+                self.apply_state(vec![tip.clone()])?;
+                self.apply_state(vec![tip])?;
+            }
+            DagOp::Merge => {
+                if len >= 2 {
+                    let a = self.state_heads[0].clone();
+                    let b = self.state_heads[1].clone();
+                    self.apply_state(vec![a, b])?;
+                } else {
+                    let tip = self.state_heads[0].clone();
+                    self.apply_state(vec![tip])?;
+                }
+            }
+            DagOp::Message => {
+                let ts = self.next_ts();
+                let event = build_message(
+                    self.room.room_id(),
+                    ts,
+                    self.timeline_heads.clone(),
+                    self.state_heads.clone(),
+                );
+                let id = self.apply_accepted(event)?.event_id.clone();
+                // A message advances only the timeline DAG, and references every
+                // timeline head, so the head-set collapses to just the message.
+                let prev = self.timeline_heads.clone();
+                self.timeline_heads = heads_after(&self.timeline_heads, &prev, &id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Post-run invariants beyond per-event acceptance.
+    fn verify(&self) -> Result<(), TestCaseError> {
+        // The incrementally-maintained current_state must equal a from-scratch
+        // resolution at the live state heads (incremental == batch).
+        let mut cache = StateBeforeCache::new();
+        let heads: Vec<OwnedEventId> = self
+            .room
+            .state_forward_extremities()
+            .iter()
+            .cloned()
+            .collect();
+        let fresh = state_at_heads(&heads, &self.provider, &mut cache)
+            .map_err(|e| TestCaseError::fail(format!("state_at_heads failed: {e}")))?;
+        let incremental: StateMap<OwnedEventId> = self
+            .room
+            .current_state()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.event_id.clone()))
+            .collect();
+        prop_assert_eq!(
+            &incremental,
+            &fresh,
+            "current_state diverged from a fresh resolution at the state heads"
+        );
+        // The create event and alice's membership are always resolved.
+        prop_assert!(
+            self.room
+                .current_state()
+                .contains_key(&("m.room.create".to_string(), String::new())),
+            "create event missing from current_state"
+        );
+        prop_assert!(
+            self.room
+                .current_state()
+                .contains_key(&("m.room.member".to_string(), FORK_MERGE_SENDER.to_string())),
+            "alice's membership missing from current_state"
+        );
+        Ok(())
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// A creator-only fork/merge DAG: every generated event must be accepted by
+    /// `apply_pdu`, and the resolved state stays consistent with a from-scratch
+    /// resolution at the state heads.
+    #[test]
+    fn creator_only_fork_merge_dag_accepts_every_event(
+        ops in prop::collection::vec(dag_op(), 1..14),
+    ) {
+        let mut run = ForkMergeRun::bootstrap()?;
+        for op in ops {
+            run.run_op(op)?;
+        }
+        run.verify()?;
     }
 }
