@@ -11,7 +11,7 @@ use axum::{
     response::IntoResponse,
 };
 use neutrino_store::{RoomStore, StateStore};
-use ruma::{OwnedUserId, RoomId, UserId};
+use ruma::{OwnedUserId, RoomAliasId, RoomId, UserId};
 use serde_json::{Value, json};
 
 use crate::{AppState, AuthUser, error_response, lock_app, room_actor_response};
@@ -135,7 +135,12 @@ async fn change_membership(
 }
 
 /// `POST /rooms/{roomId}/join` — the caller joins the room. Returns the room
-/// id per spec.
+/// id per spec. Re-joining when already `join` is an idempotent `200` with no
+/// new event (Synapse `room_member.py:1015-1025`); without this short-circuit
+/// every call would stack a duplicate `m.room.member` join into the timeline.
+/// Only the `join` state is skipped — `invite`/`leave`/`ban`/absent all fall
+/// through so accepting an invite, re-joining after leaving, or a public join
+/// still emit an event (and `ban` is left for the auth rules to reject).
 pub(crate) async fn join(
     state: State<AppState>,
     AuthUser(sender): AuthUser,
@@ -148,6 +153,13 @@ pub(crate) async fn join(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    match current_membership(&state.0, &room, &sender).await {
+        Ok(Some(m)) if m == "join" => {
+            return (StatusCode::OK, Json(json!({ "room_id": room }))).into_response();
+        }
+        Ok(_) => {}
+        Err(resp) => return resp,
+    }
     match change_membership(
         &state.0,
         sender.clone(),
@@ -202,6 +214,27 @@ pub(crate) async fn leave(
         Ok(()) => (StatusCode::OK, Json(json!({}))).into_response(),
         Err(resp) => resp,
     }
+}
+
+/// `POST /join/{roomIdOrAlias}` — the global join endpoint most clients (and
+/// Complement's `MustJoinRoom`) use; for a room *id* it is the same operation as
+/// the room-scoped [`join`], so it delegates straight to it. We have no room
+/// directory, so any syntactically valid alias (`#…`) is unresolvable: we report
+/// `404 M_NOT_FOUND` ("No such room alias", matching Synapse) rather than the
+/// `400` a room-id parse would give, so clients see the alias as *unknown* not
+/// *malformed*. A string that is neither a valid id nor a valid alias still
+/// falls through to [`join`]'s `400`. The `server_name` query param is accepted
+/// and ignored (single-server, trusted mesh).
+pub(crate) async fn join_by_id_or_alias(
+    state: State<AppState>,
+    auth: AuthUser,
+    Path(room_id_or_alias): Path<String>,
+    body: Option<Json<Value>>,
+) -> axum::response::Response {
+    if RoomAliasId::parse(&room_id_or_alias).is_ok() {
+        return error_response(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No such room alias");
+    }
+    join(state, auth, Path(room_id_or_alias), body).await
 }
 
 /// Shared body for the target-from-body endpoints (`invite`/`kick`/`ban`):

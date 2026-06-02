@@ -270,6 +270,130 @@ async fn join_public_room_without_invite_succeeds() {
     );
 }
 
+/// The global `POST /_matrix/client/v3/join/{roomIdOrAlias}` endpoint (the one
+/// Complement's `MustJoinRoom` uses) joins by room id and echoes `{room_id}`,
+/// just like the room-scoped `/rooms/{id}/join`. The `server_name` query param
+/// is accepted and ignored (single-server).
+#[tokio::test]
+async fn global_join_by_room_id_succeeds() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (bob_id, bob_tok) = register(&app, "bob").await;
+
+    let (s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    let (s, body) = send(
+        &app,
+        "POST",
+        &format!("/_matrix/client/v3/join/{room_id}?server_name=example.org"),
+        Some(&bob_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["room_id"], room_id, "global join echoes the room id");
+    assert_eq!(
+        member_membership(&app, &room_id, &bob_id).await.as_deref(),
+        Some("join"),
+        "bob should be joined after the global-join call"
+    );
+}
+
+/// The global join endpoint resolves room ids only. A syntactically valid room
+/// *alias* (`#…`) is unresolvable (we have no room directory), so it is reported
+/// as 404 `M_NOT_FOUND` — "unknown", not the 400 "malformed" a room-id parse
+/// would give — matching Synapse's "No such room alias".
+#[tokio::test]
+async fn global_join_by_alias_is_404() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+
+    // `%23` is `#`, the alias sigil; axum percent-decodes it before the handler.
+    let (s, body) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/join/%23somealias:example.org",
+        Some(&alice_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["errcode"], json!("M_NOT_FOUND"), "{body}");
+}
+
+/// Joining a room the caller is already in is idempotent: the second call
+/// still `200`s with the room id, but emits no new `m.room.member` event, so
+/// only one join is present in the timeline (Synapse parity — a no-op re-join
+/// reuses the existing membership event rather than stacking a duplicate).
+#[tokio::test]
+async fn repeated_global_join_is_idempotent() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (bob_id, bob_tok) = register(&app, "bob").await;
+
+    let (s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    let join = || async {
+        send(
+            &app,
+            "POST",
+            &format!("/_matrix/client/v3/join/{room_id}"),
+            Some(&bob_tok),
+            &json!({}),
+        )
+        .await
+    };
+    let (s1, b1) = join().await;
+    assert_eq!(s1, StatusCode::OK, "{b1}");
+    let (s2, b2) = join().await;
+    assert_eq!(s2, StatusCode::OK, "{b2}");
+    assert_eq!(
+        b2["room_id"], room_id,
+        "idempotent re-join still echoes the room id"
+    );
+
+    // Read the full timeline (generous limit) and count bob's join events.
+    let body = json!({
+        "lists": { "all": { "ranges": [[0, 99]], "timeline_limit": 50, "required_state": [] } }
+    });
+    let (s, sync) = send(&app, "POST", SYNC_PATH, Some(&bob_tok), &body).await;
+    assert_eq!(s, StatusCode::OK, "{sync}");
+    let joins = sync["rooms"][&room_id]["timeline"]
+        .as_array()
+        .map(|tl| {
+            tl.iter()
+                .filter(|ev| {
+                    ev["type"] == json!("m.room.member")
+                        && ev["state_key"] == json!(bob_id)
+                        && ev["content"]["membership"] == json!("join")
+                })
+                .count()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        joins, 1,
+        "exactly one join event after two join calls: {sync}"
+    );
+}
+
 /// A joined user leaving themselves moves their membership to `leave`.
 #[tokio::test]
 async fn self_leave_sets_membership_to_leave() {

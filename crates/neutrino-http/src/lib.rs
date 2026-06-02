@@ -245,6 +245,10 @@ fn build_router(state: AppState) -> Router {
             post(membership::join),
         )
         .route(
+            "/_matrix/client/v3/join/{room_id_or_alias}",
+            post(membership::join_by_id_or_alias),
+        )
+        .route(
             "/_matrix/client/v3/rooms/{room_id}/leave",
             post(membership::leave),
         )
