@@ -43,31 +43,30 @@ From `crates/neutrino-http/src/lib.rs:201-277`. The Complement image is built wi
 
 ---
 
-## Newly viable now that global `/join` (+ membership endpoints + multi-user shim) landed
+## Newly allowlisted, now that global `/join` (+ membership endpoints + multi-user shim) landed
 
-These were previously blocked **only** on `MustJoinRoom` 404ing the global join path, plus needing a real second user. They read their results via `/sync` or `GET /members` only — no `GET /state`, `/event`, `/messages`, or filter. **Run each empirically before adding to the allowlist** (legacy-`/sync` incremental-token and invite/leave-bucket semantics are the main residual risk; this audit is static).
+Confirmed against a Complement run (2026-06-02). 12 entries are now in `allowlist.txt`; 2 tests are parked (below). The empirical run surfaced three server fixes (all applied) — these are not test-selection issues, they were real gaps:
+- **empty-body POST → 400**: a bare `POST …/join` sends a 0-byte body with `application/json`; `Option<Json<_>>` 400s it. Replaced with an `OptionalBody` extractor that treats an empty body as `None`.
+- **kick of a non-member → 200**: now `403 M_FORBIDDEN` ("The target user is not in the room") via a current-membership pre-check, mirroring Synapse `room_member.py:1027-1045`.
+- **`PUT /state/{type}/` (trailing slash, empty key) → 404**: added the trailing-slash route (spec: "when an empty string, the trailing slash … is optional").
 
-| Test | Verifies via | Notes / risk |
+| Test | Verifies via | Needed fix |
 |---|---|---|
-| `TestCumulativeJoinLeaveJoinSync` | `/sync` join + leave sections | **Marquee single-user unlock** — join→leave→join across incremental syncs; asserts the room is not stuck in `rooms.leave`. Exercises the translator's leave bucket + `since` tokens. |
-| `TestRoomsInvite/Parallel/Can_invite_users_to_invite-only_rooms` | `/sync` invite→join | core invite/join flow |
-| `TestRoomsInvite/Parallel/Uninvited_users_cannot_join_the_room` | join 403 | auth rule 5 reject |
-| `TestRoomsInvite/Parallel/Invited_user_can_reject_invite` | `/sync` + leave | invite then leave |
-| `TestRoomsInvite/Parallel/Invited_user_can_reject_invite_for_empty_room` | `/sync` | both leave |
-| `TestRoomsInvite/Parallel/Users_cannot_invite_themselves_to_a_room` | invite 403 | |
-| `TestRoomsInvite/Parallel/Users_cannot_invite_a_user_that_is_already_in_the_room` | invite 403 | |
-| `TestRoomMembers/Parallel/POST_/rooms/:room_id/join_can_join_a_room` | join 200 | room-scoped join (apidoc_room_members) |
-| `TestRoomMembers/Parallel/POST_/join/:room_id_can_join_a_room` | join 200 | **the global-join path directly** |
-| `TestGetRoomMembers` | `GET /members` | no `at`/filter use; lists members |
-| `TestMembersLocal/Parallel/New_room_members_see_their_own_join_event` | `/sync` | |
-| `TestMembersLocal/Parallel/Existing_members_see_new_members'_join_events` | `/sync` | second user joins, first sees it |
-| `TestCannotKickNonPresentUser` | kick 403 | auth check |
-| `TestCannotKickLeftUser` | `/sync` + kick 403 | join/leave then kick |
-| `TestNotPresentUserCannotBanOthers` | PUT power_levels + ban 403 | state write + auth check |
+| `TestRoomsInvite/Parallel/{Can_invite…, Uninvited…, Invited_user_can_reject_invite, …reject_invite_for_empty_room, Users_cannot_invite_themselves…, …already_in_the_room}` | `/sync` invite/join/leave + 403s | none (passed as-is) |
+| `TestGetRoomMembers` | `GET /members` | none |
+| `TestRoomMembers/Parallel/POST_/rooms/:room_id/join_can_join_a_room` | join 200 + `/sync` | empty-body extractor |
+| `TestRoomMembers/Parallel/POST_/join/:room_id_can_join_a_room` | join 200 + `/sync` (global path) | empty-body extractor |
+| `TestCannotKickNonPresentUser` | kick 403 | kick non-member 403 |
+| `TestCannotKickLeftUser` | `/sync` + kick 403 | kick non-member 403 |
+| `TestNotPresentUserCannotBanOthers` | PUT power_levels + ban 403 | trailing-slash state route |
 
-Lower-confidence candidates (try, but more likely to fail than the above):
-- `TestRoomsInvite/Parallel/Test_that_we_can_be_reinvited_to_a_room_we_created` — writes power_levels via PUT `/state` and re-invites; viable only if it never reads back via `GET /state`.
-- `TestTentativeEventualJoiningAfterRejecting` — reject-then-join via `/sync`; verify no filter use.
+### Parked (failed the run; not a quick fix)
+- **`TestCumulativeJoinLeaveJoinSync`** — re-syncs with a stale `since` token after join→leave→join; legacy `/sync` reuses sliding-sync's *ephemeral* `pos`, so the old token → `400 M_UNKNOWN_POS` (`legacy_sync/mod.rs:66`). Needs a durable legacy stream-position token (or tolerating a stale pos as an initial sync) — see the `GET` of room state / sync-token work, not a one-liner.
+- **`TestMembersLocal/*`** — *not viable*: the test fixture does `PUT /presence/{user}/status` before any subtest (`rooms_members_local_test.go:26`); presence is an out-of-scope EDU. Dropped, not parked.
+
+Lower-confidence candidates not yet added (would need verifying they don't read `GET /state`):
+- `TestRoomsInvite/Parallel/Test_that_we_can_be_reinvited_to_a_room_we_created`
+- `TestTentativeEventualJoiningAfterRejecting`
 
 ---
 
