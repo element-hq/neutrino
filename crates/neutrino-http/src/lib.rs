@@ -14,7 +14,7 @@ use axum::{
 use neutrino_common::{Config, Event, ROOM_VERSION_ID};
 use neutrino_state::event_id::EventBuilder;
 use neutrino_state::provider::InMemoryStateProvider;
-use neutrino_state::room_core::RoomCore;
+use neutrino_state::room_core::{Effect, RoomCore};
 use neutrino_state::{CoreError, FormatError};
 use neutrino_store::{RoomStore, StateStore, StorageError};
 use neutrino_store_sqlite::SqliteStore;
@@ -606,6 +606,24 @@ enum CreateRoomError {
     Build(#[from] FormatError),
     #[error("initial event rejected by auth rules: {0}")]
     Apply(#[from] CoreError),
+    /// `apply_pdu` produced no `Persist` effect. createRoom events are
+    /// server-authored on valid heads, so they neither reject nor no-op —
+    /// unreachable in practice, surfaced rather than panicked on.
+    #[error("initial event produced no persist effect")]
+    NotApplied,
+}
+
+/// Pull the persisted (`auth_events`-stamped) event out of `apply_pdu`'s
+/// effects. createRoom always accepts its own server-authored events, so the
+/// `Persist` is always present; its absence is an internal bug.
+fn persisted_event(effects: Vec<Effect>) -> Result<Arc<Event>, CreateRoomError> {
+    effects
+        .into_iter()
+        .find_map(|e| match e {
+            Effect::Persist { event } => Some(event),
+            Effect::UpdateCurrentState(_) => None,
+        })
+        .ok_or(CreateRoomError::NotApplied)
 }
 
 /// Build the spec-mandated initial-state sequence for a new room, returning
@@ -632,7 +650,7 @@ fn build_initial_events(
 
     let mut room = RoomCore::new(create.room_id.clone());
     let mut provider = InMemoryStateProvider::new();
-    room.apply(create.clone(), &provider)?;
+    room.apply_pdu(create.clone(), &provider)?;
     provider.insert(Arc::new(create.clone()));
 
     let mut initial: Vec<Event> = Vec::new();
@@ -644,9 +662,12 @@ fn build_initial_events(
                 Some(state_key.to_owned()),
                 content,
             )?;
-            room.apply(ev.clone(), &provider)?;
-            provider.insert(Arc::new(ev.clone()));
-            initial.push(ev);
+            // apply_pdu is the sole authority for `auth_events`, stamping them
+            // onto the event it hands back via `Persist` — persist *that*, not
+            // the pre-apply build output (which has empty auth_events).
+            let stored = persisted_event(room.apply_pdu(ev, &provider)?)?;
+            provider.insert(stored.clone());
+            initial.push((*stored).clone());
             Ok(())
         };
 
@@ -835,7 +856,9 @@ fn room_actor_response(e: RoomActorError) -> axum::response::Response {
     let (status, code) = match &e {
         RoomActorError::UnknownRoom => (StatusCode::NOT_FOUND, "M_NOT_FOUND"),
         RoomActorError::Build(_) => (StatusCode::BAD_REQUEST, "M_BAD_JSON"),
-        RoomActorError::Apply(_) => (StatusCode::FORBIDDEN, "M_FORBIDDEN"),
+        RoomActorError::Apply(_) | RoomActorError::Rejected => {
+            (StatusCode::FORBIDDEN, "M_FORBIDDEN")
+        }
         RoomActorError::Storage(_) | RoomActorError::NotApplied | RoomActorError::ActorGone => {
             (StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN")
         }

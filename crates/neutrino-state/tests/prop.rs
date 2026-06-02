@@ -334,7 +334,7 @@ proptest! {
         event in arb_event(),
         (_, _, state) in arb_state_with_create(),
     ) {
-        let _ = check_auth_rules(&event, &state);
+        let _ = check_auth_rules(&event, &state, &InMemoryStateProvider::new());
     }
 
     /// Rule 5.3.1: a self-join event whose only ancestry (in both DAGs) is
@@ -385,7 +385,7 @@ proptest! {
             .origin_server_ts(join_ts)
             .build()
             .expect("self-join valid");
-        prop_assert!(check_auth_rules(&join, &state).is_ok());
+        prop_assert!(check_auth_rules(&join, &state, &InMemoryStateProvider::new()).is_ok());
     }
 }
 
@@ -400,6 +400,30 @@ proptest! {
 /// `auth_events`. The state-res functions don't look at the event body —
 /// only `event_id` and `auth_events` — so a minimal valid event suffices,
 /// and the computed event_id is what callers index by.
+/// Seed the create event for the placeholder room so `power_of_sender` can
+/// resolve the creator. The id is forced to that room's derived create id;
+/// only the create's id/sender/content matter.
+fn seed_placeholder_create(provider: &mut InMemoryStateProvider) {
+    let mut create = EventBuilder::new(
+        "@alice:example.org"
+            .parse::<OwnedUserId>()
+            .expect("user id"),
+        "m.room.create".to_owned(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .origin_server_ts(1_699_999_999_999)
+    .build()
+    .expect("create");
+    // `placeholder_arc_event` builds events in this room; the create id is its
+    // room_id with the `!` sigil swapped for `$` (v12 room-id derivation).
+    let room = room_id!("!room:example.org").to_owned();
+    let create_id = format!("${}", room.as_str().strip_prefix('!').expect("room sigil"));
+    create.event_id = create_id.parse().expect("create id");
+    create.room_id = room;
+    provider.insert(Arc::new(create));
+}
+
 fn placeholder_arc_event(ts: u64, auth_events: Vec<OwnedEventId>) -> Arc<Event> {
     Arc::new(
         EventBuilder::new(
@@ -443,6 +467,7 @@ fn arb_provider_with_ids() -> impl Strategy<Value = (InMemoryStateProvider, Vec<
         })
         .prop_map(|(n, parents_per_event)| {
             let mut provider = InMemoryStateProvider::new();
+            seed_placeholder_create(&mut provider);
             let mut ids: Vec<OwnedEventId> = Vec::with_capacity(n);
             for (i, parent_indices) in parents_per_event.iter().enumerate() {
                 // Parents must reference earlier indices to avoid forward

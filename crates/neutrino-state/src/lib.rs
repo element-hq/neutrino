@@ -155,6 +155,15 @@ pub enum FormatError {
 #[allow(non_camel_case_types)] // variant names track v12 spec rule numbers
 #[derive(Debug, Error)]
 pub enum AuthError {
+    /// The room's `m.room.create` event could not be resolved while building
+    /// the auth context — neither present in the supplied state nor fetchable
+    /// from the provider (a corrupt store, or a `room_id` with no create). An
+    /// event whose room create is unresolvable cannot be authorized. v12
+    /// excludes create from `auth_events`, so `AuthContext::new` derives it
+    /// from the `room_id`; this is the failure of that derivation.
+    #[error("m.room.create for the room could not be resolved")]
+    CreateUnavailable,
+
     /// `m.room.member` state_key did not parse as a Matrix user id (rule 9
     /// exempts `m.room.member` from the `@`-state_key format check, so rule 5
     /// is the first place this is detected). Raised by 5.4 / 5.5 / 5.6.
@@ -319,6 +328,14 @@ pub enum AuthError {
 /// preconditions.
 #[derive(Debug, Error)]
 pub enum ReferenceError {
+    /// The event's `room_id` is not a well-formed v12 room id, so no create
+    /// event id can be derived from it. A property of the event itself, not
+    /// of the store: re-applying after backfill cannot change the outcome,
+    /// so this is a DROP (non-retryable, never persisted), distinct from
+    /// [`Self::UnknownRoom`] (create simply not fetched yet — retryable).
+    #[error("malformed room_id, cannot derive create event id: {0}")]
+    MalformedRoomId(OwnedRoomId),
+
     /// v12 rule 2: the event's `room_id` does not correspond to any known
     /// `m.room.create` event.
     #[error("room not known: no create event with id derived from {0}")]
@@ -397,7 +414,7 @@ pub enum CoreError {
     Auth(#[from] AuthError),
     #[error(transparent)]
     StateRes(#[from] StateResError),
-    /// `RoomCore::apply` was called with an event whose `room_id` differs
+    /// `RoomCore::apply_pdu` was called with an event whose `room_id` differs
     /// from the `RoomCore`'s tracked room. Caller dispatched to the wrong
     /// per-room state machine; nothing on this `RoomCore` is mutated.
     #[error("event room_id `{actual}` does not match RoomCore room_id `{expected}`")]
@@ -405,4 +422,81 @@ pub enum CoreError {
         expected: OwnedRoomId,
         actual: OwnedRoomId,
     },
+}
+
+impl CoreError {
+    /// True when the failure means "we lack data" rather than "the event is
+    /// bad": missing ancestry (a `prev_state_events` entry or auth-chain link
+    /// not yet in the store, or an unknown room) or a transient storage fault.
+    /// The federation `/send` handler should backfill the gap and re-apply
+    /// rather than drop the event.
+    ///
+    /// This is the RETRY half of the disposition split documented on
+    /// [`RoomCore::apply_pdu`](crate::room_core::RoomCore::apply_pdu). It is
+    /// deliberately distinct from REJECT (an evaluable event that fails a
+    /// rule — returned as `Ok` with `Event.rejected`, never as an `Err`) and
+    /// from DROP (`RoomMismatch` / `Format`, a malformed-or-misrouted event
+    /// that is neither retryable nor persisted).
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            CoreError::Reference(
+                ReferenceError::PrevStateNotFound(_)
+                    | ReferenceError::UnknownRoom(_)
+                    | ReferenceError::Lookup(_),
+            ) | CoreError::StateRes(_)
+        )
+    }
+}
+
+#[cfg(test)]
+mod core_error_tests {
+    use super::*;
+
+    fn eid() -> OwnedEventId {
+        // v12 event id: `$` + base64url hash, no `:server` suffix.
+        "$Fw7pQdLu79h74bsZabn1UKXoXo7-q5M-cOwQxQxfh2c"
+            .parse()
+            .expect("event id")
+    }
+
+    fn rid() -> OwnedRoomId {
+        // v12 room id: `!` + the create event's hash, no `:server` suffix.
+        "!Fw7pQdLu79h74bsZabn1UKXoXo7-q5M-cOwQxQxfh2c"
+            .parse()
+            .expect("room id")
+    }
+
+    #[test]
+    fn retryable_covers_missing_ancestry_and_faults() {
+        // RETRY: we lack data — backfill and re-apply.
+        assert!(CoreError::Reference(ReferenceError::PrevStateNotFound(eid())).is_retryable());
+        assert!(CoreError::Reference(ReferenceError::UnknownRoom(rid())).is_retryable());
+        assert!(
+            CoreError::Reference(ReferenceError::Lookup(StateResError::MissingEvent(eid())))
+                .is_retryable()
+        );
+        assert!(CoreError::StateRes(StateResError::MissingEvent(eid())).is_retryable());
+        assert!(CoreError::StateRes(StateResError::Internal("db".into())).is_retryable());
+    }
+
+    #[test]
+    fn non_retryable_covers_reject_and_drop_classes() {
+        // REJECT-class references (bad data, not missing) and DROP (misrouted)
+        // are not retryable — re-applying would not change the verdict.
+        assert!(!CoreError::Reference(ReferenceError::PrevStateRejected(eid())).is_retryable());
+        assert!(
+            !CoreError::Reference(ReferenceError::PrevStateNotStateEvent(eid())).is_retryable()
+        );
+        assert!(
+            !CoreError::Reference(ReferenceError::PrevStateDifferentRoom(eid())).is_retryable()
+        );
+        assert!(
+            !CoreError::RoomMismatch {
+                expected: rid(),
+                actual: rid(),
+            }
+            .is_retryable()
+        );
+    }
 }

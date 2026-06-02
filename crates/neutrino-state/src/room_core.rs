@@ -67,7 +67,7 @@ use crate::event_id::EventBuilder;
 use crate::provider::StateProvider;
 use crate::state_res;
 use crate::validate;
-use crate::{CoreError, FormatError, StateDelta, StateMap, StateResError};
+use crate::{CoreError, FormatError, ReferenceError, StateDelta, StateMap, StateResError};
 
 /// Provider wrapper that transparently resolves a single `local_event` —
 /// the event currently being applied — while delegating everything else to
@@ -227,11 +227,11 @@ impl RoomCore {
 
     /// Build a locally-originated event sitting on the room's current heads —
     /// all in memory. `prev_events` / `prev_state_events` come from the two
-    /// head-sets; `auth_events` are calculated server-side from
-    /// state-before-event, which for an event sitting on the current heads is
-    /// `current_state`. `state_key = None` builds a message event, `Some(_)`
-    /// a state event. The result is ready to feed straight back into
-    /// [`apply`](Self::apply) (or to persist as part of an initial batch).
+    /// head-sets. `state_key = None` builds a message event, `Some(_)` a state
+    /// event. The result is ready to feed straight back into
+    /// [`apply_pdu`](Self::apply_pdu) (or to persist as part of an initial
+    /// batch) — `auth_events` are deliberately left empty here; `apply_pdu`
+    /// computes and stamps them as the sole authority (see its docs).
     pub fn build_local_event(
         &self,
         sender: OwnedUserId,
@@ -250,43 +250,68 @@ impl RoomCore {
         if let Some(sk) = state_key {
             builder = builder.state_key(sk);
         }
-        let mut event = builder.build()?;
-        let current_ids: StateMap<OwnedEventId> = self
-            .current_state
-            .iter()
-            .map(|(key, ev)| (key.clone(), ev.event_id.clone()))
-            .collect();
-        event.auth_events = calculate_auth_events(&event, &current_ids);
+        let event = builder.build()?;
         Ok(event)
     }
 
     /// Integrate a single event into the room. Returns the list of effects
     /// (in emission order) the caller should process. On hard-reject paths
     /// returns `Err(CoreError)` and emits no effects — the event must not
-    /// be persisted. If `event` is already a forward extremity of this
-    /// `RoomCore`, returns `Ok(vec![])` (idempotent no-op).
+    /// be persisted. If `event` is already persisted in `provider`, returns
+    /// `Ok(vec![])` (idempotent no-op).
+    ///
+    /// This is the single integration path for both locally-originated events
+    /// (built via [`build_local_event`](Self::build_local_event), then handed
+    /// straight here) and PDUs received over federation — there is nothing
+    /// "local" about an event once it has been built. The only caller-level
+    /// distinction is what to do with the verdict: a locally-refused event is
+    /// returned to the client as a 403 and discarded, whereas a federation
+    /// PDU that is rejected is still persisted (`rejected = true`) so it can
+    /// be referenced and is never re-requested.
+    ///
+    /// Three failure dispositions, distinguished so the caller can react:
+    /// - **DROP** (`Err`, never persisted): the event is not a valid PDU —
+    ///   `room_id` mismatch (a dispatch bug, not a verdict about the event)
+    ///   or `validate_pdu` malformed.
+    /// - **RETRY** (`Err`, caller backfills missing ancestry and re-applies):
+    ///   `ReferenceError::PrevStateNotFound` / `UnknownRoom`,
+    ///   `StateResError::MissingEvent`, or a storage fault. "We lack data",
+    ///   not "the event is bad". See [`CoreError::is_retryable`].
+    /// - **REJECT** (`Ok`, `event.rejected = true`, no FE/state mutation): the
+    ///   event is present and evaluable but fails a rule — auth against
+    ///   state-before-event, or a `prev_state_events` entry that is itself
+    ///   rejected / not a state event / in a different room (rejection
+    ///   cascades). The verdict is a deterministic function of the event and
+    ///   its references, never of this `RoomCore`'s in-memory state.
+    ///
+    /// **auth_events**: MSC4242 removes them from the wire, so `apply_pdu` is
+    /// their sole authority — it computes them from state-before-event and
+    /// stamps them onto the event before persisting. (For a locally-built
+    /// event, state-before-event equals current_state, so the result matches
+    /// what the builder would have computed; `build_local_event` therefore
+    /// does not set them.)
     ///
     /// **Assumed but verified**: `event` is the output of
     /// `EventBuilder::build()` or `Event::from_wire` — both of which run
     /// `validate::parse_event` (wire format) and `validate::validate_pdu`
-    /// (semantic rules) before yielding an `Event`. `apply` re-runs
+    /// (semantic rules) before yielding an `Event`. `apply_pdu` re-runs
     /// `validate_pdu` defensively so a hand-constructed `Event` that
     /// bypassed those constructors still can't smuggle a semantically-
     /// malformed event past the auth pipeline. Wire-format checks
     /// (`parse_event`) are NOT re-run — they require the raw JSON bytes,
     /// which `Event` doesn't expose in structured form.
     ///
-    /// Note: `apply` does NOT insert the event into `provider`. The caller
+    /// Note: `apply_pdu` does NOT insert the event into `provider`. The caller
     /// is expected to honour `Effect::Persist` by writing through to storage
-    /// (which doubles as the provider for subsequent `apply` calls).
-    pub fn apply(
+    /// (which doubles as the provider for subsequent `apply_pdu` calls).
+    pub fn apply_pdu(
         &mut self,
         event: Event,
         provider: &dyn StateProvider,
     ) -> Result<Vec<Effect>, CoreError> {
-        // C1: room_id sanity. A RoomCore is per-room; an event whose room_id
-        // doesn't match has no business mutating it, even if the other room
-        // exists in `provider`.
+        // DROP: room_id sanity. A RoomCore is per-room; an event whose
+        // room_id doesn't match was dispatched to the wrong state machine —
+        // a programming error, not a verdict about the event. Never persisted.
         if event.room_id != self.room_id {
             return Err(CoreError::RoomMismatch {
                 expected: self.room_id.clone(),
@@ -294,51 +319,61 @@ impl RoomCore {
             });
         }
 
-        let event = Arc::new(event);
+        let mut event = Arc::new(event);
 
-        // C3: idempotency. If the event is still a head of either DAG, this
-        // `RoomCore` has already integrated it; re-running the pipeline would
-        // emit a duplicate `Persist`. Both sets are checked because they
-        // diverge: a state event can remain a state-DAG head after a later
-        // non-state event has dropped it from the timeline heads (and vice
-        // versa).
-        //
-        // NOTE (I2 / coupling): head-membership is a proxy for "already
-        // integrated", not the real question ("already persisted"). It only
-        // catches re-delivery of events that are *still* heads. An event
-        // already built upon in both DAGs is in neither set, so this guard
-        // misses it and `apply` re-runs — `next_forward_extremities` would
-        // then RE-INSERT it as a head and re-drop its parents, corrupting the
-        // head-sets. The real backstop is the storage layer's
-        // `events.event_id` UNIQUE constraint, which rejects the duplicate
-        // persist; that lands in PR3. Until then this guard's correctness
-        // rests on the actor delivering each event to `apply` exactly once,
-        // in causal order — a single-owner invariant, not a defended one.
-        if self.forward_extremities.contains(&event.event_id)
-            || self.state_forward_extremities.contains(&event.event_id)
-        {
+        // Idempotency: if the event is already persisted, this room has
+        // integrated it; re-running the pipeline would emit a duplicate
+        // `Persist`. The persisted-check (not head-membership) is the real
+        // question — federation re-sends the same PDU on every transaction
+        // retry, and a re-delivered event is rarely still a head. For a
+        // freshly-built local event this is a cheap miss.
+        if provider.get_event(&event.event_id)?.is_some() {
             return Ok(Vec::new());
         }
 
-        // Phase 1b: semantic rules (no provider). Defence-in-depth — the
-        // builder / wire-parser already ran this, but we re-run so a hand-
-        // constructed `Event` doesn't bypass it.
+        // DROP: semantic rules (no provider). Defence-in-depth — the builder /
+        // wire-parser already ran this, but we re-run so a hand-constructed
+        // `Event` doesn't bypass it. A malformed event is not a valid PDU.
         validate::validate_pdu(&event)?;
 
-        // Phase 1c: reference validation (provider lookups) — local
-        // addition on top of the spec's PDU-receipt checks.
-        validate::validate_references(&event, provider)?;
+        // Reference validation, classified: a "bad reference" (rejected /
+        // non-state / different-room prev_state, rejected create) is a REJECT
+        // — persist the event marked rejected; rejection cascades. Everything
+        // else (missing ancestry, lookup fault) is RETRY/DROP and propagates
+        // as `Err`. The split is purely a function of the references, not of
+        // this room's state.
+        if let Err(ref_err) = validate::validate_references(&event, provider) {
+            if is_reference_rejection(&ref_err) {
+                Arc::make_mut(&mut event).rejected = true;
+                return Ok(vec![Effect::Persist { event }]);
+            }
+            return Err(ref_err.into());
+        }
 
         // Shared cache for state-before walks: state_before(event) and
         // (for state events) state_at_heads(new_fes) overlap heavily on the
         // old FEs' subgraphs. One cache amortises the duplicate work.
         let mut cache = state_res::StateBeforeCache::new();
 
-        // Spec step 3: auth against state-before-event.
+        // Spec step 3: auth against state-before-event. A `MissingEvent`
+        // here is RETRY (missing ancestry) and propagates as `Err`.
         let state_before_ids =
             state_res::state_at_heads(&event.prev_state_events, provider, &mut cache)?;
         let state_before_events = materialize_state(&state_before_ids, provider)?;
-        check_auth_rules(&event, &state_before_events)?;
+
+        // auth_events: apply_pdu is the sole authority (MSC4242 — never on the
+        // wire). Computed from state-before-event and stamped before persist;
+        // the provider's auth_chain walks it for future state resolution.
+        let auth_events = calculate_auth_events(&event, &state_before_ids);
+        Arc::make_mut(&mut event).auth_events = auth_events;
+
+        // REJECT: auth against state-before-event fails. The event is present
+        // and evaluable but unauthorized — persist it marked rejected, mutate
+        // nothing. (Local callers read the flag and surface a 403 instead.)
+        if check_auth_rules(&event, &state_before_events, provider).is_err() {
+            Arc::make_mut(&mut event).rejected = true;
+            return Ok(vec![Effect::Persist { event }]);
+        }
 
         let is_state_event = event.state_key.is_some();
         if is_state_event {
@@ -380,14 +415,22 @@ impl RoomCore {
 
             // State events are not soft-failed (synapse parity) — `event`
             // keeps its default `soft_failed = false`.
-            Ok(vec![
-                Effect::Persist { event },
-                Effect::UpdateCurrentState(delta),
-            ])
+            //
+            // An accepted state event always advances both head-sets (it is a
+            // head of both DAGs), but it may still *lose* state resolution —
+            // a conflicting event already in the resolved set wins its
+            // (type, state_key), so current_state is unchanged and the delta
+            // is empty. In that case emit `Persist` alone: the FE advance
+            // rides on the committed RoomCore mutation, not on the effects.
+            let mut effects = vec![Effect::Persist { event }];
+            if !delta.is_empty() {
+                effects.push(Effect::UpdateCurrentState(delta));
+            }
+            Ok(effects)
         } else {
             // Spec step 5: soft-fail against current_state. Non-state events
             // only. State events that pass step 3 are accepted as-is.
-            let soft_failed = check_auth_rules(&event, &self.current_state).is_err();
+            let soft_failed = check_auth_rules(&event, &self.current_state, provider).is_err();
 
             // Non-state events don't touch the state DAG or current_state, but
             // an *accepted* one extends the timeline DAG — advance the timeline
@@ -405,10 +448,9 @@ impl RoomCore {
             }
 
             // Stamp the verdict onto the event so it persists with the row
-            // (the `soft_failed` column). The `Arc` is unique here — it was
-            // created at the top of `apply` and not cloned on this branch —
-            // so `make_mut` mutates in place without copying.
-            let mut event = event;
+            // (the `soft_failed` column). The `Arc` is unique on this branch —
+            // created at the top of `apply_pdu`, not cloned here — so
+            // `make_mut` mutates in place without copying.
             if soft_failed {
                 Arc::make_mut(&mut event).soft_failed = true;
             }
@@ -429,6 +471,22 @@ impl RoomCore {
         fes.insert(event.event_id.clone());
         fes
     }
+}
+
+/// Classify a [`ReferenceError`] as a REJECT (the referenced data is present
+/// but bad — persist the event marked rejected; rejection cascades) versus a
+/// RETRY/DROP (missing ancestry or a lookup fault, which propagates as `Err`).
+/// The decision is a deterministic function of the event's references, never
+/// of any `RoomCore`'s in-memory state.
+fn is_reference_rejection(err: &ReferenceError) -> bool {
+    matches!(
+        err,
+        ReferenceError::PrevStateRejected(_)
+            | ReferenceError::PrevStateNotStateEvent(_)
+            | ReferenceError::PrevStateDifferentRoom(_)
+            | ReferenceError::RoomRejected(_)
+            | ReferenceError::RoomTypeMismatch(_)
+    )
 }
 
 /// Materialise a `StateMap<OwnedEventId>` into a `StateMap<Arc<Event>>` by
@@ -564,12 +622,16 @@ mod tests {
         let room_id = room_id_from_create(&create.event_id);
         let create_id = create.event_id.clone();
         let mut provider = InMemoryStateProvider::new();
-        insert(&mut provider, create.clone());
         let mut room = RoomCore::new(room_id.clone());
-        room.apply((*create).clone(), &provider).expect("create");
+        room.apply_pdu((*create).clone(), &provider)
+            .expect("create");
+        // Honour Persist after apply (matches real usage; pre-inserting would
+        // make the create event hit the idempotent persisted-check).
+        insert(&mut provider, create.clone());
         let join = Arc::new(alice_join_event(&create_id, &room_id));
         let join_id = join.event_id.clone();
-        room.apply((*join).clone(), &provider).expect("alice join");
+        room.apply_pdu((*join).clone(), &provider)
+            .expect("alice join");
         insert(&mut provider, join.clone());
         (room, provider, create_id, join_id, room_id)
     }
@@ -596,6 +658,15 @@ mod tests {
         provider.insert(event);
     }
 
+    /// Assert `effects` is exactly one `Persist` of a `rejected` event — the
+    /// REJECT disposition (auth / bad-reference failure on an evaluable event).
+    fn assert_rejected(effects: &[Effect]) {
+        assert!(
+            matches!(effects, [Effect::Persist { event }] if event.rejected),
+            "expected a single rejected Persist, got {effects:?}"
+        );
+    }
+
     // ----- apply (happy path) -----
 
     #[test]
@@ -607,7 +678,7 @@ mod tests {
         let mut room = RoomCore::new(room_id);
 
         let effects = room
-            .apply(create.clone(), &provider)
+            .apply_pdu(create.clone(), &provider)
             .expect("create accepted");
 
         assert_eq!(effects.len(), 2);
@@ -641,17 +712,21 @@ mod tests {
         let room_id = room_id_from_create(&create.event_id);
         let create_id = create.event_id.clone();
         let mut provider = InMemoryStateProvider::new();
-        insert(&mut provider, create.clone());
-
         let mut room = RoomCore::new(room_id.clone());
-        room.apply((*create).clone(), &provider).expect("create");
+        room.apply_pdu((*create).clone(), &provider)
+            .expect("create");
+        // Honour Persist after apply (matches real usage; pre-inserting would
+        // make the create event hit the idempotent persisted-check).
+        insert(&mut provider, create.clone());
 
         // Caller honours Persist by also storing alice_join into the provider
         // — for these tests we insert manually before calling apply for the
         // next event.
         let join = alice_join_event(&create_id, &room_id);
         let join_id = join.event_id.clone();
-        let effects = room.apply(join.clone(), &provider).expect("join accepted");
+        let effects = room
+            .apply_pdu(join.clone(), &provider)
+            .expect("join accepted");
         insert(&mut provider, Arc::new(join));
 
         assert!(effects.iter().any(|e| matches!(
@@ -687,14 +762,16 @@ mod tests {
         let room_id = room_id_from_create(&create.event_id);
         let create_id = create.event_id.clone();
         let mut provider = InMemoryStateProvider::new();
-        insert(&mut provider, create.clone());
-
         let mut room = RoomCore::new(room_id.clone());
-        room.apply((*create).clone(), &provider).expect("create");
+        room.apply_pdu((*create).clone(), &provider)
+            .expect("create");
+        // Honour Persist after apply (matches real usage; pre-inserting would
+        // make the create event hit the idempotent persisted-check).
+        insert(&mut provider, create.clone());
 
         let join = Arc::new(alice_join_event(&create_id, &room_id));
         let join_id = join.event_id.clone();
-        room.apply((*join).clone(), &provider).expect("join");
+        room.apply_pdu((*join).clone(), &provider).expect("join");
         insert(&mut provider, join.clone());
 
         let msg = EventBuilder::new(
@@ -712,7 +789,7 @@ mod tests {
 
         let pre_fe = room.state_forward_extremities.clone();
         let pre_state_len = room.current_state.len();
-        let effects = room.apply(msg, &provider).expect("message accepted");
+        let effects = room.apply_pdu(msg, &provider).expect("message accepted");
 
         // Message events emit Persist but NOT UpdateCurrentState.
         assert!(effects.iter().any(|e| matches!(
@@ -745,21 +822,25 @@ mod tests {
         let mut room = RoomCore::new(room_id.clone());
 
         let join = alice_join_event(&create_id, &room_id);
-        let err = room.apply(join, &provider).expect_err("unknown room");
+        let err = room.apply_pdu(join, &provider).expect_err("unknown room");
         assert!(matches!(err, CoreError::Reference(_)));
     }
 
     #[test]
     fn apply_auth_failure_does_not_mutate_room_core() {
-        // Topic by a non-joined sender → rule 6 fails.
+        // Topic by a non-joined sender → rule 6 fails. Auth-against-state-
+        // before failure is a REJECT: the event is persisted marked rejected
+        // and the RoomCore is not mutated.
         let create = Arc::new(create_event("@alice:example.org"));
         let room_id = room_id_from_create(&create.event_id);
         let create_id = create.event_id.clone();
         let mut provider = InMemoryStateProvider::new();
-        insert(&mut provider, create.clone());
-
         let mut room = RoomCore::new(room_id.clone());
-        room.apply((*create).clone(), &provider).expect("create");
+        room.apply_pdu((*create).clone(), &provider)
+            .expect("create");
+        // Honour Persist after apply (matches real usage; pre-inserting would
+        // make the create event hit the idempotent persisted-check).
+        insert(&mut provider, create.clone());
         let snapshot_fe = room.state_forward_extremities.clone();
         let snapshot_state_len = room.current_state.len();
 
@@ -778,9 +859,11 @@ mod tests {
         .build()
         .expect("valid topic");
 
-        let err = room.apply(bob_topic, &provider).expect_err("auth fails");
-        assert!(matches!(err, CoreError::Auth(_)));
-        // RoomCore must not have mutated on the hard-reject path.
+        let effects = room
+            .apply_pdu(bob_topic, &provider)
+            .expect("rejected, not Err");
+        assert_rejected(&effects);
+        // RoomCore must not have mutated on the reject path.
         assert_eq!(room.state_forward_extremities, snapshot_fe);
         assert_eq!(room.current_state.len(), snapshot_state_len);
     }
@@ -801,11 +884,14 @@ mod tests {
         insert(&mut provider, other_create.clone());
 
         let mut room = RoomCore::new(our_room_id.clone());
-        room.apply((*our_create).clone(), &provider).expect("ours");
+        room.apply_pdu((*our_create).clone(), &provider)
+            .expect("ours");
 
         // Build a member event in the OTHER room.
         let foreign_join = alice_join_event(&other_create.event_id, &other_room_id);
-        let err = room.apply(foreign_join, &provider).expect_err("wrong room");
+        let err = room
+            .apply_pdu(foreign_join, &provider)
+            .expect_err("wrong room");
         assert!(matches!(err, CoreError::RoomMismatch { .. }));
     }
 
@@ -816,15 +902,18 @@ mod tests {
         let create = Arc::new(create_event("@alice:example.org"));
         let room_id = room_id_from_create(&create.event_id);
         let mut provider = InMemoryStateProvider::new();
-        insert(&mut provider, create.clone());
         let mut room = RoomCore::new(room_id.clone());
-        room.apply((*create).clone(), &provider).expect("create");
+        room.apply_pdu((*create).clone(), &provider)
+            .expect("create");
+        // Honour Persist after apply (matches real usage; pre-inserting would
+        // make the create event hit the idempotent persisted-check).
+        insert(&mut provider, create.clone());
 
         let pre_fe = room.state_forward_extremities.clone();
         let pre_state = room.current_state.clone();
 
         // Re-apply the same create event.
-        let effects = room.apply((*create).clone(), &provider).expect("noop");
+        let effects = room.apply_pdu((*create).clone(), &provider).expect("noop");
         assert!(
             effects.is_empty(),
             "expected empty effects, got {effects:?}"
@@ -844,7 +933,7 @@ mod tests {
         let create_id = create.event_id.clone();
         let provider = InMemoryStateProvider::new();
         let mut room = RoomCore::new(room_id);
-        room.apply(create, &provider).expect("create accepted");
+        room.apply_pdu(create, &provider).expect("create accepted");
 
         assert_eq!(
             room.forward_extremities,
@@ -894,7 +983,7 @@ mod tests {
         .expect("valid message");
         let msg_id = msg.event_id.clone();
 
-        room.apply(msg, &provider).expect("message accepted");
+        room.apply_pdu(msg, &provider).expect("message accepted");
 
         assert_eq!(
             room.forward_extremities,
@@ -910,29 +999,36 @@ mod tests {
 
     #[test]
     fn apply_redelivered_non_state_event_is_noop() {
-        // A re-delivered non-state event that is still a timeline head is a
-        // no-op via the timeline-FE arm of the idempotency guard (the
-        // state-FE set never contains a non-state event, so the old
-        // state-only guard would have re-processed it).
-        let (mut room, provider, create_id, join_id, room_id) = alice_creates_and_joins(true);
+        // Idempotency is now persisted-based: once the caller has honoured the
+        // first `Persist` (here: inserting into the provider), a re-delivered
+        // copy is a no-op. This mirrors real usage — the actor persists the
+        // event before any federation re-send can arrive.
+        let (mut room, mut provider, create_id, join_id, room_id) = alice_creates_and_joins(true);
 
-        let msg = EventBuilder::new(
-            "@alice:example.org".parse().expect("user"),
-            "m.room.message".to_owned(),
-        )
-        .room_id(room_id)
-        .content(json!({ "msgtype": "m.text", "body": "hi" }))
-        .auth_events(vec![create_id, join_id.clone()])
-        .prev_events(vec![join_id.clone()])
-        .prev_state_events(vec![join_id])
-        .origin_server_ts(next_ts())
-        .build()
-        .expect("valid message");
+        let msg = Arc::new(
+            EventBuilder::new(
+                "@alice:example.org".parse().expect("user"),
+                "m.room.message".to_owned(),
+            )
+            .room_id(room_id)
+            .content(json!({ "msgtype": "m.text", "body": "hi" }))
+            .auth_events(vec![create_id, join_id.clone()])
+            .prev_events(vec![join_id.clone()])
+            .prev_state_events(vec![join_id])
+            .origin_server_ts(next_ts())
+            .build()
+            .expect("valid message"),
+        );
 
-        room.apply(msg.clone(), &provider).expect("first apply");
+        room.apply_pdu((*msg).clone(), &provider)
+            .expect("first apply");
+        // Caller honours Persist: the event is now in the provider.
+        insert(&mut provider, msg.clone());
         let pre_fe = room.forward_extremities.clone();
 
-        let effects = room.apply(msg, &provider).expect("redelivery noop");
+        let effects = room
+            .apply_pdu((*msg).clone(), &provider)
+            .expect("redelivery noop");
         assert!(
             effects.is_empty(),
             "expected empty effects, got {effects:?}"
@@ -988,7 +1084,7 @@ mod tests {
             &room_id,
         ));
         let leave_id = leave.event_id.clone();
-        room.apply((*leave).clone(), &provider)
+        room.apply_pdu((*leave).clone(), &provider)
             .expect("alice leave");
         insert(&mut provider, leave);
 
@@ -1007,7 +1103,7 @@ mod tests {
         .build()
         .expect("valid message");
 
-        let effects = room.apply(msg, &provider).expect("message accepted");
+        let effects = room.apply_pdu(msg, &provider).expect("message accepted");
         assert!(
             matches!(
                 effects.as_slice(),
@@ -1028,14 +1124,17 @@ mod tests {
     fn rule_4_cross_domain_self_join_rejected_when_federate_false() {
         // Create has m.federate=false. bob@other.org attempts to self-join.
         // Rule 4 fires (sender_domain != create_domain && !federate) before
-        // any rule-5 path → CoreError::Auth.
+        // any rule-5 path → REJECT (persisted rejected, no Err).
         let create = Arc::new(create_event_with("@alice:here.org", false));
         let room_id = room_id_from_create(&create.event_id);
         let create_id = create.event_id.clone();
         let mut provider = InMemoryStateProvider::new();
-        insert(&mut provider, create.clone());
         let mut room = RoomCore::new(room_id.clone());
-        room.apply((*create).clone(), &provider).expect("create");
+        room.apply_pdu((*create).clone(), &provider)
+            .expect("create");
+        // Honour Persist after apply (matches real usage; pre-inserting would
+        // make the create event hit the idempotent persisted-check).
+        insert(&mut provider, create.clone());
 
         let bob_self_join = member_event(
             "@bob:other.org",
@@ -1044,11 +1143,10 @@ mod tests {
             vec![create_id],
             &room_id,
         );
-        let err = room.apply(bob_self_join, &provider).expect_err("rule 4");
-        assert!(matches!(
-            err,
-            CoreError::Auth(crate::AuthError::Rule4FederationDisallowed { .. })
-        ));
+        let effects = room
+            .apply_pdu(bob_self_join, &provider)
+            .expect("rejected, not Err");
+        assert_rejected(&effects);
     }
 
     #[test]
@@ -1062,7 +1160,7 @@ mod tests {
             vec![alice_join_id],
             &room_id,
         );
-        let effects = room.apply(invite, &provider).expect("invite accepted");
+        let effects = room.apply_pdu(invite, &provider).expect("invite accepted");
         assert!(effects.iter().any(|e| matches!(
             e,
             Effect::Persist { event } if !event.soft_failed
@@ -1092,11 +1190,10 @@ mod tests {
             vec![alice_join_id],
             &room_id,
         );
-        let err = room.apply(invite, &provider).expect_err("rule 5.4.2");
-        assert!(matches!(
-            err,
-            CoreError::Auth(crate::AuthError::Rule5_4_2_InviteSenderNotJoined)
-        ));
+        let effects = room
+            .apply_pdu(invite, &provider)
+            .expect("rejected, not Err");
+        assert_rejected(&effects);
     }
 
     #[test]
@@ -1114,7 +1211,8 @@ mod tests {
             &room_id,
         ));
         let invite_id = invite.event_id.clone();
-        room.apply((*invite).clone(), &provider).expect("invite");
+        room.apply_pdu((*invite).clone(), &provider)
+            .expect("invite");
         insert(&mut provider, invite.clone());
 
         let bob_join = Arc::new(member_event(
@@ -1125,7 +1223,7 @@ mod tests {
             &room_id,
         ));
         let bob_join_id = bob_join.event_id.clone();
-        room.apply((*bob_join).clone(), &provider)
+        room.apply_pdu((*bob_join).clone(), &provider)
             .expect("bob join");
         insert(&mut provider, bob_join.clone());
 
@@ -1136,7 +1234,7 @@ mod tests {
             vec![bob_join_id],
             &room_id,
         );
-        let effects = room.apply(kick, &provider).expect("kick accepted");
+        let effects = room.apply_pdu(kick, &provider).expect("kick accepted");
         assert!(effects.iter().any(|e| matches!(
             e,
             Effect::Persist { event } if !event.soft_failed
@@ -1167,7 +1265,8 @@ mod tests {
             &room_id,
         ));
         let invite_id = invite.event_id.clone();
-        room.apply((*invite).clone(), &provider).expect("invite");
+        room.apply_pdu((*invite).clone(), &provider)
+            .expect("invite");
         insert(&mut provider, invite.clone());
 
         let bob_join = Arc::new(member_event(
@@ -1178,7 +1277,7 @@ mod tests {
             &room_id,
         ));
         let bob_join_id = bob_join.event_id.clone();
-        room.apply((*bob_join).clone(), &provider)
+        room.apply_pdu((*bob_join).clone(), &provider)
             .expect("bob join");
         insert(&mut provider, bob_join.clone());
 
@@ -1189,7 +1288,7 @@ mod tests {
             vec![bob_join_id],
             &room_id,
         );
-        let effects = room.apply(ban, &provider).expect("ban accepted");
+        let effects = room.apply_pdu(ban, &provider).expect("ban accepted");
         assert!(effects.iter().any(|e| matches!(
             e,
             Effect::Persist { event } if !event.soft_failed
@@ -1219,7 +1318,8 @@ mod tests {
             &room_id,
         ));
         let invite_id = invite.event_id.clone();
-        room.apply((*invite).clone(), &provider).expect("invite");
+        room.apply_pdu((*invite).clone(), &provider)
+            .expect("invite");
         insert(&mut provider, invite.clone());
 
         let bob_join = Arc::new(member_event(
@@ -1230,7 +1330,7 @@ mod tests {
             &room_id,
         ));
         let bob_join_id = bob_join.event_id.clone();
-        room.apply((*bob_join).clone(), &provider)
+        room.apply_pdu((*bob_join).clone(), &provider)
             .expect("bob join");
         insert(&mut provider, bob_join.clone());
 
@@ -1241,11 +1341,10 @@ mod tests {
             vec![bob_join_id],
             &room_id,
         );
-        let err = room.apply(bob_pl, &provider).expect_err("rule 8");
-        assert!(matches!(
-            err,
-            CoreError::Auth(crate::AuthError::Rule8_RequiredPowerInsufficient { .. })
-        ));
+        let effects = room
+            .apply_pdu(bob_pl, &provider)
+            .expect("rejected, not Err");
+        assert_rejected(&effects);
     }
 
     #[test]
@@ -1259,10 +1358,172 @@ mod tests {
             vec![alice_join_id],
             &room_id,
         );
-        let err = room.apply(bad_pl, &provider).expect_err("rule 10.4");
+        let effects = room
+            .apply_pdu(bad_pl, &provider)
+            .expect("rejected, not Err");
+        assert_rejected(&effects);
+    }
+
+    // ----- apply_pdu: federation-specific behaviour -----
+
+    /// Build an `m.room.topic` state event with an explicit timestamp.
+    /// `prev_state` doubles as prev_events / auth_events (apply_pdu recomputes
+    /// auth_events anyway).
+    fn topic_event_ts(
+        topic: &str,
+        ts: u64,
+        prev_state: Vec<OwnedEventId>,
+        room: &ruma::RoomId,
+    ) -> Event {
+        EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.topic".to_owned(),
+        )
+        .room_id(room.to_owned())
+        .state_key(String::new())
+        .content(json!({ "topic": topic }))
+        .auth_events(prev_state.clone())
+        .prev_events(prev_state.clone())
+        .prev_state_events(prev_state)
+        .origin_server_ts(ts)
+        .build()
+        .expect("valid topic")
+    }
+
+    #[test]
+    fn apply_state_event_that_loses_state_res_emits_persist_only() {
+        // Two competing topics rooted at alice's join → a state-DAG fork. The
+        // larger-timestamp topic wins state resolution. We apply the winner
+        // first (it becomes current_state), then the loser: the loser passes
+        // auth (so it's accepted and advances both head-sets) but loses
+        // state-res, so current_state is unchanged → `Persist` alone, no
+        // `UpdateCurrentState`. This is the empty-delta case.
+        let (mut room, mut provider, _create_id, join_id, room_id) = alice_creates_and_joins(true);
+
+        let topic_win = Arc::new(topic_event_ts(
+            "winner",
+            2_000_000_000_000,
+            vec![join_id.clone()],
+            &room_id,
+        ));
+        let topic_lose = Arc::new(topic_event_ts(
+            "loser",
+            1_000_000_000_000,
+            vec![join_id],
+            &room_id,
+        ));
+
+        room.apply_pdu((*topic_win).clone(), &provider)
+            .expect("winner accepted");
+        insert(&mut provider, topic_win.clone());
+
+        let effects = room
+            .apply_pdu((*topic_lose).clone(), &provider)
+            .expect("loser accepted");
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Persist { event }] if !event.rejected && !event.soft_failed
+            ),
+            "a state event that loses state-res emits Persist alone, got {effects:?}"
+        );
+
+        // The state DAG forked: both topics are heads.
+        assert!(room.state_forward_extremities.contains(&topic_win.event_id));
+        assert!(
+            room.state_forward_extremities
+                .contains(&topic_lose.event_id)
+        );
+        // current_state still points at the winner — the loser was accepted
+        // but did not become the resolved topic.
+        let topic_key = ("m.room.topic".to_string(), String::new());
+        assert_eq!(
+            room.current_state
+                .get(&topic_key)
+                .map(|e| e.event_id.clone()),
+            Some(topic_win.event_id.clone()),
+        );
+    }
+
+    #[test]
+    fn apply_pdu_rejected_prev_state_reference_cascades_to_rejection() {
+        // Rejection cascades: an otherwise-valid event whose prev_state points
+        // at an already-rejected event is itself rejected (persisted, not Err).
+        let (mut room, mut provider, _create_id, join_id, room_id) = alice_creates_and_joins(true);
+
+        let mut rejected_member = member_event(
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            vec![join_id],
+            &room_id,
+        );
+        rejected_member.rejected = true;
+        let rejected_member = Arc::new(rejected_member);
+        insert(&mut provider, rejected_member.clone());
+
+        let child = member_event(
+            "@alice:example.org",
+            "@bob:example.org",
+            "leave",
+            vec![rejected_member.event_id.clone()],
+            &room_id,
+        );
+        let effects = room.apply_pdu(child, &provider).expect("rejected, not Err");
+        assert_rejected(&effects);
+    }
+
+    #[test]
+    fn apply_pdu_missing_prev_state_is_retryable_error() {
+        // A prev_state_events entry absent from the store is RETRY (missing
+        // ancestry), not REJECT — it propagates as a retryable `Err`.
+        let (mut room, provider, _create_id, _join_id, room_id) = alice_creates_and_joins(true);
+        // A v12 event id (no `:server` suffix) the provider doesn't know.
+        let phantom: OwnedEventId = "$WadCIT8wxAK3K7zCT9OmewBHyQFIzTRLo15lobAE3zE"
+            .parse()
+            .expect("event id");
+        let orphan = member_event(
+            "@alice:example.org",
+            "@bob:example.org",
+            "invite",
+            vec![phantom],
+            &room_id,
+        );
+        let err = room
+            .apply_pdu(orphan, &provider)
+            .expect_err("missing ancestry");
         assert!(matches!(
             err,
-            CoreError::Auth(crate::AuthError::Rule10_4_CreatorInUsers(_))
+            CoreError::Reference(ReferenceError::PrevStateNotFound(_))
         ));
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn apply_pdu_stamps_auth_events_that_build_left_empty() {
+        // build_local_event leaves auth_events empty; apply_pdu computes and
+        // stamps them as the sole authority.
+        let (mut room, provider, _create_id, join_id, _room_id) = alice_creates_and_joins(true);
+        let built = room
+            .build_local_event(
+                "@alice:example.org".parse().expect("user"),
+                "m.room.message".to_owned(),
+                None,
+                json!({ "msgtype": "m.text", "body": "hi" }),
+            )
+            .expect("build");
+        assert!(
+            built.auth_events.is_empty(),
+            "build_local_event must not set auth_events"
+        );
+
+        let effects = room.apply_pdu(built, &provider).expect("accepted");
+        let persisted = match effects.as_slice() {
+            [Effect::Persist { event }] => event.clone(),
+            other => panic!("expected a single Persist, got {other:?}"),
+        };
+        // v12 excludes the create event from auth_events (the room_id derives
+        // from it), so a message auths against the sender's membership only.
+        assert_eq!(persisted.auth_events, vec![join_id]);
     }
 }
