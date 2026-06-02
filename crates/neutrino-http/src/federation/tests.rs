@@ -174,6 +174,10 @@ async fn build_seeded_router(
 
 // --- B1 ----------------------------------------------------------------
 
+// Gated off under `multi-user-shim`: it seeds the room via tokenless CSAPI
+// `createRoom`, which the shim rejects (401). The shim's own coverage lives in
+// `tests/e2e_multi_user.rs`; this bad-request case runs in the default build.
+#[cfg(not(feature = "multi-user-shim"))]
 #[tokio::test]
 async fn bad_request_empty_latest_events_returns_400() {
     let app = router(config()).await.expect("router");
@@ -201,6 +205,8 @@ async fn bad_request_empty_latest_events_returns_400() {
 
 // --- B2 ----------------------------------------------------------------
 
+// Gated off under `multi-user-shim` — see `bad_request_empty_latest_events`.
+#[cfg(not(feature = "multi-user-shim"))]
 #[tokio::test]
 async fn bad_request_non_json_body_returns_400() {
     let app = router(config()).await.expect("router");
@@ -225,6 +231,8 @@ async fn bad_request_non_json_body_returns_400() {
 
 // --- B3 ----------------------------------------------------------------
 
+// Gated off under `multi-user-shim` — see `bad_request_empty_latest_events`.
+#[cfg(not(feature = "multi-user-shim"))]
 #[tokio::test]
 async fn bad_request_missing_required_field_returns_400() {
     let app = router(config()).await.expect("router");

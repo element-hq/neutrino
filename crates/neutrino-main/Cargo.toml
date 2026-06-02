@@ -3,6 +3,9 @@ name = "neutrino-main"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+multi-user-shim = ["neutrino-http/multi-user-shim"]
+
 [dependencies]
 tokio.workspace = true
 tracing.workspace = true

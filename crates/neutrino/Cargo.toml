@@ -7,6 +7,9 @@ edition = "2024"
 name = "neutrino"
 path = "src/main.rs"
 
+[features]
+multi-user-shim = ["neutrino-main/multi-user-shim"]
+
 [dependencies]
 tokio.workspace = true
 

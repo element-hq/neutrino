@@ -29,8 +29,12 @@ use tracing::info;
 
 mod federation;
 mod legacy_sync;
+mod membership;
 mod room_actor;
 mod sliding_sync;
+
+#[cfg(feature = "multi-user-shim")]
+mod multi_user;
 
 use room_actor::{RoomActorError, RoomRegistry};
 use sliding_sync::{SyncError, SyncState};
@@ -47,6 +51,10 @@ struct App {
     /// removes the underlying db file. Held here so the path stays valid
     /// for as long as `store` is in use.
     _db_tempfile: NamedTempFile,
+    /// Testing-only access-token → user map (multi-user shim). See
+    /// `multi_user`. Absent from the production single-user build.
+    #[cfg(feature = "multi-user-shim")]
+    user_tokens: Arc<Mutex<multi_user::UserTokens>>,
 }
 
 #[derive(Clone)]
@@ -59,6 +67,55 @@ pub struct AppState(Arc<Mutex<App>>);
 /// subsequent request once any handler ever panicked under the lock.
 fn lock_app(state: &AppState) -> std::sync::MutexGuard<'_, App> {
     state.0.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Per-request caller identity. Yields the authenticated user.
+///
+/// - feature `multi-user-shim` ON: resolves `Authorization: Bearer <token>`
+///   against the in-memory token map; 401 on missing/unknown.
+/// - feature OFF: ignores any token and yields the single configured user
+///   (`config.user_id()`), exactly matching today's single-user behaviour.
+pub struct AuthUser(pub OwnedUserId);
+
+impl axum::extract::FromRequestParts<AppState> for AuthUser {
+    type Rejection = axum::response::Response;
+
+    #[cfg(feature = "multi-user-shim")]
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let tokens = lock_app(state).user_tokens.clone();
+        match multi_user::resolve(&parts.headers, &tokens) {
+            Ok(user) => Ok(AuthUser(user)),
+            Err(multi_user::TokenError::Missing) => Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "M_MISSING_TOKEN",
+                "Missing access token",
+            )),
+            Err(multi_user::TokenError::Unknown) => Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "M_UNKNOWN_TOKEN",
+                "Unrecognised access token",
+            )),
+        }
+    }
+
+    #[cfg(not(feature = "multi-user-shim"))]
+    async fn from_request_parts(
+        _parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let user_id = lock_app(state).config.user_id();
+        match user_id.parse() {
+            Ok(u) => Ok(AuthUser(u)),
+            Err(e) => Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            )),
+        }
+    }
 }
 
 /// Errors `AppState::new` (and therefore `router` / `serve`) can surface.
@@ -100,6 +157,8 @@ impl AppState {
             keys: None,
             config,
             _db_tempfile: tempfile,
+            #[cfg(feature = "multi-user-shim")]
+            user_tokens: Arc::new(Mutex::new(multi_user::UserTokens::new())),
         };
         AppState(Arc::new(Mutex::new(app)))
     }
@@ -114,8 +173,8 @@ pub async fn serve(listener: TcpListener, config: Config) -> Result<(), StartupE
 }
 
 pub async fn router(config: Config) -> Result<Router, StartupError> {
-    let state = AppState::new(config.clone()).await?;
-    Ok(build_router(config, state))
+    let state = AppState::new(config).await?;
+    Ok(build_router(state))
 }
 
 /// Test-only constructor that mounts the same router over an externally-
@@ -133,13 +192,11 @@ pub(crate) fn router_with_store(
     store: Arc<SqliteStore>,
     tempfile: NamedTempFile,
 ) -> Router {
-    let state = AppState::from_store(config.clone(), store, tempfile);
-    build_router(config, state)
+    let state = AppState::from_store(config, store, tempfile);
+    build_router(state)
 }
 
-fn build_router(config: Config, state: AppState) -> Router {
-    let user_id = config.user_id();
-
+fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/_matrix/client/versions", get(versions))
@@ -163,15 +220,9 @@ fn build_router(config: Config, state: AppState) -> Router {
             "/_matrix/client/v3/keys/signatures/upload",
             post(signatures_upload),
         )
+        .route("/_matrix/client/v3/profile/{user_id}", get(profile))
         .route(
-            &format!("/_matrix/client/v3/profile/{}", user_id),
-            get(profile),
-        )
-        .route(
-            &format!(
-                "/_matrix/client/v3/user/{}/account_data/{{account_data_type}}",
-                user_id
-            ),
+            "/_matrix/client/v3/user/{user_id}/account_data/{account_data_type}",
             get(get_account_data),
         )
         .route("/_matrix/client/v3/room_keys/version", get(get_room_keys))
@@ -188,6 +239,34 @@ fn build_router(config: Config, state: AppState) -> Router {
         .route(
             "/_matrix/client/v3/rooms/{room_id}/state/{type}",
             put(put_state_empty_key),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/join",
+            post(membership::join),
+        )
+        .route(
+            "/_matrix/client/v3/join/{room_id_or_alias}",
+            post(membership::join_by_id_or_alias),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/leave",
+            post(membership::leave),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/invite",
+            post(membership::invite),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/kick",
+            post(membership::kick),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/ban",
+            post(membership::ban),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/unban",
+            post(membership::unban),
         )
         .route("/_matrix/client/v3/pushers/set", post(pushers_set))
         .route("/_matrix/client/v3/capabilities", get(get_capabilities))
@@ -241,7 +320,6 @@ async fn post_register(state: State<AppState>, body: Json<Value>) -> (StatusCode
         );
     }
 
-    let app = lock_app(&state.0);
     let device_id = body
         .0
         .pointer("/device_id")
@@ -249,30 +327,122 @@ async fn post_register(state: State<AppState>, body: Json<Value>) -> (StatusCode
         .unwrap_or("DEVICEID")
         .to_string();
 
-    (
-        StatusCode::OK,
-        Json(json!({
-            "user_id": app.config.user_id(),
-            "access_token": "syt_1234567890abcdef",
-            "home_server": app.config.server_name,
-            "device_id": device_id,
-        })),
-    )
+    #[cfg(feature = "multi-user-shim")]
+    {
+        let (tokens, server_name, default_user_id) = {
+            let app = lock_app(&state.0);
+            (
+                app.user_tokens.clone(),
+                app.config.server_name.clone(),
+                app.config.user_id(),
+            )
+        };
+        // The UIA flow is stateless — this shim stores no per-session state, so
+        // the client must resend `username` on the auth-completion request (as
+        // Complement does); absent here, `provision` falls back to the default
+        // user. `localpart_of` lets a full MXID through too, matching `/login`.
+        let requested = body
+            .0
+            .pointer("/username")
+            .and_then(|v| v.as_str())
+            .map(localpart_of);
+        match multi_user::provision(
+            &tokens,
+            &server_name,
+            &default_user_id,
+            requested.as_deref(),
+        ) {
+            Ok((user_id, token)) => (
+                StatusCode::OK,
+                Json(json!({
+                    "user_id": user_id,
+                    "access_token": token,
+                    "home_server": server_name,
+                    "device_id": device_id,
+                })),
+            ),
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "errcode": "M_INVALID_USERNAME", "error": e })),
+            ),
+        }
+    }
+
+    #[cfg(not(feature = "multi-user-shim"))]
+    {
+        let app = lock_app(&state.0);
+        (
+            StatusCode::OK,
+            Json(json!({
+                "user_id": app.config.user_id(),
+                "access_token": "syt_1234567890abcdef",
+                "home_server": app.config.server_name,
+                "device_id": device_id,
+            })),
+        )
+    }
 }
 
-async fn post_login(state: State<AppState>) -> Json<Value> {
+async fn post_login(
+    state: State<AppState>,
+    #[cfg(feature = "multi-user-shim")] body: Json<Value>,
+) -> (StatusCode, Json<Value>) {
     info!("Logged in");
 
-    let app = lock_app(&state.0);
-    let user_id = app.config.user_id();
-    let server_name = app.config.server_name.clone();
+    #[cfg(feature = "multi-user-shim")]
+    {
+        let (tokens, server_name, default_user_id) = {
+            let app = lock_app(&state.0);
+            (
+                app.user_tokens.clone(),
+                app.config.server_name.clone(),
+                app.config.user_id(),
+            )
+        };
+        let requested = body
+            .0
+            .pointer("/identifier/user")
+            .or_else(|| body.0.pointer("/user"))
+            .and_then(|v| v.as_str())
+            .map(localpart_of);
+        match multi_user::provision(
+            &tokens,
+            &server_name,
+            &default_user_id,
+            requested.as_deref(),
+        ) {
+            Ok((user_id, token)) => (
+                StatusCode::OK,
+                Json(json!({
+                    "user_id": user_id,
+                    "access_token": token,
+                    "home_server": server_name,
+                    "device_id": "DEVICEID",
+                })),
+            ),
+            // Mirror `/register`: a malformed identifier is a 400, not a 200
+            // carrying a token that was never inserted into the map (which would
+            // then 401 on the very next authenticated request).
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "errcode": "M_INVALID_USERNAME", "error": e })),
+            ),
+        }
+    }
 
-    Json(json!({
-        "user_id": user_id,
-        "access_token": "syt_1234567890abcdef",
-        "home_server": server_name,
-        "device_id": "DEVICEID"
-    }))
+    #[cfg(not(feature = "multi-user-shim"))]
+    {
+        let app = lock_app(&state.0);
+        (
+            StatusCode::OK,
+            Json(json!({
+                "user_id": app.config.user_id(),
+                "access_token": "syt_1234567890abcdef",
+                "home_server": app.config.server_name,
+                "device_id": "DEVICEID",
+            })),
+        )
+    }
 }
 
 /// MSC4186 sliding-sync entrypoint. The actual work is in
@@ -284,25 +454,12 @@ async fn post_login(state: State<AppState>) -> Json<Value> {
 /// - maps `SyncError` to the spec's HTTP / errcode shape.
 async fn sync(
     state: State<AppState>,
+    AuthUser(user_id): AuthUser,
     query: Query<HashMap<String, String>>,
     body: Json<Value>,
 ) -> axum::response::Response {
     let body_value = body.0;
-    let (sync_state, user_id_str) = {
-        let app = lock_app(&state.0);
-        (app.sync_state.clone(), app.config.user_id())
-    };
-
-    let user_id: ruma::OwnedUserId = match user_id_str.as_str().try_into() {
-        Ok(u) => u,
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "M_UNKNOWN",
-                &e.to_string(),
-            );
-        }
-    };
+    let sync_state = lock_app(&state.0).sync_state.clone();
 
     let req = match build_sync_request(&query.0, body_value) {
         Ok(r) => r,
@@ -420,6 +577,20 @@ fn extensions_is_empty(e: &v5::response::Extensions) -> bool {
         && e.e2ee.device_unused_fallback_key_types.is_none()
 }
 
+/// Extract the localpart from a login identifier that may be a full MXID
+/// (`@bob:server`) or already a bare localpart (`bob`).
+#[cfg(feature = "multi-user-shim")]
+fn localpart_of(identifier: &str) -> String {
+    if let Some(rest) = identifier.strip_prefix('@') {
+        rest.split_once(':')
+            .map(|(lp, _)| lp)
+            .unwrap_or(rest)
+            .to_owned()
+    } else {
+        identifier.to_owned()
+    }
+}
+
 fn error_response(status: StatusCode, errcode: &str, error: &str) -> axum::response::Response {
     (status, Json(json!({"errcode": errcode, "error": error}))).into_response()
 }
@@ -518,14 +689,14 @@ async fn signatures_upload(state: State<AppState>, body: Json<Value>) -> Json<Va
     Json(json!({}))
 }
 
-async fn profile() -> Json<Value> {
+async fn profile(axum::extract::Path(_user_id): axum::extract::Path<String>) -> Json<Value> {
     Json(json!({
         "displayname": "Alice",
     }))
 }
 
 async fn get_account_data(
-    axum::extract::Path(_account_data_type): axum::extract::Path<String>,
+    axum::extract::Path((_user_id, _account_data_type)): axum::extract::Path<(String, String)>,
 ) -> (StatusCode, Json<Value>) {
     (
         StatusCode::NOT_FOUND,
@@ -546,22 +717,12 @@ async fn get_room_keys() -> (StatusCode, Json<Value>) {
     )
 }
 
-async fn create_room(state: State<AppState>, body: Json<Value>) -> axum::response::Response {
-    let (store, user_id) = {
-        let app = lock_app(&state.0);
-        (app.store.clone(), app.config.user_id())
-    };
-
-    let sender: OwnedUserId = match user_id.parse() {
-        Ok(s) => s,
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "M_UNKNOWN",
-                &e.to_string(),
-            );
-        }
-    };
+async fn create_room(
+    state: State<AppState>,
+    AuthUser(sender): AuthUser,
+    body: Json<Value>,
+) -> axum::response::Response {
+    let store = lock_app(&state.0).store.clone();
 
     // Build the spec-mandated initial-state batch (create → join →
     // power_levels → join_rules, plus name/topic when requested). Each event
@@ -694,6 +855,29 @@ fn build_initial_events(
         add("m.room.topic", "", json!({ "topic": t }))?;
     }
 
+    // Honour the request's `invite` list (the membership follow-up to the
+    // multi-user shim): emit one invite member event per well-formed, non-self
+    // target, authored by the creator — who is joined with implicit MAX power,
+    // so rule 5.4 accepts it. Malformed entries are skipped rather than failing
+    // room creation (test server, best-effort). `is_direct` is propagated onto
+    // the invite content when the request sets it.
+    if let Some(invitees) = body.pointer("/invite").and_then(Value::as_array) {
+        let is_direct = body.pointer("/is_direct").and_then(Value::as_bool) == Some(true);
+        for entry in invitees {
+            let Some(target) = entry.as_str() else {
+                continue;
+            };
+            if target == sender.as_str() || OwnedUserId::try_from(target).is_err() {
+                continue;
+            }
+            let mut content = json!({ "membership": "invite" });
+            if is_direct {
+                content["is_direct"] = json!(true);
+            }
+            add("m.room.member", target, content)?;
+        }
+    }
+
     Ok((create, initial))
 }
 
@@ -729,8 +913,8 @@ fn default_power_levels() -> Value {
 /// (`public` ⇒ `public_chat`, else `private_chat`). Only `public_chat` opens
 /// the room (`public`); `private_chat` / `trusted_private_chat` (and any
 /// unrecognised preset) stay invite-only. The `trusted_private_chat`
-/// invitee-power bump is not modelled — createRoom does not process the
-/// `invite` list.
+/// invitee-power bump is not modelled, though the `invite` list itself is
+/// honoured by [`build_initial_events`].
 fn join_rule_for(body: &Value) -> &'static str {
     let is_public = match body.pointer("/preset").and_then(Value::as_str) {
         Some(preset) => preset == "public_chat",
@@ -777,6 +961,7 @@ async fn members(
 /// `PUT /rooms/{room}/send/{type}/{txn}` — a message (non-state) event.
 async fn put_event(
     state: State<AppState>,
+    AuthUser(sender): AuthUser,
     axum::extract::Path((room_id, event_type, _msg_id)): axum::extract::Path<(
         String,
         String,
@@ -784,12 +969,13 @@ async fn put_event(
     )>,
     body: Json<Value>,
 ) -> axum::response::Response {
-    send_via_actor(&state.0, room_id, event_type, None, body.0).await
+    send_via_actor(&state.0, sender, room_id, event_type, None, body.0).await
 }
 
 /// `PUT /rooms/{room}/state/{type}/{stateKey}` — a state event.
 async fn put_state(
     state: State<AppState>,
+    AuthUser(sender): AuthUser,
     axum::extract::Path((room_id, event_type, state_key)): axum::extract::Path<(
         String,
         String,
@@ -797,17 +983,34 @@ async fn put_state(
     )>,
     body: Json<Value>,
 ) -> axum::response::Response {
-    send_via_actor(&state.0, room_id, event_type, Some(state_key), body.0).await
+    send_via_actor(
+        &state.0,
+        sender,
+        room_id,
+        event_type,
+        Some(state_key),
+        body.0,
+    )
+    .await
 }
 
 /// `PUT /rooms/{room}/state/{type}` — a state event with the empty state key
 /// (the common case for `m.room.name`, `m.room.topic`, …).
 async fn put_state_empty_key(
     state: State<AppState>,
+    AuthUser(sender): AuthUser,
     axum::extract::Path((room_id, event_type)): axum::extract::Path<(String, String)>,
     body: Json<Value>,
 ) -> axum::response::Response {
-    send_via_actor(&state.0, room_id, event_type, Some(String::new()), body.0).await
+    send_via_actor(
+        &state.0,
+        sender,
+        room_id,
+        event_type,
+        Some(String::new()),
+        body.0,
+    )
+    .await
 }
 
 /// Shared body for the CSAPI write endpoints: build + apply + persist the
@@ -816,25 +1019,13 @@ async fn put_state_empty_key(
 /// `Some(_)` for a state event.
 async fn send_via_actor(
     state: &AppState,
+    sender: OwnedUserId,
     room_id: String,
     event_type: String,
     state_key: Option<String>,
     content: Value,
 ) -> axum::response::Response {
-    let (registry, user_id) = {
-        let app = lock_app(state);
-        (app.room_registry.clone(), app.config.user_id())
-    };
-    let sender: OwnedUserId = match user_id.parse() {
-        Ok(s) => s,
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "M_UNKNOWN",
-                &e.to_string(),
-            );
-        }
-    };
+    let registry = lock_app(state).room_registry.clone();
     let parsed_room_id: OwnedRoomId = match room_id.parse() {
         Ok(r) => r,
         Err(e) => {
