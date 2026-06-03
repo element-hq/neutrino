@@ -19,6 +19,8 @@ use neutrino_state::{CoreError, FormatError};
 use neutrino_store::{RoomStore, StateStore, StorageError};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5;
+use ruma::events::AnyTimelineEvent;
+use ruma::serde::Raw;
 use ruma::{OwnedRoomId, OwnedUserId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -233,12 +235,16 @@ fn build_router(state: AppState) -> Router {
             put(put_event),
         )
         .route(
+            "/_matrix/client/v3/rooms/{room_id}/state",
+            get(get_state_all),
+        )
+        .route(
             "/_matrix/client/v3/rooms/{room_id}/state/{type}/{state_key}",
-            put(put_state),
+            put(put_state).get(get_state_event),
         )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/state/{type}",
-            put(put_state_empty_key),
+            put(put_state_empty_key).get(get_state_event_empty_key),
         )
         // Empty state key may be sent with a trailing slash; the spec marks it
         // optional ("when an empty string, the trailing slash on this endpoint
@@ -247,7 +253,7 @@ fn build_router(state: AppState) -> Router {
         // `…/state/{type}`, so it needs its own route.
         .route(
             "/_matrix/client/v3/rooms/{room_id}/state/{type}/",
-            put(put_state_empty_key),
+            put(put_state_empty_key).get(get_state_event_empty_key),
         )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/join",
@@ -1020,6 +1026,112 @@ async fn put_state_empty_key(
         body.0,
     )
     .await
+}
+
+/// `GET /rooms/{room}/state` — every current state event, as a bare array of
+/// full (enriched) events. No auth/visibility gating (embedded trusted surface;
+/// matches `members`).
+async fn get_state_all(
+    state: State<AppState>,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let store = lock_app(&state.0).store.clone();
+    let rid = match OwnedRoomId::try_from(room_id.as_str()) {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", &e.to_string());
+        }
+    };
+    let map = match store.current_room_state(&rid).await {
+        Ok(m) => m,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            );
+        }
+    };
+    let events: Vec<Raw<AnyTimelineEvent>> =
+        map.values().map(Raw::<AnyTimelineEvent>::from).collect();
+    (StatusCode::OK, Json(events)).into_response()
+}
+
+/// `GET /rooms/{room}/state/{type}/{stateKey}` — the current state event. The
+/// default response is the event `content`; `?format=event` returns the full
+/// enriched event.
+async fn get_state_event(
+    state: State<AppState>,
+    axum::extract::Path((room_id, event_type, state_key)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+    query: Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    state_event_response(&state.0, &room_id, &event_type, &state_key, &query.0).await
+}
+
+/// `GET /rooms/{room}/state/{type}` (and the trailing-slash form) — as
+/// [`get_state_event`] with the empty state key.
+async fn get_state_event_empty_key(
+    state: State<AppState>,
+    axum::extract::Path((room_id, event_type)): axum::extract::Path<(String, String)>,
+    query: Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    state_event_response(&state.0, &room_id, &event_type, "", &query.0).await
+}
+
+async fn state_event_response(
+    state: &AppState,
+    room_id: &str,
+    event_type: &str,
+    state_key: &str,
+    query: &HashMap<String, String>,
+) -> axum::response::Response {
+    let store = lock_app(state).store.clone();
+    let rid = match OwnedRoomId::try_from(room_id) {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", &e.to_string());
+        }
+    };
+    // `format` is the spec enum {content, event}; reject anything else with 400
+    // (Synapse parses it with `allowed_values=["content","event"]`) rather than
+    // silently treating an unknown value as the default.
+    let format = query.get("format").map(String::as_str).unwrap_or("content");
+    if format != "content" && format != "event" {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            &format!("Unknown format: {format}"),
+        );
+    }
+    let event = match store.current_state_event(&rid, event_type, state_key).await {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            return error_response(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Event not found.");
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            );
+        }
+    };
+    if format == "event" {
+        (StatusCode::OK, Json(Raw::<AnyTimelineEvent>::from(&event))).into_response()
+    } else {
+        match serde_json::from_str::<Value>(event.content.get()) {
+            Ok(content) => (StatusCode::OK, Json(content)).into_response(),
+            Err(e) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            ),
+        }
+    }
 }
 
 /// Shared body for the CSAPI write endpoints: build + apply + persist the

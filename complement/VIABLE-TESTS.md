@@ -73,8 +73,8 @@ Lower-confidence candidates not yet added (would need verifying they don't read 
 
 ## Still blocked, grouped by the one missing capability
 
-### `GET` of room state (`GET /rooms/{room}/state[/{type}/{key}]`) — the biggest remaining unlock
-The whole read-back surface: most of `rooms_state_test.go` and `apidoc_room_state_test.go`, all of `power_levels_test.go`, `apidoc_room_create_test.go`'s name/topic/version subtests, `TestRoomsInvite/…/Invited_user_can_see_room_metadata`, the `apidoc_room_members` invite/ban/leave/reinvite subtests, and `TestLeftRoomFixture/Can_get_…state…`. These PUT or createRoom fine but then `GET /state` to assert — which 404s.
+### ~~`GET` of room state~~ — IMPLEMENTED 2026-06-02
+`GET /rooms/{room}/state`, `…/state/{type}/{key}`, and `…/state/{type}` (+ trailing slash) now read the materialised current state (content by default / full event on `?format=event`; `format` validated, `404 M_NOT_FOUND` on missing — Synapse-aligned). This unblocks the read-back surface: the `apidoc_room_state_test.go` `TestRoomState` GET-state subtests (member, `?format=event`, power_levels, name, topic, PUT-then-GET name/topic, full `/state`), `apidoc_room_create_test.go`'s name/topic read-backs, `TestRoomsInvite/…/Invited_user_can_see_room_metadata`, and the `apidoc_room_members` invite/ban/leave/reinvite subtests. **Add to the allowlist after a CI Complement run confirms green.** Still out: `power_levels` "can set" (reads via `GET /event`), `TestLeftRoomFixture/Can_get_…state…` (state-at-leave for a departed user — gated out by our no-visibility model), and the createRoom `version`/`initial_state` subtests (createRoom drops those).
 
 ### `POST /user/{uid}/filter` (could be a no-op opaque-id stub)
 Blocks nearly all of `sync_test.go` and `sync_archive_test.go` (`TestSync/*`, `TestSyncLeaveSection/*`, `TestArchivedRoomsHistory/*`, `TestLeaveEventInviteRejection`, …) — they create a filter first and pass its id to `/sync`. A stub returning any id + `GET …/filter/{id} → {}` would unlock the tranche cheaply, since the translator already ignores `?filter=`.
