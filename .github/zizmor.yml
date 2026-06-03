@@ -1,0 +1,9 @@
+rules:
+  cache-poisoning:
+    ignore:
+      # The complement CI job pre-builds the neutrino image with buildx and the
+      # type=gha cache (load: true — the image is never pushed to a registry).
+      # CI publishes no release artifacts, so a poisoned CI cache cannot taint a
+      # release; release.yml carries no cache at all. The prebuild is required to
+      # run Complement, so the cache here is intentional.
+      - ci.yml

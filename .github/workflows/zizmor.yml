@@ -1,0 +1,24 @@
+name: zizmor
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+jobs:
+  zizmor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d
+        with:
+          # Print findings and fail the job rather than uploading SARIF, so this
+          # works without a GitHub Advanced Security license. Flip to true (and
+          # add `security-events: write`) to surface findings in the Security tab.
+          advanced-security: false
