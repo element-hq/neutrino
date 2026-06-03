@@ -2495,4 +2495,72 @@ proptest! {
             );
         }
     }
+
+    /// P3 — idempotency (federation re-send reality). After applying the whole
+    /// DAG in build order, re-applying an arbitrary subset of its events in an
+    /// arbitrary order is a no-op: every event is already persisted, so
+    /// `apply_pdu`'s persisted-check returns empty effects and leaves
+    /// `current_state` and both head-sets untouched. Federation re-sends the
+    /// same PDU on every transaction retry, so this is the property the
+    /// persisted-check exists to guarantee; pinning it guards against future
+    /// drift that would mutate room state before that early return. Persisted
+    /// events include rejects and soft-fails (both are stored), so the replay
+    /// subset exercises all three verdicts.
+    #[test]
+    fn adv_replay_is_idempotent(
+        ops in prop::collection::vec(adv_op(), 1..16),
+        replay in prop::collection::vec(any::<u8>().prop_map(|b| b as usize), 0..32),
+    ) {
+        let dag = build_adv_dag(ops);
+        let n = dag.events.len();
+        let mut room = RoomCore::new(dag.room_id.clone());
+        let mut provider = InMemoryStateProvider::new();
+        // Full apply in build order (a valid topological order by construction).
+        for event in &dag.events {
+            let effects = room.apply_pdu(event.clone(), &provider).map_err(|e| {
+                TestCaseError::fail(format!("apply_pdu errored on {}: {e}", event.event_id))
+            })?;
+            if let Some(persisted) = persist_effect(&effects) {
+                provider.insert(persisted);
+            }
+        }
+        let before_state: StateMap<OwnedEventId> = room
+            .current_state()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.event_id.clone()))
+            .collect();
+        let before_timeline = room.forward_extremities().clone();
+        let before_state_fes = room.state_forward_extremities().clone();
+
+        // Replay an arbitrary subset, in arbitrary order — each already persisted.
+        for r in &replay {
+            let i = r % n;
+            let id = dag.events[i].event_id.clone();
+            let effects = room.apply_pdu(dag.events[i].clone(), &provider).map_err(|e| {
+                TestCaseError::fail(format!("replay apply_pdu errored on {id}: {e}"))
+            })?;
+            prop_assert!(
+                effects.is_empty(),
+                "re-applying already-persisted event {id} was not a no-op ({} effects)",
+                effects.len()
+            );
+        }
+
+        let after_state: StateMap<OwnedEventId> = room
+            .current_state()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.event_id.clone()))
+            .collect();
+        prop_assert_eq!(&after_state, &before_state, "current_state changed under replay");
+        prop_assert_eq!(
+            room.forward_extremities(),
+            &before_timeline,
+            "timeline forward extremities changed under replay"
+        );
+        prop_assert_eq!(
+            room.state_forward_extremities(),
+            &before_state_fes,
+            "state forward extremities changed under replay"
+        );
+    }
 }

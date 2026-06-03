@@ -111,10 +111,17 @@ message events to exercise timeline-vs-state head divergence. Lives in
   `Dag` with zero new generator work (the soft-failed clause is vacuous on the
   creator-only profile but the core "FE = unreferenced event" is exercised by every
   fork/merge/message). Foundation for everything downstream.
-- **P3 — idempotency. [TODO — rides P1's DAG]** After applying the DAG, replay any
-  random subset in any order → current_state + head-sets unchanged (federation
-  re-send reality). Cheap co-check on the existing generator (`apply_pdu`'s
-  persisted-check guards it); land after P2.
+- **P3 — idempotency. [DONE 2026-06-03 — on the adversarial generator]** After
+  applying the DAG, replay any random subset in any order → current_state +
+  head-sets unchanged (federation re-send reality). Originally scoped to ride
+  P1's creator-only DAG, but that generator was retired in the 2026-06-03
+  consolidation, so it landed on `build_adv_dag` instead (a strict superset —
+  the replay subset now exercises rejects + soft-fails too, all of which are
+  persisted). Implemented as `adv_replay_is_idempotent`: full apply in build
+  order, snapshot, then re-apply an arbitrary index multiset; each re-apply
+  must return empty effects (`apply_pdu`'s persisted-check, `room_core.rs:330`,
+  returns `Ok(vec![])` before any mutation) and the final state + both head-sets
+  must equal the snapshot.
 - **P4 — rejection (separate adversarial generator). [DONE 2026-06-02]**
   Rejected-verdict is order-independent; rejection cascades through
   `prev_state_events`; a rejected event never appears in `current_state`. The
@@ -146,8 +153,10 @@ The meaningful part — that the emitted `StateDelta` stream telescopes to the r
 sqlite persist layer (current_state built purely from deltas, never recomputed); if
 wanted, it belongs in a store-sqlite test, not these RoomCore proptests.
 
-P1+P2+P3+P5 all ride one creator-only DAG/strategy; P4 wants its own adversarial
-profile. **Recommended order: P2 ✅ → P5 ✅ → P3 → (milestone) shadow model + P4.**
+P1+P2+P5 rode the (now-retired) creator-only DAG; P4 + P3 ride the adversarial
+profile. **All properties P1–P5 have landed** (P1/P2/P5's creator-only invariants
+were folded into the adversarial suite or dropped in the 2026-06-03
+consolidation; see the decisions log).
 
 ### Generator design
 
@@ -357,6 +366,8 @@ never use .unwrap() in handler code.
 Decided to use Claude.
 
 2026-06-03: Consolidated `crates/neutrino-state/tests/prop.rs` (3034 → 2498 lines, 38 → 32 tests) now that the multi-user adversarial generator subsumes the creator-only one. **Retired the entire creator-only fork/merge apparatus** (`DagOp`/`dag_op`/`heads_after`/`DagBuilder`/`build_dag`/`apply_dag`/`Outcome`, both `creator_only_*` properties, `fork_merge_generator_coverage_corpus`). Shared scaffolding (`Dag`, `Verdict`, `classify`, `persist_effect`, `expected_heads`, `random_topo_order`, `build_create`/`build_join`) stays — the adversarial suite already reuses it; a creator-only DAG is just an adversarial DAG where nothing rejects/soft-fails. **Two of the creator-only suite's invariants transferred**: (a) the `UpdateCurrentState` delta-fold == resolved `current_state` cross-check folded into `apply_adv_dag` (holds for any verdict — a rejected event emits no delta); (b) P5 message-isolation + create/creator-membership presence folded into `adv_build_order_reproduces_verdicts_and_heads`. **One invariant did NOT transfer and was dropped: positive-acceptance ("legitimate creator events are accepted").** First attempt asserted "creator event with no rejected `prev_state` ancestor ⇒ Accepted" but it fails on `[Extend Leave, Extend Invite]`: alice self-leaves, then `pick_joined` falls back to the now-unjoined creator for an invite, which *legitimately* rejects (inviter must be joined). Creator implicit-max *power* does not exempt creator events from the membership requirement, and the adversarial generator explores unjoined-creator states the creator-only generator never did — so the all-accepted oracle is inherent to the always-joined creator-only profile and cannot be re-expressed over adversarial DAGs without re-implementing the auth engine. Kegan signed off on the loss (timeline-FE order-independence over the all-accepted subset also goes with it). **Tier-1 merges (no coverage loss)**: 3 `separate_*` structural props → `separate_structural_invariants`; `sort_output_is_permutation` + `sort_parents_come_before_children` → `sort_is_topological_permutation`; `power_of_sender` props 1+3 → `power_of_sender_creator_max_else_pl_lookup` (unified expectation = creator?MAX:PL-lookup, sender picked creator-or-arbitrary via `proptest::option`); `rule_5_3_1_*` reuses `arb_state_with_create` (room id via `room_id_from_create`); `arb_state_set` alias inlined to `arb_state_map`. **Tier-2 subsumption drops (tiny edge loss)**: `separate_single_input_all_unconflicted` + `separate_identical_inputs` (subsumed by `separate_unconflicted_iff_all_sets_agree`); `acd_identical_state_sets_empty` + `acd_order_independent` (subsumed by `acd_equals_union_minus_intersection`, kept `acd_zero_or_one` for the short-circuit). fmt + clippy -p neutrino-state --tests -D warnings + cargo test -p neutrino-state --test prop clean (32 prop tests).
+
+2026-06-03: P3 (idempotency) landed as `adv_replay_is_idempotent` (`crates/neutrino-state/tests/prop.rs`) — the last outstanding fork/merge property. Scoped to ride P1's creator-only DAG, but that generator was retired earlier today, so it rides `build_adv_dag` instead — a strict superset, since the replay subset now also re-applies persisted rejects + soft-fails. Apply the whole DAG in build order, snapshot `current_state` + both head-sets, then re-apply an arbitrary index multiset (`replay in vec(u8, 0..32)`, mod n): every re-apply must return empty effects (`apply_pdu`'s persisted-check at `room_core.rs:330` returns `Ok(vec![])` before any mutation — the path federation transaction-retries rely on) and the post-replay state + head-sets must equal the snapshot. Non-vacuous (replay averages ~16 ids, n≥2 always). All of P1–P5 are now covered by the adversarial suite. fmt + clippy -p neutrino-state --tests -D warnings + cargo test -p neutrino-state --test prop clean (33 prop tests).
 
 2026-06-02: Phase 2 properties on the adversarial generator (`crates/neutrino-state/tests/prop.rs`). Two new `proptest!`s + a `reject_projection` helper. **`adv_order_independent_invariants`**: build the DAG once, apply in build order + 2–4 random topological orders (`random_topo_order`), and assert the three *order-invariant* quantities are identical — `current_state`, the state forward extremities, and the per-event **reject-or-not projection**. These are pure functions of the DAG: state events never soft-fail, and a reject depends only on `prev_state_events` ancestry. **Deliberately NOT asserted order-invariant**: the timeline forward extremities and the `SoftFailed`-vs-`Accepted` distinction — soft-fail is checked against the live resolved `current_state` at apply time (`room_core.rs:433`), so it legitimately varies with which concurrent events have been applied (real Matrix soft-fail semantics). This is why the verdict is *projected* to rejected-or-not before comparison; comparing full verdicts would be wrong, not just flaky. Stress-tested green at 3000 cases. **`adv_rejection_cascade_and_isolation`**: cascade — any event whose `prev_state_events` names a rejected event is itself rejected (`validate_references` → `PrevStateRejected`), checked structurally on the stored verdicts; isolation — a rejected event never appears in the resolved `current_state`, checked against an applied outcome (moved here from the Phase 1 property, which no longer duplicates it). **Idempotency (P3) remains skipped** per Kegan's earlier call. fmt + clippy -p neutrino-state --tests -D warnings + cargo test -p neutrino-state clean (216 lib + 43 prop).
 
