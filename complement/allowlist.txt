@@ -56,20 +56,23 @@ TestCannotKickLeftUser$
 TestNotPresentUserCannotBanOthers$
 
 # Unlocked by GET room state (2026-06-03): read-back of current state via
-# GET /rooms/{room}/state[/{type}[/{key}]]. The TestRoomState entries cover the
-# GET-state subtests only (not joined_members/publicRooms/directory/joined_rooms
-# — separate unimplemented endpoints). `\?` escapes the literal `?` in the
-# format=event subtest name; trailing `$` anchors against prefix-siblings
-# (e.g. "…with_a_topic" vs "…with_a_topic_and_writes_rich…"). Verified statically
-# against our handlers; CI is the empirical gate.
-TestRoomState/Parallel/GET_/rooms/:room_id/state/m.room.member/:user_id_fetches_my_membership$
-TestRoomState/Parallel/GET_/rooms/:room_id/state/m.room.member/:user_id\?format=event_fetches_my_membership_event$
-TestRoomState/Parallel/GET_/rooms/:room_id/state/m.room.power_levels_fetches_powerlevels$
-TestRoomState/Parallel/GET_/rooms/:room_id/state/m.room.name_gets_name$
-TestRoomState/Parallel/POST_/rooms/:room_id/state/m.room.name_sets_name$
-TestRoomState/Parallel/GET_/rooms/:room_id/state/m.room.topic_gets_topic$
-TestRoomState/Parallel/PUT_/rooms/:room_id/state/m.room.topic_sets_topic$
-TestRoomState/Parallel/GET_/rooms/:room_id/state_fetches_entire_room_state$
+# GET /rooms/{room}/state[/{type}[/{key}]]. Covers the TestRoomState GET-state
+# subtests only; NOT joined_rooms / joined_members / publicRooms / directory
+# (separate unimplemented endpoints). Regex notes (Go splits -run on `/` and
+# matches each segment UNANCHORED, so a short segment substring-matches and
+# silently drags in siblings): the `/^rooms$/` segment is anchored so it can't
+# match the sibling `joined_rooms` subtest. `\?` escapes the literal `?` in the
+# format=event name; trailing `$` anchors prefix-siblings (e.g. "…with_a_topic"
+# vs "…with_a_topic_and_writes_rich…"). TODO: anchor segments in the allowlist
+# parser (scripts/complement.sh) so per-entry anchoring isn't needed.
+TestRoomState/Parallel/GET_/^rooms$/:room_id/state/m.room.member/:user_id_fetches_my_membership$
+TestRoomState/Parallel/GET_/^rooms$/:room_id/state/m.room.member/:user_id\?format=event_fetches_my_membership_event$
+TestRoomState/Parallel/GET_/^rooms$/:room_id/state/m.room.power_levels_fetches_powerlevels$
+TestRoomState/Parallel/GET_/^rooms$/:room_id/state/m.room.name_gets_name$
+TestRoomState/Parallel/POST_/^rooms$/:room_id/state/m.room.name_sets_name$
+TestRoomState/Parallel/GET_/^rooms$/:room_id/state/m.room.topic_gets_topic$
+TestRoomState/Parallel/PUT_/^rooms$/:room_id/state/m.room.topic_sets_topic$
+TestRoomState/Parallel/GET_/^rooms$/:room_id/state_fetches_entire_room_state$
 TestRoomMembers/Parallel/POST_/rooms/:room_id/ban_can_ban_a_user$
 TestRoomMembers/Parallel/POST_/rooms/:room_id/invite_can_send_an_invite$
 TestRoomMembers/Parallel/POST_/rooms/:room_id/leave_can_leave_a_room$
