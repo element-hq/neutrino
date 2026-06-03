@@ -1,0 +1,17 @@
+rules:
+  use-trusted-publishing:
+    ignore:
+      # We publish to GitHub Packages (maven.pkg.github.com), which has no OIDC
+      # trusted-publishing flow — the audit targets PyPI/RubyGems/crates.io-style
+      # indices. Auth uses ${{ github.token }}, already an ephemeral, run-scoped,
+      # auto-expiring token (not a long-lived API secret), so there is nothing to
+      # migrate to. Not actionable for this registry.
+      - release.yml
+  cache-poisoning:
+    ignore:
+      # The complement CI job pre-builds the neutrino image with buildx and the
+      # type=gha cache (load: true — the image is never pushed to a registry).
+      # CI publishes no release artifacts, so a poisoned CI cache cannot taint a
+      # release; release.yml carries no cache at all. The prebuild is required to
+      # run Complement, so the cache here is intentional.
+      - ci.yml
