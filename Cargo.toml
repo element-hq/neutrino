@@ -1,12 +1,14 @@
 [workspace]
 members = [
     "./crates/*",
-    "./tools/uniffi-bindgen"
+    "./tools/uniffi-bindgen",
+    "./tools/xtask"
 ]
 resolver = "3"
 
 [workspace.dependencies]
 async-trait = "0.1.89"
+clap = { version = "4.6.1", features = ["derive"] }
 rand = "0.9.2"
 ruma = "0.15.1"
 serde = { version = "1.0.228", features = ["derive"] }
