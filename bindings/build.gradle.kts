@@ -51,7 +51,7 @@ publishing {
         create<MavenPublication>("release") {
             groupId = "io.element.neutrino"
             artifactId = "bindings"
-            version = "0.1.0"
+            version = (findProperty("neutrinoVersion") as String?) ?: "0.1.0-SNAPSHOT"
 
             afterEvaluate {
                 from(components["release"])
@@ -67,6 +67,17 @@ publishing {
                         url.set("https://www.gnu.org/licenses/agpl-3.0.txt")
                     }
                 }
+            }
+        }
+    }
+
+    repositories {
+        maven {
+            name = "GitHubPackages"
+            url = uri("https://maven.pkg.github.com/element-hq/neutrino")
+            credentials {
+                username = System.getenv("GITHUB_ACTOR")
+                password = System.getenv("GITHUB_TOKEN")
             }
         }
     }
