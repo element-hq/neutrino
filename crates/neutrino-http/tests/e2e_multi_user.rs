@@ -497,6 +497,203 @@ async fn put_state_trailing_slash_empty_key_succeeds() {
     assert!(body["event_id"].is_string(), "{body}");
 }
 
+/// `GET /state/m.room.member/{user}` returns the event *content* by default
+/// (top-level `membership`); `?format=event` returns the full event (with
+/// `room_id`, `sender`, nested `content`).
+#[tokio::test]
+async fn get_state_member_content_and_format_event() {
+    let app = router(config()).await.expect("router init");
+    let (alice_id, alice_tok) = register(&app, "alice").await;
+    let (s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    let (s, body) = send(
+        &app,
+        "GET",
+        &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.member/{alice_id}"),
+        Some(&alice_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["membership"],
+        json!("join"),
+        "content-only shape: {body}"
+    );
+    // Content-only must NOT carry the event envelope (distinguishes it from
+    // `?format=event`).
+    assert!(
+        body.get("room_id").is_none(),
+        "content has no room_id: {body}"
+    );
+    assert!(
+        body.get("sender").is_none(),
+        "content has no sender: {body}"
+    );
+
+    let (s, ev) = send(
+        &app,
+        "GET",
+        &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.member/{alice_id}?format=event"),
+        Some(&alice_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{ev}");
+    assert_eq!(ev["room_id"], json!(room_id), "{ev}");
+    assert_eq!(ev["sender"], json!(alice_id), "{ev}");
+    assert_eq!(ev["content"]["membership"], json!("join"), "{ev}");
+
+    // Unknown `format` is rejected (Synapse parity: enum {content, event}).
+    let (s, body) = send(
+        &app,
+        "GET",
+        &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.member/{alice_id}?format=bogus"),
+        Some(&alice_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], json!("M_INVALID_PARAM"), "{body}");
+}
+
+/// A `(type, state_key)` with no current state event is `404 M_NOT_FOUND`.
+#[tokio::test]
+async fn get_state_unknown_key_is_404() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    let (s, body) = send(
+        &app,
+        "GET",
+        &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.name"),
+        Some(&alice_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["errcode"], json!("M_NOT_FOUND"), "{body}");
+}
+
+/// `GET /state` returns a bare array of full state events; a freshly created
+/// room contains at least `m.room.create` and the creator's `m.room.member`.
+#[tokio::test]
+async fn get_state_all_lists_current_state() {
+    let app = router(config()).await.expect("router init");
+    let (alice_id, alice_tok) = register(&app, "alice").await;
+    let (s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    let (s, body) = send(
+        &app,
+        "GET",
+        &format!("/_matrix/client/v3/rooms/{room_id}/state"),
+        Some(&alice_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let events = body.as_array().expect("bare array of state events");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == json!("m.room.create") && e["room_id"] == json!(room_id)),
+        "state contains m.room.create with room_id: {body}"
+    );
+    assert!(
+        events.iter().any(|e| e["type"] == json!("m.room.member")
+            && e["state_key"] == json!(alice_id)
+            && e["content"]["membership"] == json!("join")),
+        "state contains the creator's join member event: {body}"
+    );
+}
+
+/// A state event written with the empty key round-trips through the
+/// trailing-slash GET form (`…/state/{type}/`) — the spec's optional trailing
+/// slash, which axum routes separately. Exercises the empty-key *success* path.
+#[tokio::test]
+async fn get_state_trailing_slash_empty_key_round_trips() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    let (s, _) = send(
+        &app,
+        "PUT",
+        &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.topic"),
+        Some(&alice_tok),
+        &json!({ "topic": "round trip" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // GET via the trailing-slash empty-key form.
+    let (s, body) = send(
+        &app,
+        "GET",
+        &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.topic/"),
+        Some(&alice_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["topic"], json!("round trip"), "{body}");
+}
+
+/// A syntactically invalid room id is `400 M_INVALID_PARAM` (both the full-state
+/// and single-event read paths share this guard; this hits `get_state_all`).
+#[tokio::test]
+async fn get_state_malformed_room_id_is_400() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (s, body) = send(
+        &app,
+        "GET",
+        "/_matrix/client/v3/rooms/not-a-room-id/state",
+        Some(&alice_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], json!("M_INVALID_PARAM"), "{body}");
+}
+
 /// A joined user leaving themselves moves their membership to `leave`.
 #[tokio::test]
 async fn self_leave_sets_membership_to_leave() {
