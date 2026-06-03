@@ -2,6 +2,8 @@
 
 Audit date: 2026-06-02. Re-audited after the **global `POST /_matrix/client/v3/join/{roomIdOrAlias}`** endpoint landed (the path Complement's `MustJoinRoom`/`JoinRoom` actually use — `complement-main/client/client.go:236-239`). Supersedes the 2026-05-27 audit, which predated the membership endpoints, the `/state` write routes, and the multi-user shim.
 
+**Update 2026-06-03:** GET room state landed and was allowlisted (13 entries); a second allowlist pass then added 4 more tests and dropped 2 as v12/design-incompatible — see the "Second allowlist pass — 2026-06-03" section below. The router table and the "Still NOT wired" list have been updated to match (GET state is now wired).
+
 ## Ground truth: what the axum router actually wires today
 
 From `crates/neutrino-http/src/lib.rs:201-277`. The Complement image is built with **`--features multi-user-shim`** (`docker/complement/Dockerfile`), so distinct registered users get distinct tokens/identities — multi-user flows work.
@@ -19,13 +21,14 @@ From `crates/neutrino-http/src/lib.rs:201-277`. The Complement image is built wi
 | PUT | `/_matrix/client/v3/rooms/{room_id}/send/{type}/{msg_id}` | message events |
 | PUT | `/_matrix/client/v3/rooms/{room_id}/state/{type}/{state_key}` | state **write** |
 | PUT | `/_matrix/client/v3/rooms/{room_id}/state/{type}` | state write, empty key |
+| GET | `/_matrix/client/v3/rooms/{room_id}/state` | **NEW (2026-06-03)** — full current-state array |
+| GET | `/_matrix/client/v3/rooms/{room_id}/state/{type}/{state_key}` (+ `/{type}`, + trailing slash) | **NEW (2026-06-03)** — state read; content default / full event on `?format=event` (validated → 400); `404 M_NOT_FOUND` on missing |
 | POST | `/_matrix/client/v3/rooms/{room_id}/join` | room-scoped join |
 | POST | `/_matrix/client/v3/join/{room_id_or_alias}` | **NEW** — global join; room **ids only** (valid alias → 404 `M_NOT_FOUND`), `server_name` ignored; idempotent re-join |
 | POST | `/_matrix/client/v3/rooms/{room_id}/{leave,invite,kick,ban,unban}` | `m.room.member` via the room actor; real v12 auth (rule 5) + state-res |
 | GET/POST | keys/*, profile (self), account_data (GET self), room_keys/version, pushers/set | stubs |
 
 **Still NOT wired** (these gate tests below):
-- **No GET of room state**: no `GET /rooms/{room}/state`, no `GET /rooms/{room}/state/{type}/{key}`. State is readable only via `/sync` or `GET /members`.
 - No `GET /rooms/{room}/event/{eventId}`, `GET /rooms/{room}/messages`.
 - No `POST /user/{uid}/filter` (+ `GET …/filter/{id}`) — blocks the large filtered-`/sync` tranche.
 - No `/joined_members`, `/joined_rooms`, `/publicRooms`, `/directory/room/{alias}` (no room directory).
@@ -33,7 +36,7 @@ From `crates/neutrino-http/src/lib.rs:201-277`. The Complement image is built wi
 - 404 fallback returns plain text, not `{"errcode":"M_UNRECOGNIZED"}`.
 - No EDUs / E2EE / receipts / presence / push rules; no working cross-server federation join.
 
-**Harness constraint:** `scripts/complement.sh` runs `go test … ./tests/csapi/...` only. Tests outside `csapi` — `tests/msc4222/*` (the MSC4222 dual-emission suite), `tests/v12_test.go`, all `tests/federation_*` — are **not executed by the allowlist loop**. Running them needs a harness change (extra package globs), not just an allowlist line.
+**Harness constraint:** `scripts/complement.sh` runs `go test … ./tests/csapi/...` only. Tests outside `csapi` — `tests/msc4222/*` (the MSC4222 dual-emission suite), `tests/v12_test.go`, all `tests/federation_*` — are **not executed by the allowlist loop**. Running them needs a harness change (extra package globs), not just an allowlist line. (2026-06-03: the CI `complement` job now builds the neutrino image with buildx + GitHub Actions layer cache, so the cargo-chef deps layer persists across runs; `scripts/complement.sh` reuses a pre-built image via `SKIP_IMAGE_BUILD`.)
 
 ---
 
@@ -65,16 +68,36 @@ Confirmed against a Complement run (2026-06-02). 13 entries are now in `allowlis
 ### Dropped — not viable
 - **`TestMembersLocal/*`** — the test fixture does `PUT /presence/{user}/status` before any subtest (`rooms_members_local_test.go:26`); presence is an out-of-scope EDU.
 
-Lower-confidence candidates not yet added (would need verifying they don't read `GET /state`):
-- `TestRoomsInvite/Parallel/Test_that_we_can_be_reinvited_to_a_room_we_created`
-- `TestTentativeEventualJoiningAfterRejecting`
+(The two former lower-confidence candidates are resolved in the next section: `TestTentativeEventualJoiningAfterRejecting` is now allowlisted; the reinvite flow is dropped as v12-incompatible.)
+
+---
+
+## Second allowlist pass — 2026-06-03 (GET state + 4 more, no new code)
+
+After GET room state landed (see below), a second pass added tests needing only already-wired capability. **Static verification proved insufficient for behavioural asserts:** a CI run caught two tests that are wired-clean at the endpoint level but assert behaviour this v12 server doesn't have. Net — 4 added, 2 dropped, 1 deferred.
+
+**Added (4):**
+
+| Test | Exercises |
+|---|---|
+| `TestRoomCreationReportsEventsToMyself/parallel/Setting_room_topic_reports_m.room.topic_to_myself` | PUT `m.room.topic` + `/sync` echo |
+| `TestRoomCreationReportsEventsToMyself/parallel/Joining_room_twice_is_idempotent` | join ×2 → same member event id (join is idempotent) + GET state |
+| `TestTentativeEventualJoiningAfterRejecting` | invite → reject (leave) → reinvite → join, via bare `MustSync` (no filter) |
+| `TestRoomCreate/Parallel/Rooms_can_be_created_with_an_initial_invite_list_(SYN-205)` | createRoom `invite[]` → invitee sees the invite |
+
+**Dropped — not viable (v12 / design mismatch, NOT test selection):**
+- `TestRoomMembers/Parallel/Test_that_we_can_be_reinvited_to_a_room_we_created` — PUTs `m.room.power_levels` naming the **creator** (alice) in `users`; **room v12 auth rule 10.4** forbids listing a creator (creators hold implicit infinite PL) → 403 reject (`crates/neutrino-state/src/auth_rules.rs:737-745`). The test assumes a pre-v12 room where the creator is a level-100 user.
+- `TestRoomCreationReportsEventsToMyself/parallel/Setting_state_twice_is_idempotent` — asserts a repeated identical state PUT returns the **same** event id (Synapse dedups unchanged state). neutrino builds a fresh event per PUT (`crates/neutrino-http/src/room_actor.rs:64-66`), so ids differ. Would need an unchanged-state dedup feature (not spec-mandated).
+
+**Deferred — needs an empirical run:**
+- `TestPowerLevels/Parallel/…/PUT_power_levels_should_not_explode_if_the_old_power_levels_were_empty` — expects **403 not 500** on an empty-`users` PUT; depends on v12 auth producing a clean reject rather than faulting internally. Worth a targeted run before allowlisting.
 
 ---
 
 ## Still blocked, grouped by the one missing capability
 
 ### ~~`GET` of room state~~ — IMPLEMENTED 2026-06-02
-`GET /rooms/{room}/state`, `…/state/{type}/{key}`, and `…/state/{type}` (+ trailing slash) now read the materialised current state (content by default / full event on `?format=event`; `format` validated, `404 M_NOT_FOUND` on missing — Synapse-aligned). This unblocks the read-back surface. **Allowlisted 2026-06-03** (13 entries, pending the next CI run to confirm; verified statically against the handlers): the 8 `TestRoomState` GET-state subtests (member, `?format=event`, power_levels, name get/set, topic get/set, full `/state`), `apidoc_room_create`'s `makes_a_room_with_a_{topic,name}`, and `apidoc_room_members` ban/invite/leave. Deliberately **not** added: join-with-custom-content (our `/join` ignores arbitrary member content), the `apidoc_room_members` reinvite flow (complex multi-step — defer), `TestRoomsInvite/…/Invited_user_can_see_room_metadata` (re-check). Still blocked elsewhere: `power_levels` "can set" (reads via `GET /event`), `TestLeftRoomFixture/Can_get_…state…` (state-at-leave for a departed user — gated out by our no-visibility model), createRoom `version`/`initial_state`/rich-topic subtests (createRoom drops those / no rich `m.text`), and `joined_rooms`/`joined_members`/`publicRooms`/`directory` (separate unimplemented endpoints — `joined_rooms` is a trivial wire-up over the existing `StateStore::joined_rooms`, deferred to its own change).
+`GET /rooms/{room}/state`, `…/state/{type}/{key}`, and `…/state/{type}` (+ trailing slash) now read the materialised current state (content by default / full event on `?format=event`; `format` validated, `404 M_NOT_FOUND` on missing — Synapse-aligned). This unblocks the read-back surface. **Allowlisted 2026-06-03** (13 entries, pending the next CI run to confirm; verified statically against the handlers): the 8 `TestRoomState` GET-state subtests (member, `?format=event`, power_levels, name get/set, topic get/set, full `/state`), `apidoc_room_create`'s `makes_a_room_with_a_{topic,name}`, and `apidoc_room_members` ban/invite/leave. Deliberately **not** added: join-with-custom-content (our `/join` ignores arbitrary member content), the `apidoc_room_members` reinvite flow (later tried 2026-06-03 and dropped as v12-incompatible — see "Second allowlist pass"), `TestRoomsInvite/…/Invited_user_can_see_room_metadata` (re-check). Still blocked elsewhere: `power_levels` "can set" (reads via `GET /event`), `TestLeftRoomFixture/Can_get_…state…` (state-at-leave for a departed user — gated out by our no-visibility model), createRoom `version`/`initial_state`/rich-topic subtests (createRoom drops those / no rich `m.text`), and `joined_rooms`/`joined_members`/`publicRooms`/`directory` (separate unimplemented endpoints — `joined_rooms` is a trivial wire-up over the existing `StateStore::joined_rooms`, deferred to its own change).
 
 Allowlist regex note: the GET-state entries anchor the `/^rooms$/` segment because Go's `-run` matches each `/`-split segment unanchored, so a bare `rooms` would substring-match (and silently run) the sibling `joined_rooms` subtest. The proper fix — anchoring segments in the allowlist parser (`scripts/complement.sh`) — is deferred.
 
@@ -97,9 +120,9 @@ Blocks nearly all of `sync_test.go` and `sync_archive_test.go` (`TestSync/*`, `T
 
 ## Cheap-win ordering (impact / effort)
 
-1. **Empirically run the 15 "newly viable" candidates above; allowlist the green ones.** Headline: `TestCumulativeJoinLeaveJoinSync` + the `TestRoomsInvite/Parallel` invite-flow subtests. (Effort: 0 code; one Complement run.)
-2. **No-op `POST /user/{uid}/filter` stub** → unlocks the `TestSync/*` + `TestSyncLeaveSection/*` tranche. (~30 lines.)
-3. **`GET /rooms/{room}/state[/{type}/{key}]`** → unlocks the entire state read-back surface (`rooms_state`, `apidoc_room_state`, `power_levels`, createRoom name/topic, apidoc_room_members invite/ban/leave). Largest single unlock.
+1. **[DONE 2026-06-02]** ~~Empirically run the "newly viable" candidates; allowlist the green ones.~~ Headline landed: `TestCumulativeJoinLeaveJoinSync` + the `TestRoomsInvite/Parallel` invite-flow subtests.
+2. **No-op `POST /user/{uid}/filter` stub** → unlocks the `TestSync/*` + `TestSyncLeaveSection/*` tranche. (~30 lines.) **Now the single biggest remaining unlock.**
+3. **[DONE 2026-06-03]** ~~`GET /rooms/{room}/state[/{type}/{key}]`~~ → unlocked the state read-back surface (`rooms_state`, `apidoc_room_state`, createRoom name/topic, apidoc_room_members invite/ban/leave). Largest single unlock.
 4. **`GET /rooms/{room}/event/{eventId}`** → history-visibility fetch + power-levels-by-id tests.
 5. **Teach `scripts/complement.sh` to also run `./tests/msc4222/...`** → the marquee MSC4222 `state_after` dual-emission validation (`tests/msc4222/TestSync/*`), currently unreachable because the runner is csapi-only.
 6. **404 fallback → `{"errcode":"M_UNRECOGNIZED"}`** → `TestUnknownEndpoints/*`, and correct per spec.
