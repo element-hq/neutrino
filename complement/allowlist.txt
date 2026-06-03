@@ -79,19 +79,23 @@ TestRoomMembers/Parallel/POST_/rooms/:room_id/leave_can_leave_a_room$
 TestRoomCreate/Parallel/POST_/createRoom_makes_a_room_with_a_topic$
 TestRoomCreate/Parallel/POST_/createRoom_makes_a_room_with_a_name$
 
-# Source-verified viable 2026-06-03 (no new server code). These exercise only
-# already-wired capability: createRoom name/topic/invite + PUT/GET state +
-# membership (join/leave/invite) + bare legacy /sync with NO filter (a bare
-# MustSyncUntil never touches the unimplemented filter API — sync.go:173).
-# Prior audits parked the reinvite + SYN-205 subtests as lower-confidence /
-# defer; reading the Go source confirms neither needs anything unimplemented.
-# NOT included: TestPowerLevels "should not explode" (expects 403 on the final
-# empty-users PUT — depends on v12 auth producing a clean reject not a 500;
-# needs an empirical run to confirm). Trailing `$` anchors prefix-siblings;
-# `\(` `\)` escape the literal regex parens in (SYN-205).
+# Viable 2026-06-03 (no new server code). These exercise only already-wired
+# capability: createRoom name/topic/invite + PUT/GET state + membership
+# (join/leave/invite) + bare legacy /sync with NO filter (a bare MustSyncUntil
+# never touches the unimplemented filter API — sync.go:173).
+#
+# Two candidates were dropped after a CI run proved them incompatible with this
+# server — real v12/design mismatches, NOT test-selection bugs:
+#   - Test_that_we_can_be_reinvited_to_a_room_we_created: PUTs an m.room.power_levels
+#     naming the creator (alice) in `users`, which room v12 auth rule 10.4 forbids
+#     (creators hold implicit infinite PL and must not be listed) → 403 reject.
+#   - Setting_state_twice_is_idempotent: asserts a repeated identical state PUT
+#     returns the SAME event id; neutrino builds a fresh event per PUT (no
+#     Synapse-style unchanged-state dedup, room_actor.rs:64-66), so ids differ.
+# Also NOT included: TestPowerLevels "should not explode" (expects 403-not-500 on
+# an empty-users PUT — needs an empirical run to confirm the reject is clean).
+# Trailing `$` anchors prefix-siblings; `\(` `\)` escape the parens in (SYN-205).
 TestRoomCreationReportsEventsToMyself/parallel/Setting_room_topic_reports_m.room.topic_to_myself$
-TestRoomCreationReportsEventsToMyself/parallel/Setting_state_twice_is_idempotent$
 TestRoomCreationReportsEventsToMyself/parallel/Joining_room_twice_is_idempotent$
-TestRoomMembers/Parallel/Test_that_we_can_be_reinvited_to_a_room_we_created$
 TestTentativeEventualJoiningAfterRejecting$
 TestRoomCreate/Parallel/Rooms_can_be_created_with_an_initial_invite_list_\(SYN-205\)$
