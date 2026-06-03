@@ -165,23 +165,27 @@ pub trait EventStore: Send + Sync {
     ///       `Effect::UpdateCurrentState` payload apply emitted (empty for a
     ///       non-state event). Every event id referenced by a `Some(_)` entry
     ///       in the delta MUST already be persisted (the just-persisted
-    ///       `event`, or a prior event) — the impl asserts this.
+    ///       `event`, or a prior event) — the impl asserts this. `destinations`
+    ///       are the remote servers this event must be federated to (computed
+    ///       by the caller from the post-apply room state); empty for a
+    ///       federation-received event that we don't re-originate.
     /// Post: in a single write transaction — the event is persisted with a
     ///       new `StreamPos` (event row + DAG edges); the current-state delta
     ///       is applied (each `Some(id)` upserts that `(event_type,
     ///       state_key)` row to point at `id`, each `None` deletes the row);
-    ///       and the room's forward-extremity columns are replaced with
-    ///       `timeline_fes` / `state_fes`. The `subscribe()` watch advances
-    ///       after commit. No outbox rows are written — federation delivery
-    ///       is layered on separately (Server-Server /send). This is the
-    ///       persist half of the storage⇄`RoomCore` bridge;
-    ///       `forward_extremities` is the load half.
+    ///       the room's forward-extremity columns are replaced with
+    ///       `timeline_fes` / `state_fes`; and one `outbox` row is written per
+    ///       destination (idempotent via `UNIQUE(destination, event_id)`; an
+    ///       empty slice writes none). The `subscribe()` watch advances after
+    ///       commit. This is the persist half of the storage⇄`RoomCore`
+    ///       bridge; `forward_extremities` is the load half.
     async fn persist_resolved_event(
         &self,
         event: &Event,
         timeline_fes: &BTreeSet<OwnedEventId>,
         state_fes: &BTreeSet<OwnedEventId>,
         current_state_delta: &BTreeMap<(String, String), Option<OwnedEventId>>,
+        destinations: &[&ServerName],
     ) -> Result<(), StorageError>;
 
     /// Pre:  none.
