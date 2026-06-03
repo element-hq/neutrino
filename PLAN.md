@@ -115,15 +115,17 @@ message events to exercise timeline-vs-state head divergence. Lives in
   random subset in any order → current_state + head-sets unchanged (federation
   re-send reality). Cheap co-check on the existing generator (`apply_pdu`'s
   persisted-check guards it); land after P2.
-- **P4 — rejection (separate adversarial generator). [GENERATOR DONE 2026-06-02;
-  properties = Phase 2]** Rejected-verdict is order-independent; rejection cascades
-  through `prev_state_events`; a rejected event never appears in `current_state`.
-  The multi-user shadow-auth generator (`build_adv_dag`) now exists and the
-  coverage corpus confirms it produces rejects, cascades and soft-fails; the
-  rejection-determinism / cascade-isolation *properties* land in Phase 2. NOTE:
+- **P4 — rejection (separate adversarial generator). [DONE 2026-06-02]**
+  Rejected-verdict is order-independent; rejection cascades through
+  `prev_state_events`; a rejected event never appears in `current_state`. The
+  multi-user shadow-auth generator (`build_adv_dag`) and all three properties
+  landed: `adv_order_independent_invariants` (order-invariance of
+  `current_state` + `state_fes` + reject-projection — rejection determinism is
+  the reject-projection clause) and `adv_rejection_cascade_and_isolation`. NOTE:
   soft-fail verdicts are NOT order-independent (checked against live
-  `current_state`, `room_core.rs:433`) — only reject is. Phase 2 order-independence
-  must therefore cover {`current_state`, `state_fes`, reject-verdicts} only.
+  `current_state`, `room_core.rs:433`) — only reject is, which is why
+  order-independence covers {`current_state`, `state_fes`, reject-verdicts} and
+  the verdict is projected to rejected-or-not before comparison.
 - **P5 — message-event invariants. [DONE, creator-only]** A non-state event never
   touches `current_state` or state FEs, only timeline FEs; timeline-vs-state FE
   divergence ⊆ {messages, soft-failed}. The creator-only generator already emits
@@ -254,14 +256,15 @@ Open generator question (deferred past M1): whether the shadow model's branch-me
 must be faithful enough to keep yield high on deeper forks, or whether approximate-
 merge + bounded size is sufficient. Decide empirically from the coverage corpus.
 
-### Next milestone (GENERATOR LANDED 2026-06-02; properties = Phase 2) — shadow auth model + multi-user + adversarial
+### Next milestone (DONE 2026-06-02) — shadow auth model + multi-user + adversarial
 
-STATUS: the generator + verdict-aware oracle (Phase 0) and the multi-user
-shadow-auth adversarial generator + coverage corpus (Phase 1) have landed —
-see the 2026-06-02 decisions-log entry. `build_adv_dag` / `apply_adv_dag` /
-`Shadow` / `AdvOp` / `Verdict` are in `crates/neutrino-state/tests/prop.rs`.
-What remains (Phase 2) is the *properties* below, pending a fresh-context
-subagent review of the generator first.
+STATUS: COMPLETE. Phase 0 (verdict-aware oracle), Phase 1 (multi-user
+shadow-auth adversarial generator + coverage corpus), and Phase 2 (the
+properties below) have all landed — see the 2026-06-02 decisions-log entries.
+`build_adv_dag` / `apply_adv_dag` / `Shadow` / `AdvOp` / `Verdict` /
+`adv_order_independent_invariants` / `adv_rejection_cascade_and_isolation` are
+in `crates/neutrino-state/tests/prop.rs`. The only deferred item is idempotency
+(P3), skipped per Kegan.
 
 Goal: lift the creator-only generator to **multiple users with real membership /
 power-level transitions and deliberate unauthorised events**, then re-run
@@ -352,6 +355,8 @@ never use .unwrap() in handler code.
  ## decisions log
 
 Decided to use Claude.
+
+2026-06-02: Phase 2 properties on the adversarial generator (`crates/neutrino-state/tests/prop.rs`). Two new `proptest!`s + a `reject_projection` helper. **`adv_order_independent_invariants`**: build the DAG once, apply in build order + 2–4 random topological orders (`random_topo_order`), and assert the three *order-invariant* quantities are identical — `current_state`, the state forward extremities, and the per-event **reject-or-not projection**. These are pure functions of the DAG: state events never soft-fail, and a reject depends only on `prev_state_events` ancestry. **Deliberately NOT asserted order-invariant**: the timeline forward extremities and the `SoftFailed`-vs-`Accepted` distinction — soft-fail is checked against the live resolved `current_state` at apply time (`room_core.rs:433`), so it legitimately varies with which concurrent events have been applied (real Matrix soft-fail semantics). This is why the verdict is *projected* to rejected-or-not before comparison; comparing full verdicts would be wrong, not just flaky. Stress-tested green at 3000 cases. **`adv_rejection_cascade_and_isolation`**: cascade — any event whose `prev_state_events` names a rejected event is itself rejected (`validate_references` → `PrevStateRejected`), checked structurally on the stored verdicts; isolation — a rejected event never appears in the resolved `current_state`, checked against an applied outcome (moved here from the Phase 1 property, which no longer duplicates it). **Idempotency (P3) remains skipped** per Kegan's earlier call. fmt + clippy -p neutrino-state --tests -D warnings + cargo test -p neutrino-state clean (216 lib + 43 prop).
 
 2026-06-02: Shadow-auth multi-user adversarial generator — Phase 0 + Phase 1 (`crates/neutrino-state/tests/prop.rs`; properties = Phase 2, deferred). **Phase 0**: `Dag` now carries a parallel `verdicts: Vec<Verdict>` (`Accepted`/`Rejected`/`SoftFailed`), and `expected_heads` is verdict-aware — only an `Accepted` event is head-eligible or drops the parents it names, mirroring `apply_pdu` exactly (a `Rejected` event mutates no head-set; a `SoftFailed` non-state event is persisted but is neither a timeline head nor drops its `prev_events` parents — synapse#5269). On the creator-only profile every verdict is `Accepted`, so it reduces to the original "FE = unreferenced event" rule (existing 3 creator-only tests unchanged = the gate). **Phase 1**: a second generator (`build_adv_dag`) that drives a *real* `RoomCore` in build order — heads tracked from reality, the real accept/reject/soft-fail verdict recorded per event, output still a pure replayable `Dag`. The shadow model (`Shadow::from_state`, an auth-relevant projection of resolved `current_state`) is **only a yield helper** for intent selection; a wrong guess lowers accepted-event yield but never corrupts the DAG, since verdicts come from `apply_pdu`. User pool alice(creator)+bob/carol/dave; intent-tagged ops (`Join|Invite|Leave|Kick|Ban|Unban|Topic|Name|PlPromote|PlDemote`) crossed with head-selection (`Extend|Fork|Merge|ConflictFork`), plus `Cascade`/`Unauthorised`/`Message`/`StaleMessage`. fork-width ≤4, ≤~20 events/DAG. Coverage primitives: `ConflictFork` (two PL siblings editing one user to different levels) + a later `Merge` ⇒ PL-conflict merge; `Unauthorised` (power-0 non-creator sets a name) ⇒ reliable rejects; `Cascade` (child's `prev_state_events` names the last reject) ⇒ reference-rejection cascade; `StaleMessage` (join victim → kick → victim messages off the *pre-kick* heads) ⇒ a deterministic soft-fail. Two checks: `adv_build_order_reproduces_verdicts_and_heads` (replaying the persisted events in build order reproduces the recorded verdicts + verdict-aware `expected_heads`; rejects never reach `current_state`) and `adv_generator_coverage_corpus` (2000-case deterministic floors: multihead ≥15% [measured 31%], pl-conflict ≥12% [29%], rejected-with-child ≥18% [36%], soft-failed-msg ≥20% [42%] — closes the three `TODO(P4)` buckets). **Recorded for Phase 2**: `reject` is order-independent (pure function of `prev_state_events` ancestry) but `soft-fail` is NOT — `apply_pdu` checks it against the live resolved `current_state` (`room_core.rs:433`), which depends on application order. So Phase 2 order-independence must assert invariance only over {`current_state`, `state_fes`, reject-verdicts}, not the timeline side / soft-fail verdicts. fmt + clippy -p neutrino-state --tests -D warnings + cargo test -p neutrino-state clean (216 lib + 40 prop). Pending fresh-context subagent review before Phase 2.
 

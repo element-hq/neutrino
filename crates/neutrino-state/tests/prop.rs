@@ -2114,6 +2114,15 @@ fn persist_effect(effects: &[Effect]) -> Option<Arc<Event>> {
     })
 }
 
+/// The order-INVARIANT slice of a verdict vector: rejected-or-not, per event.
+/// A reject is a pure function of the event's `prev_state_events` ancestry, so
+/// this projection is identical across application orders — unlike the full
+/// verdict, which distinguishes `SoftFailed` (order-dependent: checked against
+/// the live resolved `current_state`, room_core.rs:433).
+fn reject_projection(verdicts: &[Verdict]) -> Vec<bool> {
+    verdicts.iter().map(|v| *v == Verdict::Rejected).collect()
+}
+
 /// Auth-relevant projection of the resolved `current_state` — the shadow model.
 /// Coverage device only (see the module note): used to *realise* an intent into
 /// a concrete sender/target the model believes is valid (or, for the
@@ -2806,19 +2815,8 @@ proptest! {
             &expected_state,
             "state forward extremities diverged from the verdict-aware oracle"
         );
-        // A rejected event never appears in the resolved current_state.
-        let rejected: HashSet<&str> = dag
-            .events
-            .iter()
-            .filter(|e| classify(e) == Verdict::Rejected)
-            .map(|e| e.event_id.as_str())
-            .collect();
-        for id in replay.current_state.values() {
-            prop_assert!(
-                !rejected.contains(id.as_str()),
-                "rejected event {id} leaked into current_state"
-            );
-        }
+        // (Rejection isolation — a rejected event never reaching current_state —
+        // is asserted by `adv_rejection_cascade_and_isolation` below.)
     }
 }
 
@@ -2930,4 +2928,106 @@ fn adv_generator_coverage_corpus() {
 #[test]
 fn adv_creator_is_fork_merge_sender() {
     assert_eq!(ADV_POOL[ADV_CREATOR], FORK_MERGE_SENDER);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Phase 2 — order-independence of the order-invariant quantities, plus
+    /// rejection determinism. `current_state`, the state forward extremities,
+    /// and each event's *reject-or-not* verdict are pure functions of the DAG:
+    /// state events never soft-fail, and a reject depends only on
+    /// `prev_state_events` ancestry — so all three must be identical across
+    /// every topological application order. Applied in build order (baseline)
+    /// plus 2–4 random topo orders.
+    ///
+    /// The timeline forward extremities and the `SoftFailed`-vs-`Accepted`
+    /// distinction are deliberately NOT asserted order-invariant: soft-fail is
+    /// checked against the room's live resolved `current_state` at apply time
+    /// (room_core.rs:433), which legitimately depends on which concurrent events
+    /// have been applied. That is real Matrix soft-fail semantics, not a bug.
+    #[test]
+    fn adv_order_independent_invariants(
+        ops in prop::collection::vec(adv_op(), 1..16),
+        entropies in prop::collection::vec(
+            prop::collection::vec(any::<u8>().prop_map(|b| b as usize), 1..40),
+            2..5,
+        ),
+    ) {
+        let dag = build_adv_dag(ops);
+        let build_order: Vec<usize> = (0..dag.events.len()).collect();
+        let baseline = apply_adv_dag(&dag, &build_order)?;
+        let baseline_rejects = reject_projection(&baseline.verdicts);
+        for entropy in &entropies {
+            let order = random_topo_order(&dag, entropy);
+            prop_assert_eq!(order.len(), dag.events.len(), "topo order dropped events");
+            let outcome = apply_adv_dag(&dag, &order)?;
+            prop_assert_eq!(
+                &outcome.current_state,
+                &baseline.current_state,
+                "current_state depended on application order"
+            );
+            prop_assert_eq!(
+                &outcome.state_fes,
+                &baseline.state_fes,
+                "state forward extremities depended on application order"
+            );
+            prop_assert_eq!(
+                &reject_projection(&outcome.verdicts),
+                &baseline_rejects,
+                "reject verdicts depended on application order"
+            );
+        }
+    }
+
+    /// Phase 2 — rejection cascade + isolation. Cascade: any event whose
+    /// `prev_state_events` names a rejected event is itself rejected
+    /// (`validate::validate_references` → `PrevStateRejected`); this is a
+    /// structural property of the DAG, so it is checked directly on the stored
+    /// verdicts. Isolation: a rejected event never appears in the resolved
+    /// `current_state` (`apply_pdu` returns before any state commit on the
+    /// reject path); checked against an applied outcome.
+    #[test]
+    fn adv_rejection_cascade_and_isolation(
+        ops in prop::collection::vec(adv_op(), 1..16),
+    ) {
+        let dag = build_adv_dag(ops);
+        let verdict_by_id: HashMap<&str, Verdict> = dag
+            .events
+            .iter()
+            .map(|e| (e.event_id.as_str(), classify(e)))
+            .collect();
+
+        // Cascade.
+        for (i, e) in dag.events.iter().enumerate() {
+            let names_rejected = e
+                .prev_state_events
+                .iter()
+                .any(|p| verdict_by_id.get(p.as_str()) == Some(&Verdict::Rejected));
+            if names_rejected {
+                prop_assert_eq!(
+                    dag.verdict(i),
+                    Verdict::Rejected,
+                    "event {} names a rejected prev_state_event but was not itself rejected",
+                    e.event_id
+                );
+            }
+        }
+
+        // Isolation.
+        let build_order: Vec<usize> = (0..dag.events.len()).collect();
+        let outcome = apply_adv_dag(&dag, &build_order)?;
+        let rejected: HashSet<&str> = dag
+            .events
+            .iter()
+            .filter(|e| classify(e) == Verdict::Rejected)
+            .map(|e| e.event_id.as_str())
+            .collect();
+        for id in outcome.current_state.values() {
+            prop_assert!(
+                !rejected.contains(id.as_str()),
+                "rejected event {id} leaked into current_state"
+            );
+        }
+    }
 }
