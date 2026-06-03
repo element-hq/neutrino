@@ -91,10 +91,8 @@ enum Command {
     /// backfill and re-deliver. `event` is boxed to keep the `Command` enum
     /// small (an `Event` dwarfs `Send`'s fields).
     ///
-    /// Driven by [`RoomRegistry::apply_pdu`]; the federation `PUT /send/{txn}`
-    /// handler that calls it lands with the "Server-Server /send" work, so
-    /// until then it is exercised only by unit tests.
-    #[allow(dead_code)]
+    /// Driven by [`RoomRegistry::apply_pdu`], called from the federation
+    /// `PUT /send/{txn}` handler (`federation::send`).
     ApplyPdu {
         event: Box<Event>,
         reply: oneshot::Sender<Result<(), RoomActorError>>,
@@ -289,10 +287,8 @@ impl RoomRegistry {
     /// (see [`CoreError::is_retryable`]) signals the caller to backfill the
     /// missing ancestry and re-deliver.
     ///
-    /// Not yet wired to an HTTP route — the federation `PUT /send/{txn}`
-    /// handler lands with the "Server-Server /send" work. Exercised by unit
-    /// tests until then.
-    #[allow(dead_code)]
+    /// Called from the federation `PUT /send/{txn}` handler
+    /// (`federation::send::apply_with_gapfill`), which owns the backfill loop.
     pub async fn apply_pdu(&self, room_id: &RoomId, event: Event) -> Result<(), RoomActorError> {
         let actor = self.actor_for(room_id).await?;
         let (reply, rx) = oneshot::channel();

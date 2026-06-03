@@ -290,6 +290,10 @@ fn build_router(state: AppState) -> Router {
             post(federation::get_missing_events::handle),
         )
         .route(
+            "/_matrix/federation/v1/send/{txn_id}",
+            put(federation::send::handle),
+        )
+        .route(
             "/_matrix/federation/v1/backfill/{room_id}",
             get(federation::backfill::handle),
         )
