@@ -32,6 +32,7 @@ neutrino-common = { path = "../neutrino-common" }
 neutrino-state = { path = "../neutrino-state" }
 neutrino-store = { path = "../neutrino-store" }
 neutrino-store-sqlite = { path = "../neutrino-store-sqlite" }
+reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
 
 [dev-dependencies]
 # Required only for the `tests/e2e_sliding_sync.rs` integration tests so they

@@ -151,7 +151,7 @@ impl AppState {
     /// stays alive for the lifetime of the router.
     fn from_store(config: Config, store: Arc<SqliteStore>, tempfile: NamedTempFile) -> Self {
         let sync_state = Arc::new(SyncState::new(store.clone()));
-        let room_registry = Arc::new(RoomRegistry::new(store.clone()));
+        let room_registry = Arc::new(RoomRegistry::new(store.clone(), config.server_name.clone()));
         let app = App {
             store,
             room_registry,

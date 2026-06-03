@@ -33,17 +33,9 @@ impl EventStore for SqliteStore {
 
             let stream_pos = event.write_into_tx(&tx)?;
 
-            // Outbox: one row per destination, idempotent via the
-            // UNIQUE(destination, event_id) constraint. `event.event_id`
-            // resolves through `EventRow: Deref<Target = Event>`.
-            {
-                let mut stmt = tx.prepare(
-                    "INSERT OR IGNORE INTO outbox (destination, event_id) VALUES (?, ?)",
-                )?;
-                for dest in &destinations {
-                    stmt.execute(params![dest.as_str(), event.event_id.as_str()])?;
-                }
-            }
+            // Outbox: one row per destination. `event.event_id` resolves
+            // through `EventRow: Deref<Target = Event>`.
+            insert_outbox_rows(&tx, event.event_id.as_str(), &destinations)?;
 
             tx.commit()?;
 
@@ -89,6 +81,7 @@ impl EventStore for SqliteStore {
         timeline_fes: &BTreeSet<OwnedEventId>,
         state_fes: &BTreeSet<OwnedEventId>,
         current_state_delta: &BTreeMap<(String, String), Option<OwnedEventId>>,
+        destinations: &[&ServerName],
     ) -> Result<(), StorageError> {
         // event_id <-> raw consistency asserted inside `EventRow::from`.
         let event = EventRow::from(event).to_owned();
@@ -96,6 +89,8 @@ impl EventStore for SqliteStore {
         let timeline_json = fe_json(timeline_fes)?;
         let state_json = fe_json(state_fes)?;
         let delta = current_state_delta.clone();
+        let destinations: Vec<OwnedServerName> =
+            destinations.iter().map(|s| (*s).to_owned()).collect();
         let watch_tx = self.watch_tx.clone();
 
         self.run_write(move |conn| -> Result<(), Error> {
@@ -126,6 +121,10 @@ impl EventStore for SqliteStore {
                  WHERE room_id = ?",
                 params![timeline_json, state_json, room_id.as_str()],
             )?;
+
+            // Outbox: one row per federation destination, same txn as the
+            // event so a crash can't persist the event but drop its delivery.
+            insert_outbox_rows(&tx, event.event_id.as_str(), &destinations)?;
 
             tx.commit()?;
 
@@ -338,6 +337,25 @@ fn fe_json(fes: &BTreeSet<OwnedEventId>) -> Result<String, Error> {
         .map_err(|e| Error::Internal(format!("serialising forward_extremities: {e}")))
 }
 
+/// Insert one `outbox` row per destination for `event_id`, idempotent via the
+/// `UNIQUE(destination, event_id)` constraint. Shared by `persist_event` and
+/// `persist_resolved_event`; an empty `destinations` slice writes nothing.
+fn insert_outbox_rows(
+    tx: &Transaction,
+    event_id: &str,
+    destinations: &[OwnedServerName],
+) -> Result<(), Error> {
+    if destinations.is_empty() {
+        return Ok(());
+    }
+    let mut stmt =
+        tx.prepare("INSERT OR IGNORE INTO outbox (destination, event_id) VALUES (?, ?)")?;
+    for dest in destinations {
+        stmt.execute(params![dest.as_str(), event_id])?;
+    }
+    Ok(())
+}
+
 /// Apply a resolved current-state delta within `tx`. Each `Some(id)` upserts
 /// the `(room_id, event_type, state_key)` row to point at `id`; each `None`
 /// removes the row. The upsert derives `event_id`'s `event_type` /
@@ -442,7 +460,7 @@ mod tests {
             .collect();
         let delta = set_delta("m.room.name", "", &name_id);
 
-        s.persist_resolved_event(&name, &timeline, &state, &delta)
+        s.persist_resolved_event(&name, &timeline, &state, &delta, &[])
             .await
             .unwrap();
 
@@ -471,7 +489,7 @@ mod tests {
         let timeline: BTreeSet<OwnedEventId> = [msg_id.clone()].into_iter().collect();
         let state: BTreeSet<OwnedEventId> = [create.event_id.clone()].into_iter().collect();
 
-        s.persist_resolved_event(&msg, &timeline, &state, &BTreeMap::new())
+        s.persist_resolved_event(&msg, &timeline, &state, &BTreeMap::new(), &[])
             .await
             .unwrap();
 
@@ -497,9 +515,15 @@ mod tests {
         let name = name_event(*ALICE_ROOM_ID, *ALICE_USER_ID, "Room");
         let name_id = name.event_id.clone();
         let fe1: BTreeSet<OwnedEventId> = [name_id.clone()].into_iter().collect();
-        s.persist_resolved_event(&name, &fe1, &fe1, &set_delta("m.room.name", "", &name_id))
-            .await
-            .unwrap();
+        s.persist_resolved_event(
+            &name,
+            &fe1,
+            &fe1,
+            &set_delta("m.room.name", "", &name_id),
+            &[],
+        )
+        .await
+        .unwrap();
         assert!(
             s.current_state_event(*ALICE_ROOM_ID, "m.room.name", "")
                 .await
@@ -513,7 +537,7 @@ mod tests {
         let state_fe: BTreeSet<OwnedEventId> = [create.event_id.clone()].into_iter().collect();
         let remove: BTreeMap<(String, String), Option<OwnedEventId>> =
             BTreeMap::from([(("m.room.name".to_string(), String::new()), None)]);
-        s.persist_resolved_event(&msg, &fe2, &state_fe, &remove)
+        s.persist_resolved_event(&msg, &fe2, &state_fe, &remove, &[])
             .await
             .unwrap();
 
@@ -536,7 +560,7 @@ mod tests {
         let ghost = event_id!("$ghost:example.org").to_owned();
         let delta = set_delta("m.room.name", "", &ghost);
 
-        let result = s.persist_resolved_event(&msg, &fe, &fe, &delta).await;
+        let result = s.persist_resolved_event(&msg, &fe, &fe, &delta, &[]).await;
         assert!(
             matches!(result, Err(StorageError::Internal(_))),
             "{result:?}"
@@ -552,7 +576,7 @@ mod tests {
         let msg_id = msg.event_id.clone();
         let fe: BTreeSet<OwnedEventId> = [msg_id.clone()].into_iter().collect();
 
-        s.persist_resolved_event(&msg, &fe, &fe, &BTreeMap::new())
+        s.persist_resolved_event(&msg, &fe, &fe, &BTreeMap::new(), &[])
             .await
             .unwrap();
 
@@ -1108,6 +1132,69 @@ mod tests {
             rows,
             vec!["a.example.com".to_string(), "b.example.com".to_string()]
         );
+    }
+
+    // E37b: `persist_resolved_event` writes one outbox row per destination in
+    // the same txn (the actor's federation-delivery path), readable back via
+    // the `FederationOutbox` trait. An empty destinations slice writes none.
+    #[tokio::test]
+    async fn persist_resolved_event_writes_outbox_rows_per_destination() {
+        use neutrino_store::FederationOutbox;
+
+        let (s, create) = store_with_room_and_create().await;
+        let name = name_event(*ALICE_ROOM_ID, *ALICE_USER_ID, "Room");
+        let name_id = name.event_id.clone();
+        let timeline: BTreeSet<OwnedEventId> = [name_id.clone()].into_iter().collect();
+        let state: BTreeSet<OwnedEventId> = [create.event_id.clone(), name_id.clone()]
+            .into_iter()
+            .collect();
+        let delta = set_delta("m.room.name", "", &name_id);
+
+        let dest_a = server_name!("a.example.com");
+        let dest_b = server_name!("b.example.com");
+        s.persist_resolved_event(&name, &timeline, &state, &delta, &[dest_a, dest_b])
+            .await
+            .unwrap();
+
+        // Each destination has the event queued.
+        for dest in [dest_a, dest_b] {
+            let pending = s.pending_pdus(dest).await.unwrap();
+            assert_eq!(pending.len(), 1, "one pending pdu for {dest}");
+            assert_eq!(pending[0].event_id, name_id);
+        }
+        // A third, unaddressed destination has nothing.
+        assert!(
+            s.pending_pdus(server_name!("c.example.com"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // E37c: an empty destinations slice writes no outbox rows — the
+    // federation-received PDU path (`handle_apply_pdu` passes `&[]`).
+    #[tokio::test]
+    async fn persist_resolved_event_empty_destinations_writes_no_outbox() {
+        let (s, _create) = store_with_room_and_create().await;
+        let msg = message(*ALICE_ROOM_ID, *ALICE_USER_ID, "hi");
+        let msg_id = msg.event_id.as_str().to_owned();
+        let timeline: BTreeSet<OwnedEventId> = [msg.event_id.clone()].into_iter().collect();
+
+        s.persist_resolved_event(&msg, &timeline, &timeline, &BTreeMap::new(), &[])
+            .await
+            .unwrap();
+
+        let count: i64 = s
+            .run_read(move |conn| -> Result<i64, Error> {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM outbox WHERE event_id = ?",
+                    params![msg_id.as_str()],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     // E38: `subscribe()` receiver observes a value advance after
