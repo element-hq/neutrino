@@ -13,6 +13,10 @@ set -euo pipefail
 #   COMPLEMENT_REF  Branch/tag/commit of matrix-org/complement to fetch when
 #                   COMPLEMENT_DIR is unset. Defaults to main.
 #   IMAGE_TAG       Tag for the built image. Defaults to neutrino:complement.
+#   SKIP_IMAGE_BUILD  When set and ${IMAGE_TAG} already exists in the local
+#                   docker daemon, skip the build. CI pre-builds the image with
+#                   buildx layer caching (see .github/workflows/ci.yml) and sets
+#                   this so the script doesn't rebuild it uncached from scratch.
 #
 # Extra positional args are forwarded to `go test` (e.g. -run, -v).
 
@@ -46,11 +50,15 @@ done
 
 cd "${REPO_ROOT}"
 
-echo "Building ${IMAGE_TAG}..."
-docker build \
-    -f docker/complement/Dockerfile \
-    -t "${IMAGE_TAG}" \
-    .
+if [ -n "${SKIP_IMAGE_BUILD:-}" ] && docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
+    echo "Using pre-built ${IMAGE_TAG} (SKIP_IMAGE_BUILD set)"
+else
+    echo "Building ${IMAGE_TAG}..."
+    docker build \
+        -f docker/complement/Dockerfile \
+        -t "${IMAGE_TAG}" \
+        .
+fi
 
 export COMPLEMENT_BASE_IMAGE="${IMAGE_TAG}"
 
