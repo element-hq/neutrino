@@ -26,7 +26,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use neutrino_common::{Config, ROOM_VERSION_ID};
 use neutrino_state::event_id::EventBuilder;
-use neutrino_store::{EventStore, RoomStore};
+use neutrino_store::{EventStore, RoomStore, StateStore};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 use serde_json::{Value, json};
@@ -1016,4 +1016,307 @@ async fn backfill_limit_zero_returns_400() {
         Some("M_INVALID_PARAM"),
         "body = {body}"
     );
+}
+
+// --- /send (inbound federation transactions) ---------------------------
+
+/// Drive a PUT with a JSON body against the router.
+async fn put_json(app: &axum::Router, path: &str, body: &Value) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("PUT")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(body).unwrap()))
+        .unwrap();
+    drive(app, req).await
+}
+
+fn send_path(txn_id: &str) -> String {
+    format!("/_matrix/federation/v1/send/{txn_id}")
+}
+
+/// Wrap PDU events into a transaction envelope. `pdus` are the events' raw wire
+/// bytes embedded verbatim — exactly how a peer would send them.
+fn txn(pdus: &[&neutrino_common::Event]) -> Value {
+    let pdus: Vec<Value> = pdus
+        .iter()
+        .map(|e| serde_json::from_str(e.raw.get()).expect("pdu raw is valid JSON"))
+        .collect();
+    json!({
+        "origin": "remote.example.org",
+        "origin_server_ts": 1_700_000_000_000u64,
+        "pdus": pdus,
+    })
+}
+
+/// Seed a room (create + alice's self-join) on a fresh store and mount the
+/// router over it. forward_extremities are seeded to the join, so the actor can
+/// bootstrap when a PDU for this room arrives. Returns the router, a store
+/// handle for assertions, the room id, alice, and the join event id (the sole
+/// head of both DAGs).
+async fn seed_joined_room() -> (
+    axum::Router,
+    Arc<SqliteStore>,
+    OwnedRoomId,
+    OwnedUserId,
+    OwnedEventId,
+) {
+    let (store, tempfile) = fresh_store().await;
+    let alice = alice();
+    let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    let create_id = create.event_id.clone();
+    let join = EventBuilder::new(alice.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(alice.as_str().to_owned())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create_id.clone()])
+        .prev_state_events(vec![create_id.clone()])
+        .build()
+        .expect("build join");
+    let join_id = join.event_id.clone();
+    store
+        .create_room(&create, &[join])
+        .await
+        .expect("create_room");
+    let router = router_with_store(config(), store.clone(), tempfile);
+    (router, store, room_id, alice, join_id)
+}
+
+/// Build a message PDU sitting on `head` (both DAGs).
+fn message_on(
+    sender: &OwnedUserId,
+    room_id: &OwnedRoomId,
+    head: &OwnedEventId,
+    body: &str,
+    ts: u64,
+) -> neutrino_common::Event {
+    EventBuilder::new(sender.clone(), "m.room.message".to_owned())
+        .room_id(room_id.clone())
+        .content(json!({ "msgtype": "m.text", "body": body }))
+        .prev_events(vec![head.clone()])
+        .prev_state_events(vec![head.clone()])
+        .origin_server_ts(ts)
+        .build()
+        .expect("build message")
+}
+
+#[tokio::test]
+async fn send_accepts_pdu_and_persists() {
+    let (app, store, room_id, alice, join_id) = seed_joined_room().await;
+    let msg = message_on(
+        &alice,
+        &room_id,
+        &join_id,
+        "hello over federation",
+        1_700_000_001_000,
+    );
+    let msg_id = msg.event_id.clone();
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&msg])).await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    // Per-PDU result is an empty object (success, no error).
+    let result = body.get("pdus").and_then(|p| p.get(msg_id.as_str()));
+    assert_eq!(result, Some(&json!({})), "body = {body}");
+
+    // The event landed in the store and the timeline head advanced to it.
+    let fetched = store.get_events(&[msg_id.as_ref()]).await.unwrap();
+    assert_eq!(fetched.len(), 1);
+    assert!(!fetched[0].rejected);
+    let (timeline, _state) = store.forward_extremities(&room_id).await.unwrap().unwrap();
+    assert_eq!(timeline, [msg_id].into_iter().collect());
+}
+
+#[tokio::test]
+async fn send_persists_rejected_pdu_as_success_result() {
+    // bob — never invited — sends a join PDU into alice's invite-only room.
+    // Federation policy: the reject is *persisted*, and from the transaction's
+    // point of view the PDU was processed → empty (error-free) result.
+    let (app, store, room_id, _alice, join_id) = seed_joined_room().await;
+    let bob: OwnedUserId = "@bob:remote.example.org".parse().unwrap();
+    let bob_join = EventBuilder::new(bob.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(bob.as_str().to_owned())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![join_id.clone()])
+        .prev_state_events(vec![join_id.clone()])
+        .build()
+        .expect("build bob join");
+    let bob_join_id = bob_join.event_id.clone();
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&bob_join])).await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(
+        body.get("pdus").and_then(|p| p.get(bob_join_id.as_str())),
+        Some(&json!({})),
+        "a persisted reject is a successful PDU result; body = {body}"
+    );
+    // Persisted-but-rejected; bob is absent from current_state.
+    let fetched = store.get_events(&[bob_join_id.as_ref()]).await.unwrap();
+    assert_eq!(fetched.len(), 1);
+    assert!(fetched[0].rejected);
+    assert!(
+        store
+            .current_state_event(&room_id, "m.room.member", bob.as_str())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn send_reports_error_for_unfillable_missing_ancestry() {
+    // A PDU referencing a parent we don't have and can't backfill (NoFetcher).
+    // Terminal condition 2: no progress → the PDU gets an error.
+    let (app, _store, room_id, alice, join_id) = seed_joined_room().await;
+    // An orphan ancestor that is never persisted nor included in the txn.
+    let orphan = message_on(&alice, &room_id, &join_id, "orphan", 1_700_000_002_000);
+    let child = message_on(
+        &alice,
+        &room_id,
+        &orphan.event_id,
+        "child",
+        1_700_000_003_000,
+    );
+    let child_id = child.event_id.clone();
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let err = body
+        .get("pdus")
+        .and_then(|p| p.get(child_id.as_str()))
+        .and_then(|r| r.get("error"))
+        .and_then(Value::as_str);
+    assert!(err.is_some(), "expected an error result; body = {body}");
+}
+
+#[tokio::test]
+async fn send_toposorts_out_of_order_batch() {
+    // Two new message events arrive in the same transaction, child *before*
+    // parent in the array. The handler must toposort so the parent applies
+    // first; both end up accepted.
+    let (app, store, room_id, alice, join_id) = seed_joined_room().await;
+    let first = message_on(&alice, &room_id, &join_id, "first", 1_700_000_001_000);
+    // `second` chains the timeline off `first` but its state head stays the
+    // join (messages don't move the state DAG), so `prev_state_events` points
+    // at `join_id`, not at the `first` message.
+    let second = EventBuilder::new(alice.clone(), "m.room.message".to_owned())
+        .room_id(room_id.clone())
+        .content(json!({ "msgtype": "m.text", "body": "second" }))
+        .prev_events(vec![first.event_id.clone()])
+        .prev_state_events(vec![join_id.clone()])
+        .origin_server_ts(1_700_000_002_000)
+        .build()
+        .expect("build second");
+    let (first_id, second_id) = (first.event_id.clone(), second.event_id.clone());
+
+    // child (second) listed before parent (first).
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&second, &first])).await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(
+        body.get("pdus").and_then(|p| p.get(first_id.as_str())),
+        Some(&json!({})),
+        "body = {body}"
+    );
+    assert_eq!(
+        body.get("pdus").and_then(|p| p.get(second_id.as_str())),
+        Some(&json!({})),
+        "body = {body}"
+    );
+    // The later child is the timeline head.
+    let (timeline, _state) = store.forward_extremities(&room_id).await.unwrap().unwrap();
+    assert_eq!(timeline, [second_id].into_iter().collect());
+}
+
+#[tokio::test]
+async fn send_is_idempotent_on_duplicate_txn_id() {
+    let (app, store, room_id, alice, join_id) = seed_joined_room().await;
+    let msg = message_on(&alice, &room_id, &join_id, "once", 1_700_000_001_000);
+    let msg_id = msg.event_id.clone();
+
+    let (s1, _) = put_json(&app, &send_path("dup"), &txn(&[&msg])).await;
+    assert_eq!(s1, StatusCode::OK);
+
+    // Re-send the same (origin, txn_id): acknowledged without reprocessing,
+    // empty results map.
+    let (s2, body2) = put_json(&app, &send_path("dup"), &txn(&[&msg])).await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(body2, json!({ "pdus": {} }), "body = {body2}");
+
+    // The event is present exactly once.
+    let fetched = store.get_events(&[msg_id.as_ref()]).await.unwrap();
+    assert_eq!(fetched.len(), 1);
+}
+
+#[tokio::test]
+async fn send_ignores_edus() {
+    // A transaction carrying EDUs is accepted; the EDUs are dropped and the
+    // PDU is still processed.
+    let (app, _store, room_id, alice, join_id) = seed_joined_room().await;
+    let msg = message_on(&alice, &room_id, &join_id, "with edus", 1_700_000_001_000);
+    let msg_id = msg.event_id.clone();
+    let mut body = txn(&[&msg]);
+    body["edus"] = json!([{ "edu_type": "m.typing", "content": {} }]);
+
+    let (status, resp) = put_json(&app, &send_path("txn1"), &body).await;
+
+    assert_eq!(status, StatusCode::OK, "body = {resp}");
+    assert_eq!(
+        resp.get("pdus").and_then(|p| p.get(msg_id.as_str())),
+        Some(&json!({})),
+        "body = {resp}"
+    );
+}
+
+#[tokio::test]
+async fn send_rejects_oversized_transaction() {
+    let (app, _store, room_id, alice, join_id) = seed_joined_room().await;
+    // 51 PDUs > the 50 spec maximum.
+    let events: Vec<neutrino_common::Event> = (0..51)
+        .map(|i| message_on(&alice, &room_id, &join_id, "x", 1_700_000_001_000 + i))
+        .collect();
+    let refs: Vec<&neutrino_common::Event> = events.iter().collect();
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&refs)).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(
+        body.get("errcode").and_then(Value::as_str),
+        Some("M_INVALID_PARAM"),
+        "body = {body}"
+    );
+}
+
+#[tokio::test]
+async fn send_empty_transaction_is_ok() {
+    let (app, _store, _room_id, _alice, _join_id) = seed_joined_room().await;
+    let (status, body) = put_json(
+        &app,
+        &send_path("txn1"),
+        &json!({ "origin": "remote.example.org", "origin_server_ts": 1u64 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(body, json!({ "pdus": {} }), "body = {body}");
+}
+
+#[tokio::test]
+async fn send_malformed_body_returns_400() {
+    let (app, _store, _room_id, _alice, _join_id) = seed_joined_room().await;
+    let req = Request::builder()
+        .method("PUT")
+        .uri(send_path("txn1"))
+        .header("content-type", "application/json")
+        .body(Body::from(b"not json".to_vec()))
+        .unwrap();
+    let (status, body) = drive(&app, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
 }

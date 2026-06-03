@@ -19,6 +19,7 @@ use thiserror::Error;
 
 pub(crate) mod backfill;
 pub(crate) mod get_missing_events;
+pub(crate) mod send;
 
 #[cfg(test)]
 mod tests;
