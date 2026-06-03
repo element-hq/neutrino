@@ -6,7 +6,7 @@ This directory holds neutrino's integration with the
 ## Layout
 
 - `go.mod`/`go.sum` — declare an in-repo Go module that pins the complement
-  framework version. Used both by `tests/` and by `scripts/complement.sh` (via
+  framework version. Used both by `tests/` and by `cargo xtask complement` (via
   `setup-go`'s `go-version-file` in CI) as the source of truth for the
   complement version.
 - `tests/` — neutrino-specific complement tests (currently just
@@ -30,19 +30,19 @@ This directory holds neutrino's integration with the
 ```sh
 # Build the image, fetch matrix-org/complement@main into ./complement-main/,
 # and run the allowlist.
-bash scripts/complement.sh
+cargo xtask complement
 
 # Override the complement version (any branch, tag, or commit).
-COMPLEMENT_REF=v0.x bash scripts/complement.sh
+COMPLEMENT_REF=v0.x cargo xtask complement
 
 # Use an existing complement checkout instead of the project-local fetch.
-COMPLEMENT_DIR=/path/to/complement bash scripts/complement.sh
+COMPLEMENT_DIR=/path/to/complement cargo xtask complement
 
 # Run a specific upstream test, ignoring the allowlist.
-bash scripts/complement.sh -run TestVersionStructure
+cargo xtask complement -- -run TestVersionStructure
 
 # Run neutrino's in-repo tests (under ./complement/tests/...).
-bash scripts/complement.sh --in-repo
+cargo xtask complement --in-repo
 ```
 
 The script:

@@ -32,10 +32,10 @@
 
  ### Embedding
 
- To build Neutrino for use inside Element X, run the `compile` script:
+ To build Neutrino for use inside Element X, run:
 
  ```
- $ ./scripts/compile.sh
+ $ cargo xtask publish --local
  ```
 
  This will:
