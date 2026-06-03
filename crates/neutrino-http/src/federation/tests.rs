@@ -1237,6 +1237,55 @@ async fn send_toposorts_out_of_order_batch() {
 }
 
 #[tokio::test]
+async fn send_handles_duplicate_pdu_in_batch() {
+    // A peer repeats the same PDU bytes in one transaction, and a third event
+    // references it. Before the dedup fix this underflowed `toposort`'s
+    // indegree bookkeeping (panic in debug). Now the duplicate is dropped and
+    // both distinct events are accepted.
+    let (store, tempfile) = fresh_store().await;
+    let alice = alice();
+    let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    let create_id = create.event_id.clone();
+    store.create_room(&create, &[]).await.expect("create_room");
+    let app = router_with_store(config(), store.clone(), tempfile);
+
+    let join = EventBuilder::new(alice.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(alice.as_str().to_owned())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create_id.clone()])
+        .prev_state_events(vec![create_id.clone()])
+        .build()
+        .expect("build join");
+    let join_id = join.event_id.clone();
+    let msg = message_on(&alice, &room_id, &join_id, "after join", 1_700_000_002_000);
+    let msg_id = msg.event_id.clone();
+
+    // `join` appears twice, `msg` (which references join) once.
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&join, &join, &msg])).await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(
+        body.get("pdus").and_then(|p| p.get(join_id.as_str())),
+        Some(&json!({})),
+        "body = {body}"
+    );
+    assert_eq!(
+        body.get("pdus").and_then(|p| p.get(msg_id.as_str())),
+        Some(&json!({})),
+        "body = {body}"
+    );
+    // Both distinct events persisted; the message is the timeline head.
+    let (timeline, _state) = store.forward_extremities(&room_id).await.unwrap().unwrap();
+    assert_eq!(timeline, [msg_id].into_iter().collect());
+}
+
+#[tokio::test]
 async fn send_is_idempotent_on_duplicate_txn_id() {
     let (app, store, room_id, alice, join_id) = seed_joined_room().await;
     let msg = message_on(&alice, &room_id, &join_id, "once", 1_700_000_001_000);

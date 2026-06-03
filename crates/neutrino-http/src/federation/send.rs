@@ -153,9 +153,18 @@ pub(crate) async fn handle(
     // reference hash, so a PDU that fails it is unkeyable (malformed, or no
     // derivable id) and cannot appear in the result map — it is silently
     // dropped, matching Synapse's log-and-skip for such events.
+    //
+    // De-duplicate by event_id: a peer may legally repeat the same PDU bytes
+    // in one transaction, and `toposort`'s indegree bookkeeping is keyed by
+    // event_id, so two array slots sharing an id would double-decrement a
+    // child's indegree (a `usize` underflow → panic in debug). Keeping the
+    // first occurrence is sufficient — `apply_pdu` is idempotent anyway.
     let mut parsed: Vec<Event> = Vec::new();
+    let mut seen: HashSet<OwnedEventId> = HashSet::new();
     for raw in body.pdus {
-        if let Ok(event) = from_wire(raw, Vec::new()) {
+        if let Ok(event) = from_wire(raw, Vec::new())
+            && seen.insert(event.event_id.clone())
+        {
             parsed.push(event);
         }
     }
