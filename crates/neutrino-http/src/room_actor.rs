@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 use neutrino_common::Event;
 use neutrino_state::room_core::{Effect, RoomCore};
 use neutrino_state::{CoreError, FormatError, StateDelta, StateMap};
-use neutrino_store::{EventStore, RoomStore, StateStore, StorageError};
+use neutrino_store::{EventStore, Membership, RoomStore, StateStore, StorageError};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::{OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId};
 use serde_json::Value;
@@ -179,8 +179,16 @@ impl RoomActor {
             return Err(RoomActorError::Rejected);
         }
 
-        // Federate to every remote server in the post-apply room state.
-        let destinations = outbound_destinations(next.current_state(), &event, &self.own_server);
+        // Federate to every remote server in the post-apply room state — but a
+        // soft-failed event must not be relayed (it failed auth against current
+        // state, so peers would reject it too). Soft-fail is only ever set on
+        // non-state events, so an unrejected state event always federates; the
+        // explicit `state_key.is_none()` guard keeps that invariant local.
+        let destinations = if event.soft_failed && event.state_key.is_none() {
+            Vec::new()
+        } else {
+            outbound_destinations(next.current_state(), &event, &self.own_server)
+        };
         let dest_refs: Vec<&ServerName> = destinations.iter().map(AsRef::as_ref).collect();
 
         self.store
@@ -243,14 +251,23 @@ fn outbound_destinations(
 
     for ((event_type, state_key), member) in current_state {
         if event_type == "m.room.member"
-            && member_is_join(member)
+            && event_membership(member) == Some(Membership::Join)
             && let Ok(user) = UserId::parse(state_key.as_str())
         {
             servers.insert(user.server_name().to_owned());
         }
     }
 
+    // A departing member (leave/ban) has already dropped out of the joined set
+    // above, so explicitly notify their server of its own departure. Joins are
+    // already covered by the joined-set scan; invites/knocks are delivered via
+    // the dedicated `/invite` handshake endpoint, not transaction broadcast, so
+    // they are deliberately excluded here.
     if event.event_type == "m.room.member"
+        && matches!(
+            event_membership(event),
+            Some(Membership::Leave | Membership::Ban)
+        )
         && let Some(state_key) = &event.state_key
         && let Ok(user) = UserId::parse(state_key.as_str())
     {
@@ -261,16 +278,17 @@ fn outbound_destinations(
     servers.into_iter().collect()
 }
 
-/// Whether an `m.room.member` event's `content.membership` is `join`.
-fn member_is_join(event: &Event) -> bool {
+/// An `m.room.member` event's `content.membership`, parsed through the
+/// canonical [`Membership`] alphabet. `None` for a non-member event or any
+/// missing / unrecognised membership string.
+fn event_membership(event: &Event) -> Option<Membership> {
     serde_json::from_str::<Value>(event.content.get())
         .ok()
         .and_then(|c| {
             c.get("membership")
                 .and_then(Value::as_str)
-                .map(|m| m == "join")
+                .and_then(Membership::from_wire)
         })
-        .unwrap_or(false)
 }
 
 /// Split `apply_pdu`'s effects into the event to persist and the current-state
@@ -777,10 +795,22 @@ mod tests {
             .prev_state_events(vec![rules.event_id.clone()])
             .build()
             .expect("build zara join pdu");
+        let zara_join_id = zara_join.event_id.clone();
         registry
             .apply_pdu(&room_id, zara_join)
             .await
             .expect("zara joins via federation");
+
+        // Precondition the rest of the suite leans on: zara is *actually*
+        // joined in current_state. `apply_pdu` returns `Ok` even for a rejected
+        // PDU (federation persists rejects), so the `expect` above is not
+        // enough — assert the join landed in state, not just that it applied.
+        let zara_member = store
+            .current_state_event(&room_id, "m.room.member", zara.as_str())
+            .await
+            .unwrap()
+            .expect("zara is a current member");
+        assert_eq!(zara_member.event_id, zara_join_id, "zara's join must win");
 
         // A federation-received PDU is never re-originated: it writes no outbox.
         assert!(
@@ -852,6 +882,46 @@ mod tests {
         assert!(
             pending.iter().any(|e| e.event_id == kick.event_id),
             "departing server must receive the kick"
+        );
+    }
+
+    #[tokio::test]
+    async fn invite_of_remote_user_is_not_federated_via_send() {
+        // The "+target server" clause fires only for departing memberships
+        // (leave/ban). An invite is delivered via the dedicated `/invite`
+        // handshake, not transaction broadcast, so inviting a remote user must
+        // NOT enqueue an outbox row for their server.
+        let (registry, store, room_id, alice) = setup().await;
+        registry
+            .send_event(
+                &room_id,
+                alice.clone(),
+                "m.room.member".to_owned(),
+                Some(alice.to_string()),
+                json!({ "membership": "join" }),
+            )
+            .await
+            .expect("alice join");
+
+        let zara: OwnedUserId = ZARA.parse().unwrap();
+        registry
+            .send_event(
+                &room_id,
+                alice.clone(),
+                "m.room.member".to_owned(),
+                Some(zara.to_string()),
+                json!({ "membership": "invite" }),
+            )
+            .await
+            .expect("alice invites zara");
+
+        assert!(
+            store
+                .pending_pdus(server_name!("remote.example"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "an invite must not federate over /send"
         );
     }
 }
