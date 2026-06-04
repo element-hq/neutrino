@@ -203,16 +203,18 @@ pub trait EventStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<(StreamPos, Event)>, StorageError>;
 
-    /// Pre:  the room must exist; if `from` is `Some`, the token must have been returned
-    ///       by a previous call to this method (or constructed from a known `StreamPos`).
-    /// Post: returns up to `limit` events in the requested direction; if `from` is `None`
-    ///       and `dir` is `Backward`, starts from the most recent event in the room;
-    ///       the returned `PaginationToken` is `None` when no further events exist in
-    ///       that direction.
+    /// Pre:  the room must exist; if `from`/`to` are `Some`, the token must have been
+    ///       returned by a previous call (or built from a known `StreamPos`).
+    /// Post: returns up to `limit` events in the requested direction, starting just past
+    ///       `from` and stopping *before* `to` (both exclusive). If `from` is `None` and
+    ///       `dir` is `Backward`, starts from the most recent event; if `Forward`, from the
+    ///       earliest. `to` is `None` for no stop boundary in that direction. The returned
+    ///       `PaginationToken` is `None` when no further events exist within the range.
     async fn room_messages(
         &self,
         room_id: &RoomId,
         from: Option<PaginationToken>,
+        to: Option<PaginationToken>,
         dir: Direction,
         limit: usize,
     ) -> Result<(Vec<Event>, Option<PaginationToken>), StorageError>;

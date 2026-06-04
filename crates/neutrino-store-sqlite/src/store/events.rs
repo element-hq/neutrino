@@ -211,21 +211,17 @@ impl EventStore for SqliteStore {
         &self,
         room_id: &RoomId,
         from: Option<PaginationToken>,
+        to: Option<PaginationToken>,
         dir: Direction,
         limit: usize,
     ) -> Result<(Vec<Event>, Option<PaginationToken>), StorageError> {
         let room_id = room_id.to_owned();
-        // Fetch one extra row so we can distinguish "exactly `limit`
-        // events remain" (post-condition: return `None` token) from
-        // "more than `limit` events remain" (return a `Some` token).
-        // `events.len() < limit` alone can't tell those cases apart;
-        // see trait post-condition "token is None when no further
-        // events exist".
+        // Fetch one extra row so we can distinguish "exactly `limit` events
+        // remain" (return `None` token) from "more than `limit` remain"
+        // (return a `Some` token).
         let fetch_limit_i64 = i64::try_from(limit.saturating_add(1))
             .map_err(|_| Error::InvalidInput(format!("limit {limit} exceeds i64::MAX")))?;
-        // Default `from` per direction. Forward starts at 0
-        // (events with stream_pos > 0); backward starts at i64::MAX
-        // (events with stream_pos < MAX).
+        // Default `from` per direction: Forward starts at 0, Backward at i64::MAX.
         let from_pos: i64 = match from {
             Some(t) => i64::try_from(t.0).map_err(|_| {
                 Error::InvalidInput(format!("PaginationToken {} exceeds i64::MAX", t.0))
@@ -233,6 +229,17 @@ impl EventStore for SqliteStore {
             None => match dir {
                 Direction::Forward => 0,
                 Direction::Backward => i64::MAX,
+            },
+        };
+        // Exclusive stop boundary. Unconstraining sentinels when `to` is None:
+        // Forward never reaches i64::MAX, Backward never reaches i64::MIN.
+        let to_pos: i64 = match to {
+            Some(t) => i64::try_from(t.0).map_err(|_| {
+                Error::InvalidInput(format!("PaginationToken {} exceeds i64::MAX", t.0))
+            })?,
+            None => match dir {
+                Direction::Forward => i64::MAX,
+                Direction::Backward => i64::MIN,
             },
         };
 
@@ -255,29 +262,25 @@ impl EventStore for SqliteStore {
                     )));
                 }
 
-                // `limit == 0` is degenerate: there's no row we can hang
-                // a "more exists past this position" token on, so the
-                // overflow detection below can't satisfy the trait
-                // post-condition. Short-circuit explicitly rather than
-                // returning a possibly-misleading `None` token. Room
-                // pre-condition has already been enforced above.
+                // `limit == 0` is degenerate: no row to hang a token on.
                 if limit == 0 {
                     return Ok((Vec::new(), None));
                 }
 
-                let (cmp, order) = match dir {
-                    Direction::Forward => (">", "ASC"),
-                    Direction::Backward => ("<", "DESC"),
+                // `from` faces one way, the exclusive `to` faces the other.
+                let (from_cmp, to_cmp, order) = match dir {
+                    Direction::Forward => (">", "<", "ASC"),
+                    Direction::Backward => ("<", ">", "DESC"),
                 };
 
                 let query = format!(
                     "SELECT stream_pos, {EVENT_COLUMNS} FROM events \
-                     WHERE room_id = ? AND stream_pos {cmp} ? \
+                     WHERE room_id = ? AND stream_pos {from_cmp} ? AND stream_pos {to_cmp} ? \
                      ORDER BY stream_pos {order} LIMIT ?"
                 );
                 let mut stmt = conn.prepare(&query)?;
                 let rows = stmt.query_map(
-                    params![room_id.as_str(), from_pos, fetch_limit_i64],
+                    params![room_id.as_str(), from_pos, to_pos, fetch_limit_i64],
                     |row| {
                         let stream_pos: i64 = row.get("stream_pos")?;
                         Ok((stream_pos, EventRow::try_from(row)))
@@ -895,7 +898,7 @@ mod tests {
         s.persist_event(&m2, &[]).await.unwrap();
 
         let (events, _next) = s
-            .room_messages(*ALICE_ROOM_ID, None, Direction::Forward, 10)
+            .room_messages(*ALICE_ROOM_ID, None, None, Direction::Forward, 10)
             .await
             .unwrap();
         let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -914,7 +917,7 @@ mod tests {
         s.persist_event(&m2, &[]).await.unwrap();
 
         let (events, _next) = s
-            .room_messages(*ALICE_ROOM_ID, None, Direction::Backward, 10)
+            .room_messages(*ALICE_ROOM_ID, None, None, Direction::Backward, 10)
             .await
             .unwrap();
         let ids: Vec<&str> = events.iter().map(|e| e.event_id.as_str()).collect();
@@ -927,7 +930,7 @@ mod tests {
         let s = store_with_room().await;
         // One create event total. Asking for 10 → page is 1 item → no token.
         let (events, next) = s
-            .room_messages(*ALICE_ROOM_ID, None, Direction::Forward, 10)
+            .room_messages(*ALICE_ROOM_ID, None, None, Direction::Forward, 10)
             .await
             .unwrap();
         assert_eq!(events.len(), 1);
@@ -946,7 +949,7 @@ mod tests {
 
         // First page of 2 events (forward).
         let (page1, next1) = s
-            .room_messages(room, None, Direction::Forward, 2)
+            .room_messages(room, None, None, Direction::Forward, 2)
             .await
             .unwrap();
         assert_eq!(page1.len(), 2);
@@ -954,7 +957,7 @@ mod tests {
 
         // Second page using the token.
         let (page2, next2) = s
-            .room_messages(room, Some(token.clone()), Direction::Forward, 2)
+            .room_messages(room, Some(token.clone()), None, Direction::Forward, 2)
             .await
             .unwrap();
         assert_eq!(page2.len(), 2);
@@ -968,7 +971,7 @@ mod tests {
         // Third page should be empty (5 total events, 2+2 consumed → 1 left,
         // but we asked for 2 — third call returns the last one with no token).
         let (page3, next3) = s
-            .room_messages(room, next2, Direction::Forward, 2)
+            .room_messages(room, next2, None, Direction::Forward, 2)
             .await
             .unwrap();
         assert_eq!(page3.len(), 1);
@@ -986,7 +989,7 @@ mod tests {
             .await
             .unwrap();
         let (events, next) = s
-            .room_messages(*ALICE_ROOM_ID, None, Direction::Forward, 2)
+            .room_messages(*ALICE_ROOM_ID, None, None, Direction::Forward, 2)
             .await
             .unwrap();
         assert_eq!(events.len(), 2);
@@ -1002,7 +1005,7 @@ mod tests {
             .await
             .unwrap();
         let (events, next) = s
-            .room_messages(*ALICE_ROOM_ID, None, Direction::Forward, 0)
+            .room_messages(*ALICE_ROOM_ID, None, None, Direction::Forward, 0)
             .await
             .unwrap();
         assert!(events.is_empty());
@@ -1021,7 +1024,7 @@ mod tests {
         s.persist_event(&m_r2, &[]).await.unwrap();
 
         let (events, _) = s
-            .room_messages(*ALICE_ROOM_ID, None, Direction::Forward, 10)
+            .room_messages(*ALICE_ROOM_ID, None, None, Direction::Forward, 10)
             .await
             .unwrap();
         for ev in &events {
@@ -1034,8 +1037,153 @@ mod tests {
     async fn room_messages_unknown_room_errors() {
         let s = store().await;
         let unknown = room_id!("!nope:example.com");
-        let result = s.room_messages(unknown, None, Direction::Forward, 10).await;
+        let result = s
+            .room_messages(unknown, None, None, Direction::Forward, 10)
+            .await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    // E50: Forward `to` bound is exclusive — events at/after `to` are
+    // excluded. Seed an ordered set, take the `next` token from a limit-2
+    // probe (= stream_pos of the 2nd event), then bound a fresh forward
+    // page by it: the result is exactly the events strictly before that
+    // position, never including the event the token points at.
+    #[tokio::test]
+    async fn room_messages_to_bound_forward_is_exclusive() {
+        let s = store_with_room().await;
+        for i in 0..4 {
+            let m = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "x", i as u64 + 1);
+            s.persist_event(&m, &[]).await.unwrap();
+        }
+
+        // Unbounded forward page: the full ascending sequence.
+        let (unbounded, _) = s
+            .room_messages(*ALICE_ROOM_ID, None, None, Direction::Forward, 100)
+            .await
+            .unwrap();
+        assert!(unbounded.len() >= 3, "create + several messages seeded");
+
+        // `next` from a limit-2 probe = stream_pos of the 2nd event (index 1).
+        let (probe, tok) = s
+            .room_messages(*ALICE_ROOM_ID, None, None, Direction::Forward, 2)
+            .await
+            .unwrap();
+        assert_eq!(probe.len(), 2);
+        let stop = tok.expect("more than two events seeded");
+
+        // Forward from start, stopping *before* `stop` (exclusive). Because
+        // `stop` points at the 2nd event, only the 1st event is strictly
+        // before it.
+        let (bounded, bounded_next) = s
+            .room_messages(
+                *ALICE_ROOM_ID,
+                None,
+                Some(stop.clone()),
+                Direction::Forward,
+                100,
+            )
+            .await
+            .unwrap();
+        let bounded_ids: Vec<&str> = bounded.iter().map(|e| e.event_id.as_str()).collect();
+        let expected_ids: Vec<&str> = unbounded[..1].iter().map(|e| e.event_id.as_str()).collect();
+        assert_eq!(
+            bounded_ids, expected_ids,
+            "bounded page is exactly the events strictly before `to`"
+        );
+        // The event the exclusive `to` points at is never present.
+        let stop_id = unbounded[1].event_id.as_str();
+        assert!(
+            !bounded_ids.contains(&stop_id),
+            "event at the exclusive `to` is excluded"
+        );
+        // Single in-range event, no overflow row → no further token.
+        assert!(bounded_next.is_none());
+    }
+
+    // E51: `to = None` matches the historical unbounded behaviour — adding
+    // the parameter must not truncate or otherwise change a no-stop query.
+    #[tokio::test]
+    async fn room_messages_to_none_matches_unbounded() {
+        let s = store_with_room().await;
+        for i in 0..3 {
+            let m = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "x", i as u64 + 1);
+            s.persist_event(&m, &[]).await.unwrap();
+        }
+        let (events, next) = s
+            .room_messages(*ALICE_ROOM_ID, None, None, Direction::Backward, 100)
+            .await
+            .unwrap();
+        // 1 create + 3 messages, all fit in one page → no further token.
+        assert_eq!(events.len(), 4, "all seeded events returned");
+        assert!(next.is_none(), "all events fit, so no further token");
+    }
+
+    // E52: a `from` + `to` bracket (Backward) returns only events strictly
+    // between the two exclusive bounds. With `from` = head and `to` = an
+    // interior token, the page is exactly the events older than `from` and
+    // newer than `to`, excluding both endpoints.
+    #[tokio::test]
+    async fn room_messages_from_to_bracket_backward() {
+        let s = store_with_room().await;
+        for i in 0..4 {
+            let m = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "x", i as u64 + 1);
+            s.persist_event(&m, &[]).await.unwrap();
+        }
+
+        // Full descending sequence: [newest, ..., create].
+        let (all, _) = s
+            .room_messages(*ALICE_ROOM_ID, None, None, Direction::Backward, 100)
+            .await
+            .unwrap();
+        assert!(all.len() >= 4);
+
+        // `from` excludes the newest event (probe of 1 → token at all[0]).
+        let (_, from_tok) = s
+            .room_messages(*ALICE_ROOM_ID, None, None, Direction::Backward, 1)
+            .await
+            .unwrap();
+        let from = from_tok.expect("more than one event seeded");
+        // `to` = token after consuming two more (probe of 2 from `from`).
+        let (_, to_tok) = s
+            .room_messages(
+                *ALICE_ROOM_ID,
+                Some(from.clone()),
+                None,
+                Direction::Backward,
+                2,
+            )
+            .await
+            .unwrap();
+        let to = to_tok.expect("still events remaining");
+
+        // Bracket: strictly between `from` (exclusive head) and `to`
+        // (exclusive tail). With both probes above, exactly all[1..2] sits
+        // strictly between them.
+        let (page, _) = s
+            .room_messages(
+                *ALICE_ROOM_ID,
+                Some(from.clone()),
+                Some(to.clone()),
+                Direction::Backward,
+                100,
+            )
+            .await
+            .unwrap();
+        let page_ids: Vec<&str> = page.iter().map(|e| e.event_id.as_str()).collect();
+        let expected: Vec<&str> = all[1..2].iter().map(|e| e.event_id.as_str()).collect();
+        assert_eq!(
+            page_ids, expected,
+            "bracket returns only events strictly between `from` and `to`"
+        );
+        // Neither endpoint event appears.
+        assert!(
+            !page_ids.contains(&all[0].event_id.as_str()),
+            "`from` excluded"
+        );
+        assert!(
+            !page_ids.contains(&all[2].event_id.as_str()),
+            "`to` excluded"
+        );
     }
 
     // E28: empty store → subscribe initial value is StreamPos(0)
@@ -1302,6 +1450,7 @@ mod tests {
             .room_messages(
                 *ALICE_ROOM_ID,
                 Some(PaginationToken(0)),
+                None,
                 Direction::Backward,
                 10,
             )
@@ -1323,7 +1472,7 @@ mod tests {
             .await
             .unwrap();
         let (events, next) = s
-            .room_messages(*ALICE_ROOM_ID, None, Direction::Backward, 2)
+            .room_messages(*ALICE_ROOM_ID, None, None, Direction::Backward, 2)
             .await
             .unwrap();
         assert_eq!(events.len(), 2);

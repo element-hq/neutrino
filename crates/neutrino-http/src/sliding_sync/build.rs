@@ -401,7 +401,7 @@ async fn bump_stamp_for_joined<S: StorageBackend>(
 ) -> Result<u64, SyncError> {
     let (events, _) = state
         .store
-        .room_messages(room_id, None, Direction::Backward, 1)
+        .room_messages(room_id, None, None, Direction::Backward, 1)
         .await?;
     if let Some(ev) = events.first() {
         return Ok(ev.origin_server_ts);
@@ -563,7 +563,7 @@ async fn build_room<S: StorageBackend>(
     let (timeline_events, prev_batch_str, limited) = if is_initial_for_room {
         let (mut events, prev_batch_token) = state
             .store
-            .room_messages(room_id, None, Direction::Backward, cfg.timeline_limit)
+            .room_messages(room_id, None, None, Direction::Backward, cfg.timeline_limit)
             .await?;
         events.reverse();
         let limited = prev_batch_token.is_some();
