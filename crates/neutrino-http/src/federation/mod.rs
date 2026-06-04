@@ -8,26 +8,53 @@
 //! New federation endpoints land as sibling modules and register their
 //! routes in `lib.rs::build_router`.
 
+use std::time::Duration;
+
 use axum::{
     Json,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
 use neutrino_store::StorageError;
+use rand::Rng;
 use serde_json::json;
 use thiserror::Error;
 
 pub(crate) mod backfill;
 pub(crate) mod client;
+pub(crate) mod gapfill;
 pub(crate) mod get_missing_events;
 pub(crate) mod send;
 pub(crate) mod sender;
+pub(crate) mod worker;
 
 /// Spec maximum PDUs per federation transaction
 /// (<https://spec.matrix.org/v1.18/server-server-api/#transactions>). The
 /// inbound `/send` handler rejects a transaction carrying more than this; the
 /// outbound sender chunks to it. One constant so the two halves can't drift.
 pub(crate) const MAX_PDUS_PER_TXN: usize = 50;
+
+/// Backoff floor after a transient failure (outbound delivery, inbound
+/// staging). Shared so the two retry loops can't drift.
+pub(crate) const BACKOFF_BASE: Duration = Duration::from_secs(1);
+/// Backoff ceiling. The exponential sequence (1, 2, 4, 8, … s) is clamped here.
+pub(crate) const BACKOFF_CAP: Duration = Duration::from_secs(15 * 60);
+
+/// Double the backoff ceiling, clamped at [`BACKOFF_CAP`].
+pub(crate) fn next_backoff(current: Duration) -> Duration {
+    current.saturating_mul(2).min(BACKOFF_CAP)
+}
+
+/// Full jitter: a uniform random duration in `[0, ceiling]`. Spreads retries
+/// (and startup) so a fleet of senders / a gap-fill loop doesn't thunder a
+/// recovering peer in lockstep.
+pub(crate) fn jitter(ceiling: Duration) -> Duration {
+    let max_ms = ceiling.as_millis() as u64;
+    if max_ms == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_millis(rand::rng().random_range(0..=max_ms))
+}
 
 /// Shared test scaffolding for the federation HTTP tests (`client`, `sender`).
 #[cfg(test)]

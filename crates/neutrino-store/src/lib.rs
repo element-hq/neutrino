@@ -391,13 +391,20 @@ pub trait StagingStore: Send + Sync {
     ///       area; idempotent — re-staging the same id is a no-op (a peer may
     ///       resend, and gap-fill may re-fetch, the same event). Does NOT
     ///       advance the `subscribe` watch (staged events are invisible).
+    ///       Returns `true` if a new row was inserted, `false` if the id was
+    ///       already staged (an ignored duplicate) — the gap-fill loop uses
+    ///       this to tell "fetched new ancestry" from "peer re-sent what we
+    ///       already hold". Staging is deliberately *unbounded*: grounding an
+    ///       event requires fetching its entire state-DAG ancestry back to
+    ///       `m.room.create`, however deep (inherent to MSC4242 / auth-chain
+    ///       CRDTs), and the mesh is trusted.
     async fn stage_pdu(
         &self,
         origin: &ServerName,
         room_id: &RoomId,
         event_id: &EventId,
         raw: &RawJsonValue,
-    ) -> Result<(), StorageError>;
+    ) -> Result<bool, StorageError>;
 
     /// Pre:  none.
     /// Post: returns the distinct `room_id`s that have at least one staged PDU.
@@ -424,17 +431,8 @@ pub trait StagingStore: Send + Sync {
     ) -> Result<AncestryGap, StorageError>;
 
     /// Pre:  none.
-    /// Post: returns the staged raw bytes for each id in `event_ids` that is
-    ///       currently staged, in unspecified order; ids not staged are
-    ///       omitted (result length may be < `event_ids.len()`).
-    async fn staged_raw(
-        &self,
-        event_ids: &[&EventId],
-    ) -> Result<Vec<Box<RawJsonValue>>, StorageError>;
-
-    /// Pre:  none.
     /// Post: deletes the matching staged rows; idempotent — ids not present are
-    ///       ignored. Called after a staged subgraph has been promoted.
+    ///       ignored. Called once a staged PDU has been durably applied.
     async fn unstage_events(&self, event_ids: &[&EventId]) -> Result<(), StorageError>;
 }
 

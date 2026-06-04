@@ -25,22 +25,28 @@ impl StagingStore for SqliteStore {
         room_id: &RoomId,
         event_id: &EventId,
         raw: &RawJsonValue,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         let origin = origin.as_str().to_owned();
         let room_id = room_id.as_str().to_owned();
         let event_id = event_id.as_str().to_owned();
         let json = raw.get().to_owned();
 
-        self.run_write(move |conn| -> Result<(), Error> {
-            // INSERT OR IGNORE: a peer may resend, and gap-fill may re-fetch,
-            // the same event; the event_id is derived from the bytes, so a
-            // collision is a genuine duplicate — keep the first.
-            conn.execute(
+        self.run_write(move |conn| -> Result<bool, Error> {
+            // INSERT OR IGNORE: the event_id is content-derived, so a collision
+            // is a genuine duplicate (a peer may resend, and gap-fill may
+            // re-fetch) — keep the first. `execute` returns the row count, so a
+            // new insert is 1 and an ignored duplicate is 0; the gap-fill loop
+            // uses this to tell "fetched new ancestry" from "peer re-sent what
+            // we already hold" (its no-progress termination). Staging is
+            // deliberately *unbounded* — grounding an event means fetching its
+            // entire state-DAG ancestry to `m.room.create`, however deep
+            // (inherent to MSC4242 / auth-chain CRDTs), and the mesh is trusted.
+            let inserted = conn.execute(
                 "INSERT OR IGNORE INTO staged_events (event_id, room_id, origin, json) \
                  VALUES (?, ?, ?, ?)",
                 params![event_id, room_id, origin, json],
             )?;
-            Ok(())
+            Ok(inserted == 1)
         })
         .await
     }
@@ -156,38 +162,6 @@ impl StagingStore for SqliteStore {
         .await
     }
 
-    async fn staged_raw(
-        &self,
-        event_ids: &[&EventId],
-    ) -> Result<Vec<Box<RawJsonValue>>, StorageError> {
-        if event_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let ids: Vec<String> = event_ids.iter().map(|e| e.as_str().to_owned()).collect();
-
-        self.run_read(move |conn| -> Result<Vec<Box<RawJsonValue>>, Error> {
-            let mut out = Vec::with_capacity(ids.len());
-            for chunk in ids.chunks(MAX_PARAMS) {
-                let placeholders = vec!["?"; chunk.len()].join(",");
-                let query =
-                    format!("SELECT json FROM staged_events WHERE event_id IN ({placeholders})");
-                let mut stmt = conn.prepare(&query)?;
-                let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
-                    row.get::<_, String>(0)
-                })?;
-                for row in rows {
-                    let json = row?;
-                    let raw = RawJsonValue::from_string(json).map_err(|e| {
-                        Error::Internal(format!("malformed staged json in DB row: {e}"))
-                    })?;
-                    out.push(raw);
-                }
-            }
-            Ok(out)
-        })
-        .await
-    }
-
     async fn unstage_events(&self, event_ids: &[&EventId]) -> Result<(), StorageError> {
         if event_ids.is_empty() {
             return Ok(());
@@ -234,7 +208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stage_staged_raw_and_unstage_roundtrip() {
+    async fn stage_and_unstage_roundtrip() {
         let (s, create) = store_with_room_and_create().await;
         let a = state_event(&[create.event_id.as_ref()], 1);
 
@@ -246,17 +220,13 @@ mod tests {
             .await
             .unwrap();
 
-        let raws = s.staged_raw(&[a.event_id.as_ref()]).await.unwrap();
-        assert_eq!(raws.len(), 1);
-        assert_eq!(raws[0].get(), a.raw.get());
+        let rows = s.staged_for_room(*ALICE_ROOM_ID).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_id, a.event_id);
+        assert_eq!(rows[0].raw.get(), a.raw.get());
 
         s.unstage_events(&[a.event_id.as_ref()]).await.unwrap();
-        assert!(
-            s.staged_raw(&[a.event_id.as_ref()])
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(s.staged_for_room(*ALICE_ROOM_ID).await.unwrap().is_empty());
         // Unstaging a missing id is a no-op, not an error.
         s.unstage_events(&[a.event_id.as_ref()]).await.unwrap();
     }
@@ -445,6 +415,27 @@ mod tests {
             origin_of(&rows, &x.event_id),
             origin_a,
             "first origin must win on a duplicate stage"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_pdu_reports_newly_inserted_vs_duplicate() {
+        // The returned bool is the gap-fill loop's no-progress signal: `true`
+        // for a freshly-inserted row, `false` for an ignored duplicate.
+        let (s, create) = store_with_room_and_create().await;
+        let a = state_event(&[create.event_id.as_ref()], 1);
+
+        assert!(
+            s.stage_pdu(origin(), *ALICE_ROOM_ID, &a.event_id, &a.raw)
+                .await
+                .unwrap(),
+            "first stage of an id inserts a row"
+        );
+        assert!(
+            !s.stage_pdu(origin(), *ALICE_ROOM_ID, &a.event_id, &a.raw)
+                .await
+                .unwrap(),
+            "re-staging the same id is an ignored duplicate"
         );
     }
 }

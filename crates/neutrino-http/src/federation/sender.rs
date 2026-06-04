@@ -51,19 +51,13 @@ use std::time::Duration;
 
 use neutrino_store::{FederationOutbox, StreamPos};
 use neutrino_store_sqlite::SqliteStore;
-use rand::Rng;
 use ruma::{EventId, OwnedServerName, ServerName};
 use serde_json::value::RawValue as RawJsonValue;
 use tokio::sync::{Semaphore, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::federation::client::{FederationClient, FederationClientError, TxnIdGen};
-use crate::federation::{MAX_PDUS_PER_TXN, now_ms};
-
-/// Backoff floor after a transient delivery failure.
-const BACKOFF_BASE: Duration = Duration::from_secs(1);
-/// Backoff ceiling. The exponential sequence (1, 2, 4, 8, … s) is clamped here.
-const BACKOFF_CAP: Duration = Duration::from_secs(15 * 60);
+use crate::federation::{BACKOFF_BASE, MAX_PDUS_PER_TXN, jitter, next_backoff, now_ms};
 
 /// Upper bound on the random delay a startup-present destination waits before
 /// its first drain. Generous on purpose — spreads a fleet of restart-time
@@ -282,27 +276,11 @@ async fn deliver_batch(
 }
 
 /// Sleep for a full-jittered interval in `[0, *backoff]`, then advance the
-/// backoff ceiling toward [`BACKOFF_CAP`].
+/// backoff ceiling toward [`BACKOFF_CAP`](crate::federation::BACKOFF_CAP).
 async fn sleep_backoff(backoff: &mut Duration) {
     let wait = jitter(*backoff);
     tokio::time::sleep(wait).await;
     *backoff = next_backoff(*backoff);
-}
-
-/// Double the backoff ceiling, clamped at [`BACKOFF_CAP`].
-fn next_backoff(current: Duration) -> Duration {
-    current.saturating_mul(2).min(BACKOFF_CAP)
-}
-
-/// Full jitter: a uniform random duration in `[0, ceiling]`. Spreads retries
-/// (and startup) so a fleet of senders doesn't thunder a recovering peer in
-/// lockstep.
-fn jitter(ceiling: Duration) -> Duration {
-    let max_ms = ceiling.as_millis() as u64;
-    if max_ms == 0 {
-        return Duration::ZERO;
-    }
-    Duration::from_millis(rand::rng().random_range(0..=max_ms))
 }
 
 #[cfg(test)]
@@ -321,6 +299,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::*;
+    use crate::federation::BACKOFF_CAP;
     use crate::federation::test_support::{dead_peer, spawn_stub};
 
     /// Stub federation peer. `fail_until` requests return `fail_status`; the
