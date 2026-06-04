@@ -29,7 +29,7 @@ From `crates/neutrino-http/src/lib.rs:201-277`. The Complement image is built wi
 | GET/POST | keys/*, profile (self), account_data (GET self), room_keys/version, pushers/set | stubs |
 
 **Still NOT wired** (these gate tests below):
-- No `GET /rooms/{room}/event/{eventId}`, `GET /rooms/{room}/messages`.
+- No `GET /rooms/{room}/event/{eventId}`. (`GET /rooms/{room}/messages` landed 2026-06-04 — join-gated pagination.)
 - No `POST /user/{uid}/filter` (+ `GET …/filter/{id}`) — blocks the large filtered-`/sync` tranche.
 - No `/joined_members`, `/joined_rooms`, `/publicRooms`, `/directory/room/{alias}` (no room directory).
 - No `/forget`, `/redact`, `/upgrade`, `/typing`, profile/displayname/avatar writes, account_data writes.
@@ -104,8 +104,14 @@ Allowlist regex note: the GET-state entries anchor the `/^rooms$/` segment becau
 ### `POST /user/{uid}/filter` (could be a no-op opaque-id stub)
 Blocks nearly all of `sync_test.go` and `sync_archive_test.go` (`TestSync/*`, `TestSyncLeaveSection/*`, `TestArchivedRoomsHistory/*`, `TestLeaveEventInviteRejection`, …) — they create a filter first and pass its id to `/sync`. A stub returning any id + `GET …/filter/{id} → {}` would unlock the tranche cheaply, since the translator already ignores `?filter=`.
 
-### `GET /rooms/{room}/event/{eventId}` / `GET /rooms/{room}/messages`
-`apidoc_room_history_visibility_test.go::TestFetchEvent`; `txnid_test.go::TestTxnInEvent`; `power_levels_test.go` (reads the PL event by id); `TestLeftRoomFixture/Can_get_…messages…`.
+### `GET /rooms/{room}/event/{eventId}`
+`apidoc_room_history_visibility_test.go::TestFetchEvent`; `txnid_test.go::TestTxnInEvent`; `power_levels_test.go` (reads the PL event by id).
+
+### `GET /rooms/{room}/messages` — IMPLEMENTED 2026-06-04
+Join-gated pagination over `EventStore::room_messages` (`dir`/`from`/`to`/`limit`; `filter` accepted-but-ignored; no lazy `state`, history-visibility, or backfill). Triage of `tests/csapi/room_messages_test.go`:
+- **Allowlisted:** `TestFetchMessagesFromNonExistentRoom` — non-member (incl. unknown room) → **403**, matching the endpoint's only documented error.
+- **Blocked — `TestSendAndFetchMessage`:** uses a top-level `/sync` **`next_batch`** as `?from=` and asserts (every-element `JSONArrayEach`) the chunk is *only* the new message. Our legacy `/sync` `next_batch` is the sliding-sync **connection `pos` counter** (`legacy_sync/translate.rs:221` ← `sliding_sync/mod.rs:269`), not a stream position, so it can't act as a `/messages` cursor (the chunk would also include the setup state events). Unblocked only by the durable stream-position legacy token (option C, deferred 2026-06-02). The per-room `prev_batch` *is* a real stream_pos token and does interop — covered by the `sync_prev_batch_works_as_messages_from` Rust e2e — but this complement test uses `next_batch`.
+- **Not viable:** `TestRoomMessagesLazyLoading` / `…LocalUser` (need `filter.lazy_load_members` → the `state` field we omit); `TestMessagesOverFederation` (2 servers + backfill); `TestSendMessageWithTxn` (not a `/messages` test — asserts `/send` **txn-id dedup**, which neutrino doesn't do); `TestLeftRoomFixture/Can_get_…messages…` (state-at-leave for a departed user — gated out by our no-history-visibility model).
 
 ### `/members` query filters (`at`, `membership`, `not_membership`)
 `TestGetRoomMembersAtPoint`, all `TestGetFilteredRoomMembers/*` — we ignore the filters, so the asserted subset is wrong.

@@ -99,3 +99,11 @@ TestRoomCreationReportsEventsToMyself/parallel/Setting_room_topic_reports_m.room
 TestRoomCreationReportsEventsToMyself/parallel/Joining_room_twice_is_idempotent$
 TestTentativeEventualJoiningAfterRejecting$
 TestRoomCreate/Parallel/Rooms_can_be_created_with_an_initial_invite_list_\(SYN-205\)$
+
+# GET /rooms/{roomId}/messages (2026-06-04). The endpoint is join-gated, so a
+# request for a room the user isn't in returns 403 — exactly what this test
+# asserts. The other room_messages_test.go cases are not viable here (filters /
+# lazy-loaded state, /send txn-id dedup, federation backfill) and
+# TestSendAndFetchMessage is blocked on a durable stream-position legacy /sync
+# token — see VIABLE-TESTS.md.
+TestFetchMessagesFromNonExistentRoom$
