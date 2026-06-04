@@ -29,6 +29,7 @@ fn config() -> Config {
         server_name: "example.org".to_string(),
         bind_addr: "127.0.0.1:0".to_string(),
         localpart: "alice".to_string(),
+        ..Default::default()
     }
 }
 

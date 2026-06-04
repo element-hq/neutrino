@@ -30,8 +30,15 @@ impl FederationOutbox for SqliteStore {
         .await
     }
 
-    async fn pending_pdus(&self, destination: &ServerName) -> Result<Vec<Event>, StorageError> {
+    async fn pending_pdus(
+        &self,
+        destination: &ServerName,
+        limit: usize,
+    ) -> Result<Vec<Event>, StorageError> {
         let destination = destination.to_owned();
+        // SQLite `LIMIT` takes an i64; a `usize` past `i64::MAX` saturates to
+        // "effectively unbounded", which is the intended meaning.
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
 
         self.run_read(move |conn| -> Result<Vec<Event>, Error> {
             let query = format!(
@@ -39,10 +46,11 @@ impl FederationOutbox for SqliteStore {
                  FROM outbox o \
                  JOIN events e ON o.event_id = e.event_id \
                  WHERE o.destination = ? \
-                 ORDER BY o.outbox_id ASC"
+                 ORDER BY o.outbox_id ASC \
+                 LIMIT ?"
             );
             let mut stmt = conn.prepare(&query)?;
-            let rows = stmt.query_map(params![destination.as_str()], |row| {
+            let rows = stmt.query_map(params![destination.as_str(), limit], |row| {
                 Ok(EventRow::try_from(row))
             })?;
 
@@ -113,7 +121,7 @@ mod tests {
     async fn pending_pdus_empty_for_unknown_destination() {
         let s = store().await;
         assert!(
-            s.pending_pdus(server_name!("nope.example.com"))
+            s.pending_pdus(server_name!("nope.example.com"), usize::MAX)
                 .await
                 .unwrap()
                 .is_empty()
@@ -150,10 +158,32 @@ mod tests {
             s.persist_event(&ev, &[dest]).await.unwrap();
         }
 
-        let pdus = s.pending_pdus(dest).await.unwrap();
+        let pdus = s.pending_pdus(dest, usize::MAX).await.unwrap();
         let ids: Vec<&str> = pdus.iter().map(|e| e.event_id.as_str()).collect();
         let expected_strs: Vec<&str> = expected.iter().map(|e| e.as_str()).collect();
         assert_eq!(ids, expected_strs);
+    }
+
+    // O9: `limit` caps the batch at the oldest N, in order.
+    #[tokio::test]
+    async fn pending_pdus_respects_limit() {
+        let s = store_with_room().await;
+        let dest = server_name!("matrix.org");
+
+        let mut expected = Vec::new();
+        for i in 0..5 {
+            let ev = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "x", i);
+            expected.push(ev.event_id.clone());
+            s.persist_event(&ev, &[dest]).await.unwrap();
+        }
+
+        // Only the two oldest, in insertion order.
+        let pdus = s.pending_pdus(dest, 2).await.unwrap();
+        let ids: Vec<&str> = pdus.iter().map(|e| e.event_id.as_str()).collect();
+        assert_eq!(ids, vec![expected[0].as_str(), expected[1].as_str()]);
+
+        // limit ≥ count returns all.
+        assert_eq!(s.pending_pdus(dest, 100).await.unwrap().len(), 5);
     }
 
     // O5: remove the named event_ids only.
@@ -171,7 +201,7 @@ mod tests {
 
         s.remove_pdus(dest, &[&id_a]).await.unwrap();
 
-        let pdus = s.pending_pdus(dest).await.unwrap();
+        let pdus = s.pending_pdus(dest, usize::MAX).await.unwrap();
         assert_eq!(pdus.len(), 1);
         assert_eq!(pdus[0].event_id.as_str(), id_b.as_str());
     }
@@ -190,7 +220,7 @@ mod tests {
         // Second call with the same IDs — no error, no change.
         s.remove_pdus(dest, &[&id_a]).await.unwrap();
 
-        assert!(s.pending_pdus(dest).await.unwrap().is_empty());
+        assert!(s.pending_pdus(dest, usize::MAX).await.unwrap().is_empty());
     }
 
     // O7: empty event_ids slice short-circuits — no SQL run.

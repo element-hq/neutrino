@@ -164,10 +164,35 @@ impl AppState {
         };
         AppState(Arc::new(Mutex::new(app)))
     }
+
+    /// The shared storage handle. Used by `serve` to wire the outbound
+    /// federation sender pool to the same `SqliteStore` the router serves from.
+    fn store(&self) -> Arc<SqliteStore> {
+        lock_app(self).store.clone()
+    }
+
+    /// This homeserver's name, sent as the `origin` on outbound transactions.
+    fn server_name(&self) -> String {
+        lock_app(self).config.server_name.clone()
+    }
+
+    /// The configured cap on concurrent outbound federation transactions.
+    fn outbound_concurrency(&self) -> usize {
+        lock_app(self).config.outbound_concurrency
+    }
 }
 
 pub async fn serve(listener: TcpListener, config: Config) -> Result<(), StartupError> {
-    let router = router(config).await?;
+    let state = AppState::new(config).await?;
+    // Start draining the federation outbox before serving. Outbox rows survive
+    // restarts, so this is also the "retry on restart" path — startup
+    // enumeration resumes delivery of anything left undelivered.
+    federation::sender::spawn(
+        state.store(),
+        state.server_name(),
+        state.outbound_concurrency(),
+    );
+    let router = build_router(state);
     axum::serve(listener, router)
         .await
         .map_err(StartupError::Tempfile)?;

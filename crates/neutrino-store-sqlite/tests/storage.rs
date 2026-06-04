@@ -268,7 +268,7 @@ async fn persist_event_with_destinations_appears_in_outbox() {
 
     // Each destination has one PDU pending.
     for d in [d1, d2, d3] {
-        let pdus = s.pending_pdus(d).await.unwrap();
+        let pdus = s.pending_pdus(d, usize::MAX).await.unwrap();
         assert_eq!(
             pdus.len(),
             1,

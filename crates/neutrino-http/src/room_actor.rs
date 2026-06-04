@@ -815,7 +815,7 @@ mod tests {
         // A federation-received PDU is never re-originated: it writes no outbox.
         assert!(
             store
-                .pending_pdus(server_name!("remote.example"))
+                .pending_pdus(server_name!("remote.example"), usize::MAX)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -841,7 +841,7 @@ mod tests {
 
         // The remote server with a joined member gets the message.
         let pending = store
-            .pending_pdus(server_name!("remote.example"))
+            .pending_pdus(server_name!("remote.example"), usize::MAX)
             .await
             .unwrap();
         assert_eq!(pending.len(), 1);
@@ -850,7 +850,7 @@ mod tests {
         // Our own server is never an outbound destination.
         assert!(
             store
-                .pending_pdus(server_name!("example.org"))
+                .pending_pdus(server_name!("example.org"), usize::MAX)
                 .await
                 .unwrap()
                 .is_empty()
@@ -876,7 +876,7 @@ mod tests {
             .expect("alice kicks zara");
 
         let pending = store
-            .pending_pdus(server_name!("remote.example"))
+            .pending_pdus(server_name!("remote.example"), usize::MAX)
             .await
             .unwrap();
         assert!(
@@ -917,7 +917,7 @@ mod tests {
 
         assert!(
             store
-                .pending_pdus(server_name!("remote.example"))
+                .pending_pdus(server_name!("remote.example"), usize::MAX)
                 .await
                 .unwrap()
                 .is_empty(),
