@@ -311,7 +311,7 @@ async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
                             continue;
                         }
                         store
-                            .stage_event(room_id, &ancestor.event_id, &ancestor.raw)
+                            .stage_pdu(origin, room_id, &ancestor.event_id, &ancestor.raw)
                             .await
                             .map_err(|e| e.to_string())?;
                     }

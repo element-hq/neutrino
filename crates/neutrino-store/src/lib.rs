@@ -363,27 +363,53 @@ pub struct AncestryGap {
     pub staged: Vec<OwnedEventId>,
 }
 
-/// Pre-auth staging of federation ancestry fetched while gap-filling a
-/// received PDU's state DAG.
+/// One staged PDU as returned by [`StagingStore::staged_for_room`]: the raw
+/// bytes plus the metadata the background worker needs to process it (the
+/// originating server, for gap-fill fetches). The `event_id` is the staging key.
+#[derive(Debug, Clone)]
+pub struct StagedPdu {
+    pub event_id: OwnedEventId,
+    pub origin: OwnedServerName,
+    pub raw: Box<RawJsonValue>,
+}
+
+/// Pre-auth staging of inbound federation PDUs and the ancestry fetched while
+/// gap-filling them.
 ///
 /// Events staged here are NOT authorised and MUST NOT be given a stream
-/// position or surface in any read / state-res path — promotion through the
-/// per-room actor (which auths, resolves, and persists) is the only way they
-/// become real. See the `staged_events` table comment in `schema.sql`.
+/// position or surface in any read / state-res path — applying them through
+/// the per-room actor (which auths, resolves, and persists) is the only way
+/// they become real. See the `staged_events` table comment in `schema.sql`.
+/// Presence = pending; absence (after [`unstage_events`](StagingStore::unstage_events))
+/// = processed. Retry backoff is the worker's in-memory concern, not stored here.
 #[async_trait]
 pub trait StagingStore: Send + Sync {
     /// Pre:  `raw` is the canonical post-`from_wire` bytes whose reference hash
-    ///       is `event_id` (so id ↔ bytes round-trip), and `room_id` matches.
-    /// Post: `(event_id, room_id, raw)` is recorded in the staging area;
-    ///       idempotent — re-staging the same id is a no-op (a peer may resend
-    ///       ancestry across gap-fill rounds). Does NOT advance the `subscribe`
-    ///       watch (staged events are invisible).
-    async fn stage_event(
+    ///       is `event_id` (so id ↔ bytes round-trip), `room_id` matches, and
+    ///       `origin` is the server it arrived from (or was fetched from).
+    /// Post: `(event_id, room_id, origin, raw)` is recorded in the staging
+    ///       area; idempotent — re-staging the same id is a no-op (a peer may
+    ///       resend, and gap-fill may re-fetch, the same event). Does NOT
+    ///       advance the `subscribe` watch (staged events are invisible).
+    async fn stage_pdu(
         &self,
+        origin: &ServerName,
         room_id: &RoomId,
         event_id: &EventId,
         raw: &RawJsonValue,
     ) -> Result<(), StorageError>;
+
+    /// Pre:  none.
+    /// Post: returns the distinct `room_id`s that have at least one staged PDU.
+    ///       The background worker enumerates these on startup (and on demand)
+    ///       to know which rooms have pending work to drain.
+    async fn staged_rooms(&self) -> Result<Vec<OwnedRoomId>, StorageError>;
+
+    /// Pre:  none.
+    /// Post: returns every staged PDU for `room_id` (in unspecified order — the
+    ///       caller toposorts by `prev_events ∪ prev_state_events` before
+    ///       applying). Empty if the room has no staged rows.
+    async fn staged_for_room(&self, room_id: &RoomId) -> Result<Vec<StagedPdu>, StorageError>;
 
     /// Pre:  none (`heads` need not exist).
     /// Post: walks `prev_state_events` back from `heads` through staged events
