@@ -93,7 +93,10 @@ fn spawn_with(
     // Process-startup prefix keeps txn ids unique across restarts; the
     // in-memory counter keeps them unique within a run.
     let idgen = Arc::new(TxnIdGen::new(now_ms()));
-    let send_slots = Arc::new(Semaphore::new(concurrency));
+    // `Semaphore::new(0)` would block every send forever; clamp here so the
+    // "≥ 1" invariant holds regardless of how `Config` was constructed (the
+    // `from_env` path already clamps, but the field is `pub`).
+    let send_slots = Arc::new(Semaphore::new(concurrency.max(1)));
     tokio::spawn(supervise(
         store,
         client,
