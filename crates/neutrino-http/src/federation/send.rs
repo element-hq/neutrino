@@ -300,11 +300,18 @@ async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
             Ok(fetched) => {
                 // Stage under each event's *computed* id (`from_wire` derives it
                 // from the reference hash and yields canonical bytes, so id ↔
-                // bytes round-trip). An unkeyable PDU is dropped.
+                // bytes round-trip). An unkeyable PDU is dropped. A peer can
+                // return events for any room; only stage ones in *this* room —
+                // a foreign-room event is never reachable by this room's
+                // `ancestry_gap` walk, so staging it would be unreachable junk
+                // that nothing ever promotes or prunes.
                 for raw in fetched {
                     if let Ok(ancestor) = from_wire(raw, Vec::new()) {
+                        if ancestor.room_id != *room_id {
+                            continue;
+                        }
                         store
-                            .stage_event(&ancestor.room_id, &ancestor.event_id, &ancestor.raw)
+                            .stage_event(room_id, &ancestor.event_id, &ancestor.raw)
                             .await
                             .map_err(|e| e.to_string())?;
                     }

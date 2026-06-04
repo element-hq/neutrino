@@ -253,6 +253,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ancestry_gap_dedups_diamond_parents() {
+        // Two staged events C and D both name A in prev_state_events (a diamond
+        // merging at A). The recursive CTE uses UNION, so A must appear in
+        // `missing` exactly once — a regression to UNION ALL would duplicate it.
+        let (s, create) = store_with_room_and_create().await;
+        let a = state_event(&[create.event_id.as_ref()], 1); // never staged/committed
+        let c = state_event(&[a.event_id.as_ref()], 2);
+        let d = state_event(&[a.event_id.as_ref()], 3);
+        s.stage_event(*ALICE_ROOM_ID, &c.event_id, &c.raw)
+            .await
+            .unwrap();
+        s.stage_event(*ALICE_ROOM_ID, &d.event_id, &d.raw)
+            .await
+            .unwrap();
+
+        let gap = s
+            .ancestry_gap(*ALICE_ROOM_ID, &[c.event_id.as_ref(), d.event_id.as_ref()])
+            .await
+            .unwrap();
+        assert_eq!(
+            gap.missing,
+            vec![a.event_id.clone()],
+            "A reached via two staged paths must appear once (UNION, not UNION ALL)"
+        );
+        let mut staged = gap.staged;
+        staged.sort();
+        let mut want = vec![c.event_id.clone(), d.event_id.clone()];
+        want.sort();
+        assert_eq!(staged, want);
+    }
+
+    #[tokio::test]
     async fn ancestry_gap_is_scoped_to_room() {
         // An event staged under room A must not count as held when the walk is
         // scoped to a different room id.

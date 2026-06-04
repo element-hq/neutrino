@@ -151,8 +151,10 @@ impl FederationClient {
 /// The production [`MissingEventsFetcher`]: a thin adapter that closes a
 /// received PDU's missing state ancestry by asking the originating peer via
 /// [`FederationClient::get_missing_events`] with MSC4242 `state_dag: true`.
-/// Holds the same `FederationClient` the sender pool uses — no second
-/// connection pool, no duplicated resolver.
+/// Holds its own `FederationClient` (a separate reqwest pool from the sender
+/// pool's — see `AppState::from_store`: a second pool is cheap and avoids a
+/// derivable `App` field, and inbound-gap-fill origins differ from outbound
+/// destinations anyway).
 pub(crate) struct ReqwestFetcher {
     client: Arc<FederationClient>,
 }
