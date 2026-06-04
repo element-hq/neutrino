@@ -149,7 +149,8 @@ fn fetch_event_ts(conn: &Connection, event_id: &EventId) -> Result<Option<i64>, 
     Ok(ts)
 }
 
-/// Parents of `child_event_id` via `prev` edges, each paired with the
+/// Parents of `child_event_id` via `edge_type` edges (`'prev'` for the
+/// timeline DAG, `'prev_state'` for the state DAG), each paired with the
 /// parent's `origin_server_ts` so the priority-queue walk can enqueue them
 /// in newest-first order. `INNER JOIN events`: a parent we don't hold is
 /// omitted (it can't be hydrated or expanded — same outcome as the old
@@ -159,14 +160,15 @@ fn fetch_event_ts(conn: &Connection, event_id: &EventId) -> Result<Option<i64>, 
 fn fetch_prev_parents_with_ts(
     conn: &Connection,
     child_event_id: &EventId,
+    edge_type: &str,
 ) -> Result<Vec<(i64, OwnedEventId)>, Error> {
     let mut stmt = conn.prepare(
         "SELECT e.origin_server_ts, ed.parent_event_id \
          FROM event_edges ed \
          JOIN events e ON e.event_id = ed.parent_event_id \
-         WHERE ed.child_event_id = ? AND ed.edge_type = 'prev'",
+         WHERE ed.child_event_id = ? AND ed.edge_type = ?",
     )?;
-    let rows = stmt.query_map(params![child_event_id.as_str()], |row| {
+    let rows = stmt.query_map(params![child_event_id.as_str(), edge_type], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
     })?;
     let mut out = Vec::new();
@@ -193,6 +195,7 @@ fn walk_prev_events(
     start: Vec<OwnedEventId>,
     excluded: &HashSet<OwnedEventId>,
     limit: usize,
+    edge_type: &str,
 ) -> Result<Vec<Event>, Error> {
     let mut visited: HashSet<OwnedEventId> = HashSet::new();
     let mut frontier: BinaryHeap<WalkEntry> = BinaryHeap::new();
@@ -227,7 +230,7 @@ fn walk_prev_events(
         // rather than the JSON-derived `pdu.prev_events` — the edge table
         // is the canonical graph and the JSON order is whatever the sender
         // chose. The heap, not insertion order, decides the visit order.
-        for (origin_server_ts, parent) in fetch_prev_parents_with_ts(conn, &id)? {
+        for (origin_server_ts, parent) in fetch_prev_parents_with_ts(conn, &id, edge_type)? {
             frontier.push(WalkEntry {
                 origin_server_ts,
                 event_id: parent,
@@ -334,7 +337,7 @@ impl DagStore for SqliteStore {
             validate_room_exists(conn, &room_id)?;
             let id_refs: Vec<&OwnedEventId> = from.iter().collect();
             validate_events_exist(conn, &id_refs)?;
-            walk_prev_events(conn, &room_id, from, &HashSet::new(), limit)
+            walk_prev_events(conn, &room_id, from, &HashSet::new(), limit, "prev")
         })
         .await
     }
@@ -345,6 +348,7 @@ impl DagStore for SqliteStore {
         latest: &[&EventId],
         earliest: &[&EventId],
         limit: usize,
+        state_dag: bool,
     ) -> Result<Vec<Event>, StorageError> {
         let room_id = room_id.to_owned();
         let latest: Vec<OwnedEventId> = latest.iter().map(|&e| e.to_owned()).collect();
@@ -372,9 +376,15 @@ impl DagStore for SqliteStore {
             // See `_get_missing_events` in synapse's
             // storage/databases/main/event_federation.py and
             // docs/get-missing-events.md.
+            //
+            // `state_dag` (MSC4242) selects the edge kind: the timeline DAG
+            // (`prev`) or the state DAG (`prev_state`). Both the initial
+            // frontier (parents-of-`latest`) and the walk itself follow the
+            // same edge kind.
+            let edge_type = if state_dag { "prev_state" } else { "prev" };
             let mut initial_frontier: Vec<OwnedEventId> = Vec::new();
             for id in &latest {
-                for parent in fetch_edges(conn, id, "prev")? {
+                for parent in fetch_edges(conn, id, edge_type)? {
                     initial_frontier.push(parent);
                 }
             }
@@ -382,7 +392,14 @@ impl DagStore for SqliteStore {
             for id in latest {
                 excluded.insert(id);
             }
-            walk_prev_events(conn, &room_id, initial_frontier, &excluded, limit)
+            walk_prev_events(
+                conn,
+                &room_id,
+                initial_frontier,
+                &excluded,
+                limit,
+                edge_type,
+            )
         })
         .await
     }
@@ -610,7 +627,7 @@ mod tests {
         s.persist_event(&ev_c, &[]).await.unwrap();
 
         let got = s
-            .missing_events(*ALICE_ROOM_ID, &[&id_c], &[&id_a], 10)
+            .missing_events(*ALICE_ROOM_ID, &[&id_c], &[&id_a], 10, false)
             .await
             .unwrap();
         let ids: Vec<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
@@ -624,7 +641,7 @@ mod tests {
     async fn missing_events_empty_latest_returns_empty() {
         let s = store_with_room().await;
         let got = s
-            .missing_events(*ALICE_ROOM_ID, &[], &[], 10)
+            .missing_events(*ALICE_ROOM_ID, &[], &[], 10, false)
             .await
             .unwrap();
         assert!(got.is_empty());
@@ -669,7 +686,7 @@ mod tests {
         assert!(got.is_empty(), "events_before leaked cross-room PDU");
 
         let got = s
-            .missing_events(*ALICE_ROOM_ID, &[&id_other], &[], 10)
+            .missing_events(*ALICE_ROOM_ID, &[&id_other], &[], 10, false)
             .await
             .unwrap();
         assert!(got.is_empty(), "missing_events leaked cross-room PDU");
@@ -715,7 +732,7 @@ mod tests {
         // cross-room boundary is the load-bearing property here —
         // the test name still applies.
         let got = s
-            .missing_events(*ALICE_ROOM_ID, &[&id_a], &[], 10)
+            .missing_events(*ALICE_ROOM_ID, &[&id_a], &[], 10, false)
             .await
             .unwrap();
         assert!(
@@ -933,7 +950,7 @@ mod tests {
         let id_a = ev_a.event_id.clone();
         s.persist_event(&ev_a, &[]).await.unwrap();
         let got = s
-            .missing_events(*ALICE_ROOM_ID, &[&id_a], &[], 0)
+            .missing_events(*ALICE_ROOM_ID, &[&id_a], &[], 0, false)
             .await
             .unwrap();
         assert!(got.is_empty());
@@ -975,7 +992,7 @@ mod tests {
     async fn missing_events_unknown_room_returns_invalid_input() {
         let s = store().await;
         let err = s
-            .missing_events(*ALICE_ROOM_ID, &[], &[], 10)
+            .missing_events(*ALICE_ROOM_ID, &[], &[], 10, false)
             .await
             .expect_err("unknown room must reject");
         assert!(
@@ -995,7 +1012,7 @@ mod tests {
     async fn missing_events_unknown_latest_returns_empty() {
         let s = store_with_room().await;
         let got = s
-            .missing_events(*ALICE_ROOM_ID, &[event_id!("$nope:e")], &[], 10)
+            .missing_events(*ALICE_ROOM_ID, &[event_id!("$nope:e")], &[], 10, false)
             .await
             .expect("unknown latest must not error");
         assert!(got.is_empty(), "expected empty result, got {got:?}");
@@ -1073,7 +1090,7 @@ mod tests {
         let id_a = ev_a.event_id.clone();
         s.persist_event(&ev_a, &[]).await.unwrap();
         let got = s
-            .missing_events(*ALICE_ROOM_ID, &[&id_a], &[event_id!("$nope:e")], 10)
+            .missing_events(*ALICE_ROOM_ID, &[&id_a], &[event_id!("$nope:e")], 10, false)
             .await
             .expect("unknown earliest must not error");
         assert!(got.is_empty(), "no ancestors to walk into; expected empty");
@@ -1100,7 +1117,7 @@ mod tests {
         s.persist_event(&head, &[]).await.unwrap();
 
         let got = s
-            .missing_events(*ALICE_ROOM_ID, &[&head_id], &[], 100)
+            .missing_events(*ALICE_ROOM_ID, &[&head_id], &[], 100, false)
             .await
             .unwrap();
 
@@ -1208,7 +1225,7 @@ mod tests {
         // to its parents and beyond. All 12 events strictly behind
         // 5 are reachable: 1, 2, 3, A, b1, b2, b3, 4, B, b4, b5, b6.
         let got_all = s
-            .missing_events(*ALICE_ROOM_ID, &[&id5], &[], 100)
+            .missing_events(*ALICE_ROOM_ID, &[&id5], &[], 100, false)
             .await
             .unwrap();
         let all_ids: HashSet<OwnedEventId> = got_all.iter().map(|e| e.event_id.clone()).collect();
@@ -1231,7 +1248,7 @@ mod tests {
         // children's only prev (= 3) hits the boundary. Reachable
         // result: 4, B, b4, b5, b6. (Cardinality 5.)
         let got_bounded = s
-            .missing_events(*ALICE_ROOM_ID, &[&id5], &[&id3], 100)
+            .missing_events(*ALICE_ROOM_ID, &[&id5], &[&id3], 100, false)
             .await
             .unwrap();
         let bounded_ids: HashSet<OwnedEventId> =
@@ -1271,7 +1288,7 @@ mod tests {
         s.persist_event(&ev_b, &[]).await.unwrap();
 
         let got = s
-            .missing_events(*ALICE_ROOM_ID, &[&id_b], &[], 1)
+            .missing_events(*ALICE_ROOM_ID, &[&id_b], &[], 1, false)
             .await
             .unwrap();
         assert_eq!(got.len(), 1);
@@ -1354,7 +1371,7 @@ mod tests {
         s.persist_event(&ev_d, &[]).await.unwrap();
 
         let got = s
-            .missing_events(*ALICE_ROOM_ID, &[&id_c, &id_d], &[], 10)
+            .missing_events(*ALICE_ROOM_ID, &[&id_c, &id_d], &[], 10, false)
             .await
             .unwrap();
         let ids: HashSet<&str> = got.iter().map(|p| p.event_id.as_str()).collect();
@@ -1363,5 +1380,73 @@ mod tests {
         assert!(ids.contains(id_b.as_str()));
         assert!(!ids.contains(id_c.as_str()), "latest c must not appear");
         assert!(!ids.contains(id_d.as_str()), "latest d must not appear");
+    }
+
+    // MSC4242 `state_dag`: the walk follows `prev_state_events` when `true`,
+    // `prev_events` when `false`. Build C with *divergent* parents on the two
+    // edge kinds (prev=A, prev_state=B) so each walk returns a different event.
+    #[tokio::test]
+    async fn missing_events_state_dag_walks_prev_state_edges() {
+        use crate::tests::{make_event, store_with_room_and_create};
+        let (s, create) = store_with_room_and_create().await;
+        let create_id = create.event_id.clone();
+
+        // Two sibling state events off create.
+        let ev_a = make_event(
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.topic",
+            Some(""),
+            serde_json::json!({ "topic": "a" }),
+            1,
+            &[&create_id],
+            &[&create_id],
+        );
+        let ev_b = make_event(
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.name",
+            Some(""),
+            serde_json::json!({ "name": "b" }),
+            2,
+            &[&create_id],
+            &[&create_id],
+        );
+        let id_a = ev_a.event_id.clone();
+        let id_b = ev_b.event_id.clone();
+        s.persist_historical_event(&ev_a).await.unwrap();
+        s.persist_historical_event(&ev_b).await.unwrap();
+
+        // C: timeline parent A, state parent B.
+        let ev_c = make_event(
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.message",
+            None,
+            serde_json::json!({ "body": "c", "msgtype": "m.text" }),
+            3,
+            &[&id_a],
+            &[&id_b],
+        );
+        let id_c = ev_c.event_id.clone();
+        s.persist_historical_event(&ev_c).await.unwrap();
+
+        // Timeline walk → A (not B).
+        let timeline = s
+            .missing_events(*ALICE_ROOM_ID, &[&id_c], &[], 10, false)
+            .await
+            .unwrap();
+        let t_ids: HashSet<&str> = timeline.iter().map(|p| p.event_id.as_str()).collect();
+        assert!(t_ids.contains(id_a.as_str()), "timeline walk yields A");
+        assert!(!t_ids.contains(id_b.as_str()), "timeline walk skips B");
+
+        // State-DAG walk → B (not A).
+        let state = s
+            .missing_events(*ALICE_ROOM_ID, &[&id_c], &[], 10, true)
+            .await
+            .unwrap();
+        let s_ids: HashSet<&str> = state.iter().map(|p| p.event_id.as_str()).collect();
+        assert!(s_ids.contains(id_b.as_str()), "state walk yields B");
+        assert!(!s_ids.contains(id_a.as_str()), "state walk skips A");
     }
 }

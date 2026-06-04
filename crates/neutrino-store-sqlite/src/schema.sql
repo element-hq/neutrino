@@ -232,3 +232,34 @@ CREATE TABLE outbox (
 ) STRICT;
 
 CREATE INDEX ix_outbox_dest_order ON outbox(destination, outbox_id);
+
+-- ----------------------------------------------------------------------------
+-- staged_events — StagingStore
+-- A pre-auth holding pen for federation ancestry fetched while gap-filling a
+-- received PDU's state DAG. Events here are NOT yet authorised: we must auth
+-- every PDU (concurrency reorders operations, so a trusted peer's event can
+-- still be invalid by DAG position), and an un-vetted event must never be
+-- given a stream position or surface in any read / state-res path. So this
+-- table is deliberately invisible to every other store read: just the raw
+-- wire bytes keyed by their computed event_id (`json` is the canonical
+-- post-`from_wire` form, so `event_id` ↔ `json` round-trips).
+--
+-- The gap-fill loop stages fetched ancestry here, walks `events ∪
+-- staged_events` via `prev_state_events` (see StagingStore::ancestry_gap) to
+-- find the still-missing frontier, asks the peer only for that frontier, and
+-- once the ancestry is grounded promotes the staged subgraph through the
+-- per-room actor (where auth, stream positions, and verdicts finally happen)
+-- and deletes it from here. Durable across restarts, so a later inbound
+-- retry resumes from the cached prefix rather than refetching everything.
+--
+-- No FK on `room_id` (a holding pen, not history — same posture as the
+-- FK-free `event_edges.parent_event_id`). No `user_version` bump: additive,
+-- no live data, no migration framework yet (same policy as the `events`
+-- rejected/soft_failed and `rooms` FE columns).
+CREATE TABLE staged_events (
+    event_id  TEXT NOT NULL PRIMARY KEY,
+    room_id   TEXT NOT NULL,
+    json      TEXT NOT NULL
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX ix_staged_events_room ON staged_events(room_id);

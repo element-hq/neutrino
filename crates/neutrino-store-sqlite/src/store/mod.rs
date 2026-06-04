@@ -6,6 +6,7 @@ mod events;
 mod inbox;
 mod outbox;
 mod rooms;
+mod staging;
 mod state;
 mod state_provider;
 

@@ -26,14 +26,87 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use neutrino_common::{Config, ROOM_VERSION_ID};
 use neutrino_state::event_id::EventBuilder;
-use neutrino_store::{EventStore, RoomStore, StateStore};
+use neutrino_store::{EventStore, RoomStore, StagingStore, StateStore};
 use neutrino_store_sqlite::SqliteStore;
-use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
+use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, ServerName};
+use serde_json::value::RawValue as RawJsonValue;
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use tower::ServiceExt;
 
-use crate::{router, router_with_store};
+use crate::federation::client::FederationClientError;
+use crate::federation::send::MissingEventsFetcher;
+use crate::{router, router_with_store, router_with_store_and_fetcher};
+
+/// Deterministic gap-fill [`MissingEventsFetcher`] for the inbound `/send`
+/// tests. Returns a fixed outcome on every `fetch` and counts calls, so a test
+/// can drive the staging gap-fill loop without any network.
+struct StubFetcher {
+    // Interior mutability so a test can seed the router with the stub, then set
+    // the response *after* learning the real room/event ids from the seed.
+    outcome: std::sync::Mutex<StubOutcome>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+enum StubOutcome {
+    /// `Ok(empty)` — the peer has nothing new (an unfillable gap).
+    NoProgress,
+    /// `Ok(events)` — return these raw PDUs (rebuilt from JSON) on every call.
+    Events(Vec<String>),
+    /// `Err(Status(code))` — a peer HTTP failure.
+    Error(u16),
+}
+
+impl StubFetcher {
+    fn no_progress() -> std::sync::Arc<Self> {
+        Self::with(StubOutcome::NoProgress)
+    }
+
+    fn erroring(code: u16) -> std::sync::Arc<Self> {
+        Self::with(StubOutcome::Error(code))
+    }
+
+    fn with(outcome: StubOutcome) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            outcome: std::sync::Mutex::new(outcome),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Make subsequent `fetch` calls return these events (their canonical raw
+    /// bytes). Used after seeding to supply the ancestry under test.
+    fn set_events(&self, events: &[&neutrino_common::Event]) {
+        let jsons = events.iter().map(|e| e.raw.get().to_owned()).collect();
+        *self.outcome.lock().unwrap() = StubOutcome::Events(jsons);
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[async_trait::async_trait]
+impl MissingEventsFetcher for StubFetcher {
+    async fn fetch(
+        &self,
+        _origin: &ServerName,
+        _room_id: &RoomId,
+        _latest: &[OwnedEventId],
+        _earliest: &[OwnedEventId],
+        _limit: u32,
+    ) -> Result<Vec<Box<RawJsonValue>>, FederationClientError> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match &*self.outcome.lock().unwrap() {
+            StubOutcome::NoProgress => Ok(Vec::new()),
+            StubOutcome::Events(jsons) => Ok(jsons
+                .iter()
+                .map(|s| RawJsonValue::from_string(s.clone()).expect("stub pdu is valid JSON"))
+                .collect()),
+            StubOutcome::Error(code) => Err(FederationClientError::Status(*code)),
+        }
+    }
+}
 
 fn config() -> Config {
     Config {
@@ -1062,6 +1135,23 @@ async fn seed_joined_room() -> (
     OwnedUserId,
     OwnedEventId,
 ) {
+    // Default to a no-progress fetcher: the in-order tests never trigger
+    // gap-fill, and the one that does (`…unfillable_missing_ancestry`) wants
+    // exactly "the peer has nothing" — deterministic, no network.
+    seed_joined_room_with_fetcher(StubFetcher::no_progress()).await
+}
+
+/// As [`seed_joined_room`] but with an injected gap-fill fetcher, for the
+/// tests that exercise the staging gap-fill loop.
+async fn seed_joined_room_with_fetcher(
+    fetcher: Arc<dyn MissingEventsFetcher>,
+) -> (
+    axum::Router,
+    Arc<SqliteStore>,
+    OwnedRoomId,
+    OwnedUserId,
+    OwnedEventId,
+) {
     let (store, tempfile) = fresh_store().await;
     let alice = alice();
     let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
@@ -1084,7 +1174,7 @@ async fn seed_joined_room() -> (
         .create_room(&create, &[join])
         .await
         .expect("create_room");
-    let router = router_with_store(config(), store.clone(), tempfile);
+    let router = router_with_store_and_fetcher(config(), store.clone(), tempfile, fetcher);
     (router, store, room_id, alice, join_id)
 }
 
@@ -1173,8 +1263,8 @@ async fn send_persists_rejected_pdu_as_success_result() {
 
 #[tokio::test]
 async fn send_reports_error_for_unfillable_missing_ancestry() {
-    // A PDU referencing a parent we don't have and can't backfill (NoFetcher).
-    // Terminal condition 2: no progress → the PDU gets an error.
+    // A PDU referencing a parent we don't have, and the peer (a no-progress
+    // fetcher) returns nothing → the gap is unfillable → the PDU gets an error.
     let (app, _store, room_id, alice, join_id) = seed_joined_room().await;
     // An orphan ancestor that is never persisted nor included in the txn.
     let orphan = message_on(&alice, &room_id, &join_id, "orphan", 1_700_000_002_000);
@@ -1196,6 +1286,110 @@ async fn send_reports_error_for_unfillable_missing_ancestry() {
         .and_then(|r| r.get("error"))
         .and_then(Value::as_str);
     assert!(err.is_some(), "expected an error result; body = {body}");
+}
+
+#[tokio::test]
+async fn send_gapfills_missing_ancestry_then_accepts() {
+    // The success path that was inert under the old `NoFetcher`: a PDU arrives
+    // referencing an `orphan` we don't hold; the fetcher supplies the orphan,
+    // it is staged → promoted (authed) → and the child is then accepted. Both
+    // events end up committed.
+    let fetcher = StubFetcher::no_progress();
+    let (app, store, room_id, alice, join_id) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    // The missing ancestor must be a *state* event (it lives in the state DAG
+    // the child references via `prev_state_events`); a non-state parent would
+    // be rejected. A topic set by the creator auth-passes.
+    let orphan = EventBuilder::new(alice.clone(), "m.room.topic".to_owned())
+        .room_id(room_id.clone())
+        .state_key(String::new())
+        .content(json!({ "topic": "set in the gap" }))
+        .prev_events(vec![join_id.clone()])
+        .prev_state_events(vec![join_id.clone()])
+        .origin_server_ts(1_700_000_002_000)
+        .build()
+        .expect("build orphan topic");
+    let child = message_on(
+        &alice,
+        &room_id,
+        &orphan.event_id,
+        "child",
+        1_700_000_003_000,
+    );
+    let orphan_id = orphan.event_id.clone();
+    let child_id = child.event_id.clone();
+
+    // Now that the orphan exists, make the peer supply it on the next fetch.
+    fetcher.set_events(&[&orphan]);
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    // The child PDU was accepted (empty result object, no error).
+    assert_eq!(
+        body.get("pdus").and_then(|p| p.get(child_id.as_str())),
+        Some(&json!({})),
+        "child should be accepted after gap-fill; body = {body}"
+    );
+    assert!(
+        fetcher.call_count() >= 1,
+        "the fetcher must have been asked"
+    );
+
+    // Both the fetched orphan and the child are committed (not rejected), and
+    // nothing lingers in staging.
+    let committed = store
+        .get_events(&[orphan_id.as_ref(), child_id.as_ref()])
+        .await
+        .unwrap();
+    assert_eq!(committed.len(), 2, "orphan + child both committed");
+    assert!(committed.iter().all(|e| !e.rejected));
+    let still_missing = store
+        .ancestry_gap(&room_id, &[child_id.as_ref()])
+        .await
+        .unwrap();
+    assert!(
+        still_missing.staged.is_empty(),
+        "promoted ancestry must be unstaged"
+    );
+}
+
+#[tokio::test]
+async fn send_reports_error_when_fetcher_fails() {
+    // The peer is unreachable / errors: gap-fill can't proceed, so the PDU gets
+    // an error result (distinct from the no-progress "unfillable" case).
+    let fetcher = StubFetcher::erroring(502);
+    let (app, store, room_id, alice, join_id) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let orphan = message_on(&alice, &room_id, &join_id, "orphan", 1_700_000_002_000);
+    let child = message_on(
+        &alice,
+        &room_id,
+        &orphan.event_id,
+        "child",
+        1_700_000_003_000,
+    );
+    let child_id = child.event_id.clone();
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let err = body
+        .get("pdus")
+        .and_then(|p| p.get(child_id.as_str()))
+        .and_then(|r| r.get("error"))
+        .and_then(Value::as_str);
+    assert!(err.is_some(), "expected an error result; body = {body}");
+    assert!(
+        fetcher.call_count() >= 1,
+        "the fetcher must have been asked"
+    );
+    // The child was not committed.
+    let committed = store.get_events(&[child_id.as_ref()]).await.unwrap();
+    assert!(
+        committed.is_empty(),
+        "child must not be persisted on fetch failure"
+    );
 }
 
 #[tokio::test]

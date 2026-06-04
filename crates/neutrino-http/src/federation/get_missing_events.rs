@@ -57,6 +57,13 @@ pub(crate) struct RequestBody {
     earliest_events: Vec<ruma::OwnedEventId>,
     /// Events the requester wants to walk back from. Required and non-empty.
     latest_events: Vec<ruma::OwnedEventId>,
+    /// MSC4242: when `true`, walk back via `prev_state_events` (the state DAG)
+    /// instead of `prev_events` (the timeline DAG). Optional, default `false`
+    /// per the MSC, so a v1.18-shaped body omitting it keeps the timeline-DAG
+    /// behaviour. This is the field our own gap-fill fetcher sets to close a
+    /// received PDU's missing state ancestry.
+    #[serde(default)]
+    state_dag: bool,
 }
 
 /// Serializable mirror of `ruma::api::federation::event::get_missing_events::v1::Response`.
@@ -137,7 +144,7 @@ pub(crate) async fn handle(
     let latest: Vec<&ruma::EventId> = body.latest_events.iter().map(|id| id.as_ref()).collect();
     let earliest: Vec<&ruma::EventId> = body.earliest_events.iter().map(|id| id.as_ref()).collect();
     let events = store
-        .missing_events(&room_id, &latest, &earliest, limit)
+        .missing_events(&room_id, &latest, &earliest, limit, body.state_dag)
         .await?;
 
     // (6) — wire bytes verbatim, oldest-first. `missing_events` walks back
