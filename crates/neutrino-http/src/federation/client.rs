@@ -9,9 +9,7 @@
 //! - **No X-Matrix auth** header and no request signing.
 //! - PDUs are opaque `RawValue`s on the wire, never re-parsed here.
 //!
-//! Not yet wired into a delivery loop — that is PR3 (the per-destination sender
-//! pool). Hence `#![allow(dead_code)]` until then.
-#![allow(dead_code)] // TODO(PR3): drop once the sender pool consumes this.
+//! Consumed by the per-destination sender pool (`federation::sender`).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -44,6 +42,9 @@ pub(crate) enum FederationClientError {
     /// The target URL could not be built from the destination + room id.
     /// Unreachable for a validated `ServerName` + a base `http://` URL, but
     /// surfaced rather than panicked on.
+    // TODO(PR4): only constructed by `get_missing_events`, which the reqwest
+    // `MissingEventsFetcher` will consume.
+    #[allow(dead_code)]
     #[error("could not build federation URL")]
     InvalidUrl,
 }
@@ -103,6 +104,9 @@ impl FederationClient {
     /// to fetch ancestry between `earliest` (boundary already held) and
     /// `latest` (heads to walk back from), up to `limit` events. Returns the
     /// peer's `events` array (oldest-first), opaque PDU bytes.
+    // TODO(PR4): consumed by the reqwest `MissingEventsFetcher` replacing
+    // `NoFetcher`; unused until then.
+    #[allow(dead_code)]
     pub(crate) async fn get_missing_events(
         &self,
         dest: &ServerName,
@@ -177,6 +181,8 @@ struct TransactionRequest<'a> {
 /// Outbound `/get_missing_events` request body. Mirrors the inbound
 /// `RequestBody` (`get_missing_events.rs`): `min_depth` is omitted (optional,
 /// and the peer ignores it).
+// TODO(PR4): constructed only by `get_missing_events`; unused until the fetcher.
+#[allow(dead_code)]
 #[derive(Serialize)]
 struct MissingEventsRequest<'a> {
     earliest_events: &'a [OwnedEventId],

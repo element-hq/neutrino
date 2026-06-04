@@ -21,6 +21,7 @@ pub(crate) mod backfill;
 pub(crate) mod client;
 pub(crate) mod get_missing_events;
 pub(crate) mod send;
+pub(crate) mod sender;
 
 #[cfg(test)]
 mod tests;
