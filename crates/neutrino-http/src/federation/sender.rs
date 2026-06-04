@@ -58,20 +58,12 @@ use tokio::sync::{Semaphore, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::federation::client::{FederationClient, FederationClientError, TxnIdGen};
-use crate::federation::now_ms;
-
-/// Max PDUs per `/send` transaction. The inbound handler 400s a transaction
-/// carrying more than this (`send.rs`), so chunk on the way out.
-const MAX_PDUS_PER_TXN: usize = 50;
+use crate::federation::{MAX_PDUS_PER_TXN, now_ms};
 
 /// Backoff floor after a transient delivery failure.
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// Backoff ceiling. The exponential sequence (1, 2, 4, 8, … s) is clamped here.
 const BACKOFF_CAP: Duration = Duration::from_secs(15 * 60);
-
-/// Default cap on transactions in flight across all destinations. Overridable
-/// via `NEUTRINO_OUTBOUND_CONCURRENCY` (clamped to ≥1).
-const DEFAULT_OUTBOUND_CONCURRENCY: usize = 2;
 
 /// Upper bound on the random delay a startup-present destination waits before
 /// its first drain. Generous on purpose — spreads a fleet of restart-time
@@ -84,8 +76,8 @@ const STARTUP_JITTER_MAX: Duration = Duration::from_secs(30);
 /// Subscribes to the persist watch *before* the first enumeration so a
 /// destination added concurrently with startup can't be missed (the watch will
 /// have advanced, waking the supervisor's first `changed()`).
-pub(crate) fn spawn(store: Arc<SqliteStore>, origin: String) {
-    spawn_with(store, origin, outbound_concurrency(), STARTUP_JITTER_MAX);
+pub(crate) fn spawn(store: Arc<SqliteStore>, origin: String, concurrency: usize) {
+    spawn_with(store, origin, concurrency, STARTUP_JITTER_MAX);
 }
 
 /// Inner spawn with the flood-control bounds made explicit, so tests can run
@@ -180,8 +172,11 @@ async fn run_destination(
 
     let mut backoff = BACKOFF_BASE;
     loop {
-        let pending = match store.pending_pdus(&dest).await {
-            Ok(p) => p,
+        // One transaction's worth, in causal order. `pending_pdus` caps the
+        // load at `MAX_PDUS_PER_TXN`, so a huge backlog never lands in memory
+        // at once — we drain it a batch at a time across loop iterations.
+        let batch = match store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await {
+            Ok(b) => b,
             Err(e) => {
                 // A storage read fault is transient; back off and retry.
                 error!(%dest, error = %e, "reading pending PDUs");
@@ -190,7 +185,7 @@ async fn run_destination(
             }
         };
 
-        if pending.is_empty() {
+        if batch.is_empty() {
             // Fully drained: reset backoff and idle until the next persist.
             backoff = BACKOFF_BASE;
             if watch_rx.changed().await.is_err() {
@@ -199,49 +194,87 @@ async fn run_destination(
             continue;
         }
 
-        // One transaction's worth, in causal order.
-        let chunk = &pending[..pending.len().min(MAX_PDUS_PER_TXN)];
-        let pdus: Vec<Box<RawJsonValue>> = chunk.iter().map(|e| e.raw.clone()).collect();
-        let ids: Vec<&EventId> = chunk.iter().map(|e| &*e.event_id).collect();
-        let txn_id = idgen.next_id();
-
-        // Hold a global permit only around the network call — released before
-        // any backoff sleep, so a slow peer can't pin a concurrency slot.
-        let send_result = match send_slots.acquire().await {
-            Ok(_permit) => client.send_transaction(&dest, &txn_id, &pdus).await,
-            // The semaphore is never closed in normal operation; an error here
-            // means shutdown, so stop the task.
-            Err(_) => return,
-        };
-
-        match send_result {
-            Ok(()) => {
-                drop_batch(&store, &dest, &ids).await;
-                // Reset and loop immediately to drain any remaining chunks.
-                backoff = BACKOFF_BASE;
-            }
-            // 4xx: the peer rejected the transaction envelope. Retrying is
-            // futile — drop the batch and carry on with the next.
-            Err(FederationClientError::Status(code)) if (400..500).contains(&code) => {
-                warn!(%dest, code, pdus = ids.len(), "peer rejected transaction (4xx); dropping batch");
-                drop_batch(&store, &dest, &ids).await;
-                backoff = BACKOFF_BASE;
-            }
-            // 5xx / transport / URL: transient. Keep the batch, back off, retry.
-            Err(e) => {
-                warn!(%dest, error = %e, backoff = ?backoff, "transaction delivery failed; will retry");
-                sleep_backoff(&mut backoff).await;
-            }
+        if deliver_batch(
+            &store,
+            &client,
+            &idgen,
+            &send_slots,
+            &dest,
+            &batch,
+            &mut backoff,
+        )
+        .await
+        {
+            backoff = BACKOFF_BASE;
+        } else {
+            // Shutdown (semaphore closed). Stop the task.
+            return;
         }
     }
 }
 
-/// Remove a delivered (or dropped-as-4xx) batch from the outbox. A storage
-/// fault here is logged but not fatal: the rows survive and the next drain
-/// re-attempts removal (delivery is idempotent on the receiver via txn dedup).
-async fn drop_batch(store: &SqliteStore, dest: &ServerName, ids: &[&EventId]) {
-    if let Err(e) = store.remove_pdus(dest, ids).await {
-        error!(%dest, error = %e, "removing delivered PDUs from outbox");
+/// Deliver one batch to `dest`, retrying transient failures in place until the
+/// batch is either delivered+removed or dropped (4xx). Returns `false` only on
+/// shutdown (the global semaphore was closed), signalling the caller to stop.
+///
+/// Per spec the same `txnId` is reused across retries of the *same* batch (the
+/// receiver dedups on `(origin, txnId)`); a fresh id is minted only once a batch
+/// is done, i.e. on the next call. Transient errors (5xx / transport) back off
+/// and retry; a 4xx is an envelope-level reject that retrying can't fix, so the
+/// batch is dropped. A post-2xx `remove_pdus` failure also backs off and retries
+/// (re-sending under the same txnId, which the peer dedups) rather than
+/// hot-looping.
+async fn deliver_batch(
+    store: &SqliteStore,
+    client: &FederationClient,
+    idgen: &TxnIdGen,
+    send_slots: &Semaphore,
+    dest: &ServerName,
+    batch: &[neutrino_common::Event],
+    backoff: &mut Duration,
+) -> bool {
+    let pdus: Vec<Box<RawJsonValue>> = batch.iter().map(|e| e.raw.clone()).collect();
+    let ids: Vec<&EventId> = batch.iter().map(|e| &*e.event_id).collect();
+    let txn_id = idgen.next_id();
+
+    loop {
+        // Hold a global permit only around the network call — released before
+        // any backoff sleep, so a slow peer can't pin a concurrency slot.
+        let send_result = match send_slots.acquire().await {
+            Ok(_permit) => client.send_transaction(dest, &txn_id, &pdus).await,
+            // The semaphore is never closed in normal operation; an error here
+            // means shutdown.
+            Err(_) => return false,
+        };
+
+        let delivered = match send_result {
+            Ok(()) => true,
+            // 4xx: the peer rejected the transaction envelope. Retrying is
+            // futile — treat as delivered so the batch is dropped from the outbox.
+            Err(FederationClientError::Status(code)) if (400..500).contains(&code) => {
+                warn!(%dest, code, pdus = ids.len(), "peer rejected transaction (4xx); dropping batch");
+                true
+            }
+            // 5xx / transport / URL: transient. Keep the batch, back off, retry
+            // under the same txn_id.
+            Err(e) => {
+                warn!(%dest, error = %e, backoff = ?backoff, "transaction delivery failed; will retry");
+                sleep_backoff(backoff).await;
+                continue;
+            }
+        };
+
+        if delivered {
+            match store.remove_pdus(dest, &ids).await {
+                Ok(()) => return true,
+                Err(e) => {
+                    // Rows survive a removal fault; back off and retry rather
+                    // than hot-looping (the re-send is deduped by the peer).
+                    error!(%dest, error = %e, "removing delivered PDUs from outbox");
+                    sleep_backoff(backoff).await;
+                }
+            }
+        }
     }
 }
 
@@ -269,62 +302,46 @@ fn jitter(ceiling: Duration) -> Duration {
     Duration::from_millis(rand::rng().random_range(0..=max_ms))
 }
 
-/// Resolve the configured outbound concurrency from the environment.
-fn outbound_concurrency() -> usize {
-    parse_concurrency(
-        std::env::var("NEUTRINO_OUTBOUND_CONCURRENCY")
-            .ok()
-            .as_deref(),
-    )
-}
-
-/// Parse + clamp the concurrency knob: a valid `usize ≥ 1`, else the default.
-fn parse_concurrency(raw: Option<&str>) -> usize {
-    raw.and_then(|s| s.parse::<usize>().ok())
-        .map(|n| n.max(1))
-        .unwrap_or(DEFAULT_OUTBOUND_CONCURRENCY)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use axum::{
-        Json, Router,
-        extract::Path,
-        http::StatusCode,
-        response::IntoResponse,
-        routing::put,
+        Json, Router, extract::Path, http::StatusCode, response::IntoResponse, routing::put,
     };
     use neutrino_common::ROOM_VERSION_ID;
     use neutrino_state::event_id::EventBuilder;
     use neutrino_store::{EventStore, RoomStore};
-    use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId};
+    use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
     use serde_json::{Value, json};
     use tempfile::NamedTempFile;
 
     use super::*;
+    use crate::federation::test_support::{dead_peer, spawn_stub};
 
     /// Stub federation peer. `fail_until` requests return `fail_status`; the
     /// rest 200 and have their `pdus` array recorded (one entry per accepted
-    /// transaction). `attempts` counts *every* request, success or not.
+    /// transaction). `attempts` counts *every* request, success or not; `txns`
+    /// records the txn_id of every request (to assert SPEC1 reuse on retry).
     #[derive(Default)]
     struct Stub {
         accepted: Mutex<Vec<Vec<Value>>>,
+        txns: Mutex<Vec<String>>,
         attempts: AtomicU64,
         fail_until: u64,
         fail_status: u16,
     }
 
-    /// Bind a stub peer on an ephemeral port and return its `ServerName`
-    /// (`127.0.0.1:{port}`) — exactly what the sender resolves to `http://…`.
+    /// Bind a stub peer (via the shared `spawn_stub`) and return its
+    /// `ServerName` (`127.0.0.1:{port}`) — what the sender resolves to `http://…`.
     async fn spawn_peer(stub: Arc<Stub>) -> OwnedServerName {
         let app = Router::new().route(
             "/_matrix/federation/v1/send/{txn}",
-            put(move |Path(_txn): Path<String>, Json(body): Json<Value>| {
+            put(move |Path(txn): Path<String>, Json(body): Json<Value>| {
                 let stub = stub.clone();
                 async move {
+                    stub.txns.lock().unwrap().push(txn);
                     let n = stub.attempts.fetch_add(1, Ordering::SeqCst);
                     if n < stub.fail_until {
                         return (StatusCode::from_u16(stub.fail_status).unwrap(), "fail")
@@ -336,20 +353,7 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        format!("127.0.0.1:{port}").parse().unwrap()
-    }
-
-    /// A `ServerName` for a port nothing listens on → every connect refuses.
-    async fn dead_peer() -> OwnedServerName {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        format!("127.0.0.1:{port}").parse().unwrap()
+        spawn_stub(app).await
     }
 
     /// Open a store, create a room, and enqueue `n` linked message events to
@@ -406,7 +410,12 @@ mod tests {
     /// Poll until `dest`'s outbox is empty, or panic after ~10s.
     async fn wait_drained(store: &SqliteStore, dest: &ServerName) {
         for _ in 0..500 {
-            if store.pending_pdus(dest).await.unwrap().is_empty() {
+            if store
+                .pending_pdus(dest, usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+            {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -534,7 +543,11 @@ mod tests {
         // The healthy peer drains despite the dead peer retrying forever.
         wait_drained(&store, &healthy).await;
         assert!(
-            !store.pending_pdus(&dead).await.unwrap().is_empty(),
+            !store
+                .pending_pdus(&dead, usize::MAX)
+                .await
+                .unwrap()
+                .is_empty(),
             "dead peer's PDU should still be pending"
         );
     }
@@ -594,17 +607,47 @@ mod tests {
         assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
     }
 
-    #[test]
-    fn parse_concurrency_clamps_and_defaults() {
-        assert_eq!(parse_concurrency(None), DEFAULT_OUTBOUND_CONCURRENCY);
-        assert_eq!(
-            parse_concurrency(Some("garbage")),
-            DEFAULT_OUTBOUND_CONCURRENCY
+    /// A permanent 5xx must (TEST4) keep the batch in the outbox — never lost —
+    /// and (SPEC1) reuse the SAME txn_id on every retry, so the receiver dedups.
+    #[tokio::test]
+    async fn permanent_5xx_keeps_batch_and_reuses_txn_id() {
+        let stub = Arc::new(Stub {
+            fail_until: u64::MAX,
+            fail_status: 500,
+            ..Stub::default()
+        });
+        let dest = spawn_peer(stub.clone()).await;
+        let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 1).await;
+
+        spawn_with(store.clone(), "local.test".to_owned(), 2, NO_JITTER);
+
+        // Wait for at least two attempts — proves it retried after the first 5xx.
+        for _ in 0..500 {
+            if stub.attempts.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let attempts = stub.attempts.load(Ordering::SeqCst);
+        assert!(attempts >= 2, "expected retries, got {attempts}");
+
+        // TEST4: a 5xx never removes the batch, and nothing was accepted.
+        assert!(
+            !store
+                .pending_pdus(&dest, usize::MAX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a 5xx must leave the batch pending"
         );
-        assert_eq!(parse_concurrency(Some("")), DEFAULT_OUTBOUND_CONCURRENCY);
-        // Zero is meaningless for a semaphore → floored to 1.
-        assert_eq!(parse_concurrency(Some("0")), 1);
-        assert_eq!(parse_concurrency(Some("1")), 1);
-        assert_eq!(parse_concurrency(Some("5")), 5);
+        assert!(stub.accepted.lock().unwrap().is_empty());
+
+        // SPEC1: every retry carried one and the same txn_id.
+        let txns = stub.txns.lock().unwrap();
+        assert!(txns.len() >= 2);
+        assert!(
+            txns.iter().all(|t| t == &txns[0]),
+            "txn_id must be reused across retries: {txns:?}"
+        );
     }
 }

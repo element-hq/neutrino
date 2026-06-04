@@ -350,10 +350,16 @@ pub trait FederationOutbox: Send + Sync {
     async fn pending_destinations(&self) -> Result<Vec<OwnedServerName>, StorageError>;
 
     /// Pre:  none (returns empty vec if `destination` has no pending entries).
-    /// Post: returns all undelivered PDUs for `destination` in insertion (causal) order;
-    ///       does not remove them — the caller must call `remove_pdus` after a successful
-    ///       `/send` transaction.
-    async fn pending_pdus(&self, destination: &ServerName) -> Result<Vec<Event>, StorageError>;
+    /// Post: returns up to `limit` of the oldest undelivered PDUs for `destination` in
+    ///       insertion (causal) order; does not remove them — the caller must call
+    ///       `remove_pdus` after a successful `/send` transaction. Bounding by `limit`
+    ///       keeps a single drain from loading an unbounded backlog into memory; the
+    ///       caller drains a long queue one `limit`-sized batch at a time.
+    async fn pending_pdus(
+        &self,
+        destination: &ServerName,
+        limit: usize,
+    ) -> Result<Vec<Event>, StorageError>;
 
     /// Pre:  each `event_id` in `event_ids` should have been returned by `pending_pdus`
     ///       for this `destination`; must only be called after the remote server returned

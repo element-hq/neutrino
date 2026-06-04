@@ -200,23 +200,11 @@ mod tests {
         http::StatusCode,
         routing::{post, put},
     };
-    use ruma::{OwnedRoomId, OwnedServerName, event_id, room_id};
+    use ruma::{OwnedRoomId, event_id, room_id};
     use serde_json::{Value, json};
 
     use super::*;
-
-    /// Bind an axum stub on an ephemeral localhost port and return its
-    /// `ServerName` (`127.0.0.1:{port}`). The listener is bound before the
-    /// task spawns, so the OS accept queue absorbs an immediate client
-    /// connect — no readiness race.
-    async fn spawn_stub(app: Router) -> OwnedServerName {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        format!("127.0.0.1:{port}").parse().unwrap()
-    }
+    use crate::federation::test_support::{dead_peer, spawn_stub};
 
     fn raw(json_str: &str) -> Box<RawJsonValue> {
         RawJsonValue::from_string(json_str.to_owned()).unwrap()
@@ -375,11 +363,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_transaction_connection_refused_is_transport_error() {
-        // Bind then drop to get a port nothing is listening on → connect fails.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let dest: OwnedServerName = format!("127.0.0.1:{port}").parse().unwrap();
+        // A port nothing is listening on → connect fails.
+        let dest = dead_peer().await;
 
         let client = FederationClient::new("local.test".to_owned());
         let pdu = raw("{}");

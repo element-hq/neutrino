@@ -175,6 +175,11 @@ impl AppState {
     fn server_name(&self) -> String {
         lock_app(self).config.server_name.clone()
     }
+
+    /// The configured cap on concurrent outbound federation transactions.
+    fn outbound_concurrency(&self) -> usize {
+        lock_app(self).config.outbound_concurrency
+    }
 }
 
 pub async fn serve(listener: TcpListener, config: Config) -> Result<(), StartupError> {
@@ -182,7 +187,11 @@ pub async fn serve(listener: TcpListener, config: Config) -> Result<(), StartupE
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
     // enumeration resumes delivery of anything left undelivered.
-    federation::sender::spawn(state.store(), state.server_name());
+    federation::sender::spawn(
+        state.store(),
+        state.server_name(),
+        state.outbound_concurrency(),
+    );
     let router = build_router(state);
     axum::serve(listener, router)
         .await

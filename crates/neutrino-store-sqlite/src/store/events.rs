@@ -1158,13 +1158,13 @@ mod tests {
 
         // Each destination has the event queued.
         for dest in [dest_a, dest_b] {
-            let pending = s.pending_pdus(dest).await.unwrap();
+            let pending = s.pending_pdus(dest, usize::MAX).await.unwrap();
             assert_eq!(pending.len(), 1, "one pending pdu for {dest}");
             assert_eq!(pending[0].event_id, name_id);
         }
         // A third, unaddressed destination has nothing.
         assert!(
-            s.pending_pdus(server_name!("c.example.com"))
+            s.pending_pdus(server_name!("c.example.com"), usize::MAX)
                 .await
                 .unwrap()
                 .is_empty()

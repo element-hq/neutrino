@@ -60,9 +60,6 @@ use crate::federation::FedError;
 use crate::room_actor::{RoomActorError, RoomRegistry};
 use crate::{AppState, lock_app};
 
-/// Spec maximum PDUs per transaction
-/// (<https://spec.matrix.org/v1.18/server-server-api/#transactions>).
-const MAX_PDUS: usize = 50;
 /// Initial `limit` for the first gap-fill request; doubled each round (MSC4242
 /// recommends exponentially increasing the limit until all ancestry is seen).
 const INITIAL_GAPFILL_LIMIT: u32 = 10;
@@ -123,7 +120,7 @@ pub(crate) async fn handle(
     let body: TransactionBody = serde_json::from_value(body_value)
         .map_err(|_| FedError::BadRequest("body shape does not match the spec"))?;
 
-    if body.pdus.len() > MAX_PDUS {
+    if body.pdus.len() > super::MAX_PDUS_PER_TXN {
         return Err(FedError::BadRequest("transaction exceeds 50 PDUs"));
     }
 

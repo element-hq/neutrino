@@ -178,7 +178,10 @@ async fn restart_preserves_all_state() {
     assert_eq!(destinations.len(), 1);
     assert_eq!(destinations[0].as_str(), "matrix.org");
 
-    let pdus = s.pending_pdus(dest).await.expect("pending_pdus");
+    let pdus = s
+        .pending_pdus(dest, usize::MAX)
+        .await
+        .expect("pending_pdus");
     assert_eq!(pdus.len(), 1);
     assert_eq!(pdus[0].event_id.as_str(), msg_id.as_str());
 

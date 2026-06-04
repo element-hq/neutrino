@@ -23,6 +23,42 @@ pub(crate) mod get_missing_events;
 pub(crate) mod send;
 pub(crate) mod sender;
 
+/// Spec maximum PDUs per federation transaction
+/// (<https://spec.matrix.org/v1.18/server-server-api/#transactions>). The
+/// inbound `/send` handler rejects a transaction carrying more than this; the
+/// outbound sender chunks to it. One constant so the two halves can't drift.
+pub(crate) const MAX_PDUS_PER_TXN: usize = 50;
+
+/// Shared test scaffolding for the federation HTTP tests (`client`, `sender`).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use axum::Router;
+    use ruma::OwnedServerName;
+
+    /// Bind an axum stub on an ephemeral localhost port and return its
+    /// `ServerName` (`127.0.0.1:{port}`) — exactly what the outbound resolver
+    /// turns into `http://…`. The listener is bound before the task spawns, so
+    /// the OS accept queue absorbs an immediate client connect (no readiness
+    /// race).
+    pub(crate) async fn spawn_stub(app: Router) -> OwnedServerName {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("127.0.0.1:{port}").parse().unwrap()
+    }
+
+    /// A `ServerName` for a port nothing listens on: bind to grab a free port,
+    /// then drop the listener so every connect attempt is refused.
+    pub(crate) async fn dead_peer() -> OwnedServerName {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("127.0.0.1:{port}").parse().unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
