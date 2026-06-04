@@ -252,13 +252,22 @@ CREATE INDEX ix_outbox_dest_order ON outbox(destination, outbox_id);
 -- and deletes it from here. Durable across restarts, so a later inbound
 -- retry resumes from the cached prefix rather than refetching everything.
 --
+-- `origin` is the server that sent the PDU (or, for ancestry fetched during
+-- gap-fill, the server we asked) — the per-row target the background worker
+-- re-asks when it needs to fill a deeper gap. Per-row, not per-room, since
+-- different peers can send events into the same room.
+--
 -- No FK on `room_id` (a holding pen, not history — same posture as the
 -- FK-free `event_edges.parent_event_id`). No `user_version` bump: additive,
 -- no live data, no migration framework yet (same policy as the `events`
--- rejected/soft_failed and `rooms` FE columns).
+-- rejected/soft_failed and `rooms` FE columns). Retry backoff is NOT stored
+-- here — it lives in the worker's in-memory state (same as the outbound
+-- sender), so a restart re-drains everything; presence = pending, absence =
+-- processed.
 CREATE TABLE staged_events (
     event_id  TEXT NOT NULL PRIMARY KEY,
     room_id   TEXT NOT NULL,
+    origin    TEXT NOT NULL,
     json      TEXT NOT NULL
 ) STRICT, WITHOUT ROWID;
 
