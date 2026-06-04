@@ -208,8 +208,8 @@ impl StagingStore for SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use neutrino_store::{EventStore, StagingStore};
-    use ruma::{ServerName, server_name};
+    use neutrino_store::{EventStore, StagedPdu, StagingStore};
+    use ruma::{OwnedEventId, ServerName, server_name};
     use serde_json::json;
 
     use crate::tests::{ALICE_ROOM_ID, ALICE_USER_ID, make_event, store_with_room_and_create};
@@ -402,6 +402,49 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_pdu_records_per_row_origin_and_keeps_first_on_duplicate() {
+        // The whole point of the `origin` column is per-row fidelity (different
+        // peers into the same room), so stage two events under *different*
+        // origins and assert each round-trips its own.
+        let (s, create) = store_with_room_and_create().await;
+        let x = state_event(&[create.event_id.as_ref()], 1);
+        let y = state_event(&[create.event_id.as_ref()], 2);
+        let origin_a = server_name!("a.example.org");
+        let origin_b = server_name!("b.example.org");
+
+        s.stage_pdu(origin_a, *ALICE_ROOM_ID, &x.event_id, &x.raw)
+            .await
+            .unwrap();
+        s.stage_pdu(origin_b, *ALICE_ROOM_ID, &y.event_id, &y.raw)
+            .await
+            .unwrap();
+
+        let origin_of = |rows: &[StagedPdu], id: &OwnedEventId| {
+            rows.iter()
+                .find(|p| &p.event_id == id)
+                .map(|p| p.origin.clone())
+                .expect("row present")
+        };
+        let rows = s.staged_for_room(*ALICE_ROOM_ID).await.unwrap();
+        assert_eq!(origin_of(&rows, &x.event_id), origin_a);
+        assert_eq!(origin_of(&rows, &y.event_id), origin_b);
+
+        // Re-staging X under a *different* origin is an INSERT OR IGNORE no-op:
+        // the first origin wins (the event_id is content-derived, so a re-stage
+        // is a genuine duplicate — we keep the original sender).
+        s.stage_pdu(origin_b, *ALICE_ROOM_ID, &x.event_id, &x.raw)
+            .await
+            .unwrap();
+        let rows = s.staged_for_room(*ALICE_ROOM_ID).await.unwrap();
+        assert_eq!(rows.len(), 2, "duplicate must not add a row");
+        assert_eq!(
+            origin_of(&rows, &x.event_id),
+            origin_a,
+            "first origin must win on a duplicate stage"
         );
     }
 }
