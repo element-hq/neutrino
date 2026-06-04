@@ -72,3 +72,15 @@ impl IntoResponse for FedError {
         (status, Json(json!({"errcode": errcode, "error": msg}))).into_response()
     }
 }
+
+/// Milliseconds since the Unix epoch, for the federation transaction
+/// `origin_server_ts`. Saturates to 0 on a pre-epoch clock — never panics (no
+/// `unwrap` on `SystemTime`). Shared by the inbound `backfill` response and the
+/// outbound `client`.
+pub(crate) fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}

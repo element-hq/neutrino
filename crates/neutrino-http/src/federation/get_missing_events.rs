@@ -34,7 +34,7 @@ const MAX_LIMIT: u32 = 20;
 /// path-extracted `room_id` in the handler. Mirrors the `SyncRequestBody`
 /// pattern in `lib.rs::build_sync_request`.
 #[derive(Deserialize)]
-struct RequestBody {
+pub(crate) struct RequestBody {
     /// Optional. Saturates to [`DEFAULT_LIMIT`] when missing, capped at
     /// [`MAX_LIMIT`]. No `#[serde(default)]` — serde already deserializes a
     /// missing `Option` field to `None`.
@@ -66,9 +66,15 @@ struct RequestBody {
 /// codes, headers) but does not derive plain `Serialize`. We hand-roll a
 /// view that emits the JSON body the federation spec actually wants —
 /// just an `events` array of opaque PDUs.
-#[derive(Serialize)]
+///
+/// Doubles as the *outbound* deserialize target — the federation client
+/// (`client::FederationClient::get_missing_events`) parses a peer's response
+/// into this same type. `#[serde(default)]` lets a `{}` body (no `events`
+/// key) decode to an empty vec ("no progress").
+#[derive(Serialize, Deserialize)]
 pub(crate) struct ResponseBody {
-    events: Vec<Box<RawJsonValue>>,
+    #[serde(default)]
+    pub(crate) events: Vec<Box<RawJsonValue>>,
 }
 
 /// Federation `/get_missing_events` handler.

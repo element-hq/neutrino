@@ -14,11 +14,20 @@
 #![allow(dead_code)] // TODO(PR3): drop once the sender pool consumes this.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use reqwest::Client;
 use ruma::{OwnedEventId, RoomId, ServerName};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::value::RawValue as RawJsonValue;
+
+use crate::federation::{get_missing_events, now_ms};
+
+/// Connection-establishment timeout for a federation request.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Total per-request timeout (headers + body). Bounds a slow/black-holing peer
+/// so it can't stall a sender task indefinitely.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Errors the outbound client can surface to a caller (the PR3 sender loop,
 /// which decides retry-vs-give-up from the variant).
@@ -32,6 +41,11 @@ pub(crate) enum FederationClientError {
     /// caller can distinguish e.g. a 4xx (give up) from a 5xx (retry).
     #[error("peer returned HTTP {0}")]
     Status(u16),
+    /// The target URL could not be built from the destination + room id.
+    /// Unreachable for a validated `ServerName` + a base `http://` URL, but
+    /// surfaced rather than panicked on.
+    #[error("could not build federation URL")]
+    InvalidUrl,
 }
 
 /// reqwest-backed client for outbound federation requests.
@@ -49,6 +63,8 @@ impl FederationClient {
         // init, which we don't use — fall back to the default client if so.
         let http = Client::builder()
             .no_proxy()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .unwrap_or_else(|_| Client::new());
         Self { http, origin }
@@ -65,6 +81,8 @@ impl FederationClient {
         txn_id: &str,
         pdus: &[Box<RawJsonValue>],
     ) -> Result<(), FederationClientError> {
+        // `txn_id` is locally generated (`{u64}-{u64}`) and `dest` is a
+        // validated `ServerName`, so neither needs escaping in the path.
         let url = format!("http://{dest}/_matrix/federation/v1/send/{txn_id}");
         let body = TransactionRequest {
             origin: &self.origin,
@@ -93,17 +111,34 @@ impl FederationClient {
         earliest: &[OwnedEventId],
         limit: u32,
     ) -> Result<Vec<Box<RawJsonValue>>, FederationClientError> {
-        let url = format!("http://{dest}/_matrix/federation/v1/get_missing_events/{room_id}");
+        // `room_id` goes in a path segment. ruma's `RoomId` localpart is not
+        // URL-validated (it may contain `/`, `?`, `#`), so push it through
+        // `Url` rather than `format!` to percent-encode it. v12 room ids are
+        // url-safe-base64 in practice, but don't rely on that here.
+        // No trailing slash on the base: `path_segments_mut().push()` appends a
+        // segment, so a trailing slash would yield an empty segment + double
+        // slash (`…/get_missing_events//{room}`).
+        let mut url = reqwest::Url::parse(&format!(
+            "http://{dest}/_matrix/federation/v1/get_missing_events"
+        ))
+        .map_err(|_| FederationClientError::InvalidUrl)?;
+        url.path_segments_mut()
+            .map_err(|()| FederationClientError::InvalidUrl)?
+            .push(room_id.as_str());
+
         let body = MissingEventsRequest {
             earliest_events: earliest,
             latest_events: latest,
             limit,
         };
-        let resp = self.http.post(&url).json(&body).send().await?;
+        let resp = self.http.post(url).json(&body).send().await?;
         if !resp.status().is_success() {
             return Err(FederationClientError::Status(resp.status().as_u16()));
         }
-        Ok(resp.json::<MissingEventsResponse>().await?.events)
+        Ok(resp
+            .json::<get_missing_events::ResponseBody>()
+            .await?
+            .events)
     }
 }
 
@@ -130,16 +165,6 @@ impl TxnIdGen {
     }
 }
 
-/// Milliseconds since the Unix epoch, saturating to 0 if the clock is before
-/// it (never panics — no `unwrap` on `SystemTime`).
-fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// Outbound transaction body. Borrows everything — no clones on the send path.
 #[derive(Serialize)]
 struct TransactionRequest<'a> {
@@ -157,13 +182,6 @@ struct MissingEventsRequest<'a> {
     earliest_events: &'a [OwnedEventId],
     latest_events: &'a [OwnedEventId],
     limit: u32,
-}
-
-/// `/get_missing_events` response body — just the `events` array.
-#[derive(Deserialize)]
-struct MissingEventsResponse {
-    #[serde(default)]
-    events: Vec<Box<RawJsonValue>>,
 }
 
 #[cfg(test)]
@@ -215,9 +233,9 @@ mod tests {
         let dest = spawn_stub(app).await;
 
         let client = FederationClient::new("local.test".to_owned());
-        let pdu = raw(r#"{"hello":"world"}"#);
+        let pdus = [raw(r#"{"n":1}"#), raw(r#"{"n":2}"#)];
         client
-            .send_transaction(&dest, "txn-1", std::slice::from_ref(&pdu))
+            .send_transaction(&dest, "txn-1", &pdus)
             .await
             .unwrap();
 
@@ -228,9 +246,12 @@ mod tests {
             .expect("stub got a request");
         assert_eq!(txn, "txn-1");
         assert_eq!(body["origin"], "local.test");
-        assert_eq!(body["pdus"][0]["hello"], "world");
+        // PDU order is preserved on the wire.
+        assert_eq!(body["pdus"][0]["n"], 1);
+        assert_eq!(body["pdus"][1]["n"], 2);
         assert!(body["edus"].as_array().unwrap().is_empty());
-        assert!(body["origin_server_ts"].is_number());
+        // A real (non-saturated) timestamp, not the pre-epoch floor.
+        assert!(body["origin_server_ts"].as_u64().unwrap() > 0);
     }
 
     #[tokio::test]
@@ -278,7 +299,14 @@ mod tests {
             .get_missing_events(&dest, &room, &latest, &earliest, 5)
             .await
             .unwrap();
+        // Count, content, and order (oldest-first) all preserved.
         assert_eq!(events.len(), 2);
+        let parsed: Vec<Value> = events
+            .iter()
+            .map(|e| serde_json::from_str(e.get()).unwrap())
+            .collect();
+        assert_eq!(parsed[0]["a"], 1);
+        assert_eq!(parsed[1]["b"], 2);
 
         let (room_in, body) = captured
             .lock()
@@ -317,5 +345,116 @@ mod tests {
         assert_eq!(g.next_id(), "42-0");
         assert_eq!(g.next_id(), "42-1");
         assert_eq!(g.next_id(), "42-2");
+    }
+
+    #[test]
+    fn txn_id_gen_concurrent_ids_are_unique() {
+        use std::collections::HashSet;
+        // The whole point of the `AtomicU64` is concurrent senders; pin it.
+        let idgen = Arc::new(TxnIdGen::new(7));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let g = idgen.clone();
+                std::thread::spawn(move || (0..1000).map(|_| g.next_id()).collect::<Vec<_>>())
+            })
+            .collect();
+        let mut all = HashSet::new();
+        for h in handles {
+            for id in h.join().unwrap() {
+                assert!(all.insert(id), "duplicate txn id under concurrency");
+            }
+        }
+        assert_eq!(all.len(), 8 * 1000);
+    }
+
+    #[tokio::test]
+    async fn send_transaction_connection_refused_is_transport_error() {
+        // Bind then drop to get a port nothing is listening on → connect fails.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let dest: OwnedServerName = format!("127.0.0.1:{port}").parse().unwrap();
+
+        let client = FederationClient::new("local.test".to_owned());
+        let pdu = raw("{}");
+        let err = client
+            .send_transaction(&dest, "t", std::slice::from_ref(&pdu))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FederationClientError::Transport(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_missing_events_empty_body_yields_empty_vec() {
+        // A 2xx `{}` (no `events` key) decodes to an empty vec via
+        // `#[serde(default)]` — "the peer gave us nothing new".
+        let app = Router::new().route(
+            "/_matrix/federation/v1/get_missing_events/{room}",
+            post(|| async { Json(json!({})) }),
+        );
+        let dest = spawn_stub(app).await;
+
+        let client = FederationClient::new("local.test".to_owned());
+        let room: OwnedRoomId = room_id!("!room:example.org").to_owned();
+        let events = client
+            .get_missing_events(&dest, &room, &[], &[], 10)
+            .await
+            .unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_missing_events_malformed_body_is_transport_error() {
+        // A 2xx with a non-JSON body fails to deserialize → `Transport`.
+        let app = Router::new().route(
+            "/_matrix/federation/v1/get_missing_events/{room}",
+            post(|| async { "not json at all" }),
+        );
+        let dest = spawn_stub(app).await;
+
+        let client = FederationClient::new("local.test".to_owned());
+        let room: OwnedRoomId = room_id!("!room:example.org").to_owned();
+        let err = client
+            .get_missing_events(&dest, &room, &[], &[], 10)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FederationClientError::Transport(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// The client's serialized request bodies must satisfy the *real* inbound
+    /// parsers — the lax `Json<Value>` stubs above can't catch field-name drift
+    /// between the two federation halves, but this does.
+    #[test]
+    fn outbound_bodies_round_trip_through_inbound_parsers() {
+        use crate::federation::get_missing_events::RequestBody;
+        use crate::federation::send::TransactionBody;
+
+        let pdu = raw(r#"{"type":"m.room.message"}"#);
+        let txn = TransactionRequest {
+            origin: "local.test",
+            origin_server_ts: 12345,
+            pdus: std::slice::from_ref(&pdu),
+            edus: &[],
+        };
+        let txn_json = serde_json::to_value(&txn).unwrap();
+        let _: TransactionBody =
+            serde_json::from_value(txn_json).expect("inbound /send parses the client's body");
+
+        let latest = vec![event_id!("$l:example.org").to_owned()];
+        let earliest = vec![event_id!("$e:example.org").to_owned()];
+        let req = MissingEventsRequest {
+            earliest_events: &earliest,
+            latest_events: &latest,
+            limit: 7,
+        };
+        let req_json = serde_json::to_value(&req).unwrap();
+        let _: RequestBody = serde_json::from_value(req_json)
+            .expect("inbound /get_missing_events parses the client's body");
     }
 }
