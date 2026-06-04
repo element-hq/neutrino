@@ -11,8 +11,6 @@
 //! no X-Matrix auth, no signature verification, no history-visibility /
 //! redaction filtering.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use axum::{
     Json,
     extract::{Path, RawQuery, State},
@@ -132,14 +130,9 @@ pub(crate) async fn handle(
         .map(|e| e.raw)
         .collect();
 
-    let origin_server_ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
     Ok(Json(ResponseBody {
         origin,
-        origin_server_ts,
+        origin_server_ts: crate::federation::now_ms(),
         pdus,
     }))
 }

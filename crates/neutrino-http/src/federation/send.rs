@@ -77,7 +77,7 @@ const MAX_GAPFILL_ROUNDS: u32 = 10;
 /// unpublished sub-crate. Mirrors the wire-verbatim approach already used by
 /// `backfill.rs` / `get_missing_events.rs`: PDUs are opaque `RawValue`s.
 #[derive(Deserialize)]
-struct TransactionBody {
+pub(crate) struct TransactionBody {
     /// The sending server's name. Trusted at face value (no X-Matrix auth) and
     /// used only for transaction deduplication + as the gap-fill fetch target.
     origin: OwnedServerName,
