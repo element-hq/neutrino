@@ -38,6 +38,8 @@ mod sliding_sync;
 #[cfg(feature = "multi-user-shim")]
 mod multi_user;
 
+use federation::client::{FederationClient, ReqwestFetcher};
+use federation::send::MissingEventsFetcher;
 use room_actor::{RoomActorError, RoomRegistry};
 use sliding_sync::{SyncError, SyncState};
 
@@ -46,6 +48,11 @@ struct App {
     /// Per-room state-machine actors. CSAPI writes go through here so they
     /// are DAG-linked, auth-checked, and state-resolved.
     room_registry: Arc<RoomRegistry>,
+    /// Closes a received PDU's missing state-DAG ancestry by fetching it from
+    /// the originating peer (inbound `/send` gap-fill). Production wraps the
+    /// reqwest [`FederationClient`]; tests inject a stub via
+    /// [`AppState::from_store_with_fetcher`].
+    fetcher: Arc<dyn MissingEventsFetcher>,
     sync_state: Arc<SyncState<SqliteStore>>,
     keys: Option<Value>,
     config: Config,
@@ -150,11 +157,32 @@ impl AppState {
     /// CSAPI write path. The caller passes the tempfile guard so the file
     /// stays alive for the lifetime of the router.
     fn from_store(config: Config, store: Arc<SqliteStore>, tempfile: NamedTempFile) -> Self {
+        // Production gap-fill fetcher: a reqwest client resolving peers as
+        // `http://{server_name}` (trusted mesh). Built here rather than shared
+        // with the sender pool — a second connection pool is cheap, and sharing
+        // would add a `FederationClient` field on `App` that the fetcher is
+        // derivable from. The two clients also target different peer sets
+        // (inbound gap-fill origins vs outbound destinations).
+        let client = Arc::new(FederationClient::new(config.server_name.clone()));
+        let fetcher: Arc<dyn MissingEventsFetcher> = Arc::new(ReqwestFetcher::new(client));
+        Self::from_store_with_fetcher(config, store, tempfile, fetcher)
+    }
+
+    /// Like [`AppState::from_store`] but with an explicit gap-fill `fetcher`.
+    /// The federation gap-fill tests inject a deterministic stub here instead
+    /// of the reqwest client (which would otherwise reach the network).
+    fn from_store_with_fetcher(
+        config: Config,
+        store: Arc<SqliteStore>,
+        tempfile: NamedTempFile,
+        fetcher: Arc<dyn MissingEventsFetcher>,
+    ) -> Self {
         let sync_state = Arc::new(SyncState::new(store.clone()));
         let room_registry = Arc::new(RoomRegistry::new(store.clone(), config.server_name.clone()));
         let app = App {
             store,
             room_registry,
+            fetcher,
             sync_state,
             keys: None,
             config,
@@ -220,6 +248,21 @@ pub(crate) fn router_with_store(
     tempfile: NamedTempFile,
 ) -> Router {
     let state = AppState::from_store(config, store, tempfile);
+    build_router(state)
+}
+
+/// Like [`router_with_store`] but with an injected gap-fill `fetcher`. The
+/// inbound `/send` gap-fill tests use this to supply a deterministic
+/// [`MissingEventsFetcher`] stub (the default reqwest fetcher would reach the
+/// network for an unreachable test `origin`).
+#[cfg(test)]
+pub(crate) fn router_with_store_and_fetcher(
+    config: Config,
+    store: Arc<SqliteStore>,
+    tempfile: NamedTempFile,
+    fetcher: Arc<dyn MissingEventsFetcher>,
+) -> Router {
+    let state = AppState::from_store_with_fetcher(config, store, tempfile, fetcher);
     build_router(state)
 }
 

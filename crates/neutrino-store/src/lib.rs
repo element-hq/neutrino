@@ -6,6 +6,7 @@ use ruma::{
     EventId, OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, RoomVersionId,
     ServerName, UserId,
 };
+use serde_json::value::RawValue as RawJsonValue;
 use thiserror::Error;
 use tokio::sync::watch;
 
@@ -319,25 +320,96 @@ pub trait DagStore: Send + Sync {
     ///       `earliest` need not exist; unknown IDs in `latest` contribute
     ///       no parents to expand (empty edges row), unknown IDs in
     ///       `earliest` are no-ops on the walk.
-    /// Post: walks `prev_events` backward starting from the *parents* of each
-    ///       event in `latest`, skipping any event in `earliest ∪ latest`;
-    ///       returns at most `limit` events in reverse-chronological order
-    ///       (newest `origin_server_ts` first, ties by ascending `event_id` —
-    ///       the same priority-queue walk as `events_before`). **The events
-    ///       in `latest` themselves are never included in the result** — they
-    ///       are the boundary the requester already has. The events in
-    ///       `earliest` are likewise never included. Events in other
-    ///       rooms (cross-room seeds or corrupt `event_edges`) are
-    ///       treated as if they don't exist — the walk terminates at the
-    ///       boundary rather than leaking PDUs from another room.
-    ///       Mirrors Synapse's `_get_missing_events`.
+    /// Post: walks backward starting from the *parents* of each event in
+    ///       `latest`, skipping any event in `earliest ∪ latest`; returns at
+    ///       most `limit` events in reverse-chronological order (newest
+    ///       `origin_server_ts` first, ties by ascending `event_id` — the same
+    ///       priority-queue walk as `events_before`). **The events in `latest`
+    ///       themselves are never included in the result** — they are the
+    ///       boundary the requester already has. The events in `earliest` are
+    ///       likewise never included. Events in other rooms (cross-room seeds
+    ///       or corrupt `event_edges`) are treated as if they don't exist — the
+    ///       walk terminates at the boundary rather than leaking PDUs from
+    ///       another room. Mirrors Synapse's `_get_missing_events`.
+    ///
+    /// `state_dag` selects which edge kind to walk (MSC4242 `/get_missing_events`
+    /// `state_dag` flag): `false` walks `prev_events` (timeline DAG), `true`
+    /// walks `prev_state_events` (the state DAG — the ancestry that
+    /// `RoomCore::apply_pdu` requires to auth a PDU).
     async fn missing_events(
         &self,
         room_id: &RoomId,
         latest: &[&EventId],
         earliest: &[&EventId],
         limit: usize,
+        state_dag: bool,
     ) -> Result<Vec<Event>, StorageError>;
+}
+
+/// The result of [`StagingStore::ancestry_gap`] — a snapshot of one PDU's
+/// state-DAG ancestry split into what is still missing versus what is already
+/// cached in the staging area.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AncestryGap {
+    /// `prev_state_events` ids reachable from the query heads that are present
+    /// in NEITHER the committed `events` NOR the staging area — the still-
+    /// missing frontier to fetch from a peer. Empty ⇒ the heads' state
+    /// ancestry is fully grounded (staged ∪ committed) and can be promoted.
+    pub missing: Vec<OwnedEventId>,
+    /// Staged event ids reachable from the query heads via `prev_state_events`
+    /// (a staged head counts itself) — the cached ancestry to promote once
+    /// `missing` is empty, and the boundary to exclude from the next peer
+    /// fetch so we re-request only the frontier. Unordered.
+    pub staged: Vec<OwnedEventId>,
+}
+
+/// Pre-auth staging of federation ancestry fetched while gap-filling a
+/// received PDU's state DAG.
+///
+/// Events staged here are NOT authorised and MUST NOT be given a stream
+/// position or surface in any read / state-res path — promotion through the
+/// per-room actor (which auths, resolves, and persists) is the only way they
+/// become real. See the `staged_events` table comment in `schema.sql`.
+#[async_trait]
+pub trait StagingStore: Send + Sync {
+    /// Pre:  `raw` is the canonical post-`from_wire` bytes whose reference hash
+    ///       is `event_id` (so id ↔ bytes round-trip), and `room_id` matches.
+    /// Post: `(event_id, room_id, raw)` is recorded in the staging area;
+    ///       idempotent — re-staging the same id is a no-op (a peer may resend
+    ///       ancestry across gap-fill rounds). Does NOT advance the `subscribe`
+    ///       watch (staged events are invisible).
+    async fn stage_event(
+        &self,
+        room_id: &RoomId,
+        event_id: &EventId,
+        raw: &RawJsonValue,
+    ) -> Result<(), StorageError>;
+
+    /// Pre:  none (`heads` need not exist).
+    /// Post: walks `prev_state_events` back from `heads` through staged events
+    ///       (a committed `events` row is a grounded boundary and is not
+    ///       expanded), returning an [`AncestryGap`]: `missing` = reachable ids
+    ///       in neither table, `staged` = reachable ids currently staged. The
+    ///       walk is scoped to `room_id`.
+    async fn ancestry_gap(
+        &self,
+        room_id: &RoomId,
+        heads: &[&EventId],
+    ) -> Result<AncestryGap, StorageError>;
+
+    /// Pre:  none.
+    /// Post: returns the staged raw bytes for each id in `event_ids` that is
+    ///       currently staged, in unspecified order; ids not staged are
+    ///       omitted (result length may be < `event_ids.len()`).
+    async fn staged_raw(
+        &self,
+        event_ids: &[&EventId],
+    ) -> Result<Vec<Box<RawJsonValue>>, StorageError>;
+
+    /// Pre:  none.
+    /// Post: deletes the matching staged rows; idempotent — ids not present are
+    ///       ignored. Called after a staged subgraph has been promoted.
+    async fn unstage_events(&self, event_ids: &[&EventId]) -> Result<(), StorageError>;
 }
 
 #[async_trait]
@@ -388,11 +460,17 @@ pub trait FederationInbox: Send + Sync {
 
 /// Combined storage interface. Use as a generic bound: `S: StorageBackend`.
 pub trait StorageBackend:
-    RoomStore + EventStore + StateStore + DagStore + FederationOutbox + FederationInbox
+    RoomStore + EventStore + StateStore + DagStore + FederationOutbox + FederationInbox + StagingStore
 {
 }
 
 impl<T> StorageBackend for T where
-    T: RoomStore + EventStore + StateStore + DagStore + FederationOutbox + FederationInbox
+    T: RoomStore
+        + EventStore
+        + StateStore
+        + DagStore
+        + FederationOutbox
+        + FederationInbox
+        + StagingStore
 {
 }

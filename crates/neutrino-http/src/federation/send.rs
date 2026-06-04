@@ -25,23 +25,26 @@
 //! ## Gap-filling
 //!
 //! `apply_pdu` returns a *retryable* [`CoreError`](neutrino_state::CoreError)
-//! when an event's ancestry (a `prev_state_events` entry / auth-chain link) is
-//! absent from the store. Under MSC4242 the completeness condition is
-//! structural: the state DAG must walk back to `m.room.create`. That is exactly
-//! what makes `apply_pdu` succeed vs. return retryable, so we loop:
+//! when an event's `prev_state_events` ancestry (the auth-relevant state DAG,
+//! MSC4242) doesn't reach `m.room.create` in our store. We must *authorise*
+//! every PDU — concurrency reorders operations, so even a trusted peer's event
+//! can be invalid by DAG position — and an un-vetted event must never get a
+//! stream position or surface in any read / state-res path. So fetched ancestry
+//! is parked in a pre-auth staging cache rather than persisted as history, then
+//! promoted through the actor (which auths it) only once it is grounded. See
+//! [`apply_with_gapfill`] for the loop:
 //!
-//! 1. **Success** — `apply_pdu` → `Ok`: the closure to create resolved.
-//! 2. **No progress** — a fetch round yields zero new events ⇒ the gap is
-//!    unfillable ⇒ that PDU gets an `error`, others still commit.
-//! 3. **Safety bound** — [`MAX_GAPFILL_ROUNDS`] caps the loop against a buggy
-//!    peer feeding an unbounded chain.
+//! 1. **Fetch** the missing frontier into staging, walking `events ∪
+//!    staged_events` over `prev_state_events` to ask the peer (`state_dag: true`)
+//!    only for what we still lack ([`fill_state_ancestry`]).
+//! 2. **Promote** the now-grounded staged subgraph through the actor
+//!    ([`promote_staged_ancestry`]) — auth + stream positions happen here.
+//! 3. **Re-apply** the PDU against its committed ancestry.
 //!
-//! The outbound fetch ([`MissingEventsFetcher`]) needs an HTTP client +
-//! server-name resolution (the deferred outbound-federation work), so it is
-//! behind a trait. Until that lands the wired impl is [`NoFetcher`], which
-//! always reports "no progress" — so a transaction whose PDUs arrive with
-//! complete ancestry (the common in-order case) is handled end-to-end today,
-//! and the reqwest-backed fetcher drops in later with no handler change.
+//! The fetch is behind a [`MissingEventsFetcher`] trait
+//! ([`crate::federation::client::ReqwestFetcher`] in production; a stub in
+//! tests), held on `AppState`. A transaction whose PDUs arrive with complete
+//! ancestry (the common in-order case) skips all of this on the fast path.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -51,12 +54,13 @@ use axum::{
 };
 use neutrino_common::Event;
 use neutrino_state::event_id::from_wire;
-use neutrino_store::{EventStore, FederationInbox, RoomStore};
-use ruma::{OwnedEventId, OwnedServerName, RoomId, ServerName};
+use neutrino_store::{FederationInbox, RoomStore, StagingStore};
+use ruma::{EventId, OwnedEventId, OwnedServerName, RoomId, ServerName};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 
 use crate::federation::FedError;
+use crate::federation::client::FederationClientError;
 use crate::room_actor::{RoomActorError, RoomRegistry};
 use crate::{AppState, lock_app};
 
@@ -124,9 +128,13 @@ pub(crate) async fn handle(
         return Err(FedError::BadRequest("transaction exceeds 50 PDUs"));
     }
 
-    let (store, registry) = {
+    let (store, registry, fetcher) = {
         let app = lock_app(&state);
-        (app.store.clone(), app.room_registry.clone())
+        (
+            app.store.clone(),
+            app.room_registry.clone(),
+            app.fetcher.clone(),
+        )
     };
 
     // Transaction-level idempotency: a re-sent transaction is acknowledged
@@ -144,7 +152,6 @@ pub(crate) async fn handle(
     }
 
     let mut pdus = BTreeMap::new();
-    let fetcher = NoFetcher;
 
     // Parse every PDU up front. `from_wire` derives the event_id from the
     // reference hash, so a PDU that fails it is unkeyable (malformed, or no
@@ -170,7 +177,7 @@ pub(crate) async fn handle(
     for event in toposort(parsed) {
         let id = event.event_id.to_string();
         let result =
-            match apply_with_gapfill(&registry, &store, &body.origin, event, &fetcher).await {
+            match apply_with_gapfill(&registry, &store, &body.origin, event, &*fetcher).await {
                 Ok(()) => PduResult::default(),
                 Err(error) => PduResult { error: Some(error) },
             };
@@ -180,13 +187,33 @@ pub(crate) async fn handle(
     Ok(Json(ResponseBody { pdus }))
 }
 
-/// Integrate one PDU, gap-filling missing ancestry on a retryable verdict.
+/// Integrate one PDU, gap-filling missing *state-DAG* ancestry on a retryable
+/// verdict.
 ///
-/// Returns `Ok(())` for any terminal *integration* outcome — accepted,
-/// soft-failed, rejected, or idempotent re-delivery — since `apply_pdu` already
-/// persists rejects (federation policy). Returns `Err(reason)` only when the
-/// PDU could not be evaluated: an unfillable ancestry gap, an unknown room, a
-/// malformed/misrouted event (non-retryable `CoreError`), or a storage fault.
+/// `apply_pdu` returns retryable when `event`'s `prev_state_events` ancestry
+/// (the auth-relevant DAG, MSC4242) doesn't reach `m.room.create` in our store.
+/// We fill it through a pre-auth staging cache rather than persisting ancestry
+/// as committed history: events fetched from a peer are NOT yet authorised
+/// (concurrency reorders operations, so a trusted peer's event can still be
+/// invalid by DAG position), and an un-vetted event must never get a stream
+/// position or surface in any read / state-res path. So:
+///
+/// 1. **Fetch** the missing ancestry into staging ([`fill_state_ancestry`]):
+///    walk `events ∪ staged_events` via `prev_state_events` to find the still-
+///    missing frontier, ask the peer (`state_dag: true`) only for that, repeat
+///    until grounded. The peer is told to skip what we've staged so each round
+///    requests only the new frontier.
+/// 2. **Promote** ([`promote_staged_ancestry`]): once grounded, apply the staged
+///    subgraph through the per-room actor oldest-first — auth, state-res, and
+///    stream positions happen here — then unstage it.
+/// 3. **Re-apply** `event` against its now-committed ancestry.
+///
+/// Returns `Ok(())` for any terminal *integration* outcome of `event` —
+/// accepted, soft-failed, rejected, or idempotent re-delivery (`apply_pdu`
+/// persists rejects per federation policy). Returns `Err(reason)` when the PDU
+/// could not be evaluated: an unfillable gap, a peer fetch failure, an unknown
+/// room, a malformed/misrouted event, or a storage fault. Staged ancestry from
+/// a failed round is left durable — a later inbound retry resumes from it.
 async fn apply_with_gapfill<F: MissingEventsFetcher + ?Sized>(
     registry: &RoomRegistry,
     store: &neutrino_store_sqlite::SqliteStore,
@@ -195,60 +222,173 @@ async fn apply_with_gapfill<F: MissingEventsFetcher + ?Sized>(
     fetcher: &F,
 ) -> Result<(), String> {
     let room_id = event.room_id.clone();
+
+    // Fast path: ancestry already present (the common in-order case).
+    match registry.apply_pdu(&room_id, event.clone()).await {
+        Ok(()) => return Ok(()),
+        Err(RoomActorError::Apply(e)) if e.is_retryable() => { /* gap-fill below */ }
+        Err(RoomActorError::Apply(e)) => return Err(e.to_string()),
+        Err(RoomActorError::UnknownRoom) => return Err("unknown room".to_owned()),
+        Err(other) => return Err(other.to_string()),
+    }
+
+    fill_state_ancestry(store, origin, &event, fetcher).await?;
+    promote_staged_ancestry(registry, store, &event).await?;
+
+    // Ancestry committed: a fresh apply now evaluates `event` for real.
+    match registry.apply_pdu(&room_id, event).await {
+        Ok(()) => Ok(()),
+        Err(RoomActorError::Apply(e)) => Err(e.to_string()),
+        Err(RoomActorError::UnknownRoom) => Err("unknown room".to_owned()),
+        Err(other) => Err(other.to_string()),
+    }
+}
+
+/// Fetch `event`'s missing state-DAG ancestry into the staging cache until it
+/// is grounded (every `prev_state_events` path reaches an event we hold).
+///
+/// Each round recomputes the gap over `events ∪ staged_events`; an empty
+/// `missing` frontier means done. Otherwise we ask the peer, passing
+/// `latest = event + the staged frontier` (so the peer walks down *through*
+/// what we've cached without re-sending it) and `earliest = our state-DAG
+/// forward extremities` (the committed bottom boundary). `Ok(empty)` ⇒ the peer
+/// has nothing new ⇒ unfillable; `Err` ⇒ peer unreachable/erred. Both are
+/// terminal for this attempt (no in-request retry — inbound `/send` stays
+/// synchronous; a federation resend re-enters here and resumes from staging).
+async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
+    store: &neutrino_store_sqlite::SqliteStore,
+    origin: &ServerName,
+    event: &Event,
+    fetcher: &F,
+) -> Result<(), String> {
+    let room_id = &event.room_id;
+    let heads: Vec<&EventId> = event.prev_state_events.iter().map(|e| e.as_ref()).collect();
+    let earliest = state_dag_boundary(store, room_id).await;
     let mut rounds = 0u32;
     let mut limit = INITIAL_GAPFILL_LIMIT;
 
     loop {
-        match registry.apply_pdu(&room_id, event.clone()).await {
-            // (1) Success: closure to create resolved (or idempotent no-op).
-            Ok(()) => return Ok(()),
-            Err(RoomActorError::Apply(e)) if e.is_retryable() => {
-                // (3) Safety bound.
-                if rounds >= MAX_GAPFILL_ROUNDS {
-                    return Err(format!("gap-fill exhausted after {rounds} rounds: {e}"));
-                }
-                rounds += 1;
+        let gap = store
+            .ancestry_gap(room_id, &heads)
+            .await
+            .map_err(|e| e.to_string())?;
+        if gap.missing.is_empty() {
+            return Ok(());
+        }
+        if rounds >= MAX_GAPFILL_ROUNDS {
+            return Err(format!(
+                "gap-fill exhausted after {rounds} rounds; {} ancestry event(s) still missing",
+                gap.missing.len()
+            ));
+        }
+        rounds += 1;
 
-                let earliest = known_boundary(store, &room_id).await;
-                let want = vec![event.event_id.clone()];
-                let fetched = fetcher
-                    .fetch(origin, &room_id, &want, &earliest, limit)
-                    .await;
+        // `latest` = the event plus the staged boundary. The peer excludes
+        // these from its result but walks *through* them, so it returns only
+        // the frontier below our cache — the "ask for 1-4, not 5-99" property.
+        let mut latest = Vec::with_capacity(gap.staged.len() + 1);
+        latest.push(event.event_id.clone());
+        latest.extend(gap.staged);
 
-                // (2) No progress: the peer can't close the gap.
-                if fetched.is_empty() {
-                    return Err(format!("missing ancestry, gap unfillable: {e}"));
-                }
-
-                // Persist fetched ancestry as historical context so the next
-                // apply's auth-chain walk resolves it. (These are not
-                // auth-checked here — trusted-mesh posture, same as
-                // `/get_missing_events`/`/backfill`.)
+        match fetcher
+            .fetch(origin, room_id, &latest, &earliest, limit)
+            .await
+        {
+            Ok(fetched) if fetched.is_empty() => {
+                return Err("missing ancestry, gap unfillable: peer returned no events".to_owned());
+            }
+            Ok(fetched) => {
+                // Stage under each event's *computed* id (`from_wire` derives it
+                // from the reference hash and yields canonical bytes, so id ↔
+                // bytes round-trip). An unkeyable PDU is dropped. A peer can
+                // return events for any room; only stage ones in *this* room —
+                // a foreign-room event is never reachable by this room's
+                // `ancestry_gap` walk, so staging it would be unreachable junk
+                // that nothing ever promotes or prunes.
                 for raw in fetched {
                     if let Ok(ancestor) = from_wire(raw, Vec::new()) {
-                        let _ = store.persist_historical_event(&ancestor).await;
+                        if ancestor.room_id != *room_id {
+                            continue;
+                        }
+                        store
+                            .stage_event(room_id, &ancestor.event_id, &ancestor.raw)
+                            .await
+                            .map_err(|e| e.to_string())?;
                     }
                 }
                 limit = limit.saturating_mul(2);
             }
-            // DROP (non-retryable CoreError: malformed / misrouted), or we
-            // simply don't have the room — neither is fillable here.
+            Err(e) => return Err(format!("peer fetch failed: {e}")),
+        }
+    }
+}
+
+/// Promote `event`'s now-grounded staged ancestry through the actor, then drop
+/// it from staging.
+///
+/// The staged subgraph is applied oldest-first (toposorted by
+/// `prev_events ∪ prev_state_events`) so each event's ancestry is committed
+/// before it. `apply_pdu` is the authority — it auths, resolves, mints the
+/// stream position, and persists (accept *or* reject, per federation policy);
+/// each event is unstaged only after it commits. A retryable verdict here means
+/// the ancestry is still incomplete (a deeper gap or concurrent change) — bail
+/// and leave the remainder staged for a later retry.
+async fn promote_staged_ancestry(
+    registry: &RoomRegistry,
+    store: &neutrino_store_sqlite::SqliteStore,
+    event: &Event,
+) -> Result<(), String> {
+    let room_id = &event.room_id;
+    let heads: Vec<&EventId> = event.prev_state_events.iter().map(|e| e.as_ref()).collect();
+    let gap = store
+        .ancestry_gap(room_id, &heads)
+        .await
+        .map_err(|e| e.to_string())?;
+    if gap.staged.is_empty() {
+        // Nothing was fetched — `event`'s ancestry was already committed (the
+        // retryable verdict was a transient lookup fault, not a real gap).
+        return Ok(());
+    }
+
+    let staged_refs: Vec<&EventId> = gap.staged.iter().map(|e| e.as_ref()).collect();
+    let raws = store
+        .staged_raw(&staged_refs)
+        .await
+        .map_err(|e| e.to_string())?;
+    let ancestors: Vec<Event> = raws
+        .into_iter()
+        .filter_map(|raw| from_wire(raw, Vec::new()).ok())
+        .collect();
+
+    for ancestor in toposort(ancestors) {
+        let id = ancestor.event_id.clone();
+        match registry.apply_pdu(room_id, ancestor).await {
+            Ok(()) => {
+                store
+                    .unstage_events(&[id.as_ref()])
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Err(RoomActorError::Apply(e)) if e.is_retryable() => {
+                return Err(format!("promotion stalled, ancestry incomplete: {e}"));
+            }
             Err(RoomActorError::Apply(e)) => return Err(e.to_string()),
             Err(RoomActorError::UnknownRoom) => return Err("unknown room".to_owned()),
             Err(other) => return Err(other.to_string()),
         }
     }
+    Ok(())
 }
 
-/// The events we already have, used as the gap-fill walk boundary
-/// (`earliest_events`). Best-effort: the room's timeline forward extremities,
-/// or empty if the room is unknown / the lookup faults.
-async fn known_boundary(
+/// The room's state-DAG forward extremities — the committed bottom boundary
+/// (`earliest_events`) for a state-DAG gap-fill walk. Best-effort: empty if the
+/// room is unknown or the lookup faults.
+async fn state_dag_boundary(
     store: &neutrino_store_sqlite::SqliteStore,
     room_id: &RoomId,
 ) -> Vec<OwnedEventId> {
     match store.forward_extremities(room_id).await {
-        Ok(Some((timeline, _state))) => timeline.into_iter().collect(),
+        Ok(Some((_timeline, state))) => state.into_iter().collect(),
         _ => Vec::new(),
     }
 }
@@ -306,16 +446,17 @@ fn toposort(events: Vec<Event>) -> Vec<Event> {
     order.into_iter().filter_map(|i| slots[i].take()).collect()
 }
 
-/// Fetches missing ancestry from a peer to close a state-DAG gap.
-///
-/// The real impl (reqwest `POST origin/_matrix/federation/v1/get_missing_events`
-/// with `state_dag: true`) lands with the outbound-federation work; until then
-/// [`NoFetcher`] is wired in and every retryable PDU resolves to "no progress".
+/// Fetches missing state-DAG ancestry from a peer to close a gap, via
+/// `POST origin/_matrix/federation/v1/get_missing_events` with `state_dag: true`
+/// (MSC4242). The production impl is
+/// [`crate::federation::client::ReqwestFetcher`]; tests inject a stub. Held on
+/// `AppState` as an `Arc<dyn MissingEventsFetcher>`.
 #[async_trait::async_trait]
 pub(crate) trait MissingEventsFetcher: Send + Sync {
     /// Walk back from `latest` (stopping at `earliest`) up to `limit` events,
-    /// returning opaque PDU bytes oldest-first. An empty result means the peer
-    /// gave us nothing new — the caller treats that as an unfillable gap.
+    /// returning opaque PDU bytes oldest-first. `Ok(empty)` means the peer gave
+    /// us nothing new (the caller treats it as an unfillable gap); `Err` is a
+    /// transport/HTTP failure reaching the peer.
     async fn fetch(
         &self,
         origin: &ServerName,
@@ -323,23 +464,5 @@ pub(crate) trait MissingEventsFetcher: Send + Sync {
         latest: &[OwnedEventId],
         earliest: &[OwnedEventId],
         limit: u32,
-    ) -> Vec<Box<RawJsonValue>>;
-}
-
-/// No-op fetcher: never fills a gap. The wired impl until the outbound HTTP
-/// client lands.
-pub(crate) struct NoFetcher;
-
-#[async_trait::async_trait]
-impl MissingEventsFetcher for NoFetcher {
-    async fn fetch(
-        &self,
-        _origin: &ServerName,
-        _room_id: &RoomId,
-        _latest: &[OwnedEventId],
-        _earliest: &[OwnedEventId],
-        _limit: u32,
-    ) -> Vec<Box<RawJsonValue>> {
-        Vec::new()
-    }
+    ) -> Result<Vec<Box<RawJsonValue>>, FederationClientError>;
 }

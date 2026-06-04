@@ -11,6 +11,7 @@
 //!
 //! Consumed by the per-destination sender pool (`federation::sender`).
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ use ruma::{OwnedEventId, RoomId, ServerName};
 use serde::Serialize;
 use serde_json::value::RawValue as RawJsonValue;
 
+use crate::federation::send::MissingEventsFetcher;
 use crate::federation::{get_missing_events, now_ms};
 
 /// Connection-establishment timeout for a federation request.
@@ -42,9 +44,6 @@ pub(crate) enum FederationClientError {
     /// The target URL could not be built from the destination + room id.
     /// Unreachable for a validated `ServerName` + a base `http://` URL, but
     /// surfaced rather than panicked on.
-    // TODO(PR4): only constructed by `get_missing_events`, which the reqwest
-    // `MissingEventsFetcher` will consume.
-    #[allow(dead_code)]
     #[error("could not build federation URL")]
     InvalidUrl,
 }
@@ -104,9 +103,10 @@ impl FederationClient {
     /// to fetch ancestry between `earliest` (boundary already held) and
     /// `latest` (heads to walk back from), up to `limit` events. Returns the
     /// peer's `events` array (oldest-first), opaque PDU bytes.
-    // TODO(PR4): consumed by the reqwest `MissingEventsFetcher` replacing
-    // `NoFetcher`; unused until then.
-    #[allow(dead_code)]
+    ///
+    /// `state_dag` (MSC4242) asks the peer to walk back via `prev_state_events`
+    /// rather than `prev_events`; the gap-fill fetcher sets it `true` to close
+    /// a received PDU's missing *state* ancestry.
     pub(crate) async fn get_missing_events(
         &self,
         dest: &ServerName,
@@ -114,6 +114,7 @@ impl FederationClient {
         latest: &[OwnedEventId],
         earliest: &[OwnedEventId],
         limit: u32,
+        state_dag: bool,
     ) -> Result<Vec<Box<RawJsonValue>>, FederationClientError> {
         // `room_id` goes in a path segment. ruma's `RoomId` localpart is not
         // URL-validated (it may contain `/`, `?`, `#`), so push it through
@@ -134,6 +135,7 @@ impl FederationClient {
             earliest_events: earliest,
             latest_events: latest,
             limit,
+            state_dag,
         };
         let resp = self.http.post(url).json(&body).send().await?;
         if !resp.status().is_success() {
@@ -143,6 +145,41 @@ impl FederationClient {
             .json::<get_missing_events::ResponseBody>()
             .await?
             .events)
+    }
+}
+
+/// The production [`MissingEventsFetcher`]: a thin adapter that closes a
+/// received PDU's missing state ancestry by asking the originating peer via
+/// [`FederationClient::get_missing_events`] with MSC4242 `state_dag: true`.
+/// Holds its own `FederationClient` (a separate reqwest pool from the sender
+/// pool's — see `AppState::from_store`: a second pool is cheap and avoids a
+/// derivable `App` field, and inbound-gap-fill origins differ from outbound
+/// destinations anyway).
+pub(crate) struct ReqwestFetcher {
+    client: Arc<FederationClient>,
+}
+
+impl ReqwestFetcher {
+    pub(crate) fn new(client: Arc<FederationClient>) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait::async_trait]
+impl MissingEventsFetcher for ReqwestFetcher {
+    async fn fetch(
+        &self,
+        origin: &ServerName,
+        room_id: &RoomId,
+        latest: &[OwnedEventId],
+        earliest: &[OwnedEventId],
+        limit: u32,
+    ) -> Result<Vec<Box<RawJsonValue>>, FederationClientError> {
+        // Gap-fill always walks the state DAG (the ancestry `apply_pdu`
+        // needs), so `state_dag` is fixed `true`.
+        self.client
+            .get_missing_events(origin, room_id, latest, earliest, limit, true)
+            .await
     }
 }
 
@@ -180,14 +217,15 @@ struct TransactionRequest<'a> {
 
 /// Outbound `/get_missing_events` request body. Mirrors the inbound
 /// `RequestBody` (`get_missing_events.rs`): `min_depth` is omitted (optional,
-/// and the peer ignores it).
-// TODO(PR4): constructed only by `get_missing_events`; unused until the fetcher.
-#[allow(dead_code)]
+/// and the peer ignores it). `state_dag` (MSC4242) is always sent by our one
+/// caller (the gap-fill fetcher) but is a field rather than hard-coded so the
+/// wire shape stays explicit.
 #[derive(Serialize)]
 struct MissingEventsRequest<'a> {
     earliest_events: &'a [OwnedEventId],
     latest_events: &'a [OwnedEventId],
     limit: u32,
+    state_dag: bool,
 }
 
 #[cfg(test)]
@@ -290,7 +328,7 @@ mod tests {
         let earliest = vec![event_id!("$early:example.org").to_owned()];
 
         let events = client
-            .get_missing_events(&dest, &room, &latest, &earliest, 5)
+            .get_missing_events(&dest, &room, &latest, &earliest, 5, true)
             .await
             .unwrap();
         // Count, content, and order (oldest-first) all preserved.
@@ -324,7 +362,7 @@ mod tests {
         let client = FederationClient::new("local.test".to_owned());
         let room: OwnedRoomId = room_id!("!room:example.org").to_owned();
         let err = client
-            .get_missing_events(&dest, &room, &[], &[], 10)
+            .get_missing_events(&dest, &room, &[], &[], 10, true)
             .await
             .unwrap_err();
         assert!(
@@ -391,7 +429,7 @@ mod tests {
         let client = FederationClient::new("local.test".to_owned());
         let room: OwnedRoomId = room_id!("!room:example.org").to_owned();
         let events = client
-            .get_missing_events(&dest, &room, &[], &[], 10)
+            .get_missing_events(&dest, &room, &[], &[], 10, true)
             .await
             .unwrap();
         assert!(events.is_empty());
@@ -409,7 +447,7 @@ mod tests {
         let client = FederationClient::new("local.test".to_owned());
         let room: OwnedRoomId = room_id!("!room:example.org").to_owned();
         let err = client
-            .get_missing_events(&dest, &room, &[], &[], 10)
+            .get_missing_events(&dest, &room, &[], &[], 10, true)
             .await
             .unwrap_err();
         assert!(
@@ -443,6 +481,7 @@ mod tests {
             earliest_events: &earliest,
             latest_events: &latest,
             limit: 7,
+            state_dag: true,
         };
         let req_json = serde_json::to_value(&req).unwrap();
         let _: RequestBody = serde_json::from_value(req_json)
