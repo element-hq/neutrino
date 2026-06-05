@@ -15,7 +15,7 @@ use axum::{
     Json,
     extract::{Path, RawQuery, State},
 };
-use neutrino_store::{DagStore, EventStore, RoomStore};
+use neutrino_store::{EventStore, RoomStore};
 use ruma::{EventId, OwnedEventId, OwnedRoomId};
 use serde::Serialize;
 use serde_json::value::RawValue as RawJsonValue;
@@ -123,12 +123,8 @@ pub(crate) async fn handle(
     // Wire bytes verbatim so each event's reference hash round-trips on the
     // peer.
     let known_refs: Vec<&EventId> = known.iter().map(|id| id.as_ref()).collect();
-    let pdus: Vec<Box<RawJsonValue>> = store
-        .events_before(&room_id, &known_refs, limit)
-        .await?
-        .into_iter()
-        .map(|e| e.raw)
-        .collect();
+    let pdus: Vec<Box<RawJsonValue>> =
+        crate::federation::events_before_raw(&*store, &room_id, &known_refs, limit).await?;
 
     Ok(Json(ResponseBody {
         origin,

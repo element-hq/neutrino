@@ -88,7 +88,7 @@ pub(crate) async fn handle(
     if event.event_type != "m.room.member" {
         return Err(FedError::BadRequest("event is not an m.room.member event"));
     }
-    if membership(&event).as_deref() != Some("join") {
+    if event.content_str("membership").as_deref() != Some("join") {
         return Err(FedError::BadRequest("membership is not join"));
     }
     if event.state_key.as_deref() != Some(event.sender.as_str()) {
@@ -129,7 +129,10 @@ pub(crate) async fn handle(
         .await?
         .ok_or(FedError::RoomNotFound)?;
     let state_dag = collect_state_dag(&*store, &room_id, &state_fes).await?;
-    let timeline = collect_timeline(&*store, &room_id, &timeline_fes).await?;
+    let timeline_refs: Vec<&EventId> = timeline_fes.iter().map(|id| id.as_ref()).collect();
+    let timeline =
+        crate::federation::events_before_raw(&*store, &room_id, &timeline_refs, TIMELINE_LIMIT)
+            .await?;
 
     Ok(Json(ResponseBody {
         state_dag,
@@ -155,31 +158,4 @@ async fn collect_state_dag(
         .await?;
     events.extend(ancestry);
     Ok(events.into_iter().map(|e| e.raw).collect())
-}
-
-/// Recent timeline: walk `prev_events` back from the timeline heads, seeds
-/// included, newest-first, capped at [`TIMELINE_LIMIT`].
-async fn collect_timeline(
-    store: &impl DagStore,
-    room_id: &ruma::RoomId,
-    timeline_fes: &std::collections::BTreeSet<OwnedEventId>,
-) -> Result<Vec<Box<RawJsonValue>>, FedError> {
-    let fe_refs: Vec<&EventId> = timeline_fes.iter().map(|id| id.as_ref()).collect();
-    Ok(store
-        .events_before(room_id, &fe_refs, TIMELINE_LIMIT)
-        .await?
-        .into_iter()
-        .map(|e| e.raw)
-        .collect())
-}
-
-/// An event's `content.membership`, if present and a string.
-fn membership(event: &neutrino_common::Event) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(event.content.get())
-        .ok()
-        .and_then(|c| {
-            c.get("membership")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-        })
 }

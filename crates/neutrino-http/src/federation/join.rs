@@ -27,9 +27,9 @@ use axum::{
 use neutrino_common::ROOM_VERSION_ID;
 use neutrino_state::event_id::{EventBuilder, from_wire};
 use neutrino_store::{RoomStore, StagingStore, StateStore};
-use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId};
+use ruma::{OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId};
+use serde_json::json;
 use serde_json::value::RawValue as RawJsonValue;
-use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::warn;
 
@@ -51,6 +51,27 @@ pub(crate) async fn federated_join(
     room_id: &RoomId,
     candidates: &[OwnedServerName],
 ) -> Response {
+    federated_join_with(
+        state,
+        user,
+        room_id,
+        candidates,
+        JOIN_INGEST_TIMEOUT,
+        JOIN_POLL_INTERVAL,
+    )
+    .await
+}
+
+/// As [`federated_join`], with the ingest-wait timeout/poll injectable so a test
+/// can exercise the timeout (504) path without a 20s wall-clock wait.
+pub(crate) async fn federated_join_with(
+    state: &AppState,
+    user: OwnedUserId,
+    room_id: &RoomId,
+    candidates: &[OwnedServerName],
+    timeout: Duration,
+    poll: Duration,
+) -> Response {
     let (store, worker_poke, own_server) = {
         let app = lock_app(state);
         (
@@ -66,7 +87,7 @@ pub(crate) async fn federated_join(
         match try_join_via(&client, &*store, &worker_poke, dest, room_id, &user).await {
             Ok(()) => {
                 // Staged + worker poked; block until our join lands (or time out).
-                return match wait_for_join(&*store, room_id, &user).await {
+                return match wait_for_join(&*store, room_id, &user, timeout, poll).await {
                     Ok(()) => (StatusCode::OK, Json(json!({ "room_id": room_id }))).into_response(),
                     Err(resp) => resp,
                 };
@@ -113,19 +134,25 @@ async fn try_join_via(
 /// Rebuild the join event from the resident's template, taking its DAG
 /// references (`prev_events` / `prev_state_events`) and our own content/ts.
 /// `auth_events` are left empty (`apply_pdu` is their sole authority); the id is
-/// the reference hash of the result. `None` if the template is unparseable.
+/// the reference hash of the result. We parse the template with `from_wire`
+/// (the same parser ingest uses) to lift typed references rather than hand-walk
+/// the JSON, ignoring the id it computes. `None` if the template is unparseable.
 fn complete_join_template(
     template: &RawJsonValue,
     room_id: &RoomId,
     user: &UserId,
 ) -> Option<neutrino_common::Event> {
-    let t: Value = serde_json::from_str(template.get()).ok()?;
+    let parsed = from_wire(
+        RawJsonValue::from_string(template.get().to_owned()).ok()?,
+        Vec::new(),
+    )
+    .ok()?;
     EventBuilder::new(user.to_owned(), "m.room.member".to_owned())
         .room_id(room_id.to_owned())
         .state_key(user.to_string())
         .content(json!({ "membership": "join" }))
-        .prev_events(id_vec(t.get("prev_events")))
-        .prev_state_events(id_vec(t.get("prev_state_events")))
+        .prev_events(parsed.prev_events)
+        .prev_state_events(parsed.prev_state_events)
         .build()
         .ok()
 }
@@ -147,8 +174,9 @@ async fn ingest_state_dag(
         .chain(resp.timeline)
         .chain(std::iter::once(resp.event))
     {
-        if let Ok(ev) = from_wire(raw, Vec::new()) {
-            events.push(ev);
+        match from_wire(raw, Vec::new()) {
+            Ok(ev) => events.push(ev),
+            Err(_) => warn!(%room_id, "dropping unparseable event in send_join response"),
         }
     }
 
@@ -172,17 +200,11 @@ async fn ingest_state_dag(
             .map_err(|_| "could not register the room")?;
     }
 
-    for ev in &events {
-        if ev.room_id != *room_id {
-            continue; // never stage a cross-room event the peer slipped in
-        }
-        store
-            .stage_pdu(origin, &ev.room_id, &ev.event_id, &ev.raw)
-            .await
-            .map_err(|_| "could not stage room state")?;
-    }
-    let _ = worker_poke.try_send(room_id.to_owned());
-    Ok(())
+    // Stage every event + poke the worker (cross-room events are skipped inside;
+    // the poke is awaited so a fresh-room ingest can't be silently dropped).
+    crate::federation::stage_and_poke(store, worker_poke, origin, room_id, &events)
+        .await
+        .map_err(|_| "could not stage room state")
 }
 
 /// Block until our `join` lands in current state, or time out. On timeout the
@@ -192,8 +214,10 @@ async fn wait_for_join(
     store: &impl StateStore,
     room_id: &RoomId,
     user: &UserId,
+    timeout: Duration,
+    poll: Duration,
 ) -> Result<(), Response> {
-    let deadline = tokio::time::Instant::now() + JOIN_INGEST_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match store
             .current_state_event(room_id, "m.room.member", user.as_str())
@@ -216,31 +240,13 @@ async fn wait_for_join(
                 "timed out applying room state; the join is still being processed",
             ));
         }
-        tokio::time::sleep(JOIN_POLL_INTERVAL).await;
+        tokio::time::sleep(poll).await;
     }
-}
-
-/// Parse a JSON array of event-id strings into owned ids, dropping any that
-/// don't parse.
-fn id_vec(v: Option<&Value>) -> Vec<OwnedEventId> {
-    v.and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|x| x.as_str())
-        .filter_map(|s| OwnedEventId::try_from(s).ok())
-        .collect()
 }
 
 /// True if an `m.room.member` event's `content.membership` is `join`.
 fn membership_is_join(event: &neutrino_common::Event) -> bool {
-    serde_json::from_str::<Value>(event.content.get())
-        .ok()
-        .and_then(|c| {
-            c.get("membership")
-                .and_then(|v| v.as_str())
-                .map(|m| m == "join")
-        })
-        .unwrap_or(false)
+    event.content_str("membership").as_deref() == Some("join")
 }
 
 /// Parse repeated `?server_name=` query values into resident-server candidates.

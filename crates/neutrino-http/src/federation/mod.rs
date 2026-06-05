@@ -188,3 +188,47 @@ pub(crate) fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+/// Walk `prev_events` back from `heads` (seeds included, newest-first, capped at
+/// `limit`) and return the events' wire bytes verbatim. Shared by `/backfill`
+/// and `send_join`'s `timeline` (both want "recent PDUs as raw bytes").
+pub(crate) async fn events_before_raw(
+    store: &impl neutrino_store::DagStore,
+    room_id: &ruma::RoomId,
+    heads: &[&ruma::EventId],
+    limit: usize,
+) -> Result<Vec<Box<serde_json::value::RawValue>>, neutrino_store::StorageError> {
+    Ok(store
+        .events_before(room_id, heads, limit)
+        .await?
+        .into_iter()
+        .map(|e| e.raw)
+        .collect())
+}
+
+/// Stage a batch of already-parsed PDUs for one room, then poke the worker to
+/// drain them. Shared staging primitive — `stage_pdu` is idempotent by event
+/// id, so re-staging is a no-op. Used by the outbound-join ingest; the inbound
+/// `/send` handler keeps its own loop because it must build a per-PDU result
+/// map. The poke is awaited (not `try_send`) so a single fresh-room ingest
+/// can't be silently dropped and left to stall.
+pub(crate) async fn stage_and_poke(
+    store: &impl neutrino_store::StagingStore,
+    worker_poke: &tokio::sync::mpsc::Sender<ruma::OwnedRoomId>,
+    origin: &ruma::ServerName,
+    room_id: &ruma::RoomId,
+    events: &[neutrino_common::Event],
+) -> Result<(), neutrino_store::StorageError> {
+    for ev in events {
+        if ev.room_id != *room_id {
+            continue; // never stage a cross-room event a peer slipped in
+        }
+        store
+            .stage_pdu(origin, &ev.room_id, &ev.event_id, &ev.raw)
+            .await?;
+    }
+    if worker_poke.send(room_id.to_owned()).await.is_err() {
+        tracing::warn!(%room_id, "worker poke failed; staged events will drain on the next poke or restart");
+    }
+    Ok(())
+}

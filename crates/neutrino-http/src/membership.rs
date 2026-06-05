@@ -100,13 +100,7 @@ async fn current_membership(
                 &e.to_string(),
             )
         })?;
-    Ok(event
-        .and_then(|e| serde_json::from_str::<Value>(e.raw.get()).ok())
-        .and_then(|v| {
-            v.pointer("/content/membership")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        }))
+    Ok(event.and_then(|e| e.content_str("membership")))
 }
 
 /// Return a ready `404 M_NOT_FOUND` ("Not a known room") when `room` was never
@@ -251,8 +245,10 @@ pub(crate) async fn leave(
 /// `404 M_NOT_FOUND` ("No such room alias", matching Synapse) rather than the
 /// `400` a room-id parse would give, so clients see the alias as *unknown* not
 /// *malformed*. A string that is neither a valid id nor a valid alias still
-/// falls through to [`join`]'s `400`. The `server_name` query param is accepted
-/// and ignored (single-server, trusted mesh).
+/// falls through to [`join`]'s `400`. The `server_name` query lists candidate
+/// resident servers: for a room we don't host they trigger a federated join
+/// (`federation::join::federated_join`); for a room we already host they are
+/// ignored (we are the resident).
 pub(crate) async fn join_by_id_or_alias(
     state: State<AppState>,
     auth: AuthUser,

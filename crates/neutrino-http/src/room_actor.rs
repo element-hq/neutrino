@@ -205,25 +205,46 @@ impl RoomActor {
         if effects.is_empty() {
             return Ok(());
         }
-        let (persisted, delta) = collect_effects(effects);
-        let event = persisted.ok_or(RoomActorError::NotApplied)?;
-
-        // Resident policy mirrors a local send: a membership that fails auth is
-        // refused (403) and not stored. (Federation `/send` persists rejects;
-        // an explicit join/leave handshake does not.)
-        if event.rejected {
-            return Err(RoomActorError::Rejected);
-        }
 
         // Distribution duty: we are the fan-out origin. Federate to every other
         // server in the post-apply room state, minus the sender's server (it
         // delivered the event to us) and minus our own (excluded by
         // `outbound_destinations`).
-        let mut destinations =
-            outbound_destinations(next.current_state(), &event, &self.own_server);
-        destinations.retain(|s| s.as_str() != sender_server.as_str());
-        let dest_refs: Vec<&ServerName> = destinations.iter().map(AsRef::as_ref).collect();
+        let own = self.own_server.clone();
+        self.commit_accepted(next, effects, |event, next| {
+            let mut dests = outbound_destinations(next.current_state(), event, &own);
+            dests.retain(|s| s.as_str() != sender_server.as_str());
+            dests
+        })
+        .await
+        .map(|_| ())
+    }
 
+    /// Shared accept→persist→adopt tail for the local-send and resident-apply
+    /// paths. Both run an event through `apply_pdu`, refuse a reject (403, not
+    /// persisted — local policy), enqueue federation destinations, and persist
+    /// atomically. The only thing the two callers differ on is how they derive
+    /// the destination set (computed by `destinations` from the persisted event
+    /// + post-apply core), so that is a closure. Returns the persisted event.
+    async fn commit_accepted(
+        &mut self,
+        next: RoomCore,
+        effects: Vec<Effect>,
+        destinations: impl FnOnce(&Event, &RoomCore) -> Vec<OwnedServerName>,
+    ) -> Result<Arc<Event>, RoomActorError> {
+        let (persisted, delta) = collect_effects(effects);
+        let event = persisted.ok_or(RoomActorError::NotApplied)?;
+
+        // Local policy: a rejected event is surfaced to the client as 403 and is
+        // NOT persisted (Synapse never stores a locally-refused event). The
+        // post-apply clone is discarded — `apply_pdu` doesn't mutate on reject,
+        // so `self.room` is already correct.
+        if event.rejected {
+            return Err(RoomActorError::Rejected);
+        }
+
+        let dests = destinations(&event, &next);
+        let dest_refs: Vec<&ServerName> = dests.iter().map(AsRef::as_ref).collect();
         self.store
             .persist_resolved_event(
                 &event,
@@ -233,8 +254,9 @@ impl RoomActor {
                 &dest_refs,
             )
             .await?;
+        // Commit succeeded — adopt the post-apply state.
         self.room = next;
-        Ok(())
+        Ok(event)
     }
 
     /// Run `apply_pdu` against a *clone* of the live `RoomCore`, off to the
@@ -269,42 +291,21 @@ impl RoomActor {
             .build_local_event(sender, event_type, state_key, content)?;
 
         let (next, effects) = self.run_apply(event).await?;
-        let (persisted, delta) = collect_effects(effects);
-        let event = persisted.ok_or(RoomActorError::NotApplied)?;
-
-        // Local policy: a rejected event is surfaced to the client as 403 and
-        // is NOT persisted (Synapse never stores a locally-refused event). The
-        // post-apply clone is discarded — `apply_pdu` doesn't mutate on reject,
-        // so `self.room` is already correct.
-        if event.rejected {
-            return Err(RoomActorError::Rejected);
-        }
 
         // Federate to every remote server in the post-apply room state — but a
         // soft-failed event must not be relayed (it failed auth against current
         // state, so peers would reject it too). Soft-fail is only ever set on
         // non-state events, so an unrejected state event always federates; the
         // explicit `state_key.is_none()` guard keeps that invariant local.
-        let destinations = if event.soft_failed && event.state_key.is_none() {
-            Vec::new()
-        } else {
-            outbound_destinations(next.current_state(), &event, &self.own_server)
-        };
-        let dest_refs: Vec<&ServerName> = destinations.iter().map(AsRef::as_ref).collect();
-
-        self.store
-            .persist_resolved_event(
-                &event,
-                next.forward_extremities(),
-                next.state_forward_extremities(),
-                &delta,
-                &dest_refs,
-            )
-            .await?;
-        // Commit succeeded — adopt the post-apply state.
-        self.room = next;
-
-        Ok(event)
+        let own = self.own_server.clone();
+        self.commit_accepted(next, effects, |event, next| {
+            if event.soft_failed && event.state_key.is_none() {
+                Vec::new()
+            } else {
+                outbound_destinations(next.current_state(), event, &own)
+            }
+        })
+        .await
     }
 
     /// Integrate a fully-formed federation PDU. The federation persist policy:
@@ -383,13 +384,9 @@ fn outbound_destinations(
 /// canonical [`Membership`] alphabet. `None` for a non-member event or any
 /// missing / unrecognised membership string.
 fn event_membership(event: &Event) -> Option<Membership> {
-    serde_json::from_str::<Value>(event.content.get())
-        .ok()
-        .and_then(|c| {
-            c.get("membership")
-                .and_then(Value::as_str)
-                .and_then(Membership::from_wire)
-        })
+    event
+        .content_str("membership")
+        .and_then(|m| Membership::from_wire(&m))
 }
 
 /// Split `apply_pdu`'s effects into the event to persist and the current-state

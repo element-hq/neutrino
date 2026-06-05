@@ -120,7 +120,7 @@ async fn check_can_join(
     let member = store
         .current_state_event(room_id, "m.room.member", user_id.as_str())
         .await?;
-    let membership = member.as_ref().and_then(|e| content_field(e, "membership"));
+    let membership = member.as_ref().and_then(|e| e.content_str("membership"));
     if membership.as_deref() == Some("ban") {
         return Err(FedError::Forbidden("user is banned from the room"));
     }
@@ -128,14 +128,17 @@ async fn check_can_join(
     let join_rule = store
         .current_state_event(room_id, "m.room.join_rules", "")
         .await?
-        .and_then(|e| content_field(&e, "join_rule"))
+        .and_then(|e| e.content_str("join_rule"))
         .unwrap_or_else(|| "invite".to_owned());
 
     match join_rule.as_str() {
         "public" => Ok(()),
-        // Default and invite-only: only a currently-invited user may join.
+        // Default and invite-only: a currently-invited user may join — and so
+        // may an already-`join`ed user (a re-`make_join`, e.g. after the
+        // joining server lost its DB), matching auth rule 5.3.4 which the
+        // authoritative apply at `send_join` enforces.
         "invite" => {
-            if membership.as_deref() == Some("invite") {
+            if matches!(membership.as_deref(), Some("invite") | Some("join")) {
                 Ok(())
             } else {
                 Err(FedError::Forbidden("you are not invited to this room"))
@@ -146,14 +149,6 @@ async fn check_can_join(
             "this room's join rule is not supported",
         )),
     }
-}
-
-/// Read a string field from an event's `content`. `None` if the content isn't
-/// an object, the key is absent, or the value isn't a string.
-fn content_field(event: &neutrino_common::Event, key: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(event.content.get())
-        .ok()
-        .and_then(|c| c.get(key).and_then(|v| v.as_str()).map(str::to_owned))
 }
 
 /// Map a `build_event` actor error onto the HTTP layer. `UnknownRoom` is a 404
