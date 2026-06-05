@@ -198,6 +198,32 @@ impl FederationClient {
         }
         Ok(resp.json::<SendJoinResponse>().await?)
     }
+
+    /// `PUT http://{dest}/_matrix/federation/v2/invite/{room}/{event_id}`
+    /// carrying the invite `m.room.member` `event` (with
+    /// `unsigned.invite_room_state` for the invitee to render the room).
+    /// Returns the peer's copy of the event (`{ event }`) — in a signatures
+    /// world this is where the invitee server's signature would be added.
+    pub(crate) async fn invite(
+        &self,
+        dest: &ServerName,
+        room_id: &RoomId,
+        event_id: &EventId,
+        event: &RawJsonValue,
+    ) -> Result<InviteResponse, FederationClientError> {
+        let mut url = reqwest::Url::parse(&format!("http://{dest}/_matrix/federation/v2/invite"))
+            .map_err(|_| FederationClientError::InvalidUrl)?;
+        url.path_segments_mut()
+            .map_err(|()| FederationClientError::InvalidUrl)?
+            .push(room_id.as_str())
+            .push(event_id.as_str());
+
+        let resp = self.http.put(url).json(&event).send().await?;
+        if !resp.status().is_success() {
+            return Err(FederationClientError::Status(resp.status().as_u16()));
+        }
+        Ok(resp.json::<InviteResponse>().await?)
+    }
 }
 
 /// Deserialized `make_join` response (mirror of the inbound
@@ -217,6 +243,13 @@ pub(crate) struct SendJoinResponse {
     pub(crate) state_dag: Vec<Box<RawJsonValue>>,
     #[serde(default)]
     pub(crate) timeline: Vec<Box<RawJsonValue>>,
+    pub(crate) event: Box<RawJsonValue>,
+}
+
+/// Deserialized `/invite` (v2) response (mirror of the inbound
+/// `invite::ResponseBody`): the invitee server's copy of the event.
+#[derive(Deserialize)]
+pub(crate) struct InviteResponse {
     pub(crate) event: Box<RawJsonValue>,
 }
 

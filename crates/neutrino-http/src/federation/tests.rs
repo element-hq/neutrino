@@ -26,7 +26,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use neutrino_common::{Config, ROOM_VERSION_ID};
 use neutrino_state::event_id::EventBuilder;
-use neutrino_store::{EventStore, FederationOutbox, RoomStore, StagingStore, StateStore};
+use neutrino_store::{
+    EventStore, FederationOutbox, InviteStore, RoomStore, StagingStore, StateStore,
+};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, ServerName};
 use serde_json::value::RawValue as RawJsonValue;
@@ -2863,5 +2865,402 @@ async fn federated_join_missing_create_in_response_fails_without_registering() {
     assert!(
         !a_store.room_exists(&room_id).await.unwrap(),
         "a create-less response must not register the room"
+    );
+}
+
+// --- /invite/v2 (inbound federated invite, Milestone B2) ----------------------
+
+fn invite_path(room_id: &str, event_id: &str) -> String {
+    format!("/_matrix/federation/v2/invite/{room_id}/{event_id}")
+}
+
+/// The remote inviting server.
+fn inviter() -> OwnedUserId {
+    "@bob:remote.example.org".parse().unwrap()
+}
+
+/// The invite event's wire JSON body, optionally with an injected
+/// `unsigned.invite_room_state` (stripped state the inviting server would
+/// include). `unsigned` is outside the reference hash, so injecting it does not
+/// change the event_id the handler recomputes.
+fn invite_body(event: &neutrino_common::Event, invite_room_state: Option<Value>) -> Value {
+    let mut v: Value = serde_json::from_str(event.raw.get()).unwrap();
+    if let Some(irs) = invite_room_state {
+        v["unsigned"] = json!({ "invite_room_state": irs });
+    }
+    v
+}
+
+/// Build an `m.room.member` event off `prevs` (used for both DAGs) with the
+/// given membership, sender and target — the shape an inviting resident emits.
+fn member_pdu(
+    sender: &OwnedUserId,
+    target: &str,
+    room_id: &OwnedRoomId,
+    membership: &str,
+    prevs: &[OwnedEventId],
+) -> neutrino_common::Event {
+    EventBuilder::new(sender.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(target.to_owned())
+        .content(json!({ "membership": membership }))
+        .prev_events(prevs.to_vec())
+        .prev_state_events(prevs.to_vec())
+        .build()
+        .expect("build member event")
+}
+
+/// An out-of-band invite for a room we don't host is stored as a stub
+/// (bypassing `apply_pdu`, since there's no room state to auth against) and the
+/// handler echoes the event back. Its `unsigned.invite_room_state` survives.
+#[tokio::test]
+async fn invite_oob_stores_stub_and_returns_event() {
+    let (store, tempfile) = fresh_store().await;
+    let router = router_with_store(config(), store.clone(), tempfile);
+    let bob = inviter();
+    let invited = alice(); // local to example.org
+
+    // A throwaway create only to source a valid room id + a syntactically-valid
+    // prev event id; the room is NOT created in our store (out-of-band).
+    let create = EventBuilder::new(bob.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    let invite = member_pdu(
+        &bob,
+        invited.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&create.event_id),
+    );
+    let invite_id = invite.event_id.clone();
+    let irs = json!([
+        {"type": "m.room.name", "state_key": "", "sender": bob.as_str(),
+         "content": {"name": "Remote Room"}}
+    ]);
+
+    let (status, body) = put_json(
+        &router,
+        &invite_path(room_id.as_str(), invite_id.as_str()),
+        &invite_body(&invite, Some(irs)),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    // Response echoes the event with its computed id.
+    assert_eq!(
+        body.pointer("/event/state_key").and_then(|v| v.as_str()),
+        Some(invited.as_str()),
+        "body = {body}"
+    );
+
+    // Stub stored, retrievable, and `unsigned.invite_room_state` preserved.
+    let stored = store
+        .get_invite(&room_id, &invited)
+        .await
+        .unwrap()
+        .expect("OOB invite stub stored");
+    assert_eq!(stored.event_id, invite_id);
+    let v: Value = serde_json::from_str(stored.raw.get()).unwrap();
+    assert_eq!(
+        v.pointer("/unsigned/invite_room_state/0/content/name")
+            .and_then(|n| n.as_str()),
+        Some("Remote Room"),
+        "invite_room_state preserved in the stored stub"
+    );
+    // The room itself was never registered (no apply_pdu, no create).
+    assert!(!store.room_exists(&room_id).await.unwrap());
+}
+
+/// An invite for a room we DO host is not an error (the inviting server may not
+/// know we're resident): it is staged and integrated through the worker via
+/// `apply_pdu` (auth + state-res + persist) — landing in `current_state` — NOT
+/// stored as an out-of-band stub. (2026-06-05 decision.)
+#[tokio::test]
+async fn invite_for_hosted_room_applies_via_worker_not_oob_stub() {
+    // We host the room; alice is the joined creator (power to invite).
+    let (app, store, room_id, alice, join_id) = seed_joined_room().await;
+    let carol: OwnedUserId = "@carol:example.org".parse().unwrap();
+    // The invite arrives over federation but is authored by our own joined
+    // creator (so apply_pdu accepts it against our state) and sits on the head.
+    let invite = member_pdu(
+        &alice,
+        carol.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&join_id),
+    );
+    let invite_id = invite.event_id.clone();
+
+    let (status, body) = put_json(
+        &app,
+        &invite_path(room_id.as_str(), invite_id.as_str()),
+        &invite_body(&invite, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    // Decision 3: hosted-room invite is applied (committed + current_state),
+    // not parked as an OOB stub.
+    let committed = wait_committed(&store, invite_id.as_ref()).await;
+    assert!(
+        !committed.rejected,
+        "creator's invite of a local user is authorised"
+    );
+    let member = store
+        .current_state_event(&room_id, "m.room.member", carol.as_str())
+        .await
+        .unwrap()
+        .expect("carol now has a member event in current state");
+    assert_eq!(member.content_str("membership").as_deref(), Some("invite"));
+    assert!(
+        store.get_invite(&room_id, &carol).await.unwrap().is_none(),
+        "a hosted-room invite must NOT be stored as an out-of-band stub"
+    );
+}
+
+/// `state_key` must be one of our local users — an invite addressed to another
+/// server's user is rejected (we have no business storing it).
+#[tokio::test]
+async fn invite_rejects_non_local_invitee() {
+    let (store, tempfile) = fresh_store().await;
+    let router = router_with_store(config(), store.clone(), tempfile);
+    let bob = inviter();
+    let create = EventBuilder::new(bob.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    // Invitee on a different server.
+    let invite = member_pdu(
+        &bob,
+        "@dave:other.example.org",
+        &room_id,
+        "invite",
+        std::slice::from_ref(&create.event_id),
+    );
+    let invite_id = invite.event_id.clone();
+
+    let (status, body) = put_json(
+        &router,
+        &invite_path(room_id.as_str(), invite_id.as_str()),
+        &invite_body(&invite, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(
+        body.get("errcode").and_then(|c| c.as_str()),
+        Some("M_INVALID_PARAM")
+    );
+    // Nothing stored.
+    assert!(
+        store
+            .get_invite(
+                &room_id,
+                &"@dave:other.example.org".parse::<OwnedUserId>().unwrap()
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A non-invite membership on the invite endpoint is a 400.
+#[tokio::test]
+async fn invite_rejects_non_invite_membership() {
+    let (store, tempfile) = fresh_store().await;
+    let router = router_with_store(config(), store, tempfile);
+    let bob = inviter();
+    let create = EventBuilder::new(bob.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    // A leave (kick-shaped: sender != target) is structurally valid but not an
+    // invite.
+    let leave = member_pdu(
+        &bob,
+        alice().as_str(),
+        &room_id,
+        "leave",
+        std::slice::from_ref(&create.event_id),
+    );
+    let (status, body) = put_json(
+        &router,
+        &invite_path(room_id.as_str(), leave.event_id.as_str()),
+        &invite_body(&leave, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(
+        body.get("errcode").and_then(|c| c.as_str()),
+        Some("M_INVALID_PARAM")
+    );
+}
+
+/// The `eventId` path segment must match the event's computed reference hash.
+#[tokio::test]
+async fn invite_rejects_event_id_path_mismatch() {
+    let (store, tempfile) = fresh_store().await;
+    let router = router_with_store(config(), store, tempfile);
+    let bob = inviter();
+    let create = EventBuilder::new(bob.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    let invite = member_pdu(
+        &bob,
+        alice().as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&create.event_id),
+    );
+    // Path carries a different (but syntactically valid) event id.
+    let (status, body) = put_json(
+        &router,
+        &invite_path(room_id.as_str(), create.event_id.as_str()),
+        &invite_body(&invite, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(
+        body.get("errcode").and_then(|c| c.as_str()),
+        Some("M_INVALID_PARAM")
+    );
+}
+
+// --- outbound CSAPI /invite of a remote user (Milestone B3) -------------------
+
+/// Bind a real neutrino router on an ephemeral port whose `server_name` IS that
+/// address, so a user `@local:{addr}` is local to it (its inbound `/invite/v2`
+/// accepts the invitee). Returns the server name + the served store.
+async fn serve_invitee_server(localpart: &str) -> (String, Arc<SqliteStore>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let (store, tempfile) = fresh_store().await;
+    let router = router_with_store(config_for(&name, localpart), store.clone(), tempfile);
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (name, store)
+}
+
+/// CSAPI `/invite` of a remote user federates the invite to the invitee's
+/// server (storing an OOB stub there with our `invite_room_state`), then commits
+/// locally (current_state membership=invite). This is also the round-trip guard
+/// — our outbound body is parsed by the real inbound `/invite/v2` on the peer.
+#[tokio::test]
+async fn outbound_invite_federates_then_persists() {
+    // A (example.org) hosts the room; alice is the joined creator.
+    let (a_app, a_store, room_id, _alice, _join) = seed_joined_room().await;
+    // B serves the invitee `@dave:{B}`.
+    let (b_name, b_store) = serve_invitee_server("dave").await;
+    let dave = format!("@dave:{b_name}");
+    let dave_uid: OwnedUserId = dave.parse().unwrap();
+
+    let (status, body) = post_json(
+        &a_app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/invite"),
+        &json!({ "user_id": dave }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    // A persisted the invite into current state (committed via apply_resident).
+    let member = a_store
+        .current_state_event(&room_id, "m.room.member", dave_uid.as_str())
+        .await
+        .unwrap()
+        .expect("dave is invited in A's current state");
+    assert_eq!(membership_str(&member).as_deref(), Some("invite"));
+
+    // B stored the OOB stub (it doesn't host the room) with our stripped
+    // invite_room_state (the round-trip through B's real /invite/v2).
+    let stub = b_store
+        .get_invite(&room_id, &dave_uid)
+        .await
+        .unwrap()
+        .expect("B stored the OOB invite stub");
+    let v: Value = serde_json::from_str(stub.raw.get()).unwrap();
+    let types: Vec<&str> = v
+        .pointer("/unsigned/invite_room_state")
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e.pointer("/type").and_then(|t| t.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        types.contains(&"m.room.create"),
+        "invite_room_state carries the create event; got {types:?}"
+    );
+}
+
+/// Invitee server unreachable ⇒ CSAPI errors (502) and **nothing** is persisted
+/// locally (the atomicity property — federate-then-persist).
+#[tokio::test]
+async fn outbound_invite_peer_unreachable_persists_nothing() {
+    let (a_app, a_store, room_id, _alice, _join) = seed_joined_room().await;
+    let dead = crate::federation::test_support::dead_peer().await;
+    let dave = format!("@dave:{dead}");
+    let dave_uid: OwnedUserId = dave.parse().unwrap();
+
+    let (status, _body) = post_json(
+        &a_app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/invite"),
+        &json!({ "user_id": dave }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(
+        a_store
+            .current_state_event(&room_id, "m.room.member", dave_uid.as_str())
+            .await
+            .unwrap()
+            .is_none(),
+        "an unreachable invitee server must leave nothing persisted"
+    );
+}
+
+/// Invitee server returns 403 ⇒ CSAPI 403 and nothing persisted.
+#[tokio::test]
+async fn outbound_invite_peer_403_persists_nothing() {
+    let (a_app, a_store, room_id, _alice, _join) = seed_joined_room().await;
+
+    // A stub invitee server that 403s every /invite/v2.
+    let stub = axum::Router::new().route(
+        "/_matrix/federation/v2/invite/{room_id}/{event_id}",
+        axum::routing::put(|| async {
+            (
+                StatusCode::FORBIDDEN,
+                axum::Json(json!({"errcode": "M_FORBIDDEN", "error": "no"})),
+            )
+        }),
+    );
+    let stub_name = crate::federation::test_support::spawn_stub(stub).await;
+    let dave = format!("@dave:{stub_name}");
+    let dave_uid: OwnedUserId = dave.parse().unwrap();
+
+    let (status, _body) = post_json(
+        &a_app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/invite"),
+        &json!({ "user_id": dave }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        a_store
+            .current_state_event(&room_id, "m.room.member", dave_uid.as_str())
+            .await
+            .unwrap()
+            .is_none(),
+        "a peer 403 must leave nothing persisted"
     );
 }

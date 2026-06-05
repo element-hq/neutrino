@@ -393,6 +393,10 @@ fn build_router(state: AppState) -> Router {
             "/_matrix/federation/v2/send_join/{room_id}/{event_id}",
             put(federation::send_join::handle),
         )
+        .route(
+            "/_matrix/federation/v2/invite/{room_id}/{event_id}",
+            put(federation::invite::handle),
+        )
         .fallback(default_fallback)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
