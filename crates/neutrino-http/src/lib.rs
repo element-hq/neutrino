@@ -27,8 +27,9 @@ use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{Span, error, info, info_span};
 
 mod federation;
 mod legacy_sync;
@@ -394,7 +395,45 @@ fn build_router(state: AppState) -> Router {
             put(federation::send_join::handle),
         )
         .fallback(default_fallback)
-        .layer(TraceLayer::new_for_http())
+        // Log one INFO line per request (method + path) and one per response
+        // (status + latency), with 5xx surfaced at ERROR. We emit these under our
+        // own `neutrino_http` target (rather than `tower_http`) so they sit
+        // alongside the rest of the crate's logs under the `neutrino_http=info`
+        // env-filter (see `neutrino-main::platform`).
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::extract::Request| {
+                    info_span!(
+                        target: "neutrino_http",
+                        "request",
+                        method = %request.method(),
+                        uri = %request.uri(),
+                    )
+                })
+                .on_request(|_request: &axum::extract::Request, _span: &Span| {
+                    info!(target: "neutrino_http", "started processing request");
+                })
+                .on_response(
+                    |response: &axum::response::Response, latency: Duration, _span: &Span| {
+                        info!(
+                            target: "neutrino_http",
+                            status = response.status().as_u16(),
+                            latency = ?latency,
+                            "finished processing request",
+                        );
+                    },
+                )
+                .on_failure(
+                    |error: ServerErrorsFailureClass, latency: Duration, _span: &Span| {
+                        error!(
+                            target: "neutrino_http",
+                            %error,
+                            latency = ?latency,
+                            "response failed",
+                        );
+                    },
+                ),
+        )
         .with_state(state)
 }
 
@@ -1293,13 +1332,8 @@ async fn get_capabilities() -> Json<Value> {
     }))
 }
 
-async fn default_fallback(request: axum::extract::Request) -> (StatusCode, &'static str) {
-    info!(
-        uri = %request.uri(),
-        method = %request.method(),
-        "received request to unknown route"
-    );
-
+async fn default_fallback() -> (StatusCode, &'static str) {
+    // The 404 status on the response is sufficient; no log line needed.
     (
         StatusCode::NOT_FOUND,
         "The requested resource was not found.",
