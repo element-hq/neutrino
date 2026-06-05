@@ -27,8 +27,8 @@ use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tower_http::trace::TraceLayer;
-use tracing::info;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
+use tracing::{Level, info};
 
 mod federation;
 mod legacy_sync;
@@ -382,7 +382,16 @@ fn build_router(state: AppState) -> Router {
             get(federation::backfill::handle),
         )
         .fallback(default_fallback)
-        .layer(TraceLayer::new_for_http())
+        // Log one INFO line per request (method + path) and one per response
+        // (status + latency). `TraceLayer` defaults these to DEBUG, which the
+        // `neutrino_*=info` env-filter drops; raising span + events to INFO and
+        // enabling `tower_http=info` (see `neutrino-main::platform`) surfaces them.
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_request(DefaultOnRequest::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
         .with_state(state)
 }
 
