@@ -35,7 +35,7 @@ use tempfile::NamedTempFile;
 use tower::ServiceExt;
 
 use crate::federation::client::FederationClientError;
-use crate::federation::send::MissingEventsFetcher;
+use crate::federation::gapfill::MissingEventsFetcher;
 use crate::{router, router_with_store, router_with_store_and_fetcher};
 
 /// The arguments one `fetch` call was made with, recorded so a test can assert
@@ -1252,6 +1252,85 @@ fn topic_on(
         .expect("build topic")
 }
 
+// ── async-worker poll helpers ────────────────────────────────────────────────
+//
+// `/send` now stages PDUs and returns 200 immediately; the background worker
+// (`federation::worker`, auto-spawned by the test router) integrates them
+// asynchronously. So the e2e tests assert the *immediate* response, then poll
+// the store for the eventual outcome. ~5s budget at 10ms granularity — the
+// success path has no backoff, so this resolves in tens of ms; the bound only
+// guards against a hang.
+
+/// Poll until `id` is committed (present in `events`), returning the row.
+async fn wait_committed(store: &SqliteStore, id: &ruma::EventId) -> neutrino_common::Event {
+    for _ in 0..500 {
+        if let Some(e) = store.get_events(&[id]).await.unwrap().into_iter().next() {
+            return e;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("event {id} not committed within timeout");
+}
+
+/// Poll until the room's timeline forward extremity set is exactly `{expected}`.
+async fn wait_timeline_head(store: &SqliteStore, room_id: &RoomId, expected: &ruma::EventId) {
+    let want: std::collections::BTreeSet<OwnedEventId> =
+        [expected.to_owned()].into_iter().collect();
+    for _ in 0..500 {
+        if let Ok(Some((timeline, _state))) = store.forward_extremities(room_id).await
+            && timeline == want
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("timeline head did not advance to {expected} within timeout");
+}
+
+/// Poll until `id` is one of the room's timeline forward extremities (a leaf).
+/// Weaker than [`wait_timeline_head`] — used where the async worker may leave a
+/// *transient* extra extremity (e.g. a child applied before its timeline parent
+/// across two drain passes), which is valid federation behaviour and self-heals.
+async fn wait_timeline_contains(store: &SqliteStore, room_id: &RoomId, id: &ruma::EventId) {
+    for _ in 0..500 {
+        if let Ok(Some((timeline, _state))) = store.forward_extremities(room_id).await
+            && timeline.contains(id)
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("{id} did not become a timeline extremity within timeout");
+}
+
+/// Poll until the room has no staged rows left (the worker drained it).
+async fn wait_staging_empty(store: &SqliteStore, room_id: &RoomId) {
+    for _ in 0..500 {
+        if store
+            .staged_for_room(room_id)
+            .await
+            .map(|v| v.is_empty())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("staging for {room_id} did not drain within timeout");
+}
+
+/// Poll until the stub fetcher has recorded at least one call — i.e. the worker
+/// reached the gap-fill for a PDU with missing ancestry.
+async fn wait_fetch_attempted(fetcher: &StubFetcher) {
+    for _ in 0..500 {
+        if fetcher.call_count() >= 1 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("fetcher was never called within timeout");
+}
+
 #[tokio::test]
 async fn send_accepts_pdu_and_persists() {
     let (app, store, room_id, alice, join_id) = seed_joined_room().await;
@@ -1267,16 +1346,15 @@ async fn send_accepts_pdu_and_persists() {
     let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&msg])).await;
 
     assert_eq!(status, StatusCode::OK, "body = {body}");
-    // Per-PDU result is an empty object (success, no error).
+    // The PDU was staged: an optimistic empty per-PDU result (no error).
     let result = body.get("pdus").and_then(|p| p.get(msg_id.as_str()));
     assert_eq!(result, Some(&json!({})), "body = {body}");
 
-    // The event landed in the store and the timeline head advanced to it.
-    let fetched = store.get_events(&[msg_id.as_ref()]).await.unwrap();
-    assert_eq!(fetched.len(), 1);
-    assert!(!fetched[0].rejected);
-    let (timeline, _state) = store.forward_extremities(&room_id).await.unwrap().unwrap();
-    assert_eq!(timeline, [msg_id].into_iter().collect());
+    // The worker integrates it asynchronously: it lands in the store (not
+    // rejected) and the timeline head advances to it.
+    let fetched = wait_committed(&store, msg_id.as_ref()).await;
+    assert!(!fetched.rejected);
+    wait_timeline_head(&store, &room_id, msg_id.as_ref()).await;
 }
 
 #[tokio::test]
@@ -1302,12 +1380,12 @@ async fn send_persists_rejected_pdu_as_success_result() {
     assert_eq!(
         body.get("pdus").and_then(|p| p.get(bob_join_id.as_str())),
         Some(&json!({})),
-        "a persisted reject is a successful PDU result; body = {body}"
+        "staging always reports an empty result; body = {body}"
     );
-    // Persisted-but-rejected; bob is absent from current_state.
-    let fetched = store.get_events(&[bob_join_id.as_ref()]).await.unwrap();
-    assert_eq!(fetched.len(), 1);
-    assert!(fetched[0].rejected);
+    // The worker persists the reject (federation policy); bob stays absent from
+    // current_state.
+    let fetched = wait_committed(&store, bob_join_id.as_ref()).await;
+    assert!(fetched.rejected);
     assert!(
         store
             .current_state_event(&room_id, "m.room.member", bob.as_str())
@@ -1318,10 +1396,14 @@ async fn send_persists_rejected_pdu_as_success_result() {
 }
 
 #[tokio::test]
-async fn send_reports_error_for_unfillable_missing_ancestry() {
+async fn send_unfillable_ancestry_stays_unapplied() {
     // A PDU referencing a parent we don't have, and the peer (a no-progress
-    // fetcher) returns nothing → the gap is unfillable → the PDU gets an error.
-    let (app, _store, room_id, alice, join_id) = seed_joined_room().await;
+    // fetcher) returns nothing → the gap is unfillable. `/send` still 200s
+    // (staged); the worker tries the gap-fill, fails, backs off, and the PDU is
+    // never committed (left durably staged for a later retry/restart).
+    let fetcher = StubFetcher::no_progress();
+    let (app, store, room_id, alice, join_id) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
     // An orphan ancestor that is never persisted nor included in the txn.
     let orphan = message_on(&alice, &room_id, &join_id, "orphan", 1_700_000_002_000);
     let child = message_on(
@@ -1334,14 +1416,24 @@ async fn send_reports_error_for_unfillable_missing_ancestry() {
     let child_id = child.event_id.clone();
 
     let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
-
     assert_eq!(status, StatusCode::OK, "body = {body}");
-    let err = body
-        .get("pdus")
-        .and_then(|p| p.get(child_id.as_str()))
-        .and_then(|r| r.get("error"))
-        .and_then(Value::as_str);
-    assert!(err.is_some(), "expected an error result; body = {body}");
+    assert_eq!(
+        body.get("pdus").and_then(|p| p.get(child_id.as_str())),
+        Some(&json!({})),
+        "staging succeeds even when the eventual gap-fill won't; body = {body}"
+    );
+
+    // The worker reaches the gap-fill (fetcher called) but can't ground the
+    // ancestry, so the child is never committed.
+    wait_fetch_attempted(&fetcher).await;
+    assert!(
+        store
+            .get_events(&[child_id.as_ref()])
+            .await
+            .unwrap()
+            .is_empty(),
+        "child must not be committed while its ancestry is unfillable"
+    );
 }
 
 #[tokio::test]
@@ -1379,12 +1471,17 @@ async fn send_gapfills_missing_ancestry_then_accepts() {
     let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
 
     assert_eq!(status, StatusCode::OK, "body = {body}");
-    // The child PDU was accepted (empty result object, no error).
+    // Optimistic staged result (no error) — the actual accept happens async.
     assert_eq!(
         body.get("pdus").and_then(|p| p.get(child_id.as_str())),
         Some(&json!({})),
-        "child should be accepted after gap-fill; body = {body}"
+        "child should stage; body = {body}"
     );
+
+    // The worker gap-fills the orphan and applies both. Once the child commits,
+    // the worker has parked, so the fetch count is stable.
+    let child_row = wait_committed(&store, child_id.as_ref()).await;
+    assert!(!child_row.rejected);
     // Ancestry grounds in a single round, so exactly one fetch (a needless
     // extra round would mean wasted peer traffic).
     assert_eq!(fetcher.call_count(), 1, "exactly one gap-fill round");
@@ -1428,8 +1525,10 @@ async fn send_gapfill_fetch_targets_frontier_and_state_boundary() {
 
     let _ = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
 
+    // The gap is unfillable (no-progress peer), so the worker backs off and
+    // retries — pin the *first* round's arguments rather than the call count.
+    wait_fetch_attempted(&fetcher).await;
     let calls = fetcher.calls();
-    assert_eq!(calls.len(), 1, "one fetch round");
     assert_eq!(
         calls[0].latest,
         vec![child.event_id.clone()],
@@ -1467,9 +1566,13 @@ async fn send_gapfills_over_multiple_rounds() {
     assert_eq!(
         body.get("pdus").and_then(|p| p.get(child_id.as_str())),
         Some(&json!({})),
-        "child accepted after multi-round gap-fill; body = {body}"
+        "child stages; body = {body}"
     );
 
+    // The two-round gap-fill all happens inside one worker drain (fetch A, then
+    // B, then ground); once the child commits the worker parks, so the recorded
+    // calls are stable.
+    wait_committed(&store, child_id.as_ref()).await;
     let calls = fetcher.calls();
     assert_eq!(calls.len(), 2, "two gap-fill rounds");
     assert_eq!(calls[0].limit, 10);
@@ -1494,7 +1597,7 @@ async fn send_resend_after_gapfill_is_idempotent() {
     // event) is a clean no-op via the fast-path persisted-check — no error, and
     // no second peer fetch.
     let fetcher = StubFetcher::no_progress();
-    let (app, _store, room_id, alice, join_id) =
+    let (app, store, room_id, alice, join_id) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
     let orphan = topic_on(&alice, &room_id, &join_id, "x", 1_700_000_002_000);
     let child = message_on(
@@ -1511,19 +1614,28 @@ async fn send_resend_after_gapfill_is_idempotent() {
     assert_eq!(
         body1.get("pdus").and_then(|p| p.get(child_id.as_str())),
         Some(&json!({})),
-        "first send accepted; body = {body1}"
+        "first send staged; body = {body1}"
     );
+    // Let the gap-fill complete and the child commit.
+    wait_committed(&store, child_id.as_ref()).await;
     let after_first = fetcher.call_count();
 
     // Resend under a fresh txn_id (a same txn_id would short-circuit on txn
-    // dedup; we want to exercise the apply-level idempotency instead).
+    // dedup; we want to exercise the apply-level idempotency instead). The
+    // handler re-stages the (now-committed) event; the worker applies it via
+    // the persisted-check no-op and unstages it — no gap-fill, no re-fetch.
     let (status, body2) = put_json(&app, &send_path("txn2"), &txn(&[&child])).await;
     assert_eq!(status, StatusCode::OK, "body = {body2}");
     assert_eq!(
         body2.get("pdus").and_then(|p| p.get(child_id.as_str())),
         Some(&json!({})),
-        "resend is an idempotent no-op; body = {body2}"
+        "resend stages; body = {body2}"
     );
+    // Wait for the worker to actually process the re-staged event (it drains
+    // back to empty), then assert it took the fast-path apply — no re-fetch.
+    // Deterministic: the count can never exceed `after_first`, since an
+    // already-committed event hits the persisted-check, never the gap-fill.
+    wait_staging_empty(&store, &room_id).await;
     assert_eq!(
         fetcher.call_count(),
         after_first,
@@ -1532,9 +1644,10 @@ async fn send_resend_after_gapfill_is_idempotent() {
 }
 
 #[tokio::test]
-async fn send_reports_error_when_fetcher_fails() {
-    // The peer is unreachable / errors: gap-fill can't proceed, so the PDU gets
-    // an error result (distinct from the no-progress "unfillable" case).
+async fn send_fetcher_failure_leaves_pdu_unapplied() {
+    // The peer is unreachable / errors: the worker's gap-fill can't proceed, so
+    // the staged PDU is never committed (it backs off and waits for a retry /
+    // restart). `/send` itself still 200s — the failure is off the request path.
     let fetcher = StubFetcher::erroring(502);
     let (app, store, room_id, alice, join_id) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
@@ -1551,20 +1664,19 @@ async fn send_reports_error_when_fetcher_fails() {
     let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
 
     assert_eq!(status, StatusCode::OK, "body = {body}");
-    let err = body
-        .get("pdus")
-        .and_then(|p| p.get(child_id.as_str()))
-        .and_then(|r| r.get("error"))
-        .and_then(Value::as_str);
-    assert!(err.is_some(), "expected an error result; body = {body}");
-    assert!(
-        fetcher.call_count() >= 1,
-        "the fetcher must have been asked"
+    assert_eq!(
+        body.get("pdus").and_then(|p| p.get(child_id.as_str())),
+        Some(&json!({})),
+        "staging succeeds; the peer failure is async; body = {body}"
     );
-    // The child was not committed.
-    let committed = store.get_events(&[child_id.as_ref()]).await.unwrap();
+    // The worker asked the (failing) peer, then gave up for now.
+    wait_fetch_attempted(&fetcher).await;
     assert!(
-        committed.is_empty(),
+        store
+            .get_events(&[child_id.as_ref()])
+            .await
+            .unwrap()
+            .is_empty(),
         "child must not be persisted on fetch failure"
     );
 }
@@ -1589,7 +1701,14 @@ async fn send_toposorts_out_of_order_batch() {
         .expect("build second");
     let (first_id, second_id) = (first.event_id.clone(), second.event_id.clone());
 
-    // child (second) listed before parent (first).
+    // child (second) listed before parent (first). The worker integrates the
+    // whole batch off the request path; both must end up committed (not
+    // rejected) regardless of array order. Deterministic toposort *ordering* is
+    // covered by `toposort_orders_parents_before_children` below — here we only
+    // assert durability + that the child lands as a timeline leaf, because the
+    // async worker may drain the two across separate passes (a child applied
+    // before its timeline parent is valid out-of-order federation receipt and
+    // leaves a transient extra extremity that self-heals).
     let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&second, &first])).await;
 
     assert_eq!(status, StatusCode::OK, "body = {body}");
@@ -1603,9 +1722,11 @@ async fn send_toposorts_out_of_order_batch() {
         Some(&json!({})),
         "body = {body}"
     );
-    // The later child is the timeline head.
-    let (timeline, _state) = store.forward_extremities(&room_id).await.unwrap().unwrap();
-    assert_eq!(timeline, [second_id].into_iter().collect());
+    // Both commit, neither rejected; the child is a timeline extremity.
+    let first_row = wait_committed(&store, first_id.as_ref()).await;
+    let second_row = wait_committed(&store, second_id.as_ref()).await;
+    assert!(!first_row.rejected && !second_row.rejected);
+    wait_timeline_contains(&store, &room_id, second_id.as_ref()).await;
 }
 
 #[tokio::test]
@@ -1638,7 +1759,9 @@ async fn send_handles_duplicate_pdu_in_batch() {
     let msg = message_on(&alice, &room_id, &join_id, "after join", 1_700_000_002_000);
     let msg_id = msg.event_id.clone();
 
-    // `join` appears twice, `msg` (which references join) once.
+    // `join` appears twice, `msg` (which references join) once. The handler
+    // dedups by event_id before staging (and staging is event_id-keyed), so the
+    // worker's toposort never sees the duplicate that used to underflow it.
     let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&join, &join, &msg])).await;
 
     assert_eq!(status, StatusCode::OK, "body = {body}");
@@ -1652,9 +1775,9 @@ async fn send_handles_duplicate_pdu_in_batch() {
         Some(&json!({})),
         "body = {body}"
     );
-    // Both distinct events persisted; the message is the timeline head.
-    let (timeline, _state) = store.forward_extremities(&room_id).await.unwrap().unwrap();
-    assert_eq!(timeline, [msg_id].into_iter().collect());
+    // Both distinct events persisted; the message ends up the timeline head.
+    wait_committed(&store, join_id.as_ref()).await;
+    wait_timeline_head(&store, &room_id, msg_id.as_ref()).await;
 }
 
 #[tokio::test]
@@ -1665,9 +1788,12 @@ async fn send_is_idempotent_on_duplicate_txn_id() {
 
     let (s1, _) = put_json(&app, &send_path("dup"), &txn(&[&msg])).await;
     assert_eq!(s1, StatusCode::OK);
+    // The worker integrates it.
+    wait_committed(&store, msg_id.as_ref()).await;
 
     // Re-send the same (origin, txn_id): acknowledged without reprocessing,
-    // empty results map.
+    // empty results map (the cheap whole-txn dedup short-circuits before any
+    // staging).
     let (s2, body2) = put_json(&app, &send_path("dup"), &txn(&[&msg])).await;
     assert_eq!(s2, StatusCode::OK);
     assert_eq!(body2, json!({ "pdus": {} }), "body = {body2}");
@@ -1680,8 +1806,8 @@ async fn send_is_idempotent_on_duplicate_txn_id() {
 #[tokio::test]
 async fn send_ignores_edus() {
     // A transaction carrying EDUs is accepted; the EDUs are dropped and the
-    // PDU is still processed.
-    let (app, _store, room_id, alice, join_id) = seed_joined_room().await;
+    // PDU is still staged + processed.
+    let (app, store, room_id, alice, join_id) = seed_joined_room().await;
     let msg = message_on(&alice, &room_id, &join_id, "with edus", 1_700_000_001_000);
     let msg_id = msg.event_id.clone();
     let mut body = txn(&[&msg]);
@@ -1695,6 +1821,8 @@ async fn send_ignores_edus() {
         Some(&json!({})),
         "body = {resp}"
     );
+    // The PDU is integrated despite the EDUs in the envelope.
+    wait_committed(&store, msg_id.as_ref()).await;
 }
 
 #[tokio::test]
@@ -1740,4 +1868,157 @@ async fn send_malformed_body_returns_400() {
         .unwrap();
     let (status, body) = drive(&app, req).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+}
+
+#[tokio::test]
+async fn worker_drains_rows_staged_before_startup() {
+    // Restart recovery: PDUs staged by a previous run (here: staged directly,
+    // simulating a crash after staging but before processing) are drained when
+    // the worker starts — its startup enumeration of `staged_rooms()` picks the
+    // room up with no poke from the handler.
+    let (store, tempfile) = fresh_store().await;
+    let alice = alice();
+    let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    let create_id = create.event_id.clone();
+    let join = EventBuilder::new(alice.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(alice.as_str().to_owned())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create_id.clone()])
+        .prev_state_events(vec![create_id.clone()])
+        .build()
+        .expect("build join");
+    let join_id = join.event_id.clone();
+    store
+        .create_room(&create, &[join])
+        .await
+        .expect("create_room");
+
+    // Stage a message *before* the router (and therefore the worker) exists.
+    let msg = message_on(
+        &alice,
+        &room_id,
+        &join_id,
+        "staged before boot",
+        1_700_000_001_000,
+    );
+    let msg_id = msg.event_id.clone();
+    let origin: &ServerName = "remote.example.org".try_into().unwrap();
+    assert!(
+        store
+            .stage_pdu(origin, &room_id, &msg.event_id, &msg.raw)
+            .await
+            .unwrap()
+    );
+
+    // Mounting the router spawns the worker, which enumerates the staged room
+    // on startup and drains it — no `/send` request involved.
+    let _app = router_with_store_and_fetcher(
+        config(),
+        store.clone(),
+        tempfile,
+        StubFetcher::no_progress(),
+    );
+    wait_committed(&store, msg_id.as_ref()).await;
+    wait_timeline_head(&store, &room_id, msg_id.as_ref()).await;
+}
+
+#[tokio::test]
+async fn worker_wedged_pdu_does_not_block_sibling() {
+    // One PDU has unfillable ancestry (it backs off forever); an independent,
+    // directly-appliable PDU in the same room must still be processed. Proves a
+    // backing-off event is skipped, not head-of-line blocking.
+    let fetcher = StubFetcher::no_progress();
+    let (app, store, room_id, alice, join_id) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+
+    // Wedged: references an orphan we never hold and the peer never supplies.
+    let orphan = message_on(&alice, &room_id, &join_id, "orphan", 1_700_000_002_000);
+    let wedged = message_on(
+        &alice,
+        &room_id,
+        &orphan.event_id,
+        "wedged",
+        1_700_000_003_000,
+    );
+    // Healthy: sits directly on the committed join, applies immediately.
+    let healthy = message_on(&alice, &room_id, &join_id, "healthy", 1_700_000_004_000);
+    let wedged_id = wedged.event_id.clone();
+    let healthy_id = healthy.event_id.clone();
+
+    let (status, _) = put_json(&app, &send_path("txn1"), &txn(&[&wedged, &healthy])).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // `healthy` commits despite the wedged sibling, and the wedged PDU reaches
+    // its (failing) gap-fill so it is now in a backoff window.
+    wait_committed(&store, healthy_id.as_ref()).await;
+    wait_fetch_attempted(&fetcher).await;
+
+    // Second wave: a *fresh* event arrives after `wedged` has failed once and is
+    // backing off. It must still drain — proving a permanently-failing PDU never
+    // head-of-line-blocks later arrivals across drain passes (the worker re-reads
+    // the backlog and makes progress on the eligible event whether `wedged` is
+    // skipped in its backoff window or retried-and-fails again). The first wave
+    // alone can't show this: there both PDUs were indegree-0 and processed in one
+    // pass, so `healthy` would commit even if backoff were broken.
+    let healthy2 = message_on(&alice, &room_id, &join_id, "healthy2", 1_700_000_005_000);
+    let healthy2_id = healthy2.event_id.clone();
+    let (status, _) = put_json(&app, &send_path("txn2"), &txn(&[&healthy2])).await;
+    assert_eq!(status, StatusCode::OK);
+    wait_committed(&store, healthy2_id.as_ref()).await;
+
+    // The wedged PDU is still uncommitted (its ancestry is permanently unfillable).
+    assert!(
+        store
+            .get_events(&[wedged_id.as_ref()])
+            .await
+            .unwrap()
+            .is_empty(),
+        "the wedged PDU must not be committed"
+    );
+}
+
+#[tokio::test]
+async fn send_drops_pdu_for_unknown_room() {
+    // A PDU for a room we never created (never joined) is dropped by the worker
+    // rather than retried forever — otherwise a peer could accumulate
+    // un-drainable staged rows + a permanent per-room task by naming nonexistent
+    // rooms. `/send` still 200s (the drop is async, off the request path).
+    let (app, store, _room_id, alice, _join_id) = seed_joined_room().await;
+
+    // A standalone room id we never register, plus a message that references it.
+    let other_create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let other_room = other_create.room_id.clone();
+    let msg = message_on(
+        &alice,
+        &other_room,
+        &other_create.event_id,
+        "into the void",
+        1_700_000_009_000,
+    );
+    let msg_id = msg.event_id.clone();
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&msg])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    // The worker drains the staged row by *dropping* it (unknown room), so
+    // staging empties and the event is never committed.
+    wait_staging_empty(&store, &other_room).await;
+    assert!(
+        store
+            .get_events(&[msg_id.as_ref()])
+            .await
+            .unwrap()
+            .is_empty(),
+        "a PDU for an unknown room must not be committed"
+    );
 }

@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -39,7 +40,7 @@ mod sliding_sync;
 mod multi_user;
 
 use federation::client::{FederationClient, ReqwestFetcher};
-use federation::send::MissingEventsFetcher;
+use federation::gapfill::MissingEventsFetcher;
 use room_actor::{RoomActorError, RoomRegistry};
 use sliding_sync::{SyncError, SyncState};
 
@@ -48,11 +49,15 @@ struct App {
     /// Per-room state-machine actors. CSAPI writes go through here so they
     /// are DAG-linked, auth-checked, and state-resolved.
     room_registry: Arc<RoomRegistry>,
-    /// Closes a received PDU's missing state-DAG ancestry by fetching it from
-    /// the originating peer (inbound `/send` gap-fill). Production wraps the
-    /// reqwest [`FederationClient`]; tests inject a stub via
-    /// [`AppState::from_store_with_fetcher`].
-    fetcher: Arc<dyn MissingEventsFetcher>,
+    /// In-process poke to the inbound staging worker. The `/send` handler sends
+    /// the room id of each freshly-staged PDU; the worker spawns or wakes that
+    /// room's drain task. Best-effort (`try_send`): a full buffer just means the
+    /// worker is already aware the room has work. Dropping the owning `AppState`
+    /// drops this sender, which shuts the worker down (see `federation::worker`).
+    /// INVARIANT: this is the *only* long-lived holder of the poke sender — the
+    /// worker tasks must never hold a clone, or the channel would never close
+    /// and the worker (plus its `store`/`registry` `Arc`s) would leak.
+    worker_poke: mpsc::Sender<OwnedRoomId>,
     sync_state: Arc<SyncState<SqliteStore>>,
     keys: Option<Value>,
     config: Config,
@@ -159,10 +164,11 @@ impl AppState {
     fn from_store(config: Config, store: Arc<SqliteStore>, tempfile: NamedTempFile) -> Self {
         // Production gap-fill fetcher: a reqwest client resolving peers as
         // `http://{server_name}` (trusted mesh). Built here rather than shared
-        // with the sender pool — a second connection pool is cheap, and sharing
-        // would add a `FederationClient` field on `App` that the fetcher is
-        // derivable from. The two clients also target different peer sets
-        // (inbound gap-fill origins vs outbound destinations).
+        // with the sender pool — a second connection pool is cheap, and the two
+        // clients target different peer sets (inbound gap-fill origins vs
+        // outbound destinations). It's moved straight into the worker below
+        // (which owns the only `Arc<dyn MissingEventsFetcher>`), so `App` holds
+        // no fetcher field.
         let client = Arc::new(FederationClient::new(config.server_name.clone()));
         let fetcher: Arc<dyn MissingEventsFetcher> = Arc::new(ReqwestFetcher::new(client));
         Self::from_store_with_fetcher(config, store, tempfile, fetcher)
@@ -179,10 +185,15 @@ impl AppState {
     ) -> Self {
         let sync_state = Arc::new(SyncState::new(store.clone()));
         let room_registry = Arc::new(RoomRegistry::new(store.clone(), config.server_name.clone()));
+        // Spawn the inbound staging worker bound to this store/registry/fetcher.
+        // It runs wherever the router does (production `serve` and the e2e
+        // tests), enumerates any leftover staged rows on startup, and stops when
+        // this `AppState` is dropped (the `worker_poke` sender drops with it).
+        let worker_poke = federation::worker::spawn(store.clone(), room_registry.clone(), fetcher);
         let app = App {
             store,
             room_registry,
-            fetcher,
+            worker_poke,
             sync_state,
             keys: None,
             config,

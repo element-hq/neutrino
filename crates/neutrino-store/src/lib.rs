@@ -354,11 +354,12 @@ pub struct AncestryGap {
     /// `prev_state_events` ids reachable from the query heads that are present
     /// in NEITHER the committed `events` NOR the staging area — the still-
     /// missing frontier to fetch from a peer. Empty ⇒ the heads' state
-    /// ancestry is fully grounded (staged ∪ committed) and can be promoted.
+    /// ancestry is fully grounded (staged ∪ committed), so the staged subgraph
+    /// can be applied (the inbound worker re-drains it).
     pub missing: Vec<OwnedEventId>,
     /// Staged event ids reachable from the query heads via `prev_state_events`
-    /// (a staged head counts itself) — the cached ancestry to promote once
-    /// `missing` is empty, and the boundary to exclude from the next peer
+    /// (a staged head counts itself) — the cached ancestry the worker drains
+    /// once `missing` is empty, and the boundary to exclude from the next peer
     /// fetch so we re-request only the frontier. Unordered.
     pub staged: Vec<OwnedEventId>,
 }
@@ -391,13 +392,20 @@ pub trait StagingStore: Send + Sync {
     ///       area; idempotent — re-staging the same id is a no-op (a peer may
     ///       resend, and gap-fill may re-fetch, the same event). Does NOT
     ///       advance the `subscribe` watch (staged events are invisible).
+    ///       Returns `true` if a new row was inserted, `false` if the id was
+    ///       already staged (an ignored duplicate) — the gap-fill loop uses
+    ///       this to tell "fetched new ancestry" from "peer re-sent what we
+    ///       already hold". Staging is deliberately *unbounded*: grounding an
+    ///       event requires fetching its entire state-DAG ancestry back to
+    ///       `m.room.create`, however deep (inherent to MSC4242 / auth-chain
+    ///       CRDTs), and the mesh is trusted.
     async fn stage_pdu(
         &self,
         origin: &ServerName,
         room_id: &RoomId,
         event_id: &EventId,
         raw: &RawJsonValue,
-    ) -> Result<(), StorageError>;
+    ) -> Result<bool, StorageError>;
 
     /// Pre:  none.
     /// Post: returns the distinct `room_id`s that have at least one staged PDU.
@@ -424,17 +432,8 @@ pub trait StagingStore: Send + Sync {
     ) -> Result<AncestryGap, StorageError>;
 
     /// Pre:  none.
-    /// Post: returns the staged raw bytes for each id in `event_ids` that is
-    ///       currently staged, in unspecified order; ids not staged are
-    ///       omitted (result length may be < `event_ids.len()`).
-    async fn staged_raw(
-        &self,
-        event_ids: &[&EventId],
-    ) -> Result<Vec<Box<RawJsonValue>>, StorageError>;
-
-    /// Pre:  none.
     /// Post: deletes the matching staged rows; idempotent — ids not present are
-    ///       ignored. Called after a staged subgraph has been promoted.
+    ///       ignored. Called once a staged PDU has been durably applied.
     async fn unstage_events(&self, event_ids: &[&EventId]) -> Result<(), StorageError>;
 }
 
@@ -474,9 +473,21 @@ pub trait FederationOutbox: Send + Sync {
 #[async_trait]
 pub trait FederationInbox: Send + Sync {
     /// Pre:  none.
+    /// Post: returns `true` if `(origin, txn_id)` has already been recorded, without
+    ///       recording it. The inbound `/send` handler uses this as a cheap whole-
+    ///       transaction short-circuit *before* staging — distinct from
+    ///       [`record_federation_txn`](Self::record_federation_txn), which is called
+    ///       only *after* the transaction's PDUs are durably staged, so a mid-stage
+    ///       fault leaves the txn unrecorded and a resend re-stages (never lost).
+    async fn federation_txn_seen(
+        &self,
+        origin: &ServerName,
+        txn_id: &str,
+    ) -> Result<bool, StorageError>;
+
+    /// Pre:  none.
     /// Post: records `(origin, txn_id)` as processed; returns `true` if it was already
-    ///       recorded (caller should return 200 immediately without reprocessing),
-    ///       `false` if this is the first time seeing this transaction.
+    ///       recorded, `false` if this is the first time seeing this transaction.
     async fn record_federation_txn(
         &self,
         origin: &ServerName,

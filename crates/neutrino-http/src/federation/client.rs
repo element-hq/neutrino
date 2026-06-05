@@ -20,7 +20,7 @@ use ruma::{OwnedEventId, RoomId, ServerName};
 use serde::Serialize;
 use serde_json::value::RawValue as RawJsonValue;
 
-use crate::federation::send::MissingEventsFetcher;
+use crate::federation::gapfill::MissingEventsFetcher;
 use crate::federation::{get_missing_events, now_ms};
 
 /// Connection-establishment timeout for a federation request.
