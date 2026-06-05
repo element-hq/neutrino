@@ -45,9 +45,12 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
-      - run: cargo test
-      - run: cargo test -p neutrino-http --features multi-user-shim --lib multi_user
-      - run: cargo test -p neutrino-http --features multi-user-shim --test e2e_multi_user
+      - uses: taiki-e/install-action@4bc351f7f2614e48088386e2a0ad917ca3a7e4ba # v2.81.5
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run
+      - run: cargo nextest run -p neutrino-http --features multi-user-shim --lib multi_user
+      - run: cargo nextest run -p neutrino-http --features multi-user-shim --test e2e_multi_user
 
   complement:
     runs-on: ubuntu-latest
