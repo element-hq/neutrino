@@ -154,10 +154,15 @@ Procedure:
        duplication & consolidation: actively search the wider codebase (rust-
        analyzer references/definition, grep) for existing code this diff duplicates
        or could delegate to — flag "this is the same as X, merge/delegate" and
-       "this field/method is derivable from an existing one". Project rule: derive
+       "this field/method is derivable from an existing one".
        don't duplicate; delegate to inner rather than reimplement an optimised
        method; collapse _with_X / _for_Y variant helpers into one abstraction.
        This requires reading beyond the diff. Prefix findings ARCH*.
+       VERY IMPORTANT: ALSO hunt reinvented primitives,
+       not just duplicated code: a poll where a signal/watch exists, a hand-rolled retry/backoff where one exists,
+       a busy-loop, an O(n) scan where an indexed store method exists.
+       Ask "is there existing infrastructure this mechanism should use?", not only "is this code duplicated?".
+       Prefix these ARCH-MECH*. Project rule: derive. If none, SAY SO.
 
 - Give every subagent: the scope (`git diff HEAD` unless told otherwise — they run it themselves), the "Code Review" rubric below, and these constraints: report EVERY finding numbered (with subagent prefix) with confidence (low/medium/high/certain) + severity (nit/minor/major/critical); read surrounding source to verify claims; do NOT edit files; return findings as the final message.
 - On return, synthesize: filter/rank, drop false positives (state WHY), present the merged list. Do NOT apply any fix without asking first.
