@@ -272,3 +272,42 @@ CREATE TABLE staged_events (
 ) STRICT, WITHOUT ROWID;
 
 CREATE INDEX ix_staged_events_room ON staged_events(room_id);
+
+-- ----------------------------------------------------------------------------
+-- oob_invites — InviteStore
+-- Out-of-band membership invites: an `m.room.member` invite for a room where
+-- we host the *invitee* but hold no room state (no `m.room.create`, no auth
+-- chain). Such an invite arrives via `PUT /_matrix/federation/v2/invite` and
+-- CANNOT go through `RoomCore::apply_pdu` — there is no state DAG to auth it
+-- against — so it lives here, outside `events` / `current_state`, and is
+-- invisible to every state-res / timeline read path.
+--
+-- Keyed by (room_id, state_key): for an invite member event the `state_key` is
+-- the invited user, so the pair is unique. `INSERT OR REPLACE` on the PK gives
+-- latest-invite-wins (a peer may re-invite after a decline; the freshest
+-- stripped state is the one to render). The denormalised event columns mirror
+-- `events` so the row hydrates through the shared `EventRow` path (no
+-- redaction, raw kept verbatim); `json` is the canonical invite event raw,
+-- carrying the inviting server's `unsigned.invite_room_state` (stripped state
+-- the sync builder renders the room name / inviter from).
+--
+-- No FK on `room_id` (we don't host the room — same posture as the FK-free
+-- `staged_events.room_id`). No `auth_events` / `rejected` / `soft_failed`
+-- columns: an OOB invite is never authed, so `get_invite` projects constant
+-- `'[]' / 0 / 0` for the `EventRow` hydration. No `user_version` bump
+-- (additive, no live data — same policy as the staged_events / FE columns).
+-- Surfaces only via the sync invite path, which unions
+-- `invited_oob_rooms(user)` into the room list.
+CREATE TABLE oob_invites (
+    room_id           TEXT    NOT NULL,
+    state_key         TEXT    NOT NULL,
+    event_id          TEXT    NOT NULL,
+    event_type        TEXT    NOT NULL,
+    sender            TEXT    NOT NULL,
+    origin_server_ts  INTEGER NOT NULL,
+    json              TEXT    NOT NULL,
+    PRIMARY KEY (room_id, state_key)
+) STRICT, WITHOUT ROWID;
+
+-- invited_oob_rooms(user): direct lookup by the invited user (state_key).
+CREATE INDEX ix_oob_invites_user ON oob_invites(state_key);

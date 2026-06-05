@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use neutrino_common::ROOM_VERSION_ID;
 use neutrino_common::event_id::compute_event_id;
-use neutrino_store::{Event, EventStore, RoomStore};
+use neutrino_store::{Event, EventStore, InviteStore, RoomStore};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5::{Request, request};
 use ruma::events::StateEventType;
@@ -963,6 +963,92 @@ async fn seed_invite(
         invite_json,
     );
     seed(store, &invite_event).await;
+}
+
+/// An out-of-band federated invite (no room state — stored via `InviteStore`,
+/// not `current_state`) must surface in sliding sync exactly like an in-room
+/// invite: the room appears, carries `invite_state` (stripped state from the
+/// invite's `unsigned.invite_room_state`), and its name lifts to the top level.
+/// This is the B1 read-path: `candidate_rooms` unions `invited_oob_rooms` and
+/// `build_invite_room` sources the event from `get_invite`.
+#[tokio::test]
+async fn oob_invite_surfaces_in_sliding_sync() {
+    let (store, _tmp) = fresh_store().await;
+    let user = user_id!("@alice:example.org");
+    let inviter = user_id!("@bob:other.example.org");
+    // A room we do NOT host — no `setup_room`, no create event, no current_state.
+    let room = room_id!("!remote:other.example.org");
+
+    let invite_json = serde_json::json!({
+        "room_id": room.as_str(),
+        "type": "m.room.member",
+        "state_key": user.as_str(),
+        "sender": inviter.as_str(),
+        "origin_server_ts": 80,
+        "content": {"membership": "invite"},
+        "unsigned": {
+            "invite_room_state": [
+                {
+                    "type": "m.room.name",
+                    "state_key": "",
+                    "sender": inviter.as_str(),
+                    "content": {"name": "Remote Room"}
+                },
+                {
+                    "type": "m.room.member",
+                    "state_key": inviter.as_str(),
+                    "sender": inviter.as_str(),
+                    "content": {"membership": "join"}
+                }
+            ]
+        }
+    });
+    let invite_event = make_event_from_json(
+        room,
+        "m.room.member",
+        Some(user.as_str()),
+        inviter,
+        80,
+        invite_json,
+    );
+    store.put_invite(room, user, &invite_event).await.unwrap();
+
+    let state = SyncState::new(store);
+    let mut req = Request::new();
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    req.lists = lists;
+    let resp = handle(&state, user, req).await.unwrap();
+
+    let room_res = resp
+        .rooms
+        .get(room)
+        .expect("out-of-band invite room surfaces in sliding sync");
+    assert!(
+        room_res.timeline.is_empty(),
+        "invited rooms don't carry a timeline"
+    );
+    let invite_state = room_res
+        .invite_state
+        .as_ref()
+        .expect("invite_state populated for an OOB invite");
+    let types: Vec<String> = invite_state
+        .iter()
+        .map(|raw| raw.get_field::<String>("type").unwrap().unwrap())
+        .collect();
+    assert!(
+        types.contains(&"m.room.name".to_string()),
+        "stripped invite_room_state passed through"
+    );
+    assert!(
+        types.contains(&"m.room.member".to_string()),
+        "invite membership itself included in invite_state"
+    );
+    assert_eq!(
+        room_res.name.as_deref(),
+        Some("Remote Room"),
+        "room name lifted from stripped state for the OOB invite"
+    );
 }
 
 #[tokio::test]

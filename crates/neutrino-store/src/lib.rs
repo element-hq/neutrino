@@ -508,9 +508,78 @@ pub trait FederationInbox: Send + Sync {
     ) -> Result<bool, StorageError>;
 }
 
+/// Out-of-band membership invites: invites for rooms where we host the
+/// **invitee** but hold no room state — no `m.room.create`, no auth chain —
+/// so they cannot go through `RoomCore::apply_pdu` (which auths a PDU against
+/// the room's state DAG). The inbound `/invite` federation handler stores the
+/// invite here; the sync invite path surfaces it.
+///
+/// Keyed by `(room_id, user_id)`. For an `m.room.member` invite the
+/// `state_key` *is* the invited `user_id`, so the pair uniquely identifies
+/// the invite. The stored event's `raw` carries the inviting server's
+/// `unsigned.invite_room_state` (already-stripped state events), which is the
+/// only room context we have pre-accept — the sync builder renders the room
+/// name / inviter from it.
+///
+/// This is a separate table from the authed room state on purpose: an OOB
+/// invite carries no auth and lives outside any room's DAG, so it must not be
+/// folded into `current_state` / `rooms_with_membership`. On accept (the room
+/// enters normal joined state) or reject (membership → leave) the stub is
+/// removed.
+#[async_trait]
+pub trait InviteStore: Send + Sync {
+    /// Pre:  `event` is an `m.room.member` event with `content.membership =
+    ///       "invite"`, `state_key == user_id`, and `room_id == room_id`; its
+    ///       `raw` is the canonical wire form (round-trips its `event_id`) and
+    ///       carries `unsigned.invite_room_state`.
+    /// Post: records the invite keyed by `(room_id, user_id)`, **replacing**
+    ///       any prior invite for the same pair — latest invite wins (a peer
+    ///       may re-invite after a decline; the most recent stripped state is
+    ///       the one to render). Does NOT advance the persist watch (an OOB
+    ///       invite is not a room event; it surfaces only via the sync invite
+    ///       path).
+    async fn put_invite(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+        event: &Event,
+    ) -> Result<(), StorageError>;
+
+    /// Pre:  none.
+    /// Post: returns the stored invite `m.room.member` event for
+    ///       `(room_id, user_id)`, or `None` if none is held. The returned
+    ///       `Event` round-trips the stored wire bytes (including
+    ///       `unsigned.invite_room_state`).
+    async fn get_invite(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+    ) -> Result<Option<Event>, StorageError>;
+
+    /// Pre:  none.
+    /// Post: deletes the invite for `(room_id, user_id)` if present;
+    ///       idempotent (a missing pair is a no-op). Called when the invite is
+    ///       accepted or rejected.
+    async fn remove_invite(&self, room_id: &RoomId, user_id: &UserId) -> Result<(), StorageError>;
+
+    /// Pre:  none.
+    /// Post: returns the `room_id` of every room in which `user_id` currently
+    ///       holds an out-of-band invite. Sync unions these into its room list
+    ///       (as membership = invite), separately from `rooms_with_membership`
+    ///       since OOB invites live in a different table and carry no auth.
+    async fn invited_oob_rooms(&self, user_id: &UserId) -> Result<Vec<OwnedRoomId>, StorageError>;
+}
+
 /// Combined storage interface. Use as a generic bound: `S: StorageBackend`.
 pub trait StorageBackend:
-    RoomStore + EventStore + StateStore + DagStore + FederationOutbox + FederationInbox + StagingStore
+    RoomStore
+    + EventStore
+    + StateStore
+    + DagStore
+    + FederationOutbox
+    + FederationInbox
+    + StagingStore
+    + InviteStore
 {
 }
 
@@ -522,5 +591,6 @@ impl<T> StorageBackend for T where
         + FederationOutbox
         + FederationInbox
         + StagingStore
+        + InviteStore
 {
 }
