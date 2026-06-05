@@ -33,6 +33,7 @@ use tracing::info;
 mod federation;
 mod legacy_sync;
 mod membership;
+mod messages;
 mod room_actor;
 mod sliding_sync;
 
@@ -309,6 +310,10 @@ fn build_router(state: AppState) -> Router {
         .route("/_matrix/client/v3/room_keys/version", get(get_room_keys))
         .route("/_matrix/client/v3/createRoom", post(create_room))
         .route("/_matrix/client/v3/rooms/{room_id}/members", get(members))
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/messages",
+            get(messages::get_messages),
+        )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/send/{type}/{msg_id}",
             put(put_event),

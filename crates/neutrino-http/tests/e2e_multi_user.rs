@@ -1214,3 +1214,62 @@ async fn unban_propagates_reason() {
         .and_then(|ev| ev["content"]["reason"].as_str());
     assert_eq!(reason, Some("appeal granted"), "{members}");
 }
+
+/// `GET /rooms/{roomId}/messages` is membership-gated: a user who never joined
+/// the room is rejected with `403 M_FORBIDDEN`, while the joined creator gets a
+/// `200`. createRoom auto-joins only the creator (alice), so bob — who makes no
+/// join call — is a genuine non-member.
+#[tokio::test]
+async fn messages_requires_membership() {
+    let app = router(config()).await.expect("router init");
+    let (_alice_id, alice_tok) = register(&app, "alice").await;
+    let (_bob_id, bob_tok) = register(&app, "bob").await;
+
+    let (s, room) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice_tok),
+        &json!({ "preset": "public_chat" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    // Bob never joined → 403 M_FORBIDDEN.
+    let (s, body) = send(
+        &app,
+        "GET",
+        &format!("/_matrix/client/v3/rooms/{room_id}/messages?dir=b"),
+        Some(&bob_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["errcode"], json!("M_FORBIDDEN"), "{body}");
+
+    // Alice (the joined creator) → 200.
+    let (s, body) = send(
+        &app,
+        "GET",
+        &format!("/_matrix/client/v3/rooms/{room_id}/messages?dir=b"),
+        Some(&alice_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+
+    // A malformed query param is rejected as 400 *before* the membership gate:
+    // Bob (non-member) sending an invalid `dir` gets 400 M_INVALID_PARAM, not
+    // 403. Params are validated ahead of the join check.
+    let (s, body) = send(
+        &app,
+        "GET",
+        &format!("/_matrix/client/v3/rooms/{room_id}/messages?dir=x"),
+        Some(&bob_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], json!("M_INVALID_PARAM"), "{body}");
+}
