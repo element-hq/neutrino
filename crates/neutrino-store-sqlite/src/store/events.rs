@@ -1193,7 +1193,10 @@ mod tests {
             .max()
             .expect("Alice's room has events");
         let global_max = all.iter().map(|(sp, _)| sp.0).max().expect("events exist");
-        assert!(global_max > alice_max, "Bob's later event owns the global max");
+        assert!(
+            global_max > alice_max,
+            "Bob's later event owns the global max"
+        );
 
         let head = s.room_stream_head(*ALICE_ROOM_ID).await.unwrap();
         assert_eq!(
