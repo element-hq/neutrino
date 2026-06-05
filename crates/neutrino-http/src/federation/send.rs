@@ -110,13 +110,12 @@ pub(crate) async fn handle(
         (app.store.clone(), app.worker_poke.clone())
     };
 
-    // Cheap whole-transaction dedup: a re-sent transaction whose PDUs were
-    // already staged (or staged-then-processed) is acknowledged without
-    // re-staging. Staging and application are both idempotent, so this is an
-    // optimization, not a correctness gate — its main value is avoiding the
-    // re-staging of PDUs the worker has already processed and unstaged.
+    // Cheap whole-transaction dedup: a re-sent transaction we've already fully
+    // staged is acknowledged without re-staging. This is a read-only *check* —
+    // the matching *record* happens only after staging succeeds (below), so a
+    // mid-stage fault never marks the txn done and a resend re-stages.
     if store
-        .record_federation_txn(&body.origin, &txn_id)
+        .federation_txn_seen(&body.origin, &txn_id)
         .await
         .map_err(FedError::Storage)?
     {
@@ -133,6 +132,12 @@ pub(crate) async fn handle(
     let mut pdus = BTreeMap::new();
     let mut seen: HashSet<OwnedEventId> = HashSet::new();
     let mut touched: BTreeSet<OwnedRoomId> = BTreeSet::new();
+    // Stays true only if every keyable PDU was durably staged. A storage fault
+    // on any one keeps the txn *unrecorded* so the peer's resend re-stages it
+    // (never-lose). An unkeyable/malformed PDU is an intentional drop, not a
+    // failure — it would fail identically on every resend, so it must not block
+    // recording.
+    let mut all_staged = true;
     for raw in body.pdus {
         let Ok(event) = from_wire(raw, Vec::new()) else {
             continue;
@@ -152,15 +157,25 @@ pub(crate) async fn handle(
                 PduResult::default()
             }
             // A storage write fault is a server-side problem; surface it on this
-            // PDU and carry on staging the rest of the batch.
+            // PDU, keep staging the rest, and leave the txn unrecorded.
             Err(e) => {
                 warn!(event_id = %id, error = %e, "staging PDU failed");
+                all_staged = false;
                 PduResult {
                     error: Some(e.to_string()),
                 }
             }
         };
         pdus.insert(id, result);
+    }
+
+    // Record the transaction as processed only now that its PDUs are durably
+    // staged (and only if all of them are) — the never-lose ordering.
+    if all_staged {
+        store
+            .record_federation_txn(&body.origin, &txn_id)
+            .await
+            .map_err(FedError::Storage)?;
     }
 
     // Poke the worker once per touched room, *after* the rows are committed.

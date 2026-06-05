@@ -274,16 +274,23 @@ async fn process_one(
             unstage(ctx, &id).await;
             backoff.remove(&id);
         }
-        // Missing state-DAG ancestry: fetch the gap into staging. On success
-        // the gap is now staged and the next pass applies it ahead of this PDU,
-        // so clear the backoff to retry promptly. On failure (unfillable / peer
-        // error / cap reached) back off.
+        // Retryable verdict. `fill_state_ancestry` returns `Ok(true)` if it
+        // staged a real missing-ancestry gap — clear the backoff so the next
+        // pass applies the now-staged ancestry ahead of this PDU. `Ok(false)`
+        // means the ancestry was already grounded and nothing was fetched, i.e.
+        // the retryable verdict was a transient state-res / storage fault, not a
+        // gap — back off rather than spin re-applying. `Err` (unfillable / peer
+        // failure) also backs off.
         Err(RoomActorError::Apply(e)) if e.is_retryable() => {
             match fill_state_ancestry(&ctx.store, &staged.origin, &staged.event, &*ctx.fetcher)
                 .await
             {
-                Ok(()) => {
+                Ok(true) => {
                     backoff.remove(&id);
+                }
+                Ok(false) => {
+                    debug!(%id, "retryable apply with no gap to fill; backing off");
+                    bump_backoff(backoff, id, ctx.backoff_base);
                 }
                 Err(reason) => {
                     warn!(%id, reason, "gap-fill failed; backing off");
@@ -298,10 +305,16 @@ async fn process_one(
             unstage(ctx, &id).await;
             backoff.remove(&id);
         }
-        // The room isn't known yet (its create may still be in flight): retry.
+        // We have no record of this room. A federation `/send` only arrives for
+        // rooms we've joined (the join handshake establishes room state before
+        // live events flow), so an unknown room is anomalous, not a pre-create
+        // race. Drop the PDU rather than retry forever — otherwise an
+        // unauthenticated peer could accumulate un-drainable staged rows + a
+        // permanent per-room task by naming nonexistent rooms.
         Err(RoomActorError::UnknownRoom) => {
-            debug!(%id, "room unknown; backing off staged PDU");
-            bump_backoff(backoff, id, ctx.backoff_base);
+            warn!(%id, %room, "dropping staged PDU for unknown room");
+            unstage(ctx, &id).await;
+            backoff.remove(&id);
         }
         // Storage / actor faults: transient, back off and retry. (`Rejected`
         // and `Build` never arise on the `apply_pdu` path.)
@@ -388,4 +401,61 @@ fn toposort(items: Vec<Staged>) -> Vec<Staged> {
 
     let mut slots: Vec<Option<Staged>> = items.into_iter().map(Some).collect();
     order.into_iter().filter_map(|i| slots[i].take()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use neutrino_common::ROOM_VERSION_ID;
+    use neutrino_state::event_id::EventBuilder;
+    use ruma::{OwnedUserId, server_name};
+    use serde_json::json;
+
+    use super::*;
+
+    fn staged(event: Event) -> Staged {
+        Staged {
+            event,
+            origin: server_name!("example.org").to_owned(),
+        }
+    }
+
+    /// A linear chain create → a → b → c (each `prev_*` points at the previous),
+    /// returned oldest-first; `create` is the grounded root, not part of a batch.
+    fn chain() -> (Event, Event, Event) {
+        let alice: OwnedUserId = "@alice:example.org".parse().unwrap();
+        let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
+            .state_key(String::new())
+            .content(json!({ "room_version": ROOM_VERSION_ID }))
+            .build()
+            .unwrap();
+        let room_id = create.room_id.clone();
+        let on = |prev: &Event, body: &str| {
+            EventBuilder::new(alice.clone(), "m.room.message".to_owned())
+                .room_id(room_id.clone())
+                .content(json!({ "msgtype": "m.text", "body": body }))
+                .prev_events(vec![prev.event_id.clone()])
+                .prev_state_events(vec![prev.event_id.clone()])
+                .build()
+                .unwrap()
+        };
+        let a = on(&create, "a");
+        let b = on(&a, "b");
+        let c = on(&b, "c");
+        (a, b, c)
+    }
+
+    #[test]
+    fn toposort_orders_parents_before_children() {
+        let (a, b, c) = chain();
+        let (a_id, b_id, c_id) = (a.event_id.clone(), b.event_id.clone(), c.event_id.clone());
+
+        // Feed in a shuffled, child-before-parent order.
+        let ordered = toposort(vec![staged(c), staged(a), staged(b)]);
+        let ids: Vec<OwnedEventId> = ordered.into_iter().map(|s| s.event.event_id).collect();
+        let pos = |id: &OwnedEventId| ids.iter().position(|x| x == id).unwrap();
+
+        assert_eq!(ids.len(), 3);
+        assert!(pos(&a_id) < pos(&b_id), "a must precede b: {ids:?}");
+        assert!(pos(&b_id) < pos(&c_id), "b must precede c: {ids:?}");
+    }
 }

@@ -59,12 +59,18 @@ pub(crate) trait MissingEventsFetcher: Send + Sync {
 /// forward extremities` (the committed bottom boundary). The newly fetched
 /// events are staged, not applied — the worker's drain loop applies them.
 ///
-/// Returns `Ok(())` once the ancestry is fully staged. Returns `Err(reason)` on
-/// any terminal condition for *this* attempt: the peer has nothing new (an
-/// empty result, or a round that re-sends only events we already hold — both
-/// "unfillable"), a peer transport/HTTP failure, or a storage fault. The caller
-/// (the worker) backs the PDU off and retries later; staged ancestry from a
-/// partial round is left durable, so a retry resumes from it.
+/// Returns `Ok(true)` once the ancestry is fully staged *and this call staged at
+/// least one new event* — i.e. it made progress, so the worker should re-drain
+/// and retry the PDU immediately. Returns `Ok(false)` when the ancestry was
+/// *already* grounded on entry and nothing was fetched: the triggering
+/// `apply_pdu` was retryable for a reason other than a real state-DAG gap (a
+/// transient state-res / storage fault, or a not-yet-known room), so the worker
+/// must back off rather than spin. Returns `Err(reason)` on a terminal failure
+/// for *this* attempt: the peer has nothing new (an empty result, or a round
+/// that re-sends only events we already hold — both "unfillable"), a peer
+/// transport/HTTP failure, or a storage fault. In every non-`Ok(true)` case the
+/// worker backs the PDU off; staged ancestry from a partial round is durable, so
+/// a later retry resumes from it.
 ///
 /// The loop is **unbounded** in rounds: grounding requires the *whole* state-DAG
 /// ancestry to `m.room.create`, however deep (inherent to MSC4242 — like
@@ -76,10 +82,14 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
     origin: &ServerName,
     event: &Event,
     fetcher: &F,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let room_id = &event.room_id;
     let earliest = state_dag_boundary(store, room_id).await;
     let mut limit = INITIAL_GAPFILL_LIMIT;
+    // Whether any round staged a new event. `false` at a grounded exit means the
+    // retryable verdict wasn't a real gap (transient fault) — the signal the
+    // worker uses to back off instead of immediately retrying (which would spin).
+    let mut made_progress = false;
 
     loop {
         let heads: Vec<&EventId> = event.prev_state_events.iter().map(|e| e.as_ref()).collect();
@@ -88,7 +98,7 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
             .await
             .map_err(|e| e.to_string())?;
         if gap.missing.is_empty() {
-            return Ok(());
+            return Ok(made_progress);
         }
 
         // `latest` = the event plus the staged boundary. The peer excludes
@@ -121,6 +131,13 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
                 if ancestor.room_id != *room_id {
                     continue;
                 }
+                // Stage the fetched ancestor under `origin` — the peer that
+                // referenced it, not its true author. That's deliberate: if this
+                // ancestor itself later needs gap-filling we ask the same peer
+                // (it vouched for the reference), and `origin` is otherwise
+                // unused (no signature checks in the trusted mesh). At worst a
+                // wrong peer delays grounding, which the no-progress terminator
+                // and a later redelivery resolve.
                 if store
                     .stage_pdu(origin, room_id, &ancestor.event_id, &ancestor.raw)
                     .await
@@ -139,6 +156,7 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
         if staged_new == 0 {
             return Err("missing ancestry, gap unfillable: peer returned no new events".to_owned());
         }
+        made_progress = true;
         limit = limit.saturating_mul(2);
     }
 }

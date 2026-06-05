@@ -1287,6 +1287,38 @@ async fn wait_timeline_head(store: &SqliteStore, room_id: &RoomId, expected: &ru
     panic!("timeline head did not advance to {expected} within timeout");
 }
 
+/// Poll until `id` is one of the room's timeline forward extremities (a leaf).
+/// Weaker than [`wait_timeline_head`] — used where the async worker may leave a
+/// *transient* extra extremity (e.g. a child applied before its timeline parent
+/// across two drain passes), which is valid federation behaviour and self-heals.
+async fn wait_timeline_contains(store: &SqliteStore, room_id: &RoomId, id: &ruma::EventId) {
+    for _ in 0..500 {
+        if let Ok(Some((timeline, _state))) = store.forward_extremities(room_id).await
+            && timeline.contains(id)
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("{id} did not become a timeline extremity within timeout");
+}
+
+/// Poll until the room has no staged rows left (the worker drained it).
+async fn wait_staging_empty(store: &SqliteStore, room_id: &RoomId) {
+    for _ in 0..500 {
+        if store
+            .staged_for_room(room_id)
+            .await
+            .map(|v| v.is_empty())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("staging for {room_id} did not drain within timeout");
+}
+
 /// Poll until the stub fetcher has recorded at least one call — i.e. the worker
 /// reached the gap-fill for a PDU with missing ancestry.
 async fn wait_fetch_attempted(fetcher: &StubFetcher) {
@@ -1599,10 +1631,11 @@ async fn send_resend_after_gapfill_is_idempotent() {
         Some(&json!({})),
         "resend stages; body = {body2}"
     );
-    // Give the worker time to (wrongly) re-fetch; it must not. The count can
-    // never exceed `after_first` — an already-committed event takes the
-    // fast-path apply, never the retryable gap-fill.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Wait for the worker to actually process the re-staged event (it drains
+    // back to empty), then assert it took the fast-path apply — no re-fetch.
+    // Deterministic: the count can never exceed `after_first`, since an
+    // already-committed event hits the persisted-check, never the gap-fill.
+    wait_staging_empty(&store, &room_id).await;
     assert_eq!(
         fetcher.call_count(),
         after_first,
@@ -1668,8 +1701,14 @@ async fn send_toposorts_out_of_order_batch() {
         .expect("build second");
     let (first_id, second_id) = (first.event_id.clone(), second.event_id.clone());
 
-    // child (second) listed before parent (first). The worker toposorts the
-    // room's staged rows, so the parent still applies first.
+    // child (second) listed before parent (first). The worker integrates the
+    // whole batch off the request path; both must end up committed (not
+    // rejected) regardless of array order. Deterministic toposort *ordering* is
+    // covered by `toposort_orders_parents_before_children` below — here we only
+    // assert durability + that the child lands as a timeline leaf, because the
+    // async worker may drain the two across separate passes (a child applied
+    // before its timeline parent is valid out-of-order federation receipt and
+    // leaves a transient extra extremity that self-heals).
     let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&second, &first])).await;
 
     assert_eq!(status, StatusCode::OK, "body = {body}");
@@ -1683,9 +1722,11 @@ async fn send_toposorts_out_of_order_batch() {
         Some(&json!({})),
         "body = {body}"
     );
-    // Both apply; the later child ends up the timeline head.
-    wait_committed(&store, first_id.as_ref()).await;
-    wait_timeline_head(&store, &room_id, second_id.as_ref()).await;
+    // Both commit, neither rejected; the child is a timeline extremity.
+    let first_row = wait_committed(&store, first_id.as_ref()).await;
+    let second_row = wait_committed(&store, second_id.as_ref()).await;
+    assert!(!first_row.rejected && !second_row.rejected);
+    wait_timeline_contains(&store, &room_id, second_id.as_ref()).await;
 }
 
 #[tokio::test]
@@ -1913,10 +1954,25 @@ async fn worker_wedged_pdu_does_not_block_sibling() {
     let (status, _) = put_json(&app, &send_path("txn1"), &txn(&[&wedged, &healthy])).await;
     assert_eq!(status, StatusCode::OK);
 
-    // The healthy PDU commits despite the wedged sibling backing off; the wedged
-    // one is never committed.
+    // `healthy` commits despite the wedged sibling, and the wedged PDU reaches
+    // its (failing) gap-fill so it is now in a backoff window.
     wait_committed(&store, healthy_id.as_ref()).await;
     wait_fetch_attempted(&fetcher).await;
+
+    // Second wave: a *fresh* event arrives after `wedged` has failed once and is
+    // backing off. It must still drain — proving a permanently-failing PDU never
+    // head-of-line-blocks later arrivals across drain passes (the worker re-reads
+    // the backlog and makes progress on the eligible event whether `wedged` is
+    // skipped in its backoff window or retried-and-fails again). The first wave
+    // alone can't show this: there both PDUs were indegree-0 and processed in one
+    // pass, so `healthy` would commit even if backoff were broken.
+    let healthy2 = message_on(&alice, &room_id, &join_id, "healthy2", 1_700_000_005_000);
+    let healthy2_id = healthy2.event_id.clone();
+    let (status, _) = put_json(&app, &send_path("txn2"), &txn(&[&healthy2])).await;
+    assert_eq!(status, StatusCode::OK);
+    wait_committed(&store, healthy2_id.as_ref()).await;
+
+    // The wedged PDU is still uncommitted (its ancestry is permanently unfillable).
     assert!(
         store
             .get_events(&[wedged_id.as_ref()])
@@ -1924,5 +1980,45 @@ async fn worker_wedged_pdu_does_not_block_sibling() {
             .unwrap()
             .is_empty(),
         "the wedged PDU must not be committed"
+    );
+}
+
+#[tokio::test]
+async fn send_drops_pdu_for_unknown_room() {
+    // A PDU for a room we never created (never joined) is dropped by the worker
+    // rather than retried forever — otherwise a peer could accumulate
+    // un-drainable staged rows + a permanent per-room task by naming nonexistent
+    // rooms. `/send` still 200s (the drop is async, off the request path).
+    let (app, store, _room_id, alice, _join_id) = seed_joined_room().await;
+
+    // A standalone room id we never register, plus a message that references it.
+    let other_create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let other_room = other_create.room_id.clone();
+    let msg = message_on(
+        &alice,
+        &other_room,
+        &other_create.event_id,
+        "into the void",
+        1_700_000_009_000,
+    );
+    let msg_id = msg.event_id.clone();
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&msg])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    // The worker drains the staged row by *dropping* it (unknown room), so
+    // staging empties and the event is never committed.
+    wait_staging_empty(&store, &other_room).await;
+    assert!(
+        store
+            .get_events(&[msg_id.as_ref()])
+            .await
+            .unwrap()
+            .is_empty(),
+        "a PDU for an unknown room must not be committed"
     );
 }

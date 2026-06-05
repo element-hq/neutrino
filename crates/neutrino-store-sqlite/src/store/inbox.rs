@@ -9,6 +9,25 @@ use crate::{SqliteStore, error::Error};
 
 #[async_trait]
 impl FederationInbox for SqliteStore {
+    async fn federation_txn_seen(
+        &self,
+        origin: &ServerName,
+        txn_id: &str,
+    ) -> Result<bool, StorageError> {
+        let origin = origin.to_owned();
+        let txn_id = txn_id.to_owned();
+
+        self.run_read(move |conn| -> Result<bool, Error> {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM federation_txns WHERE origin = ? AND txn_id = ?)",
+                params![origin.as_str(), txn_id],
+                |row| row.get(0),
+            )
+            .map_err(Error::from)
+        })
+        .await
+    }
+
     async fn record_federation_txn(
         &self,
         origin: &ServerName,
@@ -79,6 +98,19 @@ mod tests {
         assert!(s.record_federation_txn(origin_a, "txn1").await.unwrap());
         assert!(s.record_federation_txn(origin_b, "txn1").await.unwrap());
         assert!(s.record_federation_txn(origin_a, "txn2").await.unwrap());
+    }
+
+    // I5: `federation_txn_seen` reports membership without recording.
+    #[tokio::test]
+    async fn federation_txn_seen_does_not_record() {
+        let s = store().await;
+        let origin = server_name!("matrix.org");
+        // Not yet recorded — seen is false, and checking does not record it.
+        assert!(!s.federation_txn_seen(origin, "txn1").await.unwrap());
+        assert!(!s.federation_txn_seen(origin, "txn1").await.unwrap());
+        // Recording it then makes seen true.
+        assert!(!s.record_federation_txn(origin, "txn1").await.unwrap());
+        assert!(s.federation_txn_seen(origin, "txn1").await.unwrap());
     }
 
     // I4: SQL injection defence. A malicious txn_id is stored verbatim

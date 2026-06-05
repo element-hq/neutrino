@@ -54,6 +54,9 @@ struct App {
     /// room's drain task. Best-effort (`try_send`): a full buffer just means the
     /// worker is already aware the room has work. Dropping the owning `AppState`
     /// drops this sender, which shuts the worker down (see `federation::worker`).
+    /// INVARIANT: this is the *only* long-lived holder of the poke sender — the
+    /// worker tasks must never hold a clone, or the channel would never close
+    /// and the worker (plus its `store`/`registry` `Arc`s) would leak.
     worker_poke: mpsc::Sender<OwnedRoomId>,
     sync_state: Arc<SyncState<SqliteStore>>,
     keys: Option<Value>,
@@ -161,10 +164,11 @@ impl AppState {
     fn from_store(config: Config, store: Arc<SqliteStore>, tempfile: NamedTempFile) -> Self {
         // Production gap-fill fetcher: a reqwest client resolving peers as
         // `http://{server_name}` (trusted mesh). Built here rather than shared
-        // with the sender pool — a second connection pool is cheap, and sharing
-        // would add a `FederationClient` field on `App` that the fetcher is
-        // derivable from. The two clients also target different peer sets
-        // (inbound gap-fill origins vs outbound destinations).
+        // with the sender pool — a second connection pool is cheap, and the two
+        // clients target different peer sets (inbound gap-fill origins vs
+        // outbound destinations). It's moved straight into the worker below
+        // (which owns the only `Arc<dyn MissingEventsFetcher>`), so `App` holds
+        // no fetcher field.
         let client = Arc::new(FederationClient::new(config.server_name.clone()));
         let fetcher: Arc<dyn MissingEventsFetcher> = Arc::new(ReqwestFetcher::new(client));
         Self::from_store_with_fetcher(config, store, tempfile, fetcher)
