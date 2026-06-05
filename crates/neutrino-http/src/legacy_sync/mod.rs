@@ -170,6 +170,9 @@ mod tests {
             "sender": inviter.as_str(),
             "origin_server_ts": 80u64,
             "content": {"membership": "invite"},
+            "hashes": {"sha256": "abcDEF0123456789"},
+            "prev_events": [],
+            "prev_state_events": [],
             "unsigned": {"invite_room_state": [
                 {"type": "m.room.name", "state_key": "", "sender": inviter.as_str(),
                  "content": {"name": name}},

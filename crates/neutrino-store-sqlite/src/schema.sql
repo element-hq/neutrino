@@ -285,27 +285,23 @@ CREATE INDEX ix_staged_events_room ON staged_events(room_id);
 -- Keyed by (room_id, state_key): for an invite member event the `state_key` is
 -- the invited user, so the pair is unique. `INSERT OR REPLACE` on the PK gives
 -- latest-invite-wins (a peer may re-invite after a decline; the freshest
--- stripped state is the one to render). The denormalised event columns mirror
--- `events` so the row hydrates through the shared `EventRow` path (no
--- redaction, raw kept verbatim); `json` is the canonical invite event raw,
--- carrying the inviting server's `unsigned.invite_room_state` (stripped state
--- the sync builder renders the room name / inviter from).
+-- stripped state is the one to render). Only the canonical invite event `json`
+-- is stored — every other field (event_id, type, sender, ts, content,
+-- prev_events) is derivable from it, so `get_invite` rehydrates via the
+-- verbatim `compute_event_id` + `parse_event` path (mirrors how
+-- `staged_events` rehydrates from `json` alone — no denormalised columns to
+-- drift). Crucially it does NOT redact (unlike `from_wire`), so the inviting
+-- server's `unsigned.invite_room_state` (stripped state the sync builder
+-- renders the room name / inviter from) survives.
 --
 -- No FK on `room_id` (we don't host the room — same posture as the FK-free
--- `staged_events.room_id`). No `auth_events` / `rejected` / `soft_failed`
--- columns: an OOB invite is never authed, so `get_invite` projects constant
--- `'[]' / 0 / 0` for the `EventRow` hydration. No `user_version` bump
--- (additive, no live data — same policy as the staged_events / FE columns).
--- Surfaces only via the sync invite path, which unions
--- `invited_oob_rooms(user)` into the room list.
+-- `staged_events.room_id`). No `user_version` bump (additive, no live data —
+-- same policy as the staged_events / FE columns). Surfaces only via the sync
+-- invite path, which unions `invited_oob_rooms(user)` into the room list.
 CREATE TABLE oob_invites (
-    room_id           TEXT    NOT NULL,
-    state_key         TEXT    NOT NULL,
-    event_id          TEXT    NOT NULL,
-    event_type        TEXT    NOT NULL,
-    sender            TEXT    NOT NULL,
-    origin_server_ts  INTEGER NOT NULL,
-    json              TEXT    NOT NULL,
+    room_id    TEXT NOT NULL,
+    state_key  TEXT NOT NULL,
+    json       TEXT NOT NULL,
     PRIMARY KEY (room_id, state_key)
 ) STRICT, WITHOUT ROWID;
 

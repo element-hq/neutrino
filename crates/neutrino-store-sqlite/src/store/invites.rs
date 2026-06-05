@@ -6,27 +6,27 @@
 //! contract. Keyed by `(room_id, state_key)` where the `state_key` is the
 //! invited user; `INSERT OR REPLACE` on that PK gives latest-invite-wins.
 //!
-//! Rows hydrate through the shared [`EventRow`] path (raw kept verbatim — no
-//! redaction), the same way every other `Event` is read; the three
-//! auth-verdict columns `EventRow` expects (`auth_events_json` / `rejected` /
-//! `soft_failed`) are projected as constants since an OOB invite is never
-//! authed. Nothing here advances the persist watch — an OOB invite is not a
-//! room event and surfaces only via the sync invite path.
+//! Only the canonical invite event `json` is stored; `get_invite` rehydrates
+//! the `Event` verbatim via `compute_event_id` + `parse_event` — the same
+//! wire→`Event` field parsing `from_wire` uses, **minus the redaction step**.
+//! Skipping redaction is the point: `from_wire` redacts on a content-hash
+//! miss, which would strip the inviting server's `unsigned.invite_room_state`
+//! (the stripped state the sync builder renders from). Every other field
+//! (event_id, type, sender, ts, content, prev_events) is derivable from
+//! `json`, so no denormalised columns are stored — the same posture as
+//! `staged_events`. Nothing here advances the persist watch — an OOB invite is
+//! not a room event and surfaces only via the sync invite path.
 
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{OptionalExtension, params};
 use neutrino_common::Event;
+use neutrino_common::event_id::compute_event_id;
+use neutrino_state::validate::parse_event;
 use neutrino_store::{InviteStore, StorageError};
 use ruma::{OwnedRoomId, RoomId, UserId};
+use serde_json::value::RawValue as RawJsonValue;
 
-use crate::{SqliteStore, error::Error, row::EventRow};
-
-/// Projection feeding [`EventRow::try_from`]: the stored columns plus the
-/// three auth-verdict columns as constants (an OOB invite is never authed).
-/// `EventRow` reads columns by name, so the constant aliases satisfy it.
-const OOB_INVITE_SELECT: &str = "SELECT event_id, room_id, event_type, state_key, sender, \
-     origin_server_ts, json, '[]' AS auth_events_json, 0 AS rejected, 0 AS soft_failed \
-     FROM oob_invites WHERE room_id = ? AND state_key = ?";
+use crate::{SqliteStore, error::Error};
 
 #[async_trait]
 impl InviteStore for SqliteStore {
@@ -38,33 +38,15 @@ impl InviteStore for SqliteStore {
     ) -> Result<(), StorageError> {
         let room_id = room_id.as_str().to_owned();
         let state_key = user_id.as_str().to_owned();
-        let event_id = event.event_id.as_str().to_owned();
-        let event_type = event.event_type.clone();
-        let sender = event.sender.as_str().to_owned();
         let json = event.raw.get().to_owned();
-        let origin_server_ts = i64::try_from(event.origin_server_ts).map_err(|_| {
-            Error::InvalidInput(format!(
-                "origin_server_ts {} exceeds i64::MAX",
-                event.origin_server_ts
-            ))
-        })?;
 
         self.run_write(move |conn| -> Result<(), Error> {
             // INSERT OR REPLACE on the (room_id, state_key) PK: a re-invite for
             // the same pair overwrites the prior stub — latest wins.
             conn.execute(
-                "INSERT OR REPLACE INTO oob_invites \
-                 (room_id, state_key, event_id, event_type, sender, origin_server_ts, json) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![
-                    room_id,
-                    state_key,
-                    event_id,
-                    event_type,
-                    sender,
-                    origin_server_ts,
-                    json
-                ],
+                "INSERT OR REPLACE INTO oob_invites (room_id, state_key, json) \
+                 VALUES (?, ?, ?)",
+                params![room_id, state_key, json],
             )?;
             Ok(())
         })
@@ -79,11 +61,29 @@ impl InviteStore for SqliteStore {
         let room_id = room_id.as_str().to_owned();
         let state_key = user_id.as_str().to_owned();
         self.run_read(move |conn| -> Result<Option<Event>, Error> {
-            conn.query_row(OOB_INVITE_SELECT, params![room_id, state_key], |row| {
-                Ok(EventRow::try_from(row).map(EventRow::into_event))
-            })
-            .optional()?
-            .transpose()
+            let json: Option<String> = conn
+                .query_row(
+                    "SELECT json FROM oob_invites WHERE room_id = ? AND state_key = ?",
+                    params![room_id, state_key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(json) = json else { return Ok(None) };
+            let raw = RawJsonValue::from_string(json).map_err(|e| {
+                Error::Internal(format!("malformed oob invite json in DB row: {e}"))
+            })?;
+            // Verbatim rehydrate: compute the id from the canonical bytes, then
+            // parse the fields keeping `raw` (and `unsigned.invite_room_state`)
+            // byte-for-byte. NOT `from_wire` — that redacts on a content-hash
+            // miss and would strip `unsigned`. The event was validated on
+            // receipt, so a parse failure here is DB corruption ⇒ Internal.
+            let event_id = compute_event_id(&raw).map_err(|e| {
+                Error::Internal(format!("oob invite event_id recompute failed: {e}"))
+            })?;
+            let event = parse_event(raw, event_id, Vec::new()).map_err(|e| {
+                Error::Internal(format!("malformed oob invite event in DB row: {e}"))
+            })?;
+            Ok(Some(event))
         })
         .await
     }
@@ -121,30 +121,32 @@ impl InviteStore for SqliteStore {
 
 #[cfg(test)]
 mod tests {
+    use neutrino_common::Event;
+    use neutrino_common::event_id::compute_event_id;
     use neutrino_store::InviteStore;
-    use ruma::{room_id, user_id};
-    use serde_json::json;
+    use ruma::{RoomId, UserId, room_id, user_id};
+    use serde_json::value::RawValue;
+    use serde_json::{Value, json};
 
-    use crate::tests::{make_event_with_raw_json, store};
+    use crate::tests::store;
 
-    /// An invite `m.room.member` event for a *remote* room we don't host,
-    /// carrying the inviting server's `unsigned.invite_room_state`. Built via
-    /// `make_event_with_raw_json` so the raw bytes (incl. `unsigned`) are
-    /// stored verbatim — the whole point is that the round-trip preserves
-    /// them.
-    fn remote_invite(
-        room: &ruma::RoomId,
-        invited: &ruma::UserId,
-        inviter: &ruma::UserId,
-        room_name: &str,
-    ) -> neutrino_common::Event {
-        let raw = json!({
+    /// A wire-shaped invite `m.room.member` event for a *remote* room we don't
+    /// host, carrying `hashes` (required by `parse_event`) and the inviting
+    /// server's `unsigned.invite_room_state`. The `event_id` is the real
+    /// reference hash of the bytes (as it would be on receipt), so a
+    /// `get_invite` that recomputes it matches; storing the whole raw is what
+    /// preserves `unsigned` across the round trip.
+    fn remote_invite(room: &RoomId, invited: &UserId, inviter: &UserId, room_name: &str) -> Event {
+        let body: Value = json!({
             "type": "m.room.member",
             "room_id": room.as_str(),
             "sender": inviter.as_str(),
             "state_key": invited.as_str(),
             "origin_server_ts": 1_700_000_000_000u64,
             "content": { "membership": "invite" },
+            // parse_event requires `hashes` present but does not verify the
+            // value — any string suffices for the fixture.
+            "hashes": { "sha256": "abcDEF0123456789" },
             "prev_events": [],
             "prev_state_events": [],
             "unsigned": {
@@ -156,17 +158,24 @@ mod tests {
                 ]
             }
         });
-        // The event_id is arbitrary here: the store keys on (room_id,
-        // state_key) and hydrates via EventRow (which reads the id from the
-        // column), so it never recomputes / validates the hash.
-        make_event_with_raw_json(
-            ruma::event_id!("$oob_invite_fixture:other.example.org"),
-            room,
-            inviter,
-            "m.room.member",
-            Some(invited.as_str()),
-            &serde_json::to_string(&raw).unwrap(),
-        )
+        let raw = RawValue::from_string(serde_json::to_string(&body).unwrap()).unwrap();
+        let event_id = compute_event_id(&raw).expect("fixture computes event_id");
+        let content = serde_json::value::to_raw_value(body.get("content").unwrap()).unwrap();
+        Event {
+            event_id,
+            room_id: room.to_owned(),
+            event_type: "m.room.member".to_owned(),
+            state_key: Some(invited.as_str().to_owned()),
+            sender: inviter.to_owned(),
+            origin_server_ts: 1_700_000_000_000,
+            content,
+            prev_events: Vec::new(),
+            prev_state_events: Vec::new(),
+            auth_events: Vec::new(),
+            rejected: false,
+            soft_failed: false,
+            raw,
+        }
     }
 
     #[tokio::test]
@@ -187,6 +196,9 @@ mod tests {
         assert_eq!(got.event_id, ev.event_id);
         assert_eq!(got.state_key.as_deref(), Some(invited.as_str()));
         assert_eq!(got.sender, inviter);
+        // ts is parsed back from the stored json (no denormalised column), so
+        // it must round-trip — the value `bump_stamp_for_invited` ranks on.
+        assert_eq!(got.origin_server_ts, 1_700_000_000_000);
 
         s.remove_invite(room, invited).await.unwrap();
         assert!(s.get_invite(room, invited).await.unwrap().is_none());
