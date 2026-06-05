@@ -72,3 +72,16 @@ pub struct Event {
     /// Canonical wire bytes — what gets hashed, federated, and stored.
     pub raw: Box<RawValue>,
 }
+
+impl Event {
+    /// Read a string field from the event's `content`. Returns `None` if the
+    /// content isn't a JSON object, the key is absent, or its value isn't a
+    /// string. The single accessor every caller that wants e.g.
+    /// `content.membership` / `content.join_rule` should go through, rather
+    /// than re-deserialising `content` ad hoc.
+    pub fn content_str(&self, key: &str) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(self.content.get())
+            .ok()
+            .and_then(|c| c.get(key).and_then(|v| v.as_str()).map(str::to_owned))
+    }
+}

@@ -97,6 +97,29 @@ enum Command {
         event: Box<Event>,
         reply: oneshot::Sender<Result<(), RoomActorError>>,
     },
+    /// Build a locally-originated event on the room's current heads **without
+    /// applying or persisting it** — the read-only event-builder primitive used
+    /// to produce a federation `make_join` / `make_leave` template. Runs on the
+    /// actor so it sees consistent heads, but mutates nothing.
+    BuildEvent {
+        sender: OwnedUserId,
+        event_type: String,
+        state_key: Option<String>,
+        content: Value,
+        reply: oneshot::Sender<Result<Arc<Event>, RoomActorError>>,
+    },
+    /// Apply a membership PDU for which **we are the resident** (received via
+    /// `send_join` / `send_leave`). Unlike [`Self::ApplyPdu`] — a `/send`
+    /// event whose origin already broadcast it, so it re-originates nothing and
+    /// persists rejects — a resident membership follows the *local* reject
+    /// policy (a rejected join/leave is refused with 403 and NOT persisted) and
+    /// triggers our **distribution duty**: on accept we are the fan-out origin,
+    /// so we federate the event to every other server in the room (minus the
+    /// sending server, which delivered it to us, and minus ourselves).
+    ApplyResident {
+        event: Box<Event>,
+        reply: oneshot::Sender<Result<(), RoomActorError>>,
+    },
 }
 
 /// The owned state machine for one room. Lives inside a spawned task; the
@@ -132,8 +155,108 @@ impl RoomActor {
                     let outcome = self.handle_apply_pdu(*event).await;
                     let _ = reply.send(outcome);
                 }
+                Command::BuildEvent {
+                    sender,
+                    event_type,
+                    state_key,
+                    content,
+                    reply,
+                } => {
+                    let outcome = self.handle_build_event(sender, event_type, state_key, content);
+                    let _ = reply.send(outcome);
+                }
+                Command::ApplyResident { event, reply } => {
+                    let outcome = self.handle_apply_resident(*event).await;
+                    let _ = reply.send(outcome);
+                }
             }
         }
+    }
+
+    /// Build (only) a locally-originated event on the current heads. Mutates
+    /// nothing — `build_local_event` reads the head-sets and computes the
+    /// reference-hash event id, leaving `auth_events` empty (`apply_pdu` is
+    /// their sole authority). Used to produce federation membership templates.
+    fn handle_build_event(
+        &self,
+        sender: OwnedUserId,
+        event_type: String,
+        state_key: Option<String>,
+        content: Value,
+    ) -> Result<Arc<Event>, RoomActorError> {
+        let event = self
+            .room
+            .build_local_event(sender, event_type, state_key, content)?;
+        Ok(Arc::new(event))
+    }
+
+    /// Integrate a membership PDU for which we are the resident server
+    /// (`send_join` / `send_leave`). Reject ⇒ `Err(Rejected)` (403, not
+    /// persisted — local policy); accept ⇒ persist + fan out to the other
+    /// servers in the room (distribution duty); a re-delivered (already
+    /// persisted) PDU is an idempotent `Ok(())`.
+    async fn handle_apply_resident(&mut self, event: Event) -> Result<(), RoomActorError> {
+        // The sending server already holds the event — capture its server name
+        // before the apply consumes `event` so we can exclude it from fan-out.
+        let sender_server = event.sender.server_name().to_owned();
+
+        let (next, effects) = self.run_apply(event).await?;
+        // Idempotent re-send: already persisted, nothing to commit.
+        if effects.is_empty() {
+            return Ok(());
+        }
+
+        // Distribution duty: we are the fan-out origin. Federate to every other
+        // server in the post-apply room state, minus the sender's server (it
+        // delivered the event to us) and minus our own (excluded by
+        // `outbound_destinations`).
+        let own = self.own_server.clone();
+        self.commit_accepted(next, effects, |event, next| {
+            let mut dests = outbound_destinations(next.current_state(), event, &own);
+            dests.retain(|s| s.as_str() != sender_server.as_str());
+            dests
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Shared accept→persist→adopt tail for the local-send and resident-apply
+    /// paths. Both run an event through `apply_pdu`, refuse a reject (403, not
+    /// persisted — local policy), enqueue federation destinations, and persist
+    /// atomically. The only thing the two callers differ on is how they derive
+    /// the destination set (computed by `destinations` from the persisted event
+    /// + post-apply core), so that is a closure. Returns the persisted event.
+    async fn commit_accepted(
+        &mut self,
+        next: RoomCore,
+        effects: Vec<Effect>,
+        destinations: impl FnOnce(&Event, &RoomCore) -> Vec<OwnedServerName>,
+    ) -> Result<Arc<Event>, RoomActorError> {
+        let (persisted, delta) = collect_effects(effects);
+        let event = persisted.ok_or(RoomActorError::NotApplied)?;
+
+        // Local policy: a rejected event is surfaced to the client as 403 and is
+        // NOT persisted (Synapse never stores a locally-refused event). The
+        // post-apply clone is discarded — `apply_pdu` doesn't mutate on reject,
+        // so `self.room` is already correct.
+        if event.rejected {
+            return Err(RoomActorError::Rejected);
+        }
+
+        let dests = destinations(&event, &next);
+        let dest_refs: Vec<&ServerName> = dests.iter().map(AsRef::as_ref).collect();
+        self.store
+            .persist_resolved_event(
+                &event,
+                next.forward_extremities(),
+                next.state_forward_extremities(),
+                &delta,
+                &dest_refs,
+            )
+            .await?;
+        // Commit succeeded — adopt the post-apply state.
+        self.room = next;
+        Ok(event)
     }
 
     /// Run `apply_pdu` against a *clone* of the live `RoomCore`, off to the
@@ -168,42 +291,21 @@ impl RoomActor {
             .build_local_event(sender, event_type, state_key, content)?;
 
         let (next, effects) = self.run_apply(event).await?;
-        let (persisted, delta) = collect_effects(effects);
-        let event = persisted.ok_or(RoomActorError::NotApplied)?;
-
-        // Local policy: a rejected event is surfaced to the client as 403 and
-        // is NOT persisted (Synapse never stores a locally-refused event). The
-        // post-apply clone is discarded — `apply_pdu` doesn't mutate on reject,
-        // so `self.room` is already correct.
-        if event.rejected {
-            return Err(RoomActorError::Rejected);
-        }
 
         // Federate to every remote server in the post-apply room state — but a
         // soft-failed event must not be relayed (it failed auth against current
         // state, so peers would reject it too). Soft-fail is only ever set on
         // non-state events, so an unrejected state event always federates; the
         // explicit `state_key.is_none()` guard keeps that invariant local.
-        let destinations = if event.soft_failed && event.state_key.is_none() {
-            Vec::new()
-        } else {
-            outbound_destinations(next.current_state(), &event, &self.own_server)
-        };
-        let dest_refs: Vec<&ServerName> = destinations.iter().map(AsRef::as_ref).collect();
-
-        self.store
-            .persist_resolved_event(
-                &event,
-                next.forward_extremities(),
-                next.state_forward_extremities(),
-                &delta,
-                &dest_refs,
-            )
-            .await?;
-        // Commit succeeded — adopt the post-apply state.
-        self.room = next;
-
-        Ok(event)
+        let own = self.own_server.clone();
+        self.commit_accepted(next, effects, |event, next| {
+            if event.soft_failed && event.state_key.is_none() {
+                Vec::new()
+            } else {
+                outbound_destinations(next.current_state(), event, &own)
+            }
+        })
+        .await
     }
 
     /// Integrate a fully-formed federation PDU. The federation persist policy:
@@ -282,13 +384,9 @@ fn outbound_destinations(
 /// canonical [`Membership`] alphabet. `None` for a non-member event or any
 /// missing / unrecognised membership string.
 fn event_membership(event: &Event) -> Option<Membership> {
-    serde_json::from_str::<Value>(event.content.get())
-        .ok()
-        .and_then(|c| {
-            c.get("membership")
-                .and_then(Value::as_str)
-                .and_then(Membership::from_wire)
-        })
+    event
+        .content_str("membership")
+        .and_then(|m| Membership::from_wire(&m))
 }
 
 /// Split `apply_pdu`'s effects into the event to persist and the current-state
@@ -372,6 +470,53 @@ impl RoomRegistry {
         let (reply, rx) = oneshot::channel();
         actor
             .send(Command::ApplyPdu {
+                event: Box::new(event),
+                reply,
+            })
+            .await
+            .map_err(|_| RoomActorError::ActorGone)?;
+        rx.await.map_err(|_| RoomActorError::ActorGone)?
+    }
+
+    /// Build a federation membership template (`make_join` / `make_leave`) on
+    /// the room's current heads, without persisting. Bootstraps the actor on
+    /// first use; `UnknownRoom` if the room doesn't exist.
+    pub async fn build_event(
+        &self,
+        room_id: &RoomId,
+        sender: OwnedUserId,
+        event_type: String,
+        state_key: Option<String>,
+        content: Value,
+    ) -> Result<Arc<Event>, RoomActorError> {
+        let actor = self.actor_for(room_id).await?;
+        let (reply, rx) = oneshot::channel();
+        actor
+            .send(Command::BuildEvent {
+                sender,
+                event_type,
+                state_key,
+                content,
+                reply,
+            })
+            .await
+            .map_err(|_| RoomActorError::ActorGone)?;
+        rx.await.map_err(|_| RoomActorError::ActorGone)?
+    }
+
+    /// Apply a membership PDU received via `send_join` / `send_leave` where we
+    /// are the resident. Accept ⇒ persisted + fanned out to the other room
+    /// servers; reject ⇒ `Err(Rejected)` (403, not persisted); already-present
+    /// ⇒ idempotent `Ok(())`. Bootstraps the actor on first use.
+    pub async fn apply_resident(
+        &self,
+        room_id: &RoomId,
+        event: Event,
+    ) -> Result<(), RoomActorError> {
+        let actor = self.actor_for(room_id).await?;
+        let (reply, rx) = oneshot::channel();
+        actor
+            .send(Command::ApplyResident {
                 event: Box::new(event),
                 reply,
             })

@@ -7,7 +7,7 @@
 use axum::{
     Json,
     body::Bytes,
-    extract::{FromRequest, Path, Request, State},
+    extract::{FromRequest, Path, RawQuery, Request, State},
     http::StatusCode,
     response::IntoResponse,
 };
@@ -100,13 +100,7 @@ pub(crate) async fn current_membership(
                 &e.to_string(),
             )
         })?;
-    Ok(event
-        .and_then(|e| serde_json::from_str::<Value>(e.raw.get()).ok())
-        .and_then(|v| {
-            v.pointer("/content/membership")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        }))
+    Ok(event.and_then(|e| e.content_str("membership")))
 }
 
 /// Return a ready `404 M_NOT_FOUND` ("Not a known room") when `room` was never
@@ -251,16 +245,40 @@ pub(crate) async fn leave(
 /// `404 M_NOT_FOUND` ("No such room alias", matching Synapse) rather than the
 /// `400` a room-id parse would give, so clients see the alias as *unknown* not
 /// *malformed*. A string that is neither a valid id nor a valid alias still
-/// falls through to [`join`]'s `400`. The `server_name` query param is accepted
-/// and ignored (single-server, trusted mesh).
+/// falls through to [`join`]'s `400`. The `server_name` query lists candidate
+/// resident servers: for a room we don't host they trigger a federated join
+/// (`federation::join::federated_join`); for a room we already host they are
+/// ignored (we are the resident).
 pub(crate) async fn join_by_id_or_alias(
     state: State<AppState>,
     auth: AuthUser,
     Path(room_id_or_alias): Path<String>,
+    RawQuery(query): RawQuery,
     body: OptionalBody,
 ) -> axum::response::Response {
     if RoomAliasId::parse(&room_id_or_alias).is_ok() {
         return error_response(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No such room alias");
+    }
+    let room = match parse_room(&room_id_or_alias) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    // A room we don't host + explicit `server_name` hints ⇒ federated join.
+    // (A v12 room id carries no server, so without a hint we can only try
+    // locally, which 404s an unknown room.) A storage error here falls through
+    // to the local path, which surfaces it as a 500.
+    let store = lock_app(&state.0).store.clone();
+    if matches!(store.room_exists(&room).await, Ok(false)) {
+        let candidates = crate::federation::join::parse_server_names(query.as_deref());
+        if !candidates.is_empty() {
+            return crate::federation::join::federated_join(
+                &state.0,
+                auth.0.clone(),
+                &room,
+                &candidates,
+            )
+            .await;
+        }
     }
     join(state, auth, Path(room_id_or_alias), body).await
 }

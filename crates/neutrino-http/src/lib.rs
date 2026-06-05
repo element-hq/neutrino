@@ -162,7 +162,11 @@ impl AppState {
     /// simplest to construct directly through the trait rather than via the
     /// CSAPI write path. The caller passes the tempfile guard so the file
     /// stays alive for the lifetime of the router.
-    fn from_store(config: Config, store: Arc<SqliteStore>, tempfile: NamedTempFile) -> Self {
+    pub(crate) fn from_store(
+        config: Config,
+        store: Arc<SqliteStore>,
+        tempfile: NamedTempFile,
+    ) -> Self {
         // Production gap-fill fetcher: a reqwest client resolving peers as
         // `http://{server_name}` (trusted mesh). Built here rather than shared
         // with the sender pool — a second connection pool is cheap, and the two
@@ -380,6 +384,14 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/_matrix/federation/v1/backfill/{room_id}",
             get(federation::backfill::handle),
+        )
+        .route(
+            "/_matrix/federation/v1/make_join/{room_id}/{user_id}",
+            get(federation::make_join::handle),
+        )
+        .route(
+            "/_matrix/federation/v2/send_join/{room_id}/{event_id}",
+            put(federation::send_join::handle),
         )
         .fallback(default_fallback)
         .layer(TraceLayer::new_for_http())

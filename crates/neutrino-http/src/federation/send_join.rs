@@ -1,0 +1,161 @@
+//! `PUT /_matrix/federation/v2/send_join/{roomId}/{eventId}` — the second half
+//! of the federated join handshake, where **we are the resident** server.
+//!
+//! The joining server sends the completed `m.room.member`/`join` event. We
+//! validate its shape, apply it through the room actor (auth + state-res +
+//! persist), fan it out to the other servers in the room (our **distribution
+//! duty** — the joiner delivered it only to us), and reply with the room state
+//! the joiner needs.
+//!
+//! ## MSC4242 response
+//!
+//! Room version 12 + MSC4242 ⇒ the response is `{ state_dag, timeline, event }`
+//! and **never** `auth_chain` / `state` / `servers_in_room`:
+//! - `state_dag` — the entire state DAG (every state event reachable via
+//!   `prev_state_events` from the current state-DAG heads back to the create
+//!   event), wire-verbatim so the joiner can recompute reference hashes and run
+//!   state resolution itself. No size cap (a large room must still be joinable).
+//! - `timeline` — the most recent timeline events, so the joiner has context
+//!   and the join event's `prev_events` resolve.
+//! - `event` — our copy of the membership event (identical to the request body;
+//!   in a signatures world this is where the resident signature would be added).
+//!
+//! Idempotent: a re-sent `send_join` (our response was lost) re-applies the
+//! same join as a no-op and we simply rebuild and return the state again.
+
+use axum::{
+    Json,
+    extract::rejection::JsonRejection,
+    extract::{Path, State},
+};
+use neutrino_state::event_id::from_wire;
+use neutrino_store::{DagStore, EventStore, RoomStore};
+use ruma::{EventId, OwnedEventId, OwnedRoomId};
+use serde::Serialize;
+use serde_json::value::RawValue as RawJsonValue;
+
+use crate::federation::FedError;
+use crate::room_actor::RoomActorError;
+use crate::{AppState, lock_app};
+
+/// Recent timeline events to include in the `send_join` response. The joiner
+/// backfills deeper history lazily via `/backfill`; this only needs to cover
+/// the join event's immediate `prev_events` plus a little context.
+const TIMELINE_LIMIT: usize = 20;
+
+/// `send_join` (v2) response — MSC4242 shape. See the module docs.
+#[derive(Serialize)]
+pub(crate) struct ResponseBody {
+    /// Every state event in the room's state DAG, wire-verbatim, in no
+    /// particular order (the joiner toposorts via `prev_state_events`).
+    state_dag: Vec<Box<RawJsonValue>>,
+    /// Recent timeline events, wire-verbatim, newest-first.
+    timeline: Vec<Box<RawJsonValue>>,
+    /// Our copy of the membership event.
+    event: Box<RawJsonValue>,
+}
+
+/// Federation `/send_join` handler.
+pub(crate) async fn handle(
+    State(state): State<AppState>,
+    Path((room_id, event_id)): Path<(String, String)>,
+    body: Result<Json<Box<RawJsonValue>>, JsonRejection>,
+) -> Result<Json<ResponseBody>, FedError> {
+    let raw = body
+        .map_err(|_| FedError::BadRequest("body is not valid JSON"))?
+        .0;
+    let room_id = OwnedRoomId::try_from(room_id.as_str())
+        .map_err(|_| FedError::BadRequest("invalid room_id"))?;
+
+    // Parse + compute the event id from the reference hash (also runs the
+    // format + semantic validators). `auth_events` start empty — apply_pdu is
+    // their sole authority.
+    let event =
+        from_wire(raw, Vec::new()).map_err(|_| FedError::BadRequest("malformed join event"))?;
+
+    // Structural validation (spec §send_join). Signature / sender-on-origin
+    // checks are skipped (trusted mesh, no X-Matrix origin header).
+    if event.event_id.as_str() != event_id {
+        return Err(FedError::BadRequest(
+            "event_id in path does not match the event",
+        ));
+    }
+    if event.room_id != room_id {
+        return Err(FedError::BadRequest(
+            "room_id in path does not match the event",
+        ));
+    }
+    if event.event_type != "m.room.member" {
+        return Err(FedError::BadRequest("event is not an m.room.member event"));
+    }
+    if event.content_str("membership").as_deref() != Some("join") {
+        return Err(FedError::BadRequest("membership is not join"));
+    }
+    if event.state_key.as_deref() != Some(event.sender.as_str()) {
+        return Err(FedError::BadRequest("state_key must equal sender"));
+    }
+
+    // Keep the wire bytes for the response `event` field before the apply
+    // consumes the parsed event.
+    let event_raw = event.raw.clone();
+
+    let (store, registry) = {
+        let app = lock_app(&state);
+        (app.store.clone(), app.room_registry.clone())
+    };
+
+    // Apply through the resident path: accept ⇒ persisted + fanned out; reject
+    // ⇒ 403; idempotent re-send ⇒ Ok. (`apply_resident` enqueues the fan-out.)
+    match registry.apply_resident(&room_id, event).await {
+        Ok(()) => {}
+        Err(RoomActorError::Rejected) => {
+            return Err(FedError::Forbidden("user is not allowed to join this room"));
+        }
+        Err(RoomActorError::UnknownRoom) => return Err(FedError::RoomNotFound),
+        Err(RoomActorError::Storage(e)) => return Err(FedError::Storage(e)),
+        // Build/Apply (e.g. malformed or unauthorisable against our state) —
+        // the joiner sent something we can't admit.
+        Err(RoomActorError::Build(_) | RoomActorError::Apply(_)) => {
+            return Err(FedError::BadRequest("could not authorise join"));
+        }
+        Err(RoomActorError::NotApplied | RoomActorError::ActorGone) => {
+            return Err(FedError::Internal("apply did not produce a result"));
+        }
+    }
+
+    // Build the MSC4242 response from the post-apply state.
+    let (timeline_fes, state_fes) = store
+        .forward_extremities(&room_id)
+        .await?
+        .ok_or(FedError::RoomNotFound)?;
+    let state_dag = collect_state_dag(&*store, &room_id, &state_fes).await?;
+    let timeline_refs: Vec<&EventId> = timeline_fes.iter().map(|id| id.as_ref()).collect();
+    let timeline =
+        crate::federation::events_before_raw(&*store, &room_id, &timeline_refs, TIMELINE_LIMIT)
+            .await?;
+
+    Ok(Json(ResponseBody {
+        state_dag,
+        timeline,
+        event: event_raw,
+    }))
+}
+
+/// The entire state DAG: the current state-DAG heads (`state_fes`) plus every
+/// state event reachable from them via `prev_state_events`, back to create.
+/// `missing_events(state_dag=true)` walks the ancestry and excludes the seeds,
+/// so the heads themselves are fetched separately. No `limit` (whole DAG).
+async fn collect_state_dag(
+    store: &(impl DagStore + EventStore),
+    room_id: &ruma::RoomId,
+    state_fes: &std::collections::BTreeSet<OwnedEventId>,
+) -> Result<Vec<Box<RawJsonValue>>, FedError> {
+    let fe_refs: Vec<&EventId> = state_fes.iter().map(|id| id.as_ref()).collect();
+    let mut events = store.get_events(&fe_refs).await?;
+    let no_boundary: &[&EventId] = &[];
+    let ancestry = store
+        .missing_events(room_id, &fe_refs, no_boundary, usize::MAX, true)
+        .await?;
+    events.extend(ancestry);
+    Ok(events.into_iter().map(|e| e.raw).collect())
+}

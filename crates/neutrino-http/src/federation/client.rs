@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use reqwest::Client;
-use ruma::{OwnedEventId, RoomId, ServerName};
-use serde::Serialize;
+use ruma::{EventId, OwnedEventId, RoomId, ServerName, UserId};
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 
 use crate::federation::gapfill::MissingEventsFetcher;
@@ -146,6 +146,78 @@ impl FederationClient {
             .await?
             .events)
     }
+
+    /// `GET http://{dest}/_matrix/federation/v1/make_join/{room}/{user}?ver={ver}`
+    /// — request a membership-event template from the resident server (the
+    /// first half of the join handshake). Returns the template + the room's
+    /// version. We send a single `ver` (the only version we support).
+    pub(crate) async fn make_join(
+        &self,
+        dest: &ServerName,
+        room_id: &RoomId,
+        user_id: &UserId,
+        ver: &str,
+    ) -> Result<MakeJoinResponse, FederationClientError> {
+        let mut url =
+            reqwest::Url::parse(&format!("http://{dest}/_matrix/federation/v1/make_join"))
+                .map_err(|_| FederationClientError::InvalidUrl)?;
+        url.path_segments_mut()
+            .map_err(|()| FederationClientError::InvalidUrl)?
+            .push(room_id.as_str())
+            .push(user_id.as_str());
+        url.query_pairs_mut().append_pair("ver", ver);
+
+        let resp = self.http.get(url).send().await?;
+        if !resp.status().is_success() {
+            return Err(FederationClientError::Status(resp.status().as_u16()));
+        }
+        Ok(resp.json::<MakeJoinResponse>().await?)
+    }
+
+    /// `PUT http://{dest}/_matrix/federation/v2/send_join/{room}/{event_id}`
+    /// carrying the completed membership `event` — the second half of the join
+    /// handshake. Returns the MSC4242 `{ state_dag, timeline, event }` response.
+    pub(crate) async fn send_join(
+        &self,
+        dest: &ServerName,
+        room_id: &RoomId,
+        event_id: &EventId,
+        event: &RawJsonValue,
+    ) -> Result<SendJoinResponse, FederationClientError> {
+        let mut url =
+            reqwest::Url::parse(&format!("http://{dest}/_matrix/federation/v2/send_join"))
+                .map_err(|_| FederationClientError::InvalidUrl)?;
+        url.path_segments_mut()
+            .map_err(|()| FederationClientError::InvalidUrl)?
+            .push(room_id.as_str())
+            .push(event_id.as_str());
+
+        let resp = self.http.put(url).json(&event).send().await?;
+        if !resp.status().is_success() {
+            return Err(FederationClientError::Status(resp.status().as_u16()));
+        }
+        Ok(resp.json::<SendJoinResponse>().await?)
+    }
+}
+
+/// Deserialized `make_join` response (mirror of the inbound
+/// `make_join::ResponseBody`). The `event` is the unsigned template.
+#[derive(Deserialize)]
+pub(crate) struct MakeJoinResponse {
+    pub(crate) event: Box<RawJsonValue>,
+    pub(crate) room_version: String,
+}
+
+/// Deserialized `send_join` (v2) response — MSC4242 shape (mirror of the
+/// inbound `send_join::ResponseBody`). `auth_chain` / `state` are never present
+/// and never read.
+#[derive(Deserialize)]
+pub(crate) struct SendJoinResponse {
+    #[serde(default)]
+    pub(crate) state_dag: Vec<Box<RawJsonValue>>,
+    #[serde(default)]
+    pub(crate) timeline: Vec<Box<RawJsonValue>>,
+    pub(crate) event: Box<RawJsonValue>,
 }
 
 /// The production [`MissingEventsFetcher`]: a thin adapter that closes a

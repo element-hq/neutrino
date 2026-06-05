@@ -24,7 +24,10 @@ pub(crate) mod backfill;
 pub(crate) mod client;
 pub(crate) mod gapfill;
 pub(crate) mod get_missing_events;
+pub(crate) mod join;
+pub(crate) mod make_join;
 pub(crate) mod send;
+pub(crate) mod send_join;
 pub(crate) mod sender;
 pub(crate) mod worker;
 
@@ -105,10 +108,25 @@ pub(crate) enum FedError {
     /// `M_INVALID_PARAM` shape).
     #[error("bad request: {0}")]
     BadRequest(&'static str),
+    /// 403 `M_FORBIDDEN` — the user/server is not permitted to perform the
+    /// membership change (e.g. an uninvited user joining an invite-only room,
+    /// or a `send_join` the auth rules reject).
+    #[error("forbidden: {0}")]
+    Forbidden(&'static str),
+    /// 400 `M_INCOMPATIBLE_ROOM_VERSION` — `make_join`'s `ver` list does not
+    /// include the room's version. The wrapped string is the version we support
+    /// and is echoed back in the response body's `room_version` field (the spec
+    /// shape for this error), so the caller learns what to offer.
+    #[error("incompatible room version (supported: {0})")]
+    IncompatibleRoomVersion(String),
     /// Fixed message — `"room not found"` is returned verbatim in the
     /// response body's `error` field.
     #[error("room not found")]
     RoomNotFound,
+    /// 500 `M_UNKNOWN` for an internal fault that isn't a storage error (e.g. a
+    /// room actor that vanished). The static string is the `error` detail.
+    #[error("internal: {0}")]
+    Internal(&'static str),
     /// The wrapped `StorageError`'s `Display` is rendered into the response
     /// body's `error` field. This is acceptable in Neutrino's trusted-mesh
     /// model; revisit if the server is ever exposed to untrusted peers.
@@ -118,20 +136,42 @@ pub(crate) enum FedError {
 
 impl IntoResponse for FedError {
     fn into_response(self) -> Response {
+        // `M_INCOMPATIBLE_ROOM_VERSION` carries an extra `room_version` field
+        // (the spec shape for `/make_join`); every other variant is the plain
+        // `{errcode, error}` standard error body.
+        if let FedError::IncompatibleRoomVersion(supported) = &self {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "errcode": "M_INCOMPATIBLE_ROOM_VERSION",
+                    "error": "room version not supported by the requester",
+                    "room_version": supported,
+                })),
+            )
+                .into_response();
+        }
         let (status, errcode, msg) = match &self {
             FedError::BadRequest(m) => {
                 (StatusCode::BAD_REQUEST, "M_INVALID_PARAM", (*m).to_string())
             }
+            FedError::Forbidden(m) => (StatusCode::FORBIDDEN, "M_FORBIDDEN", (*m).to_string()),
             FedError::RoomNotFound => (
                 StatusCode::NOT_FOUND,
                 "M_NOT_FOUND",
                 "room not found".to_string(),
+            ),
+            FedError::Internal(m) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                (*m).to_string(),
             ),
             FedError::Storage(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "M_UNKNOWN",
                 e.to_string(),
             ),
+            // Handled above with its bespoke body.
+            FedError::IncompatibleRoomVersion(_) => unreachable!(),
         };
         (status, Json(json!({"errcode": errcode, "error": msg}))).into_response()
     }
@@ -147,4 +187,48 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Walk `prev_events` back from `heads` (seeds included, newest-first, capped at
+/// `limit`) and return the events' wire bytes verbatim. Shared by `/backfill`
+/// and `send_join`'s `timeline` (both want "recent PDUs as raw bytes").
+pub(crate) async fn events_before_raw(
+    store: &impl neutrino_store::DagStore,
+    room_id: &ruma::RoomId,
+    heads: &[&ruma::EventId],
+    limit: usize,
+) -> Result<Vec<Box<serde_json::value::RawValue>>, neutrino_store::StorageError> {
+    Ok(store
+        .events_before(room_id, heads, limit)
+        .await?
+        .into_iter()
+        .map(|e| e.raw)
+        .collect())
+}
+
+/// Stage a batch of already-parsed PDUs for one room, then poke the worker to
+/// drain them. Shared staging primitive — `stage_pdu` is idempotent by event
+/// id, so re-staging is a no-op. Used by the outbound-join ingest; the inbound
+/// `/send` handler keeps its own loop because it must build a per-PDU result
+/// map. The poke is awaited (not `try_send`) so a single fresh-room ingest
+/// can't be silently dropped and left to stall.
+pub(crate) async fn stage_and_poke(
+    store: &impl neutrino_store::StagingStore,
+    worker_poke: &tokio::sync::mpsc::Sender<ruma::OwnedRoomId>,
+    origin: &ruma::ServerName,
+    room_id: &ruma::RoomId,
+    events: &[neutrino_common::Event],
+) -> Result<(), neutrino_store::StorageError> {
+    for ev in events {
+        if ev.room_id != *room_id {
+            continue; // never stage a cross-room event a peer slipped in
+        }
+        store
+            .stage_pdu(origin, &ev.room_id, &ev.event_id, &ev.raw)
+            .await?;
+    }
+    if worker_poke.send(room_id.to_owned()).await.is_err() {
+        tracing::warn!(%room_id, "worker poke failed; staged events will drain on the next poke or restart");
+    }
+    Ok(())
 }
