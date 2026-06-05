@@ -26,7 +26,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use neutrino_common::{Config, ROOM_VERSION_ID};
 use neutrino_state::event_id::EventBuilder;
-use neutrino_store::{EventStore, RoomStore, StagingStore, StateStore};
+use neutrino_store::{EventStore, FederationOutbox, RoomStore, StagingStore, StateStore};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, ServerName};
 use serde_json::value::RawValue as RawJsonValue;
@@ -2021,4 +2021,504 @@ async fn send_drops_pdu_for_unknown_room() {
             .is_empty(),
         "a PDU for an unknown room must not be committed"
     );
+}
+
+// ===================================================================
+// Server-Server join (Milestone A) — inbound make_join + send_join,
+// where WE are the resident server. A remote user (`@zara:remote.example`)
+// joins a room we host.
+// ===================================================================
+
+const ALICE: &str = "@alice:example.org";
+const ZARA: &str = "@zara:remote.example";
+const YAN: &str = "@yan:other.example";
+
+/// Seed a room created by `alice` (our user). `initial` is a chain of state
+/// events linked oldest-first after the create event (each references the
+/// previous as its sole `prev`/`prev_state`). Returns the router (mounted over
+/// the seeded store), a store handle (for outbox/state assertions), the room
+/// id, and the current state-DAG head — the event a federated membership must
+/// reference.
+async fn seed_room(
+    initial: &[(&str, &str, &str, Value)],
+) -> (axum::Router, Arc<SqliteStore>, OwnedRoomId, OwnedEventId) {
+    let (store, tempfile) = fresh_store().await;
+    let creator = alice();
+    let create = EventBuilder::new(creator, "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    let mut head = create.event_id.clone();
+    let mut events = Vec::new();
+    for (sender, ty, state_key, content) in initial {
+        let sender: OwnedUserId = sender.parse().expect("sender");
+        let ev = EventBuilder::new(sender, (*ty).to_owned())
+            .room_id(room_id.clone())
+            .state_key((*state_key).to_owned())
+            .content(content.clone())
+            .prev_events(vec![head.clone()])
+            .prev_state_events(vec![head.clone()])
+            .build()
+            .expect("build initial state event");
+        head = ev.event_id.clone();
+        events.push(ev);
+    }
+    store
+        .create_room(&create, &events)
+        .await
+        .expect("create_room");
+    let router = router_with_store(config(), store.clone(), tempfile);
+    (router, store, room_id, head)
+}
+
+/// A public room: alice joins, then opens it to `public`.
+async fn seed_public_room() -> (axum::Router, Arc<SqliteStore>, OwnedRoomId, OwnedEventId) {
+    seed_room(&[
+        (
+            ALICE,
+            "m.room.member",
+            ALICE,
+            json!({ "membership": "join" }),
+        ),
+        (
+            ALICE,
+            "m.room.join_rules",
+            "",
+            json!({ "join_rule": "public" }),
+        ),
+    ])
+    .await
+}
+
+/// Build a completed remote `m.room.member`/`join` event referencing `head`
+/// (as the joining server would after `make_join`).
+fn remote_join(room_id: &RoomId, head: &OwnedEventId, user: &str) -> neutrino_common::Event {
+    let user: OwnedUserId = user.parse().expect("user");
+    EventBuilder::new(user.clone(), "m.room.member".to_owned())
+        .room_id(room_id.to_owned())
+        .state_key(user.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![head.clone()])
+        .prev_state_events(vec![head.clone()])
+        .build()
+        .expect("build remote join")
+}
+
+fn make_join_path(room_id: &RoomId, user: &str) -> String {
+    format!("/_matrix/federation/v1/make_join/{room_id}/{user}?ver={ROOM_VERSION_ID}")
+}
+
+fn send_join_path(room_id: &RoomId, event_id: &OwnedEventId) -> String {
+    format!("/_matrix/federation/v2/send_join/{room_id}/{event_id}")
+}
+
+/// PUT a raw event body (the `send_join` request shape).
+async fn put_event(app: &axum::Router, path: &str, raw: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("PUT")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from(raw.to_owned().into_bytes()))
+        .unwrap();
+    drive(app, req).await
+}
+
+// --- make_join ---------------------------------------------------------
+
+#[tokio::test]
+async fn make_join_returns_template_without_auth_events() {
+    let (router, _store, room_id, head) = seed_public_room().await;
+
+    let (status, body) = get(&router, &make_join_path(&room_id, ZARA)).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["room_version"], ROOM_VERSION_ID);
+
+    let event = &body["event"];
+    assert_eq!(event["type"], "m.room.member");
+    assert_eq!(event["content"]["membership"], "join");
+    assert_eq!(event["sender"], ZARA);
+    assert_eq!(event["state_key"], ZARA);
+
+    // MSC4242: prev_state_events present (points at our current state head),
+    // and NO non-empty auth_events (the resident computes them at apply time).
+    let prev_state = event["prev_state_events"]
+        .as_array()
+        .expect("prev_state_events array");
+    assert_eq!(prev_state.len(), 1);
+    assert_eq!(prev_state[0], head.as_str());
+    match event.get("auth_events") {
+        None => {}
+        Some(Value::Array(a)) => assert!(a.is_empty(), "auth_events must be empty: {a:?}"),
+        other => panic!("unexpected auth_events: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn make_join_unknown_room_returns_404() {
+    let (router, _store, _room_id, _head) = seed_public_room().await;
+    let unknown = ruma::RoomId::parse("!nope:example.org").unwrap();
+    let (status, body) = get(&router, &make_join_path(&unknown, ZARA)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body:?}");
+    assert_eq!(body["errcode"], "M_NOT_FOUND");
+}
+
+#[tokio::test]
+async fn make_join_incompatible_version_returns_400() {
+    let (router, _store, room_id, _head) = seed_public_room().await;
+    // No `ver` matching ours (request an old version).
+    let path = format!("/_matrix/federation/v1/make_join/{room_id}/{ZARA}?ver=1");
+    let (status, body) = get(&router, &path).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(body["errcode"], "M_INCOMPATIBLE_ROOM_VERSION");
+    assert_eq!(body["room_version"], ROOM_VERSION_ID);
+}
+
+#[tokio::test]
+async fn make_join_invite_only_uninvited_returns_403() {
+    // Default join rule is invite-only; zara was never invited.
+    let (router, _store, room_id, _head) = seed_room(&[(
+        ALICE,
+        "m.room.member",
+        ALICE,
+        json!({ "membership": "join" }),
+    )])
+    .await;
+    let (status, body) = get(&router, &make_join_path(&room_id, ZARA)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN");
+}
+
+#[tokio::test]
+async fn make_join_banned_user_returns_403() {
+    // Public room, but zara is banned.
+    let (router, _store, room_id, _head) = seed_room(&[
+        (
+            ALICE,
+            "m.room.member",
+            ALICE,
+            json!({ "membership": "join" }),
+        ),
+        (
+            ALICE,
+            "m.room.join_rules",
+            "",
+            json!({ "join_rule": "public" }),
+        ),
+        (ALICE, "m.room.member", ZARA, json!({ "membership": "ban" })),
+    ])
+    .await;
+    let (status, body) = get(&router, &make_join_path(&room_id, ZARA)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN");
+}
+
+// --- send_join ---------------------------------------------------------
+
+#[tokio::test]
+async fn send_join_admits_remote_user_and_returns_state_dag() {
+    let (router, store, room_id, head) = seed_public_room().await;
+    let join = remote_join(&room_id, &head, ZARA);
+    let join_id = join.event_id.clone();
+
+    let (status, body) =
+        put_event(&router, &send_join_path(&room_id, &join_id), join.raw.get()).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+
+    // MSC4242 response shape: state_dag + timeline + event, and NO auth_chain.
+    assert!(
+        body.get("auth_chain").is_none(),
+        "must not return auth_chain"
+    );
+    assert!(body["timeline"].is_array());
+    assert_eq!(body["event"]["sender"], ZARA);
+
+    let state_dag = body["state_dag"].as_array().expect("state_dag array");
+    // The whole state DAG back to create is present.
+    assert!(
+        state_dag.iter().any(|e| e["type"] == "m.room.create"),
+        "state_dag must include the create event"
+    );
+    // zara's join landed in our current state.
+    let member = store
+        .current_state_event(&room_id, "m.room.member", ZARA)
+        .await
+        .unwrap()
+        .expect("zara member row");
+    assert_eq!(member.event_id, join_id);
+}
+
+#[tokio::test]
+async fn send_join_distributes_to_other_room_servers_not_the_joiner() {
+    // Room already has a remote member on other.example. zara (remote.example)
+    // joins → we must fan the join out to other.example, but NOT back to the
+    // joiner's own server, nor to ourselves.
+    let (router, store, room_id, head) = seed_room(&[
+        (
+            ALICE,
+            "m.room.member",
+            ALICE,
+            json!({ "membership": "join" }),
+        ),
+        (
+            ALICE,
+            "m.room.join_rules",
+            "",
+            json!({ "join_rule": "public" }),
+        ),
+        (YAN, "m.room.member", YAN, json!({ "membership": "join" })),
+    ])
+    .await;
+
+    let join = remote_join(&room_id, &head, ZARA);
+    let join_id = join.event_id.clone();
+    let (status, body) =
+        put_event(&router, &send_join_path(&room_id, &join_id), join.raw.get()).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+
+    // other.example gets the join (distribution duty).
+    let other = store
+        .pending_pdus(ruma::server_name!("other.example"), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        other.iter().any(|e| e.event_id == join_id),
+        "other.example must receive zara's join"
+    );
+    // The joiner's own server already has it — never echoed back.
+    assert!(
+        store
+            .pending_pdus(ruma::server_name!("remote.example"), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty(),
+        "must not echo the join back to the joiner"
+    );
+    // We never federate to ourselves.
+    assert!(
+        store
+            .pending_pdus(ruma::server_name!("example.org"), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn send_join_rejected_join_returns_403() {
+    // Invite-only room, zara not invited → apply rejects → 403, not persisted.
+    let (router, store, room_id, head) = seed_room(&[(
+        ALICE,
+        "m.room.member",
+        ALICE,
+        json!({ "membership": "join" }),
+    )])
+    .await;
+    let join = remote_join(&room_id, &head, ZARA);
+    let join_id = join.event_id.clone();
+    let (status, body) =
+        put_event(&router, &send_join_path(&room_id, &join_id), join.raw.get()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN");
+    assert!(
+        store
+            .current_state_event(&room_id, "m.room.member", ZARA)
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused join must not enter current state"
+    );
+}
+
+#[tokio::test]
+async fn send_join_event_id_path_mismatch_returns_400() {
+    let (router, _store, room_id, head) = seed_public_room().await;
+    let join = remote_join(&room_id, &head, ZARA);
+    // Path id deliberately does not match the body's computed id.
+    let wrong = ruma::EventId::parse("$wrongwrongwrong").unwrap().to_owned();
+    let (status, body) =
+        put_event(&router, &send_join_path(&room_id, &wrong), join.raw.get()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(body["errcode"], "M_INVALID_PARAM");
+}
+
+#[tokio::test]
+async fn send_join_is_idempotent_on_resend() {
+    let (router, _store, room_id, head) = seed_public_room().await;
+    let join = remote_join(&room_id, &head, ZARA);
+    let join_id = join.event_id.clone();
+    let path = send_join_path(&room_id, &join_id);
+
+    let (s1, _b1) = put_event(&router, &path, join.raw.get()).await;
+    assert_eq!(s1, StatusCode::OK);
+    // A re-sent send_join (our response was lost) re-applies as a no-op and
+    // returns the state again.
+    let (s2, b2) = put_event(&router, &path, join.raw.get()).await;
+    assert_eq!(s2, StatusCode::OK, "{b2:?}");
+    assert_eq!(b2["event"]["sender"], ZARA);
+}
+
+#[tokio::test]
+async fn make_join_then_send_join_round_trips() {
+    // Drive the full handshake: take our make_join template, complete it the
+    // way a joining server would, and send_join it back.
+    let (router, store, room_id, _head) = seed_public_room().await;
+
+    let (status, body) = get(&router, &make_join_path(&room_id, ZARA)).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+
+    // Complete the template: reuse its prev_events / prev_state_events.
+    let template = &body["event"];
+    let prev_events = id_list(&template["prev_events"]);
+    let prev_state = id_list(&template["prev_state_events"]);
+    let zara: OwnedUserId = ZARA.parse().unwrap();
+    let join = EventBuilder::new(zara.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(zara.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(prev_events)
+        .prev_state_events(prev_state)
+        .build()
+        .expect("complete the template");
+    let join_id = join.event_id.clone();
+
+    let (status, body) =
+        put_event(&router, &send_join_path(&room_id, &join_id), join.raw.get()).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert!(body["state_dag"].is_array());
+
+    let member = store
+        .current_state_event(&room_id, "m.room.member", ZARA)
+        .await
+        .unwrap()
+        .expect("zara joined via the handshake");
+    assert_eq!(member.event_id, join_id);
+}
+
+/// Parse a JSON array of event-id strings into owned ids (dropping any that
+/// don't parse). Used to lift `prev_events` / `prev_state_events` out of a
+/// make_join template.
+fn id_list(v: &Value) -> Vec<OwnedEventId> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|x| x.as_str())
+        .filter_map(|s| OwnedEventId::try_from(s).ok())
+        .collect()
+}
+
+// ===================================================================
+// Server-Server join (Milestone A) — OUTBOUND, where WE are the joining
+// server. A local user joins a remote public room via the handshake.
+// Two real servers: B (resident, served on an ephemeral port) and A (us,
+// driven via oneshot; its outbound reqwest reaches B).
+// ===================================================================
+
+/// A `Config` with an explicit server name + localpart (the joining server A
+/// is a distinct homeserver from the resident).
+fn config_for(server_name: &str, localpart: &str) -> Config {
+    Config {
+        server_name: server_name.to_string(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        localpart: localpart.to_string(),
+        ..Default::default()
+    }
+}
+
+/// `content.membership` of an event, if present.
+fn membership_str(ev: &neutrino_common::Event) -> Option<String> {
+    serde_json::from_str::<Value>(ev.content.get())
+        .ok()
+        .and_then(|c| {
+            c.get("membership")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+#[tokio::test]
+async fn outbound_federated_join_ingests_remote_room() {
+    // Resident B hosts a public room.
+    let (b_router, _b_store, room_id, _head) = seed_public_room().await;
+    let b_server = crate::federation::test_support::spawn_stub(b_router).await;
+
+    // Joining server A (a.example, user @bob:a.example) starts empty.
+    let (a_store, a_temp) = fresh_store().await;
+    let a_router = router_with_store(config_for("a.example", "bob"), a_store.clone(), a_temp);
+
+    let path = format!("/_matrix/client/v3/join/{room_id}?server_name={b_server}");
+    let (status, body) = post_json(&a_router, &path, &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["room_id"], room_id.as_str());
+
+    // @bob:a.example is now joined in A's own store...
+    let member = a_store
+        .current_state_event(&room_id, "m.room.member", "@bob:a.example")
+        .await
+        .unwrap()
+        .expect("bob joined in A's store");
+    assert_eq!(membership_str(&member).as_deref(), Some("join"));
+
+    // ...and A ingested the room's state DAG (the public join rule).
+    let rules = a_store
+        .current_state_event(&room_id, "m.room.join_rules", "")
+        .await
+        .unwrap()
+        .expect("join_rules ingested");
+    let rule: Value = serde_json::from_str(rules.content.get()).unwrap();
+    assert_eq!(rule["join_rule"], "public");
+}
+
+#[tokio::test]
+async fn outbound_join_falls_back_to_next_candidate() {
+    // First candidate is a dead port; the join must fall back to the live
+    // resident B and still succeed.
+    let (b_router, _b_store, room_id, _head) = seed_public_room().await;
+    let b_server = crate::federation::test_support::spawn_stub(b_router).await;
+    let dead = crate::federation::test_support::dead_peer().await;
+
+    let (a_store, a_temp) = fresh_store().await;
+    let a_router = router_with_store(config_for("a.example", "bob"), a_store.clone(), a_temp);
+
+    let path =
+        format!("/_matrix/client/v3/join/{room_id}?server_name={dead}&server_name={b_server}");
+    let (status, body) = post_json(&a_router, &path, &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+
+    assert!(
+        a_store
+            .current_state_event(&room_id, "m.room.member", "@bob:a.example")
+            .await
+            .unwrap()
+            .is_some(),
+        "join must succeed via the second candidate"
+    );
+}
+
+#[tokio::test]
+async fn outbound_join_all_candidates_dead_returns_502() {
+    let dead1 = crate::federation::test_support::dead_peer().await;
+    let dead2 = crate::federation::test_support::dead_peer().await;
+    let (a_store, a_temp) = fresh_store().await;
+    let a_router = router_with_store(config_for("a.example", "bob"), a_store, a_temp);
+    // A syntactically valid room id we don't host.
+    let room = "!unknown:b.example";
+    let path = format!("/_matrix/client/v3/join/{room}?server_name={dead1}&server_name={dead2}");
+    let (status, _body) = post_json(&a_router, &path, &json!({})).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+}
+
+#[test]
+fn parse_server_names_handles_repeats_and_encoded_colon() {
+    use crate::federation::join::parse_server_names;
+    let got = parse_server_names(Some(
+        "server_name=127.0.0.1%3A8008&server_name=other.example&x=y",
+    ));
+    let got: Vec<String> = got.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        got,
+        vec!["127.0.0.1:8008".to_string(), "other.example".to_string()]
+    );
+    assert!(parse_server_names(None).is_empty());
 }

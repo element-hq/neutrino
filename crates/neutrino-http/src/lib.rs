@@ -376,6 +376,14 @@ fn build_router(state: AppState) -> Router {
             "/_matrix/federation/v1/backfill/{room_id}",
             get(federation::backfill::handle),
         )
+        .route(
+            "/_matrix/federation/v1/make_join/{room_id}/{user_id}",
+            get(federation::make_join::handle),
+        )
+        .route(
+            "/_matrix/federation/v2/send_join/{room_id}/{event_id}",
+            put(federation::send_join::handle),
+        )
         .fallback(default_fallback)
         .layer(TraceLayer::new_for_http())
         .with_state(state)

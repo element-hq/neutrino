@@ -7,7 +7,7 @@
 use axum::{
     Json,
     body::Bytes,
-    extract::{FromRequest, Path, Request, State},
+    extract::{FromRequest, Path, RawQuery, Request, State},
     http::StatusCode,
     response::IntoResponse,
 };
@@ -257,10 +257,32 @@ pub(crate) async fn join_by_id_or_alias(
     state: State<AppState>,
     auth: AuthUser,
     Path(room_id_or_alias): Path<String>,
+    RawQuery(query): RawQuery,
     body: OptionalBody,
 ) -> axum::response::Response {
     if RoomAliasId::parse(&room_id_or_alias).is_ok() {
         return error_response(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No such room alias");
+    }
+    let room = match parse_room(&room_id_or_alias) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    // A room we don't host + explicit `server_name` hints ⇒ federated join.
+    // (A v12 room id carries no server, so without a hint we can only try
+    // locally, which 404s an unknown room.) A storage error here falls through
+    // to the local path, which surfaces it as a 500.
+    let store = lock_app(&state.0).store.clone();
+    if matches!(store.room_exists(&room).await, Ok(false)) {
+        let candidates = crate::federation::join::parse_server_names(query.as_deref());
+        if !candidates.is_empty() {
+            return crate::federation::join::federated_join(
+                &state.0,
+                auth.0.clone(),
+                &room,
+                &candidates,
+            )
+            .await;
+        }
     }
     join(state, auth, Path(room_id_or_alias), body).await
 }
