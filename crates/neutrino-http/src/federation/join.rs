@@ -26,11 +26,11 @@ use axum::{
 };
 use neutrino_common::ROOM_VERSION_ID;
 use neutrino_state::event_id::{EventBuilder, from_wire};
-use neutrino_store::{RoomStore, StagingStore, StateStore};
+use neutrino_store::{RoomStore, StagingStore, StateStore, StreamPos};
 use ruma::{OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId};
 use serde_json::json;
 use serde_json::value::RawValue as RawJsonValue;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
 use crate::federation::client::{FederationClient, SendJoinResponse};
@@ -40,8 +40,6 @@ use crate::{AppState, error_response, lock_app};
 /// the fetched state DAG and apply our join. On timeout the client gets an
 /// error but the drain keeps running (a later sync will show the join).
 const JOIN_INGEST_TIMEOUT: Duration = Duration::from_secs(20);
-/// Poll interval while waiting for the join to land in current state.
-const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Join a room we don't host via the federation handshake, trying each
 /// candidate resident server in turn. Returns the CSAPI `/join` response.
@@ -51,26 +49,17 @@ pub(crate) async fn federated_join(
     room_id: &RoomId,
     candidates: &[OwnedServerName],
 ) -> Response {
-    federated_join_with(
-        state,
-        user,
-        room_id,
-        candidates,
-        JOIN_INGEST_TIMEOUT,
-        JOIN_POLL_INTERVAL,
-    )
-    .await
+    federated_join_with(state, user, room_id, candidates, JOIN_INGEST_TIMEOUT).await
 }
 
-/// As [`federated_join`], with the ingest-wait timeout/poll injectable so a test
-/// can exercise the timeout (504) path without a 20s wall-clock wait.
+/// As [`federated_join`], with the ingest-wait timeout injectable so a test can
+/// exercise the timeout (504) path without a 20s wall-clock wait.
 pub(crate) async fn federated_join_with(
     state: &AppState,
     user: OwnedUserId,
     room_id: &RoomId,
     candidates: &[OwnedServerName],
     timeout: Duration,
-    poll: Duration,
 ) -> Response {
     let (store, worker_poke, own_server) = {
         let app = lock_app(state);
@@ -82,12 +71,17 @@ pub(crate) async fn federated_join_with(
     };
     let client = FederationClient::new(own_server);
 
+    // Subscribe to the persist watch *before* staging anything (subscribe-
+    // before-query: a persist between staging and subscribing can't be missed),
+    // so `wait_for_join` can block on persists instead of polling.
+    let mut persists = store.subscribe();
+
     let mut last_err = "no resident server could be reached";
     for dest in candidates {
         match try_join_via(&client, &*store, &worker_poke, dest, room_id, &user).await {
             Ok(()) => {
                 // Staged + worker poked; block until our join lands (or time out).
-                return match wait_for_join(&*store, room_id, &user, timeout, poll).await {
+                return match wait_for_join(&*store, &mut persists, room_id, &user, timeout).await {
                     Ok(()) => (StatusCode::OK, Json(json!({ "room_id": room_id }))).into_response(),
                     Err(resp) => resp,
                 };
@@ -207,17 +201,27 @@ async fn ingest_state_dag(
         .map_err(|_| "could not stage room state")
 }
 
-/// Block until our `join` lands in current state, or time out. On timeout the
-/// drain keeps running off the request path, so the client error is recoverable
-/// by a later sync.
+/// Block until our `join` lands in current state, or time out. Driven by the
+/// store's persist watch rather than a fixed poll: only a persist can change
+/// current_state, so we re-read state after each persist (any room) instead of
+/// spinning. current_state stays the source of truth, so this also catches a
+/// join that lands via a concurrent path. On timeout the drain keeps running
+/// off the request path, so the client error is recoverable by a later sync.
 async fn wait_for_join(
     store: &impl StateStore,
+    persists: &mut watch::Receiver<StreamPos>,
     room_id: &RoomId,
     user: &UserId,
     timeout: Duration,
-    poll: Duration,
 ) -> Result<(), Response> {
     let deadline = tokio::time::Instant::now() + timeout;
+    let timed_out = || {
+        error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "M_UNKNOWN",
+            "timed out applying room state; the join is still being processed",
+        )
+    };
     loop {
         match store
             .current_state_event(room_id, "m.room.member", user.as_str())
@@ -233,14 +237,25 @@ async fn wait_for_join(
                 ));
             }
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(error_response(
-                StatusCode::GATEWAY_TIMEOUT,
-                "M_UNKNOWN",
-                "timed out applying room state; the join is still being processed",
-            ));
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(timed_out());
         }
-        tokio::time::sleep(poll).await;
+        // Wait for the next persist, bounded by the deadline. `changed()`
+        // coalesces multiple persists into one wakeup — harmless, since the
+        // next loop re-reads the full current state.
+        match tokio::time::timeout(remaining, persists.changed()).await {
+            Ok(Ok(())) => {}
+            // Watch sender dropped (store shutting down) — nothing more will land.
+            Ok(Err(_)) => {
+                return Err(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "M_UNKNOWN",
+                    "store closed while joining",
+                ));
+            }
+            Err(_elapsed) => return Err(timed_out()),
+        }
     }
 }
 

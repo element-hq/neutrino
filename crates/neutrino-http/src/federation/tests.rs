@@ -2809,7 +2809,6 @@ async fn federated_join_times_out_when_state_never_grounds() {
         &room_id,
         &[b],
         std::time::Duration::from_millis(800),
-        std::time::Duration::from_millis(20),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
@@ -2858,7 +2857,6 @@ async fn federated_join_missing_create_in_response_fails_without_registering() {
         &room_id,
         &[b],
         std::time::Duration::from_millis(500),
-        std::time::Duration::from_millis(20),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
