@@ -84,7 +84,7 @@ fn body_reason(body: Option<&Value>) -> Option<String> {
 
 /// The current `content.membership` of `target` in `room`, or `None` when the
 /// user has no member event. Maps a storage failure to a ready 500 response.
-async fn current_membership(
+pub(crate) async fn current_membership(
     state: &AppState,
     room: &RoomId,
     target: &UserId,
