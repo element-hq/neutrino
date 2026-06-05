@@ -1258,4 +1258,18 @@ async fn messages_requires_membership() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "{body}");
+
+    // A malformed query param is rejected as 400 *before* the membership gate:
+    // Bob (non-member) sending an invalid `dir` gets 400 M_INVALID_PARAM, not
+    // 403. Params are validated ahead of the join check.
+    let (s, body) = send(
+        &app,
+        "GET",
+        &format!("/_matrix/client/v3/rooms/{room_id}/messages?dir=x"),
+        Some(&bob_tok),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], json!("M_INVALID_PARAM"), "{body}");
 }

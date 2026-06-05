@@ -205,11 +205,15 @@ pub trait EventStore: Send + Sync {
 
     /// Pre:  the room must exist; if `from`/`to` are `Some`, the token must have been
     ///       returned by a previous call (or built from a known `StreamPos`).
-    /// Post: returns up to `limit` events in the requested direction, starting just past
-    ///       `from` and stopping *before* `to` (both exclusive). If `from` is `None` and
-    ///       `dir` is `Backward`, starts from the most recent event; if `Forward`, from the
-    ///       earliest. `to` is `None` for no stop boundary in that direction. The returned
-    ///       `PaginationToken` is `None` when no further events exist within the range.
+    /// Post: returns up to `limit` events in the requested direction. Tokens follow
+    ///       Synapse's convention — a token points *after* the row it names — so the
+    ///       bounds are asymmetric: `Forward` excludes `from` and includes `to`;
+    ///       `Backward` includes `from` and excludes `to`. The continuation token is
+    ///       set so re-feeding it as `from` neither repeats nor skips an event. If
+    ///       `from` is `None` and `dir` is `Backward`, starts from the most recent event;
+    ///       if `Forward`, from the earliest. `to` is `None` for no stop boundary in that
+    ///       direction. The returned `PaginationToken` is `None` when no further events
+    ///       exist within the range.
     async fn room_messages(
         &self,
         room_id: &RoomId,
@@ -218,6 +222,13 @@ pub trait EventStore: Send + Sync {
         dir: Direction,
         limit: usize,
     ) -> Result<(Vec<Event>, Option<PaginationToken>), StorageError>;
+
+    /// Pre:  none.
+    /// Post: returns the `StreamPos` of the most recent event in `room_id`, or
+    ///       `StreamPos(0)` if the room holds no events. Room-scoped, unlike
+    ///       `subscribe`, whose value is the global most-recent position across
+    ///       all rooms.
+    async fn room_stream_head(&self, room_id: &RoomId) -> Result<StreamPos, StorageError>;
 
     /// Pre:  none.
     /// Post: returns a receiver whose value is the `StreamPos` of the most recently

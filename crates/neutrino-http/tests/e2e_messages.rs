@@ -278,6 +278,98 @@ async fn sync_prev_batch_works_as_messages_from() {
     );
 }
 
+/// Paginate the whole room in `dir`, following the `end` token until it is
+/// absent, with a deliberately small `page` size. Returns event ids in the
+/// order pages delivered them.
+async fn paginate_all(app: &axum::Router, room: &str, dir: &str, page: usize) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut from: Option<String> = None;
+    let mut guard = 0;
+    loop {
+        guard += 1;
+        assert!(guard < 1000, "pagination did not terminate");
+        let q = match &from {
+            Some(f) => {
+                format!("/_matrix/client/v3/rooms/{room}/messages?dir={dir}&limit={page}&from={f}")
+            }
+            None => format!("/_matrix/client/v3/rooms/{room}/messages?dir={dir}&limit={page}"),
+        };
+        let (status, body) = get(app, &q).await;
+        assert_eq!(status, StatusCode::OK);
+        for e in body["chunk"].as_array().expect("chunk array") {
+            if let Some(id) = e["event_id"].as_str() {
+                ids.push(id.to_string());
+            }
+        }
+        match body["end"].as_str() {
+            Some(end) => from = Some(end.to_string()),
+            None => break,
+        }
+    }
+    ids
+}
+
+/// Full backward sweep in pages of 2 must reconstruct the exact same sequence
+/// as a single unbounded fetch — no skipped event (gap), no repeated event
+/// (overlap), order preserved. This is the headline pagination invariant.
+#[tokio::test]
+async fn backward_pagination_recovers_every_event_exactly_once() {
+    let app = router(config()).await.expect("router");
+    let room = room_with_messages(&app, 7).await;
+    let (_, full) = get(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room}/messages?dir=b&limit=1000"),
+    )
+    .await;
+    let full_ids: Vec<String> = full["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["event_id"].as_str().map(str::to_string))
+        .collect();
+    assert!(full_ids.len() >= 7, "create + member + 7 messages");
+
+    let paged = paginate_all(&app, &room, "b", 2).await;
+    assert_eq!(
+        paged, full_ids,
+        "paged backward == unbounded: no gaps, no overlap, order preserved"
+    );
+    let mut deduped = paged.clone();
+    deduped.sort();
+    deduped.dedup();
+    assert_eq!(deduped.len(), paged.len(), "no event returned twice");
+}
+
+/// Same property forward — the direction with the least pre-existing coverage
+/// (only a single unbounded forward fetch was tested before).
+#[tokio::test]
+async fn forward_pagination_recovers_every_event_exactly_once() {
+    let app = router(config()).await.expect("router");
+    let room = room_with_messages(&app, 7).await;
+    let (_, full) = get(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room}/messages?dir=f&from=0&limit=1000"),
+    )
+    .await;
+    let full_ids: Vec<String> = full["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["event_id"].as_str().map(str::to_string))
+        .collect();
+    assert!(full_ids.len() >= 7, "create + member + 7 messages");
+
+    let paged = paginate_all(&app, &room, "f", 2).await;
+    assert_eq!(
+        paged, full_ids,
+        "paged forward == unbounded: no gaps, no overlap, order preserved"
+    );
+    let mut deduped = paged.clone();
+    deduped.sort();
+    deduped.dedup();
+    assert_eq!(deduped.len(), paged.len(), "no event returned twice");
+}
+
 #[tokio::test]
 async fn bad_params_are_rejected() {
     let app = router(config()).await.expect("router");
