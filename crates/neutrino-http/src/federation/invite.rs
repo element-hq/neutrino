@@ -2,13 +2,16 @@
 //! invite, where **we host the invited user**.
 //!
 //! A remote resident server invites one of our local users to a room. The
-//! invite is **out-of-band membership**: in the common case we hold no state for
-//! the room (no `m.room.create`, no auth chain), so the event cannot go through
+//! request body is the **v2 envelope** `{ event, room_version, invite_room_state }`
+//! (the v2 endpoint wraps the PDU; v1's bare event is not accepted). The invite
+//! is **out-of-band membership**: in the common case we hold no state for the
+//! room (no `m.room.create`, no auth chain), so the event cannot go through
 //! `apply_pdu` (there is nothing to auth it against). Two dispositions:
 //!
-//! - **Room we do NOT host** (the common case): store the invite via
-//!   [`InviteStore::put_invite`]. Its `unsigned.invite_room_state` (stripped
-//!   state the inviting server included) is what sync renders the room from.
+//! - **Room we do NOT host** (the common case): merge the envelope's
+//!   `invite_room_state` into the event's `unsigned`, then store it via
+//!   [`InviteStore::put_invite`]. That stripped state is what sync renders the
+//!   room from.
 //! - **Room we already host** (the inviting server may not realise we're
 //!   resident — *not* an error, per the 2026-06-05 decision): stage the event
 //!   and let the per-room worker integrate it through `apply_pdu` like any
@@ -29,12 +32,13 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use neutrino_common::ROOM_VERSION_ID;
 use neutrino_state::event_id::from_wire;
 use neutrino_store::{InviteStore, RoomStore, StateStore};
 use ruma::events::AnyStrippedStateEvent;
 use ruma::serde::Raw;
 use ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 use serde_json::{Value, json};
 
@@ -42,6 +46,19 @@ use crate::federation::client::{FederationClient, FederationClientError};
 use crate::federation::{FedError, stage_and_poke};
 use crate::room_actor::RoomActorError;
 use crate::{AppState, error_response, lock_app};
+
+/// v2 `/invite` request envelope: the PDU plus the room version and an optional
+/// stripped `invite_room_state` for the invitee to render the room. The v2
+/// endpoint wraps the event in this envelope (v1 sent the bare event); we parse
+/// the envelope and merge `invite_room_state` into the event's `unsigned` so the
+/// sync invite path (which reads `unsigned.invite_room_state`) surfaces it.
+#[derive(Deserialize)]
+pub(crate) struct InviteRequestBody {
+    event: Box<RawJsonValue>,
+    room_version: String,
+    #[serde(default)]
+    invite_room_state: Vec<Box<RawJsonValue>>,
+}
 
 /// `/invite/v2` response: `{ event }` — our copy of the invite event.
 #[derive(Serialize)]
@@ -53,13 +70,25 @@ pub(crate) struct ResponseBody {
 pub(crate) async fn handle(
     State(state): State<AppState>,
     Path((room_id, event_id)): Path<(String, String)>,
-    body: Result<Json<Box<RawJsonValue>>, JsonRejection>,
+    body: Result<Json<InviteRequestBody>, JsonRejection>,
 ) -> Result<Json<ResponseBody>, FedError> {
-    let raw = body
-        .map_err(|_| FedError::BadRequest("body is not valid JSON"))?
+    let body = body
+        .map_err(|_| FedError::BadRequest("body is not the v2 invite envelope"))?
         .0;
     let room_id = OwnedRoomId::try_from(room_id.as_str())
         .map_err(|_| FedError::BadRequest("invalid room_id"))?;
+
+    // Version negotiation: we only host v12 + MSC4242.
+    if body.room_version != ROOM_VERSION_ID {
+        return Err(FedError::IncompatibleRoomVersion(
+            ROOM_VERSION_ID.to_owned(),
+        ));
+    }
+
+    // Merge the envelope's `invite_room_state` into the event's `unsigned` (the
+    // sync invite path reads it from there). `unsigned` is outside the reference
+    // hash, so this leaves the computed event_id unchanged.
+    let raw = merge_invite_room_state(body.event, body.invite_room_state);
 
     // Parse + compute the event id (also runs the format + semantic validators).
     // `auth_events` start empty — they are never on the v12 wire.
@@ -200,12 +229,20 @@ pub(crate) async fn federated_invite(
     };
 
     // 2. Federate to the invitee's server (the target's domain — a v12 room id
-    //    carries no server) with stripped `invite_room_state`.
+    //    carries no server) as the v2 envelope: the bare candidate event +
+    //    room_version + stripped `invite_room_state` (the peer merges the latter
+    //    into the event's `unsigned` for its sync to render).
     let irs = build_invite_room_state(&*store, room_id, &sender).await;
-    let body = with_invite_room_state(&candidate.raw, irs);
     let client = FederationClient::new(own_server);
     let returned = match client
-        .invite(target.server_name(), room_id, &candidate.event_id, &body)
+        .invite(
+            target.server_name(),
+            room_id,
+            &candidate.event_id,
+            &candidate.raw,
+            ROOM_VERSION_ID,
+            &irs,
+        )
         .await
     {
         Ok(resp) => resp.event,
@@ -288,19 +325,35 @@ async fn build_invite_room_state(
     out
 }
 
-/// Return `raw` with `unsigned.invite_room_state` set to `irs`. `unsigned` is
-/// outside the reference hash, so this does not change the event id.
-fn with_invite_room_state(raw: &RawJsonValue, irs: Vec<Value>) -> Box<RawJsonValue> {
-    let Ok(mut v) = serde_json::from_str::<Value>(raw.get()) else {
-        return raw.to_owned();
-    };
-    if let Some(obj) = v.as_object_mut() {
-        let unsigned = obj
-            .entry("unsigned")
-            .or_insert_with(|| Value::Object(Default::default()));
-        if let Some(uobj) = unsigned.as_object_mut() {
-            uobj.insert("invite_room_state".to_owned(), Value::Array(irs));
-        }
+/// Merge the v2 envelope's `invite_room_state` into the event's
+/// `unsigned.invite_room_state`, so the sync invite path (which reads it from
+/// `unsigned`) surfaces it. `unsigned` is outside the reference hash, so this
+/// does not change the computed event id. An empty `irs` is a no-op — the event
+/// is returned untouched (preserving any `unsigned` the sender already set).
+/// Any JSON fault degrades to the original event (the invite still works, just
+/// without a room preview) rather than failing the request.
+fn merge_invite_room_state(
+    event: Box<RawJsonValue>,
+    irs: Vec<Box<RawJsonValue>>,
+) -> Box<RawJsonValue> {
+    if irs.is_empty() {
+        return event;
     }
-    RawJsonValue::from_string(v.to_string()).unwrap_or_else(|_| raw.to_owned())
+    let Ok(mut v) = serde_json::from_str::<Value>(event.get()) else {
+        return event;
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return event;
+    };
+    let arr: Vec<Value> = irs
+        .iter()
+        .filter_map(|r| serde_json::from_str::<Value>(r.get()).ok())
+        .collect();
+    let unsigned = obj
+        .entry("unsigned")
+        .or_insert_with(|| Value::Object(Default::default()));
+    if let Some(uobj) = unsigned.as_object_mut() {
+        uobj.insert("invite_room_state".to_owned(), Value::Array(arr));
+    }
+    RawJsonValue::from_string(v.to_string()).unwrap_or(event)
 }

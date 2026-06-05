@@ -18,6 +18,7 @@ use std::time::Duration;
 use reqwest::Client;
 use ruma::{EventId, OwnedEventId, RoomId, ServerName, UserId};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use serde_json::value::RawValue as RawJsonValue;
 
 use crate::federation::gapfill::MissingEventsFetcher;
@@ -200,16 +201,19 @@ impl FederationClient {
     }
 
     /// `PUT http://{dest}/_matrix/federation/v2/invite/{room}/{event_id}`
-    /// carrying the invite `m.room.member` `event` (with
-    /// `unsigned.invite_room_state` for the invitee to render the room).
-    /// Returns the peer's copy of the event (`{ event }`) — in a signatures
-    /// world this is where the invitee server's signature would be added.
+    /// carrying the **v2 request envelope** `{ event, room_version,
+    /// invite_room_state }` (the v2 endpoint wraps the PDU; v1's bare event is
+    /// not used). `invite_room_state` is the stripped state for the invitee to
+    /// render the room. Returns the peer's copy of the event (`{ event }`) — in
+    /// a signatures world this is where the invitee server's signature is added.
     pub(crate) async fn invite(
         &self,
         dest: &ServerName,
         room_id: &RoomId,
         event_id: &EventId,
         event: &RawJsonValue,
+        room_version: &str,
+        invite_room_state: &[Value],
     ) -> Result<InviteResponse, FederationClientError> {
         let mut url = reqwest::Url::parse(&format!("http://{dest}/_matrix/federation/v2/invite"))
             .map_err(|_| FederationClientError::InvalidUrl)?;
@@ -218,12 +222,27 @@ impl FederationClient {
             .push(room_id.as_str())
             .push(event_id.as_str());
 
-        let resp = self.http.put(url).json(&event).send().await?;
+        let body = InviteRequest {
+            event,
+            room_version,
+            invite_room_state,
+        };
+        let resp = self.http.put(url).json(&body).send().await?;
         if !resp.status().is_success() {
             return Err(FederationClientError::Status(resp.status().as_u16()));
         }
         Ok(resp.json::<InviteResponse>().await?)
     }
+}
+
+/// The v2 `/invite` request envelope (mirror of the inbound
+/// `invite::InviteRequestBody`): the PDU plus the room version and the stripped
+/// `invite_room_state` for the invitee to render the room.
+#[derive(Serialize)]
+struct InviteRequest<'a> {
+    event: &'a RawJsonValue,
+    room_version: &'a str,
+    invite_room_state: &'a [Value],
 }
 
 /// Deserialized `make_join` response (mirror of the inbound

@@ -2879,16 +2879,19 @@ fn inviter() -> OwnedUserId {
     "@bob:remote.example.org".parse().unwrap()
 }
 
-/// The invite event's wire JSON body, optionally with an injected
-/// `unsigned.invite_room_state` (stripped state the inviting server would
-/// include). `unsigned` is outside the reference hash, so injecting it does not
-/// change the event_id the handler recomputes.
+/// The v2 `/invite` request envelope `{ event, room_version, invite_room_state }`
+/// (the v2 endpoint wraps the PDU). `invite_room_state` is the optional stripped
+/// state the inviting server includes; the handler merges it into the stored
+/// event's `unsigned`.
 fn invite_body(event: &neutrino_common::Event, invite_room_state: Option<Value>) -> Value {
-    let mut v: Value = serde_json::from_str(event.raw.get()).unwrap();
+    let mut body = json!({
+        "event": serde_json::from_str::<Value>(event.raw.get()).unwrap(),
+        "room_version": ROOM_VERSION_ID,
+    });
     if let Some(irs) = invite_room_state {
-        v["unsigned"] = json!({ "invite_room_state": irs });
+        body["invite_room_state"] = irs;
     }
-    v
+    body
 }
 
 /// Build an `m.room.member` event off `prevs` (used for both DAGs) with the
@@ -3262,5 +3265,103 @@ async fn outbound_invite_peer_403_persists_nothing() {
             .unwrap()
             .is_none(),
         "a peer 403 must leave nothing persisted"
+    );
+}
+
+/// Inbound `/invite/v2` for a room we DO host, authored by an **unauthorised**
+/// remote inviter (not in the room, no power): the decision-3 path stages it and
+/// the worker integrates it through `apply_pdu`, which auth-REJECTS it. The
+/// invitee must NOT end up in current_state, and must NOT fall back to an
+/// out-of-band stub. (Exercises the hosted-room reject branch — the one most
+/// likely to hide a bug.)
+#[tokio::test]
+async fn invite_for_hosted_room_unauthorised_inviter_is_rejected() {
+    let (app, store, room_id, _alice, join_id) = seed_joined_room().await;
+    // A remote user with no membership/power in our room "invites" our local
+    // carol. (The invitee is local — that gate passes; auth is what refuses it.)
+    let bob: OwnedUserId = "@bob:remote.example.org".parse().unwrap();
+    let carol: OwnedUserId = "@carol:example.org".parse().unwrap();
+    let invite = member_pdu(
+        &bob,
+        carol.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&join_id),
+    );
+    let invite_id = invite.event_id.clone();
+
+    let (status, body) = put_json(
+        &app,
+        &invite_path(room_id.as_str(), invite_id.as_str()),
+        &invite_body(&invite, None),
+    )
+    .await;
+    // The handler stages optimistically and 200s; the worker does the auth.
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    // Let the worker drain (it applies → auth-rejects → unstages).
+    wait_staging_empty(&store, &room_id).await;
+
+    // Rejected ⇒ carol is NOT in current state…
+    assert!(
+        store
+            .current_state_event(&room_id, "m.room.member", carol.as_str())
+            .await
+            .unwrap()
+            .is_none(),
+        "an unauthorised invite must not land in current state"
+    );
+    // …and a hosted-room invite is NEVER parked as an out-of-band stub.
+    assert!(
+        store.get_invite(&room_id, &carol).await.unwrap().is_none(),
+        "hosted-room invite must not fall back to an OOB stub"
+    );
+}
+
+/// Outbound CSAPI `/invite`: if the invitee server 200s but returns a
+/// **different** event in `{ event }`, the `event_id` round-trip guard refuses
+/// it (502) and nothing is persisted — a peer cannot substitute a different
+/// event for `apply_resident` to commit.
+#[tokio::test]
+async fn outbound_invite_peer_returns_wrong_event_persists_nothing() {
+    let (a_app, a_store, room_id, _alice, _join) = seed_joined_room().await;
+
+    // A valid but unrelated event the stub will echo instead of our candidate.
+    let other_create = EventBuilder::new(inviter(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build a different event");
+    let bogus = json!({ "event": raw_to_value(&other_create) });
+
+    let stub = axum::Router::new().route(
+        "/_matrix/federation/v2/invite/{room_id}/{event_id}",
+        axum::routing::put(move || {
+            let body = bogus.clone();
+            async move { (StatusCode::OK, axum::Json(body)) }
+        }),
+    );
+    let stub_name = crate::federation::test_support::spawn_stub(stub).await;
+    let dave = format!("@dave:{stub_name}");
+    let dave_uid: OwnedUserId = dave.parse().unwrap();
+
+    let (status, _body) = post_json(
+        &a_app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/invite"),
+        &json!({ "user_id": dave }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "a substituted event must be refused"
+    );
+    assert!(
+        a_store
+            .current_state_event(&room_id, "m.room.member", dave_uid.as_str())
+            .await
+            .unwrap()
+            .is_none(),
+        "nothing persisted when the peer returns the wrong event"
     );
 }
