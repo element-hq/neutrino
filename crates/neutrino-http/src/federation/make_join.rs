@@ -99,7 +99,8 @@ pub(crate) async fn handle(
 /// True if the requester's repeated `?ver=` query includes our room version.
 /// A wholly-absent `ver` defaults to `["1"]` per spec, which never matches our
 /// `org.matrix.msc4242.12`, so an absent `ver` is (correctly) incompatible.
-fn ver_includes_ours(raw: Option<&str>) -> bool {
+/// Shared with `make_leave` (same spec-mandated `ver` negotiation).
+pub(crate) fn ver_includes_ours(raw: Option<&str>) -> bool {
     let Some(raw) = raw else {
         return false;
     };
@@ -153,8 +154,9 @@ async fn check_can_join(
 
 /// Map a `build_event` actor error onto the HTTP layer. `UnknownRoom` is a 404
 /// (the room vanished between the version check and the build — a race);
-/// anything else is internal.
-fn map_build_err(err: RoomActorError) -> FedError {
+/// anything else is internal. Shared with `make_leave` (same template-build
+/// path).
+pub(crate) fn map_build_err(err: RoomActorError) -> FedError {
     match err {
         RoomActorError::UnknownRoom => FedError::RoomNotFound,
         RoomActorError::Storage(e) => FedError::Storage(e),

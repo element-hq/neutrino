@@ -233,6 +233,61 @@ impl FederationClient {
         }
         Ok(resp.json::<InviteResponse>().await?)
     }
+
+    /// `GET http://{dest}/_matrix/federation/v1/make_leave/{room}/{user}?ver={ver}`
+    /// — request a leave/rejection template from the resident (the first half of
+    /// the leave handshake; used by us to reject an invite). Returns the template
+    /// and the room's version. We send our `ver` for completeness; a spec-
+    /// compliant resident is lenient on leave (a user must always be able to
+    /// depart a room it is in) and won't gate on it.
+    pub(crate) async fn make_leave(
+        &self,
+        dest: &ServerName,
+        room_id: &RoomId,
+        user_id: &UserId,
+        ver: &str,
+    ) -> Result<MakeLeaveResponse, FederationClientError> {
+        let mut url =
+            reqwest::Url::parse(&format!("http://{dest}/_matrix/federation/v1/make_leave"))
+                .map_err(|_| FederationClientError::InvalidUrl)?;
+        url.path_segments_mut()
+            .map_err(|()| FederationClientError::InvalidUrl)?
+            .push(room_id.as_str())
+            .push(user_id.as_str());
+        url.query_pairs_mut().append_pair("ver", ver);
+
+        let resp = self.http.get(url).send().await?;
+        if !resp.status().is_success() {
+            return Err(FederationClientError::Status(resp.status().as_u16()));
+        }
+        Ok(resp.json::<MakeLeaveResponse>().await?)
+    }
+
+    /// `PUT http://{dest}/_matrix/federation/v2/send_leave/{room}/{event_id}`
+    /// carrying the completed leave `event` — the second half of the leave
+    /// handshake. The v2 response is an empty object and carries no state, so it
+    /// is ignored: `Ok(())` on any 2xx.
+    pub(crate) async fn send_leave(
+        &self,
+        dest: &ServerName,
+        room_id: &RoomId,
+        event_id: &EventId,
+        event: &RawJsonValue,
+    ) -> Result<(), FederationClientError> {
+        let mut url =
+            reqwest::Url::parse(&format!("http://{dest}/_matrix/federation/v2/send_leave"))
+                .map_err(|_| FederationClientError::InvalidUrl)?;
+        url.path_segments_mut()
+            .map_err(|()| FederationClientError::InvalidUrl)?
+            .push(room_id.as_str())
+            .push(event_id.as_str());
+
+        let resp = self.http.put(url).json(&event).send().await?;
+        if !resp.status().is_success() {
+            return Err(FederationClientError::Status(resp.status().as_u16()));
+        }
+        Ok(())
+    }
 }
 
 /// The v2 `/invite` request envelope (mirror of the inbound
@@ -270,6 +325,16 @@ pub(crate) struct SendJoinResponse {
 #[derive(Deserialize)]
 pub(crate) struct InviteResponse {
     pub(crate) event: Box<RawJsonValue>,
+}
+
+/// Deserialized `make_leave` response (mirror of the inbound
+/// `make_leave::ResponseBody`). The `event` is the unsigned leave template.
+/// Structurally identical to [`MakeJoinResponse`], kept distinct per the
+/// one-mirror-per-endpoint convention.
+#[derive(Deserialize)]
+pub(crate) struct MakeLeaveResponse {
+    pub(crate) event: Box<RawJsonValue>,
+    pub(crate) room_version: String,
 }
 
 /// The production [`MissingEventsFetcher`]: a thin adapter that closes a

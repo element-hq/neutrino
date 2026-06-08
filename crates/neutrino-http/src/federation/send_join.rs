@@ -34,8 +34,7 @@ use ruma::{EventId, OwnedEventId, OwnedRoomId};
 use serde::Serialize;
 use serde_json::value::RawValue as RawJsonValue;
 
-use crate::federation::FedError;
-use crate::room_actor::RoomActorError;
+use crate::federation::{FedError, map_apply_err};
 use crate::{AppState, lock_app};
 
 /// Recent timeline events to include in the `send_join` response. The joiner
@@ -106,22 +105,10 @@ pub(crate) async fn handle(
 
     // Apply through the resident path: accept ⇒ persisted + fanned out; reject
     // ⇒ 403; idempotent re-send ⇒ Ok. (`apply_resident` enqueues the fan-out.)
-    match registry.apply_resident(&room_id, event).await {
-        Ok(()) => {}
-        Err(RoomActorError::Rejected) => {
-            return Err(FedError::Forbidden("user is not allowed to join this room"));
-        }
-        Err(RoomActorError::UnknownRoom) => return Err(FedError::RoomNotFound),
-        Err(RoomActorError::Storage(e)) => return Err(FedError::Storage(e)),
-        // Build/Apply (e.g. malformed or unauthorisable against our state) —
-        // the joiner sent something we can't admit.
-        Err(RoomActorError::Build(_) | RoomActorError::Apply(_)) => {
-            return Err(FedError::BadRequest("could not authorise join"));
-        }
-        Err(RoomActorError::NotApplied | RoomActorError::ActorGone) => {
-            return Err(FedError::Internal("apply did not produce a result"));
-        }
-    }
+    registry
+        .apply_resident(&room_id, event)
+        .await
+        .map_err(map_apply_err)?;
 
     // Build the MSC4242 response from the post-apply state.
     let (timeline_fes, state_fes) = store

@@ -26,9 +26,12 @@ pub(crate) mod gapfill;
 pub(crate) mod get_missing_events;
 pub(crate) mod invite;
 pub(crate) mod join;
+pub(crate) mod leave;
 pub(crate) mod make_join;
+pub(crate) mod make_leave;
 pub(crate) mod send;
 pub(crate) mod send_join;
+pub(crate) mod send_leave;
 pub(crate) mod sender;
 pub(crate) mod worker;
 
@@ -205,6 +208,65 @@ pub(crate) async fn events_before_raw(
         .into_iter()
         .map(|e| e.raw)
         .collect())
+}
+
+/// Map a `RoomRegistry::apply_resident` error onto the HTTP layer. Shared by the
+/// `send_join` and `send_leave` handlers, whose apply step is identical: a policy
+/// reject is a 403, an unknown room a 404, a malformed/unauthorisable event a
+/// 400, and storage / lost-result faults a 500. The human-readable strings are
+/// deliberately membership-agnostic so the two endpoints share one mapping.
+pub(crate) fn map_apply_err(err: crate::room_actor::RoomActorError) -> FedError {
+    use crate::room_actor::RoomActorError;
+    match err {
+        RoomActorError::Rejected => {
+            FedError::Forbidden("you are not permitted to perform this membership change")
+        }
+        RoomActorError::UnknownRoom => FedError::RoomNotFound,
+        RoomActorError::Storage(e) => FedError::Storage(e),
+        // Build/Apply — the event is malformed or unauthorisable against our state.
+        RoomActorError::Build(_) | RoomActorError::Apply(_) => {
+            FedError::BadRequest("could not authorise the membership event")
+        }
+        RoomActorError::NotApplied | RoomActorError::ActorGone => {
+            FedError::Internal("apply did not produce a result")
+        }
+    }
+}
+
+/// Rebuild an `m.room.member` event from a remote `make_join`/`make_leave`
+/// template, taking **only** the template's DAG references (`prev_events` /
+/// `prev_state_events`) and setting `type` / `sender` / `state_key` / `content`
+/// ourselves. `auth_events` are left empty (the resident computes them at apply);
+/// the id is the reference hash of the result.
+///
+/// **Security — complete, don't echo.** Every authoritative field is set by us;
+/// only the two DAG-reference vectors come from the remote template. A naïve
+/// completion that echoed the template's `type`/`content`/`state_key`/`sender`
+/// would let a malicious resident hand back an arbitrary event for us to author
+/// as one of our users (the make_join/make_leave template-completion forgery —
+/// worst for leave, where `content` is otherwise unconstrained). Do not
+/// "simplify" this into reusing the template's fields; a regression test pins
+/// the invariant. `None` if the template is unparseable.
+pub(crate) fn complete_membership_template(
+    template: &serde_json::value::RawValue,
+    room_id: &ruma::RoomId,
+    user: &ruma::UserId,
+    membership: &str,
+) -> Option<neutrino_common::Event> {
+    use neutrino_state::event_id::{EventBuilder, from_wire};
+    let parsed = from_wire(
+        serde_json::value::RawValue::from_string(template.get().to_owned()).ok()?,
+        Vec::new(),
+    )
+    .ok()?;
+    EventBuilder::new(user.to_owned(), "m.room.member".to_owned())
+        .room_id(room_id.to_owned())
+        .state_key(user.to_string())
+        .content(json!({ "membership": membership }))
+        .prev_events(parsed.prev_events)
+        .prev_state_events(parsed.prev_state_events)
+        .build()
+        .ok()
 }
 
 /// Stage a batch of already-parsed PDUs for one room, then poke the worker to

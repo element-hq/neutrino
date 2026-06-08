@@ -11,7 +11,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use neutrino_store::{RoomStore, StateStore};
+use neutrino_store::{InviteStore, RoomStore, StateStore};
 use ruma::{OwnedUserId, RoomAliasId, RoomId, UserId};
 use serde_json::{Value, json};
 
@@ -215,6 +215,27 @@ pub(crate) async fn leave(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    // An out-of-band invite (a room we don't host, held only as an `InviteStore`
+    // stub) is declined via the federated leave handshake + an unconditional
+    // local stub removal. Checked *before* `require_room`, which would otherwise
+    // 404 a room we have no `rooms` row for. A storage fault here is surfaced as
+    // a 500 rather than silently mistaken for "no invite" (which would 404 the
+    // room). The loaded invite is handed to `reject_invite` so it need not
+    // re-read the stub.
+    let store = lock_app(&state.0).store.clone();
+    match store.get_invite(&room, &sender).await {
+        Ok(Some(invite)) => {
+            return crate::federation::leave::reject_invite(&state.0, sender, &room, invite).await;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            );
+        }
+    }
     if let Err(resp) = require_room(&state.0, &room).await {
         return resp;
     }

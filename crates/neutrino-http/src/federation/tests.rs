@@ -3365,3 +3365,504 @@ async fn outbound_invite_peer_returns_wrong_event_persists_nothing() {
         "nothing persisted when the peer returns the wrong event"
     );
 }
+
+// ===================================================================
+// Server-Server leave / invite-rejection (Milestone C).
+// INBOUND (we are the resident): make_leave / send_leave for a remote
+// user departing a room we host. OUTBOUND (we are the joining server):
+// CSAPI /leave of an out-of-band invite → federated reject + local removal.
+// ===================================================================
+
+/// A room created by alice with zara invited (the state a rejection acts on).
+async fn seed_room_with_invited_zara() -> (axum::Router, Arc<SqliteStore>, OwnedRoomId, OwnedEventId)
+{
+    seed_room(&[
+        (
+            ALICE,
+            "m.room.member",
+            ALICE,
+            json!({ "membership": "join" }),
+        ),
+        (
+            ALICE,
+            "m.room.member",
+            ZARA,
+            json!({ "membership": "invite" }),
+        ),
+    ])
+    .await
+}
+
+fn make_leave_path(room_id: &RoomId, user: &str) -> String {
+    format!("/_matrix/federation/v1/make_leave/{room_id}/{user}?ver={ROOM_VERSION_ID}")
+}
+
+fn send_leave_path(room_id: &RoomId, event_id: &OwnedEventId) -> String {
+    format!("/_matrix/federation/v2/send_leave/{room_id}/{event_id}")
+}
+
+/// A completed remote `m.room.member`/`leave` (self-leave) referencing `head`.
+fn remote_leave(room_id: &RoomId, head: &OwnedEventId, user: &str) -> neutrino_common::Event {
+    let user: OwnedUserId = user.parse().expect("user");
+    EventBuilder::new(user.clone(), "m.room.member".to_owned())
+        .room_id(room_id.to_owned())
+        .state_key(user.to_string())
+        .content(json!({ "membership": "leave" }))
+        .prev_events(vec![head.clone()])
+        .prev_state_events(vec![head.clone()])
+        .build()
+        .expect("build remote leave")
+}
+
+// --- make_leave (inbound) ----------------------------------------------
+
+#[tokio::test]
+async fn make_leave_returns_leave_template() {
+    let (router, _store, room_id, head) = seed_room_with_invited_zara().await;
+    let (status, body) = get(&router, &make_leave_path(&room_id, ZARA)).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["room_version"], ROOM_VERSION_ID);
+
+    let event = &body["event"];
+    assert_eq!(event["type"], "m.room.member");
+    assert_eq!(event["content"]["membership"], "leave");
+    assert_eq!(event["sender"], ZARA);
+    assert_eq!(event["state_key"], ZARA);
+
+    let prev_state = event["prev_state_events"]
+        .as_array()
+        .expect("prev_state_events array");
+    assert_eq!(prev_state.len(), 1);
+    assert_eq!(prev_state[0], head.as_str());
+    match event.get("auth_events") {
+        None => {}
+        Some(Value::Array(a)) => assert!(a.is_empty(), "auth_events must be empty: {a:?}"),
+        other => panic!("unexpected auth_events: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn make_leave_unknown_room_returns_404() {
+    let (router, _store, _room_id, _head) = seed_room_with_invited_zara().await;
+    let unknown = ruma::RoomId::parse("!nope:example.org").unwrap();
+    let (status, body) = get(&router, &make_leave_path(&unknown, ZARA)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body:?}");
+    assert_eq!(body["errcode"], "M_NOT_FOUND");
+}
+
+#[tokio::test]
+async fn make_leave_incompatible_version_returns_400() {
+    // make_leave negotiates the room version like make_join: a `ver` that does
+    // not include ours — or an absent `ver` (which defaults to `[1]`) — yields
+    // 400 M_INCOMPATIBLE_ROOM_VERSION with our `room_version` in the body.
+    let (router, _store, room_id, _head) = seed_room_with_invited_zara().await;
+
+    let path = format!("/_matrix/federation/v1/make_leave/{room_id}/{ZARA}?ver=1");
+    let (status, body) = get(&router, &path).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(body["errcode"], "M_INCOMPATIBLE_ROOM_VERSION");
+    assert_eq!(body["room_version"], ROOM_VERSION_ID);
+
+    let path = format!("/_matrix/federation/v1/make_leave/{room_id}/{ZARA}");
+    let (status, body) = get(&router, &path).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(body["errcode"], "M_INCOMPATIBLE_ROOM_VERSION");
+}
+
+// --- send_leave (inbound) ----------------------------------------------
+
+#[tokio::test]
+async fn send_leave_admits_leave_and_returns_empty() {
+    // zara is invited; she rejects → leaves. yan (other.example) is joined so
+    // the leave genuinely fans out (distribution duty).
+    let (router, store, room_id, head) = seed_room(&[
+        (
+            ALICE,
+            "m.room.member",
+            ALICE,
+            json!({ "membership": "join" }),
+        ),
+        (YAN, "m.room.member", YAN, json!({ "membership": "join" })),
+        (
+            ALICE,
+            "m.room.member",
+            ZARA,
+            json!({ "membership": "invite" }),
+        ),
+    ])
+    .await;
+    let leave = remote_leave(&room_id, &head, ZARA);
+    let leave_id = leave.event_id.clone();
+
+    let (status, body) = put_event(
+        &router,
+        &send_leave_path(&room_id, &leave_id),
+        leave.raw.get(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    // The v2 response is an empty object — no state_dag / auth_chain / state.
+    assert_eq!(body, json!({}), "send_leave must return an empty object");
+
+    // zara is now `leave` in our current state.
+    let member = store
+        .current_state_event(&room_id, "m.room.member", ZARA)
+        .await
+        .unwrap()
+        .expect("zara member row");
+    assert_eq!(member.event_id, leave_id);
+    assert_eq!(membership_str(&member).as_deref(), Some("leave"));
+
+    // Distribution duty matches send_join's: fan out to the *other* room servers,
+    // but NOT back to the server that delivered the leave (zara's own
+    // remote.example — `apply_resident` excludes the sender), nor to ourselves.
+    let other = store
+        .pending_pdus(ruma::server_name!("other.example"), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        other.iter().any(|e| e.event_id == leave_id),
+        "other.example must receive zara's leave"
+    );
+    assert!(
+        store
+            .pending_pdus(ruma::server_name!("remote.example"), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty(),
+        "must not echo the leave back to the departing server"
+    );
+    assert!(
+        store
+            .pending_pdus(ruma::server_name!("example.org"), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty(),
+        "must never federate to ourselves"
+    );
+}
+
+#[tokio::test]
+async fn send_leave_non_leave_membership_returns_400() {
+    let (router, _store, room_id, head) = seed_room_with_invited_zara().await;
+    // A join event sent to send_leave must be refused on the membership check.
+    let join = remote_join(&room_id, &head, ZARA);
+    let id = join.event_id.clone();
+    let (status, body) = put_event(&router, &send_leave_path(&room_id, &id), join.raw.get()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(body["errcode"], "M_INVALID_PARAM");
+}
+
+#[tokio::test]
+async fn send_leave_event_id_path_mismatch_returns_400() {
+    let (router, _store, room_id, head) = seed_room_with_invited_zara().await;
+    let leave = remote_leave(&room_id, &head, ZARA);
+    // Path id is a real, valid, different id (the state head), so the 400 can
+    // only come from the body-vs-path comparison.
+    let (status, body) =
+        put_event(&router, &send_leave_path(&room_id, &head), leave.raw.get()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(body["errcode"], "M_INVALID_PARAM");
+}
+
+#[tokio::test]
+async fn send_leave_state_key_not_sender_returns_400() {
+    // A leave whose state_key != sender (a kick shape). send_leave only expresses
+    // a self-leave, so it must refuse this; a kick rides /send instead.
+    let (router, _store, room_id, head) = seed_room_with_invited_zara().await;
+    let zara: OwnedUserId = ZARA.parse().unwrap();
+    let leave = EventBuilder::new(zara.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(YAN.to_owned())
+        .content(json!({ "membership": "leave" }))
+        .prev_events(vec![head.clone()])
+        .prev_state_events(vec![head.clone()])
+        .build()
+        .expect("build mismatched leave");
+    let id = leave.event_id.clone();
+    let (status, body) = put_event(&router, &send_leave_path(&room_id, &id), leave.raw.get()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(body["errcode"], "M_INVALID_PARAM");
+}
+
+#[tokio::test]
+async fn send_leave_is_idempotent_on_resend() {
+    let (router, store, room_id, head) = seed_room(&[
+        (
+            ALICE,
+            "m.room.member",
+            ALICE,
+            json!({ "membership": "join" }),
+        ),
+        (YAN, "m.room.member", YAN, json!({ "membership": "join" })),
+        (
+            ALICE,
+            "m.room.member",
+            ZARA,
+            json!({ "membership": "invite" }),
+        ),
+    ])
+    .await;
+    let leave = remote_leave(&room_id, &head, ZARA);
+    let id = leave.event_id.clone();
+    let path = send_leave_path(&room_id, &id);
+
+    let (s1, _b1) = put_event(&router, &path, leave.raw.get()).await;
+    assert_eq!(s1, StatusCode::OK);
+    let after_first = store
+        .pending_pdus(ruma::server_name!("other.example"), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(after_first.len(), 1, "one fan-out on first apply");
+
+    // A re-sent send_leave re-applies as a no-op.
+    let (s2, b2) = put_event(&router, &path, leave.raw.get()).await;
+    assert_eq!(s2, StatusCode::OK, "{b2:?}");
+    let after_second = store
+        .pending_pdus(ruma::server_name!("other.example"), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_second.len(),
+        1,
+        "re-send must not enqueue the leave a second time"
+    );
+    let member = store
+        .current_state_event(&room_id, "m.room.member", ZARA)
+        .await
+        .unwrap()
+        .expect("zara member row");
+    assert_eq!(member.event_id, id);
+}
+
+#[tokio::test]
+async fn send_leave_unknown_room_returns_404() {
+    // A leave for a room we don't host: `apply_resident` can't bootstrap an actor
+    // (no forward extremities) → UnknownRoom → 404. Exercises the apply-error
+    // mapping past the structural validators.
+    let (router, _store, _room, head) = seed_room_with_invited_zara().await;
+    let unknown = ruma::RoomId::parse("!nope:example.org").unwrap();
+    let leave = remote_leave(&unknown, &head, ZARA);
+    let id = leave.event_id.clone();
+    let (status, body) = put_event(&router, &send_leave_path(&unknown, &id), leave.raw.get()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body:?}");
+    assert_eq!(body["errcode"], "M_NOT_FOUND");
+}
+
+#[tokio::test]
+async fn send_leave_unauthorised_leave_returns_403() {
+    // zara was never in this public room, so a self-leave has no valid prior
+    // membership: auth rejects it → 403, nothing persisted. Exercises the
+    // `apply_resident` Rejected → 403 arm (the structural 400 tests all trip a
+    // guard *before* apply).
+    let (router, store, room_id, head) = seed_public_room().await;
+    let leave = remote_leave(&room_id, &head, ZARA);
+    let id = leave.event_id.clone();
+    let (status, body) = put_event(&router, &send_leave_path(&room_id, &id), leave.raw.get()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN");
+    assert!(
+        store
+            .current_state_event(&room_id, "m.room.member", ZARA)
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused leave must not enter current state"
+    );
+}
+
+// --- outbound CSAPI /leave (invite rejection) --------------------------
+
+/// A resident server B (served on an ephemeral port) hosting a room created by
+/// `@bob:{B}` with `invitee` invited. Returns its name, store, room id, and the
+/// invite event (whose `sender` domain is B — the reject handshake target).
+async fn serve_resident_with_invite(
+    invitee: &str,
+) -> (
+    String,
+    Arc<SqliteStore>,
+    OwnedRoomId,
+    neutrino_common::Event,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let bob: OwnedUserId = format!("@bob:{name}").parse().unwrap();
+    let (store, tempfile) = fresh_store().await;
+
+    let create = EventBuilder::new(bob.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    let bob_join = EventBuilder::new(bob.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(bob.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create.event_id.clone()])
+        .prev_state_events(vec![create.event_id.clone()])
+        .build()
+        .expect("build bob join");
+    let invite = EventBuilder::new(bob.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(invitee.to_owned())
+        .content(json!({ "membership": "invite" }))
+        .prev_events(vec![bob_join.event_id.clone()])
+        .prev_state_events(vec![bob_join.event_id.clone()])
+        .build()
+        .expect("build invite");
+    store
+        .create_room(&create, &[bob_join, invite.clone()])
+        .await
+        .expect("create_room on B");
+    let router = router_with_store(config_for(&name, "bob"), store.clone(), tempfile);
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (name, store, room_id, invite)
+}
+
+#[tokio::test]
+async fn outbound_reject_invite_federates_leave_and_removes_stub() {
+    // B hosts the room and invited our local alice. A holds only the OOB stub.
+    let alice = alice();
+    let (_b_name, b_store, room_id, invite) = serve_resident_with_invite(alice.as_str()).await;
+
+    let (a_store, a_temp) = fresh_store().await;
+    let a_router = router_with_store(config(), a_store.clone(), a_temp);
+    a_store.put_invite(&room_id, &alice, &invite).await.unwrap();
+
+    let (status, body) = post_json(
+        &a_router,
+        &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+
+    // A's stub is gone (declined).
+    assert!(
+        a_store
+            .get_invite(&room_id, &alice)
+            .await
+            .unwrap()
+            .is_none(),
+        "the OOB invite stub must be removed on reject"
+    );
+    // B applied the leave: alice is now `leave` in B's current state.
+    let member = b_store
+        .current_state_event(&room_id, "m.room.member", alice.as_str())
+        .await
+        .unwrap()
+        .expect("alice member on B");
+    assert_eq!(
+        membership_str(&member).as_deref(),
+        Some("leave"),
+        "B must record alice's leave via the handshake"
+    );
+}
+
+#[tokio::test]
+async fn outbound_reject_invite_unreachable_server_still_removes_stub() {
+    // The inviting server is dead; local rejection must proceed regardless.
+    let dead = crate::federation::test_support::dead_peer().await;
+    let (a_store, a_temp) = fresh_store().await;
+    let a_router = router_with_store(config(), a_store.clone(), a_temp);
+    let alice = alice();
+
+    let dead_bob: OwnedUserId = format!("@bob:{dead}").parse().unwrap();
+    let create = EventBuilder::new(dead_bob.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    let invite = member_pdu(
+        &dead_bob,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&create.event_id),
+    );
+    a_store.put_invite(&room_id, &alice, &invite).await.unwrap();
+
+    let (status, body) = post_json(
+        &a_router,
+        &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert!(
+        a_store
+            .get_invite(&room_id, &alice)
+            .await
+            .unwrap()
+            .is_none(),
+        "stub must be removed even when the inviting server is unreachable"
+    );
+}
+
+#[tokio::test]
+async fn reject_then_reinvite_resurrects_stub() {
+    // Inbound invite → stub; reject (inviting server dead) → stub gone; a fresh
+    // inbound invite resurrects it. The declined-then-reinvited round trip.
+    let dead = crate::federation::test_support::dead_peer().await;
+    let (a_store, a_temp) = fresh_store().await;
+    let a_router = router_with_store(config(), a_store.clone(), a_temp);
+    let alice = alice();
+
+    let dead_bob: OwnedUserId = format!("@bob:{dead}").parse().unwrap();
+    let create = EventBuilder::new(dead_bob.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    let invite = member_pdu(
+        &dead_bob,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&create.event_id),
+    );
+    let invite_id = invite.event_id.clone();
+    let path = invite_path(room_id.as_str(), invite_id.as_str());
+
+    let (s, _b) = put_json(&a_router, &path, &invite_body(&invite, None)).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(
+        a_store
+            .get_invite(&room_id, &alice)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let (s, _b) = post_json(
+        &a_router,
+        &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(
+        a_store
+            .get_invite(&room_id, &alice)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Re-invite resurrects the declined stub.
+    let (s, _b) = put_json(&a_router, &path, &invite_body(&invite, None)).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(
+        a_store
+            .get_invite(&room_id, &alice)
+            .await
+            .unwrap()
+            .is_some(),
+        "a re-invite after a decline must resurrect the stub"
+    );
+}
