@@ -37,33 +37,27 @@ use crate::federation::client::FederationClient;
 use crate::federation::complete_membership_template;
 use crate::{AppState, error_response, lock_app};
 
-/// Reject an out-of-band invite. The caller (`membership::leave`) has already
-/// confirmed an invite stub exists for `(room_id, user)`. Always returns
+/// Reject an out-of-band invite. The caller (`membership::leave`) passes the
+/// already-loaded `invite` stub (so we don't re-read it). Always returns
 /// `200 {}` unless the local stub removal itself fails (a real storage fault).
 pub(crate) async fn reject_invite(
     state: &AppState,
     user: OwnedUserId,
     room_id: &RoomId,
+    invite: neutrino_common::Event,
 ) -> Response {
     let (store, own_server) = {
         let app = lock_app(state);
         (app.store.clone(), app.config.server_name.clone())
     };
 
-    // Best-effort federated decline. The inviting server is the invite's sender
-    // domain. Any failure (no stub, unreachable, refused, malformed template) is
-    // logged and swallowed — local rejection below is what the client relies on.
-    match store.get_invite(room_id, &user).await {
-        Ok(Some(invite)) => {
-            let dest = invite.sender.server_name().to_owned();
-            if let Err(e) = try_federated_leave(&own_server, &dest, room_id, &user).await {
-                warn!(%room_id, %dest, error = e, "federated leave (invite reject) failed; rejecting locally anyway");
-            }
-        }
-        Ok(None) => {} // raced with another reject; local removal below is a no-op
-        Err(e) => {
-            warn!(%room_id, error = %e, "could not load invite for federated reject; rejecting locally anyway")
-        }
+    // Best-effort federated decline to the inviting server (the invite's sender
+    // domain). Any failure (unreachable, refused, malformed template) is logged
+    // *with its underlying cause* and swallowed — the unconditional local
+    // removal below is what the client relies on.
+    let dest = invite.sender.server_name().to_owned();
+    if let Err(e) = try_federated_leave(&own_server, &dest, room_id, &user).await {
+        warn!(%room_id, %dest, error = %e, "federated leave (invite reject) failed; rejecting locally anyway");
     }
 
     // Unconditional local rejection: drop the stub so the invite vanishes from
@@ -79,27 +73,31 @@ pub(crate) async fn reject_invite(
 }
 
 /// Run the `make_leave` → complete → `send_leave` handshake against the inviting
-/// server. Returns a short reason on any failure (the caller swallows it).
+/// server. Returns a detailed reason (including the underlying transport/HTTP
+/// error) on any failure, which the caller logs before swallowing it.
 async fn try_federated_leave(
     own_server: &str,
     dest: &ServerName,
     room_id: &RoomId,
     user: &UserId,
-) -> Result<(), &'static str> {
+) -> Result<(), String> {
     let client = FederationClient::new(own_server.to_owned());
     let template = client
         .make_leave(dest, room_id, user, ROOM_VERSION_ID)
         .await
-        .map_err(|_| "make_leave request failed")?;
+        .map_err(|e| format!("make_leave request failed: {e}"))?;
     if template.room_version != ROOM_VERSION_ID {
-        return Err("resident room version is unsupported");
+        return Err(format!(
+            "resident room version {} is unsupported",
+            template.room_version
+        ));
     }
     let leave = complete_membership_template(&template.event, room_id, user, "leave")
-        .ok_or("could not complete the leave template")?;
+        .ok_or_else(|| "could not complete the leave template".to_string())?;
     client
         .send_leave(dest, room_id, &leave.event_id, &leave.raw)
         .await
-        .map_err(|_| "send_leave request failed")
+        .map_err(|e| format!("send_leave request failed: {e}"))
 }
 
 #[cfg(test)]
@@ -166,6 +164,21 @@ mod tests {
             v["room_id"],
             room_id.as_str(),
             "room_id must be the target room"
+        );
+        // The DAG references ARE the one thing legitimately carried from the
+        // template (so the leave anchors to the resident's heads); assert they
+        // come through verbatim — a regression that dropped them would otherwise
+        // pass the "never echoes" checks above.
+        let foreign = foreign_room.event_id.as_str();
+        assert_eq!(
+            v["prev_events"],
+            json!([foreign]),
+            "prev_events must be carried from the template"
+        );
+        assert_eq!(
+            v["prev_state_events"],
+            json!([foreign]),
+            "prev_state_events must be carried from the template"
         );
     }
 }

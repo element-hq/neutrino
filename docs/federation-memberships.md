@@ -357,10 +357,11 @@ every other leave/kick/ban already goes via `/send` (see A.3).
 `FederationClient::make_leave`/`send_leave`. Two refinements landed beyond the
 sketch below:
 
-- **make_leave is lenient about `ver`** (unlike make_join, which gates with
-  `M_INCOMPATIBLE_ROOM_VERSION`): the absent-`ver` default is `[1]`, so gating
-  would refuse legitimate departures. A user must always be able to leave a room
-  it is in, so make_leave builds the template regardless of `ver`.
+- **make_leave negotiates `ver` like make_join** → 400 `M_INCOMPATIBLE_ROOM_VERSION`
+  when our version isn't offered (spec-conformant). It still omits make_join's
+  *membership/join-rules* eligibility pre-check — the spec requires none for
+  leave, and send_leave's apply is authoritative. (First shipped lenient on
+  `ver`; gated after the post-commit review flagged the deviation.)
 - **Template-completion forgery (CVE) mitigation:** the outbound completion never
   echoes the resident's template — `complete_join_template` and
   `complete_leave_template` were collapsed into the shared

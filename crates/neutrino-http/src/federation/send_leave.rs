@@ -24,8 +24,7 @@ use ruma::OwnedRoomId;
 use serde_json::value::RawValue as RawJsonValue;
 use serde_json::{Value, json};
 
-use crate::federation::FedError;
-use crate::room_actor::RoomActorError;
+use crate::federation::{FedError, map_apply_err};
 use crate::{AppState, lock_app};
 
 /// Federation `/send_leave` (v2) handler. Returns `{}` on accept.
@@ -74,20 +73,10 @@ pub(crate) async fn handle(
 
     // Apply through the resident path: accept ⇒ persisted + fanned out; reject
     // ⇒ 403; idempotent re-send ⇒ Ok. (`apply_resident` enqueues the fan-out.)
-    match registry.apply_resident(&room_id, event).await {
-        Ok(()) => Ok(Json(json!({}))),
-        Err(RoomActorError::Rejected) => Err(FedError::Forbidden(
-            "user is not allowed to leave this room",
-        )),
-        Err(RoomActorError::UnknownRoom) => Err(FedError::RoomNotFound),
-        Err(RoomActorError::Storage(e)) => Err(FedError::Storage(e)),
-        // Build/Apply (e.g. malformed or unauthorisable against our state) — the
-        // departing server sent something we can't admit.
-        Err(RoomActorError::Build(_) | RoomActorError::Apply(_)) => {
-            Err(FedError::BadRequest("could not authorise leave"))
-        }
-        Err(RoomActorError::NotApplied | RoomActorError::ActorGone) => {
-            Err(FedError::Internal("apply did not produce a result"))
-        }
-    }
+    // The v2 response is an empty object — no state propagates on leave.
+    registry
+        .apply_resident(&room_id, event)
+        .await
+        .map_err(map_apply_err)?;
+    Ok(Json(json!({})))
 }

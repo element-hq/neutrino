@@ -3451,29 +3451,22 @@ async fn make_leave_unknown_room_returns_404() {
 }
 
 #[tokio::test]
-async fn make_leave_is_lenient_about_room_version() {
-    // Deliberate asymmetry vs make_join: a `ver` that doesn't include ours (or
-    // none at all) must still yield a template — a user must always be able to
-    // leave a room it is in. make_join 400s in this situation; make_leave must
-    // not.
+async fn make_leave_incompatible_version_returns_400() {
+    // make_leave negotiates the room version like make_join: a `ver` that does
+    // not include ours — or an absent `ver` (which defaults to `[1]`) — yields
+    // 400 M_INCOMPATIBLE_ROOM_VERSION with our `room_version` in the body.
     let (router, _store, room_id, _head) = seed_room_with_invited_zara().await;
 
     let path = format!("/_matrix/federation/v1/make_leave/{room_id}/{ZARA}?ver=1");
     let (status, body) = get(&router, &path).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "make_leave must not gate on ver: {body:?}"
-    );
-    assert_eq!(body["event"]["content"]["membership"], "leave");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(body["errcode"], "M_INCOMPATIBLE_ROOM_VERSION");
+    assert_eq!(body["room_version"], ROOM_VERSION_ID);
 
     let path = format!("/_matrix/federation/v1/make_leave/{room_id}/{ZARA}");
-    let (status, _body) = get(&router, &path).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "make_leave must accept an absent ver"
-    );
+    let (status, body) = get(&router, &path).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(body["errcode"], "M_INCOMPATIBLE_ROOM_VERSION");
 }
 
 // --- send_leave (inbound) ----------------------------------------------
@@ -3520,7 +3513,9 @@ async fn send_leave_admits_leave_and_returns_empty() {
     assert_eq!(member.event_id, leave_id);
     assert_eq!(membership_str(&member).as_deref(), Some("leave"));
 
-    // Distribution: the other joined server receives the leave.
+    // Distribution duty matches send_join's: fan out to the *other* room servers,
+    // but NOT back to the server that delivered the leave (zara's own
+    // remote.example — `apply_resident` excludes the sender), nor to ourselves.
     let other = store
         .pending_pdus(ruma::server_name!("other.example"), usize::MAX)
         .await
@@ -3528,6 +3523,22 @@ async fn send_leave_admits_leave_and_returns_empty() {
     assert!(
         other.iter().any(|e| e.event_id == leave_id),
         "other.example must receive zara's leave"
+    );
+    assert!(
+        store
+            .pending_pdus(ruma::server_name!("remote.example"), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty(),
+        "must not echo the leave back to the departing server"
+    );
+    assert!(
+        store
+            .pending_pdus(ruma::server_name!("example.org"), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty(),
+        "must never federate to ourselves"
     );
 }
 
@@ -3622,6 +3633,42 @@ async fn send_leave_is_idempotent_on_resend() {
         .unwrap()
         .expect("zara member row");
     assert_eq!(member.event_id, id);
+}
+
+#[tokio::test]
+async fn send_leave_unknown_room_returns_404() {
+    // A leave for a room we don't host: `apply_resident` can't bootstrap an actor
+    // (no forward extremities) → UnknownRoom → 404. Exercises the apply-error
+    // mapping past the structural validators.
+    let (router, _store, _room, head) = seed_room_with_invited_zara().await;
+    let unknown = ruma::RoomId::parse("!nope:example.org").unwrap();
+    let leave = remote_leave(&unknown, &head, ZARA);
+    let id = leave.event_id.clone();
+    let (status, body) = put_event(&router, &send_leave_path(&unknown, &id), leave.raw.get()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body:?}");
+    assert_eq!(body["errcode"], "M_NOT_FOUND");
+}
+
+#[tokio::test]
+async fn send_leave_unauthorised_leave_returns_403() {
+    // zara was never in this public room, so a self-leave has no valid prior
+    // membership: auth rejects it → 403, nothing persisted. Exercises the
+    // `apply_resident` Rejected → 403 arm (the structural 400 tests all trip a
+    // guard *before* apply).
+    let (router, store, room_id, head) = seed_public_room().await;
+    let leave = remote_leave(&room_id, &head, ZARA);
+    let id = leave.event_id.clone();
+    let (status, body) = put_event(&router, &send_leave_path(&room_id, &id), leave.raw.get()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN");
+    assert!(
+        store
+            .current_state_event(&room_id, "m.room.member", ZARA)
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused leave must not enter current state"
+    );
 }
 
 // --- outbound CSAPI /leave (invite rejection) --------------------------

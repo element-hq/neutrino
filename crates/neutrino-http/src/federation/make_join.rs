@@ -99,7 +99,8 @@ pub(crate) async fn handle(
 /// True if the requester's repeated `?ver=` query includes our room version.
 /// A wholly-absent `ver` defaults to `["1"]` per spec, which never matches our
 /// `org.matrix.msc4242.12`, so an absent `ver` is (correctly) incompatible.
-fn ver_includes_ours(raw: Option<&str>) -> bool {
+/// Shared with `make_leave` (same spec-mandated `ver` negotiation).
+pub(crate) fn ver_includes_ours(raw: Option<&str>) -> bool {
     let Some(raw) = raw else {
         return false;
     };

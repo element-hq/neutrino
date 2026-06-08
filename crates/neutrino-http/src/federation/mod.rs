@@ -210,6 +210,29 @@ pub(crate) async fn events_before_raw(
         .collect())
 }
 
+/// Map a `RoomRegistry::apply_resident` error onto the HTTP layer. Shared by the
+/// `send_join` and `send_leave` handlers, whose apply step is identical: a policy
+/// reject is a 403, an unknown room a 404, a malformed/unauthorisable event a
+/// 400, and storage / lost-result faults a 500. The human-readable strings are
+/// deliberately membership-agnostic so the two endpoints share one mapping.
+pub(crate) fn map_apply_err(err: crate::room_actor::RoomActorError) -> FedError {
+    use crate::room_actor::RoomActorError;
+    match err {
+        RoomActorError::Rejected => {
+            FedError::Forbidden("you are not permitted to perform this membership change")
+        }
+        RoomActorError::UnknownRoom => FedError::RoomNotFound,
+        RoomActorError::Storage(e) => FedError::Storage(e),
+        // Build/Apply — the event is malformed or unauthorisable against our state.
+        RoomActorError::Build(_) | RoomActorError::Apply(_) => {
+            FedError::BadRequest("could not authorise the membership event")
+        }
+        RoomActorError::NotApplied | RoomActorError::ActorGone => {
+            FedError::Internal("apply did not produce a result")
+        }
+    }
+}
+
 /// Rebuild an `m.room.member` event from a remote `make_join`/`make_leave`
 /// template, taking **only** the template's DAG references (`prev_events` /
 /// `prev_state_events`) and setting `type` / `sender` / `state_key` / `content`
