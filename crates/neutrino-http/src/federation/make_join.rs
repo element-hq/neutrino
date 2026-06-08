@@ -153,8 +153,9 @@ async fn check_can_join(
 
 /// Map a `build_event` actor error onto the HTTP layer. `UnknownRoom` is a 404
 /// (the room vanished between the version check and the build — a race);
-/// anything else is internal.
-fn map_build_err(err: RoomActorError) -> FedError {
+/// anything else is internal. Shared with `make_leave` (same template-build
+/// path).
+pub(crate) fn map_build_err(err: RoomActorError) -> FedError {
     match err {
         RoomActorError::UnknownRoom => FedError::RoomNotFound,
         RoomActorError::Storage(e) => FedError::Storage(e),

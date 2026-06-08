@@ -25,11 +25,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use neutrino_common::ROOM_VERSION_ID;
-use neutrino_state::event_id::{EventBuilder, from_wire};
+use neutrino_state::event_id::from_wire;
 use neutrino_store::{RoomStore, StagingStore, StateStore, StreamPos};
 use ruma::{OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId};
 use serde_json::json;
-use serde_json::value::RawValue as RawJsonValue;
 use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
@@ -113,8 +112,9 @@ async fn try_join_via(
         return Err("resident room version is unsupported");
     }
 
-    let join = complete_join_template(&template.event, room_id, user)
-        .ok_or("could not complete the join template")?;
+    let join =
+        crate::federation::complete_membership_template(&template.event, room_id, user, "join")
+            .ok_or("could not complete the join template")?;
     let join_id = join.event_id.clone();
 
     let resp = client
@@ -123,32 +123,6 @@ async fn try_join_via(
         .map_err(|_| "send_join request failed")?;
 
     ingest_state_dag(store, worker_poke, dest, room_id, resp).await
-}
-
-/// Rebuild the join event from the resident's template, taking its DAG
-/// references (`prev_events` / `prev_state_events`) and our own content/ts.
-/// `auth_events` are left empty (`apply_pdu` is their sole authority); the id is
-/// the reference hash of the result. We parse the template with `from_wire`
-/// (the same parser ingest uses) to lift typed references rather than hand-walk
-/// the JSON, ignoring the id it computes. `None` if the template is unparseable.
-fn complete_join_template(
-    template: &RawJsonValue,
-    room_id: &RoomId,
-    user: &UserId,
-) -> Option<neutrino_common::Event> {
-    let parsed = from_wire(
-        RawJsonValue::from_string(template.get().to_owned()).ok()?,
-        Vec::new(),
-    )
-    .ok()?;
-    EventBuilder::new(user.to_owned(), "m.room.member".to_owned())
-        .room_id(room_id.to_owned())
-        .state_key(user.to_string())
-        .content(json!({ "membership": "join" }))
-        .prev_events(parsed.prev_events)
-        .prev_state_events(parsed.prev_state_events)
-        .build()
-        .ok()
 }
 
 /// Ingest a `send_join` response: register the room from its create event (if

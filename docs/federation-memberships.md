@@ -344,11 +344,29 @@ invitee server has a harmless dangling stub (cleaned up on re-invite / decline).
 
 ---
 
-## 4. Milestone C — Invite rejection
+## 4. Milestone C — Invite rejection  — **DONE 2026-06-08**
 
 Goal: an invited local user declines, including when the inviting server is unreachable.
 `make_leave`/`send_leave` exist **only** for this case (self-leave with no room state) —
 every other leave/kick/ban already goes via `/send` (see A.3).
+
+**As built** (see the PLAN.md 2026-06-08 decisions-log entry for the full record):
+`federation/make_leave.rs` + `send_leave.rs` (inbound, resident; send_leave →
+`apply_resident` → `{}` 200, no state_dag) + `federation/leave.rs::reject_invite`
+(outbound CSAPI `/leave` of an OOB stub, branched before `require_room`) +
+`FederationClient::make_leave`/`send_leave`. Two refinements landed beyond the
+sketch below:
+
+- **make_leave is lenient about `ver`** (unlike make_join, which gates with
+  `M_INCOMPATIBLE_ROOM_VERSION`): the absent-`ver` default is `[1]`, so gating
+  would refuse legitimate departures. A user must always be able to leave a room
+  it is in, so make_leave builds the template regardless of `ver`.
+- **Template-completion forgery (CVE) mitigation:** the outbound completion never
+  echoes the resident's template — `complete_join_template` and
+  `complete_leave_template` were collapsed into the shared
+  `federation::complete_membership_template`, which rebuilds the event
+  (type/sender/state_key/content ours) and lifts only `prev_events` /
+  `prev_state_events`. A hostile-template regression test pins the invariant.
 
 ### C.1 Outbound — local user rejects an invite
 

@@ -11,7 +11,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use neutrino_store::{RoomStore, StateStore};
+use neutrino_store::{InviteStore, RoomStore, StateStore};
 use ruma::{OwnedUserId, RoomAliasId, RoomId, UserId};
 use serde_json::{Value, json};
 
@@ -215,6 +215,15 @@ pub(crate) async fn leave(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    // An out-of-band invite (a room we don't host, held only as an `InviteStore`
+    // stub) is declined via the federated leave handshake + an unconditional
+    // local stub removal. Checked *before* `require_room`, which would otherwise
+    // 404 a room we have no `rooms` row for. A storage fault falls through to the
+    // normal path, which surfaces it as a 500.
+    let store = lock_app(&state.0).store.clone();
+    if matches!(store.get_invite(&room, &sender).await, Ok(Some(_))) {
+        return crate::federation::leave::reject_invite(&state.0, sender, &room).await;
+    }
     if let Err(resp) = require_room(&state.0, &room).await {
         return resp;
     }
