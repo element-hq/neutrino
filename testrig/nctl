@@ -58,22 +58,33 @@ mxid() {
   esac
 }
 
-txn() { date +%s%N; }
+# Unique transaction id. NOT `date +%s%N` — BSD/macOS `date` has no `%N` and
+# emits a literal "N", so every txn in the same second would collide.
+txn() { printf '%s-%s%s' "$(date +%s)" "$RANDOM" "$RANDOM"; }
 
 # req <hs> <METHOD> <path> [json-body]   — pretty-prints JSON when jq is present.
+# Surfaces non-2xx as a stderr line + non-zero exit (curl -sS alone hides HTTP
+# errors behind a 0 exit, which previously masked a 400 as an empty result).
 req() {
   local hs=$1 method=$2 path=$3 body=${4:-} url
   url="$(base "$hs")/$path"
-  local out
+  local raw code out
   if [[ -n $body ]]; then
-    out=$(curl -sS -X "$method" "$url" -H 'Content-Type: application/json' -d "$body")
+    raw=$(curl -sS -w '\n%{http_code}' -X "$method" "$url" \
+      -H 'Content-Type: application/json' -d "$body")
   else
-    out=$(curl -sS -X "$method" "$url")
+    raw=$(curl -sS -w '\n%{http_code}' -X "$method" "$url")
   fi
+  code=${raw##*$'\n'} # trailing line appended by -w
+  out=${raw%$'\n'*}   # everything before it = response body
   if command -v jq >/dev/null && printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
     printf '%s' "$out" | jq .
   else
     printf '%s\n' "$out"
+  fi
+  if [[ $code != 2* ]]; then
+    echo "nctl: HTTP $code" >&2
+    return 1
   fi
 }
 
@@ -87,10 +98,21 @@ cmd_partition() {
     cut | heal)
       local net=${NET[$pair]:-} end=${CUTEND[$pair]:-}
       [[ -n $net ]] || die "unknown pair '$pair' (use ab|ac|bc)"
+      # Idempotent: a re-cut / re-heal must not abort under `set -e`. docker
+      # errors when the endpoint is already (dis)connected — treat that as the
+      # desired state already holding.
       if [[ $action == cut ]]; then
-        docker network disconnect "$net" "$end" && echo "cut: $pair down ($end off $net)"
+        if docker network disconnect "$net" "$end" 2>/dev/null; then
+          echo "cut: $pair down ($end off $net)"
+        else
+          echo "cut: $pair already down"
+        fi
       else
-        docker network connect "$net" "$end" && echo "heal: $pair up ($end on $net)"
+        if docker network connect "$net" "$end" 2>/dev/null; then
+          echo "heal: $pair up ($end on $net)"
+        else
+          echo "heal: $pair already up"
+        fi
       fi
       ;;
     status | "")
