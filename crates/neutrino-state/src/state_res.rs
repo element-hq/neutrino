@@ -1,6 +1,6 @@
-//! Phase 4: state resolution v2.1 (v12).
+//! State resolution v2.1 (v12).
 //!
-//! This phase composes a `StateMap<OwnedEventId>` from a list of input state
+//! This module composes a `StateMap<OwnedEventId>` from a list of input state
 //! maps (state-after each of an event's `prev_state_events`, or state-after
 //! each forward extremity when computing current state). Under MSC4242 the
 //! input shape is smaller and well-defined; the algorithm itself is unchanged
@@ -12,8 +12,8 @@
 //! - Iterative auth checks pass 1 starts from the **empty state**, not from
 //!   the unconflicted state. v2 started from unconflicted.
 //!
-//! Phase 4b adds the reverse-topological power sort and the iterative auth
-//! checks loop. Phase 4c will add mainline ordering, IAC pass 2, and the
+//! The pipeline is the reverse-topological power sort and the iterative auth
+//! checks loop, then mainline ordering, IAC pass 2, and the
 //! `resolve_state` top-level entry point.
 
 use std::cmp::Reverse;
@@ -298,14 +298,14 @@ pub fn reverse_topological_power_sort(
 ///    a state event. Message events leave `resolved` unchanged.
 ///
 /// `initial_state` is **empty** for v12 IAC pass 1 (v2.1 divergence), passed
-/// through unchanged for IAC pass 2 (phase 4c). This function is agnostic to
+/// through unchanged for IAC pass 2. This function is agnostic to
 /// which pass is running.
 ///
 /// **Caller contract**: every event_id reachable from this run — every entry
 /// in `sorted`, every id in their `event.auth_events`, and every value in
 /// `initial_state` — must be in `provider`. A missing lookup raises
 /// `StateResError::MissingEvent`. In particular: if `initial_state` is
-/// not empty (i.e. IAC pass 2 in phase 4c), the caller must ensure every
+/// not empty (i.e. IAC pass 2), the caller must ensure every
 /// value in it is provider-known. Pass 1 sidesteps this by passing
 /// `StateMap::new()`.
 pub fn iterative_auth_checks(
@@ -1068,7 +1068,7 @@ mod tests {
         assert_eq!(diff, expected);
     }
 
-    // ===== Phase 4b: power_of_sender / reverse_topological_power_sort / iterative_auth_checks =====
+    // ===== power_of_sender / reverse_topological_power_sort / iterative_auth_checks =====
 
     use neutrino_common::ROOM_VERSION_ID;
     use neutrino_common::event_id::room_id_from_create;
@@ -1463,7 +1463,7 @@ mod tests {
     fn iac_propagates_missing_auth_event_error() {
         // Build a topic referencing a create_id that is NOT in the provider.
         // The phantom create event is built but never inserted, giving us a
-        // v12-shaped room_id without populating the auth chain. Phase-4b IAC
+        // v12-shaped room_id without populating the auth chain. IAC
         // errors loudly per the project invariant ("every event we know about
         // has its complete auth chain locally resolvable").
         let phantom_create = build_create("@alice:example.org", &[], true);
@@ -1476,7 +1476,7 @@ mod tests {
         assert!(matches!(err, StateResError::MissingEvent(_)));
     }
 
-    // ===== Phase 4c =====
+    // ===== mainline ordering / resolve_state =====
 
     /// Build an `m.room.join_rules` event with a chosen `join_rule`.
     fn room_join_rules(

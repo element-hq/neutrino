@@ -1,6 +1,6 @@
 # Federation `/get_missing_events` — design
 
-Status: proposed 2026-05-27. Branch TBD. Not yet implemented.
+Status: implemented.
 
 ## Goal
 
@@ -38,7 +38,7 @@ the spec:
    in the mesh can request history from a time peer A was not joined.*
    Adding it later requires a new `StateStore::state_at_event` method
    plus the `filter_events_for_server` adaptation; out of scope until
-   Phase 6 `RoomCore::apply` lands a state-at-event provider.
+   `RoomCore::apply` lands a state-at-event provider.
 
 ## Why this endpoint first
 
@@ -219,7 +219,7 @@ Both candidate tests remain blocked:
 
 - `TestInboundCanReturnMissingEvents` — requires `charlie` to federate-
   join the room before the endpoint is reached. Federated join needs
-  state-res (Phase 4b/4c) and accept-on-`send_join` (Phase 6). Also
+  state-res and accept-on-`send_join`. Also
   asserts history-visibility redaction, which we're deferring.
 - `TestGetMissingEventsGapFilling` — outbound test (SUT calls
   `/get_missing_events` on the peer). Requires us to receive a
@@ -227,7 +227,7 @@ Both candidate tests remain blocked:
   state-res-blocked.
 
 Action: append a row to `complement/VIABLE-TESTS.md` documenting
-both tests as "blocked on Phase 4b/4c (state-res) + Phase 6". Do not
+both tests as "blocked on state-res + `send_join` accept". Do not
 add to `complement/allowlist.txt`.
 
 ## Cargo changes
@@ -257,7 +257,7 @@ Captured here so the next implementer doesn't re-derive the question:
 - **Per-peer origin tracking** — not needed for this endpoint. See
   **Open questions** for when `/send` requires it.
 - **Outbound `/get_missing_events`** (we call peers to fill our own
-  gaps) — needs state-res to integrate the response. Phase 6 territory.
+  gaps) — needs state-res to integrate the response.
 
 ## Open questions
 

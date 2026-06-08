@@ -1,4 +1,4 @@
-//! Phase 2: auth events selection.
+//! Auth events selection.
 //!
 //! Under MSC4242, `auth_events` is no longer carried on the wire; the server
 //! calculates it from state-before-event using the algorithm in v1.18 §
@@ -9,7 +9,7 @@
 //! (event ID of the create event with `!` instead of `$`), not by an entry in
 //! auth_events.
 //!
-//! The output of this module is consumed by Phase 4 state resolution
+//! The output of this module is consumed by state resolution
 //! (auth chain difference, reverse-topological power ordering, and mainline
 //! ordering all walk the auth chain — under MSC4242 that chain is built
 //! from these calculated sets, not from a wire field).
@@ -88,7 +88,7 @@ pub fn auth_event_keys(event: &Event) -> Vec<(String, String)> {
 /// Calculate the `auth_events` for `event` from `state` (state-before-event).
 ///
 /// MSC4242: `auth_events` is no longer on the wire — servers calculate it for
-/// every incoming event. This is the authoritative computation; Phase 4 state
+/// every incoming event. This is the authoritative computation; state
 /// resolution walks the auth chain by following these calculated sets.
 ///
 /// Entries the spec asks for but that are absent from state are silently

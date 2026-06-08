@@ -30,7 +30,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// so it can't stall a sender task indefinitely.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Errors the outbound client can surface to a caller (the PR3 sender loop,
+/// Errors the outbound client can surface to a caller (the sender loop,
 /// which decides retry-vs-give-up from the variant).
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FederationClientError {

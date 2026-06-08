@@ -1,4 +1,4 @@
-//! Phase 6: per-room state machine orchestration.
+//! Per-room state machine orchestration.
 //!
 //! `RoomCore::apply(event, provider)` integrates a single incoming event
 //! against the receipt-of-PDU checks the spec defines at
@@ -6,11 +6,11 @@
 //! Reading the spec's numbered list against our implementation:
 //!
 //! - **Step 1** (PDU schema / required fields): wire-format part is
-//!   upstream of `apply` (`validate::parse_event`, Phase 1a — enforced by
+//!   upstream of `apply` (`validate::parse_event` — enforced by
 //!   `EventBuilder::build()` / `Event::from_wire`). The semantic rules
 //!   that don't need a provider (count limits, create structural rules,
 //!   rule 9, per-type content shape) run inside `apply` via
-//!   `validate::validate_pdu` (Phase 1b). Running validate_pdu here
+//!   `validate::validate_pdu`. Running validate_pdu here
 //!   defensively means a caller that hand-constructs an `Event` (bypassing
 //!   the builder/wire path) still can't smuggle a semantically-malformed
 //!   event past us.
@@ -30,8 +30,8 @@
 //!   `Event` lets storage keep it out of client timelines.
 //! - **Step 6** (state-set check): removed under MSC4242 / state DAGs.
 //!
-//! Local additions on top of the spec list: reference validation (Phase
-//! 1c, `validate::validate_references`) runs before the auth checks to
+//! Local additions on top of the spec list: reference validation
+//! (`validate::validate_references`) runs before the auth checks to
 //! ensure the room exists and `prev_state_events` are well-formed.
 //!
 //! ## What `apply` mutates

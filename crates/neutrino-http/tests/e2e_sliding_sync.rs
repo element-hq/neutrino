@@ -205,7 +205,7 @@ async fn put_state_event_returns_event_id() {
 
 #[tokio::test]
 async fn create_room_with_name_then_send_succeeds() {
-    // Regression for I1: a room created *with a name* (and topic) must still
+    // Regression: a room created *with a name* (and topic) must still
     // accept a subsequent send. createRoom now emits a linear, auth-verified
     // state chain (create → join → power_levels → join_rules → name → topic),
     // so when the actor bootstraps it sees the creator's join in the state

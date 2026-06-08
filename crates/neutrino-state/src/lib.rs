@@ -46,10 +46,8 @@ pub type StateMap<V> = HashMap<(String, String), V>;
 /// is deterministic.
 pub type StateDelta = BTreeMap<(String, String), Option<OwnedEventId>>;
 
-/// Errors raised by format validation (phase 1) — wire-format violations that
+/// Errors raised by format validation — wire-format violations that
 /// reject the event outright, before any state lookup happens.
-///
-/// Variants are added by the phase that produces them.
 #[derive(Debug, Error)]
 pub enum FormatError {
     #[error("invalid JSON: {0}")]
@@ -147,10 +145,10 @@ pub enum FormatError {
     PowerLevelsBadUsers,
 }
 
-/// Errors raised by the v12 authorization rules (phase 3).
+/// Errors raised by the v12 authorization rules.
 ///
 /// Variant names track the spec rule number (e.g. `Rule5_3_2_SenderMismatch`
-/// names the 5.3.2 reject path). Cross-phase rules (1, 2, 9, 10.1–10.3) are
+/// names the 5.3.2 reject path). Spec rules 1, 2, 9, 10.1–10.3 are
 /// not here — they raise `FormatError` / `ReferenceError` instead.
 #[allow(non_camel_case_types)] // variant names track v12 spec rule numbers
 #[derive(Debug, Error)]
@@ -323,7 +321,7 @@ pub enum AuthError {
     },
 }
 
-/// Errors raised by reference validation (phase 1b) — the event's references
+/// Errors raised by reference validation — the event's references
 /// (room, `prev_state_events`) must exist in the store and meet their
 /// preconditions.
 #[derive(Debug, Error)]
@@ -380,8 +378,7 @@ pub enum ReferenceError {
     Lookup(#[from] StateResError),
 }
 
-/// Errors raised by state resolution (Phase 4) and the state-DAG
-/// orchestration (Phase 6).
+/// Errors raised by state resolution and the state-DAG orchestration.
 #[derive(Debug, Error)]
 pub enum StateResError {
     /// An event referenced by state-res or DAG walks is not in the store.

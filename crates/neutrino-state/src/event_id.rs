@@ -1,4 +1,4 @@
-//! Server-authored event construction and inbound-wire parsing (PR 2 / B2).
+//! Server-authored event construction and inbound-wire parsing.
 //!
 //! Two public entry points share the same downstream pipeline:
 //!
@@ -150,7 +150,10 @@ impl EventBuilder {
             });
         }
 
-        // Assemble the unhashed JSON map. Key set per design-doc step 2.
+        // Assemble the unhashed JSON map: type, sender, content, prev_events,
+        // prev_state_events, origin_server_ts, [state_key], [room_id],
+        // [unsigned]. `room_id` is omitted iff this is a create event;
+        // `auth_events` is struct-only and never appears in the raw (MSC4242).
         let mut map = Map::new();
         map.insert("type".to_owned(), Value::String(self.event_type.clone()));
         map.insert(

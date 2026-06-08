@@ -1116,7 +1116,7 @@ async fn members(
     // Per spec (https://spec.matrix.org/v1.18/client-server-api/#get_matrixclientv3roomsroomidmembers)
     // the default response includes members of every membership; filtering
     // is opt-in via `membership` / `not_membership` query params (which we
-    // don't honour — see PLAN.md non-goals).
+    // don't honour — member filtering is out of scope).
     let chunk: Vec<Value> = map
         .into_values()
         .filter_map(|ev| serde_json::from_str::<Value>(ev.raw.get()).ok())

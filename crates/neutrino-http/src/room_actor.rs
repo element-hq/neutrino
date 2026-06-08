@@ -5,7 +5,7 @@
 //! single owner is what keeps the state DAG consistent: two concurrent
 //! applies against the same forward extremities would each read the same
 //! heads, both extend them, and the second commit would clobber the first —
-//! corrupting the DAG. (See PLAN.md, Phase 6d.)
+//! corrupting the DAG.
 //!
 //! ## Layering
 //!

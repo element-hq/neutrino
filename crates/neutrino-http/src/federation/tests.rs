@@ -9,14 +9,14 @@
 //!   (bad-request paths, 404, unknown-IDs). Mirrors the pattern in
 //!   `tests/e2e_sliding_sync.rs`.
 //! - **Direct storage seeding** via [`build_seeded_router`] — used by tests
-//!   that need a *non-flat* DAG. The CSAPI `/send` path currently writes
-//!   events with empty `prev_events` (Phase 6 will wire the head pointer),
-//!   so the DAG walker has nothing to traverse. These tests open a fresh
-//!   `SqliteStore`, build chains with explicit `prev_events`, persist them
-//!   via the trait, then mount the router on top with
+//!   that need a *non-flat* DAG. The CSAPI `/send` path only ever links
+//!   events linearly onto the current heads, so it can't produce forks or
+//!   other arbitrary shapes the DAG walker needs to traverse. These tests open
+//!   a fresh `SqliteStore`, build chains with explicit `prev_events`, persist
+//!   them via the trait, then mount the router on top with
 //!   `router_with_store`.
 //!
-//! See `docs/get-missing-events.md` §Tests B for the table this file covers.
+//! See `docs/get-missing-events.md` for the behaviour this file covers.
 
 #![cfg(test)]
 
@@ -283,7 +283,7 @@ async fn build_seeded_router(
     (router, room_id, create_id, ids)
 }
 
-// --- B1 ----------------------------------------------------------------
+// --- bad request: empty latest_events -----------------------------------
 
 // Gated off under `multi-user-shim`: it seeds the room via tokenless CSAPI
 // `createRoom`, which the shim rejects (401). The shim's own coverage lives in
@@ -314,7 +314,7 @@ async fn bad_request_empty_latest_events_returns_400() {
     );
 }
 
-// --- B2 ----------------------------------------------------------------
+// --- bad request: non-JSON body -----------------------------------------
 
 // Gated off under `multi-user-shim` — see `bad_request_empty_latest_events`.
 #[cfg(not(feature = "multi-user-shim"))]
@@ -340,7 +340,7 @@ async fn bad_request_non_json_body_returns_400() {
     );
 }
 
-// --- B3 ----------------------------------------------------------------
+// --- bad request: missing required field --------------------------------
 
 // Gated off under `multi-user-shim` — see `bad_request_empty_latest_events`.
 #[cfg(not(feature = "multi-user-shim"))]
@@ -362,7 +362,7 @@ async fn bad_request_missing_required_field_returns_400() {
     );
 }
 
-// --- B4 ----------------------------------------------------------------
+// --- unknown room returns 404 -------------------------------------------
 
 #[tokio::test]
 async fn unknown_room_returns_404() {
@@ -386,11 +386,11 @@ async fn unknown_room_returns_404() {
     );
 }
 
-// --- B5 ----------------------------------------------------------------
+// --- happy path: events between earliest and latest ---------------------
 
 #[tokio::test]
 async fn happy_path_returns_events_between_earliest_and_latest() {
-    // B5 - happy path. The 4 message events between create (earliest) and
+    // Happy path. The 4 message events between create (earliest) and
     // msg 4 (latest) should be reachable. Assert the set of message bodies;
     // the ordering across multiple latest seeds is an
     // implementation detail per `DagStore::missing_events` (trait doc in
@@ -431,7 +431,7 @@ async fn happy_path_returns_events_between_earliest_and_latest() {
     );
 }
 
-// --- B6 ----------------------------------------------------------------
+// --- respects limit -----------------------------------------------------
 
 #[tokio::test]
 async fn respects_limit() {
@@ -458,7 +458,7 @@ async fn respects_limit() {
     assert_eq!(n, 20, "MAX_LIMIT cap not enforced; got {n}");
 }
 
-// --- B7 ----------------------------------------------------------------
+// --- default limit is 10 ------------------------------------------------
 
 #[tokio::test]
 async fn default_limit_is_10() {
@@ -483,7 +483,7 @@ async fn default_limit_is_10() {
     assert_eq!(n, 10, "default limit is 10");
 }
 
-// --- B8 ----------------------------------------------------------------
+// --- empty earliest walks back to room root -----------------------------
 
 #[tokio::test]
 async fn empty_earliest_walks_back_to_room_root() {
@@ -519,7 +519,7 @@ async fn empty_earliest_walks_back_to_room_root() {
     );
 }
 
-// --- B9 ----------------------------------------------------------------
+// --- latest event not in room returns empty -----------------------------
 
 #[tokio::test]
 async fn latest_event_not_in_room_returns_empty() {
@@ -547,7 +547,7 @@ async fn latest_event_not_in_room_returns_empty() {
     assert!(events.is_empty(), "no events reachable from unknown latest");
 }
 
-// --- B10 ---------------------------------------------------------------
+// --- min_depth field ignored --------------------------------------------
 
 #[tokio::test]
 async fn min_depth_field_ignored() {
@@ -599,7 +599,7 @@ async fn min_depth_field_ignored() {
     );
 }
 
-// --- B12 ---------------------------------------------------------------
+// --- malformed room id returns 400 with errcode -------------------------
 
 #[tokio::test]
 async fn malformed_room_id_returns_400_with_errcode() {
@@ -627,7 +627,7 @@ async fn malformed_room_id_returns_400_with_errcode() {
     );
 }
 
-// --- B11 ---------------------------------------------------------------
+// --- wire bytes passthrough ---------------------------------------------
 
 #[tokio::test]
 async fn wire_bytes_passthrough() {
@@ -665,7 +665,7 @@ async fn wire_bytes_passthrough() {
     }
 }
 
-// --- B13 (I4: result ordering) -----------------------------------------
+// --- result ordering ----------------------------------------------------
 
 #[tokio::test]
 async fn events_returned_oldest_first() {
@@ -705,11 +705,11 @@ async fn events_returned_oldest_first() {
     );
 }
 
-// --- B14 (I5: earliest boundary is excluded at the HTTP layer) ---------
+// --- earliest boundary is excluded at the HTTP layer --------------------
 
 #[tokio::test]
 async fn earliest_message_boundary_is_excluded() {
-    // B5 used the create event (no body) as `earliest`, so a leak of the
+    // The happy-path test used the create event (no body) as `earliest`, so a leak of the
     // earliest boundary would slip past its body-prefix filter. Here the
     // earliest boundary is a *message* event (detectable by body): with
     // latest=msg3, earliest=msg1, only msg2 is strictly between them.
@@ -744,7 +744,7 @@ async fn earliest_message_boundary_is_excluded() {
     );
 }
 
-// --- B15 (I6: malformed min_depth still 400s via serde) ----------------
+// --- malformed min_depth still 400s via serde ---------------------------
 
 #[tokio::test]
 async fn malformed_min_depth_returns_400() {
@@ -772,7 +772,7 @@ async fn malformed_min_depth_returns_400() {
     );
 }
 
-// --- B16 (I6: malformed event id in latest 400s) ----------------------
+// --- malformed event id in latest 400s ----------------------------------
 
 #[tokio::test]
 async fn malformed_event_id_in_latest_returns_400() {
@@ -798,7 +798,7 @@ async fn malformed_event_id_in_latest_returns_400() {
     );
 }
 
-// --- B17 (I6: wrong content-type 400s) --------------------------------
+// --- wrong content-type 400s --------------------------------------------
 
 #[tokio::test]
 async fn wrong_content_type_returns_400() {
@@ -822,7 +822,7 @@ async fn wrong_content_type_returns_400() {
     );
 }
 
-// --- B18 (I6: explicit limit=0 returns empty) -------------------------
+// --- explicit limit=0 returns empty -------------------------------------
 
 #[tokio::test]
 async fn explicit_limit_zero_returns_empty() {
@@ -850,7 +850,7 @@ async fn explicit_limit_zero_returns_empty() {
     assert!(events.is_empty(), "explicit limit=0 must return no events");
 }
 
-// --- B19 (I3: earliest_events is required per spec) -------------------
+// --- earliest_events is required per spec --------------------------------
 
 #[tokio::test]
 async fn missing_earliest_events_returns_400() {
@@ -917,7 +917,7 @@ fn pdu_bodies(body: &Value) -> Vec<String> {
         .collect()
 }
 
-// BF1: walk back from the chain head returns every ancestor plus the head
+// Walk back from the chain head returns every ancestor plus the head
 // itself, newest-first. create ← join ← msg0 ← msg1 ← msg2; backfill from
 // msg2 yields all 5 events. The three message bodies must appear
 // newest-first.
@@ -942,7 +942,7 @@ async fn backfill_returns_chain_newest_first() {
     );
 }
 
-// BF2: limit is a hard cap on the number of PDUs returned. Backfill from
+// Limit is a hard cap on the number of PDUs returned. Backfill from
 // msg2 with limit=2 yields exactly the seed and its immediate parent.
 #[tokio::test]
 async fn backfill_respects_limit() {
@@ -963,7 +963,7 @@ async fn backfill_respects_limit() {
     );
 }
 
-// BF3: the transaction envelope carries `origin` (our server name) and a
+// The transaction envelope carries `origin` (our server name) and a
 // numeric `origin_server_ts` alongside `pdus`, per the ruma /
 // Synapse backfill response shape.
 #[tokio::test]
@@ -991,7 +991,7 @@ async fn backfill_response_has_transaction_envelope() {
     assert!(body.get("pdus").and_then(Value::as_array).is_some());
 }
 
-// BF4: wire bytes verbatim — v12 / MSC4242 PDUs never carry `event_id`
+// Wire bytes verbatim — v12 / MSC4242 PDUs never carry `event_id`
 // (it's derived from the reference hash). Federation peers must receive the
 // exact bytes that produced the id, so no enrichment is applied.
 #[tokio::test]
@@ -1015,7 +1015,7 @@ async fn backfill_ships_wire_bytes_without_event_id() {
     }
 }
 
-// BF5: unknown room → 404 M_NOT_FOUND (spec-required), not a 500 or the
+// Unknown room → 404 M_NOT_FOUND (spec-required), not a 500 or the
 // bare-text fallback.
 #[tokio::test]
 async fn backfill_unknown_room_returns_404() {
@@ -1032,7 +1032,7 @@ async fn backfill_unknown_room_returns_404() {
     );
 }
 
-// BF6: a request with no `v` parameter is rejected — there's nothing to walk
+// A request with no `v` parameter is rejected — there's nothing to walk
 // back from. 400 M_INVALID_PARAM, mirroring the empty-`latest_events`
 // rejection on the sibling endpoint.
 #[tokio::test]
@@ -1049,7 +1049,7 @@ async fn backfill_missing_v_returns_400() {
     );
 }
 
-// BF7: a `v` event we don't hold is skipped, not 500'd. `events_before`
+// A `v` event we don't hold is skipped, not 500'd. `events_before`
 // would reject an unknown seed with InvalidInput; the handler pre-filters
 // via `get_events` so an unknown seed yields an empty (200) backfill.
 #[tokio::test]
@@ -1065,7 +1065,7 @@ async fn backfill_unknown_v_is_skipped_not_500() {
     assert!(pdus.is_empty(), "unknown seed must yield no events: {body}");
 }
 
-// BF8: a raw (un-percent-encoded) `$` in the query still resolves. Proves
+// A raw (un-percent-encoded) `$` in the query still resolves. Proves
 // the decoder is lenient about already-decoded sigils as well as `%24`.
 #[tokio::test]
 async fn backfill_accepts_raw_dollar_sigil_in_query() {
@@ -1087,7 +1087,7 @@ async fn backfill_accepts_raw_dollar_sigil_in_query() {
     );
 }
 
-// BF9 (I1): a present-but-blank `?v=` is rejected like a wholly-missing `v`.
+// A present-but-blank `?v=` is rejected like a wholly-missing `v`.
 // It must NOT slip past the empty-`v` guard as an empty-string seed and
 // return a misleading 200 with no PDUs.
 #[tokio::test]
@@ -1108,7 +1108,7 @@ async fn backfill_blank_v_returns_400() {
     );
 }
 
-// BF10 (I3): an explicit `limit=0` is rejected (400), matching Synapse's
+// An explicit `limit=0` is rejected (400), matching Synapse's
 // `if not limit: return 400` — asking for zero events is a client bug, not
 // a valid empty backfill. (A *missing* limit still defaults to 10.)
 #[tokio::test]
@@ -2026,7 +2026,7 @@ async fn send_drops_pdu_for_unknown_room() {
 }
 
 // ===================================================================
-// Server-Server join (Milestone A) — inbound make_join + send_join,
+// Server-Server join — inbound make_join + send_join,
 // where WE are the resident server. A remote user (`@zara:remote.example`)
 // joins a room we host.
 // ===================================================================
@@ -2483,7 +2483,7 @@ fn id_list(v: &Value) -> Vec<OwnedEventId> {
 }
 
 // ===================================================================
-// Server-Server join (Milestone A) — OUTBOUND, where WE are the joining
+// Server-Server join — OUTBOUND, where WE are the joining
 // server. A local user joins a remote public room via the handshake.
 // Two real servers: B (resident, served on an ephemeral port) and A (us,
 // driven via oneshot; its outbound reqwest reaches B).
@@ -2868,7 +2868,7 @@ async fn federated_join_missing_create_in_response_fails_without_registering() {
     );
 }
 
-// --- /invite/v2 (inbound federated invite, Milestone B2) ----------------------
+// --- /invite/v2 (inbound federated invite) ------------------------------------
 
 fn invite_path(room_id: &str, event_id: &str) -> String {
     format!("/_matrix/federation/v2/invite/{room_id}/{event_id}")
@@ -3138,7 +3138,7 @@ async fn invite_rejects_event_id_path_mismatch() {
     );
 }
 
-// --- outbound CSAPI /invite of a remote user (Milestone B3) -------------------
+// --- outbound CSAPI /invite of a remote user ----------------------------------
 
 /// Bind a real neutrino router on an ephemeral port whose `server_name` IS that
 /// address, so a user `@local:{addr}` is local to it (its inbound `/invite/v2`
@@ -3367,7 +3367,7 @@ async fn outbound_invite_peer_returns_wrong_event_persists_nothing() {
 }
 
 // ===================================================================
-// Server-Server leave / invite-rejection (Milestone C).
+// Server-Server leave / invite-rejection.
 // INBOUND (we are the resident): make_leave / send_leave for a remote
 // user departing a room we host. OUTBOUND (we are the joining server):
 // CSAPI /leave of an out-of-band invite → federated reject + local removal.

@@ -2,7 +2,7 @@
 //! integration tests are a separate crate and can't see `pub(crate)` items.
 //!
 //! Helpers compute the event_id via [`compute_event_id`] so events round-trip
-//! through `EventStore::persist_event`'s debug-build hash check (PR 2 / B4).
+//! through `EventStore::persist_event`'s debug-build hash check.
 //! Callers must capture the returned event's `event_id` if they need it for
 //! assertions — there is no caller-supplied id parameter.
 //!

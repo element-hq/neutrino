@@ -115,9 +115,9 @@ not introduce async here.
   walks. The state-res algorithm itself is unchanged from synapse
   `state/v2.py` — only the input source changes. No rule 3.2 check
   against a wire field, because there is no wire field.
-- Phase 2 (auth events selection) is still required: it's the pure
-  function used to compute `auth_events` from state-before for every
-  event as state-res traverses the auth chain.
+- Auth events selection is still required: it's the pure function used
+  to compute `auth_events` from state-before for every event as
+  state-res traverses the auth chain.
 - Missing state events during processing → request via
   `/get_missing_events` with `state_dag: true`. No silent fallback to
   defaults; an incomplete state DAG causes rejection.
@@ -126,51 +126,45 @@ not introduce async here.
   storage-backed `StateProvider` are deferred — do not start without
   explicit go-ahead.
 
-## Phase plan and status
+## Module map
 
-See `PLAN.md` for the live checkboxes. Order:
+How the pieces fit together (the orchestration order is the order they
+run inside `RoomCore::apply`):
 
-0. **types** — `RoomVersion::V12`, `StateMap`, `Event`, `FormatError`,
-   `AuthError`, `CoreError`. **Done.**
-1a. **format validation** — `validate::parse_event`. Pure-JSON wire
-    format only, no I/O. **Done.**
-1b. **reference validation** — `validate::validate_references(event,
-    provider)`. Existential checks that need provider lookups:
-    - v12 rule 2: room_id corresponds to an accepted `m.room.create`
-      event.
-    - MSC4242 prev_state_events triad: each entry must exist, belong to
-      the same room, have a `state_key`, and not be rejected.
-    Lives in the `validate` module — orchestration (Phase 6) only
-    *calls* it. **Done** — a minimal `StateProvider` trait (`get_event`)
-    was introduced up front to land this without waiting on Phase 5;
-    Phase 5 will extend the same trait with state-after lookups,
-    auth-chain difference, and power-level auth ancestor.
-2. **auth events selection** — pure fn
-   `expected_auth_events(event, state) -> Vec<OwnedEventId>`.
-3. **auth rules v12** — pure fn
-   `check_auth_rules(event, state, room_version) -> Result<(), AuthError>`.
-   Rule 4 onwards (rule 2 moves to 1b — it's existential, not auth).
-   Variants of `AuthError` added here.
-4a. **separate + auth_chain_difference** — port `_separate` and
-    `_get_auth_chain_difference` from synapse `state/v2.py`. Include the
-    v2.1 conflicted subgraph.
-4b. **reverse-topo power sort + IAC pass 1** — Kahn's algo on the auth
-    chain (the transitive closure of each event's **calculated**
-    `auth_events`, per MSC4242) with power/ts/event_id comparator; IAC
-    pass 1 starting from empty state per v12. Synapse `state/v2.py`'s
-    `_reverse_topological_power_sort` is the reference; only the
-    `auth_event_ids` source changes (computed, not read off the wire).
-4c. **mainline + IAC pass 2 + unconflicted merge** — mainline ordering
-    for remaining events; IAC pass 2; restore unconflicted. End:
-    `resolve_state(state_sets, &dyn StateProvider) -> StateMap`.
-5. **in-memory StateProvider** — HashMap-backed. Pure CPU. Enables
-   end-to-end testing without storage.
-6. **`RoomCore::apply`** — full orchestration. Calls:
-   1a → 1b → state-res → 3 → update → effects. Never implements
-   validation itself. End: testable "given events E1..En, resolved
-   current state = X".
+- **types** — `RoomVersion::V12`, `StateMap`, `Event`, `FormatError`,
+  `AuthError`, `CoreError`.
+- **format validation** — `validate::parse_event`. Pure-JSON wire format
+  only, no I/O.
+- **reference validation** — `validate::validate_references(event,
+  provider)`. Existential checks that need provider lookups:
+  - v12 rule 2: room_id corresponds to an accepted `m.room.create`
+    event.
+  - MSC4242 prev_state_events triad: each entry must exist, belong to
+    the same room, have a `state_key`, and not be rejected.
+  Lives in the `validate` module — orchestration only *calls* it. The
+  `StateProvider` trait grew over time from a minimal `get_event` to
+  state-after lookups, auth-chain difference, and power-level auth
+  ancestor.
+- **auth events selection** — pure fn computing an event's `auth_events`
+  from state-before.
+- **auth rules v12** — `check_auth_rules`, rule 4 onwards (rule 2 is
+  existential and lives in reference validation, not auth). `AuthError`
+  variants live here.
+- **state resolution** — `separate` + `auth_chain_difference` (incl. the
+  v2.1 conflicted subgraph), ported from synapse `state/v2.py`;
+  reverse-topological power sort + iterative auth checks (IAC pass 1
+  starting from empty state per v12); mainline ordering + IAC pass 2 +
+  unconflicted merge → `resolve_state`. The reverse-topo sort is Kahn's
+  over the auth chain (the transitive closure of each event's
+  **calculated** `auth_events`, per MSC4242); only the `auth_event_ids`
+  source changes from synapse (computed, not read off the wire).
+- **in-memory StateProvider** — HashMap-backed, pure CPU; enables
+  end-to-end testing without storage.
+- **`RoomCore::apply`** — full orchestration: format → references →
+  state-res → auth rules → update → effects. Never implements validation
+  itself.
 
-## Phase 1 hints (v12-specific format checks to land here)
+## v12 format-check hints
 
 Read v12 spec rule by rule. Note: under MSC4242 the wire shape has no
 `auth_events` field at all, so any auth_events-related format checks in

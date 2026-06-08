@@ -5,9 +5,8 @@
 //! federation transaction envelope `{ origin, origin_server_ts, pdus }`.
 //!
 //! Reuses `DagStore::events_before` (the seeds-included reverse-chronological
-//! priority-queue walk) rather than a dedicated storage method — see the
-//! 2026-05-29 PLAN.md decision. Trusted-mesh deviations match the
-//! `get_missing_events` sibling:
+//! priority-queue walk) rather than a dedicated storage method. Trusted-mesh
+//! deviations match the `get_missing_events` sibling:
 //! no X-Matrix auth, no signature verification, no history-visibility /
 //! redaction filtering.
 

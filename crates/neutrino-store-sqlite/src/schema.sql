@@ -108,7 +108,7 @@ CREATE UNIQUE INDEX ix_events_id_room_type_key
 
 -- ----------------------------------------------------------------------------
 -- event_edges — DagStore (events_before, missing_events)
--- Single table with edge_type (design Decision §6). No FK on
+-- Single table with edge_type. No FK on
 -- `parent_event_id`: federation backfill may insert children referencing
 -- parents we haven't yet seen. There IS a FK on `child_event_id` —
 -- `write_into_tx` always inserts the child into `events` first within
@@ -209,7 +209,7 @@ CREATE INDEX ix_current_state_room_member
 
 -- ----------------------------------------------------------------------------
 -- federation_txns — FederationInbox::record_federation_txn
--- Minimal per Decision §6. No received_at / GC for V1.
+-- Minimal: no received_at / GC for V1.
 -- record_federation_txn = INSERT OR IGNORE + check `changes() == 0`.
 -- ----------------------------------------------------------------------------
 CREATE TABLE federation_txns (

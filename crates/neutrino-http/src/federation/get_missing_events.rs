@@ -41,7 +41,7 @@ pub(crate) struct RequestBody {
     limit: Option<u32>,
     /// Parsed for spec compliance (so a malformed `min_depth` still 400s
     /// via serde) then dropped on the floor — Neutrino stores no depth
-    /// column, per the 2026-05-22 PLAN.md decision. See
+    /// column. See
     /// `docs/get-missing-events.md` §"Trust model & spec deviations".
     /// Typed `i64` (not `u64`) because the spec defines `depth` as a
     /// signed integer; using `u64` would reject negative values at serde

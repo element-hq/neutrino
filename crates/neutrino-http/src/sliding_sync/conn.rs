@@ -39,7 +39,7 @@ pub struct ListCfg {
     pub range: Option<(usize, usize)>,
     /// Parsed for forward compatibility but always ignored. The embedded
     /// single-user server returns every candidate room regardless of filters
-    /// (decision in PLAN.md 2026-05-14; not a phase TODO — intentional gap).
+    /// (an intentional gap, not a TODO — filtering is out of scope).
     #[allow(dead_code)]
     pub filters: Option<request::ListFilters>,
 }
