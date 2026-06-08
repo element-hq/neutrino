@@ -103,6 +103,12 @@ pub(crate) async fn handle(
 /// Query the store for the user's current memberships across every
 /// `Membership` variant and collect into a `BTreeMap` for O(log n)
 /// lookup by `translate_response`'s bucketing loop.
+///
+/// Out-of-band invites (federated invites for rooms we don't host, stored
+/// outside `current_state`) are unioned in as `Invite` so `translate_response`
+/// buckets those rooms into `rooms.invite` explicitly rather than via its
+/// missing-from-map `invite_state` fallback (which warns). In-room membership
+/// wins on overlap (`or_insert` keeps the `rooms_with_membership` value).
 async fn fetch_memberships<S: StorageBackend>(
     sync_state: &SyncState<S>,
     user_id: &OwnedUserId,
@@ -120,5 +126,127 @@ async fn fetch_memberships<S: StorageBackend>(
         .store
         .rooms_with_membership(user_id, &all)
         .await?;
-    Ok(rows.into_iter().collect())
+    let mut map: BTreeMap<OwnedRoomId, Membership> = rows.into_iter().collect();
+    for room_id in sync_state.store.invited_oob_rooms(user_id).await? {
+        map.entry(room_id).or_insert(Membership::Invite);
+    }
+    Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use neutrino_common::Event;
+    use neutrino_common::event_id::compute_event_id;
+    use neutrino_store::{InviteStore, Membership};
+    use neutrino_store_sqlite::SqliteStore;
+    use ruma::{RoomId, UserId, room_id, user_id};
+    use serde_json::{Value, json};
+    use tempfile::NamedTempFile;
+
+    use super::fetch_memberships;
+    use crate::legacy_sync::translate::{
+        parse_legacy_query, synthesize_v5_request, translate_response,
+    };
+    use crate::sliding_sync::{self, SyncState};
+
+    async fn fresh_store() -> (Arc<SqliteStore>, NamedTempFile) {
+        let tmp = NamedTempFile::new().expect("create tempfile");
+        let store = SqliteStore::open(tmp.path()).await.expect("open store");
+        (Arc::new(store), tmp)
+    }
+
+    /// An out-of-band invite `m.room.member` event (with stripped
+    /// `unsigned.invite_room_state`) as it arrives over `/invite/v2`. Built by
+    /// hand so the raw carries `unsigned` verbatim — `put_invite` stores it and
+    /// `get_invite` hydrates it through `EventRow` without redaction.
+    fn oob_invite(room: &RoomId, invited: &UserId, inviter: &UserId, name: &str) -> Event {
+        let body: Value = json!({
+            "room_id": room.as_str(),
+            "type": "m.room.member",
+            "state_key": invited.as_str(),
+            "sender": inviter.as_str(),
+            "origin_server_ts": 80u64,
+            "content": {"membership": "invite"},
+            "hashes": {"sha256": "abcDEF0123456789"},
+            "prev_events": [],
+            "prev_state_events": [],
+            "unsigned": {"invite_room_state": [
+                {"type": "m.room.name", "state_key": "", "sender": inviter.as_str(),
+                 "content": {"name": name}},
+                {"type": "m.room.member", "state_key": inviter.as_str(),
+                 "sender": inviter.as_str(), "content": {"membership": "join"}}
+            ]}
+        });
+        let raw = serde_json::value::to_raw_value(&body).unwrap();
+        let event_id = compute_event_id(&raw).unwrap();
+        let content = serde_json::value::to_raw_value(body.get("content").unwrap()).unwrap();
+        Event {
+            event_id,
+            room_id: room.to_owned(),
+            event_type: "m.room.member".to_owned(),
+            state_key: Some(invited.as_str().to_owned()),
+            sender: inviter.to_owned(),
+            origin_server_ts: 80,
+            content,
+            prev_events: Vec::new(),
+            prev_state_events: Vec::new(),
+            auth_events: Vec::new(),
+            rejected: false,
+            soft_failed: false,
+            raw,
+        }
+    }
+
+    /// The B1 legacy read-path: an OOB invite must be classified `Invite` by
+    /// `fetch_memberships` and bucketed under `rooms.invite` with its
+    /// `invite_state` by the full v5→v3 composition — no `current_state` for
+    /// the room exists.
+    #[tokio::test]
+    async fn oob_invite_buckets_into_legacy_rooms_invite() {
+        let (store, _tmp) = fresh_store().await;
+        let user = user_id!("@alice:example.org");
+        let inviter = user_id!("@bob:other.example.org");
+        let room = room_id!("!remote:other.example.org");
+        store
+            .put_invite(room, user, &oob_invite(room, user, inviter, "Remote Room"))
+            .await
+            .unwrap();
+
+        let sync_state = SyncState::new(store);
+        let owned_user = user.to_owned();
+
+        let memberships = fetch_memberships(&sync_state, &owned_user).await.unwrap();
+        assert_eq!(
+            memberships.get(room),
+            Some(&Membership::Invite),
+            "OOB invite classified as Invite for bucketing"
+        );
+
+        let req = synthesize_v5_request(&parse_legacy_query(&HashMap::new()));
+        let v5 = sliding_sync::handle(&sync_state, user, req).await.unwrap();
+        let body = translate_response(v5, &memberships);
+
+        let invite = body
+            .pointer("/rooms/invite")
+            .and_then(|v| v.as_object())
+            .expect("rooms.invite present");
+        let room_obj = invite
+            .get(room.as_str())
+            .expect("OOB invite room bucketed under rooms.invite");
+        let events = room_obj
+            .pointer("/invite_state/events")
+            .and_then(|v| v.as_array())
+            .expect("invite_state.events present");
+        let types: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e.pointer("/type").and_then(|t| t.as_str()))
+            .collect();
+        assert!(
+            types.contains(&"m.room.name"),
+            "stripped invite_room_state passed through to v3 invite_state"
+        );
+    }
 }

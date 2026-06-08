@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use neutrino_common::ROOM_VERSION_ID;
 use neutrino_common::event_id::compute_event_id;
-use neutrino_store::{Event, EventStore, RoomStore};
+use neutrino_store::{Event, EventStore, InviteStore, RoomStore};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5::{Request, request};
 use ruma::events::StateEventType;
@@ -963,6 +963,198 @@ async fn seed_invite(
         invite_json,
     );
     seed(store, &invite_event).await;
+}
+
+/// Build an out-of-band invite `m.room.member` `Event` for a room we don't
+/// host: carries `hashes` (so it rehydrates through `get_invite`'s
+/// `parse_event` path) and the inviting server's stripped
+/// `unsigned.invite_room_state`. `ts` is the invite's `origin_server_ts`, which
+/// `bump_stamp_for_invited` ranks on.
+fn oob_invite_event(
+    room: &RoomId,
+    invited: &UserId,
+    inviter: &UserId,
+    name: &str,
+    ts: u64,
+) -> Event {
+    let invite_json = serde_json::json!({
+        "room_id": room.as_str(),
+        "type": "m.room.member",
+        "state_key": invited.as_str(),
+        "sender": inviter.as_str(),
+        "origin_server_ts": ts,
+        "content": {"membership": "invite"},
+        "hashes": {"sha256": "abcDEF0123456789"},
+        "prev_events": [],
+        "prev_state_events": [],
+        "unsigned": {
+            "invite_room_state": [
+                {"type": "m.room.name", "state_key": "", "sender": inviter.as_str(),
+                 "content": {"name": name}},
+                {"type": "m.room.member", "state_key": inviter.as_str(),
+                 "sender": inviter.as_str(), "content": {"membership": "join"}}
+            ]
+        }
+    });
+    make_event_from_json(
+        room,
+        "m.room.member",
+        Some(invited.as_str()),
+        inviter,
+        ts,
+        invite_json,
+    )
+}
+
+/// An out-of-band federated invite (no room state — stored via `InviteStore`,
+/// not `current_state`) must surface in sliding sync exactly like an in-room
+/// invite: the room appears, carries `invite_state` (stripped state from the
+/// invite's `unsigned.invite_room_state`), and its name lifts to the top level.
+/// This is the B1 read-path: `candidate_rooms` unions `invited_oob_rooms` and
+/// `build_invite_room` sources the event from `get_invite`.
+#[tokio::test]
+async fn oob_invite_surfaces_in_sliding_sync() {
+    let (store, _tmp) = fresh_store().await;
+    let user = user_id!("@alice:example.org");
+    let inviter = user_id!("@bob:other.example.org");
+    // A room we do NOT host — no `setup_room`, no create event, no current_state.
+    let room = room_id!("!remote:other.example.org");
+
+    let invite_event = oob_invite_event(room, user, inviter, "Remote Room", 80);
+    store.put_invite(room, user, &invite_event).await.unwrap();
+
+    let state = SyncState::new(store);
+    let mut req = Request::new();
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    req.lists = lists;
+    let resp = handle(&state, user, req).await.unwrap();
+
+    let room_res = resp
+        .rooms
+        .get(room)
+        .expect("out-of-band invite room surfaces in sliding sync");
+    assert!(
+        room_res.timeline.is_empty(),
+        "invited rooms don't carry a timeline"
+    );
+    let invite_state = room_res
+        .invite_state
+        .as_ref()
+        .expect("invite_state populated for an OOB invite");
+    let types: Vec<String> = invite_state
+        .iter()
+        .map(|raw| raw.get_field::<String>("type").unwrap().unwrap())
+        .collect();
+    assert!(
+        types.contains(&"m.room.name".to_string()),
+        "stripped invite_room_state passed through"
+    );
+    assert!(
+        types.contains(&"m.room.member".to_string()),
+        "invite membership itself included in invite_state"
+    );
+    assert_eq!(
+        room_res.name.as_deref(),
+        Some("Remote Room"),
+        "room name lifted from stripped state for the OOB invite"
+    );
+}
+
+/// In-room membership must win over a stale out-of-band invite stub for the
+/// same `(room, user)`. This pins the precedence the dedup logic depends on:
+/// `candidate_rooms` skips an OOB room already in `rooms_with_membership`, and
+/// `member_event` consults `current_state` before `get_invite`. Without that
+/// precedence the joined room would be mis-rendered as an invite.
+#[tokio::test]
+async fn in_room_membership_wins_over_oob_invite_stub() {
+    let (store, _tmp) = fresh_store().await;
+    let user = user_id!("@alice:example.org");
+    let inviter = user_id!("@bob:other.example.org");
+    let room = room_id!("!shared:example.org");
+
+    // We host the room and the user is joined …
+    setup_joined_room(&store, room, user).await;
+    // … yet a stale OOB invite stub for the same (room, user) also exists.
+    let stub = oob_invite_event(room, user, inviter, "Stale Invite", 50);
+    store.put_invite(room, user, &stub).await.unwrap();
+
+    let state = SyncState::new(store);
+    let mut req = Request::new();
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    req.lists = lists;
+    let resp = handle(&state, user, req).await.unwrap();
+
+    let room_res = resp.rooms.get(room).expect("the joined room is present");
+    assert!(
+        room_res.invite_state.is_none(),
+        "in-room join membership wins: the room is NOT rendered as an invite \
+         despite the lingering OOB stub"
+    );
+    // And it appears exactly once (the OOB union skipped it via `in_room`).
+    assert_eq!(resp.lists.get("all").unwrap().count, UInt::from(1u32));
+}
+
+/// Out-of-band invites rank by their invite member-event `origin_server_ts`
+/// (via `bump_stamp_for_invited`), not by room id. Two OOB invites whose room
+/// ids sort opposite to their timestamps: the higher-ts one must take the top
+/// slot.
+#[tokio::test]
+async fn oob_invites_rank_by_member_event_ts() {
+    let (store, _tmp) = fresh_store().await;
+    let user = user_id!("@alice:example.org");
+    let inviter = user_id!("@bob:other.example.org");
+    // room ids sort `!a-…` < `!z-…`; timestamps are the inverse, so a room-id
+    // sort would rank `older` first — only a ts sort puts `newer` on top.
+    let newer = room_id!("!z-newer:other.example.org");
+    let older = room_id!("!a-older:other.example.org");
+    store
+        .put_invite(
+            newer,
+            user,
+            &oob_invite_event(newer, user, inviter, "Newer", 900),
+        )
+        .await
+        .unwrap();
+    store
+        .put_invite(
+            older,
+            user,
+            &oob_invite_event(older, user, inviter, "Older", 100),
+        )
+        .await
+        .unwrap();
+
+    let state = SyncState::new(store);
+    let mut req = Request::new();
+    let mut lists = BTreeMap::new();
+    let mut list = request::List::default();
+    list.ranges = vec![(UInt::from(0u32), UInt::from(0u32))];
+    list.room_details.timeline_limit = UInt::from(5u32);
+    lists.insert("top".to_string(), list);
+    req.lists = lists;
+
+    let resp = handle(&state, user, req).await.unwrap();
+
+    assert_eq!(
+        resp.rooms.len(),
+        1,
+        "range [0,0] yields exactly the top room"
+    );
+    assert!(
+        resp.rooms.contains_key(newer),
+        "the higher-ts OOB invite (bump_stamp 900) ranks first, not the lower room id"
+    );
+    assert!(
+        !resp.rooms.contains_key(older),
+        "the lower-ts OOB invite falls below the [0,0] range"
+    );
+    assert_eq!(
+        resp.lists.get("top").unwrap().count,
+        UInt::from(2u32),
+        "both OOB invites are counted in the candidate set"
+    );
 }
 
 #[tokio::test]

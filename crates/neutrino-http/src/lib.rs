@@ -394,6 +394,10 @@ fn build_router(state: AppState) -> Router {
             "/_matrix/federation/v2/send_join/{room_id}/{event_id}",
             put(federation::send_join::handle),
         )
+        .route(
+            "/_matrix/federation/v2/invite/{room_id}/{event_id}",
+            put(federation::invite::handle),
+        )
         .fallback(default_fallback)
         // Log one INFO line per request (method + path) and one per response
         // (status + latency), with 5xx surfaced at ERROR. We emit these under our

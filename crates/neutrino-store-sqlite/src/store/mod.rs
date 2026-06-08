@@ -4,6 +4,7 @@
 mod dag;
 mod events;
 mod inbox;
+mod invites;
 mod outbox;
 mod rooms;
 mod staging;

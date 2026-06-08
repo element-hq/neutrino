@@ -297,6 +297,9 @@ async fn candidate_rooms<S: StorageBackend>(
         .store
         .rooms_with_membership(user_id, &memberships)
         .await?;
+    // Rooms we hold state for — used to skip an out-of-band invite stub that's
+    // been superseded by real in-room membership (in-room state wins).
+    let in_room: HashSet<OwnedRoomId> = pairs.iter().map(|(r, _)| r.clone()).collect();
 
     let mut ranked: Vec<RankedRoom> = Vec::with_capacity(pairs.len());
     for (room_id, membership) in pairs {
@@ -313,6 +316,21 @@ async fn candidate_rooms<S: StorageBackend>(
             }
             _ => bump_stamp_for_joined(state, &room_id).await?,
         };
+        ranked.push(RankedRoom {
+            room_id,
+            bump_stamp,
+        });
+    }
+
+    // Union in out-of-band invites (federated invites for rooms we don't host,
+    // stored outside `current_state`). These are always included (MSC4186:
+    // invited rooms always shown). Skip any that in-room state already covers —
+    // a real membership supersedes a stale stub.
+    for room_id in state.store.invited_oob_rooms(user_id).await? {
+        if in_room.contains(&room_id) {
+            continue;
+        }
+        let bump_stamp = bump_stamp_for_invited(state, &room_id, user_id).await?;
         ranked.push(RankedRoom {
             room_id,
             bump_stamp,
@@ -424,10 +442,9 @@ async fn bump_stamp_for_invited<S: StorageBackend>(
     room_id: &RoomId,
     user_id: &UserId,
 ) -> Result<u64, SyncError> {
-    let member = state
-        .store
-        .current_state_event(room_id, "m.room.member", user_id.as_str())
-        .await?;
+    // In-room member event (invite/knock we hold state for) or, for a
+    // federated out-of-band invite, the stored invite stub.
+    let member = member_event(state, user_id, room_id).await?;
     Ok(member.map(|e| e.origin_server_ts).unwrap_or(0))
 }
 
@@ -641,20 +658,40 @@ async fn build_room<S: StorageBackend>(
     Ok(Some((room, state_events, deleted_state_keys)))
 }
 
-/// Whether `user_id`'s current `m.room.member` event in `room_id` is `invite`.
-/// A malformed event (parse failure, missing/typed-wrong `content.membership`)
-/// degrades to `false` — a single bad row shouldn't take the whole sync down
-/// with a 500.
+/// The user's `m.room.member` event for the room, sourced from in-room current
+/// state if we host the room, else from the out-of-band invite store (a
+/// federated invite for a room we hold no state for — no create event, no auth
+/// chain, so it never entered `current_state`). In-room state takes precedence:
+/// if we host the room, its authed membership is authoritative over any stale
+/// OOB stub (and the two should not coexist in practice — accepting an invite
+/// removes the stub).
+async fn member_event<S: StorageBackend>(
+    state: &SyncState<S>,
+    user_id: &UserId,
+    room_id: &RoomId,
+) -> Result<Option<Event>, SyncError> {
+    if let Some(ev) = state
+        .store
+        .current_state_event(room_id, "m.room.member", user_id.as_str())
+        .await?
+    {
+        return Ok(Some(ev));
+    }
+    Ok(state.store.get_invite(room_id, user_id).await?)
+}
+
+/// Whether `user_id`'s current `m.room.member` event in `room_id` is `invite`
+/// (in-room or out-of-band — see [`member_event`]). A malformed event (parse
+/// failure, missing/typed-wrong `content.membership`) degrades to `false` — a
+/// single bad row shouldn't take the whole sync down with a 500.
 async fn is_invited<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
     room_id: &RoomId,
 ) -> Result<bool, SyncError> {
-    let ev = state
-        .store
-        .current_state_event(room_id, "m.room.member", user_id.as_str())
-        .await?;
-    let Some(ev) = ev else { return Ok(false) };
+    let Some(ev) = member_event(state, user_id, room_id).await? else {
+        return Ok(false);
+    };
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(ev.raw.get()) else {
         return Ok(false);
     };
@@ -698,10 +735,10 @@ async fn build_invite_room<S: StorageBackend>(
     let mut room = response::Room::new();
     room.initial = Some(true);
 
-    let invite_event = state
-        .store
-        .current_state_event(room_id, "m.room.member", user_id.as_str())
-        .await?;
+    // The invite member event — in-room current state, or the out-of-band
+    // invite stub for a federated invite to a room we don't host. Its
+    // `unsigned.invite_room_state` is the stripped state we render from.
+    let invite_event = member_event(state, user_id, room_id).await?;
 
     let mut stripped: Vec<Raw<AnyStrippedStateEvent>> = Vec::new();
     if let Some(ev) = invite_event.as_ref() {

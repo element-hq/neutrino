@@ -308,14 +308,47 @@ async fn targeted(
     }
 }
 
-/// `POST /rooms/{roomId}/invite` — invite `body.user_id` to the room.
+/// `POST /rooms/{roomId}/invite` — invite `body.user_id` to the room. A
+/// **local** invitee emits an `m.room.member` event through the actor (as
+/// before). A **remote** invitee (a v12 room id carries no server, so "remote"
+/// is decided by the target's domain vs ours) takes the federated path —
+/// `federation::invite::federated_invite` (federate-then-persist, atomic).
 pub(crate) async fn invite(
     state: State<AppState>,
     AuthUser(sender): AuthUser,
     Path(room_id): Path<String>,
     OptionalBody(body): OptionalBody,
 ) -> axum::response::Response {
-    targeted(&state.0, sender, &room_id, body.as_ref(), "invite").await
+    let body = body.as_ref();
+    let target = match body_target(body) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    let room = match parse_room(&room_id) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let reason = body_reason(body);
+    let own_server = lock_app(&state.0).config.server_name.clone();
+    if own_server != target.server_name().as_str() {
+        return crate::federation::invite::federated_invite(
+            &state.0, sender, &room, &target, reason,
+        )
+        .await;
+    }
+    match change_membership(
+        &state.0,
+        sender,
+        &room,
+        &target,
+        "invite",
+        reason.as_deref(),
+    )
+    .await
+    {
+        Ok(()) => (StatusCode::OK, Json(json!({}))).into_response(),
+        Err(resp) => resp,
+    }
 }
 
 /// `POST /rooms/{roomId}/kick` — force `body.user_id` to `leave`. A kick is only
