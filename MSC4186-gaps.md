@@ -6,7 +6,7 @@ Living inventory of what `crates/neutrino-http/src/sliding_sync/` does **not** d
 - **Blocked on external** — needs ruma to expose a new field, or a `neutrino-common::storage` trait addition (which requires a decisions-log entry first).
 - **Known caveats** — real edge cases or implementation details a consumer should be aware of, even if they're not strict spec gaps.
 
-Everything previously tagged "closed in phase N" has been removed — see `LOG.md` for that history.
+Items that have since been completed have been removed — see `LOG.md` for that history.
 
 ---
 

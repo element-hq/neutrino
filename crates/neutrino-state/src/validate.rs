@@ -1,11 +1,11 @@
-//! Phase 1: validation.
+//! Validation.
 //!
-//! Phase 1a — `parse_event`: pure-JSON wire format (required fields, JSON
+//! `parse_event`: pure-JSON wire format (required fields, JSON
 //! types, ID parsing). No I/O, no semantic-rule decisions.
-//! Phase 1b — `validate_pdu`: semantic rules that work off a parsed `Event`
+//! `validate_pdu`: semantic rules that work off a parsed `Event`
 //! and need no provider (count limits, create structural rules, rule 9,
 //! per-type content shape).
-//! Phase 1c — `validate_references`: existential checks that require provider
+//! `validate_references`: existential checks that require provider
 //! lookups (v12 rule 2 + MSC4242 `prev_state_events` triad).
 //!
 //! `validate_pdu` is split out of `parse_event` so downstream callers
@@ -16,7 +16,7 @@
 //! checks.
 //!
 //! Every check is annotated inline with its spec citation. Anything that
-//! requires resolved room state is deferred to phase 3 (`check_auth_rules`).
+//! requires resolved room state is deferred to `check_auth_rules`.
 
 use neutrino_common::ROOM_VERSION_ID;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
@@ -29,7 +29,7 @@ use crate::{Event, FormatError, ReferenceError};
 const MAX_PREV_EVENTS: usize = 20;
 const MAX_PREV_STATE_EVENTS: usize = 20;
 
-/// Parse a raw event JSON into an `Event`. Phase 1a — wire-format only:
+/// Parse a raw event JSON into an `Event`. Wire-format only:
 /// required field presence, JSON value types, ID parsing. Semantic rules
 /// (count limits, create structural constraints, rule 9, per-type content
 /// shape) belong to [`validate_pdu`]; reference validation belongs to
@@ -178,7 +178,7 @@ pub fn parse_event(
     })
 }
 
-/// Phase 1b: semantic checks that don't need a provider. Runs on a parsed
+/// Semantic checks that don't need a provider. Runs on a parsed
 /// `Event` (output of [`parse_event`]).
 ///
 /// Split out of [`parse_event`] so callers don't have to take "you ran
@@ -384,8 +384,7 @@ fn check_member(content: &Map<String, Value>, state_key: Option<&str>) -> Result
     // intentionally NOT done here — `auth_rules::check_rule_5_member`'s
     // switch/case owns the value enumeration (rule 5.8 = catch-all reject as
     // `AuthError::Rule5_8_UnknownMembership`). Keeping it in one place avoids
-    // an upfront-assert/per-arm-handler sync drift. See PLAN.md decisions
-    // log for the rationale.
+    // an upfront-assert/per-arm-handler sync drift.
     Ok(())
 }
 
@@ -434,7 +433,7 @@ fn check_power_levels(content: &Map<String, Value>) -> Result<(), FormatError> {
     Ok(())
 }
 
-/// Phase 1c: validate that everything this event refers to actually resolves.
+/// Validate that everything this event refers to actually resolves.
 ///
 /// Checks:
 /// - **v12 rule 2**: the event's `room_id` is the event ID of an accepted
@@ -444,7 +443,7 @@ fn check_power_levels(content: &Map<String, Value>) -> Result<(), FormatError> {
 ///   state event), and not be rejected.
 ///
 /// Create events bypass all checks: they introduce the room, they have no
-/// `prev_state_events` (phase 1a F4), and they are the create event whose
+/// `prev_state_events` (wire-format rule F4), and they are the create event whose
 /// existence rule 2 demands.
 pub fn validate_references(
     event: &Event,
@@ -1028,7 +1027,7 @@ mod tests {
     }
 
     // =====================================================================
-    // Phase 1b: validate_references
+    // validate_references
     // =====================================================================
 
     use crate::ReferenceError;

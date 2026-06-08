@@ -1065,7 +1065,7 @@ mod tests {
         // write_into_tx only inspects `prev_events`, `prev_state_events`
         // and `content.membership` from the raw JSON, so the minimal
         // body below is enough to drive the code path. We bypass
-        // `persist_event`'s B4 debug round-trip (which would panic on
+        // `persist_event`'s debug round-trip (which would panic on
         // the intentionally malformed raw bytes here) by writing via
         // `write_into_tx` directly — same SQL boundary the production
         // path uses, just without the dev-only id-vs-raw assertion.

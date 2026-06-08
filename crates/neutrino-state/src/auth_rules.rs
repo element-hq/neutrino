@@ -1,4 +1,4 @@
-//! Phase 3: v12 state-dependent authorization rules.
+//! v12 state-dependent authorization rules.
 //!
 //! Functions and `AuthError` variants are named after the spec rule numbers
 //! they enforce, so a reader can grep `5.3.2` and find the code. The
@@ -314,12 +314,12 @@ impl PowerLevels {
         };
         let Some(ev) = event else { return out };
         let content = parse_content(ev);
-        // Phase 1b (`validate::validate_pdu`, via `check_power_levels`) has
+        // `validate::validate_pdu` (via `check_power_levels`) has
         // rejected non-integer scalars (`PowerLevelsBadIntField`) and
         // non-`{string: int}` objects (`PowerLevelsBadObjectField` /
         // `PowerLevelsBadUsers`) — so every value below either matches its
         // expected shape or the field is absent. The `.expect`s exist to
-        // convert a future Phase 1b regression into a hard panic at the
+        // convert a future `validate_pdu` regression into a hard panic at the
         // parse site rather than silently substituting defaults.
         let take_scalar = |field: &'static str, slot: &mut i64| {
             if let Some(v) = content.get(field) {
@@ -391,7 +391,7 @@ fn check_rule_5_member(member_event: &Event, ctx: &AuthContext) -> Result<(), Au
     // 5.1 (state_key + content.membership presence): enforced upstream by
     // validate::check_member (FormatError::MemberMissingStateKey /
     // MemberMissingMembership) — the `.expect()`s below are guaranteed safe
-    // for events that reach Phase 3.
+    // for events that reach the state-dependent authorization rules.
     // 5.2 (signature on join_authorised_via_users_server): skipped per
     // CLAUDE.md trusted-network policy.
     let state_key = member_event
@@ -856,7 +856,7 @@ fn check_rule_10_power_levels(
         }
         let uid: OwnedUserId = match key.parse() {
             Ok(u) => u,
-            // Phase 1b (validate::validate_pdu via PowerLevelsBadUsers)
+            // `validate::validate_pdu` (via PowerLevelsBadUsers)
             // already rejects malformed user ids in the `users` map; this
             // arm is unreachable in practice.
             Err(_) => continue,

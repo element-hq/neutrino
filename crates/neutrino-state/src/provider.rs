@@ -1,13 +1,13 @@
 //! Read-side interface the state machine uses to look up events, plus the
 //! in-memory implementation used by tests and (until storage lands) by
-//! Phase 6 `apply`.
+//! `RoomCore::apply`.
 //!
 //! The trait carries:
-//! - `get_event(id)`: used by `validate::validate_references` (Phase 1b) and
+//! - `get_event(id)`: used by `validate::validate_references` and
 //!   anywhere downstream that needs the event body / rejection flag. Rejection
 //!   lives on `Event.rejected` (server-computed, co-located on the struct),
 //!   so the trait surface is just `Option<Arc<Event>>`.
-//! - `auth_chain(seeds)`: used by Phase 4 state resolution. Returns the
+//! - `auth_chain(seeds)`: used by state resolution. Returns the
 //!   transitive backwards closure of the seeds through their `auth_events`
 //!   (including the seeds themselves). **Errors** if any event in the
 //!   closure isn't in the store — every event we know about must have its
@@ -61,7 +61,7 @@ pub trait StateProvider {
     ) -> Result<HashSet<OwnedEventId>, StateResError>;
 }
 
-/// In-memory `StateProvider`. Public (not test-cfg) — Phase 6 `apply` uses
+/// In-memory `StateProvider`. Public (not test-cfg) — `RoomCore::apply` uses
 /// it as the storage-free fallback, and unit tests use it directly. Clone
 /// is cheap: events are `Arc`-shared.
 #[derive(Debug, Default, Clone)]

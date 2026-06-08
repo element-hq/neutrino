@@ -1,14 +1,13 @@
 # Server-Server invite / join / leave
 
-Design + implementation plan for federated membership. Status: **planned, not started**
-(design signed off by Kegan 2026-06-05; see the PLAN.md decisions-log entry of that date).
-This doc is the detailed home; PLAN.md carries the one-line task block + decision summary.
+Design and implementation notes for federated membership. Status: **implemented.**
+This doc is the detailed design home.
 
-The work is sliced into three milestones, ordered to verify federation incrementally:
+The work covers three areas, ordered to verify federation incrementally:
 
-- **A — Join** → proves federation works for **public** rooms (both directions).
-- **B — Invite** → proves federation works for **private** rooms.
-- **C — Invite rejection** → the decline path + its unreachable-server failure modes.
+- **Join** → federation for **public** rooms (both directions).
+- **Invite** → federation for **private** rooms.
+- **Invite rejection** → the decline path + its unreachable-server failure modes.
 
 ---
 
@@ -21,7 +20,7 @@ Hard constraints from CLAUDE.md / project shape:
 
 - **No signatures, no signature checks, no server signing key.** Trusted mesh. Every
   place the spec says "sign the event" / "validate signatures" is a no-op for us. We
-  still preserve the *data flow* the signatures imply (see B, federate-then-persist) so
+  still preserve the *data flow* the signatures imply (see §3, federate-then-persist) so
   a future signatures world isn't a rewrite.
 - **No X-Matrix auth** on inbound federation endpoints (trusted mesh) — matches the
   existing `/send`, `/backfill`, `/get_missing_events` handlers.
@@ -31,8 +30,8 @@ Hard constraints from CLAUDE.md / project shape:
   only. Document the gap; do not implement.
 - **3pid / third-party invites out of scope** (no identity server; `/3pid/onbind`,
   `content.third_party_invite` not handled).
-- **Knock** is already surfaced in sync but federated knock is **not** in these
-  milestones (no `make_knock`/`send_knock`).
+- **Knock** is already surfaced in sync but federated knock is **not** in scope (no
+  `make_knock`/`send_knock`).
 
 ### MSC4242 response shape (the thing that's easy to get wrong)
 
@@ -52,10 +51,10 @@ We never emit `auth_chain` / `partial_state_event_ids` / `partial_auth_chain_ids
 
 **Why no auth_events on the wire matters:** under MSC4242, `auth_events` is
 server-computed at apply time (`apply_pdu` is the sole authority) and is **not part of
-the hashed `raw`** (the co-located-metadata pattern — same as `rejected` / `soft_failed`,
-see PLAN line 49). Consequence: the joining server, which has no state DAG yet, does
-**not** and **cannot** compute `auth_events`, and doesn't need to — it computes a stable
-`event_id` from the raw without them, and the resident's `apply_pdu` fills them.
+the hashed `raw`** (the co-located-metadata pattern — same as `rejected` / `soft_failed`).
+Consequence: the joining server, which has no state DAG yet, does **not** and **cannot**
+compute `auth_events`, and doesn't need to — it computes a stable `event_id` from the raw
+without them, and the resident's `apply_pdu` fills them.
 
 ### Server resolution (room ids are server-less in v12)
 
@@ -94,25 +93,25 @@ All federation endpoints are inbound HTTP under `crates/neutrino-http/src/federa
 (new files per endpoint, sibling to `send.rs` / `backfill.rs`). Outbound handshakes are
 methods on `FederationClient`. CSAPI changes are in `membership.rs`.
 
-### A shared primitive both A and B need: a read-only event builder
+### A shared primitive both join and invite need: a read-only event builder
 
 Both the inbound `make_join` template and the outbound invite candidate need to
 **construct an `m.room.member` event off current room state without persisting it**:
 read current heads (timeline FEs + state-DAG FEs) → set `prev_events` / `prev_state_events`
 → build content → (for the fully-built case) compute `event_id`. This is a **read-only
-RoomCore** snapshot, NOT a `Command::Send` (which applies+persists). Factor it once
-(e.g. a `RoomCore`/registry read method or a builder that takes a hydrated read snapshot)
-and use it in both places. There is no need to split `Command::Send`.
+RoomCore** snapshot, NOT a `Command::Send` (which applies+persists). Factored once
+(a `RoomCore`/registry read method that takes a hydrated read snapshot) and used in both
+places. There is no need to split `Command::Send`.
 
 ---
 
-## 2. Milestone A — Join (public-room federation)
+## 2. Join (public-room federation)
 
 Goal: a local user can join a remote public room and receive its state; a remote user
-can join a public room we host. After this milestone, two neutrino servers can share a
-public room and exchange timeline events over `/send`.
+can join a public room we host. Two neutrino servers can then share a public room and
+exchange timeline events over `/send`.
 
-### A.1 Inbound — we are the resident (remote user joins our room)
+### 2.1 Inbound — we are the resident (remote user joins our room)
 
 **`GET /_matrix/federation/v1/make_join/{roomId}/{userId}?ver=…`** —
 `federation/make_join.rs`.
@@ -162,7 +161,7 @@ public room and exchange timeline events over `/send`.
    same join — `apply_pdu`'s persisted-check returns accepted-with-no-effect — and we
    simply rebuild and return the `state_dag` again.
 
-### A.2 Outbound — we are the joining server (local user joins a remote room)
+### 2.2 Outbound — we are the joining server (local user joins a remote room)
 
 CSAPI entry: `POST /_matrix/client/v3/join/{roomIdOrAlias}` (and room-scoped
 `/rooms/{id}/join`). Today these only emit a *local* join via the actor; we add a
@@ -198,27 +197,26 @@ CSAPI entry: `POST /_matrix/client/v3/join/{roomIdOrAlias}` (and room-scoped
    The timeout returns an error to the client but does **not** abort the drain (it keeps
    grinding; a later sync will show the join). Success → 200 with the room id.
 
-### A.3 Mechanisms to verify (not assume) during A
+### 2.3 Mechanisms to verify (not assume)
 
 1. **Actor bootstrap of a never-seen room.** The drain applies into a room with no
    `rooms`-table FEs. The actor must `hydrate` an empty room and let the staged
    `m.room.create` seed it as the drain applies forward. If `RoomRegistry` can't
    currently bootstrap-from-nothing (it expects `forward_extremities` to exist), that's
-   a small change inside this milestone. **Check first** (`room_actor.rs` bootstrap path).
-2. **Re-join tolerance** (corrected from the first draft — re-join is NOT a second
-   handshake):
+   a small change. **Check first** (`room_actor.rs` bootstrap path).
+2. **Re-join tolerance** (re-join is NOT a second handshake):
    - A *joined* user re-joining is a normal `/send` event: locally we have state, so we
      emit + broadcast via the actor like any membership change. No handshake.
    - A full `send_join` from an already-joined user only happens after the joiner nuked
      its DB. The inbound side must tolerate it: `apply_pdu`'s persisted-check + state-res
      make it an idempotent refresh. **Add tests, not new logic.**
-3. **Joined-room leave falls out of A for free.** Leaving a room we're joined to = build
+3. **Joined-room leave falls out for free.** Leaving a room we're joined to = build
    the leave `m.room.member` locally (we have state) + broadcast via the durable `/send`
    outbox. No new endpoint. `make_leave`/`send_leave` are **invite-reject only**
-   (Milestone C). Kick/ban of a remote user likewise already federates via `/send` + the
-   departing-target destination clause (PLAN line 388) — **no new federation code**.
+   (invite rejection, §4). Kick/ban of a remote user likewise already federates via
+   `/send` + the departing-target destination clause — **no new federation code**.
 
-### A.4 Failure modes (the "what goes wrong")
+### 2.4 Failure modes (the "what goes wrong")
 
 | Scenario | Handling |
 |---|---|
@@ -232,7 +230,7 @@ CSAPI entry: `POST /_matrix/client/v3/join/{roomIdOrAlias}` (and room-scoped
 | Template stale (FEs advanced, inbound) | join is a fork/merge; state-res absorbs it |
 | send_join response lost, joiner retries (inbound) | idempotent: re-apply no-op, rebuild `state_dag` |
 
-### A.5 Tests (A)
+### 2.5 Tests
 
 - e2e against ephemeral-port axum stub peers (the `sender`/`fetcher`/`send` test
   pattern): outbound join drives a stub resident exposing make_join + send_join;
@@ -251,16 +249,16 @@ CSAPI entry: `POST /_matrix/client/v3/join/{roomIdOrAlias}` (and room-scoped
 
 ---
 
-## 3. Milestone B — Invite (private rooms)
+## 3. Invite (private rooms)
 
 Goal: a local user invites a remote user (and vice-versa). Invites are **out-of-band
 membership**: an inbound invite arrives for a room we have no state for (no create, no
 auth chain), so it **cannot** go through `apply_pdu` / RoomCore.
 
-### B.1 `InviteStore` (the one storage-trait change — Kegan approved)
+### 3.1 `InviteStore` (the one storage-trait change — Kegan approved)
 
 A lightweight store for invites where we are the **invitee's** server and hold no room
-state. Shape (final names TBD in impl, follow the `StagingStore` pattern):
+state. Shape:
 
 - `put_invite(room_id, user_id, invite_event_raw, invite_room_state: Vec<StrippedState>)`
 - `get_invite(room_id, user_id) -> Option<…>`
@@ -273,10 +271,10 @@ Keyed by `(room_id, user_id)`. Storing the stripped `invite_room_state` lets syn
 the room (name/avatar/who-invited) without any room state. New table, no `user_version`
 bump (matches prior in-place amendments).
 
-This must be added to the storage trait — flag it in the decisions log when landed,
-since trait stability matters (PLAN line 34).
+This is a storage-trait change — flagged in the decisions log when landed, since trait
+stability matters.
 
-### B.2 Inbound — we host the invited user
+### 3.2 Inbound — we host the invited user
 
 **`PUT /_matrix/federation/v2/invite/{roomId}/{eventId}`** — `federation/invite.rs`.
 
@@ -291,7 +289,7 @@ since trait stability matters (PLAN line 34).
    here it's the event verbatim).
 4. Sync now surfaces the invite (membership=invite room with `invite_state`).
 
-### B.3 Outbound — we are the resident inviting a remote user
+### 3.3 Outbound — we are the resident inviting a remote user
 
 CSAPI `/invite` with a remote `user_id`: add a **remote branch**.
 **Federate-then-persist, atomic, non-durable** — chosen to preserve the data flow a
@@ -317,11 +315,11 @@ nothing exists and retry is clean. No outbox / durability for the invite handsha
 Mechanism note: there is **no** `Command::Send` split. Build = read-only snapshot;
 commit = the same `apply_pdu` path used for inbound PDUs, plus the distribution enqueue.
 A small build→commit race (heads move between step 1 and step 3) is **accepted** — the
-event becomes a fork and state-res absorbs it (Kegan: "that's fine"). If the re-apply at
-step 3 happens to reject (inviter lost power in the window), CSAPI errors and the
-invitee server has a harmless dangling stub (cleaned up on re-invite / decline).
+event becomes a fork and state-res absorbs it. If the re-apply at step 3 happens to
+reject (inviter lost power in the window), CSAPI errors and the invitee server has a
+harmless dangling stub (cleaned up on re-invite / decline).
 
-### B.4 Failure modes (B)
+### 3.4 Failure modes
 
 | Scenario | Handling |
 |---|---|
@@ -331,7 +329,7 @@ invitee server has a harmless dangling stub (cleaned up on re-invite / decline).
 | Build→commit race rejects the candidate | CSAPI error; dangling remote stub is harmless / re-cleanable |
 | Inbound invite when we already have the room | shouldn't happen for an out-of-band invitee; if it does, prefer the in-room membership (edge, document) |
 
-### B.5 Tests (B)
+### 3.5 Tests
 
 - `InviteStore` round-trip (put/get/remove; invite_state preserved); sync enumeration
   shows the invite room.
@@ -344,32 +342,30 @@ invitee server has a harmless dangling stub (cleaned up on re-invite / decline).
 
 ---
 
-## 4. Milestone C — Invite rejection  — **DONE 2026-06-08**
+## 4. Invite rejection
 
 Goal: an invited local user declines, including when the inviting server is unreachable.
 `make_leave`/`send_leave` exist **only** for this case (self-leave with no room state) —
-every other leave/kick/ban already goes via `/send` (see A.3).
+every other leave/kick/ban already goes via `/send` (see §2.3).
 
-**As built** (see the PLAN.md 2026-06-08 decisions-log entry for the full record):
-`federation/make_leave.rs` + `send_leave.rs` (inbound, resident; send_leave →
-`apply_resident` → `{}` 200, no state_dag) + `federation/leave.rs::reject_invite`
+**As built:** `federation/make_leave.rs` + `send_leave.rs` (inbound, resident;
+send_leave → `apply_resident` → `{}` 200, no state_dag) + `federation/leave.rs::reject_invite`
 (outbound CSAPI `/leave` of an OOB stub, branched before `require_room`) +
-`FederationClient::make_leave`/`send_leave`. Two refinements landed beyond the
-sketch below:
+`FederationClient::make_leave`/`send_leave`. Two refinements landed beyond the sketch
+below:
 
 - **make_leave negotiates `ver` like make_join** → 400 `M_INCOMPATIBLE_ROOM_VERSION`
   when our version isn't offered (spec-conformant). It still omits make_join's
-  *membership/join-rules* eligibility pre-check — the spec requires none for
-  leave, and send_leave's apply is authoritative. (First shipped lenient on
-  `ver`; gated after the post-commit review flagged the deviation.)
-- **Template-completion forgery (CVE) mitigation:** the outbound completion never
-  echoes the resident's template — `complete_join_template` and
-  `complete_leave_template` were collapsed into the shared
-  `federation::complete_membership_template`, which rebuilds the event
-  (type/sender/state_key/content ours) and lifts only `prev_events` /
+  *membership/join-rules* eligibility pre-check — the spec requires none for leave, and
+  send_leave's apply is authoritative. (First shipped lenient on `ver`; gated after the
+  post-commit review flagged the deviation.)
+- **Template-completion forgery (CVE) mitigation:** the outbound completion never echoes
+  the resident's template — `complete_join_template` and `complete_leave_template` were
+  collapsed into the shared `federation::complete_membership_template`, which rebuilds
+  the event (type/sender/state_key/content ours) and lifts only `prev_events` /
   `prev_state_events`. A hostile-template regression test pins the invariant.
 
-### C.1 Outbound — local user rejects an invite
+### 4.1 Outbound — local user rejects an invite
 
 CSAPI `/leave` (or `/rooms/{id}/leave`) for a room where the caller is `invite` and we
 hold only an `InviteStore` stub (no joined state):
@@ -386,7 +382,7 @@ hold only an `InviteStore` stub (no joined state):
    A subsequent inbound `/invite/v2` for the same `(room,user)` resurrects the stub
    cleanly (re-invite works).
 
-### C.2 Inbound — a remote invited user declines an invite we issued
+### 4.2 Inbound — a remote invited user declines an invite we issued
 
 We are the resident; we hold the invite as real room state.
 
@@ -400,7 +396,7 @@ sender==state_key, sender domain == origin) → `apply_pdu` (synchronous; we hav
 ancestry) → on accept persist + **distribution duty** enqueue to other servers. Response
 is an ack (no `state_dag` needed on leave; return `{}` / 200). Idempotent on re-send.
 
-### C.3 Failure modes (C)
+### 4.3 Failure modes
 
 | Scenario | Handling |
 |---|---|
@@ -409,7 +405,7 @@ is an ack (no `state_dag` needed on leave; return `{}` / 200). Idempotent on re-
 | Decline then re-invite | stub resurrected by a fresh inbound `/invite/v2` |
 | Inbound send_leave for an only-invited user (resident) | apply the leave → clears the invite from current_state, broadcast |
 
-### C.4 Tests (C)
+### 4.4 Tests
 
 - Outbound decline: inviting-server-up → stub removed + send_leave delivered;
   inviting-server-down → stub still removed (local-rejection), no hang.
@@ -433,39 +429,39 @@ is an ack (no `state_dag` needed on leave; return `{}` / 200). Idempotent on re-
 - **`FederationClient` extensions** (client.rs): `make_join`, `send_join`, `invite`,
   `make_leave`, `send_leave` — each a thin reqwest call with a hand-rolled body type;
   keep `FederationClientError` (Transport/Status/InvalidUrl) so callers can branch
-  retry-vs-fail. Percent-encode `room_id`/`event_id`/`user_id` path segments (the
-  `room_id` encoding fix from PR2).
+  retry-vs-fail. Percent-encode `room_id`/`event_id`/`user_id` path segments.
 - **`timeline` length N** in send_join: pick a small fixed N (e.g. 20, mirroring the
   get_missing_events cap); deeper timeline is backfilled lazily via `/backfill`.
-- **Verify** whether `apply_pdu`'s `validate_references` requires `prev_events`
-  (timeline) ancestry present, or only `prev_state_events` (state DAG). Under MSC4242
-  auth/state depend on the state DAG; if timeline `prev_events` gaps are tolerated, the
+- **`apply_pdu`'s `validate_references`** depends on the state DAG (`prev_state_events`),
+  not timeline `prev_events` — under MSC4242 auth/state are state-DAG-driven, so the
   send_join `timeline` slice only needs to cover the join's immediate `prev_events`.
-  Confirm during A; it determines how much `timeline` the resident must return.
 
-## 6. Deferred / explicitly not in these milestones
+## 6. Deferred / explicitly out of scope
 
 - Restricted-room joins (`join_authorised_via_users_server`), knock federation, 3pid
   invites, alias resolution, displayname/avatar carry-over.
-- Durable retry of the invite handshake (B is non-durable by design — client retries).
+- Durable retry of the invite handshake (the invite path is non-durable by design —
+  client retries).
 - Streaming JSON for very large `state_dag` serialization (resident-side OOM on huge
   rooms is accepted for now; symmetric to the ingest-side acceptance).
-- Synapse/Complement test ports — assess after each milestone (the join milestone should
-  unblock several previously state-res-blocked Complement membership tests).
+- Synapse/Complement test ports — the join work should unblock several previously
+  state-res-blocked Complement membership tests.
 
-## 7. Suggested PR order within each milestone
+## 7. Implementation order
 
-- **A1** inbound make_join + send_join (+ distribution duty) — testable against a stub
-  joiner without the outbound side. Verify actor bootstrap-from-nothing here.
-- **A2** outbound make_join/send_join client + CSAPI `/join` remote branch + stage-drain
+Built incrementally, each piece testable against ephemeral-port stub peers:
+
+- inbound make_join + send_join (+ distribution duty) — testable against a stub joiner
+  without the outbound side. Verify actor bootstrap-from-nothing here.
+- outbound make_join/send_join client + CSAPI `/join` remote branch + stage-drain
   ingest + server_name fallback. Now two neutrinos can share a public room.
-- **B1** `InviteStore` + sync surfacing (storage + read path).
-- **B2** inbound `/invite/v2`.
-- **B3** outbound CSAPI `/invite` remote branch (federate-then-persist).
-- **C1** make_leave/send_leave (inbound, resident).
-- **C2** outbound CSAPI `/leave` invite-reject (best-effort handshake + unconditional
-  local leave).
+- `InviteStore` + sync surfacing (storage + read path).
+- inbound `/invite/v2`.
+- outbound CSAPI `/invite` remote branch (federate-then-persist).
+- make_leave/send_leave (inbound, resident).
+- outbound CSAPI `/leave` invite-reject (best-effort handshake + unconditional local
+  leave).
 
-Each PR: e2e against ephemeral-port stub peers; `cargo fmt`; `cargo clippy -p … --tests
--D warnings` (default + multi-user-shim); update PLAN.md checkboxes + LOG.md; decisions
-log on any trait change (InviteStore) or design deviation.
+Each change: e2e against ephemeral-port stub peers; `cargo fmt`; `cargo clippy -p … --tests
+-D warnings` (default + multi-user-shim); update PLAN.md + LOG.md; decisions log on any
+trait change (InviteStore) or design deviation.

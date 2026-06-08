@@ -119,8 +119,8 @@ fn arb_prev_events() -> impl Strategy<Value = Vec<OwnedEventId>> {
     prop::collection::vec(arb_event_id(), 0..=3)
 }
 
-/// Variable-length `prev_state_events`. Phase 1b validates these against a
-/// provider — only the wire shape matters here, so any ids do.
+/// Variable-length `prev_state_events`. `validate_references` validates these
+/// against a provider — only the wire shape matters here, so any ids do.
 fn arb_prev_state_events() -> impl Strategy<Value = Vec<OwnedEventId>> {
     prop::collection::vec(arb_event_id(), 0..=3)
 }
@@ -330,7 +330,7 @@ proptest! {
     /// (`AuthContext::new` enforces the create-event invariant via panic per
     /// the post-`validate_references` contract, so a create-absent state map
     /// is out of scope.) Guards the `.expect()`s inside `check_rule_5_member`
-    /// against future drift of Phase 1a's state_key / content.membership
+    /// against future drift of the wire-format state_key / content.membership
     /// invariants, and any future panics elsewhere in the dispatcher.
     #[test]
     fn check_auth_rules_never_panics(
@@ -365,7 +365,7 @@ proptest! {
     }
 }
 
-// ============== Phase 4a: state_res ==============
+// ============== state_res ==============
 //
 // Properties on `separate`, `conflicted_subgraph`, `auth_chain_difference`.
 // Strategies generate unrestricted state maps and providers (auth chains may
@@ -944,7 +944,7 @@ proptest! {
 }
 
 // ====================================================================
-// Phase 4b: power_of_sender / reverse_topological_power_sort / IAC
+// power_of_sender / reverse_topological_power_sort / IAC
 // ====================================================================
 
 /// Monotonic per-call ts for prop fixtures. Distinct from `arb_*`'s ts ranges
@@ -1218,7 +1218,7 @@ proptest! {
         prop_assert_eq!(resolved, initial);
     }
 
-    /// Phase 4c property: `resolve_state` is the identity on a single state
+    /// `resolve_state` is the identity on a single state
     /// set. With one input, `separate()` makes everything unconflicted, the
     /// conflict path is empty, and the final overlay restores the input.
     #[test]
@@ -1236,7 +1236,7 @@ proptest! {
         prop_assert_eq!(resolved, s);
     }
 
-    /// Phase 4c property: when N state sets each carry a distinct
+    /// When N state sets each carry a distinct
     /// `m.room.create` event (no other entries), `resolve_state` picks one
     /// of the candidates. Pinning *which* one is the algorithm's job — the
     /// property only guarantees the resolved value comes from the input
@@ -1392,7 +1392,7 @@ fn random_topo_order(dag: &Dag, entropy: &[usize]) -> Vec<usize> {
 }
 
 /// Recompute both head-sets straight from the raw DAG structure, independent of
-/// `RoomCore` (P2's oracle). A *timeline* forward extremity is an accepted event
+/// `RoomCore`. A *timeline* forward extremity is an accepted event
 /// named in no *accepted* event's `prev_events`; a *state* forward extremity is
 /// an accepted state event named in no *accepted state* event's
 /// `prev_state_events`. Only state events advance the state DAG — a message
@@ -1440,13 +1440,13 @@ fn expected_heads(dag: &Dag) -> (BTreeSet<OwnedEventId>, BTreeSet<OwnedEventId>)
 }
 
 // ======================================================================
-// Phase 1: multi-user shadow-auth adversarial generator
+// Multi-user shadow-auth adversarial generator
 // ======================================================================
 //
 // Lifts the creator-only generator to a bounded user pool with real
 // membership / power-level transitions and deliberately unauthorised events,
 // so the DAGs now contain genuine rejects, soft-fails and power-level conflict
-// merges. The construction strategy (settled in PLAN.md) is to drive a *real*
+// merges. The construction strategy is to drive a *real*
 // `RoomCore` in build order during construction: heads are tracked from
 // reality (advance only on the real verdict, mirroring `apply_pdu`'s
 // drop-rejected-from-heads), the verdict of every event is recorded as it is
@@ -1456,14 +1456,13 @@ fn expected_heads(dag: &Dag) -> (BTreeSet<OwnedEventId>, BTreeSet<OwnedEventId>)
 // but never corrupts the DAG, because the verdict comes from `apply_pdu`, not
 // the shadow.
 //
-// NOTE on order-(in)dependence (relevant to the Phase 2 properties, recorded
-// here so the next session sees it): `reject` is order-independent (it is a
+// NOTE on order-(in)dependence: `reject` is order-independent (it is a
 // pure function of the event's `prev_state_events` ancestry), but `soft-fail`
 // is NOT — `apply_pdu` checks soft-fail against the room's *resolved*
 // `current_state` at apply time (room_core.rs:433), which depends on which
 // concurrent events have been applied. So `current_state` and the *state*
 // forward extremities are order-independent, but the *timeline* forward
-// extremities and soft-fail verdicts are not. Phase 2's order-independence
+// extremities and soft-fail verdicts are not. The order-independence
 // property must therefore assert order-invariance only over
 // {current_state, state_fes, reject-verdicts}, not over the timeline side.
 
@@ -2201,12 +2200,12 @@ fn apply_adv_dag(dag: &Dag, order: &[usize]) -> Result<AdvOutcome, TestCaseError
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// Phase 1 generator-soundness property: the verdicts recorded during
+    /// Generator-soundness property: the verdicts recorded during
     /// construction (a RoomCore in build order) must be exactly reproduced by
     /// replaying the *persisted* events on a fresh RoomCore in the same order,
     /// and the resulting head-sets must match the verdict-aware structural
     /// oracle. This pins the generator + the verdict-aware `expected_heads`
-    /// end-to-end without yet asserting order-independence (Phase 2).
+    /// end-to-end without yet asserting order-independence.
     #[test]
     fn adv_build_order_reproduces_verdicts_and_heads(
         ops in prop::collection::vec(adv_op(), 1..16),
@@ -2250,7 +2249,7 @@ proptest! {
             "creator membership missing from current_state"
         );
 
-        // P5 — message-event isolation. A non-state event never touches the state
+        // Message-event isolation. A non-state event never touches the state
         // DAG or current_state: it appears in neither current_state nor the state
         // forward extremities. Equivalently, every timeline FE that is not also a
         // state FE is a message (a state head a later message referenced in
@@ -2398,7 +2397,7 @@ fn adv_creator_is_fork_merge_sender() {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// Phase 2 — order-independence of the order-invariant quantities, plus
+    /// Order-independence of the order-invariant quantities, plus
     /// rejection determinism. `current_state`, the state forward extremities,
     /// and each event's *reject-or-not* verdict are pure functions of the DAG:
     /// state events never soft-fail, and a reject depends only on
@@ -2445,7 +2444,7 @@ proptest! {
         }
     }
 
-    /// Phase 2 — rejection cascade + isolation. Cascade: any event whose
+    /// Rejection cascade + isolation. Cascade: any event whose
     /// `prev_state_events` names a rejected event is itself rejected
     /// (`validate::validate_references` → `PrevStateRejected`); this is a
     /// structural property of the DAG, so it is checked directly on the stored
@@ -2496,7 +2495,7 @@ proptest! {
         }
     }
 
-    /// P3 — idempotency (federation re-send reality). After applying the whole
+    /// Idempotency (federation re-send reality). After applying the whole
     /// DAG in build order, re-applying an arbitrary subset of its events in an
     /// arbitrary order is a no-op: every event is already persisted, so
     /// `apply_pdu`'s persisted-check returns empty effects and leaves

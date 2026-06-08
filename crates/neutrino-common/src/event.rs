@@ -9,7 +9,7 @@
 //! - `auth_events`, which is **not** on the v12 wire under MSC4242 but is
 //!   calculated server-side and co-located here for state resolution.
 //! - `event_id`, which is **never** on the v12 wire — it is computed from
-//!   the reference hash of `raw` (see PR 2 / `event-id-design.md`).
+//!   the reference hash of `raw` (see `event-id-design.md`).
 //! - `raw`, the canonical wire bytes of the event.
 //!
 //! See `event-id-design.md` §"Co-location pattern" for the five
@@ -23,8 +23,8 @@ use serde_json::value::RawValue;
 /// Parsed view of a Matrix v12 PDU.
 ///
 /// Constructed by the format-validation pass (`neutrino-state::validate`)
-/// and by the server-side event builder (`neutrino-state::event_id`,
-/// landing in PR 2). Round-trips through `Event.raw` byte-for-byte.
+/// and by the server-side event builder (`neutrino-state::event_id`).
+/// Round-trips through `Event.raw` byte-for-byte.
 #[derive(Debug, Clone)]
 pub struct Event {
     /// Computed from `reference_hash(raw)`. Never on the wire in v12.

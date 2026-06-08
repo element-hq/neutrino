@@ -1,4 +1,4 @@
-//! Outbound federated invite-rejection (Milestone C, joining-server side).
+//! Outbound federated invite-rejection (joining-server side).
 //!
 //! When a local user declines an **out-of-band invite** — an invite for a room
 //! we don't host, held only as an [`InviteStore`] stub with no room state — the

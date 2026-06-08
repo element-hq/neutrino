@@ -170,7 +170,7 @@ fn apply_sticky(conn: &mut Conn, req: &Request) {
         // a singular `range`. Ruma v5's `ranges: Vec` is a half-migrated
         // artefact — we honour only the first entry and silently drop any
         // others. Going strict-with-400 would break clients that haven't fully
-        // migrated yet (see PLAN.md/MSC4186-gaps.md notes on ruma's dialect).
+        // migrated yet (see MSC4186-gaps.md notes on ruma's dialect).
         let range = list
             .ranges
             .first()
@@ -229,8 +229,8 @@ async fn fetch_event_deltas<S: StorageBackend>(
 /// One candidate room plus its server-computed sort key.
 ///
 /// `bump_stamp` uses `origin_server_ts` rather than stream position so that
-/// federation-backfilled old events don't bump the room to the top (PLAN.md
-/// 2026-05-14). The source depends on the user's membership:
+/// federation-backfilled old events don't bump the room to the top. The
+/// source depends on the user's membership:
 /// - **Joined**: most recent event in the room (via `room_messages` Backward
 ///   limit 1), falling back to the `m.room.create` event ts.
 /// - **Invited**: the invitee's own `m.room.member` event ts (i.e. the invite
@@ -273,8 +273,8 @@ struct CombinedCfg {
 ///   lost) — documented in MSC4186-gaps.md.
 ///
 /// We don't apply MSC4186's `is_dm`/`is_encrypted`/`spaces`/`tags`/etc.
-/// filters — the embedded single-user server returns the full set (PLAN.md
-/// 2026-05-14). Sorted by `bump_stamp` desc, tiebroken by `room_id` asc so
+/// filters — the embedded single-user server returns the full set. Sorted
+/// by `bump_stamp` desc, tiebroken by `room_id` asc so
 /// tests are deterministic.
 async fn candidate_rooms<S: StorageBackend>(
     state: &SyncState<S>,
@@ -412,7 +412,7 @@ async fn is_kick<S: StorageBackend>(
 /// `StateStore::room_bump_stamps(rooms)` trait method; (c) maintain a
 /// `bump_stamp` column on the rooms table updated transactionally on every
 /// `persist_event`. (c) is the cleanest long-term; (a) is cheapest if storage
-/// stays single-process. All are out of scope for phase 3.
+/// stays single-process. None are implemented yet.
 async fn bump_stamp_for_joined<S: StorageBackend>(
     state: &SyncState<S>,
     room_id: &RoomId,
@@ -513,8 +513,8 @@ fn combined_room_configs(conn: &Conn, ranked: &[RankedRoom]) -> BTreeMap<OwnedRo
 /// field on the request) becomes the full window `[0, total-1]`. Zero
 /// candidates → `None` (caller iterates zero times anyway).
 ///
-/// We *drop* malformed ranges rather than 400'ing because phase 3 has no
-/// request-validation step yet; phase 6 may upgrade this to a `BadRequest`.
+/// We *drop* malformed ranges rather than 400'ing because there is no
+/// request-validation step yet; this could later be upgraded to a `BadRequest`.
 ///
 /// Only one range is honoured per list (MSC4186 removed MSC3575's multi-range
 /// support; see `apply_sticky`).
@@ -750,7 +750,7 @@ async fn build_invite_room<S: StorageBackend>(
         stripped.push(ev.try_into()?);
         // Lift `m.room.name` / `m.room.avatar` out of `invite_room_state` to
         // the top-level fields. Without this the client sees only the
-        // stripped array and falls back to heroes (unimplemented, PLAN.md)
+        // stripped array and falls back to heroes (unimplemented)
         // → renders the raw room id. Member counts are intentionally left
         // `None` for invites (Synapse-parity, no pre-accept room-size leak).
         let (name, avatar) = lift_invite_metadata(ev);
@@ -970,9 +970,9 @@ async fn populate_room_metadata<S: StorageBackend>(
 /// MSC3575 §"Required State" matching: each `(event_type, state_key)` rule is
 /// OR'd against the current state; `"*"` is a wildcard for either field.
 ///
-/// TODO(phase-4+): implement the special tokens `$LAZY` / `$ME` — needed only
+/// TODO: implement the special tokens `$LAZY` / `$ME` — needed only
 /// if a client we care about starts sending them. `$LAZY` is paired with
-/// lazy_members which is explicitly out of scope per PLAN.md.
+/// lazy_members which is explicitly out of scope.
 fn required_state_matches(
     rules: &[(StateEventType, String)],
     evt_type: &str,

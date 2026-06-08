@@ -7,7 +7,7 @@
 //! - [`translate_response`]: [`v5::Response`] + membership map → v3 JSON.
 //!
 //! The handler that ties them together lives in
-//! `legacy_sync` proper (phase 2); these helpers have no I/O, no awaits, and
+//! `legacy_sync` proper; these helpers have no I/O, no awaits, and
 //! no fallible logic on the happy path so they're easy to test.
 
 use std::collections::{BTreeMap, HashMap};
@@ -139,7 +139,7 @@ const LEGACY_TIMELINE_LIMIT: u32 = 50;
 /// Translate a v5 sliding-sync response into a legacy `/sync` JSON payload.
 ///
 /// `memberships` is the caller-supplied bucketing map keyed by `OwnedRoomId`
-/// (built in phase 2 from `StorageBackend::rooms_with_membership` before
+/// (built by the handler from `StorageBackend::rooms_with_membership` before
 /// invoking the v5 handler).
 ///
 /// Bucketing rules per MSC4186 + the design doc:
@@ -163,7 +163,7 @@ const LEGACY_TIMELINE_LIMIT: u32 = 50;
 ///   `tracing::warn!`, then probe `room.invite_state` as a tiebreaker. If
 ///   v5 supplied stripped invite state we bucket into `rooms.invite` so
 ///   those events aren't lost; otherwise we graceful-default to
-///   `rooms.join`. Shouldn't normally happen because phase 2 prefills
+///   `rooms.join`. Shouldn't normally happen because the handler prefills
 ///   `memberships` from the same query that drives candidate rooms, but
 ///   covers the race where a fresh invite lands between the pre-query
 ///   and the v5 call.
@@ -782,7 +782,7 @@ mod tests {
 
     #[test]
     fn translate_unknown_membership_defaults_to_join() {
-        // Phase 2 ought to prefill `memberships` for every room in the v5
+        // The handler ought to prefill `memberships` for every room in the v5
         // response, but the helper must degrade gracefully (warn + put in
         // join) rather than drop the room or panic.
         let r = room_id!("!stray:example.org").to_owned();
@@ -796,7 +796,7 @@ mod tests {
 
     #[test]
     fn translate_unknown_membership_with_invite_state_buckets_to_invite() {
-        // Race: a fresh invite lands between the phase-2 pre-query and the
+        // Race: a fresh invite lands between the membership pre-query and the
         // v5 call, so `memberships` lacks an entry but the v5 response
         // carries stripped invite_state. The helper must bucket into
         // `rooms.invite` and preserve the stripped events rather than

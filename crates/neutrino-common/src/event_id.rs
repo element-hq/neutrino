@@ -5,10 +5,10 @@
 //! - `Event::from_wire` here in `neutrino-common::event` (federation receive)
 //!
 //! Layered as:
-//! - **B0** — internal primitives (`canonical`, `sha256`, two base64 flavours,
-//!   `redact_for_hash`).
-//! - **B1** — public spec functions (`content_hash`, `reference_hash`,
-//!   `event_id_from_hash`, `room_id_from_create`).
+//! - **Internal primitives** — `canonical`, `sha256`, two base64 flavours,
+//!   `redact_for_hash`.
+//! - **Public spec functions** — `content_hash`, `reference_hash`,
+//!   `event_id_from_hash`, `room_id_from_create`.
 //!
 //! See `event-id-design.md` for the full flow.
 
@@ -307,7 +307,7 @@ mod tests {
         assert!(!o.contains_key("prev_state_events"));
     }
 
-    // ---- B1: content_hash, reference_hash, event_id_from_hash, room_id_from_create ----
+    // ---- public spec functions: content_hash, reference_hash, event_id_from_hash, room_id_from_create ----
 
     /// Spec appendix §event-signing, vector 1 ("minimally-sized event").
     /// v1-shaped (`origin` field, v1 event_id format, `auth_events: []` on a

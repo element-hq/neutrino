@@ -1,4 +1,4 @@
-//! Outbound federated join (Milestone A, joining-server side).
+//! Outbound federated join (joining-server side).
 //!
 //! When a local user joins a room we don't host, the CSAPI `/join` handler
 //! delegates here. We run the handshake against each candidate resident server

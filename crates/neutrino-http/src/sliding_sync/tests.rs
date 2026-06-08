@@ -80,7 +80,7 @@ async fn fresh_store() -> (Arc<SqliteStore>, NamedTempFile) {
 ///
 /// The `event_id` is computed from the canonical bytes of `json` via
 /// [`compute_event_id`], matching `EventStore::persist_event`'s debug-build
-/// hash check (PR 2 / B4). Callers that need to refer to the resulting
+/// hash check. Callers that need to refer to the resulting
 /// event_id capture it from the returned `Event`.
 fn build_stored_event(
     room_id: &RoomId,
@@ -280,7 +280,7 @@ fn list_with(timeline_limit: u32, required: Vec<(StateEventType, &str)>) -> requ
 }
 
 // -----------------------------------------------------------------------------
-// Phase 3 — initial sync, candidate rooms, range slicing.
+// Initial sync, candidate rooms, range slicing.
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
@@ -686,7 +686,7 @@ async fn list_count_independent_of_range_size() {
 }
 
 // -----------------------------------------------------------------------------
-// Phase 4 — deltas, `limited`, invite_state, name/avatar/counts, state stubs.
+// Deltas, `limited`, invite_state, name/avatar/counts, state stubs.
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1010,7 +1010,7 @@ fn oob_invite_event(
 /// not `current_state`) must surface in sliding sync exactly like an in-room
 /// invite: the room appears, carries `invite_state` (stripped state from the
 /// invite's `unsigned.invite_room_state`), and its name lifts to the top level.
-/// This is the B1 read-path: `candidate_rooms` unions `invited_oob_rooms` and
+/// This is the OOB-invite read-path: `candidate_rooms` unions `invited_oob_rooms` and
 /// `build_invite_room` sources the event from `get_invite`.
 #[tokio::test]
 async fn oob_invite_surfaces_in_sliding_sync() {
@@ -1407,7 +1407,7 @@ async fn name_avatar_and_counts_emitted() {
 }
 
 // -----------------------------------------------------------------------------
-// Phase 6 — request validation + extension echoes.
+// Request validation + extension echoes.
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1527,7 +1527,7 @@ async fn extensions_not_echoed_when_not_requested() {
 }
 
 // -----------------------------------------------------------------------------
-// Phase 5 — long-poll loop + retry idempotency.
+// Long-poll loop + retry idempotency.
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1854,7 +1854,7 @@ async fn retry_does_not_consume_pending_events() {
 }
 
 // -----------------------------------------------------------------------------
-// Phase 7 — ported from Synapse `tests/rest/client/sliding_sync/`.
+// Ported from Synapse `tests/rest/client/sliding_sync/`.
 // -----------------------------------------------------------------------------
 
 #[tokio::test]

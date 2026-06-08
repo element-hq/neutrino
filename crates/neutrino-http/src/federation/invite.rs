@@ -163,7 +163,7 @@ pub(crate) async fn handle(
     Ok(Json(ResponseBody { event: event_raw }))
 }
 
-// ── Outbound: we are the resident inviting a remote user (Milestone B3) ───────
+// ── Outbound: we are the resident inviting a remote user ──────────────────────
 
 /// Current-state types worth giving the invitee to render the room with
 /// (spec `unsigned.invite_room_state`). A curated subset; the inviter's own
