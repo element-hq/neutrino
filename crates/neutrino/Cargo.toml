@@ -14,3 +14,4 @@ multi-user-shim = ["neutrino-main/multi-user-shim"]
 tokio.workspace = true
 
 neutrino-main = { path = "../neutrino-main" }
+neutrino-common = { path = "../neutrino-common" }

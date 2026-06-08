@@ -3,6 +3,8 @@ pub mod event_id;
 pub mod event_view;
 pub use event::Event;
 
+use std::path::PathBuf;
+
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8008";
 const DEFAULT_SERVER_NAME: &str = "localhost";
 const DEFAULT_LOCALPART: &str = "alice";
@@ -32,6 +34,11 @@ pub struct Config {
     /// Max outbound federation transactions in flight across all destinations
     /// at once (the sender pool's global concurrency bound). Always ≥ 1.
     pub outbound_concurrency: usize,
+    /// Directory the SQLite database lives in. A server always needs one, so
+    /// this is required (not optional) — the platform bindings (`neutrino`,
+    /// `neutrino-ffi`) are responsible for supplying a value; `Default` leaves
+    /// it empty as a placeholder those bindings overwrite.
+    pub storage_path: PathBuf,
 }
 
 impl Default for Config {
@@ -41,6 +48,7 @@ impl Default for Config {
             bind_addr: DEFAULT_BIND_ADDR.to_string(),
             localpart: DEFAULT_LOCALPART.to_string(),
             outbound_concurrency: DEFAULT_OUTBOUND_CONCURRENCY,
+            storage_path: std::env::current_dir().unwrap(),
         }
     }
 }
@@ -57,6 +65,12 @@ impl Config {
                     .ok()
                     .as_deref(),
             ),
+            // The host binary's default: a stable directory under the system
+            // temp dir when `NEUTRINO_STORAGE_PATH` is unset (it survives
+            // restarts — unlike a tempfile — but stays out of the cwd).
+            storage_path: std::env::var_os("NEUTRINO_STORAGE_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::temp_dir().join("neutrino")),
             // `localpart` (and any future non-env field) defaults from `Default`,
             // so the value lives in exactly one place.
             ..Default::default()

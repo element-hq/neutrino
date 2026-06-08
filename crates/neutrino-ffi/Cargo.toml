@@ -14,6 +14,7 @@ tokio.workspace = true
 uniffi.workspace = true
 
 neutrino-main = { path = "../neutrino-main" }
+neutrino-common = { path = "../neutrino-common" }
 
 [build-dependencies]
 uniffi = { workspace = true, features = ["build"] }

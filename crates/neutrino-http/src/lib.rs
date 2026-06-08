@@ -24,7 +24,6 @@ use ruma::serde::Raw;
 use ruma::{OwnedRoomId, OwnedUserId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tower_http::classify::ServerErrorsFailureClass;
@@ -63,10 +62,6 @@ struct App {
     sync_state: Arc<SyncState<SqliteStore>>,
     keys: Option<Value>,
     config: Config,
-    /// Kept alive for the lifetime of the server; `NamedTempFile::drop`
-    /// removes the underlying db file. Held here so the path stays valid
-    /// for as long as `store` is in use.
-    _db_tempfile: NamedTempFile,
     /// Testing-only access-token → user map (multi-user shim). See
     /// `multi_user`. Absent from the production single-user build.
     #[cfg(feature = "multi-user-shim")]
@@ -139,21 +134,39 @@ impl axum::extract::FromRequestParts<AppState> for AuthUser {
 /// not networking.
 #[derive(Debug, thiserror::Error)]
 pub enum StartupError {
-    #[error("creating db tempfile: {0}")]
-    Tempfile(#[from] std::io::Error),
+    #[error("io error during startup: {0}")]
+    Io(#[from] std::io::Error),
     #[error("opening sqlite store: {0}")]
     Store(#[from] StorageError),
 }
 
+/// Fixed filename for the SQLite database inside the configured `storage_path`
+/// directory. The server owns the filename (and any sidecar files SQLite
+/// creates, e.g. `-wal`/`-shm`); callers pass only the directory.
+const DB_FILE_NAME: &str = "neutrino.db";
+
 impl AppState {
+    /// Open the persistent store at `config.storage_path` and build the running
+    /// state around it. This is the production path; the platform bindings
+    /// always supply a `storage_path`. Tests that want an ephemeral store build
+    /// it themselves and use [`AppState::from_store`].
     async fn new(config: Config) -> Result<Self, StartupError> {
-        // File-backed SQLite on a tempfile. `SqliteStore::open_in_memory`
-        // exists but its shared-cache mode is unsafe for the concurrent
-        // reader+writer workloads sliding-sync long-polls drive — see
-        // the `open_in_memory` doc-comment.
-        let tempfile = NamedTempFile::new()?;
-        let store = Arc::new(SqliteStore::open(tempfile.path()).await?);
-        Ok(Self::from_store(config, store, tempfile))
+        std::fs::create_dir_all(&config.storage_path)?;
+        let db_path = config.storage_path.join(DB_FILE_NAME);
+        let store = Arc::new(SqliteStore::open(db_path).await?);
+        let fetcher = Self::default_fetcher(&config);
+        Ok(Self::from_store_with_fetcher(config, store, fetcher))
+    }
+
+    /// Production gap-fill fetcher: a reqwest client resolving peers as
+    /// `http://{server_name}` (trusted mesh). Built separately from the outbound
+    /// sender pool — a second connection pool is cheap, and the two clients
+    /// target different peer sets (inbound gap-fill origins vs outbound
+    /// destinations). The worker that receives it owns the only
+    /// `Arc<dyn MissingEventsFetcher>`, so `App` holds no fetcher field.
+    fn default_fetcher(config: &Config) -> Arc<dyn MissingEventsFetcher> {
+        let client = Arc::new(FederationClient::new(config.server_name.clone()));
+        Arc::new(ReqwestFetcher::new(client))
     }
 
     /// Build an `AppState` around an already-open `SqliteStore`. Used by
@@ -161,32 +174,21 @@ impl AppState {
     /// storage trait *before* the router is mounted — `DagStore::missing_events`
     /// needs specific multi-event DAG shapes (gaps, branches) that are
     /// simplest to construct directly through the trait rather than via the
-    /// CSAPI write path. The caller passes the tempfile guard so the file
-    /// stays alive for the lifetime of the router.
-    pub(crate) fn from_store(
-        config: Config,
-        store: Arc<SqliteStore>,
-        tempfile: NamedTempFile,
-    ) -> Self {
-        // Production gap-fill fetcher: a reqwest client resolving peers as
-        // `http://{server_name}` (trusted mesh). Built here rather than shared
-        // with the sender pool — a second connection pool is cheap, and the two
-        // clients target different peer sets (inbound gap-fill origins vs
-        // outbound destinations). It's moved straight into the worker below
-        // (which owns the only `Arc<dyn MissingEventsFetcher>`), so `App` holds
-        // no fetcher field.
-        let client = Arc::new(FederationClient::new(config.server_name.clone()));
-        let fetcher: Arc<dyn MissingEventsFetcher> = Arc::new(ReqwestFetcher::new(client));
-        Self::from_store_with_fetcher(config, store, tempfile, fetcher)
+    /// CSAPI write path. The store is opened (and its tempfile guard, if any,
+    /// kept alive) by the caller — `App` does not own any on-disk lifetime.
+    #[cfg(test)]
+    pub(crate) fn from_store(config: Config, store: Arc<SqliteStore>) -> Self {
+        let fetcher = Self::default_fetcher(&config);
+        Self::from_store_with_fetcher(config, store, fetcher)
     }
 
     /// Like [`AppState::from_store`] but with an explicit gap-fill `fetcher`.
     /// The federation gap-fill tests inject a deterministic stub here instead
-    /// of the reqwest client (which would otherwise reach the network).
+    /// of the reqwest client (which would otherwise reach the network). Also the
+    /// shared core of [`AppState::new`].
     fn from_store_with_fetcher(
         config: Config,
         store: Arc<SqliteStore>,
-        tempfile: NamedTempFile,
         fetcher: Arc<dyn MissingEventsFetcher>,
     ) -> Self {
         let sync_state = Arc::new(SyncState::new(store.clone()));
@@ -203,7 +205,6 @@ impl AppState {
             sync_state,
             keys: None,
             config,
-            _db_tempfile: tempfile,
             #[cfg(feature = "multi-user-shim")]
             user_tokens: Arc::new(Mutex::new(multi_user::UserTokens::new())),
         };
@@ -240,7 +241,7 @@ pub async fn serve(listener: TcpListener, config: Config) -> Result<(), StartupE
     let router = build_router(state);
     axum::serve(listener, router)
         .await
-        .map_err(StartupError::Tempfile)?;
+        .map_err(StartupError::Io)?;
     Ok(())
 }
 
@@ -250,21 +251,16 @@ pub async fn router(config: Config) -> Result<Router, StartupError> {
 }
 
 /// Test-only constructor that mounts the same router over an externally-
-/// provided `SqliteStore`. The tempfile guard keeps the underlying db
-/// file alive — drop it (e.g. when the test scope ends) and the file is
-/// removed.
+/// provided `SqliteStore`. The caller owns the store's on-disk lifetime — it
+/// keeps any tempfile guard alive in its own scope (the router/`App` does not).
 ///
 /// Used by `src/federation/tests.rs` to seed events via the
 /// `StorageBackend` trait directly before the HTTP layer observes them —
 /// the DAG-walk tests need arbitrary chain/gap shapes that are simplest to
 /// construct through the trait rather than via the CSAPI write path.
 #[cfg(test)]
-pub(crate) fn router_with_store(
-    config: Config,
-    store: Arc<SqliteStore>,
-    tempfile: NamedTempFile,
-) -> Router {
-    let state = AppState::from_store(config, store, tempfile);
+pub(crate) fn router_with_store(config: Config, store: Arc<SqliteStore>) -> Router {
+    let state = AppState::from_store(config, store);
     build_router(state)
 }
 
@@ -276,10 +272,9 @@ pub(crate) fn router_with_store(
 pub(crate) fn router_with_store_and_fetcher(
     config: Config,
     store: Arc<SqliteStore>,
-    tempfile: NamedTempFile,
     fetcher: Arc<dyn MissingEventsFetcher>,
 ) -> Router {
-    let state = AppState::from_store_with_fetcher(config, store, tempfile, fetcher);
+    let state = AppState::from_store_with_fetcher(config, store, fetcher);
     build_router(state)
 }
 

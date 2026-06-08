@@ -12,12 +12,6 @@ multi-user-shim = []
 [dependencies]
 axum = "0.8.7"
 tower-http = { version = "0.6.6", features = ["trace"] }
-# `AppState::new` opens a file-backed `SqliteStore` on a `NamedTempFile`
-# rather than the in-memory variant (whose shared-cache mode isn't safe for
-# concurrent reader+writer workloads — see `SqliteStore::open_in_memory`
-# doc-comment). The tempfile is owned by `AppState` so it lives as long
-# as the server, and is cleaned up on exit.
-tempfile = "3.27.0"
 
 async-trait.workspace = true
 rand.workspace = true
