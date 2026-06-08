@@ -12,8 +12,8 @@
 //! - Iterative auth checks pass 1 starts from the **empty state**, not from
 //!   the unconflicted state. v2 started from unconflicted.
 //!
-//! The pipeline is the reverse-topological power sort and the iterative auth
-//! checks loop, then mainline ordering, IAC pass 2, and the
+//! The pipeline is the reverse-topological power sort, the iterative auth
+//! checks loop, mainline ordering, and IAC pass 2, all wrapped by the
 //! `resolve_state` top-level entry point.
 
 use std::cmp::Reverse;
