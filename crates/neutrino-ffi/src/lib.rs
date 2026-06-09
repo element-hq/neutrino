@@ -1,5 +1,3 @@
-use std::sync::Mutex;
-
 uniffi::setup_scaffolding!("neutrino");
 
 /// FFI-facing server configuration. Mirrors `neutrino_common::Config` so EX
@@ -52,24 +50,32 @@ impl From<Command> for neutrino_main::Command {
 
 #[derive(uniffi::Object)]
 pub struct NeutrinoHandle {
-    tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    tx: tokio::sync::mpsc::UnboundedSender<neutrino_main::Command>,
 }
 
 #[uniffi::export]
 impl NeutrinoHandle {
+    /// Push a control command to the running server. Fire-and-forget: returns
+    /// immediately, never blocks. A send after the server has already stopped
+    /// (the receiver was dropped) is a silent no-op.
+    pub fn command(&self, command: Command) {
+        let _ = self.tx.send(command.into());
+    }
+
+    /// Gracefully stop the server. Convenience for `command(Command::Shutdown)`;
+    /// preserves the pre-existing FFI method so existing Android callers keep
+    /// working unchanged.
     pub fn shutdown(&self) {
-        if let Some(tx) = self.tx.lock().unwrap().take() {
-            tx.send(()).unwrap()
-        }
+        self.command(Command::Shutdown);
     }
 }
 
 /// Spawn the Tokio runtime and begin polling the server entrypoint with the
-/// supplied configuration. Returns a handle that can gracefully shut the
-/// server down.
+/// supplied configuration. Returns a handle for pushing control commands
+/// (including `Shutdown`) into the running server.
 #[uniffi::export]
 pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let config: neutrino_main::Config = config.into();
     std::thread::spawn(move || {
         let rt = async_compat::get_runtime_handle();
@@ -80,12 +86,35 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
                         eprintln!("entrypoint exited: {e}");
                     }
                 },
-                _ = rx => {}
+                _ = drain_until_shutdown(rx) => {},
             }
         });
     });
-    NeutrinoHandle {
-        tx: Mutex::new(Some(tx)),
+    NeutrinoHandle { tx }
+}
+
+/// Drain control commands until a `Shutdown` arrives, or until the channel
+/// closes (every `NeutrinoHandle` dropped). Returning resolves the `select!`
+/// arm in `start`, which drops the entrypoint future and tears down the
+/// runtime — the same lifecycle the old shutdown oneshot drove.
+///
+/// Only lifecycle commands are handled here. When a server-directed variant is
+/// added (e.g. the Approach A `NetworkReachable` backoff kick), the receiver
+/// will instead be threaded into `neutrino_main::entrypoint` → `serve`, and the
+/// exhaustive `match` below will force that wiring decision at compile time.
+async fn drain_until_shutdown(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<neutrino_main::Command>,
+) {
+    // `never_loop` fires because every current arm of the match returns.
+    // The loop is intentional: future non-Shutdown variants (e.g. NetworkReachable)
+    // will `continue` rather than `return`, and the exhaustive match will force
+    // that decision at compile time.
+    #[allow(clippy::never_loop)]
+    loop {
+        match rx.recv().await {
+            None => return, // channel closed — all senders dropped
+            Some(neutrino_main::Command::Shutdown) => return,
+        }
     }
 }
 
@@ -108,6 +137,24 @@ mod tests {
         assert_eq!(cfg.localpart, "alice");
         assert_eq!(cfg.storage_dir, std::path::PathBuf::from("/data/neutrino"));
         assert_eq!(cfg.outbound_concurrency, 1);
+    }
+
+    #[tokio::test]
+    async fn drain_returns_on_shutdown() {
+        // A Shutdown command must end the drain loop (which resolves the
+        // select! arm in `start` and tears the runtime down).
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<neutrino_main::Command>();
+        tx.send(neutrino_main::Command::Shutdown).unwrap();
+        drain_until_shutdown(rx).await; // hangs (test times out) if it never returns
+    }
+
+    #[tokio::test]
+    async fn drain_returns_when_all_senders_dropped() {
+        // Dropping every NeutrinoHandle closes the channel; the drain must end,
+        // preserving the old behaviour where dropping the handle shut the server.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<neutrino_main::Command>();
+        drop(tx);
+        drain_until_shutdown(rx).await;
     }
 
     #[test]
