@@ -26,7 +26,17 @@ services:
     environment:
       NEUTRINO_SERVER_NAME: hs1
     ports: ["8001:80"]
-    networks: [net_ab, net_ac]
+    # Static IPs, fully numeric so they read off the names: subnet third octet =
+    # the pair (net_13 -> 10.211.13.0/24), host last octet = the server (hs1 ->
+    # .11). Pinning them keeps the address stable across a cut/heal cycle, which
+    # makes the rig predictable and rules out stale-address effects. NOTE: the
+    # actual one-way-heal fix lives in `nctl` (the `--alias` on reconnect) — the
+    # real failure was DNS, not IP: a plain `docker network connect` doesn't
+    # restore the compose service-name alias, so a healed server stops resolving
+    # by name from its peer. The static IP alone does not fix that.
+    networks:
+      net_12: { ipv4_address: 10.211.12.11 }
+      net_13: { ipv4_address: 10.211.13.11 }
 
   hs2:
     <<: *hs
@@ -34,7 +44,9 @@ services:
     environment:
       NEUTRINO_SERVER_NAME: hs2
     ports: ["8002:80"]
-    networks: [net_ab, net_bc]
+    networks:
+      net_12: { ipv4_address: 10.211.12.12 }
+      net_23: { ipv4_address: 10.211.23.12 }
     depends_on: [hs1]
 
   hs3:
@@ -43,15 +55,22 @@ services:
     environment:
       NEUTRINO_SERVER_NAME: hs3
     ports: ["8003:80"]
-    networks: [net_ac, net_bc]
+    networks:
+      net_13: { ipv4_address: 10.211.13.13 }
+      net_23: { ipv4_address: 10.211.23.13 }
     depends_on: [hs1]
 
 # Explicit `name:` avoids the project-name prefix, so the partition script can
-# refer to networks by a stable, predictable name.
+# refer to networks by a stable, predictable name. Each net pins an explicit
+# subnet so the per-service `ipv4_address` assignments above are valid (docker
+# only honours a static `--ip` on a network with a user-defined subnet).
 networks:
-  net_ab:
-    name: neutrino_net_ab
-  net_ac:
-    name: neutrino_net_ac
-  net_bc:
-    name: neutrino_net_bc
+  net_12:
+    name: neutrino_net_12
+    ipam: { config: [{ subnet: 10.211.12.0/24 }] }
+  net_13:
+    name: neutrino_net_13
+    ipam: { config: [{ subnet: 10.211.13.0/24 }] }
+  net_23:
+    name: neutrino_net_23
+    ipam: { config: [{ subnet: 10.211.23.0/24 }] }
