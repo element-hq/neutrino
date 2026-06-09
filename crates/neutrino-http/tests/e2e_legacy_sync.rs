@@ -33,6 +33,17 @@ fn config() -> Config {
     }
 }
 
+/// Build a router over a throwaway storage directory the test owns. The
+/// returned `TempDir` MUST be held for the lifetime of the router — dropping
+/// it deletes the database directory.
+async fn test_router() -> (axum::Router, tempfile::TempDir) {
+    let tmp = tempfile::TempDir::new().expect("create storage tempdir");
+    let mut cfg = config();
+    cfg.storage_dir = tmp.path().to_path_buf();
+    let app = router(cfg).await.expect("router");
+    (app, tmp)
+}
+
 /// GET helper for the legacy `/sync` endpoint.
 async fn get(app: &axum::Router, path: &str, query: Option<&str>) -> (StatusCode, Value) {
     let uri = match query {
@@ -101,7 +112,7 @@ async fn put(app: &axum::Router, path: &str, body: &Value) -> (StatusCode, Value
 
 #[tokio::test]
 async fn legacy_sync_returns_v3_envelope() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     let (status, body) = get(&app, LEGACY_SYNC_PATH, None).await;
     assert_eq!(status, StatusCode::OK);
@@ -139,7 +150,7 @@ async fn legacy_sync_returns_v3_envelope() {
 
 #[tokio::test]
 async fn send_event_then_legacy_sync_delivers_it_in_timeline() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     let (_, body) = post(&app, "/_matrix/client/v3/createRoom", &json!({})).await;
     let room_id = body
@@ -192,7 +203,7 @@ async fn send_event_then_legacy_sync_delivers_it_in_timeline() {
 
 #[tokio::test]
 async fn legacy_sync_advertises_state_after_alongside_state() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     // createRoom currently only honours `name` (see `create_room` in
     // lib.rs); that's enough state to verify both fields carry it.
@@ -241,7 +252,7 @@ async fn legacy_sync_advertises_state_after_alongside_state() {
 
 #[tokio::test]
 async fn legacy_sync_passes_since_through_v5_pos() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     // Initial sync, capture next_batch.
     let (status, body) = get(&app, LEGACY_SYNC_PATH, None).await;
@@ -270,7 +281,7 @@ async fn legacy_sync_passes_since_through_v5_pos() {
 
 #[tokio::test]
 async fn legacy_sync_unknown_since_falls_back_to_initial() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     // Garbage `since` — sliding_sync's pos parser is u64, so a non-numeric value
     // fails with `SyncError::UnknownPos`. Legacy `since` tokens are durable, so
@@ -290,7 +301,7 @@ async fn legacy_sync_unknown_since_falls_back_to_initial() {
 /// Single-user mirror of Complement's `TestCumulativeJoinLeaveJoinSync`.
 #[tokio::test]
 async fn legacy_sync_cumulative_join_leave_join() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     // A token from before the room exists; the connection advances past it.
     let (s, before) = get(&app, LEGACY_SYNC_PATH, Some("timeout=0")).await;
@@ -354,7 +365,7 @@ async fn legacy_sync_cumulative_join_leave_join() {
 
 #[tokio::test]
 async fn legacy_sync_timeout_zero_returns_immediately() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     // `?timeout=0` (and `timeout` absent) must both return promptly — the
     // legacy default is no-wait. We bound the wall clock at ~1s to catch
@@ -387,7 +398,7 @@ async fn send_event_then_legacy_sync_returns_event_with_event_id() {
     // it comes back via /sync. The v12 / MSC4242 wire bytes don't carry
     // event_id; this exercises the `event_view::From<&Event>` enrichment
     // path that injects it for CSAPI delivery.
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     let (_, body) = post(&app, "/_matrix/client/v3/createRoom", &json!({})).await;
     let room_id = body
@@ -434,7 +445,7 @@ async fn legacy_sync_create_event_carries_room_id_and_event_id() {
     // room_id (derived from event_id via sigil swap) and never carry
     // event_id. Both must be injected when delivered via CSAPI /sync,
     // otherwise complement / clients can't address the event.
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     let (_, body) = post(&app, "/_matrix/client/v3/createRoom", &json!({})).await;
     let room_id = body

@@ -24,6 +24,17 @@ fn config() -> Config {
     }
 }
 
+/// Build a router over a throwaway storage directory the test owns. The
+/// returned `TempDir` MUST be held for the lifetime of the router — dropping
+/// it deletes the database directory.
+async fn test_router() -> (axum::Router, tempfile::TempDir) {
+    let tmp = tempfile::TempDir::new().expect("create storage tempdir");
+    let mut cfg = config();
+    cfg.storage_dir = tmp.path().to_path_buf();
+    let app = router(cfg).await.expect("router");
+    (app, tmp)
+}
+
 /// Send a request with an optional Bearer token and JSON body.
 async fn send(
     app: &axum::Router,
@@ -88,7 +99,7 @@ fn sync_body() -> Value {
 
 #[tokio::test]
 async fn register_two_users_yields_distinct_tokens() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (alice_id, alice_tok) = register(&app, "alice").await;
     let (bob_id, bob_tok) = register(&app, "bob").await;
 
@@ -99,7 +110,7 @@ async fn register_two_users_yields_distinct_tokens() {
 
 #[tokio::test]
 async fn createroom_and_sync_are_attributed_to_the_token_user() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (_bob_id, bob_tok) = register(&app, "bob").await;
 
@@ -154,7 +165,7 @@ async fn createroom_and_sync_are_attributed_to_the_token_user() {
 
 #[tokio::test]
 async fn missing_token_is_401_missing() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (s, body) = send(
         &app,
         "POST",
@@ -169,7 +180,7 @@ async fn missing_token_is_401_missing() {
 
 #[tokio::test]
 async fn unknown_token_is_401_unknown() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (s, body) = send(
         &app,
         "POST",
@@ -187,7 +198,7 @@ async fn unknown_token_is_401_unknown() {
 /// hardcoded constant that was never stored.
 #[tokio::test]
 async fn login_mints_a_resolvable_token() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (s, body) = send(
         &app,
         "POST",
@@ -218,7 +229,7 @@ async fn login_mints_a_resolvable_token() {
 /// is rejected regardless of ruma's (lenient) charset grammar.
 #[tokio::test]
 async fn login_with_malformed_identifier_is_400() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let oversized = "a".repeat(300);
     let (s, body) = send(
         &app,
@@ -236,7 +247,7 @@ async fn login_with_malformed_identifier_is_400() {
 /// `public` join rule, and the room then appears in the joiner's sync.
 #[tokio::test]
 async fn join_public_room_without_invite_succeeds() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (_bob_id, bob_tok) = register(&app, "bob").await;
 
@@ -277,7 +288,7 @@ async fn join_public_room_without_invite_succeeds() {
 /// is accepted and ignored (single-server).
 #[tokio::test]
 async fn global_join_by_room_id_succeeds() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (bob_id, bob_tok) = register(&app, "bob").await;
 
@@ -315,7 +326,7 @@ async fn global_join_by_room_id_succeeds() {
 /// would give — matching Synapse's "No such room alias".
 #[tokio::test]
 async fn global_join_by_alias_is_404() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
 
     // `%23` is `#`, the alias sigil; axum percent-decodes it before the handler.
@@ -337,7 +348,7 @@ async fn global_join_by_alias_is_404() {
 /// reuses the existing membership event rather than stacking a duplicate).
 #[tokio::test]
 async fn repeated_global_join_is_idempotent() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (bob_id, bob_tok) = register(&app, "bob").await;
 
@@ -401,7 +412,7 @@ async fn repeated_global_join_is_idempotent() {
 /// it as "no body". Regression for the Complement bare `POST …/join` failure.
 #[tokio::test]
 async fn global_join_with_empty_body_succeeds() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (bob_id, bob_tok) = register(&app, "bob").await;
 
@@ -440,7 +451,7 @@ async fn global_join_with_empty_body_succeeds() {
 /// is `403 M_FORBIDDEN`, not a silent no-op `leave` (Synapse parity).
 #[tokio::test]
 async fn kick_user_not_in_room_is_forbidden() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (bob_id, _bob_tok) = register(&app, "bob").await;
 
@@ -472,7 +483,7 @@ async fn kick_user_not_in_room_is_forbidden() {
 /// clients use it (Complement sets `m.room.power_levels` this way).
 #[tokio::test]
 async fn put_state_trailing_slash_empty_key_succeeds() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
 
     let (s, room) = send(
@@ -503,7 +514,7 @@ async fn put_state_trailing_slash_empty_key_succeeds() {
 /// `room_id`, `sender`, nested `content`).
 #[tokio::test]
 async fn get_state_member_content_and_format_event() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (alice_id, alice_tok) = register(&app, "alice").await;
     let (s, room) = send(
         &app,
@@ -570,7 +581,7 @@ async fn get_state_member_content_and_format_event() {
 /// A `(type, state_key)` with no current state event is `404 M_NOT_FOUND`.
 #[tokio::test]
 async fn get_state_unknown_key_is_404() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (s, room) = send(
         &app,
@@ -599,7 +610,7 @@ async fn get_state_unknown_key_is_404() {
 /// room contains at least `m.room.create` and the creator's `m.room.member`.
 #[tokio::test]
 async fn get_state_all_lists_current_state() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (alice_id, alice_tok) = register(&app, "alice").await;
     let (s, room) = send(
         &app,
@@ -641,7 +652,7 @@ async fn get_state_all_lists_current_state() {
 /// slash, which axum routes separately. Exercises the empty-key *success* path.
 #[tokio::test]
 async fn get_state_trailing_slash_empty_key_round_trips() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (s, room) = send(
         &app,
@@ -681,7 +692,7 @@ async fn get_state_trailing_slash_empty_key_round_trips() {
 /// and single-event read paths share this guard; this hits `get_state_all`).
 #[tokio::test]
 async fn get_state_malformed_room_id_is_400() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (s, body) = send(
         &app,
@@ -698,7 +709,7 @@ async fn get_state_malformed_room_id_is_400() {
 /// A joined user leaving themselves moves their membership to `leave`.
 #[tokio::test]
 async fn self_leave_sets_membership_to_leave() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (bob_id, bob_tok) = register(&app, "bob").await;
 
@@ -779,7 +790,7 @@ async fn member_membership(app: &axum::Router, room_id: &str, user_id: &str) -> 
 /// join; after joining `GET /members` reports their membership as `join`.
 #[tokio::test]
 async fn invite_then_join_makes_room_visible() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (bob_id, bob_tok) = register(&app, "bob").await;
 
@@ -833,7 +844,7 @@ async fn invite_then_join_makes_room_visible() {
 /// Joining an invite-only room with no prior invite is rejected.
 #[tokio::test]
 async fn join_invite_only_without_invite_is_403() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (_bob_id, bob_tok) = register(&app, "bob").await;
 
@@ -863,7 +874,7 @@ async fn join_invite_only_without_invite_is_403() {
 /// the target's membership becomes `leave`.
 #[tokio::test]
 async fn kick_sets_target_membership_to_leave() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (bob_id, bob_tok) = register(&app, "bob").await;
 
@@ -910,7 +921,7 @@ async fn kick_sets_target_membership_to_leave() {
 /// `leave` and lets them join again (public room).
 #[tokio::test]
 async fn ban_blocks_rejoin_until_unban() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (bob_id, bob_tok) = register(&app, "bob").await;
 
@@ -996,7 +1007,7 @@ async fn ban_blocks_rejoin_until_unban() {
 /// explicit `/invite` call and `GET /members` reports them as `invite`.
 #[tokio::test]
 async fn createroom_invite_list_invites_listed_users() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (bob_id, bob_tok) = register(&app, "bob").await;
 
@@ -1034,7 +1045,7 @@ async fn createroom_invite_list_invites_listed_users() {
 /// handler must short-circuit to 200 rather than surface a 403.
 #[tokio::test]
 async fn leave_when_not_in_room_succeeds() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (bob_id, bob_tok) = register(&app, "bob").await;
 
@@ -1067,7 +1078,7 @@ async fn leave_when_not_in_room_succeeds() {
 /// the no-op success is only for a room that exists but the caller never joined.
 #[tokio::test]
 async fn leave_on_nonexistent_room_is_404() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_bob_id, bob_tok) = register(&app, "bob").await;
 
     let (s, body) = send(
@@ -1088,7 +1099,7 @@ async fn leave_on_nonexistent_room_is_404() {
 /// check is ever reached.
 #[tokio::test]
 async fn unban_on_nonexistent_room_is_404() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (bob_id, _bob_tok) = register(&app, "bob").await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
 
@@ -1112,7 +1123,7 @@ async fn unban_on_nonexistent_room_is_404() {
 /// destructive wrong action.
 #[tokio::test]
 async fn unban_non_banned_member_is_rejected_and_does_not_kick() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (bob_id, bob_tok) = register(&app, "bob").await;
 
@@ -1158,7 +1169,7 @@ async fn unban_non_banned_member_is_rejected_and_does_not_kick() {
 /// per the spec's optional `reason` parameter.
 #[tokio::test]
 async fn unban_propagates_reason() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (bob_id, bob_tok) = register(&app, "bob").await;
 
@@ -1221,7 +1232,7 @@ async fn unban_propagates_reason() {
 /// join call — is a genuine non-member.
 #[tokio::test]
 async fn messages_requires_membership() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let (_alice_id, alice_tok) = register(&app, "alice").await;
     let (_bob_id, bob_tok) = register(&app, "bob").await;
 

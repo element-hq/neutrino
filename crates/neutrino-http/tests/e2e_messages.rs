@@ -19,6 +19,17 @@ fn config() -> Config {
     }
 }
 
+/// Build a router over a throwaway storage directory the test owns. The
+/// returned `TempDir` MUST be held for the lifetime of the router — dropping
+/// it deletes the database directory.
+async fn test_router() -> (axum::Router, tempfile::TempDir) {
+    let tmp = tempfile::TempDir::new().expect("create storage tempdir");
+    let mut cfg = config();
+    cfg.storage_dir = tmp.path().to_path_buf();
+    let app = router(cfg).await.expect("router");
+    (app, tmp)
+}
+
 async fn post(app: &axum::Router, path: &str, body: &Value) -> (StatusCode, Value) {
     drive(app, "POST", path, Some(body)).await
 }
@@ -84,7 +95,7 @@ fn chunk_len(body: &Value) -> usize {
 
 #[tokio::test]
 async fn backward_no_from_returns_recent_newest_first() {
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
     let room = room_with_messages(&app, 3).await;
     let (status, body) = get(
         &app,
@@ -105,7 +116,7 @@ async fn backward_no_from_returns_recent_newest_first() {
 
 #[tokio::test]
 async fn pagination_roundtrip_via_end_token() {
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
     let room = room_with_messages(&app, 5).await;
     let (s1, p1) = get(
         &app,
@@ -143,7 +154,7 @@ async fn pagination_roundtrip_via_end_token() {
 
 #[tokio::test]
 async fn forward_from_zero_oldest_first() {
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
     let room = room_with_messages(&app, 3).await;
     let (status, body) = get(
         &app,
@@ -162,7 +173,7 @@ async fn forward_from_zero_oldest_first() {
 
 #[tokio::test]
 async fn limit_is_capped_not_rejected() {
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
     let room = room_with_messages(&app, 1).await;
     let (status, _) = get(
         &app,
@@ -174,7 +185,7 @@ async fn limit_is_capped_not_rejected() {
 
 #[tokio::test]
 async fn filter_param_is_ignored() {
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
     let room = room_with_messages(&app, 2).await;
     let plain = get(
         &app,
@@ -197,7 +208,7 @@ async fn filter_param_is_ignored() {
 
 #[tokio::test]
 async fn unknown_room_is_forbidden() {
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
     let (status, body) = get(
         &app,
         "/_matrix/client/v3/rooms/!nope:example.org/messages?dir=b",
@@ -213,7 +224,7 @@ async fn sync_prev_batch_works_as_messages_from() {
     // is the same `stream_pos` decimal that `/messages` accepts as `from`. Prove
     // the token crosses endpoints and yields the older events before the synced
     // window.
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
     // Enough messages that sliding-sync's timeline is `limited` and emits a prev_batch.
     let room = room_with_messages(&app, 6).await;
 
@@ -314,7 +325,7 @@ async fn paginate_all(app: &axum::Router, room: &str, dir: &str, page: usize) ->
 /// (overlap), order preserved. This is the headline pagination invariant.
 #[tokio::test]
 async fn backward_pagination_recovers_every_event_exactly_once() {
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
     let room = room_with_messages(&app, 7).await;
     let (_, full) = get(
         &app,
@@ -344,7 +355,7 @@ async fn backward_pagination_recovers_every_event_exactly_once() {
 /// (only a single unbounded forward fetch was tested before).
 #[tokio::test]
 async fn forward_pagination_recovers_every_event_exactly_once() {
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
     let room = room_with_messages(&app, 7).await;
     let (_, full) = get(
         &app,
@@ -372,7 +383,7 @@ async fn forward_pagination_recovers_every_event_exactly_once() {
 
 #[tokio::test]
 async fn bad_params_are_rejected() {
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
     let room = room_with_messages(&app, 1).await;
     for q in ["dir=x", "dir=b&from=notanumber", "dir=b&limit=abc"] {
         let (status, body) = get(
