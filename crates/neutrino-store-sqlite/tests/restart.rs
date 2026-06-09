@@ -224,17 +224,18 @@ async fn restart_empty_db_seeds_watch_at_zero() {
     );
 }
 
-/// `open_in_dir` owns the `<dir>/neutrino.db` layout: it creates a missing
-/// directory (parents included), places the database at the documented
-/// filename, and a reopen at the same directory observes prior writes. Pins
-/// the dir-creation + filename invariants the configurable-storage-dir
-/// feature relies on — the HTTP round-trip tests exercise persistence but
-/// never assert the on-disk file name or that a missing dir is created.
+/// `open_in_dir` owns the `<dir>/neutrino.db` layout: it creates the (missing)
+/// leaf directory, places the database at the documented filename, and a reopen
+/// at the same directory observes prior writes. Pins the dir-creation + filename
+/// invariants the configurable-storage-dir feature relies on — the HTTP
+/// round-trip tests exercise persistence but never assert the on-disk file name
+/// or that a missing dir is created.
 #[tokio::test]
 async fn open_in_dir_creates_dir_and_persists_at_neutrino_db() {
     let root = TempDir::new().expect("tempdir");
-    // A nested, not-yet-existing path — exercises create_dir_all's parents.
-    let dir = root.path().join("does/not/exist/yet");
+    // A not-yet-existing leaf whose parent (the TempDir root) already exists:
+    // `open_in_dir` creates the leaf but, by contract, not its parents.
+    let dir = root.path().join("neutrino");
 
     let create_ev = create_event(*ALICE_ROOM_ID, *ALICE_USER_ID);
     let member_ev = member_join(*ALICE_ROOM_ID, *ALICE_USER_ID);
@@ -262,28 +263,96 @@ async fn open_in_dir_creates_dir_and_persists_at_neutrino_db() {
     );
 }
 
-/// On unix, a directory `open_in_dir` creates is owner-only (`0o700`) — the
-/// DB holds plaintext message history, so no other UID should be able to
-/// traverse in and read it (or its WAL sidecars). Defense-in-depth on top of
-/// the Android per-UID sandbox; also protects the dev binary writing to cwd.
+/// `open_in_dir` creates only the leaf directory, not its parents — a missing
+/// parent is the caller's responsibility and must surface as an error rather
+/// than being silently created (which would force our owner-only mode onto
+/// intermediate dirs the host may share). Pins the contract behind finding #6.
+#[tokio::test]
+async fn open_in_dir_errors_when_parent_missing() {
+    let root = TempDir::new().expect("tempdir");
+    let dir = root.path().join("missing-parent/leaf");
+
+    let err = SqliteStore::open_in_dir(&dir)
+        .await
+        .expect_err("open_in_dir must fail when a parent dir is missing");
+    assert!(
+        !dir.exists(),
+        "store must not create the leaf when its parent is absent"
+    );
+    // Surfaces as a storage error naming the path (not a panic / silent mkdir).
+    let _ = err;
+}
+
+/// On unix the plaintext DB is kept owner-private regardless of who owns the
+/// directory: the DB file and its `-wal`/`-shm` sidecars are clamped to
+/// `0o600`, and a directory we create is `0o700`. This is the file-level
+/// guarantee finding #2 asked for — the parent-dir mode alone is not enough.
 #[cfg(unix)]
 #[tokio::test]
-async fn open_in_dir_creates_owner_only_directory() {
+async fn open_in_dir_creates_owner_only_dir_and_db_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode_of = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .unwrap_or_else(|e| panic!("stat {}: {e}", p.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    };
+
+    let root = TempDir::new().expect("tempdir");
+    let dir = root.path().join("created-by-us");
+
+    // Keep the store open so the WAL `-wal`/`-shm` sidecars are present.
+    let _s = SqliteStore::open_in_dir(&dir).await.expect("open_in_dir");
+
+    assert_eq!(
+        mode_of(&dir),
+        0o700,
+        "a storage dir we create must be owner-only (0o700)"
+    );
+    for name in ["neutrino.db", "neutrino.db-wal", "neutrino.db-shm"] {
+        let path = dir.join(name);
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "{name} must be owner-only (0o600), it holds plaintext history"
+        );
+    }
+}
+
+/// Option-1 contract: a *pre-existing* directory keeps the mode its owner
+/// chose — `open_in_dir` never tightens a dir the host handed us (e.g. the dev
+/// binary's `./data` from a prior run, Android's `filesDir`). The DB file is
+/// still clamped to `0o600`, so confidentiality does not depend on the dir mode.
+#[cfg(unix)]
+#[tokio::test]
+async fn open_in_dir_preserves_existing_directory_mode() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = TempDir::new().expect("tempdir");
-    let dir = root.path().join("created/by/us");
+    let dir = root.path().join("host-owned");
+    std::fs::create_dir(&dir).expect("pre-create dir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod 0o755");
 
     let _s = SqliteStore::open_in_dir(&dir).await.expect("open_in_dir");
 
-    let mode = std::fs::metadata(&dir)
-        .expect("stat storage dir")
+    let dir_mode = std::fs::metadata(&dir)
+        .expect("stat dir")
         .permissions()
-        .mode();
+        .mode()
+        & 0o777;
     assert_eq!(
-        mode & 0o777,
-        0o700,
-        "storage dir we create must be owner-only (0o700), got {:o}",
-        mode & 0o777
+        dir_mode, 0o755,
+        "open_in_dir must not tighten a directory it did not create"
+    );
+    let db_mode = std::fs::metadata(dir.join("neutrino.db"))
+        .expect("stat db")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        db_mode, 0o600,
+        "the DB file must be owner-only even inside a host-owned dir"
     );
 }

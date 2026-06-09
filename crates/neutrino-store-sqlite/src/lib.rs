@@ -78,6 +78,54 @@ pub struct SqliteStore {
 /// owned here, not by callers handing us a directory.
 const DB_FILENAME: &str = "neutrino.db";
 
+/// Create the storage directory itself — *not* its parents, which are the
+/// caller's responsibility. Returns whether we actually created it (vs. it
+/// already existing), so [`secure_storage_dir`] knows whether it owns the
+/// directory's permissions. A missing parent surfaces as an error naming the
+/// path so the caller knows to create it first.
+async fn create_storage_dir(dir: &Path) -> Result<bool, StorageError> {
+    match tokio::fs::create_dir(dir).await {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(Error::Internal(format!(
+            "creating storage dir {} (create its parent dirs first): {e}",
+            dir.display()
+        ))
+        .into()),
+    }
+}
+
+/// Keep the plaintext DB owner-private on unix: clamp `neutrino.db` and its
+/// `-wal`/`-shm` sidecars to `0o600`, and — only when we created it — the
+/// directory to `0o700`. We never tighten a directory the host handed us
+/// (`created == false`); that mode is its owner's choice. Sidecar absence is
+/// tolerated: they exist once WAL is engaged (the schema bundle is a write),
+/// but a future journal-mode change shouldn't make this brittle.
+#[cfg(unix)]
+async fn secure_storage_dir(dir: &Path, created: bool) -> Result<(), StorageError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if created {
+        tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|e| Error::Internal(format!("securing storage dir {}: {e}", dir.display())))?;
+    }
+
+    let db = dir.join(DB_FILENAME);
+    let wal = dir.join(format!("{DB_FILENAME}-wal"));
+    let shm = dir.join(format!("{DB_FILENAME}-shm"));
+    for path in [db, wal, shm] {
+        match tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::Internal(format!("securing {}: {e}", path.display())).into());
+            }
+        }
+    }
+    Ok(())
+}
+
 impl SqliteStore {
     /// Open a file-backed store at `path`. Creates the schema bundle on
     /// first open (per `schema::ensure_schema`'s version gate).
@@ -86,30 +134,32 @@ impl SqliteStore {
         Self::build(cfg, /* reader_size */ 4).await
     }
 
-    /// Open a store rooted at a storage *directory*: the directory (and any
-    /// missing parents) is created, and the database lives at
+    /// Open a store rooted at a storage *directory*: the directory itself is
+    /// created (tolerating it already existing) and the database lives at
     /// `<dir>/neutrino.db`. This is the constructor production code should
     /// use — the host passes a directory it owns (e.g. Android's
     /// `context.filesDir`) and stays unaware of the database filename and
     /// WAL sidecar layout.
     ///
-    /// On unix, directories we create are mode `0o700` (owner-only): the DB
-    /// holds plaintext message history, and an owner-only dir keeps every
-    /// other UID out of `neutrino.db` *and* its `-wal`/`-shm` sidecars without
-    /// having to chase each file's mode. `recursive` only applies the mode to
-    /// dirs we actually create, so a pre-existing host dir (Android's
-    /// per-UID `filesDir`) keeps the permissions the host chose for it.
+    /// We create only the final directory, *not* its parents — a missing
+    /// parent surfaces as an error pointing the caller at it. (Creating the
+    /// whole chain would force our owner-only mode onto intermediate dirs the
+    /// host may share with other processes.)
+    ///
+    /// On unix the plaintext DB is kept owner-private: [`secure_storage_dir`]
+    /// clamps `neutrino.db` and its `-wal`/`-shm` sidecars to `0o600`, and the
+    /// directory to `0o700` *only when we created it* — a pre-existing host
+    /// dir (Android's per-UID `filesDir`, a `./data` from a prior run) keeps
+    /// the mode its owner chose.
     pub async fn open_in_dir(dir: impl AsRef<Path>) -> Result<Self, StorageError> {
         let dir = dir.as_ref();
-        let mut builder = tokio::fs::DirBuilder::new();
-        builder.recursive(true);
+        let created = create_storage_dir(dir).await?;
+        let store = Self::open(dir.join(DB_FILENAME)).await?;
         #[cfg(unix)]
-        builder.mode(0o700);
-        builder
-            .create(dir)
-            .await
-            .map_err(|e| Error::Internal(format!("creating storage dir {}: {e}", dir.display())))?;
-        Self::open(dir.join(DB_FILENAME)).await
+        secure_storage_dir(dir, created).await?;
+        #[cfg(not(unix))]
+        let _ = created;
+        Ok(store)
     }
 
     /// Open a private in-memory store. Per pool-split doc §5: two

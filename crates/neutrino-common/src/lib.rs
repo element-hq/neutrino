@@ -10,6 +10,11 @@ const DEFAULT_SERVER_NAME: &str = "localhost";
 const DEFAULT_LOCALPART: &str = "alice";
 /// Default cap on concurrent in-flight outbound federation transactions.
 const DEFAULT_OUTBOUND_CONCURRENCY: usize = 2;
+/// Default storage directory: a `data/` subdirectory of the process's working
+/// directory rather than the cwd itself, so the server never has to clamp the
+/// permissions of (or scatter its DB sidecars across) a directory it doesn't
+/// own. The dev binary lands here; Android always overrides it over the FFI.
+const DEFAULT_STORAGE_DIR: &str = "./data";
 
 /// Wire identifier for the only room version this server speaks.
 ///
@@ -35,8 +40,9 @@ pub struct Config {
     /// at once (the sender pool's global concurrency bound). Always ≥ 1.
     pub outbound_concurrency: usize,
     /// Directory the embedded SQLite database lives in (`<dir>/neutrino.db`).
-    /// Defaults to the current working directory; Android supplies its app
-    /// files dir over the FFI. The server creates the dir if it is missing.
+    /// Defaults to `./data`; Android supplies its app files dir over the FFI.
+    /// The server creates this directory if missing, but not its parents —
+    /// those are the caller's responsibility (see `SqliteStore::open_in_dir`).
     pub storage_dir: PathBuf,
 }
 
@@ -47,7 +53,7 @@ impl Default for Config {
             bind_addr: DEFAULT_BIND_ADDR.to_string(),
             localpart: DEFAULT_LOCALPART.to_string(),
             outbound_concurrency: DEFAULT_OUTBOUND_CONCURRENCY,
-            storage_dir: PathBuf::from("."),
+            storage_dir: PathBuf::from(DEFAULT_STORAGE_DIR),
         }
     }
 }
@@ -84,11 +90,12 @@ impl Config {
     }
 }
 
-/// Resolve the storage directory: the env value if present, else the current
-/// working directory (`"."`, resolved lazily at open time so this stays
-/// infallible).
+/// Resolve the storage directory: the env value if present, else the
+/// [`DEFAULT_STORAGE_DIR`] (`./data`, resolved lazily at open time so this
+/// stays infallible).
 fn storage_dir_from(raw: Option<&str>) -> PathBuf {
-    raw.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+    raw.map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_STORAGE_DIR))
 }
 
 /// Parse + clamp the outbound-concurrency env value: a valid `usize ≥ 1`, else
@@ -104,8 +111,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn storage_dir_from_defaults_to_cwd() {
-        assert_eq!(storage_dir_from(None), std::path::PathBuf::from("."));
+    fn storage_dir_from_defaults_to_data() {
+        assert_eq!(
+            storage_dir_from(None),
+            std::path::PathBuf::from(DEFAULT_STORAGE_DIR)
+        );
         assert_eq!(
             storage_dir_from(Some("/data/neutrino")),
             std::path::PathBuf::from("/data/neutrino")
@@ -113,8 +123,11 @@ mod tests {
     }
 
     #[test]
-    fn default_config_storage_dir_is_cwd() {
-        assert_eq!(Config::default().storage_dir, std::path::PathBuf::from("."));
+    fn default_config_storage_dir_is_data() {
+        assert_eq!(
+            Config::default().storage_dir,
+            std::path::PathBuf::from(DEFAULT_STORAGE_DIR)
+        );
     }
 
     #[test]
