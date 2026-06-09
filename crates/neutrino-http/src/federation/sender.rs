@@ -234,7 +234,22 @@ async fn deliver_batch(
     let ids: Vec<&EventId> = batch.iter().map(|e| &*e.event_id).collect();
     let txn_id = idgen.next_id();
 
+    let mut attempt = 0u32;
     loop {
+        // One INFO line per send attempt, under the same `neutrino_http` target
+        // as the inbound request log. Retries reuse the same `txn_id`, so a peer
+        // being retried (e.g. while partitioned) shows as repeating lines with a
+        // climbing `attempt`. The `/send` path is spelled out so it surfaces when
+        // filtering federation traffic on `_matrix/federation/`.
+        attempt += 1;
+        info!(
+            target: "neutrino_http",
+            %dest,
+            txn = %txn_id,
+            pdus = pdus.len(),
+            attempt,
+            "outbound PUT /_matrix/federation/v1/send",
+        );
         // Hold a global permit only around the network call — released before
         // any backoff sleep, so a slow peer can't pin a concurrency slot.
         let send_result = match send_slots.acquire().await {

@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+#
+# nctl — drive the 3-server neutrino federation test rig.
+#
+#   Lifecycle:   nctl up | down | ps | logs <hs>
+#   Federation:  nctl fedlog [hs]            -> follow federation HTTP requests
+#   Partitions:  nctl partition cut|heal <ab|ac|bc> | nctl partition status
+#   Room ops:    nctl <hs> <action> ...        (hs = hs1 | hs2 | hs3)
+#
+# Room actions (each acts as that server's single user, @alice:<hs>):
+#   create [public|private] [name...]     -> prints the new room id
+#   join   <roomId> [residentHs]          -> join (residentHs hints a federated join)
+#   msg    <roomId> <text...>
+#   name   <roomId> <new name...>         -> set m.room.name
+#   invite <roomId> <user>                -> user = hsN (=> @alice:hsN) or a full @mxid
+#   kick   <roomId> <user> [reason...]
+#   ban    <roomId> <user> [reason...]
+#   leave  <roomId>
+#   state  <roomId>                       -> current room state (jq-formatted)
+#   members <roomId>                      -> member list (user + membership)
+#   sync                                  -> sliding-sync view of all rooms
+#
+# Convergence demo (hs3 must be IN the room first, or its sync is just empty):
+#   nctl hs1 invite '!room' hs3 ; nctl hs3 join '!room' hs1
+#   nctl partition cut ac                 # isolate hs1<->hs3
+#   nctl hs1 msg '!room' "during split"   # lands on hs1+hs2, parks for hs3
+#   nctl hs3 sync                          # hs3 has NOT seen it
+#   nctl partition heal ac                 # outbox drains
+#   nctl hs3 sync                          # hs3 has converged
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE=(docker compose -f "$DIR/docker-compose.yml")
+
+# server name -> published host port
+declare -A PORT=([hs1]=8001 [hs2]=8002 [hs3]=8003)
+# pair key -> docker network name (matches docker-compose.yml)
+declare -A NET=([ab]=neutrino_net_ab [ac]=neutrino_net_ac [bc]=neutrino_net_bc)
+# pair key -> the container whose disconnect severs that one link
+declare -A CUTEND=([ab]=neutrino-hs1 [ac]=neutrino-hs1 [bc]=neutrino-hs2)
+
+CS="_matrix/client/v3"
+SYNC="_matrix/client/unstable/org.matrix.simplified_msc3575/sync"
+
+die() { echo "nctl: $*" >&2; exit 2; }
+
+base() { # $1 = hs ; echoes base url or dies
+  local p=${PORT[${1:-}]:-}
+  [[ -n $p ]] || die "unknown server '${1:-}' (use hs1|hs2|hs3)"
+  printf 'http://localhost:%s' "$p"
+}
+
+# user shorthand: hsN -> @alice:hsN ; @... passes through unchanged.
+mxid() {
+  case "${1:-}" in
+    @*) printf '%s' "$1" ;;
+    hs1 | hs2 | hs3) printf '@alice:%s' "$1" ;;
+    *) die "bad user '${1:-}' (use hsN or a full @user:server)" ;;
+  esac
+}
+
+# Unique transaction id. NOT `date +%s%N` — BSD/macOS `date` has no `%N` and
+# emits a literal "N", so every txn in the same second would collide.
+txn() { printf '%s-%s%s' "$(date +%s)" "$RANDOM" "$RANDOM"; }
+
+# req <hs> <METHOD> <path> [json-body]   — pretty-prints JSON when jq is present.
+# Surfaces non-2xx as a stderr line + non-zero exit (curl -sS alone hides HTTP
+# errors behind a 0 exit, which previously masked a 400 as an empty result).
+req() {
+  local hs=$1 method=$2 path=$3 body=${4:-} url
+  url="$(base "$hs")/$path"
+  local raw code out
+  if [[ -n $body ]]; then
+    raw=$(curl -sS -w '\n%{http_code}' -X "$method" "$url" \
+      -H 'Content-Type: application/json' -d "$body")
+  else
+    raw=$(curl -sS -w '\n%{http_code}' -X "$method" "$url")
+  fi
+  code=${raw##*$'\n'} # trailing line appended by -w
+  out=${raw%$'\n'*}   # everything before it = response body
+  if command -v jq >/dev/null && printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
+    printf '%s' "$out" | jq .
+  else
+    printf '%s\n' "$out"
+  fi
+  if [[ $code != 2* ]]; then
+    echo "nctl: HTTP $code" >&2
+    return 1
+  fi
+}
+
+need_jq() { command -v jq >/dev/null || die "this action needs 'jq' installed"; }
+
+# ---- top-level (no server) verbs -------------------------------------------
+
+cmd_partition() {
+  local action=${1:-} pair=${2:-}
+  case "$action" in
+    cut | heal)
+      local net=${NET[$pair]:-} end=${CUTEND[$pair]:-}
+      [[ -n $net ]] || die "unknown pair '$pair' (use ab|ac|bc)"
+      # Idempotent: a re-cut / re-heal must not abort under `set -e`. docker
+      # errors when the endpoint is already (dis)connected — treat that as the
+      # desired state already holding.
+      if [[ $action == cut ]]; then
+        if docker network disconnect "$net" "$end" 2>/dev/null; then
+          echo "cut: $pair down ($end off $net)"
+        else
+          echo "cut: $pair already down"
+        fi
+      else
+        if docker network connect "$net" "$end" 2>/dev/null; then
+          echo "heal: $pair up ($end on $net)"
+        else
+          echo "heal: $pair already up"
+        fi
+      fi
+      ;;
+    status | "")
+      local p
+      for p in ab ac bc; do
+        local members
+        members=$(docker network inspect "${NET[$p]}" \
+          -f '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null || true)
+        local n; n=$(printf '%s' "$members" | wc -w)
+        if [[ $n -ge 2 ]]; then echo "$p: UP   ($members)"; else echo "$p: CUT  ($members)"; fi
+      done
+      ;;
+    *) die "partition: use cut|heal <ab|ac|bc> or status" ;;
+  esac
+}
+
+# ---- per-server room actions ------------------------------------------------
+
+cmd_server() {
+  local hs=$1 action=${2:-}; shift 2 || true
+  base "$hs" >/dev/null # validate hs early
+  case "$action" in
+    create)
+      local vis=public preset name
+      if [[ ${1:-} == public || ${1:-} == private ]]; then vis=$1; shift; fi
+      [[ $vis == private ]] && preset=private_chat || preset=public_chat
+      name="$*"
+      need_jq
+      local body
+      if [[ -n $name ]]; then
+        body=$(jq -n --arg p "$preset" --arg n "$name" '{preset:$p, name:$n}')
+      else
+        body=$(jq -n --arg p "$preset" '{preset:$p}')
+      fi
+      req "$hs" POST "$CS/createRoom" "$body"
+      ;;
+    join)
+      local room=${1:-}; [[ -n $room ]] || die "join: need <roomId>"
+      local resident=${2:-}
+      if [[ -n $resident ]]; then
+        req "$hs" POST "$CS/join/$room?server_name=$resident"
+      else
+        req "$hs" POST "$CS/rooms/$room/join"
+      fi
+      ;;
+    msg)
+      local room=${1:-}; shift || true
+      [[ -n $room && -n $* ]] || die "msg: need <roomId> <text>"
+      need_jq
+      local body; body=$(jq -n --arg b "$*" '{msgtype:"m.text", body:$b}')
+      req "$hs" PUT "$CS/rooms/$room/send/m.room.message/$(txn)" "$body"
+      ;;
+    name)
+      local room=${1:-}; shift || true
+      [[ -n $room && -n $* ]] || die "name: need <roomId> <new name>"
+      need_jq
+      local body; body=$(jq -n --arg n "$*" '{name:$n}')
+      req "$hs" PUT "$CS/rooms/$room/state/m.room.name" "$body"
+      ;;
+    invite | kick | ban)
+      local room=${1:-} user=${2:-}; shift 2 || true
+      [[ -n $room && -n $user ]] || die "$action: need <roomId> <user>"
+      need_jq
+      local target; target=$(mxid "$user")
+      local body
+      if [[ -n $* ]]; then
+        body=$(jq -n --arg u "$target" --arg r "$*" '{user_id:$u, reason:$r}')
+      else
+        body=$(jq -n --arg u "$target" '{user_id:$u}')
+      fi
+      req "$hs" POST "$CS/rooms/$room/$action" "$body"
+      ;;
+    leave)
+      local room=${1:-}; [[ -n $room ]] || die "leave: need <roomId>"
+      req "$hs" POST "$CS/rooms/$room/leave"
+      ;;
+    state)
+      local room=${1:-}; [[ -n $room ]] || die "state: need <roomId>"
+      need_jq
+      req "$hs" GET "$CS/rooms/$room/state" \
+        | jq 'map({type, state_key, content})'
+      ;;
+    members)
+      local room=${1:-}; [[ -n $room ]] || die "members: need <roomId>"
+      need_jq
+      req "$hs" GET "$CS/rooms/$room/members" \
+        | jq '[.chunk[] | {user: .state_key, membership: .content.membership}]'
+      ;;
+    sync)
+      need_jq
+      # ruma's sliding-sync List requires `timeline_limit`; omitting it is a
+      # 400 M_BAD_JSON. Surface any error body rather than masking it as [].
+      req "$hs" POST "$SYNC" \
+        '{"lists":{"default":{"ranges":[[0,99]],"timeline_limit":20}}}' \
+        | jq 'def trim: with_entries(select(.value != null));
+              if .errcode then {error: .errcode, detail: .error}
+              else (.rooms // {}) | to_entries | map({
+                room: .key,
+                name: .value.name,
+                invite: (if .value.invite_state != null then true else null end),
+                timeline: [ .value.timeline[]?
+                  | { type, sender, state_key, content } | trim ]
+              } | trim) end'
+      ;;
+    "") die "usage: nctl <hs> <action> ... (try: nctl help)" ;;
+    *) die "unknown action '$action' (try: nctl help)" ;;
+  esac
+}
+
+# ---- dispatch ---------------------------------------------------------------
+
+main() {
+  local first=${1:-}
+  case "$first" in
+    up) shift; exec "${COMPOSE[@]}" up -d --build "$@" ;;
+    down) shift; exec "${COMPOSE[@]}" down "$@" ;;
+    ps) shift; exec "${COMPOSE[@]}" ps "$@" ;;
+    logs)
+      local hs=${2:-}; [[ -n $hs ]] || die "logs: need <hs>"
+      exec docker logs -f "neutrino-$hs"
+      ;;
+    fedlog)
+      # Every inbound federation request is logged by its DESTINATION server
+      # (neutrino's per-request INFO line: method + full path, then status +
+      # latency). Each request is received by exactly one server, so the union
+      # across all three is the complete federation request stream. Follow and
+      # filter to federation paths; the compose log prefix (hs1/hs2/hs3) tells
+      # you which server received each one.
+      local hs=${2:-}
+      if [[ -n $hs ]]; then
+        docker logs -f "neutrino-$hs" 2>&1 | grep --line-buffered '_matrix/federation/'
+      else
+        "${COMPOSE[@]}" logs -f --no-color 2>&1 | grep --line-buffered '_matrix/federation/'
+      fi
+      ;;
+    partition) shift; cmd_partition "$@" ;;
+    help | -h | --help | "")
+      # Print the header comment block (lines 3..first non-comment), stripping
+      # the leading "# ". awk (not a fixed line range) so it can't leak code.
+      awk 'NR<3 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' \
+        "${BASH_SOURCE[0]}"
+      ;;
+    *) cmd_server "$@" ;;
+  esac
+}
+
+main "$@"

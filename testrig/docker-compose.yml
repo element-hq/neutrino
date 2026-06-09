@@ -1,0 +1,57 @@
+# 3 single-user neutrino servers wired for federation over docker networks.
+#
+# One bridge network per *pair* of servers. Federation between two servers only
+# has that one shared network as a path, so `docker network disconnect` on a
+# pair-network severs that link symmetrically (both directions) while leaving the
+# other two links up — clean pairwise partitions, no proxy, no neutrino changes.
+#
+# Client-Server traffic does NOT use these networks: the CLI hits each server on
+# its published host port (8001/8002/8003), so you can keep driving a server
+# even while it is partitioned from its peers.
+name: neutrino-testrig
+
+x-hs: &hs
+  image: neutrino-testrig:latest
+  # In-memory SQLite (tempfile per process) → fresh state on every restart.
+  restart: "no"
+
+services:
+  hs1:
+    <<: *hs
+    # Only hs1 carries `build:`; hs2/hs3 reuse the resulting image tag.
+    build:
+      context: ..
+      dockerfile: testrig/Dockerfile
+    container_name: neutrino-hs1
+    environment:
+      NEUTRINO_SERVER_NAME: hs1
+    ports: ["8001:80"]
+    networks: [net_ab, net_ac]
+
+  hs2:
+    <<: *hs
+    container_name: neutrino-hs2
+    environment:
+      NEUTRINO_SERVER_NAME: hs2
+    ports: ["8002:80"]
+    networks: [net_ab, net_bc]
+    depends_on: [hs1]
+
+  hs3:
+    <<: *hs
+    container_name: neutrino-hs3
+    environment:
+      NEUTRINO_SERVER_NAME: hs3
+    ports: ["8003:80"]
+    networks: [net_ac, net_bc]
+    depends_on: [hs1]
+
+# Explicit `name:` avoids the project-name prefix, so the partition script can
+# refer to networks by a stable, predictable name.
+networks:
+  net_ab:
+    name: neutrino_net_ab
+  net_ac:
+    name: neutrino_net_ac
+  net_bc:
+    name: neutrino_net_bc

@@ -20,6 +20,7 @@ use ruma::{EventId, OwnedEventId, RoomId, ServerName, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue as RawJsonValue;
+use tracing::info;
 
 use crate::federation::gapfill::MissingEventsFetcher;
 use crate::federation::{get_missing_events, now_ms};
@@ -124,6 +125,7 @@ impl FederationClient {
         // No trailing slash on the base: `path_segments_mut().push()` appends a
         // segment, so a trailing slash would yield an empty segment + double
         // slash (`…/get_missing_events//{room}`).
+        info!(target: "neutrino_http", %dest, %room_id, limit, state_dag, "outbound POST /_matrix/federation/v1/get_missing_events");
         let mut url = reqwest::Url::parse(&format!(
             "http://{dest}/_matrix/federation/v1/get_missing_events"
         ))
@@ -159,6 +161,7 @@ impl FederationClient {
         user_id: &UserId,
         ver: &str,
     ) -> Result<MakeJoinResponse, FederationClientError> {
+        info!(target: "neutrino_http", %dest, %room_id, %user_id, "outbound GET /_matrix/federation/v1/make_join");
         let mut url =
             reqwest::Url::parse(&format!("http://{dest}/_matrix/federation/v1/make_join"))
                 .map_err(|_| FederationClientError::InvalidUrl)?;
@@ -185,6 +188,7 @@ impl FederationClient {
         event_id: &EventId,
         event: &RawJsonValue,
     ) -> Result<SendJoinResponse, FederationClientError> {
+        info!(target: "neutrino_http", %dest, %room_id, %event_id, "outbound PUT /_matrix/federation/v2/send_join");
         let mut url =
             reqwest::Url::parse(&format!("http://{dest}/_matrix/federation/v2/send_join"))
                 .map_err(|_| FederationClientError::InvalidUrl)?;
@@ -215,6 +219,7 @@ impl FederationClient {
         room_version: &str,
         invite_room_state: &[Value],
     ) -> Result<InviteResponse, FederationClientError> {
+        info!(target: "neutrino_http", %dest, %room_id, %event_id, "outbound PUT /_matrix/federation/v2/invite");
         let mut url = reqwest::Url::parse(&format!("http://{dest}/_matrix/federation/v2/invite"))
             .map_err(|_| FederationClientError::InvalidUrl)?;
         url.path_segments_mut()
@@ -247,6 +252,7 @@ impl FederationClient {
         user_id: &UserId,
         ver: &str,
     ) -> Result<MakeLeaveResponse, FederationClientError> {
+        info!(target: "neutrino_http", %dest, %room_id, %user_id, "outbound GET /_matrix/federation/v1/make_leave");
         let mut url =
             reqwest::Url::parse(&format!("http://{dest}/_matrix/federation/v1/make_leave"))
                 .map_err(|_| FederationClientError::InvalidUrl)?;
@@ -274,6 +280,7 @@ impl FederationClient {
         event_id: &EventId,
         event: &RawJsonValue,
     ) -> Result<(), FederationClientError> {
+        info!(target: "neutrino_http", %dest, %room_id, %event_id, "outbound PUT /_matrix/federation/v2/send_leave");
         let mut url =
             reqwest::Url::parse(&format!("http://{dest}/_matrix/federation/v2/send_leave"))
                 .map_err(|_| FederationClientError::InvalidUrl)?;
