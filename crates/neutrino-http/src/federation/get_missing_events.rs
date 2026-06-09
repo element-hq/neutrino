@@ -21,9 +21,14 @@ const DEFAULT_LIMIT: u32 = 10;
 /// Hard cap on the number of events returned. The v1.18 spec sets *no* maximum
 /// on `limit` (the field is documented only as "Defaults to 10":
 /// <https://spec.matrix.org/v1.18/server-server-api/#post_matrixfederationv1get_missing_eventsroomid>).
-/// This 20-event ceiling matches Synapse's `min(limit, 20)` in
-/// `_get_missing_events` and bounds per-request work. Saturating cap, not a 400.
-const MAX_LIMIT: u32 = 20;
+/// We deliberately diverge from Synapse's `min(limit, 20)`: the requester's
+/// `limit` is *honoured* up to this anti-spam ceiling, so the MSC4242 state-DAG
+/// gap-fill caller (which grows `limit` exponentially per round, see
+/// `gapfill.rs`) can pull a deep ancestry in a few large pages rather than
+/// dozens of 20-event round-trips. 1000 bounds per-request work while leaving
+/// ample headroom for exponential growth to take effect. Saturating cap, not a
+/// 400.
+const MAX_LIMIT: u32 = 1000;
 
 /// Body of the federation request.
 ///

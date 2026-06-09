@@ -455,7 +455,12 @@ async fn happy_path_returns_events_between_earliest_and_latest() {
 
 #[tokio::test]
 async fn respects_limit() {
-    // Seed >20 events in a chain, ask for limit=50, receive at most 20.
+    // A requested `limit` well above Synapse's old 20-floor but below MAX_LIMIT
+    // is honoured in full: seed a 25-message chain, ask for limit=50, receive
+    // all 26 ancestors of the latest (24 earlier messages + the self-join + the
+    // create; the latest itself is the excluded boundary). Pins the divergence
+    // from `min(limit, 20)` that lets the gap-fill caller's exponential growth
+    // actually take effect.
     let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(25).await;
 
     let (status, body) = post_json(
@@ -475,7 +480,36 @@ async fn respects_limit() {
         .and_then(Value::as_array)
         .expect("events array")
         .len();
-    assert_eq!(n, 20, "MAX_LIMIT cap not enforced; got {n}");
+    assert_eq!(n, 26, "limit above old 20-floor must be honoured; got {n}");
+}
+
+// --- MAX_LIMIT anti-spam ceiling ----------------------------------------
+
+#[tokio::test]
+async fn limit_capped_at_max() {
+    // Seed > MAX_LIMIT (1000) events and ask for more: the response saturates
+    // at the 1000-event anti-spam ceiling rather than honouring the request or
+    // returning the whole chain.
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(1001).await;
+
+    let (status, body) = post_json(
+        &app,
+        &fed_path(room_id.as_str()),
+        &json!({
+            "earliest_events": [],
+            "latest_events": [msgs[1000].as_str()],
+            "limit": 5000,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let n = body
+        .get("events")
+        .and_then(Value::as_array)
+        .expect("events array")
+        .len();
+    assert_eq!(n, 1000, "MAX_LIMIT ceiling not enforced; got {n}");
 }
 
 // --- default limit is 10 ------------------------------------------------
