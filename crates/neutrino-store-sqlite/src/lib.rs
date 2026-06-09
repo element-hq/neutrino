@@ -128,8 +128,10 @@ impl SqliteStore {
     /// reader side when a writer holds an in-flight transaction.
     /// **Safe for single-task and single-worker tests; not safe for
     /// concurrent reader+writer workloads.** Use file-backed
-    /// [`SqliteStore::open`] on a `tempfile::NamedTempFile` for any test
-    /// that exercises the concurrent reader/writer surface. See
+    /// [`SqliteStore::open_in_dir`] on a `tempfile::TempDir` for any test
+    /// that exercises the concurrent reader/writer surface — a `TempDir`
+    /// reaps the DB *and* its WAL `-wal`/`-shm` sidecars on drop, which a
+    /// bare `NamedTempFile` would orphan. See
     /// `docs/2026-05-18-read-write-pool-split.md` §5 for the full
     /// rationale.
     pub async fn open_in_memory() -> Result<Self, StorageError> {

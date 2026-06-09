@@ -33,7 +33,7 @@ use neutrino_store_sqlite::SqliteStore;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, ServerName};
 use serde_json::value::RawValue as RawJsonValue;
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
+use tempfile::TempDir;
 use tower::ServiceExt;
 
 use crate::federation::client::FederationClientError;
@@ -217,17 +217,19 @@ async fn drive(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, value)
 }
 
-/// Open a fresh sqlite store on a tempfile. Returns both so the caller
-/// can pass the store to `router_with_store` and keep the tempfile guard
-/// alive for the lifetime of the router.
-async fn fresh_store() -> (Arc<SqliteStore>, NamedTempFile) {
-    let tempfile = NamedTempFile::new().expect("tempfile");
+/// Open a fresh sqlite store in a throwaway directory. Returns both so the
+/// caller can pass the store to `router_with_store` and keep the `TempDir`
+/// guard alive for the lifetime of the router — dropping it removes the
+/// directory and the DB (plus its `-wal`/`-shm` sidecars), unlike a bare
+/// `NamedTempFile` which would orphan the sidecars.
+async fn fresh_store() -> (Arc<SqliteStore>, TempDir) {
+    let tempdir = TempDir::new().expect("tempdir");
     let store = Arc::new(
-        SqliteStore::open(tempfile.path())
+        SqliteStore::open_in_dir(tempdir.path())
             .await
             .expect("open sqlite"),
     );
-    (store, tempfile)
+    (store, tempdir)
 }
 
 /// Build a seeded room with a linear chain of `n` message events whose
@@ -247,7 +249,7 @@ async fn build_seeded_router(
     OwnedRoomId,
     OwnedEventId,
     Vec<OwnedEventId>,
-    NamedTempFile,
+    TempDir,
 ) {
     let (store, tempfile) = fresh_store().await;
     let sender = alice();
@@ -1189,7 +1191,7 @@ async fn seed_joined_room() -> (
     OwnedRoomId,
     OwnedUserId,
     OwnedEventId,
-    NamedTempFile,
+    TempDir,
 ) {
     // Default to a no-progress fetcher: the in-order tests never trigger
     // gap-fill, and the one that does (`…unfillable_missing_ancestry`) wants
@@ -1207,7 +1209,7 @@ async fn seed_joined_room_with_fetcher(
     OwnedRoomId,
     OwnedUserId,
     OwnedEventId,
-    NamedTempFile,
+    TempDir,
 ) {
     let (store, tempfile) = fresh_store().await;
     let alice = alice();
@@ -2063,7 +2065,7 @@ async fn seed_room(
     Arc<SqliteStore>,
     OwnedRoomId,
     OwnedEventId,
-    NamedTempFile,
+    TempDir,
 ) {
     let (store, tempfile) = fresh_store().await;
     let creator = alice();
@@ -2102,7 +2104,7 @@ async fn seed_public_room() -> (
     Arc<SqliteStore>,
     OwnedRoomId,
     OwnedEventId,
-    NamedTempFile,
+    TempDir,
 ) {
     seed_room(&[
         (
@@ -3169,7 +3171,7 @@ async fn invite_rejects_event_id_path_mismatch() {
 /// address, so a user `@local:{addr}` is local to it (its inbound `/invite/v2`
 /// accepts the invitee). Returns the server name, the served store, and the
 /// tempfile guard (held by the caller so the backing DB outlives the server).
-async fn serve_invitee_server(localpart: &str) -> (String, Arc<SqliteStore>, NamedTempFile) {
+async fn serve_invitee_server(localpart: &str) -> (String, Arc<SqliteStore>, TempDir) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
     let (store, tempfile) = fresh_store().await;
@@ -3405,7 +3407,7 @@ async fn seed_room_with_invited_zara() -> (
     Arc<SqliteStore>,
     OwnedRoomId,
     OwnedEventId,
-    NamedTempFile,
+    TempDir,
 ) {
     seed_room(&[
         (
@@ -3714,7 +3716,7 @@ async fn serve_resident_with_invite(
     Arc<SqliteStore>,
     OwnedRoomId,
     neutrino_common::Event,
-    NamedTempFile,
+    TempDir,
 ) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());

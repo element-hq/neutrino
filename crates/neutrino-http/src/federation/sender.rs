@@ -311,7 +311,7 @@ mod tests {
     use neutrino_store::{EventStore, RoomStore};
     use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
     use serde_json::{Value, json};
-    use tempfile::NamedTempFile;
+    use tempfile::TempDir;
 
     use super::*;
     use crate::federation::BACKOFF_CAP;
@@ -360,14 +360,9 @@ mod tests {
     async fn store_with_outbox(
         dest: &ServerName,
         n: usize,
-    ) -> (
-        Arc<SqliteStore>,
-        NamedTempFile,
-        OwnedRoomId,
-        Vec<OwnedEventId>,
-    ) {
-        let tempfile = NamedTempFile::new().unwrap();
-        let store = Arc::new(SqliteStore::open(tempfile.path()).await.unwrap());
+    ) -> (Arc<SqliteStore>, TempDir, OwnedRoomId, Vec<OwnedEventId>) {
+        let tempfile = TempDir::new().unwrap();
+        let store = Arc::new(SqliteStore::open_in_dir(tempfile.path()).await.unwrap());
         let sender: OwnedUserId = "@alice:local.test".parse().unwrap();
 
         let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())

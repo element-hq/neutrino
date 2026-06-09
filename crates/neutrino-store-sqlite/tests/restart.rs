@@ -8,9 +8,11 @@
 //! regression that broke any of them would only have shown up in
 //! production.
 //!
-//! File-backed via `tempfile::NamedTempFile` — `open_in_memory` is
-//! pointless here because the in-memory DB is gone the moment the
-//! first store drops.
+//! File-backed via `tempfile::TempDir` (a throwaway directory per test,
+//! opened through `SqliteStore::open_in_dir`) — `open_in_memory` is
+//! pointless here because the in-memory DB is gone the moment the first
+//! store drops. `TempDir`'s recursive drop also reaps the WAL `-wal`/`-shm`
+//! sidecars that a bare `NamedTempFile` would orphan in the temp dir.
 
 mod common;
 
@@ -23,7 +25,7 @@ use neutrino_store::{
 };
 use neutrino_store_sqlite::SqliteStore;
 use ruma::{RoomVersionId, server_name};
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::TempDir;
 
 use common::{ALICE_ROOM_ID, ALICE_USER_ID, create_event, member_join, message, name_event};
 
@@ -57,8 +59,8 @@ async fn settle_close_race() {
 /// pinpoints the broken invariant on its own.
 #[tokio::test]
 async fn restart_preserves_all_state() {
-    let file = NamedTempFile::new().expect("tempfile");
-    let path = file.path();
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path();
 
     let dest = server_name!("matrix.org");
     let origin = server_name!("origin.example.com");
@@ -76,7 +78,7 @@ async fn restart_preserves_all_state() {
 
     // ---- Process 1: populate every durable surface. ----
     let final_pos = {
-        let s = SqliteStore::open(path).await.expect("first open");
+        let s = SqliteStore::open_in_dir(path).await.expect("first open");
 
         // create_room writes the create event + one initial member event.
         s.create_room(&create_ev, &[member_ev])
@@ -114,7 +116,7 @@ async fn restart_preserves_all_state() {
 
     // ---- Process 2: reopen and verify. ----
     settle_close_race().await;
-    let s = SqliteStore::open(path).await.expect("reopen");
+    let s = SqliteStore::open_in_dir(path).await.expect("reopen");
 
     // Watch must seed from MAX(stream_pos) — the durability contract
     // for cross-restart subscriber wake-up.
@@ -206,15 +208,15 @@ async fn restart_preserves_all_state() {
 /// seeding query — distinct from the post-write path covered above.
 #[tokio::test]
 async fn restart_empty_db_seeds_watch_at_zero() {
-    let file = NamedTempFile::new().expect("tempfile");
-    let path = file.path();
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path();
 
     {
-        let _ = SqliteStore::open(path).await.expect("first open");
+        let _ = SqliteStore::open_in_dir(path).await.expect("first open");
     }
 
     settle_close_race().await;
-    let s = SqliteStore::open(path).await.expect("reopen");
+    let s = SqliteStore::open_in_dir(path).await.expect("reopen");
     assert_eq!(
         *s.subscribe().borrow(),
         StreamPos(0),

@@ -85,7 +85,7 @@ pub(crate) fn apply_connection_pragmas(conn: &Connection, query_only: bool) -> R
 mod tests {
     use deadpool_sqlite::rusqlite::Connection;
     use neutrino_store::StorageError;
-    use tempfile::NamedTempFile;
+    use tempfile::TempDir;
 
     use crate::SqliteStore;
 
@@ -105,8 +105,11 @@ mod tests {
     /// hang on the two schema tests.
     #[tokio::test]
     async fn ensure_schema_refuses_unknown_user_version() {
-        let file = NamedTempFile::new().expect("tempfile");
-        let path = file.path().to_path_buf();
+        // TempDir (not NamedTempFile): these tests raw-open the DB file to
+        // poke `user_version`, and TempDir's recursive drop also reaps the
+        // WAL `-wal`/`-shm` sidecars a NamedTempFile would orphan.
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("schema_test.db");
 
         // First open installs the schema, leaving user_version = 1.
         {
@@ -141,8 +144,11 @@ mod tests {
     /// short-circuiting on the `1 => Ok(())` arm with a partial schema.
     #[tokio::test]
     async fn ensure_schema_rolls_back_on_mid_bundle_failure() {
-        let file = NamedTempFile::new().expect("tempfile");
-        let path = file.path().to_path_buf();
+        // TempDir (not NamedTempFile): these tests raw-open the DB file to
+        // poke `user_version`, and TempDir's recursive drop also reaps the
+        // WAL `-wal`/`-shm` sidecars a NamedTempFile would orphan.
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("schema_test.db");
 
         // Pre-existing colliding `rooms` table. `CREATE TABLE rooms (…)`
         // in the bundle will fail with "table rooms already exists",
