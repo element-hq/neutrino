@@ -12,6 +12,7 @@
 #   join   <roomId> [residentHs]          -> join (residentHs hints a federated join)
 #   msg    <roomId> <text...>
 #   name   <roomId> <new name...>         -> set m.room.name
+#   power  <roomId> <user> <level>        -> set a user's power level (merges m.room.power_levels)
 #   invite <roomId> <user>                -> user = hsN (=> @alice:hsN) or a full @mxid
 #   kick   <roomId> <user> [reason...]
 #   ban    <roomId> <user> [reason...]
@@ -73,6 +74,10 @@ txn() { printf '%s-%s%s' "$(date +%s)" "$RANDOM" "$RANDOM"; }
 req() {
   local hs=$1 method=$2 path=$3 body=${4:-} url
   url="$(base "$hs")/$path"
+  # Echo the request line to stderr so a caller (or a human watching) can see
+  # which endpoint is being hit — including repeated polls. stderr, so it never
+  # contaminates the JSON body on stdout that callers parse.
+  echo "  » $method $url" >&2
   local raw code out
   if [[ -n $body ]]; then
     raw=$(curl -sS -w '\n%{http_code}' -X "$method" "$url" \
@@ -184,6 +189,20 @@ cmd_server() {
       need_jq
       local body; body=$(jq -n --arg n "$*" '{name:$n}')
       req "$hs" PUT "$CS/rooms/$room/state/m.room.name" "$body"
+      ;;
+    power)
+      local room=${1:-} user=${2:-} level=${3:-}
+      [[ -n $room && -n $user && -n $level ]] || die "power: need <roomId> <user> <level>"
+      need_jq
+      local target; target=$(mxid "$user")
+      # PUT replaces the whole power_levels content, so merge into the current
+      # one rather than send a bare {users:{…}} (which would drop every other
+      # field). GET /state/{type} returns the content directly.
+      local current
+      current=$(req "$hs" GET "$CS/rooms/$room/state/m.room.power_levels")
+      local body
+      body=$(printf '%s' "$current" | jq --arg u "$target" --argjson l "$level" '.users[$u] = $l')
+      req "$hs" PUT "$CS/rooms/$room/state/m.room.power_levels" "$body"
       ;;
     invite | kick | ban)
       local room=${1:-} user=${2:-}; shift 2 || true

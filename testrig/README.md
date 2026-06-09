@@ -84,6 +84,7 @@ ROOM='!...'                                # paste the id
 | `nctl <hs> join <roomId> [residentHs]` | join (a `residentHs` hint forces a federated join) |
 | `nctl <hs> msg <roomId> <text>` | send an `m.room.message` |
 | `nctl <hs> name <roomId> <name>` | set `m.room.name` |
+| `nctl <hs> power <roomId> <user> <level>` | set a user's power level (merges `m.room.power_levels`) |
 | `nctl <hs> invite\|kick\|ban <roomId> <user> [reason]` | membership change (`user` = `hsN` or full `@mxid`) |
 | `nctl <hs> leave <roomId>` | leave |
 | `nctl <hs> state <roomId>` | current room state |
