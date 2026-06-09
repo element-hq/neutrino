@@ -90,6 +90,17 @@ impl Config {
     }
 }
 
+/// Out-of-band control commands the embedding host (Android, over FFI) pushes
+/// into a running server. Fire-and-forget: senders never block and never
+/// receive a reply. The UniFFI-facing mirror and the conversion into this type
+/// live in `neutrino-ffi`, keeping UniFFI out of the common crates — the same
+/// split used for [`Config`] / `NeutrinoConfig`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    /// Gracefully stop the server and tear down the embedded runtime.
+    Shutdown,
+}
+
 /// Resolve the storage directory: the env value if present, else the
 /// [`DEFAULT_STORAGE_DIR`] (`./data`, resolved lazily at open time so this
 /// stays infallible).
