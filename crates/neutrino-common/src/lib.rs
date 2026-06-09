@@ -74,6 +74,14 @@ impl Config {
     pub fn user_id(&self) -> String {
         format!("@{}:{}", self.localpart, self.server_name)
     }
+
+    /// Floor an outbound-concurrency value to 1 — zero is meaningless for the
+    /// sender semaphore. The single home of that invariant: both `from_env`
+    /// and the FFI `From<NeutrinoConfig>` route their input through here so
+    /// the floor can't drift between entry points.
+    pub fn clamp_outbound_concurrency(n: usize) -> usize {
+        n.max(1)
+    }
 }
 
 /// Resolve the storage directory: the env value if present, else the current
@@ -84,10 +92,10 @@ fn storage_dir_from(raw: Option<&str>) -> PathBuf {
 }
 
 /// Parse + clamp the outbound-concurrency env value: a valid `usize ≥ 1`, else
-/// the default. Zero is meaningless for a semaphore, so it floors to 1.
+/// the default. The floor lives in [`Config::clamp_outbound_concurrency`].
 fn parse_outbound_concurrency(raw: Option<&str>) -> usize {
     raw.and_then(|s| s.parse::<usize>().ok())
-        .map(|n| n.max(1))
+        .map(Config::clamp_outbound_concurrency)
         .unwrap_or(DEFAULT_OUTBOUND_CONCURRENCY)
 }
 

@@ -25,9 +25,10 @@ impl From<NeutrinoConfig> for neutrino_main::Config {
             bind_addr: c.bind_addr,
             localpart: c.localpart,
             storage_dir: std::path::PathBuf::from(c.storage_dir),
-            // Zero is meaningless for the sender semaphore; clamp to 1, matching
-            // `Config::from_env`'s outbound-concurrency floor.
-            outbound_concurrency: (c.outbound_concurrency.max(1)) as usize,
+            // Floor-to-1 invariant lives on `Config`, shared with `from_env`.
+            outbound_concurrency: neutrino_main::Config::clamp_outbound_concurrency(
+                c.outbound_concurrency as usize,
+            ),
         }
     }
 }
