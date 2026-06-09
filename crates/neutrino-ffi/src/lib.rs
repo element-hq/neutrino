@@ -33,6 +33,23 @@ impl From<NeutrinoConfig> for neutrino_main::Config {
     }
 }
 
+/// FFI-facing control command. Mirrors `neutrino_common::Command` (re-exported
+/// as `neutrino_main::Command`) so EX Android can drive the embedded server.
+/// Kept here, not on the common `Command`, so UniFFI stays out of the common
+/// crates — the same split as `NeutrinoConfig` / `Config`.
+#[derive(uniffi::Enum)]
+pub enum Command {
+    Shutdown,
+}
+
+impl From<Command> for neutrino_main::Command {
+    fn from(c: Command) -> Self {
+        match c {
+            Command::Shutdown => neutrino_main::Command::Shutdown,
+        }
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct NeutrinoHandle {
     tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -91,6 +108,12 @@ mod tests {
         assert_eq!(cfg.localpart, "alice");
         assert_eq!(cfg.storage_dir, std::path::PathBuf::from("/data/neutrino"));
         assert_eq!(cfg.outbound_concurrency, 1);
+    }
+
+    #[test]
+    fn command_shutdown_maps_to_internal() {
+        let internal: neutrino_main::Command = Command::Shutdown.into();
+        assert_eq!(internal, neutrino_main::Command::Shutdown);
     }
 
     #[test]
