@@ -33,7 +33,7 @@ use neutrino_store_sqlite::SqliteStore;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, ServerName};
 use serde_json::value::RawValue as RawJsonValue;
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
+use tempfile::TempDir;
 use tower::ServiceExt;
 
 use crate::federation::client::FederationClientError;
@@ -154,6 +154,18 @@ fn config() -> Config {
     }
 }
 
+/// Build a router over a throwaway storage directory the test owns. The
+/// returned `TempDir` MUST be held for the lifetime of the router — dropping
+/// it deletes the database directory. Use this instead of `router(config())`
+/// so each test gets an isolated DB rather than sharing `./neutrino.db`.
+async fn test_router() -> (axum::Router, tempfile::TempDir) {
+    let tmp = tempfile::TempDir::new().expect("create storage tempdir");
+    let mut cfg = config();
+    cfg.storage_dir = tmp.path().to_path_buf();
+    let app = router(cfg).await.expect("router");
+    (app, tmp)
+}
+
 fn alice() -> OwnedUserId {
     "@alice:example.org".parse().unwrap()
 }
@@ -205,17 +217,19 @@ async fn drive(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, value)
 }
 
-/// Open a fresh sqlite store on a tempfile. Returns both so the caller
-/// can pass the store to `router_with_store` and keep the tempfile guard
-/// alive for the lifetime of the router.
-async fn fresh_store() -> (Arc<SqliteStore>, NamedTempFile) {
-    let tempfile = NamedTempFile::new().expect("tempfile");
+/// Open a fresh sqlite store in a throwaway directory. Returns both so the
+/// caller can pass the store to `router_with_store` and keep the `TempDir`
+/// guard alive for the lifetime of the router — dropping it removes the
+/// directory and the DB (plus its `-wal`/`-shm` sidecars), unlike a bare
+/// `NamedTempFile` which would orphan the sidecars.
+async fn fresh_store() -> (Arc<SqliteStore>, TempDir) {
+    let tempdir = TempDir::new().expect("tempdir");
     let store = Arc::new(
-        SqliteStore::open(tempfile.path())
+        SqliteStore::open_in_dir(tempdir.path())
             .await
             .expect("open sqlite"),
     );
-    (store, tempfile)
+    (store, tempdir)
 }
 
 /// Build a seeded room with a linear chain of `n` message events whose
@@ -230,7 +244,13 @@ async fn fresh_store() -> (Arc<SqliteStore>, NamedTempFile) {
 /// ```
 async fn build_seeded_router(
     n_messages: usize,
-) -> (axum::Router, OwnedRoomId, OwnedEventId, Vec<OwnedEventId>) {
+) -> (
+    axum::Router,
+    OwnedRoomId,
+    OwnedEventId,
+    Vec<OwnedEventId>,
+    TempDir,
+) {
     let (store, tempfile) = fresh_store().await;
     let sender = alice();
 
@@ -279,8 +299,8 @@ async fn build_seeded_router(
         prev = id;
     }
 
-    let router = router_with_store(config(), store, tempfile);
-    (router, room_id, create_id, ids)
+    let router = router_with_store(config(), store);
+    (router, room_id, create_id, ids, tempfile)
 }
 
 // --- bad request: empty latest_events -----------------------------------
@@ -291,7 +311,7 @@ async fn build_seeded_router(
 #[cfg(not(feature = "multi-user-shim"))]
 #[tokio::test]
 async fn bad_request_empty_latest_events_returns_400() {
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
     let (_, body) = post_json(&app, "/_matrix/client/v3/createRoom", &json!({})).await;
     let room_id = body.get("room_id").and_then(Value::as_str).unwrap();
 
@@ -320,7 +340,7 @@ async fn bad_request_empty_latest_events_returns_400() {
 #[cfg(not(feature = "multi-user-shim"))]
 #[tokio::test]
 async fn bad_request_non_json_body_returns_400() {
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
     let (_, body) = post_json(&app, "/_matrix/client/v3/createRoom", &json!({})).await;
     let room_id = body.get("room_id").and_then(Value::as_str).unwrap();
 
@@ -346,7 +366,7 @@ async fn bad_request_non_json_body_returns_400() {
 #[cfg(not(feature = "multi-user-shim"))]
 #[tokio::test]
 async fn bad_request_missing_required_field_returns_400() {
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
     let (_, body) = post_json(&app, "/_matrix/client/v3/createRoom", &json!({})).await;
     let room_id = body.get("room_id").and_then(Value::as_str).unwrap();
 
@@ -366,7 +386,7 @@ async fn bad_request_missing_required_field_returns_400() {
 
 #[tokio::test]
 async fn unknown_room_returns_404() {
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
 
     let (status, body) = post_json(
         &app,
@@ -396,7 +416,7 @@ async fn happy_path_returns_events_between_earliest_and_latest() {
     // implementation detail per `DagStore::missing_events` (trait doc in
     // neutrino-store/src/lib.rs), so we collect into a `BTreeSet` and
     // compare set-equality only.
-    let (app, room_id, create_id, msgs) = build_seeded_router(5).await;
+    let (app, room_id, create_id, msgs, _tempfile) = build_seeded_router(5).await;
 
     let (status, body) = post_json(
         &app,
@@ -436,7 +456,7 @@ async fn happy_path_returns_events_between_earliest_and_latest() {
 #[tokio::test]
 async fn respects_limit() {
     // Seed >20 events in a chain, ask for limit=50, receive at most 20.
-    let (app, room_id, _create_id, msgs) = build_seeded_router(25).await;
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(25).await;
 
     let (status, body) = post_json(
         &app,
@@ -462,7 +482,7 @@ async fn respects_limit() {
 
 #[tokio::test]
 async fn default_limit_is_10() {
-    let (app, room_id, _create_id, msgs) = build_seeded_router(15).await;
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(15).await;
 
     let (status, body) = post_json(
         &app,
@@ -490,7 +510,7 @@ async fn empty_earliest_walks_back_to_room_root() {
     // With no `earliest_events`, the walk continues all the way back.
     // Seed 3 messages; ask for everything up to msg[2]; expect msg[1],
     // msg[0], join, create — in particular the create event must appear.
-    let (app, room_id, create_id, msgs) = build_seeded_router(3).await;
+    let (app, room_id, create_id, msgs, _tempfile) = build_seeded_router(3).await;
 
     let (status, body) = post_json(
         &app,
@@ -526,7 +546,7 @@ async fn latest_event_not_in_room_returns_empty() {
     // Room exists; the requested `latest` ID isn't in it. Per the design
     // doc, this is a no-op walk: no events reachable, no error, just
     // empty.
-    let (app, room_id, _create_id, _msgs) = build_seeded_router(2).await;
+    let (app, room_id, _create_id, _msgs, _tempfile) = build_seeded_router(2).await;
 
     let (status, body) = post_json(
         &app,
@@ -555,7 +575,7 @@ async fn min_depth_field_ignored() {
     // the field — Neutrino doesn't store depth, so the filter is a no-op
     // (the field is parsed only to satisfy serde when the wire shape
     // includes it). Pins the spec divergence.
-    let (app, room_id, _create_id, msgs) = build_seeded_router(3).await;
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(3).await;
 
     let (_, baseline) = post_json(
         &app,
@@ -607,7 +627,7 @@ async fn malformed_room_id_returns_400_with_errcode() {
     // surface a JSON `M_INVALID_PARAM` body rather than axum's default
     // plain-text 400. Mirrors the `members` handler precedent in
     // `lib.rs`.
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
 
     let (status, body) = post_json(
         &app,
@@ -635,7 +655,7 @@ async fn wire_bytes_passthrough() {
     // v12 / MSC4242 wire bytes never carry `event_id` (it's derived from
     // the reference hash), so the field must be absent from every event
     // in the response. This pins federation = raw, CSAPI = enriched.
-    let (app, room_id, _create_id, msgs) = build_seeded_router(2).await;
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(2).await;
 
     let (status, body) = post_json(
         &app,
@@ -676,7 +696,7 @@ async fn events_returned_oldest_first() {
     // oldest-first — msg 0, msg 1, msg 2 (msg3 is the excluded boundary,
     // create/join carry no "msg N" body). Asserts a *sequence*, not a set,
     // so a regression to newest-first fails here.
-    let (app, room_id, _create_id, msgs) = build_seeded_router(4).await;
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(4).await;
 
     let (status, body) = post_json(
         &app,
@@ -714,7 +734,7 @@ async fn earliest_message_boundary_is_excluded() {
     // earliest boundary is a *message* event (detectable by body): with
     // latest=msg3, earliest=msg1, only msg2 is strictly between them.
     // msg1 (earliest) and everything below it must NOT appear.
-    let (app, room_id, _create_id, msgs) = build_seeded_router(4).await;
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(4).await;
 
     let (status, body) = post_json(
         &app,
@@ -751,7 +771,7 @@ async fn malformed_min_depth_returns_400() {
     // `min_depth` is parsed (then ignored). A non-integer value must still
     // 400 at serde — the whole reason the field is typed rather than
     // dropped. Pins the doc claim on `RequestBody._min_depth`.
-    let (app, room_id, _create_id, msgs) = build_seeded_router(2).await;
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(2).await;
 
     let (status, body) = post_json(
         &app,
@@ -778,7 +798,7 @@ async fn malformed_min_depth_returns_400() {
 async fn malformed_event_id_in_latest_returns_400() {
     // A `latest_events` entry that isn't a valid event ID fails
     // `OwnedEventId` deserialization → 400, before the store is touched.
-    let (app, room_id, _create_id, _msgs) = build_seeded_router(1).await;
+    let (app, room_id, _create_id, _msgs, _tempfile) = build_seeded_router(1).await;
 
     let (status, body) = post_json(
         &app,
@@ -805,7 +825,7 @@ async fn wrong_content_type_returns_400() {
     // A body sent with a non-JSON content-type is rejected by the `Json`
     // extractor; the handler maps that rejection to 400 M_INVALID_PARAM
     // rather than letting axum's default (415/422) through.
-    let (app, room_id, _create_id, msgs) = build_seeded_router(2).await;
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(2).await;
 
     let payload = serde_json::to_vec(&json!({
         "earliest_events": [],
@@ -829,7 +849,7 @@ async fn explicit_limit_zero_returns_empty() {
     // An explicit `limit: 0` is honored as 0 (matching Synapse's
     // `min(limit, 20)`); the handler returns 200 with an empty `events`
     // array rather than substituting the default of 10.
-    let (app, room_id, _create_id, msgs) = build_seeded_router(3).await;
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(3).await;
 
     let (status, body) = post_json(
         &app,
@@ -856,7 +876,7 @@ async fn explicit_limit_zero_returns_empty() {
 async fn missing_earliest_events_returns_400() {
     // `earliest_events` is Required per the spec; omitting it 400s at
     // deserialization rather than being silently treated as empty.
-    let (app, room_id, _create_id, msgs) = build_seeded_router(2).await;
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(2).await;
 
     let (status, body) = post_json(
         &app,
@@ -923,7 +943,7 @@ fn pdu_bodies(body: &Value) -> Vec<String> {
 // newest-first.
 #[tokio::test]
 async fn backfill_returns_chain_newest_first() {
-    let (app, room_id, _create_id, msgs) = build_seeded_router(3).await;
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(3).await;
 
     let (status, body) = get(
         &app,
@@ -946,7 +966,7 @@ async fn backfill_returns_chain_newest_first() {
 // msg2 with limit=2 yields exactly the seed and its immediate parent.
 #[tokio::test]
 async fn backfill_respects_limit() {
-    let (app, room_id, _create_id, msgs) = build_seeded_router(3).await;
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(3).await;
 
     let (status, body) = get(
         &app,
@@ -968,7 +988,7 @@ async fn backfill_respects_limit() {
 // Synapse backfill response shape.
 #[tokio::test]
 async fn backfill_response_has_transaction_envelope() {
-    let (app, room_id, _create_id, msgs) = build_seeded_router(1).await;
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(1).await;
 
     let (status, body) = get(
         &app,
@@ -996,7 +1016,7 @@ async fn backfill_response_has_transaction_envelope() {
 // exact bytes that produced the id, so no enrichment is applied.
 #[tokio::test]
 async fn backfill_ships_wire_bytes_without_event_id() {
-    let (app, room_id, _create_id, msgs) = build_seeded_router(2).await;
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(2).await;
 
     let (status, body) = get(
         &app,
@@ -1019,7 +1039,7 @@ async fn backfill_ships_wire_bytes_without_event_id() {
 // bare-text fallback.
 #[tokio::test]
 async fn backfill_unknown_room_returns_404() {
-    let (app, _room_id, _create_id, msgs) = build_seeded_router(1).await;
+    let (app, _room_id, _create_id, msgs, _tempfile) = build_seeded_router(1).await;
     let unknown = "!nope:example.org";
 
     let (status, body) = get(&app, &backfill_path(unknown, &[msgs[0].as_str()], Some(10))).await;
@@ -1037,7 +1057,7 @@ async fn backfill_unknown_room_returns_404() {
 // rejection on the sibling endpoint.
 #[tokio::test]
 async fn backfill_missing_v_returns_400() {
-    let (app, room_id, _create_id, _msgs) = build_seeded_router(1).await;
+    let (app, room_id, _create_id, _msgs, _tempfile) = build_seeded_router(1).await;
 
     let (status, body) = get(&app, &backfill_path(room_id.as_str(), &[], Some(10))).await;
 
@@ -1054,7 +1074,7 @@ async fn backfill_missing_v_returns_400() {
 // via `get_events` so an unknown seed yields an empty (200) backfill.
 #[tokio::test]
 async fn backfill_unknown_v_is_skipped_not_500() {
-    let (app, room_id, _create_id, _msgs) = build_seeded_router(1).await;
+    let (app, room_id, _create_id, _msgs, _tempfile) = build_seeded_router(1).await;
     // Syntactically valid v12 id (43 base64url chars) that isn't in the room.
     let ghost = "$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
@@ -1069,7 +1089,7 @@ async fn backfill_unknown_v_is_skipped_not_500() {
 // the decoder is lenient about already-decoded sigils as well as `%24`.
 #[tokio::test]
 async fn backfill_accepts_raw_dollar_sigil_in_query() {
-    let (app, room_id, _create_id, msgs) = build_seeded_router(1).await;
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(1).await;
     // Build the path with the sigil left raw.
     let path = format!(
         "/_matrix/federation/v1/backfill/{}?v={}&limit=10",
@@ -1092,7 +1112,7 @@ async fn backfill_accepts_raw_dollar_sigil_in_query() {
 // return a misleading 200 with no PDUs.
 #[tokio::test]
 async fn backfill_blank_v_returns_400() {
-    let (app, room_id, _create_id, _msgs) = build_seeded_router(1).await;
+    let (app, room_id, _create_id, _msgs, _tempfile) = build_seeded_router(1).await;
     let path = format!(
         "/_matrix/federation/v1/backfill/{}?v=&limit=10",
         room_id.as_str()
@@ -1113,7 +1133,7 @@ async fn backfill_blank_v_returns_400() {
 // a valid empty backfill. (A *missing* limit still defaults to 10.)
 #[tokio::test]
 async fn backfill_limit_zero_returns_400() {
-    let (app, room_id, _create_id, msgs) = build_seeded_router(1).await;
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(1).await;
 
     let (status, body) = get(
         &app,
@@ -1171,6 +1191,7 @@ async fn seed_joined_room() -> (
     OwnedRoomId,
     OwnedUserId,
     OwnedEventId,
+    TempDir,
 ) {
     // Default to a no-progress fetcher: the in-order tests never trigger
     // gap-fill, and the one that does (`…unfillable_missing_ancestry`) wants
@@ -1188,6 +1209,7 @@ async fn seed_joined_room_with_fetcher(
     OwnedRoomId,
     OwnedUserId,
     OwnedEventId,
+    TempDir,
 ) {
     let (store, tempfile) = fresh_store().await;
     let alice = alice();
@@ -1211,8 +1233,8 @@ async fn seed_joined_room_with_fetcher(
         .create_room(&create, &[join])
         .await
         .expect("create_room");
-    let router = router_with_store_and_fetcher(config(), store.clone(), tempfile, fetcher);
-    (router, store, room_id, alice, join_id)
+    let router = router_with_store_and_fetcher(config(), store.clone(), fetcher);
+    (router, store, room_id, alice, join_id, tempfile)
 }
 
 /// Build a message PDU sitting on `head` (both DAGs).
@@ -1335,7 +1357,7 @@ async fn wait_fetch_attempted(fetcher: &StubFetcher) {
 
 #[tokio::test]
 async fn send_accepts_pdu_and_persists() {
-    let (app, store, room_id, alice, join_id) = seed_joined_room().await;
+    let (app, store, room_id, alice, join_id, _tempfile) = seed_joined_room().await;
     let msg = message_on(
         &alice,
         &room_id,
@@ -1364,7 +1386,7 @@ async fn send_persists_rejected_pdu_as_success_result() {
     // bob — never invited — sends a join PDU into alice's invite-only room.
     // Federation policy: the reject is *persisted*, and from the transaction's
     // point of view the PDU was processed → empty (error-free) result.
-    let (app, store, room_id, _alice, join_id) = seed_joined_room().await;
+    let (app, store, room_id, _alice, join_id, _tempfile) = seed_joined_room().await;
     let bob: OwnedUserId = "@bob:remote.example.org".parse().unwrap();
     let bob_join = EventBuilder::new(bob.clone(), "m.room.member".to_owned())
         .room_id(room_id.clone())
@@ -1404,7 +1426,7 @@ async fn send_unfillable_ancestry_stays_unapplied() {
     // (staged); the worker tries the gap-fill, fails, backs off, and the PDU is
     // never committed (left durably staged for a later retry/restart).
     let fetcher = StubFetcher::no_progress();
-    let (app, store, room_id, alice, join_id) =
+    let (app, store, room_id, alice, join_id, _tempfile) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
     // An orphan ancestor that is never persisted nor included in the txn.
     let orphan = message_on(&alice, &room_id, &join_id, "orphan", 1_700_000_002_000);
@@ -1445,7 +1467,7 @@ async fn send_gapfills_missing_ancestry_then_accepts() {
     // it is staged → promoted (authed) → and the child is then accepted. Both
     // events end up committed.
     let fetcher = StubFetcher::no_progress();
-    let (app, store, room_id, alice, join_id) =
+    let (app, store, room_id, alice, join_id, _tempfile) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
     // The missing ancestor must be a *state* event (it lives in the state DAG
     // the child references via `prev_state_events`); a non-state parent would
@@ -1514,7 +1536,7 @@ async fn send_gapfill_fetch_targets_frontier_and_state_boundary() {
     // the first round uses the initial limit. A no-progress fetcher records one
     // call; the resulting unfillable error is irrelevant here.
     let fetcher = StubFetcher::no_progress();
-    let (app, _store, room_id, alice, join_id) =
+    let (app, _store, room_id, alice, join_id, _tempfile) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
     let orphan = topic_on(&alice, &room_id, &join_id, "x", 1_700_000_002_000);
     let child = message_on(
@@ -1553,7 +1575,7 @@ async fn send_gapfills_over_multiple_rounds() {
     // Round 1 fetches A, round 2 fetches B; the loop must double the limit and
     // carry the staged frontier in `latest` so it doesn't re-request A.
     let fetcher = StubFetcher::no_progress();
-    let (app, store, room_id, alice, join_id) =
+    let (app, store, room_id, alice, join_id, _tempfile) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
     let b = topic_on(&alice, &room_id, &join_id, "b", 1_700_000_002_000);
     let a = topic_on(&alice, &room_id, &b.event_id, "a", 1_700_000_003_000);
@@ -1599,7 +1621,7 @@ async fn send_resend_after_gapfill_is_idempotent() {
     // event) is a clean no-op via the fast-path persisted-check — no error, and
     // no second peer fetch.
     let fetcher = StubFetcher::no_progress();
-    let (app, store, room_id, alice, join_id) =
+    let (app, store, room_id, alice, join_id, _tempfile) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
     let orphan = topic_on(&alice, &room_id, &join_id, "x", 1_700_000_002_000);
     let child = message_on(
@@ -1651,7 +1673,7 @@ async fn send_fetcher_failure_leaves_pdu_unapplied() {
     // the staged PDU is never committed (it backs off and waits for a retry /
     // restart). `/send` itself still 200s — the failure is off the request path.
     let fetcher = StubFetcher::erroring(502);
-    let (app, store, room_id, alice, join_id) =
+    let (app, store, room_id, alice, join_id, _tempfile) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
     let orphan = message_on(&alice, &room_id, &join_id, "orphan", 1_700_000_002_000);
     let child = message_on(
@@ -1688,7 +1710,7 @@ async fn send_toposorts_out_of_order_batch() {
     // Two new message events arrive in the same transaction, child *before*
     // parent in the array. The handler must toposort so the parent applies
     // first; both end up accepted.
-    let (app, store, room_id, alice, join_id) = seed_joined_room().await;
+    let (app, store, room_id, alice, join_id, _tempfile) = seed_joined_room().await;
     let first = message_on(&alice, &room_id, &join_id, "first", 1_700_000_001_000);
     // `second` chains the timeline off `first` but its state head stays the
     // join (messages don't move the state DAG), so `prev_state_events` points
@@ -1737,7 +1759,7 @@ async fn send_handles_duplicate_pdu_in_batch() {
     // references it. Before the dedup fix this underflowed `toposort`'s
     // indegree bookkeeping (panic in debug). Now the duplicate is dropped and
     // both distinct events are accepted.
-    let (store, tempfile) = fresh_store().await;
+    let (store, _tempfile) = fresh_store().await;
     let alice = alice();
     let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
         .state_key(String::new())
@@ -1747,7 +1769,7 @@ async fn send_handles_duplicate_pdu_in_batch() {
     let room_id = create.room_id.clone();
     let create_id = create.event_id.clone();
     store.create_room(&create, &[]).await.expect("create_room");
-    let app = router_with_store(config(), store.clone(), tempfile);
+    let app = router_with_store(config(), store.clone());
 
     let join = EventBuilder::new(alice.clone(), "m.room.member".to_owned())
         .room_id(room_id.clone())
@@ -1784,7 +1806,7 @@ async fn send_handles_duplicate_pdu_in_batch() {
 
 #[tokio::test]
 async fn send_is_idempotent_on_duplicate_txn_id() {
-    let (app, store, room_id, alice, join_id) = seed_joined_room().await;
+    let (app, store, room_id, alice, join_id, _tempfile) = seed_joined_room().await;
     let msg = message_on(&alice, &room_id, &join_id, "once", 1_700_000_001_000);
     let msg_id = msg.event_id.clone();
 
@@ -1809,7 +1831,7 @@ async fn send_is_idempotent_on_duplicate_txn_id() {
 async fn send_ignores_edus() {
     // A transaction carrying EDUs is accepted; the EDUs are dropped and the
     // PDU is still staged + processed.
-    let (app, store, room_id, alice, join_id) = seed_joined_room().await;
+    let (app, store, room_id, alice, join_id, _tempfile) = seed_joined_room().await;
     let msg = message_on(&alice, &room_id, &join_id, "with edus", 1_700_000_001_000);
     let msg_id = msg.event_id.clone();
     let mut body = txn(&[&msg]);
@@ -1829,7 +1851,7 @@ async fn send_ignores_edus() {
 
 #[tokio::test]
 async fn send_rejects_oversized_transaction() {
-    let (app, _store, room_id, alice, join_id) = seed_joined_room().await;
+    let (app, _store, room_id, alice, join_id, _tempfile) = seed_joined_room().await;
     // 51 PDUs > the 50 spec maximum.
     let events: Vec<neutrino_common::Event> = (0..51)
         .map(|i| message_on(&alice, &room_id, &join_id, "x", 1_700_000_001_000 + i))
@@ -1848,7 +1870,7 @@ async fn send_rejects_oversized_transaction() {
 
 #[tokio::test]
 async fn send_empty_transaction_is_ok() {
-    let (app, _store, _room_id, _alice, _join_id) = seed_joined_room().await;
+    let (app, _store, _room_id, _alice, _join_id, _tempfile) = seed_joined_room().await;
     let (status, body) = put_json(
         &app,
         &send_path("txn1"),
@@ -1861,7 +1883,7 @@ async fn send_empty_transaction_is_ok() {
 
 #[tokio::test]
 async fn send_malformed_body_returns_400() {
-    let (app, _store, _room_id, _alice, _join_id) = seed_joined_room().await;
+    let (app, _store, _room_id, _alice, _join_id, _tempfile) = seed_joined_room().await;
     let req = Request::builder()
         .method("PUT")
         .uri(send_path("txn1"))
@@ -1878,7 +1900,7 @@ async fn worker_drains_rows_staged_before_startup() {
     // simulating a crash after staging but before processing) are drained when
     // the worker starts — its startup enumeration of `staged_rooms()` picks the
     // room up with no poke from the handler.
-    let (store, tempfile) = fresh_store().await;
+    let (store, _tempfile) = fresh_store().await;
     let alice = alice();
     let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
         .state_key(String::new())
@@ -1920,12 +1942,7 @@ async fn worker_drains_rows_staged_before_startup() {
 
     // Mounting the router spawns the worker, which enumerates the staged room
     // on startup and drains it — no `/send` request involved.
-    let _app = router_with_store_and_fetcher(
-        config(),
-        store.clone(),
-        tempfile,
-        StubFetcher::no_progress(),
-    );
+    let _app = router_with_store_and_fetcher(config(), store.clone(), StubFetcher::no_progress());
     wait_committed(&store, msg_id.as_ref()).await;
     wait_timeline_head(&store, &room_id, msg_id.as_ref()).await;
 }
@@ -1936,7 +1953,7 @@ async fn worker_wedged_pdu_does_not_block_sibling() {
     // directly-appliable PDU in the same room must still be processed. Proves a
     // backing-off event is skipped, not head-of-line blocking.
     let fetcher = StubFetcher::no_progress();
-    let (app, store, room_id, alice, join_id) =
+    let (app, store, room_id, alice, join_id, _tempfile) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
 
     // Wedged: references an orphan we never hold and the peer never supplies.
@@ -1991,7 +2008,7 @@ async fn send_drops_pdu_for_unknown_room() {
     // rather than retried forever — otherwise a peer could accumulate
     // un-drainable staged rows + a permanent per-room task by naming nonexistent
     // rooms. `/send` still 200s (the drop is async, off the request path).
-    let (app, store, _room_id, alice, _join_id) = seed_joined_room().await;
+    let (app, store, _room_id, alice, _join_id, _tempfile) = seed_joined_room().await;
 
     // A standalone room id we never register, plus a message that references it.
     let other_create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
@@ -2043,7 +2060,13 @@ const YAN: &str = "@yan:other.example";
 /// reference.
 async fn seed_room(
     initial: &[(&str, &str, &str, Value)],
-) -> (axum::Router, Arc<SqliteStore>, OwnedRoomId, OwnedEventId) {
+) -> (
+    axum::Router,
+    Arc<SqliteStore>,
+    OwnedRoomId,
+    OwnedEventId,
+    TempDir,
+) {
     let (store, tempfile) = fresh_store().await;
     let creator = alice();
     let create = EventBuilder::new(creator, "m.room.create".to_owned())
@@ -2071,12 +2094,18 @@ async fn seed_room(
         .create_room(&create, &events)
         .await
         .expect("create_room");
-    let router = router_with_store(config(), store.clone(), tempfile);
-    (router, store, room_id, head)
+    let router = router_with_store(config(), store.clone());
+    (router, store, room_id, head, tempfile)
 }
 
 /// A public room: alice joins, then opens it to `public`.
-async fn seed_public_room() -> (axum::Router, Arc<SqliteStore>, OwnedRoomId, OwnedEventId) {
+async fn seed_public_room() -> (
+    axum::Router,
+    Arc<SqliteStore>,
+    OwnedRoomId,
+    OwnedEventId,
+    TempDir,
+) {
     seed_room(&[
         (
             ALICE,
@@ -2131,7 +2160,7 @@ async fn put_event(app: &axum::Router, path: &str, raw: &str) -> (StatusCode, Va
 
 #[tokio::test]
 async fn make_join_returns_template_without_auth_events() {
-    let (router, _store, room_id, head) = seed_public_room().await;
+    let (router, _store, room_id, head, _tempfile) = seed_public_room().await;
 
     let (status, body) = get(&router, &make_join_path(&room_id, ZARA)).await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
@@ -2159,7 +2188,7 @@ async fn make_join_returns_template_without_auth_events() {
 
 #[tokio::test]
 async fn make_join_unknown_room_returns_404() {
-    let (router, _store, _room_id, _head) = seed_public_room().await;
+    let (router, _store, _room_id, _head, _tempfile) = seed_public_room().await;
     let unknown = ruma::RoomId::parse("!nope:example.org").unwrap();
     let (status, body) = get(&router, &make_join_path(&unknown, ZARA)).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body:?}");
@@ -2168,7 +2197,7 @@ async fn make_join_unknown_room_returns_404() {
 
 #[tokio::test]
 async fn make_join_incompatible_version_returns_400() {
-    let (router, _store, room_id, _head) = seed_public_room().await;
+    let (router, _store, room_id, _head, _tempfile) = seed_public_room().await;
     // No `ver` matching ours (request an old version).
     let path = format!("/_matrix/federation/v1/make_join/{room_id}/{ZARA}?ver=1");
     let (status, body) = get(&router, &path).await;
@@ -2180,7 +2209,7 @@ async fn make_join_incompatible_version_returns_400() {
 #[tokio::test]
 async fn make_join_invite_only_uninvited_returns_403() {
     // Default join rule is invite-only; zara was never invited.
-    let (router, _store, room_id, _head) = seed_room(&[(
+    let (router, _store, room_id, _head, _tempfile) = seed_room(&[(
         ALICE,
         "m.room.member",
         ALICE,
@@ -2195,7 +2224,7 @@ async fn make_join_invite_only_uninvited_returns_403() {
 #[tokio::test]
 async fn make_join_banned_user_returns_403() {
     // Public room, but zara is banned.
-    let (router, _store, room_id, _head) = seed_room(&[
+    let (router, _store, room_id, _head, _tempfile) = seed_room(&[
         (
             ALICE,
             "m.room.member",
@@ -2220,7 +2249,7 @@ async fn make_join_banned_user_returns_403() {
 
 #[tokio::test]
 async fn send_join_admits_remote_user_and_returns_state_dag() {
-    let (router, store, room_id, head) = seed_public_room().await;
+    let (router, store, room_id, head, _tempfile) = seed_public_room().await;
     let join = remote_join(&room_id, &head, ZARA);
     let join_id = join.event_id.clone();
 
@@ -2273,7 +2302,7 @@ async fn send_join_distributes_to_other_room_servers_not_the_joiner() {
     // Room already has a remote member on other.example. zara (remote.example)
     // joins → we must fan the join out to other.example, but NOT back to the
     // joiner's own server, nor to ourselves.
-    let (router, store, room_id, head) = seed_room(&[
+    let (router, store, room_id, head, _tempfile) = seed_room(&[
         (
             ALICE,
             "m.room.member",
@@ -2330,7 +2359,7 @@ async fn send_join_rejected_join_returns_403() {
     // non-empty if it happened), zara not invited → apply rejects → 403, not
     // persisted, and crucially NOT fanned out (the reject path returns before
     // persist_resolved_event).
-    let (router, store, room_id, head) = seed_room(&[
+    let (router, store, room_id, head, _tempfile) = seed_room(&[
         (
             ALICE,
             "m.room.member",
@@ -2366,7 +2395,7 @@ async fn send_join_rejected_join_returns_403() {
 
 #[tokio::test]
 async fn send_join_event_id_path_mismatch_returns_400() {
-    let (router, _store, room_id, head) = seed_public_room().await;
+    let (router, _store, room_id, head, _tempfile) = seed_public_room().await;
     let join = remote_join(&room_id, &head, ZARA);
     // Path id is a *real, valid, different* event id (the room's state head), so
     // the 400 can only come from the body-vs-path comparison, not a malformed id.
@@ -2380,7 +2409,7 @@ async fn send_join_is_idempotent_on_resend() {
     // Use a room with a second server so the join genuinely fans out — that lets
     // us assert the *re-send* is a true no-op: no duplicate state row, and no
     // second outbox enqueue (the `effects.is_empty()` guard short-circuits).
-    let (router, store, room_id, head) = seed_room(&[
+    let (router, store, room_id, head, _tempfile) = seed_room(&[
         (
             ALICE,
             "m.room.member",
@@ -2437,7 +2466,7 @@ async fn send_join_is_idempotent_on_resend() {
 async fn make_join_then_send_join_round_trips() {
     // Drive the full handshake: take our make_join template, complete it the
     // way a joining server would, and send_join it back.
-    let (router, store, room_id, _head) = seed_public_room().await;
+    let (router, store, room_id, _head, _tempfile) = seed_public_room().await;
 
     let (status, body) = get(&router, &make_join_path(&room_id, ZARA)).await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
@@ -2514,12 +2543,12 @@ fn membership_str(ev: &neutrino_common::Event) -> Option<String> {
 #[tokio::test]
 async fn outbound_federated_join_ingests_remote_room() {
     // Resident B hosts a public room.
-    let (b_router, _b_store, room_id, _head) = seed_public_room().await;
+    let (b_router, _b_store, room_id, _head, _tempfile) = seed_public_room().await;
     let b_server = crate::federation::test_support::spawn_stub(b_router).await;
 
     // Joining server A (a.example, user @bob:a.example) starts empty.
-    let (a_store, a_temp) = fresh_store().await;
-    let a_router = router_with_store(config_for("a.example", "bob"), a_store.clone(), a_temp);
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_router = router_with_store(config_for("a.example", "bob"), a_store.clone());
 
     let path = format!("/_matrix/client/v3/join/{room_id}?server_name={b_server}");
     let (status, body) = post_json(&a_router, &path, &json!({})).await;
@@ -2548,12 +2577,12 @@ async fn outbound_federated_join_ingests_remote_room() {
 async fn outbound_join_falls_back_to_next_candidate() {
     // First candidate is a dead port; the join must fall back to the live
     // resident B and still succeed.
-    let (b_router, _b_store, room_id, _head) = seed_public_room().await;
+    let (b_router, _b_store, room_id, _head, _tempfile) = seed_public_room().await;
     let b_server = crate::federation::test_support::spawn_stub(b_router).await;
     let dead = crate::federation::test_support::dead_peer().await;
 
-    let (a_store, a_temp) = fresh_store().await;
-    let a_router = router_with_store(config_for("a.example", "bob"), a_store.clone(), a_temp);
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_router = router_with_store(config_for("a.example", "bob"), a_store.clone());
 
     let path =
         format!("/_matrix/client/v3/join/{room_id}?server_name={dead}&server_name={b_server}");
@@ -2574,8 +2603,8 @@ async fn outbound_join_falls_back_to_next_candidate() {
 async fn outbound_join_all_candidates_dead_returns_502() {
     let dead1 = crate::federation::test_support::dead_peer().await;
     let dead2 = crate::federation::test_support::dead_peer().await;
-    let (a_store, a_temp) = fresh_store().await;
-    let a_router = router_with_store(config_for("a.example", "bob"), a_store, a_temp);
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_router = router_with_store(config_for("a.example", "bob"), a_store);
     // A syntactically valid room id we don't host.
     let room = "!unknown:b.example";
     let path = format!("/_matrix/client/v3/join/{room}?server_name={dead1}&server_name={dead2}");
@@ -2608,7 +2637,7 @@ fn raw_to_value(ev: &neutrino_common::Event) -> Value {
 #[tokio::test]
 async fn make_join_invited_user_is_allowed() {
     // Invite-only room (default rule), zara HAS a pending invite → make_join 200.
-    let (router, _store, room_id, _head) = seed_room(&[
+    let (router, _store, room_id, _head, _tempfile) = seed_room(&[
         (
             ALICE,
             "m.room.member",
@@ -2631,7 +2660,7 @@ async fn make_join_invited_user_is_allowed() {
 #[tokio::test]
 async fn make_join_is_read_only() {
     // make_join must not persist anything: heads unchanged, no member row created.
-    let (router, store, room_id, head) = seed_public_room().await;
+    let (router, store, room_id, head, _tempfile) = seed_public_room().await;
     let before = store.forward_extremities(&room_id).await.unwrap();
 
     let (status, _body) = get(&router, &make_join_path(&room_id, ZARA)).await;
@@ -2659,7 +2688,7 @@ async fn make_join_is_read_only() {
 
 #[tokio::test]
 async fn make_join_with_our_version_among_several_succeeds() {
-    let (router, _store, room_id, _head) = seed_public_room().await;
+    let (router, _store, room_id, _head, _tempfile) = seed_public_room().await;
     let path = format!(
         "/_matrix/federation/v1/make_join/{room_id}/{ZARA}?ver=1&ver={ROOM_VERSION_ID}&ver=11"
     );
@@ -2669,7 +2698,7 @@ async fn make_join_with_our_version_among_several_succeeds() {
 
 #[tokio::test]
 async fn send_join_non_join_membership_returns_400() {
-    let (router, _store, room_id, head) = seed_public_room().await;
+    let (router, _store, room_id, head, _tempfile) = seed_public_room().await;
     let zara: OwnedUserId = ZARA.parse().unwrap();
     let leave = EventBuilder::new(zara.clone(), "m.room.member".to_owned())
         .room_id(room_id.clone())
@@ -2691,7 +2720,7 @@ async fn send_join_non_join_membership_returns_400() {
 
 #[tokio::test]
 async fn send_join_state_key_not_sender_returns_400() {
-    let (router, _store, room_id, head) = seed_public_room().await;
+    let (router, _store, room_id, head, _tempfile) = seed_public_room().await;
     let zara: OwnedUserId = ZARA.parse().unwrap();
     // sender = zara, but state_key = a different user.
     let bad = EventBuilder::new(zara, "m.room.member".to_owned())
@@ -2714,7 +2743,7 @@ async fn send_join_state_key_not_sender_returns_400() {
 
 #[tokio::test]
 async fn send_join_room_id_path_mismatch_returns_400() {
-    let (router, _store, room_id, head) = seed_public_room().await;
+    let (router, _store, room_id, head, _tempfile) = seed_public_room().await;
     let join = remote_join(&room_id, &head, ZARA);
     // Correct event_id in the path, but a different room id.
     let other_room = ruma::RoomId::parse("!other:example.org").unwrap();
@@ -2802,9 +2831,8 @@ async fn federated_join_times_out_when_state_never_grounds() {
     });
     let b = crate::federation::test_support::spawn_stub(stub_resident(mj, sj)).await;
 
-    let (a_store, a_temp) = fresh_store().await;
-    let a_state =
-        crate::AppState::from_store(config_for("a.example", "bob"), a_store.clone(), a_temp);
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_state = crate::AppState::from_store(config_for("a.example", "bob"), a_store.clone());
     let resp = crate::federation::join::federated_join_with(
         &a_state,
         zara.clone(),
@@ -2850,9 +2878,8 @@ async fn federated_join_missing_create_in_response_fails_without_registering() {
     let sj = json!({ "state_dag": [], "timeline": [], "event": raw_to_value(&template) });
     let b = crate::federation::test_support::spawn_stub(stub_resident(mj, sj)).await;
 
-    let (a_store, a_temp) = fresh_store().await;
-    let a_state =
-        crate::AppState::from_store(config_for("a.example", "bob"), a_store.clone(), a_temp);
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_state = crate::AppState::from_store(config_for("a.example", "bob"), a_store.clone());
     let resp = crate::federation::join::federated_join_with(
         &a_state,
         zara,
@@ -2918,8 +2945,8 @@ fn member_pdu(
 /// handler echoes the event back. Its `unsigned.invite_room_state` survives.
 #[tokio::test]
 async fn invite_oob_stores_stub_and_returns_event() {
-    let (store, tempfile) = fresh_store().await;
-    let router = router_with_store(config(), store.clone(), tempfile);
+    let (store, _tempfile) = fresh_store().await;
+    let router = router_with_store(config(), store.clone());
     let bob = inviter();
     let invited = alice(); // local to example.org
 
@@ -2984,7 +3011,7 @@ async fn invite_oob_stores_stub_and_returns_event() {
 #[tokio::test]
 async fn invite_for_hosted_room_applies_via_worker_not_oob_stub() {
     // We host the room; alice is the joined creator (power to invite).
-    let (app, store, room_id, alice, join_id) = seed_joined_room().await;
+    let (app, store, room_id, alice, join_id, _tempfile) = seed_joined_room().await;
     let carol: OwnedUserId = "@carol:example.org".parse().unwrap();
     // The invite arrives over federation but is authored by our own joined
     // creator (so apply_pdu accepts it against our state) and sits on the head.
@@ -3028,8 +3055,8 @@ async fn invite_for_hosted_room_applies_via_worker_not_oob_stub() {
 /// server's user is rejected (we have no business storing it).
 #[tokio::test]
 async fn invite_rejects_non_local_invitee() {
-    let (store, tempfile) = fresh_store().await;
-    let router = router_with_store(config(), store.clone(), tempfile);
+    let (store, _tempfile) = fresh_store().await;
+    let router = router_with_store(config(), store.clone());
     let bob = inviter();
     let create = EventBuilder::new(bob.clone(), "m.room.create".to_owned())
         .state_key(String::new())
@@ -3074,8 +3101,8 @@ async fn invite_rejects_non_local_invitee() {
 /// A non-invite membership on the invite endpoint is a 400.
 #[tokio::test]
 async fn invite_rejects_non_invite_membership() {
-    let (store, tempfile) = fresh_store().await;
-    let router = router_with_store(config(), store, tempfile);
+    let (store, _tempfile) = fresh_store().await;
+    let router = router_with_store(config(), store);
     let bob = inviter();
     let create = EventBuilder::new(bob.clone(), "m.room.create".to_owned())
         .state_key(String::new())
@@ -3108,8 +3135,8 @@ async fn invite_rejects_non_invite_membership() {
 /// The `eventId` path segment must match the event's computed reference hash.
 #[tokio::test]
 async fn invite_rejects_event_id_path_mismatch() {
-    let (store, tempfile) = fresh_store().await;
-    let router = router_with_store(config(), store, tempfile);
+    let (store, _tempfile) = fresh_store().await;
+    let router = router_with_store(config(), store);
     let bob = inviter();
     let create = EventBuilder::new(bob.clone(), "m.room.create".to_owned())
         .state_key(String::new())
@@ -3142,16 +3169,17 @@ async fn invite_rejects_event_id_path_mismatch() {
 
 /// Bind a real neutrino router on an ephemeral port whose `server_name` IS that
 /// address, so a user `@local:{addr}` is local to it (its inbound `/invite/v2`
-/// accepts the invitee). Returns the server name + the served store.
-async fn serve_invitee_server(localpart: &str) -> (String, Arc<SqliteStore>) {
+/// accepts the invitee). Returns the server name, the served store, and the
+/// tempfile guard (held by the caller so the backing DB outlives the server).
+async fn serve_invitee_server(localpart: &str) -> (String, Arc<SqliteStore>, TempDir) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
     let (store, tempfile) = fresh_store().await;
-    let router = router_with_store(config_for(&name, localpart), store.clone(), tempfile);
+    let router = router_with_store(config_for(&name, localpart), store.clone());
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    (name, store)
+    (name, store, tempfile)
 }
 
 /// CSAPI `/invite` of a remote user federates the invite to the invitee's
@@ -3161,9 +3189,9 @@ async fn serve_invitee_server(localpart: &str) -> (String, Arc<SqliteStore>) {
 #[tokio::test]
 async fn outbound_invite_federates_then_persists() {
     // A (example.org) hosts the room; alice is the joined creator.
-    let (a_app, a_store, room_id, _alice, _join) = seed_joined_room().await;
+    let (a_app, a_store, room_id, _alice, _join, _tempfile) = seed_joined_room().await;
     // B serves the invitee `@dave:{B}`.
-    let (b_name, b_store) = serve_invitee_server("dave").await;
+    let (b_name, b_store, _b_tempfile) = serve_invitee_server("dave").await;
     let dave = format!("@dave:{b_name}");
     let dave_uid: OwnedUserId = dave.parse().unwrap();
 
@@ -3210,7 +3238,7 @@ async fn outbound_invite_federates_then_persists() {
 /// locally (the atomicity property — federate-then-persist).
 #[tokio::test]
 async fn outbound_invite_peer_unreachable_persists_nothing() {
-    let (a_app, a_store, room_id, _alice, _join) = seed_joined_room().await;
+    let (a_app, a_store, room_id, _alice, _join, _tempfile) = seed_joined_room().await;
     let dead = crate::federation::test_support::dead_peer().await;
     let dave = format!("@dave:{dead}");
     let dave_uid: OwnedUserId = dave.parse().unwrap();
@@ -3235,7 +3263,7 @@ async fn outbound_invite_peer_unreachable_persists_nothing() {
 /// Invitee server returns 403 ⇒ CSAPI 403 and nothing persisted.
 #[tokio::test]
 async fn outbound_invite_peer_403_persists_nothing() {
-    let (a_app, a_store, room_id, _alice, _join) = seed_joined_room().await;
+    let (a_app, a_store, room_id, _alice, _join, _tempfile) = seed_joined_room().await;
 
     // A stub invitee server that 403s every /invite/v2.
     let stub = axum::Router::new().route(
@@ -3276,7 +3304,7 @@ async fn outbound_invite_peer_403_persists_nothing() {
 /// likely to hide a bug.)
 #[tokio::test]
 async fn invite_for_hosted_room_unauthorised_inviter_is_rejected() {
-    let (app, store, room_id, _alice, join_id) = seed_joined_room().await;
+    let (app, store, room_id, _alice, join_id, _tempfile) = seed_joined_room().await;
     // A remote user with no membership/power in our room "invites" our local
     // carol. (The invitee is local — that gate passes; auth is what refuses it.)
     let bob: OwnedUserId = "@bob:remote.example.org".parse().unwrap();
@@ -3324,7 +3352,7 @@ async fn invite_for_hosted_room_unauthorised_inviter_is_rejected() {
 /// event for `apply_resident` to commit.
 #[tokio::test]
 async fn outbound_invite_peer_returns_wrong_event_persists_nothing() {
-    let (a_app, a_store, room_id, _alice, _join) = seed_joined_room().await;
+    let (a_app, a_store, room_id, _alice, _join, _tempfile) = seed_joined_room().await;
 
     // A valid but unrelated event the stub will echo instead of our candidate.
     let other_create = EventBuilder::new(inviter(), "m.room.create".to_owned())
@@ -3374,8 +3402,13 @@ async fn outbound_invite_peer_returns_wrong_event_persists_nothing() {
 // ===================================================================
 
 /// A room created by alice with zara invited (the state a rejection acts on).
-async fn seed_room_with_invited_zara() -> (axum::Router, Arc<SqliteStore>, OwnedRoomId, OwnedEventId)
-{
+async fn seed_room_with_invited_zara() -> (
+    axum::Router,
+    Arc<SqliteStore>,
+    OwnedRoomId,
+    OwnedEventId,
+    TempDir,
+) {
     seed_room(&[
         (
             ALICE,
@@ -3418,7 +3451,7 @@ fn remote_leave(room_id: &RoomId, head: &OwnedEventId, user: &str) -> neutrino_c
 
 #[tokio::test]
 async fn make_leave_returns_leave_template() {
-    let (router, _store, room_id, head) = seed_room_with_invited_zara().await;
+    let (router, _store, room_id, head, _tempfile) = seed_room_with_invited_zara().await;
     let (status, body) = get(&router, &make_leave_path(&room_id, ZARA)).await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["room_version"], ROOM_VERSION_ID);
@@ -3443,7 +3476,7 @@ async fn make_leave_returns_leave_template() {
 
 #[tokio::test]
 async fn make_leave_unknown_room_returns_404() {
-    let (router, _store, _room_id, _head) = seed_room_with_invited_zara().await;
+    let (router, _store, _room_id, _head, _tempfile) = seed_room_with_invited_zara().await;
     let unknown = ruma::RoomId::parse("!nope:example.org").unwrap();
     let (status, body) = get(&router, &make_leave_path(&unknown, ZARA)).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body:?}");
@@ -3455,7 +3488,7 @@ async fn make_leave_incompatible_version_returns_400() {
     // make_leave negotiates the room version like make_join: a `ver` that does
     // not include ours — or an absent `ver` (which defaults to `[1]`) — yields
     // 400 M_INCOMPATIBLE_ROOM_VERSION with our `room_version` in the body.
-    let (router, _store, room_id, _head) = seed_room_with_invited_zara().await;
+    let (router, _store, room_id, _head, _tempfile) = seed_room_with_invited_zara().await;
 
     let path = format!("/_matrix/federation/v1/make_leave/{room_id}/{ZARA}?ver=1");
     let (status, body) = get(&router, &path).await;
@@ -3475,7 +3508,7 @@ async fn make_leave_incompatible_version_returns_400() {
 async fn send_leave_admits_leave_and_returns_empty() {
     // zara is invited; she rejects → leaves. yan (other.example) is joined so
     // the leave genuinely fans out (distribution duty).
-    let (router, store, room_id, head) = seed_room(&[
+    let (router, store, room_id, head, _tempfile) = seed_room(&[
         (
             ALICE,
             "m.room.member",
@@ -3544,7 +3577,7 @@ async fn send_leave_admits_leave_and_returns_empty() {
 
 #[tokio::test]
 async fn send_leave_non_leave_membership_returns_400() {
-    let (router, _store, room_id, head) = seed_room_with_invited_zara().await;
+    let (router, _store, room_id, head, _tempfile) = seed_room_with_invited_zara().await;
     // A join event sent to send_leave must be refused on the membership check.
     let join = remote_join(&room_id, &head, ZARA);
     let id = join.event_id.clone();
@@ -3555,7 +3588,7 @@ async fn send_leave_non_leave_membership_returns_400() {
 
 #[tokio::test]
 async fn send_leave_event_id_path_mismatch_returns_400() {
-    let (router, _store, room_id, head) = seed_room_with_invited_zara().await;
+    let (router, _store, room_id, head, _tempfile) = seed_room_with_invited_zara().await;
     let leave = remote_leave(&room_id, &head, ZARA);
     // Path id is a real, valid, different id (the state head), so the 400 can
     // only come from the body-vs-path comparison.
@@ -3569,7 +3602,7 @@ async fn send_leave_event_id_path_mismatch_returns_400() {
 async fn send_leave_state_key_not_sender_returns_400() {
     // A leave whose state_key != sender (a kick shape). send_leave only expresses
     // a self-leave, so it must refuse this; a kick rides /send instead.
-    let (router, _store, room_id, head) = seed_room_with_invited_zara().await;
+    let (router, _store, room_id, head, _tempfile) = seed_room_with_invited_zara().await;
     let zara: OwnedUserId = ZARA.parse().unwrap();
     let leave = EventBuilder::new(zara.clone(), "m.room.member".to_owned())
         .room_id(room_id.clone())
@@ -3587,7 +3620,7 @@ async fn send_leave_state_key_not_sender_returns_400() {
 
 #[tokio::test]
 async fn send_leave_is_idempotent_on_resend() {
-    let (router, store, room_id, head) = seed_room(&[
+    let (router, store, room_id, head, _tempfile) = seed_room(&[
         (
             ALICE,
             "m.room.member",
@@ -3640,7 +3673,7 @@ async fn send_leave_unknown_room_returns_404() {
     // A leave for a room we don't host: `apply_resident` can't bootstrap an actor
     // (no forward extremities) → UnknownRoom → 404. Exercises the apply-error
     // mapping past the structural validators.
-    let (router, _store, _room, head) = seed_room_with_invited_zara().await;
+    let (router, _store, _room, head, _tempfile) = seed_room_with_invited_zara().await;
     let unknown = ruma::RoomId::parse("!nope:example.org").unwrap();
     let leave = remote_leave(&unknown, &head, ZARA);
     let id = leave.event_id.clone();
@@ -3655,7 +3688,7 @@ async fn send_leave_unauthorised_leave_returns_403() {
     // membership: auth rejects it → 403, nothing persisted. Exercises the
     // `apply_resident` Rejected → 403 arm (the structural 400 tests all trip a
     // guard *before* apply).
-    let (router, store, room_id, head) = seed_public_room().await;
+    let (router, store, room_id, head, _tempfile) = seed_public_room().await;
     let leave = remote_leave(&room_id, &head, ZARA);
     let id = leave.event_id.clone();
     let (status, body) = put_event(&router, &send_leave_path(&room_id, &id), leave.raw.get()).await;
@@ -3683,6 +3716,7 @@ async fn serve_resident_with_invite(
     Arc<SqliteStore>,
     OwnedRoomId,
     neutrino_common::Event,
+    TempDir,
 ) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let name = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
@@ -3715,21 +3749,22 @@ async fn serve_resident_with_invite(
         .create_room(&create, &[bob_join, invite.clone()])
         .await
         .expect("create_room on B");
-    let router = router_with_store(config_for(&name, "bob"), store.clone(), tempfile);
+    let router = router_with_store(config_for(&name, "bob"), store.clone());
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    (name, store, room_id, invite)
+    (name, store, room_id, invite, tempfile)
 }
 
 #[tokio::test]
 async fn outbound_reject_invite_federates_leave_and_removes_stub() {
     // B hosts the room and invited our local alice. A holds only the OOB stub.
     let alice = alice();
-    let (_b_name, b_store, room_id, invite) = serve_resident_with_invite(alice.as_str()).await;
+    let (_b_name, b_store, room_id, invite, _b_tempfile) =
+        serve_resident_with_invite(alice.as_str()).await;
 
-    let (a_store, a_temp) = fresh_store().await;
-    let a_router = router_with_store(config(), a_store.clone(), a_temp);
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_router = router_with_store(config(), a_store.clone());
     a_store.put_invite(&room_id, &alice, &invite).await.unwrap();
 
     let (status, body) = post_json(
@@ -3766,8 +3801,8 @@ async fn outbound_reject_invite_federates_leave_and_removes_stub() {
 async fn outbound_reject_invite_unreachable_server_still_removes_stub() {
     // The inviting server is dead; local rejection must proceed regardless.
     let dead = crate::federation::test_support::dead_peer().await;
-    let (a_store, a_temp) = fresh_store().await;
-    let a_router = router_with_store(config(), a_store.clone(), a_temp);
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_router = router_with_store(config(), a_store.clone());
     let alice = alice();
 
     let dead_bob: OwnedUserId = format!("@bob:{dead}").parse().unwrap();
@@ -3808,8 +3843,8 @@ async fn reject_then_reinvite_resurrects_stub() {
     // Inbound invite → stub; reject (inviting server dead) → stub gone; a fresh
     // inbound invite resurrects it. The declined-then-reinvited round trip.
     let dead = crate::federation::test_support::dead_peer().await;
-    let (a_store, a_temp) = fresh_store().await;
-    let a_router = router_with_store(config(), a_store.clone(), a_temp);
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_router = router_with_store(config(), a_store.clone());
     let alice = alice();
 
     let dead_bob: OwnedUserId = format!("@bob:{dead}").parse().unwrap();

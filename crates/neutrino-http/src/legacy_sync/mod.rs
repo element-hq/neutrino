@@ -144,7 +144,7 @@ mod tests {
     use neutrino_store_sqlite::SqliteStore;
     use ruma::{RoomId, UserId, room_id, user_id};
     use serde_json::{Value, json};
-    use tempfile::NamedTempFile;
+    use tempfile::TempDir;
 
     use super::fetch_memberships;
     use crate::legacy_sync::translate::{
@@ -152,9 +152,11 @@ mod tests {
     };
     use crate::sliding_sync::{self, SyncState};
 
-    async fn fresh_store() -> (Arc<SqliteStore>, NamedTempFile) {
-        let tmp = NamedTempFile::new().expect("create tempfile");
-        let store = SqliteStore::open(tmp.path()).await.expect("open store");
+    async fn fresh_store() -> (Arc<SqliteStore>, TempDir) {
+        let tmp = TempDir::new().expect("create tempfile");
+        let store = SqliteStore::open_in_dir(tmp.path())
+            .await
+            .expect("open store");
         (Arc::new(store), tmp)
     }
 

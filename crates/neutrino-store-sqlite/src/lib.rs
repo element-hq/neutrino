@@ -50,7 +50,8 @@ use crate::error::Error;
 
 /// SQLite-backed `StorageBackend`.
 ///
-/// Constructed via [`SqliteStore::open`] (file-backed) or
+/// Constructed via [`SqliteStore::open_in_dir`] (production — a storage
+/// directory), [`SqliteStore::open`] (file-backed, by exact path) or
 /// [`SqliteStore::open_in_memory`] (tests). Cheap to clone — both inner
 /// pools are `Arc`-shared.
 #[derive(Debug, Clone)]
@@ -72,12 +73,93 @@ pub struct SqliteStore {
     watch_tx: watch::Sender<StreamPos>,
 }
 
+/// Database filename within a storage directory. The on-disk layout — this
+/// file plus its `-wal`/`-shm` sidecars — is a storage-implementation detail
+/// owned here, not by callers handing us a directory.
+const DB_FILENAME: &str = "neutrino.db";
+
+/// Create the storage directory itself — *not* its parents, which are the
+/// caller's responsibility. Returns whether we actually created it (vs. it
+/// already existing), so [`secure_storage_dir`] knows whether it owns the
+/// directory's permissions. A missing parent surfaces as an error naming the
+/// path so the caller knows to create it first.
+async fn create_storage_dir(dir: &Path) -> Result<bool, StorageError> {
+    match tokio::fs::create_dir(dir).await {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(Error::Internal(format!(
+            "creating storage dir {} (create its parent dirs first): {e}",
+            dir.display()
+        ))
+        .into()),
+    }
+}
+
+/// Keep the plaintext DB owner-private on unix: clamp `neutrino.db` and its
+/// `-wal`/`-shm` sidecars to `0o600`, and — only when we created it — the
+/// directory to `0o700`. We never tighten a directory the host handed us
+/// (`created == false`); that mode is its owner's choice. Sidecar absence is
+/// tolerated: they exist once WAL is engaged (the schema bundle is a write),
+/// but a future journal-mode change shouldn't make this brittle.
+#[cfg(unix)]
+async fn secure_storage_dir(dir: &Path, created: bool) -> Result<(), StorageError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if created {
+        tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|e| Error::Internal(format!("securing storage dir {}: {e}", dir.display())))?;
+    }
+
+    let db = dir.join(DB_FILENAME);
+    let wal = dir.join(format!("{DB_FILENAME}-wal"));
+    let shm = dir.join(format!("{DB_FILENAME}-shm"));
+    for path in [db, wal, shm] {
+        match tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::Internal(format!("securing {}: {e}", path.display())).into());
+            }
+        }
+    }
+    Ok(())
+}
+
 impl SqliteStore {
     /// Open a file-backed store at `path`. Creates the schema bundle on
     /// first open (per `schema::ensure_schema`'s version gate).
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let cfg = Config::new(path.as_ref().to_path_buf());
         Self::build(cfg, /* reader_size */ 4).await
+    }
+
+    /// Open a store rooted at a storage *directory*: the directory itself is
+    /// created (tolerating it already existing) and the database lives at
+    /// `<dir>/neutrino.db`. This is the constructor production code should
+    /// use — the host passes a directory it owns (e.g. Android's
+    /// `context.filesDir`) and stays unaware of the database filename and
+    /// WAL sidecar layout.
+    ///
+    /// We create only the final directory, *not* its parents — a missing
+    /// parent surfaces as an error pointing the caller at it. (Creating the
+    /// whole chain would force our owner-only mode onto intermediate dirs the
+    /// host may share with other processes.)
+    ///
+    /// On unix the plaintext DB is kept owner-private: [`secure_storage_dir`]
+    /// clamps `neutrino.db` and its `-wal`/`-shm` sidecars to `0o600`, and the
+    /// directory to `0o700` *only when we created it* — a pre-existing host
+    /// dir (Android's per-UID `filesDir`, a `./data` from a prior run) keeps
+    /// the mode its owner chose.
+    pub async fn open_in_dir(dir: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let dir = dir.as_ref();
+        let created = create_storage_dir(dir).await?;
+        let store = Self::open(dir.join(DB_FILENAME)).await?;
+        #[cfg(unix)]
+        secure_storage_dir(dir, created).await?;
+        #[cfg(not(unix))]
+        let _ = created;
+        Ok(store)
     }
 
     /// Open a private in-memory store. Per pool-split doc §5: two
@@ -96,8 +178,10 @@ impl SqliteStore {
     /// reader side when a writer holds an in-flight transaction.
     /// **Safe for single-task and single-worker tests; not safe for
     /// concurrent reader+writer workloads.** Use file-backed
-    /// [`SqliteStore::open`] on a `tempfile::NamedTempFile` for any test
-    /// that exercises the concurrent reader/writer surface. See
+    /// [`SqliteStore::open_in_dir`] on a `tempfile::TempDir` for any test
+    /// that exercises the concurrent reader/writer surface — a `TempDir`
+    /// reaps the DB *and* its WAL `-wal`/`-shm` sidecars on drop, which a
+    /// bare `NamedTempFile` would orphan. See
     /// `docs/2026-05-18-read-write-pool-split.md` §5 for the full
     /// rationale.
     pub async fn open_in_memory() -> Result<Self, StorageError> {

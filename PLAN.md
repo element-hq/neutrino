@@ -75,6 +75,9 @@ Intentional gaps in the sliding-sync implementation — see `MSC4186-gaps.md`:
 - federated-invite error-code parity with the local invite path
 - multi-server / idempotency federation tests
 - port the relevant Synapse + Complement membership-endpoint tests
+- `storage_dir` empty-string handling: an exported-but-empty `NEUTRINO_STORAGE_DIR=` (and the FFI
+  `NeutrinoConfig.storage_dir`) is taken literally as `""` rather than falling back to the default,
+  aborting startup with an opaque `creating storage dir : …`; validate/normalise empty → default
 
 ## stack
 - framework: axum + tokio

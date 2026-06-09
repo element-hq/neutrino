@@ -19,12 +19,12 @@ use std::time::{Duration, Instant};
 
 use neutrino_store::{EventStore, RoomStore, StorageError, StreamPos};
 use neutrino_store_sqlite::SqliteStore;
-use tempfile::NamedTempFile;
+use tempfile::TempDir;
 
 use common::{ALICE_ROOM_ID, ALICE_USER_ID, create_event, message_with_ts};
 
 /// Bootstrap a file-backed `SqliteStore` on a fresh tempfile, plus the
-/// create event for [`ALICE_ROOM_ID`]. The returned [`NamedTempFile`]
+/// create event for [`ALICE_ROOM_ID`]. The returned [`TempDir`]
 /// keeps the on-disk file alive for the test's lifetime; it's unlinked
 /// when the binding drops.
 ///
@@ -38,9 +38,9 @@ use common::{ALICE_ROOM_ID, ALICE_USER_ID, create_event, message_with_ts};
 /// (see sqlite.org/sharedcache.html). File-backed `open(path)` uses
 /// the regular WAL file-locking instead, which gives true concurrent
 /// reader/writer semantics — what the contention surface needs.
-async fn store_with_room_on_tempfile() -> (SqliteStore, NamedTempFile) {
-    let file = NamedTempFile::new().expect("create tempfile");
-    let s = SqliteStore::open(file.path())
+async fn store_with_room_on_tempfile() -> (SqliteStore, TempDir) {
+    let file = TempDir::new().expect("create tempfile");
+    let s = SqliteStore::open_in_dir(file.path())
         .await
         .expect("open store on tempfile");
     s.create_room(&create_event(*ALICE_ROOM_ID, *ALICE_USER_ID), &[])

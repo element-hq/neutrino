@@ -21,9 +21,20 @@ fn config() -> Config {
     }
 }
 
+/// Build a router over a throwaway storage directory the test owns. The
+/// returned `TempDir` MUST be held for the lifetime of the router — dropping
+/// it deletes the database directory.
+async fn test_router() -> (axum::Router, tempfile::TempDir) {
+    let tmp = tempfile::TempDir::new().expect("create storage tempdir");
+    let mut cfg = config();
+    cfg.storage_dir = tmp.path().to_path_buf();
+    let app = router(cfg).await.expect("router");
+    (app, tmp)
+}
+
 #[tokio::test]
 async fn versions_advertises_msc4222_and_sliding_sync() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     let req = Request::builder()
         .method("GET")

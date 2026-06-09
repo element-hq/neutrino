@@ -9,7 +9,7 @@ use ruma::api::client::sync::sync_events::v5::{Request, request};
 use ruma::events::StateEventType;
 use ruma::{OwnedRoomId, RoomId, UInt, UserId, room_id, user_id};
 use serde_json::Value;
-use tempfile::NamedTempFile;
+use tempfile::TempDir;
 
 use super::conn::ConnKey;
 use super::{SyncError, SyncState, handle};
@@ -58,15 +58,15 @@ async fn wait_for_in_flight_cancel_sub<S>(
 // SQLite's shared-cache backing under a per-store UUID URI, which is fine for
 // single-task tests but unsafe for the concurrent reader+writer workloads the
 // long-poll tests drive (the shared-cache lock manager doesn't honour
-// `busy_timeout`). A `NamedTempFile` per test gives every case a private DB
+// `busy_timeout`). A `TempDir` per test gives every case a private DB
 // that auto-deletes on drop.
 // -----------------------------------------------------------------------------
 
-/// Open a fresh file-backed `SqliteStore`. The returned `NamedTempFile` must be
+/// Open a fresh file-backed `SqliteStore`. The returned `TempDir` must be
 /// kept alive for the test's lifetime — its `Drop` removes the underlying file.
-async fn fresh_store() -> (Arc<SqliteStore>, NamedTempFile) {
-    let tmp = NamedTempFile::new().expect("create tempfile");
-    let store = SqliteStore::open(tmp.path())
+async fn fresh_store() -> (Arc<SqliteStore>, TempDir) {
+    let tmp = TempDir::new().expect("create tempfile");
+    let store = SqliteStore::open_in_dir(tmp.path())
         .await
         .expect("open SqliteStore on tempfile");
     (Arc::new(store), tmp)

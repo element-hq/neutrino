@@ -32,6 +32,17 @@ fn config() -> Config {
     }
 }
 
+/// Build a router over a throwaway storage directory the test owns. The
+/// returned `TempDir` MUST be held for the lifetime of the router — dropping
+/// it deletes the database directory.
+async fn test_router() -> (axum::Router, tempfile::TempDir) {
+    let tmp = tempfile::TempDir::new().expect("create storage tempdir");
+    let mut cfg = config();
+    cfg.storage_dir = tmp.path().to_path_buf();
+    let app = router(cfg).await.expect("router");
+    (app, tmp)
+}
+
 /// POST a JSON body to `path` with the optional query string appended.
 async fn post(
     app: &axum::Router,
@@ -97,7 +108,7 @@ fn sync_body_with_default_list() -> Value {
 
 #[tokio::test]
 async fn create_room_then_initial_sync_returns_the_room() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     let (status, body) = post(&app, "/_matrix/client/v3/createRoom", None, &json!({})).await;
     assert_eq!(status, StatusCode::OK);
@@ -130,7 +141,7 @@ async fn create_room_then_initial_sync_returns_the_room() {
 
 #[tokio::test]
 async fn put_event_then_sync_delivers_it_in_timeline() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     let (_, body) = post(&app, "/_matrix/client/v3/createRoom", None, &json!({})).await;
     let room_id = body
@@ -182,7 +193,7 @@ async fn put_event_then_sync_delivers_it_in_timeline() {
 
 #[tokio::test]
 async fn put_state_event_returns_event_id() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     let (_, body) = post(&app, "/_matrix/client/v3/createRoom", None, &json!({})).await;
     let room_id = body
@@ -213,7 +224,7 @@ async fn create_room_with_name_then_send_succeeds() {
     // a non-linear state DAG whose seeded head omitted the join, which made
     // the bootstrapped state miss the creator's membership and rejected this
     // send with 403.
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     let (status, body) = post(
         &app,
@@ -255,7 +266,7 @@ async fn create_public_room_then_send_succeeds() {
     // history-visibility events are well-formed and accepted by the state
     // machine. (The preset → join_rule mapping itself is unit-tested in
     // `lib.rs`.)
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     let (status, body) = post(
         &app,
@@ -283,7 +294,7 @@ async fn put_event_then_sliding_sync_returns_event_with_event_id() {
     // PUT /send returned to the caller. v12 / MSC4242 wire bytes don't
     // carry event_id; this pins the `event_view::From<&Event>` enrichment
     // for the v5 timeline path.
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     let (_, body) = post(&app, "/_matrix/client/v3/createRoom", None, &json!({})).await;
     let room_id = body
@@ -340,7 +351,7 @@ async fn put_event_then_sliding_sync_returns_event_with_event_id() {
 
 #[tokio::test]
 async fn stale_pos_returns_m_unknown_pos() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     // Advance the conn so pos="1" is no longer current.
     let (_, resp1) = post(&app, SYNC_PATH, None, &sync_body_with_default_list()).await;
@@ -382,7 +393,7 @@ async fn stale_pos_returns_m_unknown_pos() {
 
 #[tokio::test]
 async fn idempotent_retry_returns_same_response_bytes() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     let (_, _) = post(&app, "/_matrix/client/v3/createRoom", None, &json!({})).await;
     let (_, resp1) = post(&app, SYNC_PATH, None, &sync_body_with_default_list()).await;
@@ -416,7 +427,7 @@ async fn idempotent_retry_returns_same_response_bytes() {
 
 #[tokio::test]
 async fn invalid_conn_id_too_long_returns_m_invalid_param() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     let body = json!({
         "conn_id": "this-string-is-much-longer-than-sixteen-characters",
@@ -432,7 +443,7 @@ async fn invalid_conn_id_too_long_returns_m_invalid_param() {
 
 #[tokio::test]
 async fn extension_e2ee_echoed_on_request() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     let body = json!({
         "lists": {"all": {"ranges": [[0, 99]], "timeline_limit": 1, "required_state": []}},
@@ -450,7 +461,7 @@ async fn extension_e2ee_echoed_on_request() {
 
 #[tokio::test]
 async fn long_poll_returns_within_timeout_when_no_events() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     let (_, _) = post(&app, "/_matrix/client/v3/createRoom", None, &json!({})).await;
     let (_, resp1) = post(&app, SYNC_PATH, None, &sync_body_with_default_list()).await;
@@ -488,7 +499,7 @@ async fn long_poll_returns_within_timeout_when_no_events() {
 async fn long_poll_wakes_on_concurrent_put_event() {
     // Start a long-poll, then PUT an event after a short delay, then assert
     // the long-poll returns the event before its full timeout.
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     let (_, body) = post(&app, "/_matrix/client/v3/createRoom", None, &json!({})).await;
     let room_id = body
@@ -546,7 +557,7 @@ async fn long_poll_wakes_on_concurrent_put_event() {
 
 #[tokio::test]
 async fn initial_sync_with_named_room_returns_the_name() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
 
     let (_, body) = post(
         &app,

@@ -20,6 +20,17 @@ fn config() -> Config {
     }
 }
 
+/// Build a router over a throwaway storage directory the test owns. The
+/// returned `TempDir` MUST be held for the lifetime of the router — dropping
+/// it deletes the database directory.
+async fn test_router() -> (axum::Router, tempfile::TempDir) {
+    let tmp = tempfile::TempDir::new().expect("create storage tempdir");
+    let mut cfg = config();
+    cfg.storage_dir = tmp.path().to_path_buf();
+    let app = router(cfg).await.expect("router");
+    (app, tmp)
+}
+
 async fn post(app: &axum::Router, path: &str, body: &Value) -> StatusCode {
     let req = Request::builder()
         .method("POST")
@@ -39,7 +50,7 @@ const QUERY: &str = "/_matrix/client/v3/keys/query";
 /// pointer and panic.
 #[tokio::test]
 async fn keys_upload_without_device_keys_does_not_panic() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let status = post(&app, UPLOAD, &json!({ "one_time_keys": {} })).await;
     assert!(status.is_success(), "got {status} (panic → 500?)");
 }
@@ -47,7 +58,7 @@ async fn keys_upload_without_device_keys_does_not_panic() {
 /// Body that isn't even an object.
 #[tokio::test]
 async fn device_signing_upload_with_non_object_body_does_not_panic() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let status = post(&app, DEVICE_SIGNING, &json!("not-an-object")).await;
     assert!(status.is_success(), "got {status} (panic → 500?)");
 }
@@ -56,7 +67,7 @@ async fn device_signing_upload_with_non_object_body_does_not_panic() {
 /// path used to `.unwrap()` through three missing pointers.
 #[tokio::test]
 async fn signatures_upload_without_expected_path_does_not_panic() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let status = post(&app, SIGNATURES, &json!({ "wrong": "shape" })).await;
     assert!(status.is_success(), "got {status} (panic → 500?)");
 }
@@ -65,7 +76,7 @@ async fn signatures_upload_without_expected_path_does_not_panic() {
 /// so `app.keys` is `None` — the handlers must no-op rather than unwrap.
 #[tokio::test]
 async fn signing_and_signatures_before_upload_do_not_panic() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let user = config().user_id();
 
     let well_formed_signing = json!({ "master_key": { "keys": {} }, "auth": {} });
@@ -86,7 +97,7 @@ async fn signing_and_signatures_before_upload_do_not_panic() {
 /// Happy path still works: a well-formed upload is stored and queryable.
 #[tokio::test]
 async fn well_formed_upload_round_trips_through_query() {
-    let app = router(config()).await.expect("router init");
+    let (app, _tmp) = test_router().await;
     let user = config().user_id();
 
     let upload = json!({
