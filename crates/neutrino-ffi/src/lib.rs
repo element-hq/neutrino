@@ -56,8 +56,12 @@ pub struct NeutrinoHandle {
 #[uniffi::export]
 impl NeutrinoHandle {
     /// Push a control command to the running server. Fire-and-forget: returns
-    /// immediately, never blocks. A send after the server has already stopped
-    /// (the receiver was dropped) is a silent no-op.
+    /// immediately and never blocks — the channel is unbounded, so the sync
+    /// `UnboundedSender::send` never awaits, which is what lets this be called
+    /// safely from the FFI/JNI thread (a bounded channel would force either an
+    /// `async fn` across the boundary or a backpressure-drop policy). A send
+    /// after the server has already stopped (receiver dropped) is a silent
+    /// no-op.
     pub fn command(&self, command: Command) {
         let _ = self.tx.send(command.into());
     }
@@ -105,10 +109,11 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
 async fn drain_until_shutdown(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<neutrino_main::Command>,
 ) {
-    // `never_loop` fires because every current arm of the match returns.
-    // The loop is intentional: future non-Shutdown variants (e.g. NetworkReachable)
-    // will `continue` rather than `return`, and the exhaustive match will force
-    // that decision at compile time.
+    // `never_loop` fires only because every variant today (`Shutdown`) returns;
+    // the loop earns its keep once a non-terminating variant lands. See the
+    // doc comment above for the design rationale.
+    // TODO: when the first non-Shutdown variant is added, add a test that sends
+    // it followed by `Shutdown` and asserts the drain consumes both then returns.
     #[allow(clippy::never_loop)]
     loop {
         match rx.recv().await {
