@@ -1,6 +1,6 @@
 mod platform;
 
-pub use neutrino_common::Config;
+pub use neutrino_common::{Command, Config};
 
 pub async fn entrypoint(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     platform::init_tracing();
