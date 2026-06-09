@@ -665,7 +665,7 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_neutrino_fn_method_neutrinohandle_shutdown(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-    external fun uniffi_neutrino_fn_func_start(uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_neutrino_fn_func_start(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     external fun ffi_neutrino_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -938,6 +938,29 @@ private class AndroidSystemCleanable(
     private val cleanable: java.lang.ref.Cleaner.Cleanable,
 ) : UniffiCleaner.Cleanable {
     override fun clean() = cleanable.clean()
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterUInt: FfiConverter<UInt, Int> {
+    override fun lift(value: Int): UInt {
+        return value.toUInt()
+    }
+
+    override fun read(buf: ByteBuffer): UInt {
+        return lift(buf.getInt())
+    }
+
+    override fun lower(value: UInt): Int {
+        return value.toInt()
+    }
+
+    override fun allocationSize(value: UInt) = 4UL
+
+    override fun write(value: UInt, buf: ByteBuffer) {
+        buf.putInt(value.toInt())
+    }
 }
 
 /**
@@ -1245,15 +1268,80 @@ public object FfiConverterTypeNeutrinoHandle: FfiConverter<NeutrinoHandle, Long>
         buf.putLong(lower(value))
     }
 }
+
+
+
+/**
+ * FFI-facing server configuration. Mirrors `neutrino_common::Config` so EX
+ * Android can fully configure the embedded homeserver. Kept here (not on the
+ * common `Config`) so UniFFI stays out of the common crates — see the
+ * crate-structure rule in CLAUDE.md. All fields are required; defaults live
+ * in `Config::default`/`from_env` for the dev binary.
+ */
+data class NeutrinoConfig (
+    var `serverName`: kotlin.String
+    , 
+    var `bindAddr`: kotlin.String
+    , 
+    var `localpart`: kotlin.String
+    , 
+    /**
+     * Absolute path to a writable directory the host owns (e.g. Android's
+     * `context.filesDir`). The DB is `<storage_dir>/neutrino.db`.
+     */
+    var `storageDir`: kotlin.String
+    , 
+    var `outboundConcurrency`: kotlin.UInt
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeNeutrinoConfig: FfiConverterRustBuffer<NeutrinoConfig> {
+    override fun read(buf: ByteBuffer): NeutrinoConfig {
+        return NeutrinoConfig(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: NeutrinoConfig) = (
+            FfiConverterString.allocationSize(value.`serverName`) +
+            FfiConverterString.allocationSize(value.`bindAddr`) +
+            FfiConverterString.allocationSize(value.`localpart`) +
+            FfiConverterString.allocationSize(value.`storageDir`) +
+            FfiConverterUInt.allocationSize(value.`outboundConcurrency`)
+    )
+
+    override fun write(value: NeutrinoConfig, buf: ByteBuffer) {
+            FfiConverterString.write(value.`serverName`, buf)
+            FfiConverterString.write(value.`bindAddr`, buf)
+            FfiConverterString.write(value.`localpart`, buf)
+            FfiConverterString.write(value.`storageDir`, buf)
+            FfiConverterUInt.write(value.`outboundConcurrency`, buf)
+    }
+}
         /**
-         * Spawn the Tokio runtime and begin polling the server entrypoint. Returns a
-         * handle that can be used to gracefully shutdown the server.
-         */ fun `start`(): NeutrinoHandle {
+         * Spawn the Tokio runtime and begin polling the server entrypoint with the
+         * supplied configuration. Returns a handle that can gracefully shut the
+         * server down.
+         */ fun `start`(`config`: NeutrinoConfig): NeutrinoHandle {
             return FfiConverterTypeNeutrinoHandle.lift(
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_neutrino_fn_func_start(
     
-        _status)
+        FfiConverterTypeNeutrinoConfig.lower(`config`),_status)
 }
     )
     }
