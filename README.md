@@ -88,16 +88,16 @@ For example, to iterate from the `v0.2.0` release towards `0.2.1`:
    $ cargo xtask publish --local --version 0.2.1-SNAPSHOT
    ```
 
-2. Set the matching version in the fork's `gradle/libs.versions.toml` (it has a dedicated `neutrino`
-   version block):
+2. Set the matching version in `element-x-android-neutrino`'s `gradle/libs.versions.toml` (it has a
+   dedicated `neutrino` version block):
 
    ```toml
    [versions]
    neutrino = "0.2.1-SNAPSHOT"
    ```
 
-3. Re-sync your `element-x-android-neutrino` repository to pick up the bindings. This can be done
-   via the far right toolbar buttons inside Android Studio.
+3. Re-sync your EX Android fork to pick up the bindings. This can be done via the far right toolbar
+   buttons inside Android Studio.
 
 4. Once `v0.2.1` is pushed as a tag on GitHub, CI builds all four ABIs and publishes `0.2.1` (no
    `-SNAPSHOT`) to GitHub Packages. Bump the catalog to `neutrino = "0.2.1"`, ensuring no local
