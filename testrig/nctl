@@ -3,6 +3,7 @@
 # nctl — drive the 3-server neutrino federation test rig.
 #
 #   Lifecycle:   nctl up | down | ps | logs <hs>
+#   Federation:  nctl fedlog [hs]            -> follow federation HTTP requests
 #   Partitions:  nctl partition cut|heal <ab|ac|bc> | nctl partition status
 #   Room ops:    nctl <hs> <action> ...        (hs = hs1 | hs2 | hs3)
 #
@@ -234,9 +235,26 @@ main() {
       local hs=${2:-}; [[ -n $hs ]] || die "logs: need <hs>"
       exec docker logs -f "neutrino-$hs"
       ;;
+    fedlog)
+      # Every inbound federation request is logged by its DESTINATION server
+      # (neutrino's per-request INFO line: method + full path, then status +
+      # latency). Each request is received by exactly one server, so the union
+      # across all three is the complete federation request stream. Follow and
+      # filter to federation paths; the compose log prefix (hs1/hs2/hs3) tells
+      # you which server received each one.
+      local hs=${2:-}
+      if [[ -n $hs ]]; then
+        docker logs -f "neutrino-$hs" 2>&1 | grep --line-buffered '_matrix/federation/'
+      else
+        "${COMPOSE[@]}" logs -f --no-color 2>&1 | grep --line-buffered '_matrix/federation/'
+      fi
+      ;;
     partition) shift; cmd_partition "$@" ;;
     help | -h | --help | "")
-      sed -n '3,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      # Print the header comment block (lines 3..first non-comment), stripping
+      # the leading "# ". awk (not a fixed line range) so it can't leak code.
+      awk 'NR<3 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' \
+        "${BASH_SOURCE[0]}"
       ;;
     *) cmd_server "$@" ;;
   esac
