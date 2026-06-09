@@ -23,7 +23,7 @@ use neutrino_store::{
 };
 use neutrino_store_sqlite::SqliteStore;
 use ruma::{RoomVersionId, server_name};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 
 use common::{ALICE_ROOM_ID, ALICE_USER_ID, create_event, member_join, message, name_event};
 
@@ -219,5 +219,43 @@ async fn restart_empty_db_seeds_watch_at_zero() {
         *s.subscribe().borrow(),
         StreamPos(0),
         "empty events table must seed watch at StreamPos(0)"
+    );
+}
+
+/// `open_in_dir` owns the `<dir>/neutrino.db` layout: it creates a missing
+/// directory (parents included), places the database at the documented
+/// filename, and a reopen at the same directory observes prior writes. Pins
+/// the dir-creation + filename invariants the configurable-storage-dir
+/// feature relies on — the HTTP round-trip tests exercise persistence but
+/// never assert the on-disk file name or that a missing dir is created.
+#[tokio::test]
+async fn open_in_dir_creates_dir_and_persists_at_neutrino_db() {
+    let root = TempDir::new().expect("tempdir");
+    // A nested, not-yet-existing path — exercises create_dir_all's parents.
+    let dir = root.path().join("does/not/exist/yet");
+
+    let create_ev = create_event(*ALICE_ROOM_ID, *ALICE_USER_ID);
+    let member_ev = member_join(*ALICE_ROOM_ID, *ALICE_USER_ID);
+
+    {
+        let s = SqliteStore::open_in_dir(&dir).await.expect("open_in_dir");
+        s.create_room(&create_ev, &[member_ev])
+            .await
+            .expect("create room");
+    }
+
+    assert!(
+        dir.join("neutrino.db").exists(),
+        "store must create the directory and name the DB <dir>/neutrino.db"
+    );
+
+    settle_close_race().await;
+
+    // Reopening the same directory must observe the prior write — the watch
+    // seeds from MAX(stream_pos), so a non-zero position proves persistence.
+    let s = SqliteStore::open_in_dir(&dir).await.expect("reopen_in_dir");
+    assert!(
+        *s.subscribe().borrow() > StreamPos(0),
+        "writes before drop must survive reopening the same storage dir"
     );
 }

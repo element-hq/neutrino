@@ -140,14 +140,12 @@ pub enum StartupError {
 
 impl AppState {
     async fn new(config: Config) -> Result<Self, StartupError> {
-        // File-backed SQLite at `<storage_dir>/neutrino.db`. The directory is
-        // created if missing; persistence (vs. the old per-process tempfile)
-        // is the whole point. `open_in_memory` exists but its shared-cache
-        // mode is unsafe for the concurrent reader+writer workloads
-        // sliding-sync long-polls drive — see that method's doc-comment.
-        std::fs::create_dir_all(&config.storage_dir)?;
-        let db_path = config.storage_dir.join("neutrino.db");
-        let store = Arc::new(SqliteStore::open(&db_path).await?);
+        // Persistent file-backed store rooted at the configured directory;
+        // the store owns the `<dir>/neutrino.db` layout and creates the dir
+        // if missing. (`open_in_memory` exists but its shared-cache mode is
+        // unsafe for the concurrent reader+writer workloads sliding-sync
+        // long-polls drive — see that method's doc-comment.)
+        let store = Arc::new(SqliteStore::open_in_dir(&config.storage_dir).await?);
         Ok(Self::from_store(config, store))
     }
 

@@ -50,7 +50,8 @@ use crate::error::Error;
 
 /// SQLite-backed `StorageBackend`.
 ///
-/// Constructed via [`SqliteStore::open`] (file-backed) or
+/// Constructed via [`SqliteStore::open_in_dir`] (production — a storage
+/// directory), [`SqliteStore::open`] (file-backed, by exact path) or
 /// [`SqliteStore::open_in_memory`] (tests). Cheap to clone — both inner
 /// pools are `Arc`-shared.
 #[derive(Debug, Clone)]
@@ -72,12 +73,31 @@ pub struct SqliteStore {
     watch_tx: watch::Sender<StreamPos>,
 }
 
+/// Database filename within a storage directory. The on-disk layout — this
+/// file plus its `-wal`/`-shm` sidecars — is a storage-implementation detail
+/// owned here, not by callers handing us a directory.
+const DB_FILENAME: &str = "neutrino.db";
+
 impl SqliteStore {
     /// Open a file-backed store at `path`. Creates the schema bundle on
     /// first open (per `schema::ensure_schema`'s version gate).
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let cfg = Config::new(path.as_ref().to_path_buf());
         Self::build(cfg, /* reader_size */ 4).await
+    }
+
+    /// Open a store rooted at a storage *directory*: the directory (and any
+    /// missing parents) is created, and the database lives at
+    /// `<dir>/neutrino.db`. This is the constructor production code should
+    /// use — the host passes a directory it owns (e.g. Android's
+    /// `context.filesDir`) and stays unaware of the database filename and
+    /// WAL sidecar layout.
+    pub async fn open_in_dir(dir: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let dir = dir.as_ref();
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| Error::Internal(format!("creating storage dir {}: {e}", dir.display())))?;
+        Self::open(dir.join(DB_FILENAME)).await
     }
 
     /// Open a private in-memory store. Per pool-split doc §5: two
