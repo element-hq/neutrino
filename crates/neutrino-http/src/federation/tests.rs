@@ -154,6 +154,18 @@ fn config() -> Config {
     }
 }
 
+/// Build a router over a throwaway storage directory the test owns. The
+/// returned `TempDir` MUST be held for the lifetime of the router — dropping
+/// it deletes the database directory. Use this instead of `router(config())`
+/// so each test gets an isolated DB rather than sharing `./neutrino.db`.
+async fn test_router() -> (axum::Router, tempfile::TempDir) {
+    let tmp = tempfile::TempDir::new().expect("create storage tempdir");
+    let mut cfg = config();
+    cfg.storage_dir = tmp.path().to_path_buf();
+    let app = router(cfg).await.expect("router");
+    (app, tmp)
+}
+
 fn alice() -> OwnedUserId {
     "@alice:example.org".parse().unwrap()
 }
@@ -297,7 +309,7 @@ async fn build_seeded_router(
 #[cfg(not(feature = "multi-user-shim"))]
 #[tokio::test]
 async fn bad_request_empty_latest_events_returns_400() {
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
     let (_, body) = post_json(&app, "/_matrix/client/v3/createRoom", &json!({})).await;
     let room_id = body.get("room_id").and_then(Value::as_str).unwrap();
 
@@ -326,7 +338,7 @@ async fn bad_request_empty_latest_events_returns_400() {
 #[cfg(not(feature = "multi-user-shim"))]
 #[tokio::test]
 async fn bad_request_non_json_body_returns_400() {
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
     let (_, body) = post_json(&app, "/_matrix/client/v3/createRoom", &json!({})).await;
     let room_id = body.get("room_id").and_then(Value::as_str).unwrap();
 
@@ -352,7 +364,7 @@ async fn bad_request_non_json_body_returns_400() {
 #[cfg(not(feature = "multi-user-shim"))]
 #[tokio::test]
 async fn bad_request_missing_required_field_returns_400() {
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
     let (_, body) = post_json(&app, "/_matrix/client/v3/createRoom", &json!({})).await;
     let room_id = body.get("room_id").and_then(Value::as_str).unwrap();
 
@@ -372,7 +384,7 @@ async fn bad_request_missing_required_field_returns_400() {
 
 #[tokio::test]
 async fn unknown_room_returns_404() {
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
 
     let (status, body) = post_json(
         &app,
@@ -613,7 +625,7 @@ async fn malformed_room_id_returns_400_with_errcode() {
     // surface a JSON `M_INVALID_PARAM` body rather than axum's default
     // plain-text 400. Mirrors the `members` handler precedent in
     // `lib.rs`.
-    let app = router(config()).await.expect("router");
+    let (app, _tmp) = test_router().await;
 
     let (status, body) = post_json(
         &app,
