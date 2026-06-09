@@ -92,9 +92,21 @@ impl SqliteStore {
     /// use — the host passes a directory it owns (e.g. Android's
     /// `context.filesDir`) and stays unaware of the database filename and
     /// WAL sidecar layout.
+    ///
+    /// On unix, directories we create are mode `0o700` (owner-only): the DB
+    /// holds plaintext message history, and an owner-only dir keeps every
+    /// other UID out of `neutrino.db` *and* its `-wal`/`-shm` sidecars without
+    /// having to chase each file's mode. `recursive` only applies the mode to
+    /// dirs we actually create, so a pre-existing host dir (Android's
+    /// per-UID `filesDir`) keeps the permissions the host chose for it.
     pub async fn open_in_dir(dir: impl AsRef<Path>) -> Result<Self, StorageError> {
         let dir = dir.as_ref();
-        tokio::fs::create_dir_all(dir)
+        let mut builder = tokio::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder
+            .create(dir)
             .await
             .map_err(|e| Error::Internal(format!("creating storage dir {}: {e}", dir.display())))?;
         Self::open(dir.join(DB_FILENAME)).await

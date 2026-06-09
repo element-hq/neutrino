@@ -259,3 +259,29 @@ async fn open_in_dir_creates_dir_and_persists_at_neutrino_db() {
         "writes before drop must survive reopening the same storage dir"
     );
 }
+
+/// On unix, a directory `open_in_dir` creates is owner-only (`0o700`) — the
+/// DB holds plaintext message history, so no other UID should be able to
+/// traverse in and read it (or its WAL sidecars). Defense-in-depth on top of
+/// the Android per-UID sandbox; also protects the dev binary writing to cwd.
+#[cfg(unix)]
+#[tokio::test]
+async fn open_in_dir_creates_owner_only_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TempDir::new().expect("tempdir");
+    let dir = root.path().join("created/by/us");
+
+    let _s = SqliteStore::open_in_dir(&dir).await.expect("open_in_dir");
+
+    let mode = std::fs::metadata(&dir)
+        .expect("stat storage dir")
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o777,
+        0o700,
+        "storage dir we create must be owner-only (0o700), got {:o}",
+        mode & 0o777
+    );
+}
