@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 pub mod event;
 pub mod event_id;
 pub mod event_view;
@@ -32,6 +34,10 @@ pub struct Config {
     /// Max outbound federation transactions in flight across all destinations
     /// at once (the sender pool's global concurrency bound). Always ≥ 1.
     pub outbound_concurrency: usize,
+    /// Directory the embedded SQLite database lives in (`<dir>/neutrino.db`).
+    /// Defaults to the current working directory; Android supplies its app
+    /// files dir over the FFI. The server creates the dir if it is missing.
+    pub storage_dir: PathBuf,
 }
 
 impl Default for Config {
@@ -41,6 +47,7 @@ impl Default for Config {
             bind_addr: DEFAULT_BIND_ADDR.to_string(),
             localpart: DEFAULT_LOCALPART.to_string(),
             outbound_concurrency: DEFAULT_OUTBOUND_CONCURRENCY,
+            storage_dir: PathBuf::from("."),
         }
     }
 }
@@ -57,6 +64,7 @@ impl Config {
                     .ok()
                     .as_deref(),
             ),
+            storage_dir: storage_dir_from(std::env::var("NEUTRINO_STORAGE_DIR").ok().as_deref()),
             // `localpart` (and any future non-env field) defaults from `Default`,
             // so the value lives in exactly one place.
             ..Default::default()
@@ -66,6 +74,13 @@ impl Config {
     pub fn user_id(&self) -> String {
         format!("@{}:{}", self.localpart, self.server_name)
     }
+}
+
+/// Resolve the storage directory: the env value if present, else the current
+/// working directory (`"."`, resolved lazily at open time so this stays
+/// infallible).
+fn storage_dir_from(raw: Option<&str>) -> PathBuf {
+    raw.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Parse + clamp the outbound-concurrency env value: a valid `usize ≥ 1`, else
@@ -79,6 +94,20 @@ fn parse_outbound_concurrency(raw: Option<&str>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_dir_from_defaults_to_cwd() {
+        assert_eq!(storage_dir_from(None), std::path::PathBuf::from("."));
+        assert_eq!(
+            storage_dir_from(Some("/data/neutrino")),
+            std::path::PathBuf::from("/data/neutrino")
+        );
+    }
+
+    #[test]
+    fn default_config_storage_dir_is_cwd() {
+        assert_eq!(Config::default().storage_dir, std::path::PathBuf::from("."));
+    }
 
     #[test]
     fn parse_outbound_concurrency_clamps_and_defaults() {
