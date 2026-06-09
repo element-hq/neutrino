@@ -12,12 +12,6 @@ multi-user-shim = []
 [dependencies]
 axum = "0.8.7"
 tower-http = { version = "0.6.6", features = ["trace"] }
-# `AppState::new` opens a file-backed `SqliteStore` on a `NamedTempFile`
-# rather than the in-memory variant (whose shared-cache mode isn't safe for
-# concurrent reader+writer workloads — see `SqliteStore::open_in_memory`
-# doc-comment). The tempfile is owned by `AppState` so it lives as long
-# as the server, and is cleaned up on exit.
-tempfile = "3.27.0"
 
 async-trait.workspace = true
 rand.workspace = true
@@ -39,3 +33,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
 # can drive the router via `Router::oneshot(req)`. Same major version that
 # `tower-http` already pulls in transitively, so no extra build cost.
 tower = "0.5"
+# Test-only: integration tests own a `TempDir` as their storage_dir; in-crate
+# tests open file-backed stores on a `NamedTempFile`. Production no longer
+# uses tempfiles — the server persists into `config.storage_dir`.
+tempfile = "3.27.0"
