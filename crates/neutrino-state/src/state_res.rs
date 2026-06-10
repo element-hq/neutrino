@@ -444,6 +444,36 @@ pub fn split_power_events(
     Ok((power, non_power))
 }
 
+/// Step 1 of the v2 algorithm: the set of events that go through the
+/// reverse-topological power sort.
+///
+/// Spec v11/v12 §state resolution step 1: "Select the set X of all power events
+/// that appear in the full conflicted set. For each such power event P, enlarge
+/// X by adding the events in the auth chain of P which also belong to the full
+/// conflicted set." Synapse parity: `_add_event_and_auth_chain_to_graph` walks
+/// each power event's `auth_events` and pulls in any ancestor that is in the
+/// full conflicted set.
+///
+/// The complement (`full_conflicted \ <this set>`) is what `resolve_state`
+/// hands to the mainline sort in step 3 — so this enlargement is *not* a
+/// no-op: it moves the conflicted auth-chain ancestors of power events (e.g. a
+/// contested membership a power_levels event depends on) out of the mainline
+/// pass and into the power-ordered pass, where the spec requires them.
+fn power_sort_set(
+    full_conflicted: &HashSet<OwnedEventId>,
+    provider: &dyn StateProvider,
+) -> Result<HashSet<OwnedEventId>, StateResError> {
+    let (power_seed, _) = split_power_events(full_conflicted, provider)?;
+    if power_seed.is_empty() {
+        return Ok(power_seed);
+    }
+    // `auth_chain` returns the transitive backwards closure including the
+    // seeds; intersecting with `full_conflicted` keeps the power events plus
+    // their in-conflict auth-chain ancestors and drops everything else.
+    let closure = provider.auth_chain(&power_seed)?;
+    Ok(closure.intersection(full_conflicted).cloned().collect())
+}
+
 // ----------------- mainline -----------------
 
 /// Walk the m.room.power_levels chain backwards starting at `seed_pl_id`.
@@ -708,9 +738,10 @@ fn state_before_inner(
 /// 2. Compute the **full conflicted set** = `auth_chain_difference ∪
 ///    conflicted_subgraph ∪ conflicted-state-values` (v2.1 adds the subgraph;
 ///    v2 used just the diff + conflicted values).
-/// 3. Split the full conflicted set into power events vs non-power events
-///    via `is_power_event`.
-/// 4. Reverse-topological power sort over power events.
+/// 3. Compute the **step-1 set** via `power_sort_set`: the power events in the
+///    full conflicted set plus their auth-chain ancestors that are also in it.
+///    The complement is the mainline set.
+/// 4. Reverse-topological power sort over the step-1 set.
 /// 5. **IAC pass 1**: iterative auth checks from the **empty** state (v2.1
 ///    divergence from v2.0's "from unconflicted").
 /// 6. Mainline sort over non-power events, anchored on pass-1's resolved PL.
@@ -740,8 +771,11 @@ pub fn resolve_state(
         .chain(conflicted_values)
         .collect();
 
-    // (3) Split into power / non-power.
-    let (power_events, non_power_events) = split_power_events(&full_conflicted, provider)?;
+    // (3) Step 1 set: power events PLUS their in-conflict auth-chain ancestors
+    // (spec step 1's "enlarge X"). The remainder goes to the mainline sort.
+    let power_events = power_sort_set(&full_conflicted, provider)?;
+    let non_power_events: HashSet<OwnedEventId> =
+        full_conflicted.difference(&power_events).cloned().collect();
 
     // (4) Reverse-topological power sort + (5) IAC pass 1 from empty.
     let sorted_power = reverse_topological_power_sort(&power_events, provider)?;
@@ -1647,6 +1681,77 @@ mod tests {
         let (power, non_power) = split_power_events(&events, &provider).unwrap();
         assert_eq!(power, HashSet::from([create_id, pl_id]));
         assert_eq!(non_power, HashSet::from([topic_id]));
+    }
+
+    // ----- power_sort_set (spec step 1 auth-chain enlargement) -----
+
+    #[test]
+    fn power_sort_set_pulls_in_conflicted_auth_ancestor_of_power_event() {
+        // Spec step 1: "For each power event P, enlarge X by adding the events
+        // in the auth chain of P which also belong to the full conflicted set."
+        // Here a contested self-join (NOT a power event) is the sender
+        // membership a contested power_levels event depends on. It MUST land in
+        // the power-sort set, not the mainline set — the bug routed it to the
+        // mainline because the split was done purely by `is_power_event`.
+        let (mut provider, create_id, room_id) = setup_default();
+        let alice_join = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.member".to_owned(),
+        )
+        .room_id(room_id.clone())
+        .state_key("@alice:example.org".to_owned())
+        .content(json!({ "membership": "join" }))
+        .auth_events(vec![create_id.clone()])
+        .prev_events(vec![create_id.clone()])
+        .prev_state_events(vec![create_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid join");
+        let join_id = put(&mut provider, alice_join);
+        // power_levels whose auth chain includes the self-join above.
+        let pl = room_pl(
+            &room_id,
+            "@alice:example.org",
+            json!({ "users_default": 1 }),
+            vec![create_id.clone(), join_id.clone()],
+        );
+        let pl_id = put(&mut provider, pl);
+
+        let full: HashSet<OwnedEventId> = [create_id.clone(), join_id.clone(), pl_id.clone()]
+            .into_iter()
+            .collect();
+
+        // The naive `is_power_event` split (the old behaviour) excludes the
+        // self-join — proving the enlargement below is load-bearing, not a
+        // no-op.
+        let (naive_power, naive_non_power) = split_power_events(&full, &provider).unwrap();
+        assert!(
+            !naive_power.contains(&join_id),
+            "a self-join is not itself a power event"
+        );
+        assert!(naive_non_power.contains(&join_id));
+
+        // The step-1 set pulls the self-join in via the power_levels auth chain.
+        let step1 = power_sort_set(&full, &provider).unwrap();
+        assert!(
+            step1.contains(&join_id),
+            "conflicted auth-ancestor of a power event must join the power-sort set"
+        );
+        assert!(step1.contains(&pl_id));
+        // And the mainline complement no longer carries it.
+        let mainline_set: HashSet<OwnedEventId> = full.difference(&step1).cloned().collect();
+        assert!(!mainline_set.contains(&join_id));
+    }
+
+    #[test]
+    fn power_sort_set_empty_when_no_power_events() {
+        // No power events in the conflicted set → nothing to anchor an auth
+        // chain on → the step-1 set is empty (everything goes to the mainline).
+        let (mut provider, create_id, room_id) = setup_default();
+        let topic = room_topic(&room_id, "@alice:example.org", vec![create_id]);
+        let topic_id = put(&mut provider, topic);
+        let full: HashSet<OwnedEventId> = [topic_id].into_iter().collect();
+        assert!(power_sort_set(&full, &provider).unwrap().is_empty());
     }
 
     // ----- mainline -----
