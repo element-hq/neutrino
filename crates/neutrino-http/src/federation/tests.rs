@@ -2612,6 +2612,48 @@ async fn outbound_join_all_candidates_dead_returns_502() {
     assert_eq!(status, StatusCode::BAD_GATEWAY);
 }
 
+#[tokio::test]
+async fn room_scoped_join_uses_pending_invite_server() {
+    // Resident B hosts a public room and is reachable on an ephemeral port.
+    let (b_router, _b_store, room_id, _head, _b_temp) = seed_public_room().await;
+    let b_server = crate::federation::test_support::spawn_stub(b_router).await;
+
+    // Joining server A (@bob:a.example) starts empty — no `server_name` hint.
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_router = router_with_store(config_for("a.example", "bob"), a_store.clone());
+
+    // Plant a pending OOB invite for @bob:a.example whose inviter lives on B,
+    // so the inviter's server resolves to the live resident.
+    let inviter: OwnedUserId = format!("@alice:{b_server}").parse().unwrap();
+    let throwaway = EventBuilder::new(inviter.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build throwaway create for a valid prev id");
+    let invite = member_pdu(
+        &inviter,
+        "@bob:a.example",
+        &room_id,
+        "invite",
+        std::slice::from_ref(&throwaway.event_id),
+    );
+    let bob: OwnedUserId = "@bob:a.example".parse().unwrap();
+    a_store.put_invite(&room_id, &bob, &invite).await.unwrap();
+
+    // Room-scoped join with NO `server_name` — the SDK's invite-accept path.
+    let path = format!("/_matrix/client/v3/rooms/{room_id}/join");
+    let (status, body) = post_json(&a_router, &path, &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["room_id"], room_id.as_str());
+
+    let member = a_store
+        .current_state_event(&room_id, "m.room.member", "@bob:a.example")
+        .await
+        .unwrap()
+        .expect("bob joined via the invite-sourced server");
+    assert_eq!(membership_str(&member).as_deref(), Some("join"));
+}
+
 #[test]
 fn parse_server_names_handles_repeats_and_encoded_colon() {
     use crate::federation::join::parse_server_names;

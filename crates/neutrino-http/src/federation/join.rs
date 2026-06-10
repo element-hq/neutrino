@@ -26,7 +26,7 @@ use axum::{
 };
 use neutrino_common::ROOM_VERSION_ID;
 use neutrino_state::event_id::from_wire;
-use neutrino_store::{RoomStore, StagingStore, StateStore, StreamPos};
+use neutrino_store::{InviteStore, RoomStore, StagingStore, StateStore, StreamPos};
 use ruma::{OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId};
 use serde_json::json;
 use tokio::sync::{mpsc, watch};
@@ -92,6 +92,41 @@ pub(crate) async fn federated_join_with(
         }
     }
     error_response(StatusCode::BAD_GATEWAY, "M_UNKNOWN", last_err)
+}
+
+/// For a room we do NOT host, assemble the candidate resident servers and run a
+/// federated join. Candidates are `hints` (explicit `?server_name=`) followed by
+/// the inviter's server when the user holds a pending out-of-band invite — the
+/// client cannot supply a `via` for a v12 room id (no domain), so we mirror
+/// Synapse (`handlers/room_member.py:1108`) and source it from the invite.
+/// Returns:
+///   - `Some(_)` when a federated join was attempted (its CSAPI response), or
+///   - `None` when the room is hosted, or no candidate could be sourced — the
+///     caller then falls back to the local join path.
+pub(crate) async fn federated_join_if_remote(
+    state: &AppState,
+    user: &UserId,
+    room_id: &RoomId,
+    hints: &[OwnedServerName],
+) -> Option<Response> {
+    let store = lock_app(state).store.clone();
+    // Resident (or a storage fault): the local path owns it. A storage error
+    // falls through to local, which surfaces it as a 500 — matching the prior
+    // inline behaviour in `join_by_id_or_alias`.
+    if !matches!(store.room_exists(room_id).await, Ok(false)) {
+        return None;
+    }
+    let mut candidates: Vec<OwnedServerName> = hints.to_vec();
+    if let Ok(Some(invite)) = store.get_invite(room_id, user).await {
+        let inviter = invite.sender.server_name().to_owned();
+        if !candidates.contains(&inviter) {
+            candidates.push(inviter);
+        }
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    Some(federated_join(state, user.to_owned(), room_id, &candidates).await)
 }
 
 /// One candidate's handshake: make_join → complete → send_join → ingest. Any

@@ -175,6 +175,15 @@ pub(crate) async fn join(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    // A room we don't host + a pending invite ⇒ federated join via the
+    // inviter's server (the SDK accepts invites through this endpoint and
+    // supplies no `server_name`). Hosted rooms / no invite return None and
+    // fall through to the local path below.
+    if let Some(resp) =
+        crate::federation::join::federated_join_if_remote(&state.0, &sender, &room, &[]).await
+    {
+        return resp;
+    }
     match current_membership(&state.0, &room, &sender).await {
         Ok(Some(m)) if m == "join" => {
             return (StatusCode::OK, Json(json!({ "room_id": room }))).into_response();
