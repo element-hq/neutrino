@@ -2693,6 +2693,28 @@ async fn join_by_alias_falls_back_to_invite_server_after_dead_hint() {
     );
 }
 
+#[tokio::test]
+async fn room_scoped_join_unknown_room_no_invite_returns_404() {
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_router = router_with_store(config_for("a.example", "bob"), a_store.clone());
+
+    // Syntactically valid v12-style room id we don't host, no invite planted.
+    let room = "!unknown:b.example";
+    let path = format!("/_matrix/client/v3/rooms/{room}/join");
+    let (status, _body) = post_json(&a_router, &path, &json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let rid = RoomId::parse(room).unwrap();
+    assert!(
+        a_store
+            .current_state_event(&rid, "m.room.member", "@bob:a.example")
+            .await
+            .unwrap()
+            .is_none(),
+        "no join must be created when nothing could source a server"
+    );
+}
+
 #[test]
 fn parse_server_names_handles_repeats_and_encoded_colon() {
     use crate::federation::join::parse_server_names;
