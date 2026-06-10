@@ -2654,6 +2654,45 @@ async fn room_scoped_join_uses_pending_invite_server() {
     assert_eq!(membership_str(&member).as_deref(), Some("join"));
 }
 
+#[tokio::test]
+async fn join_by_alias_falls_back_to_invite_server_after_dead_hint() {
+    let (b_router, _b_store, room_id, _head, _b_temp) = seed_public_room().await;
+    let b_server = crate::federation::test_support::spawn_stub(b_router).await;
+    let dead = crate::federation::test_support::dead_peer().await;
+
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_router = router_with_store(config_for("a.example", "bob"), a_store.clone());
+
+    let inviter: OwnedUserId = format!("@alice:{b_server}").parse().unwrap();
+    let throwaway = EventBuilder::new(inviter.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build throwaway create");
+    let invite = member_pdu(
+        &inviter,
+        "@bob:a.example",
+        &room_id,
+        "invite",
+        std::slice::from_ref(&throwaway.event_id),
+    );
+    let bob: OwnedUserId = "@bob:a.example".parse().unwrap();
+    a_store.put_invite(&room_id, &bob, &invite).await.unwrap();
+
+    // Explicit hint is dead; the invite sender (live B) is appended and used.
+    let path = format!("/_matrix/client/v3/join/{room_id}?server_name={dead}");
+    let (status, body) = post_json(&a_router, &path, &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert!(
+        a_store
+            .current_state_event(&room_id, "m.room.member", "@bob:a.example")
+            .await
+            .unwrap()
+            .is_some(),
+        "join must succeed via the invite-sourced server after the dead hint"
+    );
+}
+
 #[test]
 fn parse_server_names_handles_repeats_and_encoded_colon() {
     use crate::federation::join::parse_server_names;

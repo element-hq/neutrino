@@ -293,22 +293,15 @@ pub(crate) async fn join_by_id_or_alias(
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    // A room we don't host + explicit `server_name` hints ⇒ federated join.
-    // (A v12 room id carries no server, so without a hint we can only try
-    // locally, which 404s an unknown room.) A storage error here falls through
-    // to the local path, which surfaces it as a 500.
-    let store = lock_app(&state.0).store.clone();
-    if matches!(store.room_exists(&room).await, Ok(false)) {
-        let candidates = crate::federation::join::parse_server_names(query.as_deref());
-        if !candidates.is_empty() {
-            return crate::federation::join::federated_join(
-                &state.0,
-                auth.0.clone(),
-                &room,
-                &candidates,
-            )
-            .await;
-        }
+    // A room we don't host ⇒ federated join via the explicit `server_name`
+    // hints plus the inviter's server from any pending invite (a v12 room id
+    // carries no server, so without one of these we can only try locally,
+    // which 404s an unknown room). On None, fall through to the local path.
+    let hints = crate::federation::join::parse_server_names(query.as_deref());
+    if let Some(resp) =
+        crate::federation::join::federated_join_if_remote(&state.0, &auth.0, &room, &hints).await
+    {
+        return resp;
     }
     join(state, auth, Path(room_id_or_alias), body).await
 }
