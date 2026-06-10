@@ -73,6 +73,7 @@ Intentional gaps in the sliding-sync implementation — see `MSC4186-gaps.md`:
 - relocate `outbound_destinations` from the HTTP actor into `neutrino-state`
 - fold the repeated `FederationClient` PUT-event idiom into one helper
 - federated-invite error-code parity with the local invite path
+- OOB-invite join review leftovers (noted, not blocking): `federated_join_if_remote` runs twice on the `join_by_id_or_alias`→`join` fall-through; a single private `join_core(hints)` would collapse it. `room_exists` is a coarse "do we host it" gate (a timed-out federated join leaves the room registered mid-ingest, so a retry takes the local path). No single shared "is this room remote / who is the inviter's resident server" predicate (invite/leave/join each re-derive it). Stale OOB stub not removed on a successful federated accept (harmless — both sync builders supersede it). No direct test yet for the remote-`403`→`M_FORBIDDEN` promotion.
 - multi-server / idempotency federation tests
 - port the relevant Synapse + Complement membership-endpoint tests
 - `storage_dir` empty-string handling: an exported-but-empty `NEUTRINO_STORAGE_DIR=` (and the FFI

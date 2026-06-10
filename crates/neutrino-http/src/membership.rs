@@ -177,7 +177,7 @@ pub(crate) async fn join(
     };
     // A room we don't host + a pending invite ⇒ federated join via the
     // inviter's server (the SDK accepts invites through this endpoint and
-    // supplies no `server_name`). Hosted rooms / no invite return None and
+    // supplies no `via`). Hosted rooms / no invite return None and
     // fall through to the local path below.
     if let Some(resp) =
         crate::federation::join::federated_join_if_remote(&state.0, &sender, &room, &[]).await
@@ -275,7 +275,7 @@ pub(crate) async fn leave(
 /// `404 M_NOT_FOUND` ("No such room alias", matching Synapse) rather than the
 /// `400` a room-id parse would give, so clients see the alias as *unknown* not
 /// *malformed*. A string that is neither a valid id nor a valid alias still
-/// falls through to [`join`]'s `400`. The `server_name` query lists candidate
+/// falls through to [`join`]'s `400`. The `via` query lists candidate
 /// resident servers: for a room we don't host they trigger a federated join
 /// (`federation::join::federated_join`); for a room we already host they are
 /// ignored (we are the resident).
@@ -293,8 +293,8 @@ pub(crate) async fn join_by_id_or_alias(
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    // A room we don't host ⇒ federated join via the explicit `server_name`
-    // hints plus the inviter's server from any pending invite (a v12 room id
+    // A room we don't host ⇒ federated join via the explicit `via` hints
+    // plus the inviter's server from any pending invite (a v12 room id
     // carries no server, so without one of these we can only try locally,
     // which 404s an unknown room). On None, fall through to the local path.
     let hints = crate::federation::join::parse_server_names(query.as_deref());

@@ -2,8 +2,7 @@
 //!
 //! When a local user joins a room we don't host, the CSAPI `/join` handler
 //! delegates here. We run the handshake against each candidate resident server
-//! (`?server_name=` hints — a v12 room id carries no server, so we cannot
-//! derive one):
+//! (`?via=` hints — a v12 room id carries no server, so we cannot derive one):
 //!
 //! 1. `make_join` → a membership-event template on the resident's heads.
 //! 2. Complete it (fill ts, recompute the reference-hash id — no signature) and
@@ -32,7 +31,7 @@ use serde_json::json;
 use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
-use crate::federation::client::{FederationClient, SendJoinResponse};
+use crate::federation::client::{FederationClient, FederationClientError, SendJoinResponse};
 use crate::{AppState, error_response, lock_app};
 
 /// How long the CSAPI `/join` request blocks waiting for the worker to ground
@@ -75,7 +74,7 @@ pub(crate) async fn federated_join_with(
     // so `wait_for_join` can block on persists instead of polling.
     let mut persists = store.subscribe();
 
-    let mut last_err = "no resident server could be reached";
+    let mut terminal: Option<JoinFailure> = None;
     for dest in candidates {
         match try_join_via(&client, &*store, &worker_poke, dest, room_id, &user).await {
             Ok(()) => {
@@ -85,22 +84,40 @@ pub(crate) async fn federated_join_with(
                     Err(resp) => resp,
                 };
             }
-            Err(e) => {
-                warn!(%dest, error = e, "federated join via candidate failed");
-                last_err = e;
+            Err(f) => {
+                warn!(%dest, error = f.reason, "federated join via candidate failed");
+                // A 403 is an authoritative auth refusal — once any candidate
+                // returns it, keep it rather than let a later unreachable
+                // candidate downgrade the client's error back to 502.
+                if terminal
+                    .as_ref()
+                    .is_none_or(|t| t.status != StatusCode::FORBIDDEN)
+                {
+                    terminal = Some(f);
+                }
             }
         }
     }
-    error_response(StatusCode::BAD_GATEWAY, "M_UNKNOWN", last_err)
+    let f = terminal.unwrap_or_else(|| gateway("no resident server could be reached"));
+    error_response(f.status, f.errcode, f.reason)
 }
 
 /// For a room we do NOT host, assemble the candidate resident servers and run a
-/// federated join. Candidates are `hints` (explicit `?server_name=`) followed by
-/// the inviter's server when the user holds a pending out-of-band invite — the
+/// federated join. Candidates are `hints` (explicit `?via=`) followed by the
+/// inviter's server when the user holds a pending out-of-band invite — the
 /// client cannot supply a `via` for a v12 room id (no domain), so we mirror
 /// Synapse (`handlers/room_member.py:1108`) and source it from the invite.
+///
+/// Trust model: peers in the mesh are implicitly trusted, so the inviter's
+/// `server_name` is used as an outbound join target verbatim — there is no
+/// loopback / private-range / allowlist check. A hostile invite could point
+/// this request at an arbitrary host, but every federated peer is trusted by
+/// design (signatures are off for the same reason), so this is intentional, not
+/// an oversight.
+///
 /// Returns:
 ///   - `Some(_)` when a federated join was attempted (its CSAPI response), or
+///     when reading the invite hit a storage fault (surfaced as a `500`), or
 ///   - `None` when the room is hosted, or no candidate could be sourced — the
 ///     caller then falls back to the local join path.
 pub(crate) async fn federated_join_if_remote(
@@ -117,10 +134,24 @@ pub(crate) async fn federated_join_if_remote(
         return None;
     }
     let mut candidates: Vec<OwnedServerName> = hints.to_vec();
-    if let Ok(Some(invite)) = store.get_invite(room_id, user).await {
-        let inviter = invite.sender.server_name().to_owned();
-        if !candidates.contains(&inviter) {
-            candidates.push(inviter);
+    // A pending OOB invite supplies the inviter's server as a fallback
+    // candidate. A storage fault here is surfaced as a 500 (matching `leave`'s
+    // invite lookup), not silently mistaken for "no invite" — which would 404 a
+    // room the user could in fact join.
+    match store.get_invite(room_id, user).await {
+        Ok(Some(invite)) => {
+            let inviter = invite.sender.server_name().to_owned();
+            if !candidates.contains(&inviter) {
+                candidates.push(inviter);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Some(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            ));
         }
     }
     if candidates.is_empty() {
@@ -129,8 +160,43 @@ pub(crate) async fn federated_join_if_remote(
     Some(federated_join(state, user.to_owned(), room_id, &candidates).await)
 }
 
+/// Why one candidate's join handshake failed, plus how to surface it to the
+/// CSAPI client if no candidate succeeds. A remote `403` is an authoritative
+/// auth refusal (invite-only / banned) and maps to the spec's `403
+/// M_FORBIDDEN`; every other failure (transport, 5xx, version mismatch, ingest)
+/// is a gateway failure → `502 M_UNKNOWN`.
+struct JoinFailure {
+    reason: &'static str,
+    status: StatusCode,
+    errcode: &'static str,
+}
+
+/// A retryable/opaque candidate failure: `502 M_UNKNOWN` carrying `reason`.
+fn gateway(reason: &'static str) -> JoinFailure {
+    JoinFailure {
+        reason,
+        status: StatusCode::BAD_GATEWAY,
+        errcode: "M_UNKNOWN",
+    }
+}
+
+/// Map a `make_join`/`send_join` client error into a [`JoinFailure`], promoting
+/// a remote `403` into a client-visible `403 M_FORBIDDEN`; everything else is a
+/// gateway failure tagged with `reason`.
+fn from_client_err(e: FederationClientError, reason: &'static str) -> JoinFailure {
+    match e {
+        FederationClientError::Status(403) => JoinFailure {
+            reason: "resident refused the join",
+            status: StatusCode::FORBIDDEN,
+            errcode: "M_FORBIDDEN",
+        },
+        _ => gateway(reason),
+    }
+}
+
 /// One candidate's handshake: make_join → complete → send_join → ingest. Any
-/// failure returns a short reason so the caller can try the next candidate.
+/// failure returns a [`JoinFailure`] so the caller can try the next candidate
+/// and, if all fail, surface the most authoritative error to the client.
 async fn try_join_via(
     client: &FederationClient,
     store: &(impl RoomStore + StagingStore),
@@ -138,26 +204,28 @@ async fn try_join_via(
     dest: &ServerName,
     room_id: &RoomId,
     user: &UserId,
-) -> Result<(), &'static str> {
+) -> Result<(), JoinFailure> {
     let template = client
         .make_join(dest, room_id, user, ROOM_VERSION_ID)
         .await
-        .map_err(|_| "make_join request failed")?;
+        .map_err(|e| from_client_err(e, "make_join request failed"))?;
     if template.room_version != ROOM_VERSION_ID {
-        return Err("resident room version is unsupported");
+        return Err(gateway("resident room version is unsupported"));
     }
 
     let join =
         crate::federation::complete_membership_template(&template.event, room_id, user, "join")
-            .ok_or("could not complete the join template")?;
+            .ok_or_else(|| gateway("could not complete the join template"))?;
     let join_id = join.event_id.clone();
 
     let resp = client
         .send_join(dest, room_id, &join_id, &join.raw)
         .await
-        .map_err(|_| "send_join request failed")?;
+        .map_err(|e| from_client_err(e, "send_join request failed"))?;
 
-    ingest_state_dag(store, worker_poke, dest, room_id, resp).await
+    ingest_state_dag(store, worker_poke, dest, room_id, resp)
+        .await
+        .map_err(gateway)
 }
 
 /// Ingest a `send_join` response: register the room from its create event (if
@@ -273,7 +341,9 @@ fn membership_is_join(event: &neutrino_common::Event) -> bool {
     event.content_str("membership").as_deref() == Some("join")
 }
 
-/// Parse repeated `?server_name=` query values into resident-server candidates.
+/// Parse repeated `?via=` (or the pre-1.12 alias `?server_name=`) query values
+/// into resident-server candidates. `via` superseded `server_name` in Matrix
+/// v1.12; we advertise v1.16, so ruma clients send `via` — accept both.
 /// Tolerates a percent-encoded port colon (`%3A`) — the common client encoding;
 /// other escapes are left as-is (server names are host[:port], rarely encoded).
 pub(crate) fn parse_server_names(raw: Option<&str>) -> Vec<OwnedServerName> {
@@ -283,7 +353,7 @@ pub(crate) fn parse_server_names(raw: Option<&str>) -> Vec<OwnedServerName> {
     raw.split('&')
         .filter_map(|pair| {
             let (key, val) = pair.split_once('=')?;
-            if key != "server_name" {
+            if key != "via" && key != "server_name" {
                 return None;
             }
             let decoded = val.replace("%3A", ":").replace("%3a", ":");

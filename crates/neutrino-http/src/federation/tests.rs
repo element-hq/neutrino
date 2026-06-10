@@ -2715,6 +2715,129 @@ async fn room_scoped_join_unknown_room_no_invite_returns_404() {
     );
 }
 
+#[tokio::test]
+async fn join_tries_hint_before_invite_fallback() {
+    // Live resident B hosts the room and will satisfy the join.
+    let (b_router, _b_store, room_id, _head, _b_temp) = seed_public_room().await;
+    let b_server = crate::federation::test_support::spawn_stub(b_router).await;
+
+    // A live *decoy* hint that records each make_join hit and refuses (500), so
+    // the test can prove the explicit hint is attempted *before* the invite
+    // server — a plain `dead_peer` can't distinguish "tried first" from
+    // "silently dropped".
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let decoy = {
+        let hits = hits.clone();
+        axum::Router::new().route(
+            "/_matrix/federation/v1/make_join/{room_id}/{user_id}",
+            axum::routing::get(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        )
+    };
+    let decoy_server = crate::federation::test_support::spawn_stub(decoy).await;
+
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_router = router_with_store(config_for("a.example", "bob"), a_store.clone());
+
+    // Pending invite whose sender lives on the live resident B.
+    let inviter: OwnedUserId = format!("@alice:{b_server}").parse().unwrap();
+    let throwaway = EventBuilder::new(inviter.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build throwaway create");
+    let invite = member_pdu(
+        &inviter,
+        "@bob:a.example",
+        &room_id,
+        "invite",
+        std::slice::from_ref(&throwaway.event_id),
+    );
+    let bob: OwnedUserId = "@bob:a.example".parse().unwrap();
+    a_store.put_invite(&room_id, &bob, &invite).await.unwrap();
+
+    // `via` names the decoy (tried first); the invite server is the fallback.
+    let path = format!("/_matrix/client/v3/join/{room_id}?via={decoy_server}");
+    let (status, body) = post_json(&a_router, &path, &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+
+    assert!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the explicit hint must be attempted before falling back to the invite server"
+    );
+    let member = a_store
+        .current_state_event(&room_id, "m.room.member", "@bob:a.example")
+        .await
+        .unwrap()
+        .expect("bob joined via the invite-sourced fallback");
+    assert_eq!(membership_str(&member).as_deref(), Some("join"));
+}
+
+#[tokio::test]
+async fn hosted_room_with_pending_invite_does_not_federate() {
+    // We host the room locally (seed store), and mount the joining server on top.
+    let (_seed_router, store, room_id, _head, _temp) = seed_public_room().await;
+    let router = router_with_store(config_for("a.example", "bob"), store.clone());
+
+    // Plant a stale OOB invite for the local user whose inviter lives on a dead
+    // server. If the `room_exists` guard ever regressed and this federated, the
+    // join would contact that dead server and 502; because the room is resident
+    // it must take the local path and join (200) without any outbound request.
+    let dead = crate::federation::test_support::dead_peer().await;
+    let inviter: OwnedUserId = format!("@alice:{dead}").parse().unwrap();
+    let throwaway = EventBuilder::new(inviter.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build throwaway create");
+    let invite = member_pdu(
+        &inviter,
+        "@bob:a.example",
+        &room_id,
+        "invite",
+        std::slice::from_ref(&throwaway.event_id),
+    );
+    let bob: OwnedUserId = "@bob:a.example".parse().unwrap();
+    store.put_invite(&room_id, &bob, &invite).await.unwrap();
+
+    let path = format!("/_matrix/client/v3/rooms/{room_id}/join");
+    let (status, body) = post_json(&router, &path, &json!({})).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a hosted room must join locally, never federate via the invite: {body:?}"
+    );
+    let member = store
+        .current_state_event(&room_id, "m.room.member", "@bob:a.example")
+        .await
+        .unwrap()
+        .expect("bob joined the resident room locally");
+    assert_eq!(membership_str(&member).as_deref(), Some("join"));
+}
+
+#[test]
+fn parse_server_names_accepts_via_and_server_name() {
+    use crate::federation::join::parse_server_names;
+    // `via` is the v1.12+ name; a modern client sends only `via` to our v1.16.
+    let via = parse_server_names(Some("via=127.0.0.1%3A8008&via=other.example"));
+    let via: Vec<String> = via.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        via,
+        vec!["127.0.0.1:8008".to_string(), "other.example".to_string()]
+    );
+    // The pre-1.12 `server_name` alias is still accepted for older clients.
+    let legacy = parse_server_names(Some("server_name=legacy.example"));
+    assert_eq!(
+        legacy.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        vec!["legacy.example".to_string()]
+    );
+}
+
 #[test]
 fn parse_server_names_handles_repeats_and_encoded_colon() {
     use crate::federation::join::parse_server_names;
