@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    ops::ControlFlow,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -11,7 +12,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post, put},
 };
-use neutrino_common::{Config, Event, ROOM_VERSION_ID};
+use neutrino_common::{Command, Config, Event, ROOM_VERSION_ID};
 use neutrino_state::event_id::EventBuilder;
 use neutrino_state::provider::InMemoryStateProvider;
 use neutrino_state::room_core::{Effect, RoomCore};
@@ -206,7 +207,11 @@ impl AppState {
     }
 }
 
-pub async fn serve(listener: TcpListener, config: Config) -> Result<(), StartupError> {
+pub async fn serve(
+    listener: TcpListener,
+    config: Config,
+    commands: mpsc::UnboundedReceiver<Command>,
+) -> Result<(), StartupError> {
     let state = AppState::new(config).await?;
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
@@ -216,16 +221,50 @@ pub async fn serve(listener: TcpListener, config: Config) -> Result<(), StartupE
         state.server_name(),
         state.outbound_concurrency(),
     );
-    let router = build_router(state);
+    let router = build_router(&state);
+    // `dispatch` resolves on a terminal command or when every sender is dropped,
+    // which drives axum's graceful shutdown — in-flight requests drain first.
+    // `state` is threaded in so server-directed commands can act on internals.
     axum::serve(listener, router)
+        .with_graceful_shutdown(dispatch(commands, state))
         .await
         .map_err(StartupError::Io)?;
     Ok(())
 }
 
+/// Dispatch out-of-band control commands until a terminal one (`Shutdown`)
+/// arrives, or until every sender is dropped — the embedding host released the
+/// last `NeutrinoHandle`. Resolving this future is what triggers the server's
+/// graceful shutdown in [`serve`].
+///
+/// This is the permanent home for command handling: a server-directed command
+/// (e.g. a future `NetworkReachable` that kicks the federation sender's
+/// backoff) acts on internals reachable only from inside `serve`, and is added
+/// as one more arm in [`handle`] returning [`ControlFlow::Continue`] to keep
+/// the loop running. `_state` is the handle to those internals, threaded in
+/// now (unused until the first server-directed command) so the wiring is ready.
+async fn dispatch(mut commands: mpsc::UnboundedReceiver<Command>, _state: AppState) {
+    while let Some(command) = commands.recv().await {
+        if handle(command).is_break() {
+            return;
+        }
+    }
+    // Channel closed: all senders dropped — fall through to shut down.
+}
+
+/// Apply a single control command, returning whether the dispatch loop should
+/// stop ([`ControlFlow::Break`]) or keep running ([`ControlFlow::Continue`]).
+/// Splitting this out of [`dispatch`] keeps per-command behaviour
+/// unit-testable, and the `Continue` path is what makes the loop a genuine loop.
+fn handle(command: Command) -> ControlFlow<()> {
+    match command {
+        Command::Shutdown => ControlFlow::Break(()),
+    }
+}
+
 pub async fn router(config: Config) -> Result<Router, StartupError> {
     let state = AppState::new(config).await?;
-    Ok(build_router(state))
+    Ok(build_router(&state))
 }
 
 /// Test-only constructor that mounts the same router over an externally-
@@ -237,7 +276,7 @@ pub async fn router(config: Config) -> Result<Router, StartupError> {
 #[cfg(test)]
 pub(crate) fn router_with_store(config: Config, store: Arc<SqliteStore>) -> Router {
     let state = AppState::from_store(config, store);
-    build_router(state)
+    build_router(&state)
 }
 
 /// Like [`router_with_store`] but with an injected gap-fill `fetcher`. The
@@ -251,10 +290,10 @@ pub(crate) fn router_with_store_and_fetcher(
     fetcher: Arc<dyn MissingEventsFetcher>,
 ) -> Router {
     let state = AppState::from_store_with_fetcher(config, store, fetcher);
-    build_router(state)
+    build_router(&state)
 }
 
-fn build_router(state: AppState) -> Router {
+fn build_router(state: &AppState) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/_matrix/client/versions", get(versions))
@@ -417,7 +456,9 @@ fn build_router(state: AppState) -> Router {
                     },
                 ),
         )
-        .with_state(state)
+        // `AppState` is `Arc`-backed; this clone is the router's instance, the
+        // caller keeps the other (e.g. `serve` hands its instance to `dispatch`).
+        .with_state(state.clone())
 }
 
 async fn root() -> &'static str {
@@ -1325,8 +1366,85 @@ async fn default_fallback() -> (StatusCode, &'static str) {
 
 #[cfg(test)]
 mod tests {
-    use super::join_rule_for;
+    use super::{
+        AppState, Command, Config, ControlFlow, SqliteStore, TcpListener, dispatch, handle,
+        join_rule_for, mpsc,
+    };
     use serde_json::json;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    fn test_config(tmp: &TempDir) -> Config {
+        Config {
+            server_name: "127.0.0.1".to_string(),
+            bind_addr: "127.0.0.1:0".to_string(),
+            localpart: "alice".to_string(),
+            storage_dir: tmp.path().to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    /// A throwaway `AppState` over a fresh temp-dir store. `dispatch` takes a
+    /// state handle (for future server-directed commands); these tests only
+    /// exercise the lifecycle arms, so the state is constructed but unused.
+    async fn test_state() -> (AppState, TempDir) {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = Arc::new(
+            SqliteStore::open_in_dir(tmp.path())
+                .await
+                .expect("open store"),
+        );
+        let state = AppState::from_store(test_config(&tmp), store);
+        (state, tmp)
+    }
+
+    #[test]
+    fn handle_shutdown_breaks() {
+        // The only terminal command today. When a non-terminal variant lands it
+        // returns ControlFlow::Continue, and this stays the per-command oracle.
+        assert_eq!(handle(Command::Shutdown), ControlFlow::Break(()));
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_on_shutdown() {
+        let (state, _tmp) = test_state().await;
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Command::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), dispatch(rx, state))
+            .await
+            .expect("dispatch must return promptly on Shutdown, not hang");
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_when_all_senders_dropped() {
+        let (state, _tmp) = test_state().await;
+        let (tx, rx) = mpsc::unbounded_channel::<Command>();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(1), dispatch(rx, state))
+            .await
+            .expect("dispatch must return promptly when the channel closes, not hang");
+    }
+
+    #[tokio::test]
+    async fn serve_stops_when_shutdown_command_sent() {
+        // End-to-end: a Shutdown command must actually drive `serve` to return
+        // via the graceful-shutdown wiring — not just the dispatch helper in
+        // isolation. A regression that dropped/mis-wired the receiver would hang
+        // here and trip the timeout.
+        let tmp = TempDir::new().expect("tempdir");
+        let config = test_config(&tmp);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let (tx, rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(super::serve(listener, config, rx));
+        tx.send(Command::Shutdown).expect("send shutdown");
+        let joined = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("serve must return after a Shutdown command, not hang");
+        joined
+            .expect("serve task must not panic")
+            .expect("serve must return Ok after graceful shutdown");
+    }
 
     #[test]
     fn join_rule_explicit_preset_wins_over_visibility() {
