@@ -1552,6 +1552,11 @@ async fn send_gapfills_missing_ancestry_then_accepts() {
         .unwrap();
     assert_eq!(committed.len(), 2, "orphan + child both committed");
     assert!(committed.iter().all(|e| !e.rejected));
+    // The worker commits a PDU and unstages it in two separate steps, so the
+    // child can be visible in `events` a beat before its (and the orphan's)
+    // staged rows are deleted. Wait for the drain to settle before asserting
+    // emptiness, rather than racing the worker's follow-up unstage.
+    wait_staging_empty(&store, &room_id).await;
     let still_missing = store
         .ancestry_gap(&room_id, &[child_id.as_ref()])
         .await
