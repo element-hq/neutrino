@@ -77,9 +77,13 @@ impl NeutrinoHandle {
 /// Spawn an owned Tokio runtime and begin polling the server entrypoint with
 /// the supplied configuration. Returns a handle for pushing control commands
 /// (including `Shutdown`) into the running server. When the server stops
-/// (via `Shutdown` or channel close) the runtime is dropped on its OS thread,
-/// which cancels async stragglers, joins the blocking pool, and reclaims all
-/// runtime threads.
+/// (via `Shutdown` or channel close) the runtime is dropped on its OS thread:
+/// the executor stops and async tasks are cancelled at their next await point,
+/// but joining the blocking pool waits for any in-flight SQLite write to finish
+/// — those `spawn_blocking` closures are non-cancellable (`neutrino-store-sqlite`
+/// `WRITE_TIMEOUT` surfaces a hung write to its awaiter but does not stop the
+/// closure). Normal writes are sub-millisecond, so teardown is effectively
+/// immediate; only a runaway closure can delay this thread's exit.
 #[uniffi::export]
 pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -109,8 +113,12 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
             }
         });
         // `rt` drops here on this OS thread (sync context — safe): the executor
-        // stops, async stragglers are cancelled, the blocking pool is joined, the
-        // thread exits. This is the real runtime teardown.
+        // stops and async tasks are cancelled at their next await point. Joining
+        // the blocking pool, however, waits for any in-flight SQLite write to
+        // finish — `spawn_blocking` closures are non-cancellable (the store's
+        // `WRITE_TIMEOUT` only surfaces a hung write to its awaiter, it does not
+        // stop the closure), so a runaway write can delay this thread's exit.
+        // Normal writes are sub-millisecond, so in practice teardown is immediate.
     });
     NeutrinoHandle { tx }
 }
