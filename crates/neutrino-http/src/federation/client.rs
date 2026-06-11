@@ -17,10 +17,11 @@ use std::time::Duration;
 
 use reqwest::Client;
 use ruma::{EventId, OwnedEventId, RoomId, ServerName, UserId};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue as RawJsonValue;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::federation::gapfill::MissingEventsFetcher;
 use crate::federation::{get_missing_events, now_ms};
@@ -30,6 +31,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Total per-request timeout (headers + body). Bounds a slow/black-holing peer
 /// so it can't stall a sender task indefinitely.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Cap on how many characters of a peer's response body we log. Bounds the line
+/// length on a verbose/hostile peer while still capturing a Matrix
+/// `{errcode,error}` reason, which is small.
+const BODY_LOG_LIMIT: usize = 1024;
 
 /// Errors the outbound client can surface to a caller (the sender loop,
 /// which decides retry-vs-give-up from the variant).
@@ -96,7 +101,7 @@ impl FederationClient {
         };
         let resp = self.http.put(&url).json(&body).send().await?;
         if !resp.status().is_success() {
-            return Err(FederationClientError::Status(resp.status().as_u16()));
+            return Err(non_2xx_error(resp, dest, "PUT /send").await);
         }
         Ok(())
     }
@@ -142,12 +147,13 @@ impl FederationClient {
         };
         let resp = self.http.post(url).json(&body).send().await?;
         if !resp.status().is_success() {
-            return Err(FederationClientError::Status(resp.status().as_u16()));
+            return Err(non_2xx_error(resp, dest, "POST /get_missing_events").await);
         }
-        Ok(resp
-            .json::<get_missing_events::ResponseBody>()
-            .await?
-            .events)
+        Ok(
+            parse_2xx::<get_missing_events::ResponseBody>(resp, dest, "POST /get_missing_events")
+                .await?
+                .events,
+        )
     }
 
     /// `GET http://{dest}/_matrix/federation/v1/make_join/{room}/{user}?ver={ver}`
@@ -173,9 +179,9 @@ impl FederationClient {
 
         let resp = self.http.get(url).send().await?;
         if !resp.status().is_success() {
-            return Err(FederationClientError::Status(resp.status().as_u16()));
+            return Err(non_2xx_error(resp, dest, "GET /make_join").await);
         }
-        Ok(resp.json::<MakeJoinResponse>().await?)
+        parse_2xx::<MakeJoinResponse>(resp, dest, "GET /make_join").await
     }
 
     /// `PUT http://{dest}/_matrix/federation/v2/send_join/{room}/{event_id}`
@@ -199,9 +205,9 @@ impl FederationClient {
 
         let resp = self.http.put(url).json(&event).send().await?;
         if !resp.status().is_success() {
-            return Err(FederationClientError::Status(resp.status().as_u16()));
+            return Err(non_2xx_error(resp, dest, "PUT /send_join").await);
         }
-        Ok(resp.json::<SendJoinResponse>().await?)
+        parse_2xx::<SendJoinResponse>(resp, dest, "PUT /send_join").await
     }
 
     /// `PUT http://{dest}/_matrix/federation/v2/invite/{room}/{event_id}`
@@ -234,9 +240,9 @@ impl FederationClient {
         };
         let resp = self.http.put(url).json(&body).send().await?;
         if !resp.status().is_success() {
-            return Err(FederationClientError::Status(resp.status().as_u16()));
+            return Err(non_2xx_error(resp, dest, "PUT /invite").await);
         }
-        Ok(resp.json::<InviteResponse>().await?)
+        parse_2xx::<InviteResponse>(resp, dest, "PUT /invite").await
     }
 
     /// `GET http://{dest}/_matrix/federation/v1/make_leave/{room}/{user}?ver={ver}`
@@ -264,9 +270,9 @@ impl FederationClient {
 
         let resp = self.http.get(url).send().await?;
         if !resp.status().is_success() {
-            return Err(FederationClientError::Status(resp.status().as_u16()));
+            return Err(non_2xx_error(resp, dest, "GET /make_leave").await);
         }
-        Ok(resp.json::<MakeLeaveResponse>().await?)
+        parse_2xx::<MakeLeaveResponse>(resp, dest, "GET /make_leave").await
     }
 
     /// `PUT http://{dest}/_matrix/federation/v2/send_leave/{room}/{event_id}`
@@ -291,10 +297,46 @@ impl FederationClient {
 
         let resp = self.http.put(url).json(&event).send().await?;
         if !resp.status().is_success() {
-            return Err(FederationClientError::Status(resp.status().as_u16()));
+            return Err(non_2xx_error(resp, dest, "PUT /send_leave").await);
         }
         Ok(())
     }
+}
+
+/// Drain a non-2xx federation response into a [`FederationClientError::Status`],
+/// logging the peer's response **body** first. Without this the peer's Matrix
+/// `{errcode,error}` (the actual reason it rejected) is discarded and an
+/// operator debugging the failure sees only a bare status code. `endpoint` is a
+/// short label (e.g. `"PUT /send_join"`) for the log line.
+async fn non_2xx_error(
+    resp: reqwest::Response,
+    dest: &ServerName,
+    endpoint: &str,
+) -> FederationClientError {
+    let status = resp.status().as_u16();
+    // `text()` consumes `resp`, which we are discarding anyway. A body-read
+    // failure degrades to an empty body (logged as `body=""`) — the status is
+    // what matters.
+    let body = resp.text().await.unwrap_or_default();
+    let body: String = body.chars().take(BODY_LOG_LIMIT).collect();
+    warn!(target: "neutrino_http", %dest, endpoint, status, %body, "federation peer returned non-2xx");
+    FederationClientError::Status(status)
+}
+
+/// Deserialize a 2xx federation response body, logging the parse error on
+/// failure. A peer that answers `200` with a malformed/unexpected body otherwise
+/// surfaces as an indistinguishable [`FederationClientError::Transport`] with no
+/// record of *what* failed to parse; the `{:?}` rendering of the reqwest error
+/// carries the underlying serde detail (e.g. a missing field).
+async fn parse_2xx<T: DeserializeOwned>(
+    resp: reqwest::Response,
+    dest: &ServerName,
+    endpoint: &str,
+) -> Result<T, FederationClientError> {
+    resp.json::<T>().await.map_err(|e| {
+        warn!(target: "neutrino_http", %dest, endpoint, error = ?e, "federation peer returned an unparseable 2xx body");
+        e.into()
+    })
 }
 
 /// The v2 `/invite` request envelope (mirror of the inbound
