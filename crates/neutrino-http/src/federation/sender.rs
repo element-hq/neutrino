@@ -66,6 +66,17 @@ use crate::federation::{BACKOFF_BASE, MAX_PDUS_PER_TXN, jitter, next_backoff, no
 /// retries so they don't flood the network in lockstep.
 const STARTUP_JITTER_MAX: Duration = Duration::from_secs(30);
 
+/// Shared, cheaply-cloneable handles every sender task needs. Bundled so the
+/// per-destination signatures stay readable as the pool grows (mirrors
+/// `worker::WorkerCtx`).
+#[derive(Clone)]
+struct SenderCtx {
+    store: Arc<SqliteStore>,
+    client: Arc<FederationClient>,
+    idgen: Arc<TxnIdGen>,
+    send_slots: Arc<Semaphore>,
+}
+
 /// Spawn the outbound sender pool. Returns the supervisor's `JoinHandle` so
 /// the caller can await it after the shutdown token fires.
 ///
@@ -99,25 +110,20 @@ fn spawn_with(
     // "≥ 1" invariant holds regardless of how `Config` was constructed (the
     // `from_env` path already clamps, but the field is `pub`).
     let send_slots = Arc::new(Semaphore::new(concurrency.max(1)));
-    tokio::spawn(supervise(
+    let ctx = SenderCtx {
         store,
         client,
         idgen,
         send_slots,
-        watch_rx,
-        startup_jitter_max,
-        shutdown,
-    ))
+    };
+    tokio::spawn(supervise(ctx, watch_rx, startup_jitter_max, shutdown))
 }
 
 /// Discovery loop: ensure every destination with pending PDUs has a running
 /// sender task. Runs until the shutdown token is cancelled or the store's watch
 /// sender is dropped. On exit, aborts all per-destination child tasks.
 async fn supervise(
-    store: Arc<SqliteStore>,
-    client: Arc<FederationClient>,
-    idgen: Arc<TxnIdGen>,
-    send_slots: Arc<Semaphore>,
+    ctx: SenderCtx,
     mut watch_rx: watch::Receiver<StreamPos>,
     startup_jitter_max: Duration,
     shutdown: CancellationToken,
@@ -125,7 +131,7 @@ async fn supervise(
     let mut running: HashMap<OwnedServerName, JoinHandle<()>> = HashMap::new();
     let mut first_round = true;
     loop {
-        match store.pending_destinations().await {
+        match ctx.store.pending_destinations().await {
             Ok(dests) => {
                 for dest in dests {
                     running.entry(dest.clone()).or_insert_with(|| {
@@ -138,10 +144,7 @@ async fn supervise(
                         };
                         debug!(%dest, ?initial_delay, "spawning outbound sender task");
                         tokio::spawn(run_destination(
-                            store.clone(),
-                            client.clone(),
-                            idgen.clone(),
-                            send_slots.clone(),
+                            ctx.clone(),
                             dest,
                             watch_rx.clone(),
                             initial_delay,
@@ -173,10 +176,7 @@ async fn supervise(
 /// Drain a single destination forever: deliver pending PDUs, then block until
 /// the next persist wakes us. Owns its own backoff state.
 async fn run_destination(
-    store: Arc<SqliteStore>,
-    client: Arc<FederationClient>,
-    idgen: Arc<TxnIdGen>,
-    send_slots: Arc<Semaphore>,
+    ctx: SenderCtx,
     dest: OwnedServerName,
     mut watch_rx: watch::Receiver<StreamPos>,
     initial_delay: Duration,
@@ -190,7 +190,7 @@ async fn run_destination(
         // One transaction's worth, in causal order. `pending_pdus` caps the
         // load at `MAX_PDUS_PER_TXN`, so a huge backlog never lands in memory
         // at once — we drain it a batch at a time across loop iterations.
-        let batch = match store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await {
+        let batch = match ctx.store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await {
             Ok(b) => b,
             Err(e) => {
                 // A storage read fault is transient; back off and retry.
@@ -209,17 +209,7 @@ async fn run_destination(
             continue;
         }
 
-        if deliver_batch(
-            &store,
-            &client,
-            &idgen,
-            &send_slots,
-            &dest,
-            &batch,
-            &mut backoff,
-        )
-        .await
-        {
+        if deliver_batch(&ctx, &dest, &batch, &mut backoff).await {
             backoff = BACKOFF_BASE;
         } else {
             // Shutdown (semaphore closed). Stop the task.
@@ -240,17 +230,14 @@ async fn run_destination(
 /// (re-sending under the same txnId, which the peer dedups) rather than
 /// hot-looping.
 async fn deliver_batch(
-    store: &SqliteStore,
-    client: &FederationClient,
-    idgen: &TxnIdGen,
-    send_slots: &Semaphore,
+    ctx: &SenderCtx,
     dest: &ServerName,
     batch: &[neutrino_common::Event],
     backoff: &mut Duration,
 ) -> bool {
     let pdus: Vec<Box<RawJsonValue>> = batch.iter().map(|e| e.raw.clone()).collect();
     let ids: Vec<&EventId> = batch.iter().map(|e| &*e.event_id).collect();
-    let txn_id = idgen.next_id();
+    let txn_id = ctx.idgen.next_id();
 
     let mut attempt = 0u32;
     loop {
@@ -270,8 +257,8 @@ async fn deliver_batch(
         );
         // Hold a global permit only around the network call — released before
         // any backoff sleep, so a slow peer can't pin a concurrency slot.
-        let send_result = match send_slots.acquire().await {
-            Ok(_permit) => client.send_transaction(dest, &txn_id, &pdus).await,
+        let send_result = match ctx.send_slots.acquire().await {
+            Ok(_permit) => ctx.client.send_transaction(dest, &txn_id, &pdus).await,
             // The semaphore is never closed in normal operation; an error here
             // means shutdown.
             Err(_) => return false,
@@ -295,7 +282,7 @@ async fn deliver_batch(
         };
 
         if delivered {
-            match store.remove_pdus(dest, &ids).await {
+            match ctx.store.remove_pdus(dest, &ids).await {
                 Ok(()) => return true,
                 Err(e) => {
                     // Rows survive a removal fault; back off and retry rather
