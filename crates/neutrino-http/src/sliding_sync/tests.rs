@@ -1639,16 +1639,21 @@ async fn long_poll_wakes_on_new_event() {
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos);
     req2.lists = lists;
-    req2.timeout = Some(std::time::Duration::from_millis(300));
+    req2.timeout = Some(std::time::Duration::from_millis(2000));
 
     let start = std::time::Instant::now();
     let resp2 = handle(&state_arc, user, req2).await.unwrap();
     let elapsed = start.elapsed();
     waker.await.unwrap();
 
+    // The event arrives ~50ms in; a working notify wakes the poll near-
+    // immediately. The ceiling sits far above that wake latency (so CPU-load
+    // drift can't cross it) yet well below the 2s timeout — a broken notify
+    // would only return at the timeout (~2000ms), so this still catches the
+    // regression. Mirrors `long_poll_wakes_on_concurrent_put_event`.
     assert!(
-        elapsed < std::time::Duration::from_millis(250),
-        "should return promptly after the event arrives, got {elapsed:?}"
+        elapsed < std::time::Duration::from_millis(1500),
+        "should wake on the event well before the 2s timeout, got {elapsed:?}"
     );
     assert_eq!(
         resp2.rooms.get(room).unwrap().timeline.len(),

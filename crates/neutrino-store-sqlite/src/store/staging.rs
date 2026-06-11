@@ -32,18 +32,29 @@ impl StagingStore for SqliteStore {
         let json = raw.get().to_owned();
 
         self.run_write(move |conn| -> Result<bool, Error> {
-            // INSERT OR IGNORE: the event_id is content-derived, so a collision
-            // is a genuine duplicate (a peer may resend, and gap-fill may
-            // re-fetch) — keep the first. `execute` returns the row count, so a
-            // new insert is 1 and an ignored duplicate is 0; the gap-fill loop
-            // uses this to tell "fetched new ancestry" from "peer re-sent what
-            // we already hold" (its no-progress termination). Staging is
-            // deliberately *unbounded* — grounding an event means fetching its
-            // entire state-DAG ancestry to `m.room.create`, however deep
-            // (inherent to MSC4242 / auth-chain CRDTs), and the mesh is trusted.
+            // `INSERT OR IGNORE … SELECT … WHERE NOT EXISTS` so the row is staged
+            // only when the event is *neither* already staged *nor* already
+            // committed:
+            //   - `OR IGNORE` drops a re-stage of the same staged id (the
+            //     event_id is content-derived, so a collision is a genuine
+            //     duplicate — keep the first; a peer may resend and gap-fill may
+            //     re-fetch).
+            //   - `WHERE NOT EXISTS (… events …)` drops an event we already hold
+            //     committed: a peer's `get_missing_events` walk can over-return
+            //     ancestry below our boundary, and re-staging an already-grounded
+            //     event would be pointless churn the worker has to re-drain.
+            // `execute` returns the inserted-row count, so a fresh stage is 1 and
+            // either skip is 0. The gap-fill loop reads this as its no-progress
+            // signal: a round that only re-surfaces events we already hold
+            // (staged or committed) returns `false`, terminating the walk instead
+            // of spinning. Staging is otherwise *unbounded* — grounding an event
+            // means fetching its entire state-DAG ancestry to `m.room.create`,
+            // however deep (inherent to MSC4242 / auth-chain CRDTs), and the mesh
+            // is trusted.
             let inserted = conn.execute(
                 "INSERT OR IGNORE INTO staged_events (event_id, room_id, origin, json) \
-                 VALUES (?, ?, ?, ?)",
+                 SELECT ?1, ?2, ?3, ?4 \
+                 WHERE NOT EXISTS (SELECT 1 FROM events WHERE event_id = ?1)",
                 params![event_id, room_id, origin, json],
             )?;
             Ok(inserted == 1)
@@ -436,6 +447,29 @@ mod tests {
                 .await
                 .unwrap(),
             "re-staging the same id is an ignored duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_pdu_skips_already_committed_event() {
+        // An event we already hold committed must NOT be staged: the gap-fill
+        // loop relies on the returned bool to tell "fetched new ancestry" from
+        // "peer over-returned something we already have". Staging a committed
+        // event would falsely report progress and leave a redundant row for the
+        // worker to re-drain.
+        let (s, create) = store_with_room_and_create().await;
+        let a = state_event(&[create.event_id.as_ref()], 1);
+        s.persist_event(&a, &[]).await.unwrap();
+
+        assert!(
+            !s.stage_pdu(origin(), *ALICE_ROOM_ID, &a.event_id, &a.raw)
+                .await
+                .unwrap(),
+            "staging an already-committed event must report no progress"
+        );
+        assert!(
+            s.staged_for_room(*ALICE_ROOM_ID).await.unwrap().is_empty(),
+            "no staged row may be created for a committed event"
         );
     }
 }
