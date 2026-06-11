@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    ops::ControlFlow,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -11,7 +12,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post, put},
 };
-use neutrino_common::{Config, Event, ROOM_VERSION_ID};
+use neutrino_common::{Command, Config, Event, ROOM_VERSION_ID};
 use neutrino_state::event_id::EventBuilder;
 use neutrino_state::provider::InMemoryStateProvider;
 use neutrino_state::room_core::{Effect, RoomCore};
@@ -26,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::trace::TraceLayer;
 use tracing::{Span, error, info, info_span};
@@ -62,6 +64,10 @@ struct App {
     sync_state: Arc<SyncState<SqliteStore>>,
     keys: Option<Value>,
     config: Config,
+    /// Latching cancellation signal shared with long-polls and the outbound
+    /// federation sender. Fired once by [`AppState::begin_shutdown`]; after
+    /// that, every `cancelled().await` on any clone resolves immediately.
+    shutdown: CancellationToken,
     /// Testing-only access-token → user map (multi-user shim). See
     /// `multi_user`. Absent from the production single-user build.
     #[cfg(feature = "multi-user-shim")]
@@ -169,7 +175,8 @@ impl AppState {
         store: Arc<SqliteStore>,
         fetcher: Arc<dyn MissingEventsFetcher>,
     ) -> Self {
-        let sync_state = Arc::new(SyncState::new(store.clone()));
+        let shutdown = CancellationToken::new();
+        let sync_state = Arc::new(SyncState::new(store.clone(), shutdown.clone()));
         let room_registry = Arc::new(RoomRegistry::new(store.clone(), config.server_name.clone()));
         // Spawn the inbound staging worker bound to this store/registry/fetcher.
         // It runs wherever the router does (production `serve` and the e2e
@@ -183,6 +190,7 @@ impl AppState {
             sync_state,
             keys: None,
             config,
+            shutdown,
             #[cfg(feature = "multi-user-shim")]
             user_tokens: Arc::new(Mutex::new(multi_user::UserTokens::new())),
         };
@@ -204,28 +212,89 @@ impl AppState {
     fn outbound_concurrency(&self) -> usize {
         lock_app(self).config.outbound_concurrency
     }
+
+    /// Signal every shutdown-aware subsystem (long-polls, the outbound federation
+    /// sender) to wind down. Idempotent (`CancellationToken::cancel` is a no-op
+    /// once already cancelled, and takes `&self`). Called by the command dispatcher
+    /// on the terminal command or when the last `NeutrinoHandle` is dropped.
+    fn begin_shutdown(&self) {
+        lock_app(self).shutdown.cancel();
+    }
+
+    /// A clone of the shutdown token, for a subsystem spawned from `serve`.
+    /// Every clone shares one cancellation state, so a later `begin_shutdown`
+    /// is observed by all of them via `cancelled().await`.
+    fn subscribe_shutdown(&self) -> CancellationToken {
+        lock_app(self).shutdown.clone()
+    }
 }
 
-pub async fn serve(listener: TcpListener, config: Config) -> Result<(), StartupError> {
+pub async fn serve(
+    listener: TcpListener,
+    config: Config,
+    commands: mpsc::UnboundedReceiver<Command>,
+) -> Result<(), StartupError> {
     let state = AppState::new(config).await?;
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
     // enumeration resumes delivery of anything left undelivered.
-    federation::sender::spawn(
+    let sender_task = federation::sender::spawn(
         state.store(),
         state.server_name(),
         state.outbound_concurrency(),
+        state.subscribe_shutdown(),
     );
-    let router = build_router(state);
+    let router = build_router(&state);
+    // `dispatch` resolves on a terminal command or when every sender is dropped,
+    // which drives axum's graceful shutdown — in-flight requests drain first.
+    // `state` is threaded in so server-directed commands can act on internals.
     axum::serve(listener, router)
+        .with_graceful_shutdown(dispatch(commands, state))
         .await
         .map_err(StartupError::Io)?;
+    // dispatch fired the token before resolving, so the supervisor has already
+    // begun winding down and aborting its children; await it to confirm teardown.
+    let _ = sender_task.await;
     Ok(())
+}
+
+/// Dispatch out-of-band control commands until a terminal one (`Shutdown`)
+/// arrives, or until every sender is dropped — the embedding host released the
+/// last `NeutrinoHandle`. Resolving this future is what triggers the server's
+/// graceful shutdown in [`serve`].
+///
+/// This is the permanent home for command handling: a server-directed command
+/// (e.g. a future `NetworkReachable` that kicks the federation sender's
+/// backoff) acts on internals reachable only from inside `serve`, and is added
+/// as one more arm in [`handle`] returning [`ControlFlow::Continue`] to keep
+/// the loop running. `state` is the handle to those internals — every terminal
+/// command fires the shutdown token before returning.
+async fn dispatch(mut commands: mpsc::UnboundedReceiver<Command>, state: AppState) {
+    while let Some(command) = commands.recv().await {
+        if handle(command, &state).is_break() {
+            return; // Shutdown already signalled inside handle
+        }
+    }
+    // Channel closed: last NeutrinoHandle dropped — treat as a shutdown request.
+    state.begin_shutdown();
+}
+
+/// Apply a single control command, returning whether the dispatch loop should
+/// stop ([`ControlFlow::Break`]) or keep running ([`ControlFlow::Continue`]).
+/// Splitting this out of [`dispatch`] keeps per-command behaviour
+/// unit-testable, and the `Continue` path is what makes the loop a genuine loop.
+fn handle(command: Command, state: &AppState) -> ControlFlow<()> {
+    match command {
+        Command::Shutdown => {
+            state.begin_shutdown();
+            ControlFlow::Break(())
+        }
+    }
 }
 
 pub async fn router(config: Config) -> Result<Router, StartupError> {
     let state = AppState::new(config).await?;
-    Ok(build_router(state))
+    Ok(build_router(&state))
 }
 
 /// Test-only constructor that mounts the same router over an externally-
@@ -237,7 +306,7 @@ pub async fn router(config: Config) -> Result<Router, StartupError> {
 #[cfg(test)]
 pub(crate) fn router_with_store(config: Config, store: Arc<SqliteStore>) -> Router {
     let state = AppState::from_store(config, store);
-    build_router(state)
+    build_router(&state)
 }
 
 /// Like [`router_with_store`] but with an injected gap-fill `fetcher`. The
@@ -251,10 +320,10 @@ pub(crate) fn router_with_store_and_fetcher(
     fetcher: Arc<dyn MissingEventsFetcher>,
 ) -> Router {
     let state = AppState::from_store_with_fetcher(config, store, fetcher);
-    build_router(state)
+    build_router(&state)
 }
 
-fn build_router(state: AppState) -> Router {
+fn build_router(state: &AppState) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/_matrix/client/versions", get(versions))
@@ -417,7 +486,9 @@ fn build_router(state: AppState) -> Router {
                     },
                 ),
         )
-        .with_state(state)
+        // `AppState` is `Arc`-backed; this clone is the router's instance, the
+        // caller keeps the other (e.g. `serve` hands its instance to `dispatch`).
+        .with_state(state.clone())
 }
 
 async fn root() -> &'static str {
@@ -1325,8 +1396,138 @@ async fn default_fallback() -> (StatusCode, &'static str) {
 
 #[cfg(test)]
 mod tests {
-    use super::join_rule_for;
+    use super::{
+        AppState, Command, Config, ControlFlow, SqliteStore, TcpListener, dispatch, handle,
+        join_rule_for, mpsc,
+    };
     use serde_json::json;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    fn test_config(tmp: &TempDir) -> Config {
+        Config {
+            server_name: "127.0.0.1".to_string(),
+            bind_addr: "127.0.0.1:0".to_string(),
+            localpart: "alice".to_string(),
+            storage_dir: tmp.path().to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    /// A throwaway `AppState` over a fresh temp-dir store. `dispatch` takes a
+    /// state handle (for future server-directed commands); these tests only
+    /// exercise the lifecycle arms, so the state is constructed but unused.
+    async fn test_state() -> (AppState, TempDir) {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = Arc::new(
+            SqliteStore::open_in_dir(tmp.path())
+                .await
+                .expect("open store"),
+        );
+        let state = AppState::from_store(test_config(&tmp), store);
+        (state, tmp)
+    }
+
+    #[tokio::test]
+    async fn handle_shutdown_breaks() {
+        // The only terminal command today. When a non-terminal variant lands it
+        // returns ControlFlow::Continue, and this stays the per-command oracle.
+        let (state, _tmp) = test_state().await;
+        assert_eq!(handle(Command::Shutdown, &state), ControlFlow::Break(()));
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_on_shutdown() {
+        let (state, _tmp) = test_state().await;
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Command::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), dispatch(rx, state))
+            .await
+            .expect("dispatch must return promptly on Shutdown, not hang");
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_when_all_senders_dropped() {
+        let (state, _tmp) = test_state().await;
+        let (tx, rx) = mpsc::unbounded_channel::<Command>();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(1), dispatch(rx, state))
+            .await
+            .expect("dispatch must return promptly when the channel closes, not hang");
+    }
+
+    #[tokio::test]
+    async fn serve_stops_when_shutdown_command_sent() {
+        // End-to-end: a Shutdown command must actually drive `serve` to return
+        // via the graceful-shutdown wiring — not just the dispatch helper in
+        // isolation. A regression that dropped/mis-wired the receiver would hang
+        // here and trip the timeout.
+        //
+        // We seed an outbox row destined for a dead peer so the sender supervisor
+        // spawns a live per-destination task. The key regression this pins is that
+        // a live sender task does NOT block `serve` from returning after
+        // `Command::Shutdown`. (That the supervisor actually aborts its children
+        // is pinned by `sender::tests::supervisor_returns_on_shutdown`.)
+        use neutrino_common::ROOM_VERSION_ID;
+        use neutrino_state::event_id::EventBuilder;
+        use neutrino_store::{EventStore, RoomStore};
+
+        let tmp = TempDir::new().expect("tempdir");
+        let config = test_config(&tmp);
+
+        // Open the store and seed one outbox row to a dead peer (nothing listens
+        // on this port after we drop the listener).
+        let dead_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind dead");
+        let dead_port = dead_listener.local_addr().expect("addr").port();
+        drop(dead_listener);
+        let dead_peer: ruma::OwnedServerName = format!("127.0.0.1:{dead_port}")
+            .parse()
+            .expect("parse server name");
+
+        let store = Arc::new(
+            SqliteStore::open_in_dir(tmp.path())
+                .await
+                .expect("open store"),
+        );
+        // Build a minimal room so we can persist a message event.
+        let sender: ruma::OwnedUserId = "@alice:127.0.0.1".parse().expect("user id");
+        let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
+            .state_key(String::new())
+            .content(serde_json::json!({ "room_version": ROOM_VERSION_ID }))
+            .build()
+            .expect("build create");
+        let room_id = create.room_id.clone();
+        store.create_room(&create, &[]).await.expect("create_room");
+        // Persist a message event to the dead peer's outbox — this is what makes
+        // the sender supervisor spawn a per-destination task that keeps retrying.
+        let msg = EventBuilder::new(sender, "m.room.message".to_owned())
+            .room_id(room_id)
+            .content(serde_json::json!({ "msgtype": "m.text", "body": "hi" }))
+            .prev_events(vec![create.event_id])
+            .build()
+            .expect("build msg");
+        store
+            .persist_event(&msg, &[&*dead_peer])
+            .await
+            .expect("persist_event");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let (tx, rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(super::serve(listener, config, rx));
+
+        // Give the sender supervisor a moment to discover the dead peer and
+        // spawn its per-destination task (which will be retrying the dead peer).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        tx.send(Command::Shutdown).expect("send shutdown");
+        let joined = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("serve must return after a Shutdown command even with a live sender task");
+        joined
+            .expect("serve task must not panic")
+            .expect("serve must return Ok after graceful shutdown");
+    }
 
     #[test]
     fn join_rule_explicit_preset_wins_over_visibility() {

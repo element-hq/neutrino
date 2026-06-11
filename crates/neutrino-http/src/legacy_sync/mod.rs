@@ -152,6 +152,11 @@ mod tests {
     };
     use crate::sliding_sync::{self, SyncState};
 
+    /// A shutdown token that never fires — for tests exercising non-shutdown paths.
+    fn no_shutdown() -> tokio_util::sync::CancellationToken {
+        tokio_util::sync::CancellationToken::new()
+    }
+
     async fn fresh_store() -> (Arc<SqliteStore>, TempDir) {
         let tmp = TempDir::new().expect("create tempfile");
         let store = SqliteStore::open_in_dir(tmp.path())
@@ -217,7 +222,7 @@ mod tests {
             .await
             .unwrap();
 
-        let sync_state = SyncState::new(store);
+        let sync_state = SyncState::new(store, no_shutdown());
         let owned_user = user.to_owned();
 
         let memberships = fetch_memberships(&sync_state, &owned_user).await.unwrap();

@@ -1,5 +1,3 @@
-use std::sync::Mutex;
-
 uniffi::setup_scaffolding!("neutrino");
 
 /// FFI-facing server configuration. Mirrors `neutrino_common::Config` so EX
@@ -33,43 +31,96 @@ impl From<NeutrinoConfig> for neutrino_main::Config {
     }
 }
 
-#[derive(uniffi::Object)]
-pub struct NeutrinoHandle {
-    tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+/// FFI-facing control command. Mirrors `neutrino_common::Command` (re-exported
+/// as `neutrino_main::Command`) so EX Android can drive the embedded server.
+/// Kept here, not on the common `Command`, so UniFFI stays out of the common
+/// crates — the same split as `NeutrinoConfig` / `Config`.
+#[derive(uniffi::Enum)]
+pub enum Command {
+    Shutdown,
 }
 
-#[uniffi::export]
-impl NeutrinoHandle {
-    pub fn shutdown(&self) {
-        if let Some(tx) = self.tx.lock().unwrap().take() {
-            tx.send(()).unwrap()
+impl From<Command> for neutrino_main::Command {
+    fn from(c: Command) -> Self {
+        match c {
+            Command::Shutdown => neutrino_main::Command::Shutdown,
         }
     }
 }
 
-/// Spawn the Tokio runtime and begin polling the server entrypoint with the
-/// supplied configuration. Returns a handle that can gracefully shut the
-/// server down.
+#[derive(uniffi::Object)]
+pub struct NeutrinoHandle {
+    tx: tokio::sync::mpsc::UnboundedSender<neutrino_main::Command>,
+}
+
+#[uniffi::export]
+impl NeutrinoHandle {
+    /// Push a control command to the running server. Fire-and-forget: returns
+    /// immediately and never blocks — the channel is unbounded, so the sync
+    /// `UnboundedSender::send` never awaits, which is what lets this be called
+    /// safely from the FFI/JNI thread (a bounded channel would force either an
+    /// `async fn` across the boundary or a backpressure-drop policy). A send
+    /// after the server has already stopped (receiver dropped) is a silent
+    /// no-op.
+    pub fn command(&self, command: Command) {
+        let _ = self.tx.send(command.into());
+    }
+
+    /// Gracefully stop the server. Convenience for `command(Command::Shutdown)`;
+    /// preserves the pre-existing FFI method so existing Android callers keep
+    /// working unchanged.
+    pub fn shutdown(&self) {
+        self.command(Command::Shutdown);
+    }
+}
+
+/// Spawn an owned Tokio runtime and begin polling the server entrypoint with
+/// the supplied configuration. Returns a handle for pushing control commands
+/// (including `Shutdown`) into the running server. When the server stops
+/// (via `Shutdown` or channel close) the runtime is dropped on its OS thread:
+/// the executor stops and async tasks are cancelled at their next await point,
+/// but joining the blocking pool waits for any in-flight SQLite write to finish
+/// — those `spawn_blocking` closures are non-cancellable (`neutrino-store-sqlite`
+/// `WRITE_TIMEOUT` surfaces a hung write to its awaiter but does not stop the
+/// closure). Normal writes are sub-millisecond, so teardown is effectively
+/// immediate; only a runaway closure can delay this thread's exit.
 #[uniffi::export]
 pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let config: neutrino_main::Config = config.into();
     std::thread::spawn(move || {
-        let rt = async_compat::get_runtime_handle();
+        // Neutrino owns its runtime. current_thread = parity with the previous
+        // async-compat global (also current_thread); all DB work is offloaded to
+        // the blocking pool, so the executor is I/O-bound. enable_all() = I/O +
+        // time drivers (TcpListener, reqwest, tokio::time).
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .thread_name("neutrino")
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("failed to build runtime: {e}");
+                return;
+            }
+        };
         rt.block_on(async {
-            tokio::select! {
-                res = neutrino_main::entrypoint(config) => {
-                    if let Err(e) = res {
-                        eprintln!("entrypoint exited: {e}");
-                    }
-                },
-                _ = rx => {}
+            // The command receiver is threaded into the server; a `Shutdown`
+            // command (or every `NeutrinoHandle` being dropped, which closes the
+            // channel) drives `serve`'s graceful shutdown and returns here.
+            if let Err(e) = neutrino_main::entrypoint(config, rx).await {
+                eprintln!("entrypoint exited: {e}");
             }
         });
+        // `rt` drops here on this OS thread (sync context — safe): the executor
+        // stops and async tasks are cancelled at their next await point. Joining
+        // the blocking pool, however, waits for any in-flight SQLite write to
+        // finish — `spawn_blocking` closures are non-cancellable (the store's
+        // `WRITE_TIMEOUT` only surfaces a hung write to its awaiter, it does not
+        // stop the closure), so a runaway write can delay this thread's exit.
+        // Normal writes are sub-millisecond, so in practice teardown is immediate.
     });
-    NeutrinoHandle {
-        tx: Mutex::new(Some(tx)),
-    }
+    NeutrinoHandle { tx }
 }
 
 #[cfg(test)]
@@ -91,6 +142,18 @@ mod tests {
         assert_eq!(cfg.localpart, "alice");
         assert_eq!(cfg.storage_dir, std::path::PathBuf::from("/data/neutrino"));
         assert_eq!(cfg.outbound_concurrency, 1);
+    }
+
+    #[test]
+    fn shutdown_enqueues_shutdown_command() {
+        // The FFI producer side: shutdown() -> command(Shutdown) -> `From`
+        // conversion -> tx.send must land a `Shutdown` on the channel that
+        // `serve`'s dispatch loop drains. (The dispatch/teardown side is tested
+        // in neutrino-http, where that logic now lives.)
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = NeutrinoHandle { tx };
+        handle.shutdown();
+        assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::Shutdown);
     }
 
     #[test]

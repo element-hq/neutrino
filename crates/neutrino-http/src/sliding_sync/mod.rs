@@ -30,6 +30,7 @@ use ruma::events::AnyToDeviceEvent;
 use ruma::serde::Raw;
 use thiserror::Error;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 mod build;
 mod conn;
@@ -85,13 +86,18 @@ pub enum SyncError {
 pub struct SyncState<S> {
     pub store: Arc<S>,
     pub registry: ConnRegistry,
+    /// Shared shutdown latch. When fired (via `CancellationToken::cancel`),
+    /// every in-flight long-poll breaks out of its idle select so the connection
+    /// is released promptly instead of waiting up to 30 s for its deadline.
+    shutdown: CancellationToken,
 }
 
 impl<S> SyncState<S> {
-    pub fn new(store: Arc<S>) -> Self {
+    pub fn new(store: Arc<S>, shutdown: CancellationToken) -> Self {
         Self {
             store,
             registry: ConnRegistry::new(),
+            shutdown,
         }
     }
 }
@@ -236,7 +242,10 @@ pub async fn handle<S: StorageBackend>(
         if remaining.is_zero() {
             break resp;
         }
-        // Three-way race in the idle wait:
+        // Four-way race in the idle wait (evaluated biased, in order):
+        // - `state.shutdown.cancelled()` fires → server is shutting down;
+        //   break with the current (empty) resp so the long-poll releases
+        //   promptly instead of holding open for up to 30 s.
         // - `cancel_rx.wait_for(|g| *g > my_gen)` fires → a strictly-later
         //   request has called `cancel()` on our entry (or the registry
         //   replaced our entry on an initial sync, which also bumps our
@@ -251,6 +260,7 @@ pub async fn handle<S: StorageBackend>(
         // - `tokio::time::timeout` elapses → return the current empty resp.
         tokio::select! {
             biased;
+            _ = state.shutdown.cancelled() => break resp,            // server shutting down
             _ = cancel_rx.wait_for(|g| *g > my_gen) => break resp,
             res = tokio::time::timeout(remaining, rx.changed()) => match res {
                 Ok(_) => continue,
