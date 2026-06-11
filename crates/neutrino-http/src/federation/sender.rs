@@ -660,6 +660,38 @@ mod tests {
 
     /// A permanent 5xx must (TEST4) keep the batch in the outbox — never lost —
     /// and (SPEC1) reuse the SAME txn_id on every retry, so the receiver dedups.
+    /// Cancelling the shutdown token makes the supervisor break out of its loop,
+    /// abort its per-destination children, and RETURN — even with a live store and
+    /// a forever-retrying dead-peer child task. Pre-shutdown-wiring this hung
+    /// (the supervisor only returned when the store's persist-watch closed).
+    #[tokio::test]
+    async fn supervisor_returns_on_shutdown() {
+        let dead = dead_peer().await;
+        let (store, _tmp, _room, _ids) = store_with_outbox(&dead, 1).await;
+        let shutdown = CancellationToken::new();
+
+        let supervisor = spawn_with(
+            store.clone(),
+            "local.test".to_owned(),
+            2,
+            NO_JITTER,
+            shutdown.clone(),
+        );
+
+        // Let the supervisor enumerate the dead peer and spawn its (forever-retrying)
+        // child before we signal shutdown, so we exercise the drain+abort path.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        shutdown.cancel();
+
+        tokio::time::timeout(Duration::from_secs(5), supervisor)
+            .await
+            .expect("supervisor must return promptly after shutdown, not hang")
+            .expect("supervisor task must not panic");
+    }
+
+    /// A permanent 5xx must (TEST4) keep the batch in the outbox — never lost —
+    /// and (SPEC1) reuse the SAME txn_id on every retry, so the receiver dedups.
     #[tokio::test]
     async fn permanent_5xx_keeps_batch_and_reuses_txn_id() {
         let stub = Arc::new(Stub {

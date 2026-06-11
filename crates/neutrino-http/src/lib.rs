@@ -1466,8 +1466,9 @@ mod tests {
         //
         // We seed an outbox row destined for a dead peer so the sender supervisor
         // spawns a live per-destination task. The key regression this pins is that
-        // an in-flight sender task does NOT prevent `serve` from returning after
-        // `Command::Shutdown` — the sender task is aborted as part of teardown.
+        // a live sender task does NOT block `serve` from returning after
+        // `Command::Shutdown`. (That the supervisor actually aborts its children
+        // is pinned by `sender::tests::supervisor_returns_on_shutdown`.)
         use neutrino_common::ROOM_VERSION_ID;
         use neutrino_state::event_id::EventBuilder;
         use neutrino_store::{EventStore, RoomStore};
