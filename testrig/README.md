@@ -156,3 +156,55 @@ their failure to the caller instead.)
 - Cut **hs1↔hs3**: the join still succeeds on hs1+hs2; HOP3 parks in hs1's
   durable outbox and retries. On heal it drains and hs3 converges (pulling any
   missed ancestry via `get_missing_events`). This is the partition-tolerance path.
+
+## Automated tests
+
+Two scripts drive the rig and assert outcomes:
+
+- `./smoke.sh` — three **curated** scenarios (basic send/receive, partition+heal,
+  concurrent room-name state-res). A fixed CI gate; deterministic by construction.
+- `./converge.sh [SEED]` — a **seeded randomized** convergence fuzzer. Same rig,
+  but it generates random episodes of room ops (message / name / power /
+  invite / kick / leave / rejoin) interleaved with random partition cut+heal,
+  then heals everything and asserts the convergence invariant.
+
+### What `converge.sh` asserts
+
+After every partition heals and the outboxes drain, **every server joined to the
+room must reach byte-identical resolved `/state`, and no locally-accepted message
+may be lost** (each ledgered message must appear in every joined server's
+`/messages` timeline). It does *not* predict which concurrent write wins —
+state-res tie-breaks on `origin_server_ts` then `event_id` (wall-clock, not
+seeded) — it asserts *agreement*, which is independent of delivery order.
+
+```sh
+./converge.sh            # fresh seed (printed); reproduce a failure with:
+./converge.sh 12345      # an explicit seed replays the same op sequence
+EPISODES=10 ROUNDS_PER_EPISODE=20 ./converge.sh 12345   # longer run
+```
+
+`SEED` seeds one PRNG stream that drives every choice; the seed + a full op log
+are printed on failure so a failing run can be replayed. Note that federation
+delivery timing is asynchronous and *not* seed-controlled, so the seed pins the
+intended op sequence and gives highly reproducible runs, not bit-identical ones.
+
+**Two-tier status policy.** A server auth-checks each op against its own
+possibly-stale view, so exact CSAPI status is only predictable when the rig is
+fully converged. So: ops issued at a barrier (all healed + converged) are
+**exact-asserted** — this is where the admin / power-level / membership-validity
+contract is checked (non-admin name → `M_FORBIDDEN`, promote → 2xx, etc.); ops
+fired *during* a partition are **record-only** (a stale-view rejection is
+legitimate, not a failure) and a 2xx event simply joins the must-converge set.
+
+**Knobs.** `EPISODES` (6), `ROUNDS_PER_EPISODE` (12), `DEADLINE` (90s per
+convergence poll), `STABLE_POLLS` (2), `STRICT_EVENT_PRESENCE` (1 — set 0 to
+skip the message-presence check; state equality stays the hard gate). hs1 is a fixed anchor (never
+leaves / kicked / demoted); ban is excluded as the rig exposes no unban path.
+
+> During each convergence poll the harness can send `SIGUSR2` to every server to
+> reset the outbox backoff timers, so a healed link drains immediately instead of
+> waiting out its exponential backoff (this is what lets `DEADLINE` stay small
+> under heavy partitioning). **This is OFF by default**: neutrino does not yet
+> install a SIGUSR2 handler, so the signal currently hits its default disposition
+> and would *terminate* the server. Once the server handles SIGUSR2, enable the
+> nudge with `CONVERGE_SIGUSR2=1`.

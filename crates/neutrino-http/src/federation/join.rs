@@ -80,7 +80,21 @@ pub(crate) async fn federated_join_with(
             Ok(()) => {
                 // Staged + worker poked; block until our join lands (or time out).
                 return match wait_for_join(&*store, &mut persists, room_id, &user, timeout).await {
-                    Ok(()) => (StatusCode::OK, Json(json!({ "room_id": room_id }))).into_response(),
+                    Ok(()) => {
+                        // The join is grounded — drop any out-of-band invite stub
+                        // that sourced this join. A lingering stub would make a
+                        // later `/leave` route through the OOB-invite *decline*
+                        // path (`federation::leave::reject_invite`), which leaves
+                        // for the inviting server but never updates our own room
+                        // state — so the leaver stays `join` in its own view while
+                        // peers see `leave`. Best-effort: a stale stub is otherwise
+                        // superseded by the joined state in sync, so a removal
+                        // fault must not fail an already-successful join.
+                        if let Err(e) = store.remove_invite(room_id, &user).await {
+                            warn!(%room_id, %user, error = %e, "failed to clear invite stub after federated join");
+                        }
+                        (StatusCode::OK, Json(json!({ "room_id": room_id }))).into_response()
+                    }
                     Err(resp) => resp,
                 };
             }
