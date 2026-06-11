@@ -74,23 +74,43 @@ impl NeutrinoHandle {
     }
 }
 
-/// Spawn the Tokio runtime and begin polling the server entrypoint with the
-/// supplied configuration. Returns a handle for pushing control commands
-/// (including `Shutdown`) into the running server.
+/// Spawn an owned Tokio runtime and begin polling the server entrypoint with
+/// the supplied configuration. Returns a handle for pushing control commands
+/// (including `Shutdown`) into the running server. When the server stops
+/// (via `Shutdown` or channel close) the runtime is dropped on its OS thread,
+/// which cancels async stragglers, joins the blocking pool, and reclaims all
+/// runtime threads.
 #[uniffi::export]
 pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let config: neutrino_main::Config = config.into();
     std::thread::spawn(move || {
-        let rt = async_compat::get_runtime_handle();
+        // Neutrino owns its runtime. current_thread = parity with the previous
+        // async-compat global (also current_thread); all DB work is offloaded to
+        // the blocking pool, so the executor is I/O-bound. enable_all() = I/O +
+        // time drivers (TcpListener, reqwest, tokio::time).
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .thread_name("neutrino")
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("failed to build runtime: {e}");
+                return;
+            }
+        };
         rt.block_on(async {
             // The command receiver is threaded into the server; a `Shutdown`
             // command (or every `NeutrinoHandle` being dropped, which closes the
-            // channel) drives `serve`'s graceful shutdown and ends the runtime.
+            // channel) drives `serve`'s graceful shutdown and returns here.
             if let Err(e) = neutrino_main::entrypoint(config, rx).await {
                 eprintln!("entrypoint exited: {e}");
             }
         });
+        // `rt` drops here on this OS thread (sync context — safe): the executor
+        // stops, async stragglers are cancelled, the blocking pool is joined, the
+        // thread exits. This is the real runtime teardown.
     });
     NeutrinoHandle { tx }
 }

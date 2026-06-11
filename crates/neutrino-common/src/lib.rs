@@ -97,7 +97,9 @@ impl Config {
 /// split used for [`Config`] / `NeutrinoConfig`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Gracefully stop the server and tear down the embedded runtime.
+    /// Gracefully stop the server. The FFI layer owns the Tokio runtime, so
+    /// once the entrypoint returns the runtime is dropped and all its threads
+    /// are reclaimed — this is the real embedded-runtime teardown.
     Shutdown,
 }
 
