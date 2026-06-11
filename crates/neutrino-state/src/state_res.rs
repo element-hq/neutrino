@@ -444,6 +444,36 @@ pub fn split_power_events(
     Ok((power, non_power))
 }
 
+/// Step 1 of the v2 algorithm: the set of events that go through the
+/// reverse-topological power sort.
+///
+/// Spec v11/v12 §state resolution step 1: "Select the set X of all power events
+/// that appear in the full conflicted set. For each such power event P, enlarge
+/// X by adding the events in the auth chain of P which also belong to the full
+/// conflicted set." Synapse parity: `_add_event_and_auth_chain_to_graph` walks
+/// each power event's `auth_events` and pulls in any ancestor that is in the
+/// full conflicted set.
+///
+/// The complement (`full_conflicted \ <this set>`) is what `resolve_state`
+/// hands to the mainline sort in step 3 — so this enlargement is *not* a
+/// no-op: it moves the conflicted auth-chain ancestors of power events (e.g. a
+/// contested membership a power_levels event depends on) out of the mainline
+/// pass and into the power-ordered pass, where the spec requires them.
+fn power_sort_set(
+    full_conflicted: &HashSet<OwnedEventId>,
+    provider: &dyn StateProvider,
+) -> Result<HashSet<OwnedEventId>, StateResError> {
+    let (power_seed, _) = split_power_events(full_conflicted, provider)?;
+    if power_seed.is_empty() {
+        return Ok(power_seed);
+    }
+    // `auth_chain` returns the transitive backwards closure including the
+    // seeds; intersecting with `full_conflicted` keeps the power events plus
+    // their in-conflict auth-chain ancestors and drops everything else.
+    let closure = provider.auth_chain(&power_seed)?;
+    Ok(closure.intersection(full_conflicted).cloned().collect())
+}
+
 // ----------------- mainline -----------------
 
 /// Walk the m.room.power_levels chain backwards starting at `seed_pl_id`.
@@ -511,11 +541,15 @@ pub fn mainline(
 
 /// Mainline depth of `event_id`: the index in `mainline_map` of the nearest
 /// PL ancestor reachable from `event_id` through its `auth_events` chain.
-/// Smaller index = closer to the current (resolved) PL.
+/// `mainline_map` indexes the mainline oldest→newest with a 1-based offset
+/// (oldest PL → 1, newest PL → `mainline_len`), so a LARGER index = closer to
+/// the resolved PL and sorts LATER (wins last-write-wins in IAC pass 2).
 ///
 /// If no PL ancestor is found (or the closest PL isn't in the mainline),
-/// returns `mainline_len` — i.e. "this event sorts last among non-power
-/// events" semantics. Synapse parity: `state/v2.py::_get_event_mainline_rank`.
+/// returns `0` — strictly below every in-mainline index, so such events sort
+/// FIRST among non-power events. Synapse parity:
+/// `state/v2.py::_get_mainline_depth` (the `return 0` default, reserved by the
+/// 1-based mainline indexing).
 ///
 /// The walk follows each event's `m.room.power_levels` reference in
 /// `auth_events`, recursing into that PL's own auth_events if its id isn't
@@ -524,7 +558,6 @@ pub fn mainline(
 pub fn mainline_position(
     event_id: &OwnedEventId,
     mainline_map: &HashMap<OwnedEventId, usize>,
-    mainline_len: usize,
     provider: &dyn StateProvider,
 ) -> Result<usize, StateResError> {
     let mut current = event_id.clone();
@@ -535,7 +568,7 @@ pub fn mainline_position(
         }
         if !visited.insert(current.clone()) {
             // Defensive cycle break — shouldn't trigger under hash-derived ids.
-            return Ok(mainline_len);
+            return Ok(0);
         }
         let info = provider
             .get_event(&current)?
@@ -556,7 +589,7 @@ pub fn mainline_position(
         }
         match next {
             Some(n) => current = n,
-            None => return Ok(mainline_len),
+            None => return Ok(0),
         }
     }
 }
@@ -570,8 +603,15 @@ pub fn mainline_position(
 /// empty and every event gets depth 0 — the sort collapses to
 /// `(origin_server_ts, event_id)` ascending.
 ///
-/// Synapse parity: `state/v2.py::_mainline_sort`. The output is the order
-/// IAC pass 2 processes the non-power conflict set.
+/// `mainline()` returns the PL chain newest-first; the index map is built over
+/// its REVERSE (oldest→newest) with a 1-based offset, so the oldest PL gets
+/// index 1 and the newest (resolved) PL gets the highest index. Ascending sort
+/// then places events anchored at newer power_levels LAST, where IAC pass 2's
+/// last-write-wins makes them win — and reserves index 0 for the no-PL-ancestor
+/// default so those events sort first. Synapse parity:
+/// `state/v2.py::_mainline_sort` + the `{ev: i + 1 for i, ev in
+/// enumerate(reversed(mainline))}` indexing. The output is the order IAC pass 2
+/// processes the non-power conflict set.
 pub fn mainline_sort(
     events: &HashSet<OwnedEventId>,
     resolved_pl_id: Option<OwnedEventId>,
@@ -580,10 +620,10 @@ pub fn mainline_sort(
     let chain = mainline(resolved_pl_id, provider)?;
     let mainline_map: HashMap<OwnedEventId, usize> = chain
         .iter()
+        .rev()
         .enumerate()
-        .map(|(i, id)| (id.clone(), i))
+        .map(|(i, id)| (id.clone(), i + 1))
         .collect();
-    let mainline_len = chain.len();
 
     // (depth, ts, id) → ascending; OwnedEventId implements Ord.
     let mut decorated: Vec<(usize, u64, OwnedEventId)> = Vec::with_capacity(events.len());
@@ -591,7 +631,7 @@ pub fn mainline_sort(
         let info = provider
             .get_event(eid)?
             .ok_or_else(|| StateResError::MissingEvent(eid.clone()))?;
-        let depth = mainline_position(eid, &mainline_map, mainline_len, provider)?;
+        let depth = mainline_position(eid, &mainline_map, provider)?;
         decorated.push((depth, info.origin_server_ts, eid.clone()));
     }
     decorated.sort();
@@ -698,9 +738,10 @@ fn state_before_inner(
 /// 2. Compute the **full conflicted set** = `auth_chain_difference ∪
 ///    conflicted_subgraph ∪ conflicted-state-values` (v2.1 adds the subgraph;
 ///    v2 used just the diff + conflicted values).
-/// 3. Split the full conflicted set into power events vs non-power events
-///    via `is_power_event`.
-/// 4. Reverse-topological power sort over power events.
+/// 3. Compute the **step-1 set** via `power_sort_set`: the power events in the
+///    full conflicted set plus their auth-chain ancestors that are also in it.
+///    The complement is the mainline set.
+/// 4. Reverse-topological power sort over the step-1 set.
 /// 5. **IAC pass 1**: iterative auth checks from the **empty** state (v2.1
 ///    divergence from v2.0's "from unconflicted").
 /// 6. Mainline sort over non-power events, anchored on pass-1's resolved PL.
@@ -730,8 +771,11 @@ pub fn resolve_state(
         .chain(conflicted_values)
         .collect();
 
-    // (3) Split into power / non-power.
-    let (power_events, non_power_events) = split_power_events(&full_conflicted, provider)?;
+    // (3) Step 1 set: power events PLUS their in-conflict auth-chain ancestors
+    // (spec step 1's "enlarge X"). The remainder goes to the mainline sort.
+    let power_events = power_sort_set(&full_conflicted, provider)?;
+    let non_power_events: HashSet<OwnedEventId> =
+        full_conflicted.difference(&power_events).cloned().collect();
 
     // (4) Reverse-topological power sort + (5) IAC pass 1 from empty.
     let sorted_power = reverse_topological_power_sort(&power_events, provider)?;
@@ -1639,6 +1683,77 @@ mod tests {
         assert_eq!(non_power, HashSet::from([topic_id]));
     }
 
+    // ----- power_sort_set (spec step 1 auth-chain enlargement) -----
+
+    #[test]
+    fn power_sort_set_pulls_in_conflicted_auth_ancestor_of_power_event() {
+        // Spec step 1: "For each power event P, enlarge X by adding the events
+        // in the auth chain of P which also belong to the full conflicted set."
+        // Here a contested self-join (NOT a power event) is the sender
+        // membership a contested power_levels event depends on. It MUST land in
+        // the power-sort set, not the mainline set — the bug routed it to the
+        // mainline because the split was done purely by `is_power_event`.
+        let (mut provider, create_id, room_id) = setup_default();
+        let alice_join = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.member".to_owned(),
+        )
+        .room_id(room_id.clone())
+        .state_key("@alice:example.org".to_owned())
+        .content(json!({ "membership": "join" }))
+        .auth_events(vec![create_id.clone()])
+        .prev_events(vec![create_id.clone()])
+        .prev_state_events(vec![create_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid join");
+        let join_id = put(&mut provider, alice_join);
+        // power_levels whose auth chain includes the self-join above.
+        let pl = room_pl(
+            &room_id,
+            "@alice:example.org",
+            json!({ "users_default": 1 }),
+            vec![create_id.clone(), join_id.clone()],
+        );
+        let pl_id = put(&mut provider, pl);
+
+        let full: HashSet<OwnedEventId> = [create_id.clone(), join_id.clone(), pl_id.clone()]
+            .into_iter()
+            .collect();
+
+        // The naive `is_power_event` split (the old behaviour) excludes the
+        // self-join — proving the enlargement below is load-bearing, not a
+        // no-op.
+        let (naive_power, naive_non_power) = split_power_events(&full, &provider).unwrap();
+        assert!(
+            !naive_power.contains(&join_id),
+            "a self-join is not itself a power event"
+        );
+        assert!(naive_non_power.contains(&join_id));
+
+        // The step-1 set pulls the self-join in via the power_levels auth chain.
+        let step1 = power_sort_set(&full, &provider).unwrap();
+        assert!(
+            step1.contains(&join_id),
+            "conflicted auth-ancestor of a power event must join the power-sort set"
+        );
+        assert!(step1.contains(&pl_id));
+        // And the mainline complement no longer carries it.
+        let mainline_set: HashSet<OwnedEventId> = full.difference(&step1).cloned().collect();
+        assert!(!mainline_set.contains(&join_id));
+    }
+
+    #[test]
+    fn power_sort_set_empty_when_no_power_events() {
+        // No power events in the conflicted set → nothing to anchor an auth
+        // chain on → the step-1 set is empty (everything goes to the mainline).
+        let (mut provider, create_id, room_id) = setup_default();
+        let topic = room_topic(&room_id, "@alice:example.org", vec![create_id]);
+        let topic_id = put(&mut provider, topic);
+        let full: HashSet<OwnedEventId> = [topic_id].into_iter().collect();
+        assert!(power_sort_set(&full, &provider).unwrap().is_empty());
+    }
+
     // ----- mainline -----
 
     #[test]
@@ -1746,19 +1861,24 @@ mod tests {
         );
         let topic_id = put(&mut provider, topic);
         let chain = mainline(Some(pl_v2_id.clone()), &provider).unwrap();
+        // Mainline indexed oldest→newest, 1-based: pl_v1 at depth 1, pl_v2 at
+        // depth 2 (newest = highest = wins).
         let map: HashMap<_, _> = chain
             .iter()
+            .rev()
             .enumerate()
-            .map(|(i, id)| (id.clone(), i))
+            .map(|(i, id)| (id.clone(), i + 1))
             .collect();
-        // pl_v2 at depth 0, pl_v1 at depth 1.
-        let depth = mainline_position(&topic_id, &map, chain.len(), &provider).unwrap();
+        // topic is anchored at pl_v1 → depth 1.
+        let depth = mainline_position(&topic_id, &map, &provider).unwrap();
         assert_eq!(depth, 1);
     }
 
     #[test]
-    fn mainline_position_event_with_no_pl_ancestor_returns_len() {
-        // Event whose auth_events contains create only — no PL ancestor.
+    fn mainline_position_event_with_no_pl_ancestor_returns_zero() {
+        // Event whose auth_events contains create only — no PL ancestor. Synapse
+        // reserves depth 0 for this case (the 1-based mainline indexing), so the
+        // event sorts FIRST among non-power events.
         let (mut provider, create_id, room_id) = setup_default();
         let pl = room_pl(
             &room_id,
@@ -1772,11 +1892,12 @@ mod tests {
         let chain = mainline(Some(pl_id), &provider).unwrap();
         let map: HashMap<_, _> = chain
             .iter()
+            .rev()
             .enumerate()
-            .map(|(i, id)| (id.clone(), i))
+            .map(|(i, id)| (id.clone(), i + 1))
             .collect();
-        let depth = mainline_position(&topic_id, &map, chain.len(), &provider).unwrap();
-        assert_eq!(depth, chain.len());
+        let depth = mainline_position(&topic_id, &map, &provider).unwrap();
+        assert_eq!(depth, 0);
     }
 
     // ----- mainline_sort -----
@@ -1804,10 +1925,12 @@ mod tests {
 
     #[test]
     fn mainline_sort_depth_orders_before_ts() {
-        // Two events: one under pl_v2 (depth 0), one under pl_v1 (depth 1).
-        // The pl_v1-anchored event has an EARLIER ts than the pl_v2-anchored
-        // one. Without mainline ordering it would come first; mainline depth
-        // pushes it after.
+        // Two events anchored at different power_levels. Timestamps OPPOSE depth
+        // so the test isolates depth's effect: the event under the newer
+        // (resolved) PL is given the EARLIER ts, so by ts alone it would sort
+        // first. Mainline depth must override that — the newer-anchored event
+        // gets the higher depth and sorts LAST, where IAC pass 2's
+        // last-write-wins makes it win.
         let (mut provider, create_id, room_id) = setup_default();
         let pl_v1 = room_pl(
             &room_id,
@@ -1816,14 +1939,6 @@ mod tests {
             vec![create_id.clone()],
         );
         let pl_v1_id = put(&mut provider, pl_v1);
-        // Earlier-ts event under pl_v1 (depth 1).
-        let topic_under_v1 = room_topic(
-            &room_id,
-            "@alice:example.org",
-            vec![create_id.clone(), pl_v1_id.clone()],
-        );
-        let topic_under_v1_id = put(&mut provider, topic_under_v1);
-        // Later-ts pl_v2.
         let pl_v2 = room_pl(
             &room_id,
             "@alice:example.org",
@@ -1831,19 +1946,27 @@ mod tests {
             vec![create_id.clone(), pl_v1_id.clone()],
         );
         let pl_v2_id = put(&mut provider, pl_v2);
-        // Even-later topic under pl_v2 (depth 0).
+        // EARLIER-ts topic under pl_v2 (newer PL, depth 2 → should sort LAST).
         let topic_under_v2 = room_topic(
             &room_id,
             "@alice:example.org",
-            vec![create_id, pl_v2_id.clone()],
+            vec![create_id.clone(), pl_v2_id.clone()],
         );
         let topic_under_v2_id = put(&mut provider, topic_under_v2);
+        // LATER-ts topic under pl_v1 (older PL, depth 1 → should sort FIRST).
+        let topic_under_v1 = room_topic(
+            &room_id,
+            "@alice:example.org",
+            vec![create_id, pl_v1_id.clone()],
+        );
+        let topic_under_v1_id = put(&mut provider, topic_under_v1);
         let events: HashSet<_> = [topic_under_v1_id.clone(), topic_under_v2_id.clone()]
             .into_iter()
             .collect();
         let sorted = mainline_sort(&events, Some(pl_v2_id), &provider).unwrap();
-        // topic_under_v2 has depth 0, topic_under_v1 has depth 1 → v2 first.
-        assert_eq!(sorted, vec![topic_under_v2_id, topic_under_v1_id]);
+        // Depth 1 (older anchor) sorts before depth 2 (newer anchor), despite
+        // topic_under_v2 having the earlier ts. Newest-anchored is LAST = wins.
+        assert_eq!(sorted, vec![topic_under_v1_id, topic_under_v2_id]);
     }
 
     // ----- resolve_state -----
@@ -1960,6 +2083,92 @@ mod tests {
             out.get(&("m.room.create".to_string(), String::new())),
             Some(&create_id)
         );
+    }
+
+    #[test]
+    fn resolve_state_newer_pl_anchored_non_power_event_wins() {
+        // Regression: mainline sort direction. Two conflicting NON-power events
+        // (topics) anchored at different power_levels. The topic under the
+        // newer (resolved) PL must win, EVEN THOUGH it has the earlier ts —
+        // mainline depth dominates ts, and the newer anchor sorts last so IAC
+        // pass 2's last-write-wins picks it. The buggy inverted indexing made
+        // the older-anchored (later-ts) topic win instead.
+        let (mut provider, create_id, room_id) = setup_default();
+        let alice_join = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.room.member".to_owned(),
+        )
+        .room_id(room_id.clone())
+        .state_key("@alice:example.org".to_owned())
+        .content(json!({ "membership": "join" }))
+        .auth_events(vec![create_id.clone()])
+        .prev_events(vec![create_id.clone()])
+        .prev_state_events(vec![create_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid join");
+        let alice_join_id = put(&mut provider, alice_join);
+
+        // pl_old then pl_new — pl_new has the later ts so it wins IAC pass 1 and
+        // becomes the resolved PL the mainline is anchored on.
+        let pl_old = room_pl(
+            &room_id,
+            "@alice:example.org",
+            json!({ "users_default": 1 }),
+            vec![create_id.clone(), alice_join_id.clone()],
+        );
+        let pl_old_id = put(&mut provider, pl_old);
+        let pl_new = room_pl(
+            &room_id,
+            "@alice:example.org",
+            json!({ "users_default": 2 }),
+            vec![create_id.clone(), alice_join_id.clone()],
+        );
+        let pl_new_id = put(&mut provider, pl_new);
+
+        // EARLIER-ts topic under pl_new (depth 2 → sorts last → must win).
+        let topic_new = room_topic(
+            &room_id,
+            "@alice:example.org",
+            vec![create_id.clone(), alice_join_id.clone(), pl_new_id.clone()],
+        );
+        let topic_new_id = put(&mut provider, topic_new);
+        // LATER-ts topic under pl_old (depth 1 → sorts first → must lose).
+        let topic_old = room_topic(
+            &room_id,
+            "@alice:example.org",
+            vec![create_id.clone(), alice_join_id.clone(), pl_old_id.clone()],
+        );
+        let topic_old_id = put(&mut provider, topic_old);
+
+        let member_key = (
+            "m.room.member".to_string(),
+            "@alice:example.org".to_string(),
+        );
+        let create_key = ("m.room.create".to_string(), String::new());
+        let pl_key = ("m.room.power_levels".to_string(), String::new());
+        let topic_key = ("m.room.topic".to_string(), String::new());
+
+        // s1 chose pl_old + topic_old, s2 chose pl_new + topic_new.
+        let mut s1 = StateMap::new();
+        s1.insert(create_key.clone(), create_id.clone());
+        s1.insert(member_key.clone(), alice_join_id.clone());
+        s1.insert(pl_key.clone(), pl_old_id);
+        s1.insert(topic_key.clone(), topic_old_id);
+        let mut s2 = StateMap::new();
+        s2.insert(create_key, create_id);
+        s2.insert(member_key, alice_join_id);
+        s2.insert(pl_key, pl_new_id.clone());
+        s2.insert(topic_key.clone(), topic_new_id.clone());
+
+        let out = resolve_state(&[&s1, &s2], &provider).unwrap();
+        // Resolved PL is pl_new (later ts), and the topic anchored at it wins
+        // despite its earlier ts.
+        assert_eq!(
+            out.get(&("m.room.power_levels".to_string(), String::new())),
+            Some(&pl_new_id)
+        );
+        assert_eq!(out.get(&topic_key), Some(&topic_new_id));
     }
 
     // ----- state_before -----

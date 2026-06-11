@@ -175,6 +175,15 @@ pub(crate) async fn join(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    // A room we don't host + a pending invite ⇒ federated join via the
+    // inviter's server (the SDK accepts invites through this endpoint and
+    // supplies no `via`). Hosted rooms / no invite return None and
+    // fall through to the local path below.
+    if let Some(resp) =
+        crate::federation::join::federated_join_if_remote(&state.0, &sender, &room, &[]).await
+    {
+        return resp;
+    }
     match current_membership(&state.0, &room, &sender).await {
         Ok(Some(m)) if m == "join" => {
             return (StatusCode::OK, Json(json!({ "room_id": room }))).into_response();
@@ -266,7 +275,7 @@ pub(crate) async fn leave(
 /// `404 M_NOT_FOUND` ("No such room alias", matching Synapse) rather than the
 /// `400` a room-id parse would give, so clients see the alias as *unknown* not
 /// *malformed*. A string that is neither a valid id nor a valid alias still
-/// falls through to [`join`]'s `400`. The `server_name` query lists candidate
+/// falls through to [`join`]'s `400`. The `via` query lists candidate
 /// resident servers: for a room we don't host they trigger a federated join
 /// (`federation::join::federated_join`); for a room we already host they are
 /// ignored (we are the resident).
@@ -284,22 +293,15 @@ pub(crate) async fn join_by_id_or_alias(
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    // A room we don't host + explicit `server_name` hints ⇒ federated join.
-    // (A v12 room id carries no server, so without a hint we can only try
-    // locally, which 404s an unknown room.) A storage error here falls through
-    // to the local path, which surfaces it as a 500.
-    let store = lock_app(&state.0).store.clone();
-    if matches!(store.room_exists(&room).await, Ok(false)) {
-        let candidates = crate::federation::join::parse_server_names(query.as_deref());
-        if !candidates.is_empty() {
-            return crate::federation::join::federated_join(
-                &state.0,
-                auth.0.clone(),
-                &room,
-                &candidates,
-            )
-            .await;
-        }
+    // A room we don't host ⇒ federated join via the explicit `via` hints
+    // plus the inviter's server from any pending invite (a v12 room id
+    // carries no server, so without one of these we can only try locally,
+    // which 404s an unknown room). On None, fall through to the local path.
+    let hints = crate::federation::join::parse_server_names(query.as_deref());
+    if let Some(resp) =
+        crate::federation::join::federated_join_if_remote(&state.0, &auth.0, &room, &hints).await
+    {
+        return resp;
     }
     join(state, auth, Path(room_id_or_alias), body).await
 }
