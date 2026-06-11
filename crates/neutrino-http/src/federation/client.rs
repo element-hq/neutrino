@@ -315,7 +315,8 @@ async fn non_2xx_error(
 ) -> FederationClientError {
     let status = resp.status().as_u16();
     // `text()` consumes `resp`, which we are discarding anyway. A body-read
-    // failure is itself only logged (empty body) — the status is what matters.
+    // failure degrades to an empty body (logged as `body=""`) — the status is
+    // what matters.
     let body = resp.text().await.unwrap_or_default();
     let body: String = body.chars().take(BODY_LOG_LIMIT).collect();
     warn!(target: "neutrino_http", %dest, endpoint, status, %body, "federation peer returned non-2xx");

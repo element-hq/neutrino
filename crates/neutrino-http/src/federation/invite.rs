@@ -263,7 +263,7 @@ pub(crate) async fn federated_invite(
         // unparseable response — propagated from the client `?` and logged
         // nowhere else, so surface the underlying cause here.
         Err(e) => {
-            warn!(dest = %target.server_name(), %room_id, error = %e, "outbound invite: could not reach the invitee's server");
+            warn!(dest = %target.server_name(), %room_id, error = %e, "outbound invite: federation request to the invitee's server failed");
             return error_response(
                 StatusCode::BAD_GATEWAY,
                 "M_UNKNOWN",
