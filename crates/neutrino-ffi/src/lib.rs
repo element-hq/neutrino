@@ -38,12 +38,14 @@ impl From<NeutrinoConfig> for neutrino_main::Config {
 #[derive(uniffi::Enum)]
 pub enum Command {
     Shutdown,
+    KickBackoff,
 }
 
 impl From<Command> for neutrino_main::Command {
     fn from(c: Command) -> Self {
         match c {
             Command::Shutdown => neutrino_main::Command::Shutdown,
+            Command::KickBackoff => neutrino_main::Command::KickBackoff,
         }
     }
 }
@@ -71,6 +73,13 @@ impl NeutrinoHandle {
     /// working unchanged.
     pub fn shutdown(&self) {
         self.command(Command::Shutdown);
+    }
+
+    /// Reset outbound retry backoff and retry now. Convenience for
+    /// `command(Command::KickBackoff)`; the host calls this when device
+    /// connectivity is restored so backed-off destinations reconnect promptly.
+    pub fn kick_backoff(&self) {
+        self.command(Command::KickBackoff);
     }
 }
 
@@ -154,6 +163,17 @@ mod tests {
         let handle = NeutrinoHandle { tx };
         handle.shutdown();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::Shutdown);
+    }
+
+    #[test]
+    fn kick_backoff_enqueues_kick_command() {
+        // The FFI producer side for the non-terminal kick: kick_backoff() ->
+        // command(KickBackoff) -> `From` -> tx.send lands a `KickBackoff` on the
+        // channel `serve`'s dispatch loop drains.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = NeutrinoHandle { tx };
+        handle.kick_backoff();
+        assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::KickBackoff);
     }
 
     #[test]
