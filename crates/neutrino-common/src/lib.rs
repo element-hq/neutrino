@@ -101,6 +101,12 @@ pub enum Command {
     /// once the entrypoint returns the runtime is dropped and all its threads
     /// are reclaimed — this is the real embedded-runtime teardown.
     Shutdown,
+    /// Reset every outbound destination's retry backoff to base and retry
+    /// immediately. The host sends this when device connectivity is restored, so
+    /// a destination that backed off while offline reconnects promptly instead
+    /// of waiting out a long (up to the backoff cap) retry delay. Non-terminal:
+    /// the server keeps running.
+    KickBackoff,
 }
 
 /// Resolve the storage directory: the env value if present, else the

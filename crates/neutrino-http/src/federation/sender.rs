@@ -88,8 +88,16 @@ pub(crate) fn spawn(
     origin: String,
     concurrency: usize,
     shutdown: CancellationToken,
+    kick_rx: watch::Receiver<u64>,
 ) -> JoinHandle<()> {
-    spawn_with(store, origin, concurrency, STARTUP_JITTER_MAX, shutdown)
+    spawn_with(
+        store,
+        origin,
+        concurrency,
+        STARTUP_JITTER_MAX,
+        shutdown,
+        kick_rx,
+    )
 }
 
 /// Inner spawn with the flood-control bounds made explicit, so tests can run
@@ -100,6 +108,7 @@ fn spawn_with(
     concurrency: usize,
     startup_jitter_max: Duration,
     shutdown: CancellationToken,
+    kick_rx: watch::Receiver<u64>,
 ) -> JoinHandle<()> {
     let watch_rx = store.subscribe();
     let client = Arc::new(FederationClient::new(origin));
@@ -116,7 +125,13 @@ fn spawn_with(
         idgen,
         send_slots,
     };
-    tokio::spawn(supervise(ctx, watch_rx, startup_jitter_max, shutdown))
+    tokio::spawn(supervise(
+        ctx,
+        watch_rx,
+        startup_jitter_max,
+        shutdown,
+        kick_rx,
+    ))
 }
 
 /// Discovery loop: ensure every destination with pending PDUs has a running
@@ -127,6 +142,7 @@ async fn supervise(
     mut watch_rx: watch::Receiver<StreamPos>,
     startup_jitter_max: Duration,
     shutdown: CancellationToken,
+    kick_rx: watch::Receiver<u64>,
 ) {
     let mut running: HashMap<OwnedServerName, JoinHandle<()>> = HashMap::new();
     let mut first_round = true;
@@ -147,6 +163,7 @@ async fn supervise(
                             ctx.clone(),
                             dest,
                             watch_rx.clone(),
+                            kick_rx.clone(),
                             initial_delay,
                         ))
                     });
@@ -179,8 +196,14 @@ async fn run_destination(
     ctx: SenderCtx,
     dest: OwnedServerName,
     mut watch_rx: watch::Receiver<StreamPos>,
+    mut kick_rx: watch::Receiver<u64>,
     initial_delay: Duration,
 ) {
+    // Baseline the kick generation: only a `KickBackoff` sent *after* this task
+    // starts should shortcut a backoff. (A just-spawned destination is at base
+    // and about to drain anyway, so a kick racing spawn is harmless to miss.)
+    kick_rx.borrow_and_update();
+
     if !initial_delay.is_zero() {
         tokio::time::sleep(initial_delay).await;
     }
@@ -195,7 +218,9 @@ async fn run_destination(
             Err(e) => {
                 // A storage read fault is transient; back off and retry.
                 error!(%dest, error = %e, "reading pending PDUs");
-                sleep_backoff(&mut backoff).await;
+                if sleep_backoff(&mut backoff, &mut kick_rx).await {
+                    backoff = BACKOFF_BASE;
+                }
                 continue;
             }
         };
@@ -209,7 +234,7 @@ async fn run_destination(
             continue;
         }
 
-        if deliver_batch(&ctx, &dest, &batch, &mut backoff).await {
+        if deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await {
             backoff = BACKOFF_BASE;
         } else {
             // Shutdown (semaphore closed). Stop the task.
@@ -234,6 +259,7 @@ async fn deliver_batch(
     dest: &ServerName,
     batch: &[neutrino_common::Event],
     backoff: &mut Duration,
+    kick_rx: &mut watch::Receiver<u64>,
 ) -> bool {
     let pdus: Vec<Box<RawJsonValue>> = batch.iter().map(|e| e.raw.clone()).collect();
     let ids: Vec<&EventId> = batch.iter().map(|e| &*e.event_id).collect();
@@ -276,7 +302,9 @@ async fn deliver_batch(
             // under the same txn_id.
             Err(e) => {
                 warn!(%dest, error = %e, backoff = ?backoff, "transaction delivery failed; will retry");
-                sleep_backoff(backoff).await;
+                if sleep_backoff(backoff, kick_rx).await {
+                    *backoff = BACKOFF_BASE;
+                }
                 continue;
             }
         };
@@ -288,7 +316,9 @@ async fn deliver_batch(
                     // Rows survive a removal fault; back off and retry rather
                     // than hot-looping (the re-send is deduped by the peer).
                     error!(%dest, error = %e, "removing delivered PDUs from outbox");
-                    sleep_backoff(backoff).await;
+                    if sleep_backoff(backoff, kick_rx).await {
+                        *backoff = BACKOFF_BASE;
+                    }
                 }
             }
         }
@@ -297,10 +327,32 @@ async fn deliver_batch(
 
 /// Sleep for a full-jittered interval in `[0, *backoff]`, then advance the
 /// backoff ceiling toward [`BACKOFF_CAP`](crate::federation::BACKOFF_CAP).
-async fn sleep_backoff(backoff: &mut Duration) {
+///
+/// Returns `true` if a `KickBackoff` (`kick_rx` advanced — the host signalled
+/// connectivity restored) interrupts the wait: the caller resets `*backoff` to
+/// base and retries immediately, and the ceiling is left unadvanced. A kick that
+/// landed while the caller was mid-send is caught here too — `watch` retains the
+/// unobserved generation, so `changed()` resolves at once. An `Err` from
+/// `changed()` means the kick sender was dropped (teardown, this task is about
+/// to be aborted); fall back to a normal backoff so we never busy-loop on a
+/// closed channel.
+async fn sleep_backoff(backoff: &mut Duration, kick_rx: &mut watch::Receiver<u64>) -> bool {
     let wait = jitter(*backoff);
-    tokio::time::sleep(wait).await;
-    *backoff = next_backoff(*backoff);
+    tokio::select! {
+        biased;
+        res = kick_rx.changed() => {
+            if res.is_ok() {
+                return true;
+            }
+            tokio::time::sleep(wait).await;
+            *backoff = next_backoff(*backoff);
+            false
+        }
+        _ = tokio::time::sleep(wait) => {
+            *backoff = next_backoff(*backoff);
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -325,6 +377,13 @@ mod tests {
     /// A shutdown token that never fires — for tests exercising non-shutdown paths.
     fn no_shutdown() -> CancellationToken {
         CancellationToken::new()
+    }
+
+    /// A kick receiver whose sender is dropped immediately — no kick ever
+    /// arrives, so the sender behaves exactly as it did before `KickBackoff`
+    /// (a dropped sender makes `sleep_backoff` fall back to a normal backoff).
+    fn no_kick() -> watch::Receiver<u64> {
+        watch::channel(0u64).1
     }
 
     /// Stub federation peer. `fail_until` requests return `fail_status`; the
@@ -450,6 +509,7 @@ mod tests {
             2,
             NO_JITTER,
             no_shutdown(),
+            no_kick(),
         ));
         wait_drained(&store, &dest).await;
 
@@ -483,6 +543,7 @@ mod tests {
             2,
             NO_JITTER,
             no_shutdown(),
+            no_kick(),
         ));
         wait_drained(&store, &dest).await;
 
@@ -512,6 +573,7 @@ mod tests {
             2,
             NO_JITTER,
             no_shutdown(),
+            no_kick(),
         ));
         wait_drained(&store, &dest).await; // dropped → outbox empties
 
@@ -532,6 +594,7 @@ mod tests {
             2,
             NO_JITTER,
             no_shutdown(),
+            no_kick(),
         ));
         wait_drained(&store, &dest).await;
 
@@ -570,6 +633,7 @@ mod tests {
             2,
             NO_JITTER,
             no_shutdown(),
+            no_kick(),
         ));
 
         // The healthy peer drains despite the dead peer retrying forever.
@@ -598,6 +662,7 @@ mod tests {
             2,
             NO_JITTER,
             no_shutdown(),
+            no_kick(),
         ));
         // Give the supervisor a moment to reach its idle `changed()` await.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -645,6 +710,43 @@ mod tests {
         assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
     }
 
+    /// A `KickBackoff` (network restored) interrupts an in-progress backoff
+    /// sleep: `sleep_backoff` returns `true` immediately and leaves the ceiling
+    /// untouched, so the caller resets to base and retries now instead of
+    /// waiting out a long (up to [`BACKOFF_CAP`]) backoff. A bump sent before we
+    /// poll is observed by the `biased` select's first arm, so this is
+    /// deterministic without any real sleep.
+    #[tokio::test]
+    async fn kick_interrupts_backoff_and_preserves_ceiling() {
+        let (tx, mut rx) = watch::channel(0u64);
+        rx.borrow_and_update(); // baseline; only a later bump counts as a kick
+        let mut backoff = BACKOFF_CAP; // a long ceiling we must NOT wait out
+        tx.send_modify(|g| *g += 1); // network restored: kick pending before poll
+        let kicked = sleep_backoff(&mut backoff, &mut rx).await;
+        assert!(kicked, "a pending kick must interrupt the backoff sleep");
+        assert_eq!(
+            backoff, BACKOFF_CAP,
+            "a kick must not advance the backoff ceiling"
+        );
+    }
+
+    /// With no kick, `sleep_backoff` waits out the jittered interval and advances
+    /// the ceiling toward the cap — the pre-existing behaviour. `_tx` is kept
+    /// alive so `changed()` stays pending (a dropped sender would resolve `Err`).
+    #[tokio::test]
+    async fn backoff_sleep_without_kick_advances_ceiling() {
+        let (_tx, mut rx) = watch::channel(0u64);
+        rx.borrow_and_update();
+        let mut backoff = Duration::from_millis(10);
+        let kicked = sleep_backoff(&mut backoff, &mut rx).await;
+        assert!(!kicked, "no kick: must report a normal timed backoff");
+        assert_eq!(
+            backoff,
+            Duration::from_millis(20),
+            "a timed backoff must double the ceiling"
+        );
+    }
+
     /// A permanent 5xx must (TEST4) keep the batch in the outbox — never lost —
     /// and (SPEC1) reuse the SAME txn_id on every retry, so the receiver dedups.
     /// Cancelling the shutdown token makes the supervisor break out of its loop,
@@ -663,6 +765,7 @@ mod tests {
             2,
             NO_JITTER,
             shutdown.clone(),
+            no_kick(),
         );
 
         // Let the supervisor enumerate the dead peer and spawn its (forever-retrying)
@@ -695,6 +798,7 @@ mod tests {
             2,
             NO_JITTER,
             no_shutdown(),
+            no_kick(),
         ));
 
         // Wait for at least two attempts — proves it retried after the first 5xx.
