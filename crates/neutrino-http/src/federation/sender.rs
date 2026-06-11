@@ -88,7 +88,7 @@ pub(crate) fn spawn(
     origin: String,
     concurrency: usize,
     shutdown: CancellationToken,
-    kick_rx: watch::Receiver<u64>,
+    kick_rx: watch::Receiver<()>,
 ) -> JoinHandle<()> {
     spawn_with(
         store,
@@ -108,7 +108,7 @@ fn spawn_with(
     concurrency: usize,
     startup_jitter_max: Duration,
     shutdown: CancellationToken,
-    kick_rx: watch::Receiver<u64>,
+    kick_rx: watch::Receiver<()>,
 ) -> JoinHandle<()> {
     let watch_rx = store.subscribe();
     let client = Arc::new(FederationClient::new(origin));
@@ -142,7 +142,7 @@ async fn supervise(
     mut watch_rx: watch::Receiver<StreamPos>,
     startup_jitter_max: Duration,
     shutdown: CancellationToken,
-    kick_rx: watch::Receiver<u64>,
+    kick_rx: watch::Receiver<()>,
 ) {
     let mut running: HashMap<OwnedServerName, JoinHandle<()>> = HashMap::new();
     let mut first_round = true;
@@ -196,10 +196,10 @@ async fn run_destination(
     ctx: SenderCtx,
     dest: OwnedServerName,
     mut watch_rx: watch::Receiver<StreamPos>,
-    mut kick_rx: watch::Receiver<u64>,
+    mut kick_rx: watch::Receiver<()>,
     initial_delay: Duration,
 ) {
-    // Baseline the kick generation: only a `KickBackoff` sent *after* this task
+    // Baseline the kick signal: only a `KickBackoff` sent *after* this task
     // starts should shortcut a backoff. (A just-spawned destination is at base
     // and about to drain anyway, so a kick racing spawn is harmless to miss.)
     kick_rx.borrow_and_update();
@@ -259,7 +259,7 @@ async fn deliver_batch(
     dest: &ServerName,
     batch: &[neutrino_common::Event],
     backoff: &mut Duration,
-    kick_rx: &mut watch::Receiver<u64>,
+    kick_rx: &mut watch::Receiver<()>,
 ) -> bool {
     let pdus: Vec<Box<RawJsonValue>> = batch.iter().map(|e| e.raw.clone()).collect();
     let ids: Vec<&EventId> = batch.iter().map(|e| &*e.event_id).collect();
@@ -332,11 +332,11 @@ async fn deliver_batch(
 /// connectivity restored) interrupts the wait: the caller resets `*backoff` to
 /// base and retries immediately, and the ceiling is left unadvanced. A kick that
 /// landed while the caller was mid-send is caught here too — `watch` retains the
-/// unobserved generation, so `changed()` resolves at once. An `Err` from
+/// unobserved pulse, so `changed()` resolves at once. An `Err` from
 /// `changed()` means the kick sender was dropped (teardown, this task is about
 /// to be aborted); fall back to a normal backoff so we never busy-loop on a
 /// closed channel.
-async fn sleep_backoff(backoff: &mut Duration, kick_rx: &mut watch::Receiver<u64>) -> bool {
+async fn sleep_backoff(backoff: &mut Duration, kick_rx: &mut watch::Receiver<()>) -> bool {
     let wait = jitter(*backoff);
     tokio::select! {
         biased;
@@ -382,8 +382,8 @@ mod tests {
     /// A kick receiver whose sender is dropped immediately — no kick ever
     /// arrives, so the sender behaves exactly as it did before `KickBackoff`
     /// (a dropped sender makes `sleep_backoff` fall back to a normal backoff).
-    fn no_kick() -> watch::Receiver<u64> {
-        watch::channel(0u64).1
+    fn no_kick() -> watch::Receiver<()> {
+        watch::channel(()).1
     }
 
     /// Stub federation peer. `fail_until` requests return `fail_status`; the
@@ -713,15 +713,15 @@ mod tests {
     /// A `KickBackoff` (network restored) interrupts an in-progress backoff
     /// sleep: `sleep_backoff` returns `true` immediately and leaves the ceiling
     /// untouched, so the caller resets to base and retries now instead of
-    /// waiting out a long (up to [`BACKOFF_CAP`]) backoff. A bump sent before we
+    /// waiting out a long (up to [`BACKOFF_CAP`]) backoff. A pulse sent before we
     /// poll is observed by the `biased` select's first arm, so this is
     /// deterministic without any real sleep.
     #[tokio::test]
     async fn kick_interrupts_backoff_and_preserves_ceiling() {
-        let (tx, mut rx) = watch::channel(0u64);
-        rx.borrow_and_update(); // baseline; only a later bump counts as a kick
+        let (tx, mut rx) = watch::channel(());
+        rx.borrow_and_update(); // baseline; only a later pulse counts as a kick
         let mut backoff = BACKOFF_CAP; // a long ceiling we must NOT wait out
-        tx.send_modify(|g| *g += 1); // network restored: kick pending before poll
+        tx.send_modify(|_| {}); // network restored: kick pending before poll
         let kicked = sleep_backoff(&mut backoff, &mut rx).await;
         assert!(kicked, "a pending kick must interrupt the backoff sleep");
         assert_eq!(
@@ -735,7 +735,7 @@ mod tests {
     /// alive so `changed()` stays pending (a dropped sender would resolve `Err`).
     #[tokio::test]
     async fn backoff_sleep_without_kick_advances_ceiling() {
-        let (_tx, mut rx) = watch::channel(0u64);
+        let (_tx, mut rx) = watch::channel(());
         rx.borrow_and_update();
         let mut backoff = Duration::from_millis(10);
         let kicked = sleep_backoff(&mut backoff, &mut rx).await;

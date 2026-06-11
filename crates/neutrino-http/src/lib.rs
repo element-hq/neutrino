@@ -68,13 +68,25 @@ struct App {
     /// federation sender. Fired once by [`AppState::begin_shutdown`]; after
     /// that, every `cancelled().await` on any clone resolves immediately.
     shutdown: CancellationToken,
-    /// Monotonic "kick" generation shared with the outbound sender's
-    /// per-destination tasks. [`AppState::kick_backoff`] bumps it; each task
-    /// watches a clone and, on a change, resets its retry backoff to base and
-    /// retries immediately. The host bumps it (via `Command::KickBackoff`) when
-    /// device connectivity is restored, so a destination that backed off while
-    /// offline doesn't wait out a long backoff before reconnecting.
-    kick_backoff: watch::Sender<u64>,
+    /// "Kick" signal shared with the outbound sender's per-destination tasks.
+    /// [`AppState::kick_backoff`] pulses it; each task watches a clone and, on a
+    /// change, resets its retry backoff to base and retries immediately. The
+    /// host pulses it (via `Command::KickBackoff`) when device connectivity is
+    /// restored, so a destination that backed off while offline doesn't wait out
+    /// a long backoff before reconnecting.
+    ///
+    /// Carries `()`: receivers only observe *that* it changed (via `changed()` /
+    /// `borrow_and_update()`), never a value — `send_modify` always notifies, so
+    /// a no-op mutation is a pulse.
+    ///
+    /// Why `watch` rather than the `shutdown` `CancellationToken` precedent
+    /// above: a kick is a repeatable edge, not a one-shot latch. And unlike
+    /// `Notify::notify_waiters`, `watch` *retains* a pulse that lands while a
+    /// task is mid-send (between backoff sleeps), so it isn't lost. The store's
+    /// `subscribe()` (`StreamPos`) watch can't carry it either: an offline task
+    /// is parked in the delivery retry loop with PDUs still queued, not on that
+    /// idle stream-position arm, so a position bump wouldn't reach it.
+    kick_backoff: watch::Sender<()>,
     /// Testing-only access-token → user map (multi-user shim). See
     /// `multi_user`. Absent from the production single-user build.
     #[cfg(feature = "multi-user-shim")]
@@ -193,7 +205,7 @@ impl AppState {
         // Receivers are taken later via `subscribe_kick` (one per destination
         // task); the initial receiver is dropped — `send_modify` notifies any
         // live receivers and is a no-op when there are none.
-        let (kick_backoff, _) = watch::channel(0u64);
+        let (kick_backoff, _) = watch::channel(());
         let app = App {
             store,
             room_registry,
@@ -241,21 +253,21 @@ impl AppState {
     }
 
     /// Reset every outbound destination's retry backoff to base and retry now,
-    /// by advancing the shared kick generation. Idempotent in effect: each
+    /// by pulsing the shared kick signal. Idempotent in effect: each
     /// destination task collapses any number of bumps into a single reset.
     /// Called by the command dispatcher on `Command::KickBackoff`.
     fn kick_backoff(&self) {
-        // `send_modify` always notifies, never errors on zero receivers (vs
-        // `send`); a destination spawned later picks up the new base via the
-        // value it observes at subscribe time.
-        lock_app(self)
-            .kick_backoff
-            .send_modify(|g| *g = g.wrapping_add(1));
+        // `send_modify` always notifies, even on a no-op mutation, and never
+        // errors on zero receivers (vs `send`). A destination spawned later
+        // baselines at the current version in `run_destination`, so only a pulse
+        // after it subscribes interrupts its backoff — which is correct, since a
+        // fresh task is already at base.
+        lock_app(self).kick_backoff.send_modify(|_| {});
     }
 
-    /// A clone of the kick generation receiver, for a sender task spawned from
+    /// A clone of the kick signal receiver, for a sender task spawned from
     /// `serve`. Mirrors [`AppState::subscribe_shutdown`].
-    fn subscribe_kick(&self) -> watch::Receiver<u64> {
+    fn subscribe_kick(&self) -> watch::Receiver<()> {
         lock_app(self).kick_backoff.subscribe()
     }
 }
@@ -1476,10 +1488,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_kick_backoff_continues_and_bumps_generation() {
+    async fn handle_kick_backoff_continues_and_pulses_kick() {
         // Non-terminal: the dispatch loop must keep running (Continue, not Break)
         // and must NOT fire the shutdown token. The observable effect is that the
-        // shared kick generation advances, so destination tasks see the kick.
+        // shared kick signal changes, so destination tasks see the kick.
         let (state, _tmp) = test_state().await;
         let kick_rx = state.subscribe_kick();
         assert_eq!(
@@ -1488,7 +1500,7 @@ mod tests {
         );
         assert!(
             kick_rx.has_changed().expect("kick sender is alive"),
-            "KickBackoff must advance the shared kick generation"
+            "KickBackoff must pulse the shared kick signal"
         );
     }
 
