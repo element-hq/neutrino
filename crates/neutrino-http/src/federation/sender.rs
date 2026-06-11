@@ -45,7 +45,7 @@
 //!   only, so a restart re-enumerates and retries within the startup jitter
 //!   window — restarting the app is a way to "kick" a stuck destination.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,6 +54,8 @@ use neutrino_store_sqlite::SqliteStore;
 use ruma::{EventId, OwnedServerName, ServerName};
 use serde_json::value::RawValue as RawJsonValue;
 use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::federation::client::{FederationClient, FederationClientError, TxnIdGen};
@@ -64,14 +66,19 @@ use crate::federation::{BACKOFF_BASE, MAX_PDUS_PER_TXN, jitter, next_backoff, no
 /// retries so they don't flood the network in lockstep.
 const STARTUP_JITTER_MAX: Duration = Duration::from_secs(30);
 
-/// Spawn the outbound sender pool. Returns immediately; the supervisor and
-/// per-destination tasks run detached for the lifetime of the process.
+/// Spawn the outbound sender pool. Returns the supervisor's `JoinHandle` so
+/// the caller can await it after the shutdown token fires.
 ///
 /// Subscribes to the persist watch *before* the first enumeration so a
 /// destination added concurrently with startup can't be missed (the watch will
 /// have advanced, waking the supervisor's first `changed()`).
-pub(crate) fn spawn(store: Arc<SqliteStore>, origin: String, concurrency: usize) {
-    spawn_with(store, origin, concurrency, STARTUP_JITTER_MAX);
+pub(crate) fn spawn(
+    store: Arc<SqliteStore>,
+    origin: String,
+    concurrency: usize,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
+    spawn_with(store, origin, concurrency, STARTUP_JITTER_MAX, shutdown)
 }
 
 /// Inner spawn with the flood-control bounds made explicit, so tests can run
@@ -81,7 +88,8 @@ fn spawn_with(
     origin: String,
     concurrency: usize,
     startup_jitter_max: Duration,
-) {
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
     let watch_rx = store.subscribe();
     let client = Arc::new(FederationClient::new(origin));
     // Process-startup prefix keeps txn ids unique across restarts; the
@@ -98,11 +106,13 @@ fn spawn_with(
         send_slots,
         watch_rx,
         startup_jitter_max,
-    ));
+        shutdown,
+    ))
 }
 
 /// Discovery loop: ensure every destination with pending PDUs has a running
-/// sender task. Runs until the store's watch sender is dropped (shutdown).
+/// sender task. Runs until the shutdown token is cancelled or the store's watch
+/// sender is dropped. On exit, aborts all per-destination child tasks.
 async fn supervise(
     store: Arc<SqliteStore>,
     client: Arc<FederationClient>,
@@ -110,15 +120,15 @@ async fn supervise(
     send_slots: Arc<Semaphore>,
     mut watch_rx: watch::Receiver<StreamPos>,
     startup_jitter_max: Duration,
+    shutdown: CancellationToken,
 ) {
-    let mut running: HashSet<OwnedServerName> = HashSet::new();
+    let mut running: HashMap<OwnedServerName, JoinHandle<()>> = HashMap::new();
     let mut first_round = true;
     loop {
         match store.pending_destinations().await {
             Ok(dests) => {
                 for dest in dests {
-                    // `insert` returns false if already present → don't respawn.
-                    if running.insert(dest.clone()) {
+                    running.entry(dest.clone()).or_insert_with(|| {
                         // Only the startup backlog gets jittered; a destination
                         // discovered mid-run is a single live send, not a flood.
                         let initial_delay = if first_round {
@@ -135,20 +145,28 @@ async fn supervise(
                             dest,
                             watch_rx.clone(),
                             initial_delay,
-                        ));
-                    }
+                        ))
+                    });
                 }
             }
             Err(e) => error!(error = %e, "enumerating outbox destinations"),
         }
         first_round = false;
-        // Wait for the next persist (which may have added a new destination).
-        // `Err` means the watch sender was dropped — the store is gone, so the
-        // pool shuts down with it.
-        if watch_rx.changed().await.is_err() {
-            info!("persist watch closed; outbound supervisor stopping");
-            return;
+        // Wait for the next persist (which may have added a new destination) or
+        // for the shutdown signal. `Err` on `changed()` means the watch sender
+        // was dropped — the store is gone, so the pool shuts down with it.
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,                      // shutdown requested
+            res = watch_rx.changed() => if res.is_err() { break },  // store gone
         }
+    }
+    info!(
+        "outbound supervisor stopping; aborting {} child task(s)",
+        running.len()
+    );
+    for (_, handle) in running.drain() {
+        handle.abort();
     }
 }
 
@@ -317,6 +335,11 @@ mod tests {
     use crate::federation::BACKOFF_CAP;
     use crate::federation::test_support::{dead_peer, spawn_stub};
 
+    /// A shutdown token that never fires — for tests exercising non-shutdown paths.
+    fn no_shutdown() -> CancellationToken {
+        CancellationToken::new()
+    }
+
     /// Stub federation peer. `fail_until` requests return `fail_status`; the
     /// rest 200 and have their `pdus` array recorded (one entry per accepted
     /// transaction). `attempts` counts *every* request, success or not; `txns`
@@ -434,7 +457,13 @@ mod tests {
         let dest = spawn_peer(stub.clone()).await;
         let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 3).await;
 
-        spawn_with(store.clone(), "local.test".to_owned(), 2, NO_JITTER);
+        drop(spawn_with(
+            store.clone(),
+            "local.test".to_owned(),
+            2,
+            NO_JITTER,
+            no_shutdown(),
+        ));
         wait_drained(&store, &dest).await;
 
         // Every event was delivered, in causal order, across the transaction(s).
@@ -461,7 +490,13 @@ mod tests {
         let dest = spawn_peer(stub.clone()).await;
         let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 1).await;
 
-        spawn_with(store.clone(), "local.test".to_owned(), 2, NO_JITTER);
+        drop(spawn_with(
+            store.clone(),
+            "local.test".to_owned(),
+            2,
+            NO_JITTER,
+            no_shutdown(),
+        ));
         wait_drained(&store, &dest).await;
 
         assert!(
@@ -484,7 +519,13 @@ mod tests {
         let dest = spawn_peer(stub.clone()).await;
         let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 1).await;
 
-        spawn_with(store.clone(), "local.test".to_owned(), 2, NO_JITTER);
+        drop(spawn_with(
+            store.clone(),
+            "local.test".to_owned(),
+            2,
+            NO_JITTER,
+            no_shutdown(),
+        ));
         wait_drained(&store, &dest).await; // dropped → outbox empties
 
         // Exactly one attempt: the 4xx was not retried.
@@ -498,7 +539,13 @@ mod tests {
         let dest = spawn_peer(stub.clone()).await;
         let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 60).await;
 
-        spawn_with(store.clone(), "local.test".to_owned(), 2, NO_JITTER);
+        drop(spawn_with(
+            store.clone(),
+            "local.test".to_owned(),
+            2,
+            NO_JITTER,
+            no_shutdown(),
+        ));
         wait_drained(&store, &dest).await;
 
         let accepted = stub.accepted.lock().unwrap();
@@ -530,7 +577,13 @@ mod tests {
             .unwrap();
         store.persist_event(&ev, &[&dead]).await.unwrap();
 
-        spawn_with(store.clone(), "local.test".to_owned(), 2, NO_JITTER);
+        drop(spawn_with(
+            store.clone(),
+            "local.test".to_owned(),
+            2,
+            NO_JITTER,
+            no_shutdown(),
+        ));
 
         // The healthy peer drains despite the dead peer retrying forever.
         wait_drained(&store, &healthy).await;
@@ -552,7 +605,13 @@ mod tests {
         // n=0: a real room exists but the outbox starts empty.
         let (store, _tmp, room_id, _ids) = store_with_outbox(&dest, 0).await;
 
-        spawn_with(store.clone(), "local.test".to_owned(), 2, NO_JITTER);
+        drop(spawn_with(
+            store.clone(),
+            "local.test".to_owned(),
+            2,
+            NO_JITTER,
+            no_shutdown(),
+        ));
         // Give the supervisor a moment to reach its idle `changed()` await.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -611,7 +670,13 @@ mod tests {
         let dest = spawn_peer(stub.clone()).await;
         let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 1).await;
 
-        spawn_with(store.clone(), "local.test".to_owned(), 2, NO_JITTER);
+        drop(spawn_with(
+            store.clone(),
+            "local.test".to_owned(),
+            2,
+            NO_JITTER,
+            no_shutdown(),
+        ));
 
         // Wait for at least two attempts — proves it retried after the first 5xx.
         for _ in 0..500 {

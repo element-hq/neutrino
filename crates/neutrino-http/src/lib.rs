@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::trace::TraceLayer;
 use tracing::{Span, error, info, info_span};
@@ -63,6 +64,10 @@ struct App {
     sync_state: Arc<SyncState<SqliteStore>>,
     keys: Option<Value>,
     config: Config,
+    /// Latching cancellation signal shared with long-polls and the outbound
+    /// federation sender. Fired once by [`AppState::begin_shutdown`]; after
+    /// that, every `cancelled().await` on any clone resolves immediately.
+    shutdown: CancellationToken,
     /// Testing-only access-token → user map (multi-user shim). See
     /// `multi_user`. Absent from the production single-user build.
     #[cfg(feature = "multi-user-shim")]
@@ -170,7 +175,8 @@ impl AppState {
         store: Arc<SqliteStore>,
         fetcher: Arc<dyn MissingEventsFetcher>,
     ) -> Self {
-        let sync_state = Arc::new(SyncState::new(store.clone()));
+        let shutdown = CancellationToken::new();
+        let sync_state = Arc::new(SyncState::new(store.clone(), shutdown.clone()));
         let room_registry = Arc::new(RoomRegistry::new(store.clone(), config.server_name.clone()));
         // Spawn the inbound staging worker bound to this store/registry/fetcher.
         // It runs wherever the router does (production `serve` and the e2e
@@ -184,6 +190,7 @@ impl AppState {
             sync_state,
             keys: None,
             config,
+            shutdown,
             #[cfg(feature = "multi-user-shim")]
             user_tokens: Arc::new(Mutex::new(multi_user::UserTokens::new())),
         };
@@ -205,6 +212,21 @@ impl AppState {
     fn outbound_concurrency(&self) -> usize {
         lock_app(self).config.outbound_concurrency
     }
+
+    /// Signal every shutdown-aware subsystem (long-polls, the outbound federation
+    /// sender) to wind down. Idempotent (`CancellationToken::cancel` is a no-op
+    /// once already cancelled, and takes `&self`). Called by the command dispatcher
+    /// on the terminal command or when the last `NeutrinoHandle` is dropped.
+    fn begin_shutdown(&self) {
+        lock_app(self).shutdown.cancel();
+    }
+
+    /// A clone of the shutdown token, for a subsystem spawned from `serve`.
+    /// Every clone shares one cancellation state, so a later `begin_shutdown`
+    /// is observed by all of them via `cancelled().await`.
+    fn subscribe_shutdown(&self) -> CancellationToken {
+        lock_app(self).shutdown.clone()
+    }
 }
 
 pub async fn serve(
@@ -216,10 +238,11 @@ pub async fn serve(
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
     // enumeration resumes delivery of anything left undelivered.
-    federation::sender::spawn(
+    let sender_task = federation::sender::spawn(
         state.store(),
         state.server_name(),
         state.outbound_concurrency(),
+        state.subscribe_shutdown(),
     );
     let router = build_router(&state);
     // `dispatch` resolves on a terminal command or when every sender is dropped,
@@ -229,6 +252,9 @@ pub async fn serve(
         .with_graceful_shutdown(dispatch(commands, state))
         .await
         .map_err(StartupError::Io)?;
+    // dispatch fired the token before resolving, so the supervisor has already
+    // begun winding down and aborting its children; await it to confirm teardown.
+    let _ = sender_task.await;
     Ok(())
 }
 
@@ -241,24 +267,28 @@ pub async fn serve(
 /// (e.g. a future `NetworkReachable` that kicks the federation sender's
 /// backoff) acts on internals reachable only from inside `serve`, and is added
 /// as one more arm in [`handle`] returning [`ControlFlow::Continue`] to keep
-/// the loop running. `_state` is the handle to those internals, threaded in
-/// now (unused until the first server-directed command) so the wiring is ready.
-async fn dispatch(mut commands: mpsc::UnboundedReceiver<Command>, _state: AppState) {
+/// the loop running. `state` is the handle to those internals — every terminal
+/// command fires the shutdown token before returning.
+async fn dispatch(mut commands: mpsc::UnboundedReceiver<Command>, state: AppState) {
     while let Some(command) = commands.recv().await {
-        if handle(command).is_break() {
-            return;
+        if handle(command, &state).is_break() {
+            return; // Shutdown already signalled inside handle
         }
     }
-    // Channel closed: all senders dropped — fall through to shut down.
+    // Channel closed: last NeutrinoHandle dropped — treat as a shutdown request.
+    state.begin_shutdown();
 }
 
 /// Apply a single control command, returning whether the dispatch loop should
 /// stop ([`ControlFlow::Break`]) or keep running ([`ControlFlow::Continue`]).
 /// Splitting this out of [`dispatch`] keeps per-command behaviour
 /// unit-testable, and the `Continue` path is what makes the loop a genuine loop.
-fn handle(command: Command) -> ControlFlow<()> {
+fn handle(command: Command, state: &AppState) -> ControlFlow<()> {
     match command {
-        Command::Shutdown => ControlFlow::Break(()),
+        Command::Shutdown => {
+            state.begin_shutdown();
+            ControlFlow::Break(())
+        }
     }
 }
 
@@ -1399,11 +1429,12 @@ mod tests {
         (state, tmp)
     }
 
-    #[test]
-    fn handle_shutdown_breaks() {
+    #[tokio::test]
+    async fn handle_shutdown_breaks() {
         // The only terminal command today. When a non-terminal variant lands it
         // returns ControlFlow::Continue, and this stays the per-command oracle.
-        assert_eq!(handle(Command::Shutdown), ControlFlow::Break(()));
+        let (state, _tmp) = test_state().await;
+        assert_eq!(handle(Command::Shutdown, &state), ControlFlow::Break(()));
     }
 
     #[tokio::test]
@@ -1432,15 +1463,66 @@ mod tests {
         // via the graceful-shutdown wiring — not just the dispatch helper in
         // isolation. A regression that dropped/mis-wired the receiver would hang
         // here and trip the timeout.
+        //
+        // We seed an outbox row destined for a dead peer so the sender supervisor
+        // spawns a live per-destination task. The key regression this pins is that
+        // an in-flight sender task does NOT prevent `serve` from returning after
+        // `Command::Shutdown` — the sender task is aborted as part of teardown.
+        use neutrino_common::ROOM_VERSION_ID;
+        use neutrino_state::event_id::EventBuilder;
+        use neutrino_store::{EventStore, RoomStore};
+
         let tmp = TempDir::new().expect("tempdir");
         let config = test_config(&tmp);
+
+        // Open the store and seed one outbox row to a dead peer (nothing listens
+        // on this port after we drop the listener).
+        let dead_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind dead");
+        let dead_port = dead_listener.local_addr().expect("addr").port();
+        drop(dead_listener);
+        let dead_peer: ruma::OwnedServerName = format!("127.0.0.1:{dead_port}")
+            .parse()
+            .expect("parse server name");
+
+        let store = Arc::new(
+            SqliteStore::open_in_dir(tmp.path())
+                .await
+                .expect("open store"),
+        );
+        // Build a minimal room so we can persist a message event.
+        let sender: ruma::OwnedUserId = "@alice:127.0.0.1".parse().expect("user id");
+        let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
+            .state_key(String::new())
+            .content(serde_json::json!({ "room_version": ROOM_VERSION_ID }))
+            .build()
+            .expect("build create");
+        let room_id = create.room_id.clone();
+        store.create_room(&create, &[]).await.expect("create_room");
+        // Persist a message event to the dead peer's outbox — this is what makes
+        // the sender supervisor spawn a per-destination task that keeps retrying.
+        let msg = EventBuilder::new(sender, "m.room.message".to_owned())
+            .room_id(room_id)
+            .content(serde_json::json!({ "msgtype": "m.text", "body": "hi" }))
+            .prev_events(vec![create.event_id])
+            .build()
+            .expect("build msg");
+        store
+            .persist_event(&msg, &[&*dead_peer])
+            .await
+            .expect("persist_event");
+
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let (tx, rx) = mpsc::unbounded_channel();
         let server = tokio::spawn(super::serve(listener, config, rx));
+
+        // Give the sender supervisor a moment to discover the dead peer and
+        // spawn its per-destination task (which will be retrying the dead peer).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
         tx.send(Command::Shutdown).expect("send shutdown");
         let joined = tokio::time::timeout(Duration::from_secs(5), server)
             .await
-            .expect("serve must return after a Shutdown command, not hang");
+            .expect("serve must return after a Shutdown command even with a live sender task");
         joined
             .expect("serve task must not panic")
             .expect("serve must return Ok after graceful shutdown");

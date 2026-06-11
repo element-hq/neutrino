@@ -14,6 +14,11 @@ use tempfile::TempDir;
 use super::conn::ConnKey;
 use super::{SyncError, SyncState, handle};
 
+/// A shutdown token that never fires — for tests exercising non-shutdown paths.
+fn no_shutdown() -> tokio_util::sync::CancellationToken {
+    tokio_util::sync::CancellationToken::new()
+}
+
 /// Wait until a spawned long-poll on `(user_id, conn_id)` has subscribed to
 /// its cancel signal and is in (or about to enter) its idle wait.
 ///
@@ -286,7 +291,7 @@ fn list_with(timeline_limit: u32, required: Vec<(StateEventType, &str)>) -> requ
 #[tokio::test]
 async fn initial_sync_with_no_lists_returns_empty_rooms_and_fresh_pos() {
     let (store, _tmp) = fresh_store().await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let user = user_id!("@alice:example.org");
 
     let req = Request::new();
@@ -332,7 +337,7 @@ async fn initial_sync_with_list_returns_joined_rooms_and_calls_storage() {
     )
     .await;
 
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut req = Request::new();
     let mut lists = BTreeMap::new();
@@ -389,7 +394,7 @@ async fn required_state_filters_current_state() {
     )
     .await;
 
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut req = Request::new();
     let mut lists = BTreeMap::new();
@@ -425,7 +430,7 @@ async fn required_state_filters_current_state() {
 #[tokio::test]
 async fn unknown_pos_returns_error() {
     let (store, _tmp) = fresh_store().await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let user = user_id!("@alice:example.org");
 
     let mut req = Request::new();
@@ -437,7 +442,7 @@ async fn unknown_pos_returns_error() {
 #[tokio::test]
 async fn second_sync_with_correct_pos_succeeds() {
     let (store, _tmp) = fresh_store().await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let user = user_id!("@alice:example.org");
 
     let resp1 = handle(&state, user, Request::new()).await.unwrap();
@@ -461,7 +466,7 @@ async fn invited_rooms_are_candidates() {
     setup_room(&store, invited_room, inviter).await;
     seed_member(&store, invited_room, user, inviter, "invite", 100).await;
 
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut req = Request::new();
     let mut lists = BTreeMap::new();
@@ -511,7 +516,7 @@ async fn rooms_sorted_by_bump_stamp_desc() {
     let (store, _tmp) = fresh_store().await;
     let user = user_id!("@alice:example.org");
     let ids = seed_rooms_with_timestamps(&store, user, &[300, 200, 100]).await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut req = Request::new();
     let mut lists = BTreeMap::new();
@@ -551,7 +556,7 @@ async fn range_slicing_returns_only_requested_indexes() {
     let user = user_id!("@alice:example.org");
     let timestamps: Vec<u64> = (1..=10).map(|i| i * 100).collect();
     let ids = seed_rooms_with_timestamps(&store, user, &timestamps).await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut req = Request::new();
     let mut lists = BTreeMap::new();
@@ -576,7 +581,7 @@ async fn subscription_bypasses_list_range() {
     let (store, _tmp) = fresh_store().await;
     let user = user_id!("@alice:example.org");
     let ids = seed_rooms_with_timestamps(&store, user, &[300, 200, 100]).await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut req = Request::new();
     let mut lists = BTreeMap::new();
@@ -612,7 +617,7 @@ async fn multi_range_request_only_honours_first() {
     let (store, _tmp) = fresh_store().await;
     let user = user_id!("@alice:example.org");
     let ids = seed_rooms_with_timestamps(&store, user, &[100, 200, 300, 400, 500]).await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut req = Request::new();
     let mut lists = BTreeMap::new();
@@ -646,7 +651,7 @@ async fn invited_room_bump_stamp_uses_invitee_member_event() {
     // the per-membership branch this would inflate bump_stamp to 1000.
     seed_member(&store, invited, inviter, inviter, "join", 1000).await;
 
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let mut req = Request::new();
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -668,7 +673,7 @@ async fn list_count_independent_of_range_size() {
     let (store, _tmp) = fresh_store().await;
     let user = user_id!("@alice:example.org");
     let _ids = seed_rooms_with_timestamps(&store, user, &[100, 200, 300, 400, 500]).await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut req = Request::new();
     let mut lists = BTreeMap::new();
@@ -707,7 +712,7 @@ async fn second_sync_returns_only_new_events() {
         ),
     )
     .await;
-    let state = SyncState::new(store.clone());
+    let state = SyncState::new(store.clone(), no_shutdown());
 
     let mut req1 = Request::new();
     let mut lists = BTreeMap::new();
@@ -781,7 +786,7 @@ async fn third_sync_with_no_new_events_omits_room() {
         ),
     )
     .await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -819,7 +824,7 @@ async fn limited_set_when_timeline_truncated() {
         ),
     )
     .await;
-    let state = SyncState::new(store.clone());
+    let state = SyncState::new(store.clone(), no_shutdown());
 
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(2, vec![]));
@@ -872,7 +877,7 @@ async fn required_state_not_re_sent_when_unchanged() {
         ),
     )
     .await;
-    let state = SyncState::new(store.clone());
+    let state = SyncState::new(store.clone(), no_shutdown());
 
     let mut lists = BTreeMap::new();
     lists.insert(
@@ -1023,7 +1028,7 @@ async fn oob_invite_surfaces_in_sliding_sync() {
     let invite_event = oob_invite_event(room, user, inviter, "Remote Room", 80);
     store.put_invite(room, user, &invite_event).await.unwrap();
 
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let mut req = Request::new();
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -1079,7 +1084,7 @@ async fn in_room_membership_wins_over_oob_invite_stub() {
     let stub = oob_invite_event(room, user, inviter, "Stale Invite", 50);
     store.put_invite(room, user, &stub).await.unwrap();
 
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let mut req = Request::new();
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -1126,7 +1131,7 @@ async fn oob_invites_rank_by_member_event_ts() {
         .await
         .unwrap();
 
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let mut req = Request::new();
     let mut lists = BTreeMap::new();
     let mut list = request::List::default();
@@ -1211,7 +1216,7 @@ async fn invited_room_emits_invite_state() {
     );
     seed(&store, &invite_event).await;
 
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let mut req = Request::new();
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -1261,7 +1266,7 @@ async fn fresh_invite_emitted_while_existing_invite_pending() {
 
     setup_room(&store, room_a, inviter).await;
     seed_invite(&store, room_a, user, inviter, "Room A", 100).await;
-    let state = SyncState::new(store.clone());
+    let state = SyncState::new(store.clone(), no_shutdown());
 
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -1385,7 +1390,7 @@ async fn name_avatar_and_counts_emitted() {
     seed_member(&store, room, bob, bob, "join", 130).await;
     seed_member(&store, room, carol, user, "invite", 140).await;
 
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let mut req = Request::new();
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -1413,7 +1418,7 @@ async fn name_avatar_and_counts_emitted() {
 #[tokio::test]
 async fn conn_id_over_16_chars_rejected() {
     let (store, _tmp) = fresh_store().await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let user = user_id!("@alice:example.org");
 
     let mut req = Request::new();
@@ -1427,7 +1432,7 @@ async fn conn_id_at_limit_16_chars_accepted() {
     // MSC4186 limits `conn_id` to ≤16 characters. Boundary test: exactly
     // 16 chars must be accepted.
     let (store, _tmp) = fresh_store().await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let user = user_id!("@alice:example.org");
 
     let mut req = Request::new();
@@ -1445,7 +1450,7 @@ async fn conn_id_at_limit_16_chars_accepted() {
 async fn conn_id_at_17_chars_rejected() {
     // Boundary test: 17 chars (one over the MSC4186 limit) must be rejected.
     let (store, _tmp) = fresh_store().await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let user = user_id!("@alice:example.org");
 
     let mut req = Request::new();
@@ -1461,7 +1466,7 @@ async fn conn_id_at_17_chars_rejected() {
 #[tokio::test]
 async fn too_many_lists_rejected() {
     let (store, _tmp) = fresh_store().await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let user = user_id!("@alice:example.org");
 
     let mut req = Request::new();
@@ -1477,7 +1482,7 @@ async fn too_many_lists_rejected() {
 #[tokio::test]
 async fn e2ee_extension_echoed_when_enabled() {
     let (store, _tmp) = fresh_store().await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let user = user_id!("@alice:example.org");
 
     let mut req = Request::new();
@@ -1499,7 +1504,7 @@ async fn e2ee_extension_echoed_when_enabled() {
 #[tokio::test]
 async fn to_device_extension_echoed_when_enabled() {
     let (store, _tmp) = fresh_store().await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let user = user_id!("@alice:example.org");
 
     let mut req = Request::new();
@@ -1518,7 +1523,7 @@ async fn to_device_extension_echoed_when_enabled() {
 #[tokio::test]
 async fn extensions_not_echoed_when_not_requested() {
     let (store, _tmp) = fresh_store().await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let user = user_id!("@alice:example.org");
 
     let resp = handle(&state, user, Request::new()).await.unwrap();
@@ -1533,7 +1538,7 @@ async fn extensions_not_echoed_when_not_requested() {
 #[tokio::test]
 async fn initial_sync_ignores_timeout() {
     let (store, _tmp) = fresh_store().await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let user = user_id!("@alice:example.org");
 
     let mut req = Request::new();
@@ -1565,7 +1570,7 @@ async fn long_poll_returns_empty_after_timeout() {
         ),
     )
     .await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -1608,7 +1613,7 @@ async fn long_poll_wakes_on_new_event() {
         ),
     )
     .await;
-    let state_arc = Arc::new(SyncState::new(store.clone()));
+    let state_arc = Arc::new(SyncState::new(store.clone(), no_shutdown()));
 
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -1675,7 +1680,7 @@ async fn retry_with_same_pos_returns_cached_response() {
         ),
     )
     .await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -1726,7 +1731,7 @@ async fn retry_at_same_pos_with_different_body_misses_cache() {
     let user = user_id!("@alice:example.org");
     let room = room_id!("!room:example.org");
     setup_joined_room(&store, room, user).await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut lists_a = BTreeMap::new();
     lists_a.insert("all".to_string(), list_with(5, vec![]));
@@ -1767,7 +1772,7 @@ async fn retry_at_same_pos_with_different_body_misses_cache() {
 async fn stale_pos_returns_unknown_pos_after_advancing() {
     let (store, _tmp) = fresh_store().await;
     let user = user_id!("@alice:example.org");
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let resp1 = handle(&state, user, Request::new()).await.unwrap();
 
@@ -1806,7 +1811,7 @@ async fn retry_does_not_consume_pending_events() {
         ),
     )
     .await;
-    let state = SyncState::new(store.clone());
+    let state = SyncState::new(store.clone(), no_shutdown());
 
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -1875,7 +1880,7 @@ async fn required_state_wildcard_matches_everything() {
         ),
     )
     .await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut lists = BTreeMap::new();
     let mut list = request::List::default();
@@ -1922,7 +1927,7 @@ async fn required_state_wildcard_state_key_returns_all_keys_of_type() {
         ),
     )
     .await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut list = request::List::default();
     list.ranges = vec![(UInt::from(0u32), UInt::from(0u32))];
@@ -1962,7 +1967,7 @@ async fn required_state_wildcard_event_type_matches_specific_state_key() {
         ),
     )
     .await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut list = request::List::default();
     list.ranges = vec![(UInt::from(0u32), UInt::from(0u32))];
@@ -2008,7 +2013,7 @@ async fn initial_sync_sets_limited_true_when_room_has_more_events_than_limit() {
         )
         .await;
     }
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(2, vec![]));
@@ -2046,7 +2051,7 @@ async fn initial_sync_sets_limited_false_when_all_events_fit() {
         ),
     )
     .await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(10, vec![]));
@@ -2081,7 +2086,7 @@ async fn newly_joined_room_emits_initial_snapshot_on_incremental_sync() {
         ),
     )
     .await;
-    let state = SyncState::new(store.clone());
+    let state = SyncState::new(store.clone(), no_shutdown());
 
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -2145,7 +2150,7 @@ async fn empty_room_still_emitted_on_initial_sync() {
     // `setup_joined_room` already writes create + member-join (the minimum to
     // make the room visible). "Empty" here means no additional content.
     setup_joined_room(&store, room, user).await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -2178,7 +2183,7 @@ async fn name_change_propagates_on_incremental_sync() {
         ),
     )
     .await;
-    let state = SyncState::new(store.clone());
+    let state = SyncState::new(store.clone(), no_shutdown());
 
     let mut lists = BTreeMap::new();
     lists.insert(
@@ -2264,7 +2269,7 @@ async fn invited_room_emits_name_and_avatar_from_stripped_state() {
     );
     seed(&store, &invite_event).await;
 
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -2297,7 +2302,7 @@ async fn knocked_room_appears_in_candidates() {
     setup_room(&store, room, knocker).await;
     seed_member(&store, room, user, user, "knock", 100).await;
 
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut req = Request::new();
     let mut lists = BTreeMap::new();
@@ -2324,7 +2329,7 @@ async fn kicked_room_appears_in_candidates_even_on_fresh_connection() {
     seed_member(&store, room, user, user, "join", 60).await;
     seed_member(&store, room, user, kicker, "leave", 100).await;
 
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let mut req = Request::new();
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -2345,7 +2350,7 @@ async fn self_left_room_only_appears_if_previously_emitted() {
 
     // Step 1: user is joined. Sync once to put the room into conn.sent.
     setup_joined_room(&store, room, user).await;
-    let state = SyncState::new(store.clone());
+    let state = SyncState::new(store.clone(), no_shutdown());
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
     let mut req1 = Request::new();
@@ -2367,7 +2372,7 @@ async fn self_left_room_only_appears_if_previously_emitted() {
 
     // Step 3: a brand-new connection (no `pos`) does NOT see the
     // self-leave-only room — it was never emitted on this conn.
-    let new_state = SyncState::new(store);
+    let new_state = SyncState::new(store, no_shutdown());
     let mut req3 = Request::new();
     let mut lists2 = BTreeMap::new();
     lists2.insert("all".to_string(), list_with(5, vec![]));
@@ -2388,7 +2393,7 @@ async fn banned_room_only_appears_if_previously_emitted() {
     setup_room(&store, room, banner).await;
     seed_member(&store, room, banner, banner, "join", 50).await;
     seed_member(&store, room, user, banner, "ban", 100).await;
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
     let mut req1 = Request::new();
@@ -2410,7 +2415,7 @@ async fn banned_room_remains_visible_after_being_emitted_while_joined() {
     // Join → sync to register the room with the conn → get banned → next sync
     // must still show the room because conn.sent recorded it.
     setup_joined_room(&store, room, user).await;
-    let state = SyncState::new(store.clone());
+    let state = SyncState::new(store.clone(), no_shutdown());
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
     let mut req1 = Request::new();
@@ -2456,7 +2461,7 @@ async fn concurrent_long_poll_is_cancelled_by_newer_request() {
         ),
     )
     .await;
-    let state = Arc::new(SyncState::new(store));
+    let state = Arc::new(SyncState::new(store, no_shutdown()));
 
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -2531,7 +2536,7 @@ async fn initial_sync_cancels_prior_entrys_long_poll() {
         ),
     )
     .await;
-    let state = Arc::new(SyncState::new(store));
+    let state = Arc::new(SyncState::new(store, no_shutdown()));
 
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -2602,7 +2607,7 @@ async fn concurrent_body_differing_request_gets_unknown_pos_after_cancellation()
         ),
     )
     .await;
-    let state = Arc::new(SyncState::new(store.clone()));
+    let state = Arc::new(SyncState::new(store.clone(), no_shutdown()));
 
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
@@ -2690,7 +2695,7 @@ async fn initial_sync_anchors_high_water_at_store_head() {
         )
         .await;
     }
-    let state = SyncState::new(store);
+    let state = SyncState::new(store, no_shutdown());
 
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
