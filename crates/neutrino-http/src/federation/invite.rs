@@ -41,6 +41,7 @@ use ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 use serde_json::{Value, json};
+use tracing::{debug, warn};
 
 use crate::federation::client::{FederationClient, FederationClientError};
 use crate::federation::{FedError, stage_and_poke};
@@ -247,8 +248,10 @@ pub(crate) async fn federated_invite(
     {
         Ok(resp) => resp.event,
         // The invitee server refused (e.g. 403 from its own checks). Map 403 →
-        // 403, anything else → 502; persist nothing either way.
+        // 403, anything else → 502; persist nothing either way. (The client has
+        // already logged the peer's response body alongside this status.)
         Err(FederationClientError::Status(code)) => {
+            warn!(dest = %target.server_name(), %room_id, status = code, "outbound invite: invitee server rejected the invite");
             let (status, errcode) = if code == StatusCode::FORBIDDEN.as_u16() {
                 (StatusCode::FORBIDDEN, "M_FORBIDDEN")
             } else {
@@ -256,7 +259,11 @@ pub(crate) async fn federated_invite(
             };
             return error_response(status, errcode, "invitee server rejected the invite");
         }
-        Err(_) => {
+        // Transport failure (connection refused, DNS, timeout, TLS) or an
+        // unparseable response — propagated from the client `?` and logged
+        // nowhere else, so surface the underlying cause here.
+        Err(e) => {
+            warn!(dest = %target.server_name(), %room_id, error = %e, "outbound invite: could not reach the invitee's server");
             return error_response(
                 StatusCode::BAD_GATEWAY,
                 "M_UNKNOWN",
@@ -271,7 +278,18 @@ pub(crate) async fn federated_invite(
     //    is outside the hash and never read for a remote member).
     let returned_event = match from_wire(returned, Vec::new()) {
         Ok(ev) if ev.event_id == candidate.event_id => ev,
-        _ => {
+        // The peer handed back a *different* event than we sent — a swap attempt
+        // worth a distinct log line, not just a parse failure.
+        Ok(ev) => {
+            warn!(dest = %target.server_name(), %room_id, expected = %candidate.event_id, returned = %ev.event_id, "outbound invite: invitee server returned a different event id");
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "M_UNKNOWN",
+                "invitee server returned an unexpected event",
+            );
+        }
+        Err(e) => {
+            warn!(dest = %target.server_name(), %room_id, error = %e, "outbound invite: invitee server returned an unparseable event");
             return error_response(
                 StatusCode::BAD_GATEWAY,
                 "M_UNKNOWN",
@@ -307,6 +325,7 @@ async fn build_invite_room_state(
     inviter: &UserId,
 ) -> Vec<Value> {
     let Ok(state) = store.current_room_state(room_id).await else {
+        warn!(%room_id, "invite_room_state: could not read current room state; sending an empty room preview");
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -320,6 +339,8 @@ async fn build_invite_room_state(
             && let Ok(v) = serde_json::to_value(&stripped)
         {
             out.push(v);
+        } else {
+            debug!(%room_id, %event_type, %state_key, "invite_room_state: could not strip event; omitting from the room preview");
         }
     }
     out
@@ -340,9 +361,11 @@ fn merge_invite_room_state(
         return event;
     }
     let Ok(mut v) = serde_json::from_str::<Value>(event.get()) else {
+        debug!("invite_room_state merge skipped: event body is not valid JSON");
         return event;
     };
     let Some(obj) = v.as_object_mut() else {
+        debug!("invite_room_state merge skipped: event body is not a JSON object");
         return event;
     };
     let arr: Vec<Value> = irs

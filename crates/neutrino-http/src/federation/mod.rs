@@ -254,19 +254,28 @@ pub(crate) fn complete_membership_template(
     membership: &str,
 ) -> Option<neutrino_common::Event> {
     use neutrino_state::event_id::{EventBuilder, from_wire};
-    let parsed = from_wire(
-        serde_json::value::RawValue::from_string(template.get().to_owned()).ok()?,
-        Vec::new(),
-    )
-    .ok()?;
-    EventBuilder::new(user.to_owned(), "m.room.member".to_owned())
+    let raw = serde_json::value::RawValue::from_string(template.get().to_owned()).ok()?;
+    let parsed = match from_wire(raw, Vec::new()) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            tracing::warn!(target: "neutrino_http", %room_id, %user, membership, error = %e, "could not parse the membership template from the resident server");
+            return None;
+        }
+    };
+    match EventBuilder::new(user.to_owned(), "m.room.member".to_owned())
         .room_id(room_id.to_owned())
         .state_key(user.to_string())
         .content(json!({ "membership": membership }))
         .prev_events(parsed.prev_events)
         .prev_state_events(parsed.prev_state_events)
         .build()
-        .ok()
+    {
+        Ok(event) => Some(event),
+        Err(e) => {
+            tracing::warn!(target: "neutrino_http", %room_id, %user, membership, error = %e, "could not build the membership event from the resident's template");
+            None
+        }
+    }
 }
 
 /// Stage a batch of already-parsed PDUs for one room, then poke the worker to
