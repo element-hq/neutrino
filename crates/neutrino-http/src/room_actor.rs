@@ -35,9 +35,10 @@ use neutrino_state::room_core::{Effect, RoomCore};
 use neutrino_state::{CoreError, FormatError, StateDelta, StateMap};
 use neutrino_store::{EventStore, Membership, RoomStore, StateStore, StorageError};
 use neutrino_store_sqlite::SqliteStore;
-use ruma::{OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId};
+use ruma::{EventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
+use tracing::{info, warn};
 
 /// Inbox depth for a room actor. Senders `.await` when full, applying
 /// natural back-pressure rather than unbounded buffering.
@@ -200,7 +201,7 @@ impl RoomActor {
         // before the apply consumes `event` so we can exclude it from fan-out.
         let sender_server = event.sender.server_name().to_owned();
 
-        let (next, effects) = self.run_apply(event).await?;
+        let (next, effects) = self.run_apply("resident", event).await?;
         // Idempotent re-send: already persisted, nothing to commit.
         if effects.is_empty() {
             return Ok(());
@@ -263,7 +264,26 @@ impl RoomActor {
     /// side. The store hands us a read-only provider; the state-machine logic
     /// stays here in the actor. Returns the post-apply core (adopted by the
     /// caller only after any persist commits) and the emitted effects.
-    async fn run_apply(&self, event: Event) -> Result<(RoomCore, Vec<Effect>), RoomActorError> {
+    ///
+    /// `source` labels where the event came from (`federation` / `resident` /
+    /// `local`) so the one-line-per-event apply log can be filtered. Logging
+    /// lives here, not in `apply_pdu`, because `neutrino-state` carries no
+    /// `tracing` dependency and isn't in the default log filter — and the
+    /// verdict (accept / reject / soft-fail / duplicate / retry, and whether
+    /// `current_state` moved) is fully reconstructable from the effects.
+    async fn run_apply(
+        &self,
+        source: &'static str,
+        event: Event,
+    ) -> Result<(RoomCore, Vec<Effect>), RoomActorError> {
+        // Snapshot identity before `event` is moved into the provider closure.
+        let event_id = event.event_id.clone();
+        let event_type = event.event_type.clone();
+        let state_key = event.state_key.clone();
+        let sender = event.sender.clone();
+        let prev = event.prev_events.len();
+        let prev_state = event.prev_state_events.len();
+
         let room = self.room.clone();
         let (next, verdict) = self
             .store
@@ -273,6 +293,18 @@ impl RoomActor {
                 (room, verdict)
             })
             .await?;
+
+        log_apply(
+            source,
+            &event_id,
+            &event_type,
+            &state_key,
+            &sender,
+            prev,
+            prev_state,
+            &verdict,
+        );
+
         Ok((next, verdict?))
     }
 
@@ -290,7 +322,7 @@ impl RoomActor {
             .room
             .build_local_event(sender, event_type, state_key, content)?;
 
-        let (next, effects) = self.run_apply(event).await?;
+        let (next, effects) = self.run_apply("local", event).await?;
 
         // Federate to every remote server in the post-apply room state — but a
         // soft-failed event must not be relayed (it failed auth against current
@@ -315,7 +347,7 @@ impl RoomActor {
     /// (`apply_pdu` returns no effects). A missing-ancestry / fault `CoreError`
     /// propagates so the caller can backfill and re-deliver.
     async fn handle_apply_pdu(&mut self, event: Event) -> Result<(), RoomActorError> {
-        let (next, effects) = self.run_apply(event).await?;
+        let (next, effects) = self.run_apply("federation", event).await?;
         // Idempotent no-op: the PDU is already persisted. Nothing to commit.
         if effects.is_empty() {
             return Ok(());
@@ -404,6 +436,57 @@ fn collect_effects(effects: Vec<Effect>) -> (Option<Arc<Event>>, StateDelta) {
         }
     }
     (persisted, delta)
+}
+
+/// One INFO line per integrated event (WARN when not integrated), keyed by
+/// `event_id` — the per-event counterpart to the per-request HTTP log. Makes
+/// incoming federation traffic visible by id and classifies the `apply_pdu`
+/// verdict: accepted (and whether `current_state` moved), rejected,
+/// soft-failed, an idempotent duplicate re-send, or a retry/fault (missing
+/// ancestry → the caller backfills and re-delivers). The accepted-but-no-change
+/// case is the tell for a state event that lost state resolution.
+#[allow(clippy::too_many_arguments)]
+fn log_apply(
+    source: &str,
+    event_id: &EventId,
+    event_type: &str,
+    state_key: &Option<String>,
+    sender: &UserId,
+    prev: usize,
+    prev_state: usize,
+    verdict: &Result<Vec<Effect>, CoreError>,
+) {
+    match verdict {
+        Err(e) => warn!(
+            source, %event_id, event_type, ?state_key, %sender, prev, prev_state,
+            error = %e, "apply: not integrated (retry/fault)"
+        ),
+        Ok(effects) if effects.is_empty() => info!(
+            source, %event_id, event_type, ?state_key, %sender,
+            "apply: duplicate re-delivery, no-op"
+        ),
+        Ok(effects) => {
+            let persisted = effects.iter().find_map(|e| match e {
+                Effect::Persist { event } => Some(event),
+                Effect::UpdateCurrentState(_) => None,
+            });
+            let state_keys_changed = effects.iter().find_map(|e| match e {
+                Effect::UpdateCurrentState(d) => Some(d.len()),
+                Effect::Persist { .. } => None,
+            });
+            let outcome = match persisted {
+                Some(ev) if ev.rejected => "rejected",
+                Some(ev) if ev.soft_failed => "soft-failed (persisted, not relayed)",
+                _ if state_keys_changed.is_some() => "accepted (current_state changed)",
+                _ if state_key.is_some() => "accepted (state event; lost state-res / no change)",
+                _ => "accepted (timeline)",
+            };
+            info!(
+                source, %event_id, event_type, ?state_key, %sender, prev, prev_state,
+                state_keys_changed = state_keys_changed.unwrap_or(0), outcome, "apply"
+            );
+        }
+    }
 }
 
 /// Registry of per-room actors. Looks up (or lazily bootstraps + spawns) the

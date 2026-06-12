@@ -51,6 +51,11 @@
 #                               the /state equality check.
 #   5. Op log                 — every action + predicted/actual status; dumped
 #                               with the seed on failure for exact replay.
+#   6. Divergence tracking     — DIVERGENCE_SEEN / CONFLICT_FIRED / ANY_CUT. The
+#                               conflict driver forces two co-admins to write the
+#                               same state key across an active cut; the guard
+#                               then asserts they actually disagree (a partition
+#                               that DOESN'T bite makes convergence vacuous).
 #
 # SCOPE CHOICES (deliberate, see design discussion)
 #   * hs1 is the anchor: never leaves / is never kicked / is never demoted, so a
@@ -95,6 +100,9 @@ declare -A MSG_ACCEPTED=()              # message event_id -> origin hs (must co
 declare -a OPLOG=()                     # human-readable action trail
 SEQ=0                                   # monotonic tag for generated content
 ROOM=""
+DIVERGENCE_SEEN=0                       # set once any partition is proven to bite
+CONFLICT_FIRED=0                        # set once a manufactured conflict is asserted
+ANY_CUT=0                               # set once any link is cut (vacuity check)
 
 # ---- output helpers ---------------------------------------------------------
 
@@ -172,6 +180,10 @@ kick_outboxes() {
 
 mxid() { printf '@alice:%s' "$1"; }
 power_of() { printf '%s' "${PL[$1]:-$PL_USERS_DEFAULT}"; }
+
+# pair key -> its two server names (12 -> "hs1 hs2"). Used by the conflict driver
+# and the divergence guard to map a link to the two servers it separates.
+link_servers() { case "$1" in 12) echo hs1 hs2 ;; 13) echo hs1 hs3 ;; 23) echo hs2 hs3 ;; esac; }
 
 # state_req <event-type> -> power required to send it as state.
 state_req() {
@@ -314,7 +326,41 @@ state_map() {
   cs "$1" GET "$CS/rooms/$ROOM/state"
   [[ $CS_CODE == 2* ]] || return 1
   printf '%s' "$CS_BODY" | jq -S -c \
-    'map({ (.type + " " + (.state_key // "")): .event_id }) | add // {}'
+    'map({ (.type + " " + (.state_key // "")): .event_id }) | add // {}'
+}
+
+# Divergence guard (#1): two servers on opposite sides of an ACTIVE cut, each
+# having just locally accepted a write to the SAME state key, MUST now disagree
+# on their resolved /state. If they AGREE, the partition is not biting and every
+# later "converged" assertion is vacuous — there was never anything to reconcile.
+# Fail loudly: a green run that never diverges is a green run that tested nothing.
+assert_divergent() { # <a> <b> <ctx>
+  local a=$1 b=$2 ctx=$3 ma mb
+  ma=$(state_map "$a") || fail "divergence guard: $a /state unreadable ($ctx)"
+  mb=$(state_map "$b") || fail "divergence guard: $b /state unreadable ($ctx)"
+  [[ $ma != "$mb" ]] || fail "divergence guard: $a and $b agree on /state under an active cut after conflicting writes ($ctx) — the partition is NOT biting, so convergence checks would pass vacuously"
+  DIVERGENCE_SEEN=1
+  oplog "  divergence confirmed: $a != $b under active cut ($ctx)"
+}
+
+# Pre-heal probe, run at the top of every barrier BEFORE any link is healed: if
+# two readable servers already disagree, a partition produced real divergence
+# this episode. Sticky for the whole run; a run that cuts links but NEVER once
+# observes divergence is flagged at the end as likely vacuous. A server that left
+# returns non-2xx on /state and is simply skipped (no false "divergence").
+sample_divergence() {
+  local maps=() hs m i
+  for hs in "${SERVERS[@]}"; do
+    m=$(state_map "$hs") && maps+=("$m")
+  done
+  ((${#maps[@]} >= 2)) || return 0
+  for ((i = 1; i < ${#maps[@]}; i++)); do
+    [[ ${maps[0]} == "${maps[$i]}" ]] && continue
+    DIVERGENCE_SEEN=1
+    note "pre-heal divergence observed (partitions are biting)"
+    return 0
+  done
+  return 0
 }
 
 # Every message-timeline event_id a server holds, paged oldest-first via
@@ -398,6 +444,9 @@ ensure_joined() {
 
 barrier() {
   log "barrier: heal all links, restore membership, converge"
+  # Sample divergence BEFORE healing: any real partition this episode shows up as
+  # two servers disagreeing here. Sticky for the run's end-of-run vacuity check.
+  sample_divergence
   local k
   for k in "${LINKS[@]}"; do
     if [[ ${UP[$k]} != 1 ]]; then issue partition heal "$k" || true; fi
@@ -497,6 +546,52 @@ fuzz_mutate() {
   esac
 }
 
+# Deliberately manufacture a state-res CONFLICT (#2): pick two joined servers
+# that can both author m.room.name, ensure the link between them is cut, then
+# have each set the name to a DIFFERENT value. Neither has seen the other's write
+# (the link is down), so the two events are concurrent siblings — the only way to
+# exercise the origin_server_ts/event_id tie-break. Ordinary fuzz writes one op
+# per round and almost never collides two servers on one state key across a
+# partition. Both writes are RECORD-tier (a stale-view reject is tolerated); when
+# BOTH are accepted, assert_divergent proves the cut actually bit. m.room.name is
+# the natural target — same state_key ("") on both sides, and it matches the
+# curated concurrent-name scenario in smoke.sh. Returns 1 when no conflict is
+# possible (fewer than two co-admins joined) so the caller falls through.
+fuzz_conflict() {
+  local req pairs=() k a b
+  req=$(state_req m.room.name)
+  for k in "${LINKS[@]}"; do
+    read -r a b <<<"$(link_servers "$k")"
+    [[ ${MEMBER[$a]} == join && ${MEMBER[$b]} == join ]] || continue
+    (($(power_of "$a") >= req)) && (($(power_of "$b") >= req)) && pairs+=("$k")
+  done
+  ((${#pairs[@]} > 0)) || return 1
+
+  k=${pairs[$((RANDOM % ${#pairs[@]}))]}
+  read -r a b <<<"$(link_servers "$k")"
+  if [[ ${UP[$k]} == 1 ]]; then              # need an active cut for concurrency
+    issue partition cut "$k" || true
+    UP[$k]=0
+    ANY_CUT=1
+    oplog "topology cut  $k (to manufacture a conflict)"
+  fi
+
+  local tag=$((SEQ += 1)) ra rb
+  oplog "conflict $k: $a vs $b both set m.room.name under an active cut"
+  issue "$a" name "$ROOM" "conflict-$tag-$a"; ra=$RC
+  oplog "  $a name -> $([[ $ra -eq 0 ]] && echo ok || echo "${ERR:-rc$ra}")"
+  issue "$b" name "$ROOM" "conflict-$tag-$b"; rb=$RC
+  oplog "  $b name -> $([[ $rb -eq 0 ]] && echo ok || echo "${ERR:-rc$rb}")"
+
+  if [[ $ra -eq 0 && $rb -eq 0 ]]; then
+    CONFLICT_FIRED=1
+    assert_divergent "$a" "$b" "conflict-$tag link=$k"
+  else
+    oplog "  conflict not both-accepted (ra=$ra rb=$rb); divergence not asserted (stale view, ok)"
+  fi
+  return 0
+}
+
 # Cut a random up-link or heal a random down-link. Biased toward healing when
 # many links are down so episodes don't spend all their rounds fully isolated.
 fuzz_topology() {
@@ -513,12 +608,22 @@ fuzz_topology() {
     k=${ups[$((RANDOM % ${#ups[@]}))]}
     issue partition cut "$k" || true
     UP[$k]=0
+    ANY_CUT=1
     oplog "topology cut  $k"
   fi
 }
 
+# ~30% topology change; ~15% manufacture a state-res conflict (falling through to
+# a normal mutation when no two co-admins are joined); else a model-valid mutation.
 fuzz_round() {
-  if ((RANDOM % 100 < 30)); then fuzz_topology; else fuzz_mutate; fi
+  local roll=$((RANDOM % 100))
+  if ((roll < 30)); then
+    fuzz_topology
+  elif ((roll < 45)); then
+    fuzz_conflict || fuzz_mutate
+  else
+    fuzz_mutate
+  fi
 }
 
 # ---- rig lifecycle -----------------------------------------------------------
@@ -579,5 +684,17 @@ while ((ep < EPISODES)); do
   barrier
   exact_probes
 done
+
+# Vacuity check: a run that cut links but NEVER observed divergence (no
+# manufactured conflict, no pre-heal disagreement) almost certainly means the
+# partitions aren't biting — the convergence assertions then passed over nothing.
+# The per-conflict assert_divergent is the hard gate; this is the run-level signal.
+if [[ $CONFLICT_FIRED == 1 ]]; then
+  note "state-res conflicts exercised; divergence guard held on every manufactured conflict"
+elif [[ $ANY_CUT == 1 && $DIVERGENCE_SEEN == 1 ]]; then
+  note "no two co-admins coincided on a cut (no conflict manufactured), but partition divergence WAS observed pre-heal"
+elif [[ $ANY_CUT == 1 ]]; then
+  log "WARNING: links were cut but divergence was never observed and no conflict fired — partitions may not be biting, or this seed under-exercised them (try more EPISODES/ROUNDS_PER_EPISODE, or another seed)"
+fi
 
 log "PASS — all $EPISODES episodes converged (seed=$SEED)"
