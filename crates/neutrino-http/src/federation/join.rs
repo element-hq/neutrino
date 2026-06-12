@@ -80,7 +80,21 @@ pub(crate) async fn federated_join_with(
             Ok(()) => {
                 // Staged + worker poked; block until our join lands (or time out).
                 return match wait_for_join(&*store, &mut persists, room_id, &user, timeout).await {
-                    Ok(()) => (StatusCode::OK, Json(json!({ "room_id": room_id }))).into_response(),
+                    Ok(()) => {
+                        // The join is grounded — drop any out-of-band invite stub
+                        // that sourced this join. A lingering stub would make a
+                        // later `/leave` route through the OOB-invite *decline*
+                        // path (`federation::leave::reject_invite`), which leaves
+                        // for the inviting server but never updates our own room
+                        // state — so the leaver stays `join` in its own view while
+                        // peers see `leave`. Best-effort: a stale stub is otherwise
+                        // superseded by the joined state in sync, so a removal
+                        // fault must not fail an already-successful join.
+                        if let Err(e) = store.remove_invite(room_id, &user).await {
+                            warn!(%room_id, %user, error = %e, "failed to clear invite stub after federated join");
+                        }
+                        (StatusCode::OK, Json(json!({ "room_id": room_id }))).into_response()
+                    }
                     Err(resp) => resp,
                 };
             }
@@ -126,18 +140,60 @@ pub(crate) async fn federated_join_if_remote(
     room_id: &RoomId,
     hints: &[OwnedServerName],
 ) -> Option<Response> {
-    let store = lock_app(state).store.clone();
-    // Resident (or a storage fault): the local path owns it. A storage error
-    // falls through to local, which surfaces it as a 500 — matching the prior
-    // inline behaviour in `join_by_id_or_alias`.
-    if !matches!(store.room_exists(room_id).await, Ok(false)) {
-        return None;
-    }
+    let (store, own_server) = {
+        let app = lock_app(state);
+        (app.store.clone(), app.config.server_name.clone())
+    };
+
     let mut candidates: Vec<OwnedServerName> = hints.to_vec();
-    // A pending OOB invite supplies the inviter's server as a fallback
-    // candidate. A storage fault here is surfaced as a 500 (matching `leave`'s
-    // invite lookup), not silently mistaken for "no invite" — which would 404 a
-    // room the user could in fact join.
+
+    // Decide local vs remote join, and source resident candidates:
+    //   * Not hosted                     → ordinary remote join (candidates from
+    //     the `via` hints + any OOB-invite inviter, below).
+    //   * Hosted, ≥1 joined LOCAL member  → our copy is live (we still receive
+    //     the room's events) → local join path, return None.
+    //   * Hosted, 0 joined local members  → our copy is STALE: federation stops
+    //     delivering to a server once its last member leaves, so a re-join must
+    //     go through the remote `send_join` handshake (which transfers the
+    //     resident's current state DAG and re-syncs us) rather than the local
+    //     path, which would build on our stale heads and never reconcile. The
+    //     candidates are the other servers we last knew to be joined.
+    match store.room_exists(room_id).await {
+        Ok(false) => {} // not hosted: ordinary remote join
+        Ok(true) => match store.joined_members(room_id).await {
+            Ok(members) => {
+                let mut have_local_member = false;
+                for uid in members.keys() {
+                    if uid.server_name().as_str() == own_server.as_str() {
+                        have_local_member = true;
+                    } else {
+                        let srv = uid.server_name().to_owned();
+                        if !candidates.contains(&srv) {
+                            candidates.push(srv);
+                        }
+                    }
+                }
+                // A live local member means our view is current — local join.
+                if have_local_member {
+                    return None;
+                }
+            }
+            Err(e) => {
+                return Some(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "M_UNKNOWN",
+                    &e.to_string(),
+                ));
+            }
+        },
+        // A storage fault checking existence falls through to the local path
+        // (which surfaces it as a 500), matching the prior behaviour.
+        Err(_) => return None,
+    }
+
+    // A pending OOB invite supplies the inviter's server as a fallback candidate
+    // (the client cannot supply a `via` for a v12 room id). A storage fault is a
+    // 500, not silently mistaken for "no invite" — which would 404 a joinable room.
     match store.get_invite(room_id, user).await {
         Ok(Some(invite)) => {
             let inviter = invite.sender.server_name().to_owned();
@@ -154,6 +210,10 @@ pub(crate) async fn federated_join_if_remote(
             ));
         }
     }
+
+    // Never target ourselves — a stale member list (or a stray hint) could name
+    // our own server, and a self-directed make_join would be nonsensical.
+    candidates.retain(|c| c.as_str() != own_server.as_str());
     if candidates.is_empty() {
         return None;
     }

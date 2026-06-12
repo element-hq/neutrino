@@ -2782,15 +2782,38 @@ async fn join_tries_hint_before_invite_fallback() {
 }
 
 #[tokio::test]
-async fn hosted_room_with_pending_invite_does_not_federate() {
-    // We host the room locally (seed store), and mount the joining server on top.
-    let (_seed_router, store, room_id, _head, _temp) = seed_public_room().await;
+async fn hosted_room_with_live_local_member_and_pending_invite_does_not_federate() {
+    // A hosted room with a *live local* member (@carol:a.example joined) is a
+    // current copy, so a local user's join must take the local path — never
+    // federate. (A hosted room with *no* joined local member is the stale-copy
+    // case that re-syncs; see `rejoining_hosted_room_with_no_local_members…`.)
+    let (_seed_router, store, room_id, _head, _temp) = seed_room(&[
+        (
+            ALICE,
+            "m.room.member",
+            ALICE,
+            json!({ "membership": "join" }),
+        ),
+        (
+            ALICE,
+            "m.room.join_rules",
+            "",
+            json!({ "join_rule": "public" }),
+        ),
+        (
+            "@carol:a.example",
+            "m.room.member",
+            "@carol:a.example",
+            json!({ "membership": "join" }),
+        ),
+    ])
+    .await;
     let router = router_with_store(config_for("a.example", "bob"), store.clone());
 
     // Plant a stale OOB invite for the local user whose inviter lives on a dead
-    // server. If the `room_exists` guard ever regressed and this federated, the
-    // join would contact that dead server and 502; because the room is resident
-    // it must take the local path and join (200) without any outbound request.
+    // server. If the gate ever regressed and this federated, the join would
+    // contact that dead server and 502; because the copy is live it must take
+    // the local path and join (200) without any outbound request.
     let dead = crate::federation::test_support::dead_peer().await;
     let inviter: OwnedUserId = format!("@alice:{dead}").parse().unwrap();
     let throwaway = EventBuilder::new(inviter.clone(), "m.room.create".to_owned())
@@ -2821,6 +2844,102 @@ async fn hosted_room_with_pending_invite_does_not_federate() {
         .unwrap()
         .expect("bob joined the resident room locally");
     assert_eq!(membership_str(&member).as_deref(), Some("join"));
+}
+
+#[tokio::test]
+async fn rejoining_hosted_room_with_no_local_members_resyncs_from_resident() {
+    // A previously hosted this room but has no joined local member left, so its
+    // copy is stale (federation stopped delivering once its last member left). A
+    // local user re-joining must take the REMOTE path and pull the resident's
+    // current state — not build on the stale local heads. The resident's state
+    // carries an m.room.name A never saw; after the re-join it must appear.
+    let alice = alice(); // @alice:example.org — a *remote* member from A's view
+    let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .unwrap();
+    let room_id = create.room_id.clone();
+    let alice_join = EventBuilder::new(alice.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(alice.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create.event_id.clone()])
+        .prev_state_events(vec![create.event_id.clone()])
+        .build()
+        .unwrap();
+    let rules = EventBuilder::new(alice.clone(), "m.room.join_rules".to_owned())
+        .room_id(room_id.clone())
+        .state_key(String::new())
+        .content(json!({ "join_rule": "public" }))
+        .prev_events(vec![alice_join.event_id.clone()])
+        .prev_state_events(vec![alice_join.event_id.clone()])
+        .build()
+        .unwrap();
+    // The state event A is missing while away.
+    let name = EventBuilder::new(alice.clone(), "m.room.name".to_owned())
+        .room_id(room_id.clone())
+        .state_key(String::new())
+        .content(json!({ "name": "synced-from-resident" }))
+        .prev_events(vec![rules.event_id.clone()])
+        .prev_state_events(vec![rules.event_id.clone()])
+        .build()
+        .unwrap();
+    let bob: OwnedUserId = "@bob:a.example".parse().unwrap();
+    let bob_join = EventBuilder::new(bob.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(bob.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![name.event_id.clone()])
+        .prev_state_events(vec![name.event_id.clone()])
+        .build()
+        .unwrap();
+
+    // Resident hands back current state including the name A never saw.
+    let mj = json!({ "event": raw_to_value(&bob_join), "room_version": ROOM_VERSION_ID });
+    let sj = json!({
+        "state_dag": [
+            raw_to_value(&create),
+            raw_to_value(&alice_join),
+            raw_to_value(&rules),
+            raw_to_value(&name),
+        ],
+        "timeline": [],
+        "event": raw_to_value(&bob_join),
+    });
+    let resident = crate::federation::test_support::spawn_stub(stub_resident(mj, sj)).await;
+
+    // A's STALE copy: hosts the room only up to join_rules (no name), and has no
+    // joined local member (alice is remote).
+    let (a_store, _a_temp) = fresh_store().await;
+    a_store
+        .create_room(&create, &[alice_join.clone(), rules.clone()])
+        .await
+        .unwrap();
+    assert!(a_store.room_exists(&room_id).await.unwrap());
+    let a_router = router_with_store(config_for("a.example", "bob"), a_store.clone());
+
+    // Re-join, hinting the live resident.
+    let path = format!("/_matrix/client/v3/join/{room_id}?server_name={resident}");
+    let (status, body) = post_json(&a_router, &path, &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+
+    // bob re-joined...
+    let member = a_store
+        .current_state_event(&room_id, "m.room.member", bob.as_str())
+        .await
+        .unwrap()
+        .expect("bob re-joined");
+    assert_eq!(membership_str(&member).as_deref(), Some("join"));
+    // ...and A pulled in the resident state it had missed (the proof of re-sync;
+    // the old local-join path would leave A on its stale heads with no name).
+    let name_ev = a_store
+        .current_state_event(&room_id, "m.room.name", "")
+        .await
+        .unwrap()
+        .expect("the missed m.room.name must be pulled in by the re-join");
+    let got: Value = serde_json::from_str(name_ev.content.get()).unwrap();
+    assert_eq!(got["name"], "synced-from-resident");
 }
 
 #[tokio::test]
