@@ -4,12 +4,14 @@
 //! for the design — the algorithm comments below cross-reference the seven
 //! steps from the design doc's §Handler/Algorithm.
 
+use std::collections::HashSet;
+
 use axum::{
     Json,
     extract::{Path, State},
 };
-use neutrino_store::{DagStore, RoomStore};
-use ruma::OwnedRoomId;
+use neutrino_store::{DagStore, EventStore, RoomStore};
+use ruma::{OwnedEventId, OwnedRoomId};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 
@@ -69,6 +71,15 @@ pub(crate) struct RequestBody {
     /// received PDU's missing state ancestry.
     #[serde(default)]
     state_dag: bool,
+    /// Anti-entropy (forward-extremity reconciliation): when `true`, the response
+    /// additionally includes any `latest_events` this server *itself holds*, not
+    /// only their ancestors. The unmodified endpoint returns only ancestors of
+    /// `latest_events` — it assumes the caller already has the heads (it received
+    /// them via `/send`). A reconciling caller, by contrast, is missing the
+    /// advertised head itself, so it sets this to retrieve the head and its gap
+    /// in one request. Optional, default `false`.
+    #[serde(default)]
+    include_latest_events: bool,
 }
 
 /// Serializable mirror of `ruma::api::federation::event::get_missing_events::v1::Response`.
@@ -148,7 +159,7 @@ pub(crate) async fn handle(
     // (5)
     let latest: Vec<&ruma::EventId> = body.latest_events.iter().map(|id| id.as_ref()).collect();
     let earliest: Vec<&ruma::EventId> = body.earliest_events.iter().map(|id| id.as_ref()).collect();
-    let events = store
+    let ancestors = store
         .missing_events(&room_id, &latest, &earliest, limit, body.state_dag)
         .await?;
 
@@ -158,7 +169,22 @@ pub(crate) async fn handle(
     // which reverses its walk before responding. The reference hash that
     // produced each event_id was computed over `event.raw`, so peers MUST
     // receive those exact bytes for the event_id to round-trip.
-    let events: Vec<Box<RawJsonValue>> = events.into_iter().rev().map(|e| e.raw).collect();
+    let mut seen: HashSet<OwnedEventId> = ancestors.iter().map(|e| e.event_id.clone()).collect();
+    let mut events: Vec<Box<RawJsonValue>> = ancestors.into_iter().rev().map(|e| e.raw).collect();
+
+    // (6b) — anti-entropy: when `include_latest_events` is set, append any
+    // `latest_events` we hold. They are the newest events, so they follow their
+    // ancestors in oldest-first order; the receiver re-toposorts regardless.
+    // `get_events` returns only the events we actually have, so it both fetches
+    // and existence-filters; dedup against the ancestors (a head may be an
+    // ancestor of another head).
+    if body.include_latest_events {
+        for ev in store.get_events(&latest).await? {
+            if seen.insert(ev.event_id.clone()) {
+                events.push(ev.raw);
+            }
+        }
+    }
 
     Ok(Json(ResponseBody { events }))
 }

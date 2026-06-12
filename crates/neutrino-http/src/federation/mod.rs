@@ -29,6 +29,7 @@ pub(crate) mod join;
 pub(crate) mod leave;
 pub(crate) mod make_join;
 pub(crate) mod make_leave;
+pub(crate) mod reconcile;
 pub(crate) mod send;
 pub(crate) mod send_join;
 pub(crate) mod send_leave;

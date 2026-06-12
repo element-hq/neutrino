@@ -44,6 +44,7 @@ use serde_json::value::RawValue as RawJsonValue;
 use tracing::warn;
 
 use crate::federation::FedError;
+use crate::federation::reconcile::{self, ForwardExtremities};
 use crate::{AppState, lock_app};
 
 /// Inbound federation transaction body.
@@ -70,6 +71,12 @@ pub(crate) struct TransactionBody {
     /// Deserialized for shape validation, then dropped — stubbed per CLAUDE.md.
     #[serde(default, rename = "edus")]
     _edus: Vec<Box<RawJsonValue>>,
+    /// Anti-entropy: the sender's per-room forward extremities. Optional; a peer
+    /// that has not implemented forward-extremity reconciliation omits it and the
+    /// transaction behaves exactly as before. For each advertised room we hold,
+    /// any head we are missing is fetched + reconciled (off the response path).
+    #[serde(default)]
+    forward_extremities: BTreeMap<OwnedRoomId, ForwardExtremities>,
 }
 
 /// Per-PDU processing result. An empty object is success; `error` carries a
@@ -80,10 +87,16 @@ struct PduResult {
     error: Option<String>,
 }
 
-/// Transaction response body: `{ "pdus": { "$id": {} | { "error": … } } }`.
+/// Transaction response body: `{ "pdus": { "$id": {} | { "error": … } } }`,
+/// plus the anti-entropy `forward_extremities` advertisement (this server's
+/// per-room heads, so the *sender* can reconcile against us from the response —
+/// a single transaction reconciles both directions). Omitted when empty, so a
+/// peer that does not implement reconciliation sees an unchanged response shape.
 #[derive(Serialize)]
 pub(crate) struct ResponseBody {
     pdus: BTreeMap<String, PduResult>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    forward_extremities: BTreeMap<OwnedRoomId, ForwardExtremities>,
 }
 
 /// Federation `/send/{txnId}` handler. Stages the transaction's PDUs and pokes
@@ -105,9 +118,13 @@ pub(crate) async fn handle(
         return Err(FedError::BadRequest("transaction exceeds 50 PDUs"));
     }
 
-    let (store, worker_poke) = {
+    let (store, worker_poke, fetcher) = {
         let app = lock_app(&state);
-        (app.store.clone(), app.worker_poke.clone())
+        (
+            app.store.clone(),
+            app.worker_poke.clone(),
+            app.fetcher.clone(),
+        )
     };
 
     // Cheap whole-transaction dedup: a re-sent transaction we've already fully
@@ -119,8 +136,13 @@ pub(crate) async fn handle(
         .await
         .map_err(FedError::Storage)?
     {
+        // A duplicate (already-staged) transaction: ack without re-staging. We
+        // skip the anti-entropy advertisement here to keep the dedup path cheap —
+        // reconciliation rides organic (non-duplicate) traffic, of which a healthy
+        // mesh has plenty.
         return Ok(Json(ResponseBody {
             pdus: BTreeMap::new(),
+            forward_extremities: BTreeMap::new(),
         }));
     }
 
@@ -181,9 +203,40 @@ pub(crate) async fn handle(
     // Poke the worker once per touched room, *after* the rows are committed.
     // Best-effort: a full buffer means the worker already has pending pokes, and
     // its next drain (or startup enumeration) still picks the room up.
-    for room in touched {
-        let _ = worker_poke.try_send(room);
+    for room in &touched {
+        let _ = worker_poke.try_send(room.clone());
     }
 
-    Ok(Json(ResponseBody { pdus }))
+    // Anti-entropy. Advertise our own forward extremities back to the sender (so
+    // it can reconcile against us from this response), for every room it
+    // advertised plus every room this transaction touched.
+    let advertised = body.forward_extremities;
+    let mut resp_rooms: BTreeSet<OwnedRoomId> = touched;
+    resp_rooms.extend(advertised.keys().cloned());
+    let mut forward_extremities = BTreeMap::new();
+    for room in &resp_rooms {
+        let fes = reconcile::local_extremities(&store, room).await;
+        if !fes.is_empty() {
+            forward_extremities.insert(room.clone(), fes);
+        }
+    }
+
+    // Reconcile our view against the heads the sender advertised: fire-and-forget
+    // so the 200 isn't blocked on peer round-trips. Each task fetches any
+    // advertised head we lack and stages it for the worker.
+    for (room, heads) in advertised {
+        let store = store.clone();
+        let fetcher = fetcher.clone();
+        let worker_poke = worker_poke.clone();
+        let origin = body.origin.clone();
+        tokio::spawn(async move {
+            reconcile::reconcile_room(&store, &*fetcher, &worker_poke, &origin, &room, &heads)
+                .await;
+        });
+    }
+
+    Ok(Json(ResponseBody {
+        pdus,
+        forward_extremities,
+    }))
 }

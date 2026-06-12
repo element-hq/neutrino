@@ -37,7 +37,7 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 use crate::federation::client::FederationClientError;
-use crate::federation::gapfill::MissingEventsFetcher;
+use crate::federation::gapfill::{MissingEventsFetcher, MissingEventsQuery};
 use crate::{router, router_with_store, router_with_store_and_fetcher};
 
 /// The arguments one `fetch` call was made with, recorded so a test can assert
@@ -117,16 +117,12 @@ impl StubFetcher {
 impl MissingEventsFetcher for StubFetcher {
     async fn fetch(
         &self,
-        _origin: &ServerName,
-        _room_id: &RoomId,
-        latest: &[OwnedEventId],
-        earliest: &[OwnedEventId],
-        limit: u32,
+        q: MissingEventsQuery<'_>,
     ) -> Result<Vec<Box<RawJsonValue>>, FederationClientError> {
         self.calls.lock().unwrap().push(FetchCall {
-            latest: latest.to_vec(),
-            earliest: earliest.to_vec(),
-            limit,
+            latest: q.latest.to_vec(),
+            earliest: q.earliest.to_vec(),
+            limit: q.limit,
         });
         let rebuild = |jsons: &[String]| {
             jsons

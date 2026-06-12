@@ -45,20 +45,22 @@
 //!   only, so a restart re-enumerates and retries within the startup jitter
 //!   window — restarting the app is a way to "kick" a stuck destination.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
 use neutrino_store::{FederationOutbox, StreamPos};
 use neutrino_store_sqlite::SqliteStore;
-use ruma::{EventId, OwnedServerName, ServerName};
+use ruma::{EventId, OwnedRoomId, OwnedServerName, ServerName};
 use serde_json::value::RawValue as RawJsonValue;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::federation::client::{FederationClient, FederationClientError, TxnIdGen};
+use crate::federation::gapfill::MissingEventsFetcher;
+use crate::federation::reconcile::{self, ForwardExtremities};
 use crate::federation::{BACKOFF_BASE, MAX_PDUS_PER_TXN, jitter, next_backoff, now_ms};
 
 /// Upper bound on the random delay a startup-present destination waits before
@@ -75,6 +77,12 @@ struct SenderCtx {
     client: Arc<FederationClient>,
     idgen: Arc<TxnIdGen>,
     send_slots: Arc<Semaphore>,
+    /// Anti-entropy: peer fetcher for reconciling against the forward extremities
+    /// a peer advertises on a transaction *response*. Shared with the inbound
+    /// worker/handler (see `AppState`).
+    fetcher: Arc<dyn MissingEventsFetcher>,
+    /// Poke the inbound worker after reconciliation stages fetched events.
+    worker_poke: mpsc::Sender<OwnedRoomId>,
 }
 
 /// Spawn the outbound sender pool. Returns the supervisor's `JoinHandle` so
@@ -83,12 +91,15 @@ struct SenderCtx {
 /// Subscribes to the persist watch *before* the first enumeration so a
 /// destination added concurrently with startup can't be missed (the watch will
 /// have advanced, waking the supervisor's first `changed()`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     store: Arc<SqliteStore>,
     origin: String,
     concurrency: usize,
     shutdown: CancellationToken,
     kick_rx: watch::Receiver<()>,
+    fetcher: Arc<dyn MissingEventsFetcher>,
+    worker_poke: mpsc::Sender<OwnedRoomId>,
 ) -> JoinHandle<()> {
     spawn_with(
         store,
@@ -97,11 +108,14 @@ pub(crate) fn spawn(
         STARTUP_JITTER_MAX,
         shutdown,
         kick_rx,
+        fetcher,
+        worker_poke,
     )
 }
 
 /// Inner spawn with the flood-control bounds made explicit, so tests can run
 /// the full supervisor → task path with zero startup jitter.
+#[allow(clippy::too_many_arguments)]
 fn spawn_with(
     store: Arc<SqliteStore>,
     origin: String,
@@ -109,6 +123,8 @@ fn spawn_with(
     startup_jitter_max: Duration,
     shutdown: CancellationToken,
     kick_rx: watch::Receiver<()>,
+    fetcher: Arc<dyn MissingEventsFetcher>,
+    worker_poke: mpsc::Sender<OwnedRoomId>,
 ) -> JoinHandle<()> {
     let watch_rx = store.subscribe();
     let client = Arc::new(FederationClient::new(origin));
@@ -124,6 +140,8 @@ fn spawn_with(
         client,
         idgen,
         send_slots,
+        fetcher,
+        worker_poke,
     };
     tokio::spawn(supervise(
         ctx,
@@ -265,6 +283,18 @@ async fn deliver_batch(
     let ids: Vec<&EventId> = batch.iter().map(|e| &*e.event_id).collect();
     let txn_id = ctx.idgen.next_id();
 
+    // Anti-entropy: advertise our forward extremities for every room in this
+    // batch, so the peer can reconcile against us. Computed once at send time
+    // (re-using the same value across retries is fine — it's only a hint).
+    let mut our_fes: BTreeMap<OwnedRoomId, ForwardExtremities> = BTreeMap::new();
+    let rooms: BTreeSet<OwnedRoomId> = batch.iter().map(|e| e.room_id.clone()).collect();
+    for room in &rooms {
+        let fes = reconcile::local_extremities(&ctx.store, room).await;
+        if !fes.is_empty() {
+            our_fes.insert(room.clone(), fes);
+        }
+    }
+
     let mut attempt = 0u32;
     loop {
         // One INFO line per send attempt, under the same `neutrino_http` target
@@ -284,19 +314,26 @@ async fn deliver_batch(
         // Hold a global permit only around the network call — released before
         // any backoff sleep, so a slow peer can't pin a concurrency slot.
         let send_result = match ctx.send_slots.acquire().await {
-            Ok(_permit) => ctx.client.send_transaction(dest, &txn_id, &pdus).await,
+            Ok(_permit) => {
+                ctx.client
+                    .send_transaction(dest, &txn_id, &pdus, &our_fes)
+                    .await
+            }
             // The semaphore is never closed in normal operation; an error here
             // means shutdown.
             Err(_) => return false,
         };
 
-        let delivered = match send_result {
-            Ok(()) => true,
+        // `(delivered, peer_fes)`: `peer_fes` is the peer's advertised forward
+        // extremities from a 2xx response (empty on a 4xx drop — there's nothing
+        // to reconcile against a rejection).
+        let (delivered, peer_fes) = match send_result {
+            Ok(peer_fes) => (true, peer_fes),
             // 4xx: the peer rejected the transaction envelope. Retrying is
             // futile — treat as delivered so the batch is dropped from the outbox.
             Err(FederationClientError::Status(code)) if (400..500).contains(&code) => {
                 warn!(%dest, code, pdus = ids.len(), "peer rejected transaction (4xx); dropping batch");
-                true
+                (true, BTreeMap::new())
             }
             // 5xx / transport / URL: transient. Keep the batch, back off, retry
             // under the same txn_id.
@@ -311,7 +348,13 @@ async fn deliver_batch(
 
         if delivered {
             match ctx.store.remove_pdus(dest, &ids).await {
-                Ok(()) => return true,
+                Ok(()) => {
+                    // Anti-entropy: reconcile our view against the heads the peer
+                    // advertised in its response. Spawned so a peer round-trip
+                    // doesn't stall this destination's outbox drain.
+                    spawn_reconcile(ctx, dest, peer_fes);
+                    return true;
+                }
                 Err(e) => {
                     // Rows survive a removal fault; back off and retry rather
                     // than hot-looping (the re-send is deduped by the peer).
@@ -322,6 +365,25 @@ async fn deliver_batch(
                 }
             }
         }
+    }
+}
+
+/// Spawn a best-effort reconciliation task per room the peer advertised in its
+/// transaction response. Fire-and-forget: a healed link's divergence is closed
+/// off the outbox's hot path (see [`reconcile::reconcile_room`]).
+fn spawn_reconcile(
+    ctx: &SenderCtx,
+    dest: &ServerName,
+    peer_fes: BTreeMap<OwnedRoomId, ForwardExtremities>,
+) {
+    for (room, heads) in peer_fes {
+        let store = ctx.store.clone();
+        let fetcher = ctx.fetcher.clone();
+        let worker_poke = ctx.worker_poke.clone();
+        let dest = dest.to_owned();
+        tokio::spawn(async move {
+            reconcile::reconcile_room(&store, &*fetcher, &worker_poke, &dest, &room, &heads).await;
+        });
     }
 }
 
@@ -384,6 +446,29 @@ mod tests {
     /// (a dropped sender makes `sleep_backoff` fall back to a normal backoff).
     fn no_kick() -> watch::Receiver<()> {
         watch::channel(()).1
+    }
+
+    /// A no-op fetcher for the sender tests: these stubs respond with no
+    /// `forward_extremities`, so reconciliation never fires and the fetcher is
+    /// never called — but the sender pool now requires one.
+    struct NoFetcher;
+    #[async_trait::async_trait]
+    impl MissingEventsFetcher for NoFetcher {
+        async fn fetch(
+            &self,
+            _q: crate::federation::gapfill::MissingEventsQuery<'_>,
+        ) -> Result<Vec<Box<RawJsonValue>>, FederationClientError> {
+            Ok(Vec::new())
+        }
+    }
+    fn null_fetcher() -> Arc<dyn MissingEventsFetcher> {
+        Arc::new(NoFetcher)
+    }
+    /// A worker-poke sender whose receiver is dropped — `try_send` just fails,
+    /// which reconciliation tolerates. Reconciliation never fires in these tests
+    /// anyway (see [`NoFetcher`]).
+    fn null_poke() -> mpsc::Sender<OwnedRoomId> {
+        mpsc::channel(1).0
     }
 
     /// Stub federation peer. `fail_until` requests return `fail_status`; the
@@ -510,6 +595,8 @@ mod tests {
             NO_JITTER,
             no_shutdown(),
             no_kick(),
+            null_fetcher(),
+            null_poke(),
         ));
         wait_drained(&store, &dest).await;
 
@@ -544,6 +631,8 @@ mod tests {
             NO_JITTER,
             no_shutdown(),
             no_kick(),
+            null_fetcher(),
+            null_poke(),
         ));
         wait_drained(&store, &dest).await;
 
@@ -574,6 +663,8 @@ mod tests {
             NO_JITTER,
             no_shutdown(),
             no_kick(),
+            null_fetcher(),
+            null_poke(),
         ));
         wait_drained(&store, &dest).await; // dropped → outbox empties
 
@@ -595,6 +686,8 @@ mod tests {
             NO_JITTER,
             no_shutdown(),
             no_kick(),
+            null_fetcher(),
+            null_poke(),
         ));
         wait_drained(&store, &dest).await;
 
@@ -634,6 +727,8 @@ mod tests {
             NO_JITTER,
             no_shutdown(),
             no_kick(),
+            null_fetcher(),
+            null_poke(),
         ));
 
         // The healthy peer drains despite the dead peer retrying forever.
@@ -663,6 +758,8 @@ mod tests {
             NO_JITTER,
             no_shutdown(),
             no_kick(),
+            null_fetcher(),
+            null_poke(),
         ));
         // Give the supervisor a moment to reach its idle `changed()` await.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -766,6 +863,8 @@ mod tests {
             NO_JITTER,
             shutdown.clone(),
             no_kick(),
+            null_fetcher(),
+            null_poke(),
         );
 
         // Let the supervisor enumerate the dead peer and spawn its (forever-retrying)
@@ -799,6 +898,8 @@ mod tests {
             NO_JITTER,
             no_shutdown(),
             no_kick(),
+            null_fetcher(),
+            null_poke(),
         ));
 
         // Wait for at least two attempts — proves it retried after the first 5xx.
