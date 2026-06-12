@@ -299,6 +299,41 @@ async fn build_seeded_router(
     (router, room_id, create_id, ids, tempfile)
 }
 
+/// Create a room (create + `sender`'s self-join) directly in `store`, returning
+/// the room id and the join event id (sole head of both DAGs). Lets a test seed
+/// several independent rooms in one store — e.g. to prove a handler scopes a
+/// by-id lookup to the requested room. `ts` distinguishes otherwise-identical
+/// create events so each call yields a distinct room id (v12 derives the room id
+/// from the create event's reference hash).
+async fn create_joined_room_in(
+    store: &SqliteStore,
+    sender: &OwnedUserId,
+    ts: u64,
+) -> (OwnedRoomId, OwnedEventId) {
+    let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .origin_server_ts(ts)
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    let create_id = create.event_id.clone();
+    let join = EventBuilder::new(sender.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(sender.as_str().to_owned())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create_id.clone()])
+        .prev_state_events(vec![create_id.clone()])
+        .build()
+        .expect("build join");
+    let join_id = join.event_id.clone();
+    store
+        .create_room(&create, &[join])
+        .await
+        .expect("create_room");
+    (room_id, join_id)
+}
+
 // --- bad request: empty latest_events -----------------------------------
 
 // Gated off under `multi-user-shim`: it seeds the room via tokenless CSAPI
@@ -922,6 +957,72 @@ async fn missing_earliest_events_returns_400() {
         body.get("errcode").and_then(Value::as_str),
         Some("M_INVALID_PARAM"),
         "body = {body}"
+    );
+}
+
+// --- include_latest_events returns held heads, room-scoped --------------
+
+#[tokio::test]
+async fn include_latest_events_returns_held_head_scoped_to_room() {
+    // Anti-entropy's pull sets `include_latest_events` so the responder serves
+    // the advertised head itself (not only its ancestors). The held head must be
+    // returned — but scoped to the requested room: `get_events` looks up by id
+    // across all rooms, so without a room filter a caller could name a foreign
+    // room's event id and exfiltrate it.
+    let (store, _tempfile) = fresh_store().await;
+    let alice = alice();
+    let (room_a, head_a) = create_joined_room_in(&store, &alice, 1_700_000_000_000).await;
+    let (room_b, head_b) = create_joined_room_in(&store, &alice, 1_700_000_001_000).await;
+    let app = router_with_store(config(), store);
+
+    // (a) With the flag set, the head we hold in *this* room comes back. Walking
+    // back from the join (head_a) with no earliest yields its create ancestor;
+    // `include_latest_events` additionally returns the join (an m.room.member)
+    // itself — absent it, only the create (no state_key-less member) would show.
+    let (status, body) = post_json(
+        &app,
+        &fed_path(room_a.as_str()),
+        &json!({
+            "earliest_events": [],
+            "latest_events": [head_a.as_str()],
+            "include_latest_events": true,
+            "limit": 10,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let head_returned = body
+        .get("events")
+        .and_then(Value::as_array)
+        .expect("events array")
+        .iter()
+        .any(|e| e.get("type").and_then(Value::as_str) == Some("m.room.member"));
+    assert!(
+        head_returned,
+        "include_latest_events must return the held head: {body}"
+    );
+
+    // (b) Naming a head from a *different* room must return nothing, even though
+    // the store holds it — the regression this guards is a cross-room leak.
+    let (status, body) = post_json(
+        &app,
+        &fed_path(room_a.as_str()),
+        &json!({
+            "earliest_events": [],
+            "latest_events": [head_b.as_str()],
+            "include_latest_events": true,
+            "limit": 10,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let events = body
+        .get("events")
+        .and_then(Value::as_array)
+        .expect("events array");
+    assert!(
+        events.is_empty(),
+        "a foreign-room head ({head_b} in {room_b}) must not leak into {room_a}: {body}"
     );
 }
 
@@ -2074,6 +2175,63 @@ async fn send_drops_pdu_for_unknown_room() {
             .unwrap()
             .is_empty(),
         "a PDU for an unknown room must not be committed"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_converges_on_advertised_head() {
+    // Anti-entropy's whole point: a peer advertises a forward extremity we were
+    // never sent (the divergence a point-in-time fan-out snapshot can produce),
+    // and we converge — pull the head, stage it, and apply it through the normal
+    // worker pipeline — with NO PDU in the transaction. This is the convergence
+    // invariant the mechanism exists to guarantee.
+    let fetcher = StubFetcher::no_progress();
+    let (app, store, room_id, alice, join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+
+    // The event the peer holds and we lack. It sits on our shared head, so once
+    // fetched its ancestry is already grounded (no further gap-fill).
+    let missing = message_on(
+        &alice,
+        &room_id,
+        &join_id,
+        "only on the peer",
+        1_700_000_002_000,
+    );
+    let missing_id = missing.event_id.clone();
+    // The peer serves it from the `get_missing_events` we issue on the pull.
+    fetcher.set_events(&[&missing]);
+
+    // A transaction with NO pdus, advertising the peer's heads: its timeline head
+    // is `missing` (we don't hold it), its state head is our shared join (we do).
+    let body = json!({
+        "origin": "remote.example.org",
+        "origin_server_ts": 1_700_000_000_000u64,
+        "pdus": [],
+        "forward_extremities": {
+            room_id.as_str(): {
+                "timeline": [missing_id.as_str()],
+                "state": [join_id.as_str()],
+            }
+        }
+    });
+    let (status, resp) = put_json(&app, &send_path("ae-txn"), &body).await;
+    assert_eq!(status, StatusCode::OK, "body = {resp}");
+
+    // We pull the advertised head and the worker applies it: it commits (auth
+    // passes, not rejected) and becomes our timeline head — converged on the
+    // peer's view without any event being pushed to us.
+    let row = wait_committed(&store, missing_id.as_ref()).await;
+    assert!(!row.rejected, "reconciled event must auth-pass and commit");
+    wait_timeline_head(&store, &room_id, missing_id.as_ref()).await;
+
+    // Exactly one pull: the unknown timeline head triggered a fetch; the
+    // already-held state head (our shared join) did not. A regression that
+    // re-fetches held heads, or pulls per-DAG unconditionally, fails here.
+    assert_eq!(
+        fetcher.call_count(),
+        1,
+        "only the unknown head is pulled; the held state head triggers no fetch",
     );
 }
 

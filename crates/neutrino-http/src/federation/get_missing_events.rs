@@ -177,10 +177,13 @@ pub(crate) async fn handle(
     // ancestors in oldest-first order; the receiver re-toposorts regardless.
     // `get_events` returns only the events we actually have, so it both fetches
     // and existence-filters; dedup against the ancestors (a head may be an
-    // ancestor of another head).
+    // ancestor of another head). `get_events` looks up by ID across all rooms,
+    // so scope to this room — otherwise a caller could name event IDs from a
+    // room it isn't in and exfiltrate them (the ancestor walk above is already
+    // room-scoped via `missing_events`).
     if body.include_latest_events {
         for ev in store.get_events(&latest).await? {
-            if seen.insert(ev.event_id.clone()) {
+            if ev.room_id == room_id && seen.insert(ev.event_id.clone()) {
                 events.push(ev.raw);
             }
         }
