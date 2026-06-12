@@ -639,6 +639,10 @@ internal object IntegrityCheckingUniffiLib {
     }
     external fun uniffi_neutrino_checksum_func_start(
     ): Short
+    external fun uniffi_neutrino_checksum_method_neutrinohandle_command(
+    ): Short
+    external fun uniffi_neutrino_checksum_method_neutrinohandle_kick_backoff(
+    ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_shutdown(
     ): Short
     external fun ffi_neutrino_uniffi_contract_version(
@@ -662,6 +666,10 @@ internal object UniffiLib {
     external fun uniffi_neutrino_fn_clone_neutrinohandle(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     external fun uniffi_neutrino_fn_free_neutrinohandle(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_neutrino_fn_method_neutrinohandle_command(`ptr`: Long,`command`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_neutrino_fn_method_neutrinohandle_kick_backoff(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_neutrino_fn_method_neutrinohandle_shutdown(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -1118,6 +1126,29 @@ public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
 
 public interface NeutrinoHandleInterface {
     
+    /**
+     * Push a control command to the running server. Fire-and-forget: returns
+     * immediately and never blocks — the channel is unbounded, so the sync
+     * `UnboundedSender::send` never awaits, which is what lets this be called
+     * safely from the FFI/JNI thread (a bounded channel would force either an
+     * `async fn` across the boundary or a backpressure-drop policy). A send
+     * after the server has already stopped (receiver dropped) is a silent
+     * no-op.
+     */
+    fun `command`(`command`: Command)
+    
+    /**
+     * Reset outbound retry backoff and retry now. Convenience for
+     * `command(Command::KickBackoff)`; the host calls this when device
+     * connectivity is restored so backed-off destinations reconnect promptly.
+     */
+    fun `kickBackoff`()
+    
+    /**
+     * Gracefully stop the server. Convenience for `command(Command::Shutdown)`;
+     * preserves the pre-existing FFI method so existing Android callers keep
+     * working unchanged.
+     */
     fun `shutdown`()
     
     companion object
@@ -1219,7 +1250,50 @@ open class NeutrinoHandle: Disposable, AutoCloseable, NeutrinoHandleInterface
         }
     }
 
-    override fun `shutdown`()
+    
+    /**
+     * Push a control command to the running server. Fire-and-forget: returns
+     * immediately and never blocks — the channel is unbounded, so the sync
+     * `UnboundedSender::send` never awaits, which is what lets this be called
+     * safely from the FFI/JNI thread (a bounded channel would force either an
+     * `async fn` across the boundary or a backpressure-drop policy). A send
+     * after the server has already stopped (receiver dropped) is a silent
+     * no-op.
+     */override fun `command`(`command`: Command)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_neutrino_fn_method_neutrinohandle_command(
+        it,
+        FfiConverterTypeCommand.lower(`command`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Reset outbound retry backoff and retry now. Convenience for
+     * `command(Command::KickBackoff)`; the host calls this when device
+     * connectivity is restored so backed-off destinations reconnect promptly.
+     */override fun `kickBackoff`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_neutrino_fn_method_neutrinohandle_kick_backoff(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Gracefully stop the server. Convenience for `command(Command::Shutdown)`;
+     * preserves the pre-existing FFI method so existing Android callers keep
+     * working unchanged.
+     */override fun `shutdown`()
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
@@ -1332,10 +1406,57 @@ public object FfiConverterTypeNeutrinoConfig: FfiConverterRustBuffer<NeutrinoCon
             FfiConverterUInt.write(value.`outboundConcurrency`, buf)
     }
 }
+
+
+
+/**
+ * FFI-facing control command. Mirrors `neutrino_common::Command` (re-exported
+ * as `neutrino_main::Command`) so EX Android can drive the embedded server.
+ * Kept here, not on the common `Command`, so UniFFI stays out of the common
+ * crates — the same split as `NeutrinoConfig` / `Config`.
+ */
+
+enum class Command {
+    
+    SHUTDOWN,
+    KICK_BACKOFF;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeCommand: FfiConverterRustBuffer<Command> {
+    override fun read(buf: ByteBuffer) = try {
+        Command.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: Command) = 4UL
+
+    override fun write(value: Command, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
         /**
-         * Spawn the Tokio runtime and begin polling the server entrypoint with the
-         * supplied configuration. Returns a handle that can gracefully shut the
-         * server down.
+         * Spawn an owned Tokio runtime and begin polling the server entrypoint with
+         * the supplied configuration. Returns a handle for pushing control commands
+         * (including `Shutdown`) into the running server. When the server stops
+         * (via `Shutdown` or channel close) the runtime is dropped on its OS thread:
+         * the executor stops and async tasks are cancelled at their next await point,
+         * but joining the blocking pool waits for any in-flight SQLite write to finish
+         * — those `spawn_blocking` closures are non-cancellable (`neutrino-store-sqlite`
+         * `WRITE_TIMEOUT` surfaces a hung write to its awaiter but does not stop the
+         * closure). Normal writes are sub-millisecond, so teardown is effectively
+         * immediate; only a runaway closure can delay this thread's exit.
          */ fun `start`(`config`: NeutrinoConfig): NeutrinoHandle {
             return FfiConverterTypeNeutrinoHandle.lift(
     uniffiRustCall() { _status ->
