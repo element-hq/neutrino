@@ -172,8 +172,10 @@ Two scripts drive the rig and assert outcomes:
 
 After every partition heals and the outboxes drain, **every server joined to the
 room must reach byte-identical resolved `/state`, and no locally-accepted message
-may be lost** (each ledgered message must appear in every joined server's
-`/messages` timeline). It does *not* predict which concurrent write wins —
+may be lost** — each ledgered message must appear (via `/messages`) on every
+server that was joined *when it was sent*. A server that joins later is not
+required to backfill messages it missed while absent (Matrix does not
+retro-deliver to a re-joiner). It does *not* predict which concurrent write wins —
 state-res tie-breaks on `origin_server_ts` then `event_id` (wall-clock, not
 seeded) — it asserts *agreement*, which is independent of delivery order.
 

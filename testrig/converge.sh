@@ -44,9 +44,11 @@
 #                               mid-episode; RE-SYNCED from real /state at every
 #                               barrier (the only point it is authoritative).
 #   3. Topology model         — UP[12|13|23]; only up-links are cut, down healed.
-#   4. Message ledger         — MSG_ACCEPTED[event_id]=origin; the "must appear
-#                               in every joined server's /messages" no-lost-
-#                               writes set (state events covered by /state).
+#   4. Message ledger         — MSG_ACCEPTED[event_id]=send-time audience; each
+#                               message must appear in /messages on every server
+#                               joined when it was sent (a later joiner is not
+#                               expected to backfill it). State events covered by
+#                               the /state equality check.
 #   5. Op log                 — every action + predicted/actual status; dumped
 #                               with the seed on failure for exact replay.
 #
@@ -224,7 +226,16 @@ apply_model() { # <hs> <action> <room> [target] [level]
 # no-lost-writes check verifies messages via /messages (state is covered by the
 # resolved-state equality check), so message events are tracked separately.
 ledger() { # <hs> <action> ...
-  [[ -n $EVID && $2 == msg ]] && MSG_ACCEPTED[$EVID]=$1
+  [[ -n $EVID && $2 == msg ]] || return 0
+  # Audience = servers joined (per the model) at send time. Only they are
+  # required to hold the message: a server that joins *later* is not expected to
+  # backfill messages sent while it was absent (Matrix does not retro-deliver to
+  # a re-joiner), so requiring it everywhere would false-fail on membership churn.
+  local aud="" hs
+  for hs in "${SERVERS[@]}"; do
+    [[ ${MEMBER[$hs]} == join ]] && aud+="$hs "
+  done
+  MSG_ACCEPTED[$EVID]=${aud% }
   return 0
 }
 
@@ -338,6 +349,8 @@ messages_present_all() {
     [[ ${MEMBER[$hs]} == join ]] || continue
     ids=$(collect_msg_ids "$hs") || return 1
     for eid in "${!MSG_ACCEPTED[@]}"; do
+      # Only require the message on servers that were in its send-time audience.
+      [[ " ${MSG_ACCEPTED[$eid]} " == *" $hs "* ]] || continue
       case $'\n'"$ids"$'\n' in
         *$'\n'"$eid"$'\n'*) : ;;
         *) return 1 ;;
