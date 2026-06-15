@@ -163,10 +163,11 @@ Two scripts drive the rig and assert outcomes:
 
 - `./smoke.sh` — three **curated** scenarios (basic send/receive, partition+heal,
   concurrent room-name state-res). A fixed CI gate; deterministic by construction.
-- `./converge.sh [SEED]` — a **seeded randomized** convergence fuzzer: random
-  episodes of room ops (message / name / power / invite / kick / leave / rejoin)
-  interleaved with random partition cut+heal — plus deliberately conflicting
-  concurrent writes across an active cut, guarded by an assertion that the
-  servers actually diverged — then heals everything and asserts the room
-  converges. See **[README-CONVERGENCE.md](README-CONVERGENCE.md)** for what it
-  asserts and how a run is structured.
+- `cargo run -p converge -- [SEED]` — a **seeded randomized** convergence fuzzer:
+  random episodes of room ops (message / name / power / invite / kick / leave /
+  rejoin) interleaved with random partition cut+heal — plus deliberately
+  conflicting concurrent writes across an active cut, guarded by an assertion that
+  the servers actually diverged — then heals everything and asserts the room
+  converges. It drives this same rig (CSAPI over HTTP) and delegates cut/heal to
+  `./nctl partition`. See **[tools/converge/README.md](../tools/converge/README.md)**
+  for what it asserts and how a run is structured.
