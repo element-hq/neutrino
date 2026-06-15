@@ -35,6 +35,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use axum::{
     Json,
     extract::{Path, State},
+    http::HeaderMap,
 };
 use neutrino_state::event_id::from_wire;
 use neutrino_store::{FederationInbox, StagingStore};
@@ -43,8 +44,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 use tracing::warn;
 
-use crate::federation::FedError;
 use crate::federation::reconcile::{self, ForwardExtremities};
+use crate::federation::{FedError, auth};
 use crate::{AppState, lock_app};
 
 /// Inbound federation transaction body.
@@ -104,6 +105,7 @@ pub(crate) struct ResponseBody {
 pub(crate) async fn handle(
     State(state): State<AppState>,
     Path(txn_id): Path<String>,
+    headers: HeaderMap,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ResponseBody>, FedError> {
     // Route JSON-edge failures (bad content-type, invalid JSON, shape mismatch)
@@ -118,14 +120,27 @@ pub(crate) async fn handle(
         return Err(FedError::BadRequest("transaction exceeds 50 PDUs"));
     }
 
-    let (store, worker_poke, fetcher) = {
+    let (store, worker_poke, fetcher, our_name) = {
         let app = lock_app(&state);
         (
             app.store.clone(),
             app.worker_poke.clone(),
             app.fetcher.clone(),
+            app.config.server_name.clone(),
         )
     };
+
+    // Authenticate the sender via its `X-Matrix` header. The header origin is
+    // network-attested; `body.origin` is self-asserted. Require them to agree so
+    // the authenticated identity governs txn dedup, the staged gap-fill target,
+    // and reconciliation — a peer can't claim one origin in the envelope and
+    // another at the network layer.
+    let origin = auth::authenticated_origin(&headers, &our_name)?;
+    if origin != body.origin {
+        return Err(FedError::Unauthorized(
+            "X-Matrix origin does not match the transaction origin",
+        ));
+    }
 
     // Cheap whole-transaction dedup: a re-sent transaction we've already fully
     // staged is acknowledged without re-staging. This is a read-only *check* —

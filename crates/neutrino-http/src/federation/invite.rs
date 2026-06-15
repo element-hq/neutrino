@@ -29,7 +29,7 @@ use axum::{
     Json,
     extract::rejection::JsonRejection,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use neutrino_common::ROOM_VERSION_ID;
@@ -44,7 +44,7 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::federation::client::{FederationClient, FederationClientError};
-use crate::federation::{FedError, stage_and_poke};
+use crate::federation::{FedError, auth, stage_and_poke};
 use crate::room_actor::RoomActorError;
 use crate::{AppState, error_response, lock_app};
 
@@ -71,6 +71,7 @@ pub(crate) struct ResponseBody {
 pub(crate) async fn handle(
     State(state): State<AppState>,
     Path((room_id, event_id)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Result<Json<InviteRequestBody>, JsonRejection>,
 ) -> Result<Json<ResponseBody>, FedError> {
     let body = body
@@ -137,6 +138,14 @@ pub(crate) async fn handle(
             "invited user is not local to this server",
         ));
     }
+
+    // Require an authenticated `X-Matrix` origin (rejects a missing header or a
+    // peer impersonating us). We deliberately do NOT additionally require
+    // `origin == sender.server`: unlike send_join/leave (self-membership), an
+    // invite may legitimately be authored by a local user yet arrive over
+    // federation for a hosted room, and `apply_pdu` / OOB-stub validation is the
+    // authoritative gate either way.
+    auth::authenticated_origin(&headers, &our_server)?;
 
     // Keep the wire bytes for the response before either path moves `event`.
     let event_raw = event.raw.clone();

@@ -9,13 +9,14 @@ use std::collections::HashSet;
 use axum::{
     Json,
     extract::{Path, State},
+    http::HeaderMap,
 };
 use neutrino_store::{DagStore, EventStore, RoomStore};
 use ruma::{OwnedEventId, OwnedRoomId};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 
-use crate::federation::FedError;
+use crate::federation::{FedError, auth};
 use crate::{AppState, lock_app};
 
 /// Spec default for `limit` when the client omits it.
@@ -115,6 +116,7 @@ pub(crate) struct ResponseBody {
 pub(crate) async fn handle(
     State(state): State<AppState>,
     Path(room_id): Path<String>,
+    headers: HeaderMap,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ResponseBody>, FedError> {
     // Parse the path-extracted `room_id` manually so malformed IDs surface
@@ -122,6 +124,15 @@ pub(crate) async fn handle(
     // Mirrors the `members` handler precedent in `lib.rs`.
     let room_id: OwnedRoomId = OwnedRoomId::try_from(room_id.as_str())
         .map_err(|_| FedError::BadRequest("invalid room_id"))?;
+
+    // Authenticate the calling server via its `X-Matrix` header (network-attested
+    // origin — see `federation::auth`). Required: this endpoint serves a room's
+    // DAG, so a non-member must not be able to walk it.
+    let (store, our_name) = {
+        let app = lock_app(&state);
+        (app.store.clone(), app.config.server_name.clone())
+    };
+    let origin = auth::authenticated_origin(&headers, &our_name)?;
 
     // Take the raw JSON Value through `Json<Value>` so any malformed body
     // — invalid JSON, wrong content-type, missing required fields when we
@@ -139,16 +150,22 @@ pub(crate) async fn handle(
         return Err(FedError::BadRequest("latest_events must not be empty"));
     }
 
-    let store = {
-        let app = lock_app(&state);
-        app.store.clone()
-    };
-
     // (2) — `missing_events` surfaces an unknown room as
     // `StorageError::InvalidInput` (→ 500), so we pre-check existence via
-    // `RoomStore::room_exists` and map absence to the spec-required 404.
+    // `RoomStore::room_exists` and map absence to the spec-required 404. Order
+    // matters: 404 (unknown room) before the 403 membership gate below, so an
+    // unknown room isn't masked as "you're not a member".
     if !store.room_exists(&room_id).await? {
         return Err(FedError::RoomNotFound);
+    }
+
+    // (2b) — member-only scoping: only a server that shares the room may walk its
+    // DAG. Closes the read-exfiltration hole the bare endpoint had (any caller
+    // who knew a room id could pull its history).
+    if !auth::server_in_room(&store, &room_id, &origin).await? {
+        return Err(FedError::Forbidden(
+            "origin server is not a member of this room",
+        ));
     }
 
     // (3) — saturating cap, not a 400.

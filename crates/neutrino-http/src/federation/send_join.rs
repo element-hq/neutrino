@@ -27,6 +27,7 @@ use axum::{
     Json,
     extract::rejection::JsonRejection,
     extract::{Path, State},
+    http::HeaderMap,
 };
 use neutrino_state::event_id::from_wire;
 use neutrino_store::{DagStore, EventStore, RoomStore};
@@ -34,7 +35,7 @@ use ruma::{EventId, OwnedEventId, OwnedRoomId};
 use serde::Serialize;
 use serde_json::value::RawValue as RawJsonValue;
 
-use crate::federation::{FedError, map_apply_err};
+use crate::federation::{FedError, auth, map_apply_err};
 use crate::{AppState, lock_app};
 
 /// Recent timeline events to include in the `send_join` response. The joiner
@@ -58,6 +59,7 @@ pub(crate) struct ResponseBody {
 pub(crate) async fn handle(
     State(state): State<AppState>,
     Path((room_id, event_id)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Result<Json<Box<RawJsonValue>>, JsonRejection>,
 ) -> Result<Json<ResponseBody>, FedError> {
     let raw = body
@@ -72,8 +74,9 @@ pub(crate) async fn handle(
     let event =
         from_wire(raw, Vec::new()).map_err(|_| FedError::BadRequest("malformed join event"))?;
 
-    // Structural validation (spec §send_join). Signature / sender-on-origin
-    // checks are skipped (trusted mesh, no X-Matrix origin header).
+    // Structural validation (spec §send_join). The signature check is skipped
+    // (no signing keys); the sender-on-origin check is enforced below via the
+    // network-attested `X-Matrix` origin. apply_resident remains the real auth.
     if event.event_id.as_str() != event_id {
         return Err(FedError::BadRequest(
             "event_id in path does not match the event",
@@ -98,10 +101,24 @@ pub(crate) async fn handle(
     // consumes the parsed event.
     let event_raw = event.raw.clone();
 
-    let (store, registry) = {
+    let (store, registry, our_name) = {
         let app = lock_app(&state);
-        (app.store.clone(), app.room_registry.clone())
+        (
+            app.store.clone(),
+            app.room_registry.clone(),
+            app.config.server_name.clone(),
+        )
     };
+
+    // A server may only send_join its own user's membership event — the
+    // authenticated origin must own the event's sender. Cheap pre-filter;
+    // apply_resident's auth rules remain authoritative.
+    let origin = auth::authenticated_origin(&headers, &our_name)?;
+    if origin != event.sender.server_name() {
+        return Err(FedError::Forbidden(
+            "origin server does not own the event sender",
+        ));
+    }
 
     // Apply through the resident path: accept ⇒ persisted + fanned out; reject
     // ⇒ 403; idempotent re-send ⇒ Ok. (`apply_resident` enqueues the fan-out.)

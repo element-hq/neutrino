@@ -80,6 +80,18 @@ impl FederationClient {
         Self { http, origin }
     }
 
+    /// The `Authorization: X-Matrix origin="…",destination="…"` header value for
+    /// an outbound request to `dest`. No `key`/`sig`: we have no signing key, so
+    /// this is a network-attested identity, not a signature (see
+    /// [`crate::federation::auth`]). Server names contain no `"`/`,`, so the
+    /// values need no escaping.
+    fn x_matrix(&self, dest: &ServerName) -> String {
+        format!(
+            "X-Matrix origin=\"{}\",destination=\"{}\"",
+            self.origin, dest
+        )
+    }
+
     /// `PUT http://{dest}/_matrix/federation/v1/send/{txn_id}` carrying `pdus`
     /// (and an empty `edus` list — EDUs are out of scope) plus our
     /// `forward_extremities` advertisement. The per-PDU result map in the response
@@ -107,7 +119,13 @@ impl FederationClient {
             edus: &[],
             forward_extremities,
         };
-        let resp = self.http.put(&url).json(&body).send().await?;
+        let resp = self
+            .http
+            .put(&url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .json(&body)
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "PUT /send").await);
         }
@@ -164,7 +182,13 @@ impl FederationClient {
             state_dag,
             include_latest_events,
         };
-        let resp = self.http.post(url).json(&body).send().await?;
+        let resp = self
+            .http
+            .post(url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .json(&body)
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "POST /get_missing_events").await);
         }
@@ -196,7 +220,12 @@ impl FederationClient {
             .push(user_id.as_str());
         url.query_pairs_mut().append_pair("ver", ver);
 
-        let resp = self.http.get(url).send().await?;
+        let resp = self
+            .http
+            .get(url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "GET /make_join").await);
         }
@@ -222,7 +251,13 @@ impl FederationClient {
             .push(room_id.as_str())
             .push(event_id.as_str());
 
-        let resp = self.http.put(url).json(&event).send().await?;
+        let resp = self
+            .http
+            .put(url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .json(&event)
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "PUT /send_join").await);
         }
@@ -257,7 +292,13 @@ impl FederationClient {
             room_version,
             invite_room_state,
         };
-        let resp = self.http.put(url).json(&body).send().await?;
+        let resp = self
+            .http
+            .put(url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .json(&body)
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "PUT /invite").await);
         }
@@ -287,7 +328,12 @@ impl FederationClient {
             .push(user_id.as_str());
         url.query_pairs_mut().append_pair("ver", ver);
 
-        let resp = self.http.get(url).send().await?;
+        let resp = self
+            .http
+            .get(url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "GET /make_leave").await);
         }
@@ -314,7 +360,13 @@ impl FederationClient {
             .push(room_id.as_str())
             .push(event_id.as_str());
 
-        let resp = self.http.put(url).json(&event).send().await?;
+        let resp = self
+            .http
+            .put(url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .json(&event)
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "PUT /send_leave").await);
         }

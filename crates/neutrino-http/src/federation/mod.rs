@@ -20,6 +20,7 @@ use rand::Rng;
 use serde_json::json;
 use thiserror::Error;
 
+pub(crate) mod auth;
 pub(crate) mod backfill;
 pub(crate) mod client;
 pub(crate) mod gapfill;
@@ -113,6 +114,11 @@ pub(crate) enum FedError {
     /// `M_INVALID_PARAM` shape).
     #[error("bad request: {0}")]
     BadRequest(&'static str),
+    /// 401 `M_UNAUTHORIZED` — the `X-Matrix` authorization header is missing,
+    /// malformed, misrouted (wrong `destination`), or impersonates this server.
+    /// See [`auth`] for the network-attested (non-cryptographic) trust model.
+    #[error("unauthorized: {0}")]
+    Unauthorized(&'static str),
     /// 403 `M_FORBIDDEN` — the user/server is not permitted to perform the
     /// membership change (e.g. an uninvited user joining an invite-only room,
     /// or a `send_join` the auth rules reject).
@@ -158,6 +164,9 @@ impl IntoResponse for FedError {
         let (status, errcode, msg) = match &self {
             FedError::BadRequest(m) => {
                 (StatusCode::BAD_REQUEST, "M_INVALID_PARAM", (*m).to_string())
+            }
+            FedError::Unauthorized(m) => {
+                (StatusCode::UNAUTHORIZED, "M_UNAUTHORIZED", (*m).to_string())
             }
             FedError::Forbidden(m) => (StatusCode::FORBIDDEN, "M_FORBIDDEN", (*m).to_string()),
             FedError::RoomNotFound => (

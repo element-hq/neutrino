@@ -18,19 +18,21 @@ use axum::{
     Json,
     extract::rejection::JsonRejection,
     extract::{Path, State},
+    http::HeaderMap,
 };
 use neutrino_state::event_id::from_wire;
 use ruma::OwnedRoomId;
 use serde_json::value::RawValue as RawJsonValue;
 use serde_json::{Value, json};
 
-use crate::federation::{FedError, map_apply_err};
+use crate::federation::{FedError, auth, map_apply_err};
 use crate::{AppState, lock_app};
 
 /// Federation `/send_leave` (v2) handler. Returns `{}` on accept.
 pub(crate) async fn handle(
     State(state): State<AppState>,
     Path((room_id, event_id)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Result<Json<Box<RawJsonValue>>, JsonRejection>,
 ) -> Result<Json<Value>, FedError> {
     let raw = body
@@ -45,10 +47,11 @@ pub(crate) async fn handle(
     let event =
         from_wire(raw, Vec::new()).map_err(|_| FedError::BadRequest("malformed leave event"))?;
 
-    // Structural validation (spec §send_leave). Signature / sender-on-origin
-    // checks are skipped (trusted mesh, no X-Matrix origin header). state_key ==
-    // sender is mandatory, so this endpoint can only ever express a *self*-leave;
-    // a kick/ban of another user rides `/send` as a normal PDU instead.
+    // Structural validation (spec §send_leave). The signature check is skipped
+    // (no signing keys); the sender-on-origin check is enforced below via the
+    // network-attested `X-Matrix` origin. state_key == sender is mandatory, so
+    // this endpoint can only ever express a *self*-leave; a kick/ban of another
+    // user rides `/send` as a normal PDU instead.
     if event.event_id.as_str() != event_id {
         return Err(FedError::BadRequest(
             "event_id in path does not match the event",
@@ -69,7 +72,18 @@ pub(crate) async fn handle(
         return Err(FedError::BadRequest("state_key must equal sender"));
     }
 
-    let registry = lock_app(&state).room_registry.clone();
+    let (registry, our_name) = {
+        let app = lock_app(&state);
+        (app.room_registry.clone(), app.config.server_name.clone())
+    };
+
+    // A server may only send_leave its own user's membership event.
+    let origin = auth::authenticated_origin(&headers, &our_name)?;
+    if origin != event.sender.server_name() {
+        return Err(FedError::Forbidden(
+            "origin server does not own the event sender",
+        ));
+    }
 
     // Apply through the resident path: accept ⇒ persisted + fanned out; reject
     // ⇒ 403; idempotent re-send ⇒ Ok. (`apply_resident` enqueues the fan-out.)

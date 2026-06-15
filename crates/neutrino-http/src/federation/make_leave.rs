@@ -21,6 +21,7 @@
 use axum::{
     Json,
     extract::{Path, RawQuery, State},
+    http::HeaderMap,
 };
 use neutrino_common::ROOM_VERSION_ID;
 use neutrino_store::RoomStore;
@@ -29,8 +30,8 @@ use serde::Serialize;
 use serde_json::json;
 use serde_json::value::RawValue as RawJsonValue;
 
-use crate::federation::FedError;
 use crate::federation::make_join::{map_build_err, ver_includes_ours};
+use crate::federation::{FedError, auth};
 use crate::{AppState, lock_app};
 
 /// `make_leave` response: the leave-event `template` plus the room's version.
@@ -54,6 +55,7 @@ pub(crate) struct ResponseBody {
 pub(crate) async fn handle(
     State(state): State<AppState>,
     Path((room_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<ResponseBody>, FedError> {
     let room_id = OwnedRoomId::try_from(room_id.as_str())
@@ -61,10 +63,22 @@ pub(crate) async fn handle(
     let user_id = OwnedUserId::try_from(user_id.as_str())
         .map_err(|_| FedError::BadRequest("invalid user_id"))?;
 
-    let (store, registry) = {
+    let (store, registry, our_name) = {
         let app = lock_app(&state);
-        (app.store.clone(), app.room_registry.clone())
+        (
+            app.store.clone(),
+            app.room_registry.clone(),
+            app.config.server_name.clone(),
+        )
     };
+
+    // A server may only request a leave template for its own users.
+    let origin = auth::authenticated_origin(&headers, &our_name)?;
+    if origin != user_id.server_name() {
+        return Err(FedError::Forbidden(
+            "origin server does not own the leaving user",
+        ));
+    }
 
     if store.get_room_version(&room_id).await?.is_none() {
         return Err(FedError::RoomNotFound);

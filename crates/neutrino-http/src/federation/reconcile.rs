@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::federation::auth;
 use crate::federation::gapfill::{MissingEventsFetcher, MissingEventsQuery};
 
 /// Initial `limit` for a reconciliation fetch. We only need the advertised
@@ -88,8 +89,21 @@ pub(crate) async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
     if advertised.is_empty() {
         return;
     }
+    // Only honour advertisements from a peer that actually shares this room. The
+    // advertised heads are attacker-controllable, so without this a peer could
+    // induce us to fetch from it for any room we host — even one it isn't in.
+    // (The fetched events are still independently auth-checked by the worker, so
+    // this is a fetch-amplification scope, not an integrity gate.)
+    match auth::server_in_room(store, room_id, peer).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            warn!(%peer, %room_id, error = %e, "reconcile: peer-membership check failed");
+            return;
+        }
+    }
     // Only reconcile rooms we actually host — `forward_extremities` is `None` for
-    // an unknown room, so this also scopes us to rooms we share with the peer.
+    // an unknown room.
     let Ok(Some((our_timeline, our_state))) = store.forward_extremities(room_id).await else {
         return;
     };
