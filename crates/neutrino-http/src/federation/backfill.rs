@@ -6,9 +6,9 @@
 //!
 //! Reuses `DagStore::events_before` (the seeds-included reverse-chronological
 //! priority-queue walk) rather than a dedicated storage method. Trusted-mesh
-//! deviations match the `get_missing_events` sibling:
-//! no X-Matrix auth, no signature verification, no history-visibility /
-//! redaction filtering.
+//! deviations match the `get_missing_events` sibling: no signature verification,
+//! no history-visibility / redaction filtering. The `X-Matrix` origin is
+//! authenticated and member-only scoped (see handler).
 
 use axum::{
     Json,

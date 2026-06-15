@@ -25,9 +25,10 @@
 //!
 //! ## Trust model
 //!
-//! No X-Matrix auth and no signature verification — the same trusted-mesh
-//! stance as `/get_missing_events` and `/backfill`. The transaction's `origin`
-//! field is taken at face value for txn deduplication and as the worker's
+//! Requires an `X-Matrix` header (network-attested origin — see
+//! [`crate::federation::auth`]); no signature verification (no signing keys).
+//! The transaction's `origin` field is cross-checked against the header origin
+//! (rejected on mismatch), then used for txn deduplication and as the worker's
 //! gap-fill fetch target.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -56,9 +57,10 @@ use crate::{AppState, lock_app};
 /// `backfill.rs` / `get_missing_events.rs`: PDUs are opaque `RawValue`s.
 #[derive(Deserialize)]
 pub(crate) struct TransactionBody {
-    /// The sending server's name. Trusted at face value (no X-Matrix auth) and
-    /// used for transaction deduplication + as the worker's gap-fill fetch
-    /// target (recorded as the staged row's `origin`).
+    /// The sending server's name. Required to equal the network-attested
+    /// `X-Matrix` origin (rejected on mismatch), then used for transaction
+    /// deduplication + as the worker's gap-fill fetch target (recorded as the
+    /// staged row's `origin`).
     origin: OwnedServerName,
     /// Required by the spec; parsed for shape validation then ignored — this
     /// server stores no per-transaction timestamp.

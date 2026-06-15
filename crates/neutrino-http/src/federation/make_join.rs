@@ -11,9 +11,10 @@
 //! **no `auth_events`** — those are server-computed at apply time, so the
 //! joining server neither has nor needs the state DAG to produce a valid id.
 //!
-//! Trusted-mesh deviations match the sibling federation handlers: no X-Matrix
-//! auth, no signature, no `join_authorised_via_users_server` (restricted rooms
-//! are out of scope — a `restricted`/`knock` join rule is refused 403 here).
+//! Trusted-mesh deviations match the sibling federation handlers: no signature,
+//! no `join_authorised_via_users_server` (restricted rooms are out of scope — a
+//! `restricted`/`knock` join rule is refused 403 here). The `X-Matrix` origin is
+//! authenticated and must own the joining user (see handler).
 
 use axum::{
     Json,

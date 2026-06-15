@@ -6,7 +6,8 @@
 //!
 //! - **Resolution** is `http://{server_name}` — raw IP:port, no TLS, no
 //!   `.well-known` / SRV lookup.
-//! - **No X-Matrix auth** header and no request signing.
+//! - **X-Matrix header sent** (network-attested origin + destination, no
+//!   key/sig — see [`crate::federation::auth`]); no request signing.
 //! - PDUs are opaque `RawValue`s on the wire, never re-parsed here.
 //!
 //! Consumed by the per-destination sender pool (`federation::sender`).

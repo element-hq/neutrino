@@ -4649,8 +4649,19 @@ async fn reject_then_reinvite_resurrects_stub() {
     );
     let invite_id = invite.event_id.clone();
     let path = invite_path(room_id.as_str(), invite_id.as_str());
+    // The invite's sender lives on `dead`; the inbound X-Matrix origin must own
+    // it (OOB-branch SEC1 check), so advertise that server explicitly rather than
+    // relying on `drive`'s default injected origin.
+    let auth = xm(dead.as_str());
 
-    let (s, _b) = put_json(&a_router, &path, &invite_body(&invite, None)).await;
+    let (s, _b) = fed_req(
+        &a_router,
+        "PUT",
+        &path,
+        Some(&invite_body(&invite, None)),
+        Some(&auth),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
     assert!(
         a_store
@@ -4676,7 +4687,14 @@ async fn reject_then_reinvite_resurrects_stub() {
     );
 
     // Re-invite resurrects the declined stub.
-    let (s, _b) = put_json(&a_router, &path, &invite_body(&invite, None)).await;
+    let (s, _b) = fed_req(
+        &a_router,
+        "PUT",
+        &path,
+        Some(&invite_body(&invite, None)),
+        Some(&auth),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
     assert!(
         a_store
@@ -4685,5 +4703,222 @@ async fn reject_then_reinvite_resurrects_stub() {
             .unwrap()
             .is_some(),
         "a re-invite after a decline must resurrect the stub"
+    );
+}
+
+// === X-Matrix auth gate: per-endpoint coverage ==========================
+//
+// `drive` auto-injects a valid header on positive paths, so these build their
+// requests directly (via `oneshot_json`) to exercise the missing-header (401)
+// and wrong-origin (403) branches on EVERY federation endpoint — not just
+// get_missing_events.
+
+/// An `X-Matrix` Authorization header value advertising `origin`. `destination`
+/// is a fixed placeholder (the handlers don't enforce it).
+fn xm(origin: &str) -> String {
+    format!(r#"X-Matrix origin="{origin}",destination="example.org""#)
+}
+
+/// Drive a federation request with an explicit `auth` header (or none), bypassing
+/// `drive`'s default injection. `body`, when present, is sent as JSON.
+async fn fed_req(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    auth: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(method).uri(path);
+    if let Some(a) = auth {
+        builder = builder.header("authorization", a);
+    }
+    let req = match body {
+        Some(b) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(b).unwrap()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    };
+    oneshot_json(app, req).await
+}
+
+#[tokio::test]
+async fn federation_endpoints_require_x_matrix_header() {
+    // Missing header → 401 M_UNAUTHORIZED on every inbound federation endpoint.
+    // (get_missing_events is covered by get_missing_events_rejects_bad_x_matrix_header.)
+    // Auth runs before apply on each, so structurally-valid but unauthenticated
+    // requests are rejected — proving each handler actually calls authenticated_origin.
+    let (router, _store, room_id, head, _tempfile) = seed_public_room().await;
+    let join = remote_join(&room_id, &head, ZARA);
+    let leave = remote_leave(&room_id, &head, ZARA);
+    let zara: OwnedUserId = ZARA.parse().unwrap();
+    let carol = "@carol:example.org";
+    let invite = member_pdu(
+        &zara,
+        carol,
+        &room_id,
+        "invite",
+        std::slice::from_ref(&head),
+    );
+
+    let cases: Vec<(&str, String, Option<Value>)> = vec![
+        (
+            "PUT",
+            send_path("ae-missing"),
+            Some(json!({ "origin": TEST_PEER, "origin_server_ts": 1u64, "pdus": [] })),
+        ),
+        ("GET", make_join_path(&room_id, ZARA), None),
+        ("GET", make_leave_path(&room_id, ZARA), None),
+        (
+            "PUT",
+            send_join_path(&room_id, &join.event_id),
+            Some(serde_json::from_str(join.raw.get()).unwrap()),
+        ),
+        (
+            "PUT",
+            send_leave_path(&room_id, &leave.event_id),
+            Some(serde_json::from_str(leave.raw.get()).unwrap()),
+        ),
+        (
+            "PUT",
+            invite_path(room_id.as_str(), invite.event_id.as_str()),
+            Some(invite_body(&invite, None)),
+        ),
+        (
+            "GET",
+            backfill_path(room_id.as_str(), &[head.as_str()], Some(10)),
+            None,
+        ),
+    ];
+    for (method, path, body) in &cases {
+        let (status, b) = fed_req(&router, method, path, body.as_ref(), None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{method} {path} without header should be 401: {b}"
+        );
+        assert_eq!(
+            b.get("errcode").and_then(Value::as_str),
+            Some("M_UNAUTHORIZED"),
+            "{method} {path}: {b}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn membership_handshake_rejects_wrong_origin() {
+    // make_join/make_leave: the origin must own the user. send_join/send_leave:
+    // the origin must own the event sender. A valid-but-foreign origin (not self,
+    // != the user/sender server) → 403 M_FORBIDDEN. Pins the negative branch the
+    // positive ZARA tests don't reach.
+    let (router, _store, room_id, head, _tempfile) = seed_public_room().await;
+    let join = remote_join(&room_id, &head, ZARA);
+    let leave = remote_leave(&room_id, &head, ZARA);
+    let foreign = xm("other.example"); // authenticated, but != ZARA's server
+
+    let cases: Vec<(&str, String, Option<Value>)> = vec![
+        ("GET", make_join_path(&room_id, ZARA), None),
+        ("GET", make_leave_path(&room_id, ZARA), None),
+        (
+            "PUT",
+            send_join_path(&room_id, &join.event_id),
+            Some(serde_json::from_str(join.raw.get()).unwrap()),
+        ),
+        (
+            "PUT",
+            send_leave_path(&room_id, &leave.event_id),
+            Some(serde_json::from_str(leave.raw.get()).unwrap()),
+        ),
+    ];
+    for (method, path, body) in &cases {
+        let (status, b) = fed_req(&router, method, path, body.as_ref(), Some(&foreign)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} {path} with foreign origin should be 403: {b}"
+        );
+        assert_eq!(
+            b.get("errcode").and_then(Value::as_str),
+            Some("M_FORBIDDEN"),
+            "{method} {path}: {b}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn invite_oob_rejects_forged_sender() {
+    // SEC1 regression: an out-of-band invite (room we don't host) must have the
+    // authenticated origin own the inviter, or an authenticated peer could plant a
+    // stub with a forged sender that sync surfaces verbatim. The injected origin
+    // is TEST_PEER (remote.example.org); the invite's sender is on bank.example.
+    let (store, _tempfile) = fresh_store().await;
+    let router = router_with_store(config(), store.clone());
+    let forger: OwnedUserId = "@boss:bank.example".parse().unwrap();
+    let invited = alice(); // local
+
+    // Throwaway create → a valid room id we never register (out-of-band).
+    let create = EventBuilder::new(forger.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    let invite = member_pdu(
+        &forger,
+        invited.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&create.event_id),
+    );
+
+    // `put_json` → `drive` injects origin=remote.example.org, which does NOT own
+    // @boss:bank.example.
+    let (status, body) = put_json(
+        &router,
+        &invite_path(room_id.as_str(), invite.event_id.as_str()),
+        &invite_body(&invite, None),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "forged-sender OOB invite: {body}"
+    );
+    assert_eq!(
+        body.get("errcode").and_then(Value::as_str),
+        Some("M_FORBIDDEN")
+    );
+    // Nothing stored.
+    assert!(
+        store
+            .get_invite(&room_id, &invited)
+            .await
+            .unwrap()
+            .is_none(),
+        "a forged-sender invite must not be stored"
+    );
+
+    // Positive control: when the origin DOES own the sender, the stub is stored.
+    let honest = xm("bank.example");
+    let (status, _) = fed_req(
+        &router,
+        "PUT",
+        &invite_path(room_id.as_str(), invite.event_id.as_str()),
+        Some(&invite_body(&invite, None)),
+        Some(&honest),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "honest-origin OOB invite must be accepted"
+    );
+    assert!(
+        store
+            .get_invite(&room_id, &invited)
+            .await
+            .unwrap()
+            .is_some(),
+        "honest OOB invite stub must be stored"
     );
 }

@@ -1,9 +1,10 @@
 //! Server-to-server (federation) HTTP handlers.
 //!
-//! Currently houses [`get_missing_events`] only — see `docs/get-missing-events.md`
-//! for the design and the trust-model caveats (no X-Matrix auth, no signature
-//! verification, no `min_depth` filter, no history-visibility filter — all
-//! deliberate spec deviations under the trusted-mesh assumption).
+//! Houses the inbound + outbound Server-Server handlers (see the submodules
+//! below). `X-Matrix` origin auth is network-attested (see [`auth`]); the
+//! remaining trust-model caveats are deliberate spec deviations under the
+//! trusted-mesh assumption: no signature verification, no `min_depth` filter,
+//! no history-visibility filter. See `docs/get-missing-events.md` for design.
 //!
 //! New federation endpoints land as sibling modules and register their
 //! routes in `lib.rs::build_router`.
@@ -115,8 +116,9 @@ pub(crate) enum FedError {
     #[error("bad request: {0}")]
     BadRequest(&'static str),
     /// 401 `M_UNAUTHORIZED` — the `X-Matrix` authorization header is missing,
-    /// malformed, misrouted (wrong `destination`), or impersonates this server.
-    /// See [`auth`] for the network-attested (non-cryptographic) trust model.
+    /// malformed, or impersonates this server. (`destination` is parsed but not
+    /// enforced — see [`auth`].) See [`auth`] for the network-attested
+    /// (non-cryptographic) trust model.
     #[error("unauthorized: {0}")]
     Unauthorized(&'static str),
     /// 403 `M_FORBIDDEN` — the user/server is not permitted to perform the
