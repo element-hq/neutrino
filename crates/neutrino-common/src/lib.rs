@@ -7,7 +7,7 @@ pub use event::Event;
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8008";
 const DEFAULT_SERVER_NAME: &str = "localhost";
-const DEFAULT_LOCALPART: &str = "alice";
+const DEFAULT_LOCALPART: &str = "n";
 /// Default cap on concurrent in-flight outbound federation transactions.
 const DEFAULT_OUTBOUND_CONCURRENCY: usize = 2;
 /// Default storage directory: a `data/` subdirectory of the process's working

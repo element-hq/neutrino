@@ -101,8 +101,8 @@ After GET room state landed (see below), a second pass added tests needing only 
 
 Allowlist regex note: the GET-state entries anchor the `/^rooms$/` segment because Go's `-run` matches each `/`-split segment unanchored, so a bare `rooms` would substring-match (and silently run) the sibling `joined_rooms` subtest. The proper fix — anchoring segments in the allowlist parser (`scripts/complement.sh`) — is deferred.
 
-### `POST /user/{uid}/filter` (could be a no-op opaque-id stub)
-Blocks nearly all of `sync_test.go` and `sync_archive_test.go` (`TestSync/*`, `TestSyncLeaveSection/*`, `TestArchivedRoomsHistory/*`, `TestLeaveEventInviteRejection`, …) — they create a filter first and pass its id to `/sync`. A stub returning any id + `GET …/filter/{id} → {}` would unlock the tranche cheaply, since the translator already ignores `?filter=`.
+### ~~`POST /user/{uid}/filter`~~ — IMPLEMENTED 2026-06-15 (no-op stub)
+`POST /user/{userId}/filter` returns a constant `{"filter_id":"0"}`; `GET …/filter/{id}` returns `{}`. Filters are never stored or applied — the real sync path is MSC4186 sliding sync (which self-filters); legacy `/v3/sync` is Complement-only and already discards `?filter=`. Pinned by `tests/e2e_filter.rs`. This unblocks Complement's `CreateFilter`, which previously 404'd ahead of nearly all of `sync_test.go` / `sync_archive_test.go` (`TestSync/*`, `TestSyncLeaveSection/*`, `TestArchivedRoomsHistory/*`, `TestLeaveEventInviteRejection`, …). **Not yet allowlisted** — needs an empirical Complement run (Docker+Go) to confirm which subtests are green vs. still gated on other gaps (e.g. lazy-loading, `GET /event`). The `filter_test.go` round-trip cases (`Can download filter`) will NOT pass: the stub returns `{}` rather than echoing the uploaded filter (Option A, deliberate).
 
 ### `GET /rooms/{room}/event/{eventId}`
 `apidoc_room_history_visibility_test.go::TestFetchEvent`; `txnid_test.go::TestTxnInEvent`; `power_levels_test.go` (reads the PL event by id).
@@ -127,7 +127,7 @@ Join-gated pagination over `EventStore::room_messages` (`dir`/`from`/`to`/`limit
 ## Cheap-win ordering (impact / effort)
 
 1. **[DONE 2026-06-02]** ~~Empirically run the "newly viable" candidates; allowlist the green ones.~~ Headline landed: `TestCumulativeJoinLeaveJoinSync` + the `TestRoomsInvite/Parallel` invite-flow subtests.
-2. **No-op `POST /user/{uid}/filter` stub** → unlocks the `TestSync/*` + `TestSyncLeaveSection/*` tranche. (~30 lines.) **Now the single biggest remaining unlock.**
+2. **[DONE 2026-06-15]** ~~No-op `POST /user/{uid}/filter` stub → unlocks the `TestSync/*` + `TestSyncLeaveSection/*` tranche.~~ Endpoint landed (`tests/e2e_filter.rs`); allowlisting pending an empirical Complement run.
 3. **[DONE 2026-06-03]** ~~`GET /rooms/{room}/state[/{type}/{key}]`~~ → unlocked the state read-back surface (`rooms_state`, `apidoc_room_state`, createRoom name/topic, apidoc_room_members invite/ban/leave). Largest single unlock.
 4. **`GET /rooms/{room}/event/{eventId}`** → history-visibility fetch + power-levels-by-id tests.
 5. **Teach `scripts/complement.sh` to also run `./tests/msc4222/...`** → the marquee MSC4222 `state_after` dual-emission validation (`tests/msc4222/TestSync/*`), currently unreachable because the runner is csapi-only.

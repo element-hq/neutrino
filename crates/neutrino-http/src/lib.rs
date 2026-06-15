@@ -402,6 +402,14 @@ fn build_router(state: &AppState) -> Router {
             "/_matrix/client/v3/user/{user_id}/account_data/{account_data_type}",
             get(get_account_data),
         )
+        .route(
+            "/_matrix/client/{version}/user/{user_id}/filter",
+            post(post_filter),
+        )
+        .route(
+            "/_matrix/client/{version}/user/{user_id}/filter/{filter_id}",
+            get(get_filter),
+        )
         .route("/_matrix/client/v3/room_keys/version", get(get_room_keys))
         .route("/_matrix/client/v3/createRoom", post(create_room))
         .route("/_matrix/client/v3/rooms/{room_id}/members", get(members))
@@ -963,6 +971,32 @@ async fn get_account_data(
               "error": "No current backup version"
         })),
     )
+}
+
+/// `POST /user/{userId}/filter` — no-op filter upload stub.
+///
+/// matrix-rust-sdk syncs via MSC4186 sliding sync (which filters itself);
+/// neutrino's legacy `/v3/sync` is Complement-only and its translator discards
+/// `?filter=`. So filters are never stored or applied — we only need to hand
+/// Complement's `CreateFilter` a `filter_id` so the `TestSync/*` tranche gets
+/// past filter creation. The body is accepted and ignored; a constant id is
+/// fine because nothing ever dereferences it. (Auth is out of scope, so the
+/// spec's cross-user `403 M_FORBIDDEN` check is intentionally skipped.)
+async fn post_filter(body: Option<Json<Value>>) -> Json<Value> {
+    let _ = body;
+    Json(json!({ "filter_id": "0" }))
+}
+
+/// `GET /user/{userId}/filter/{filterId}` — companion read stub. Returns an
+/// empty filter object; see [`post_filter`] for why nothing is stored.
+async fn get_filter(
+    axum::extract::Path((_version, _user_id, _filter_id)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+) -> Json<Value> {
+    Json(json!({}))
 }
 
 async fn get_room_keys() -> (StatusCode, Json<Value>) {
