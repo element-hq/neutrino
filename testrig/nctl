@@ -5,6 +5,7 @@
 #   Lifecycle:   nctl up | down | ps | logs <hs>
 #   Federation:  nctl fedlog [hs]            -> follow federation HTTP requests
 #   Partitions:  nctl partition cut|heal <12|13|23> | nctl partition status
+#                (heal auto-kicks both ends; `nctl kick [hs]` to do it manually)
 #   Room ops:    nctl <hs> <action> ...        (hs = hs1 | hs2 | hs3)
 #
 # Room actions (each acts as that server's single user, @alice:<hs>):
@@ -131,6 +132,10 @@ cmd_partition() {
         else
           echo "heal: $pair already up"
         fi
+        # Reset backoff on BOTH ends of the healed link so the outbox drains now
+        # instead of waiting out the per-destination backoff. pair "13" -> hs1,hs3.
+        kick "hs${pair:0:1}"
+        kick "hs${pair:1:1}"
       fi
       ;;
     status | "")
@@ -145,6 +150,30 @@ cmd_partition() {
       ;;
     *) die "partition: use cut|heal <12|13|23> or status" ;;
   esac
+}
+
+# Send SIGUSR2 -> Command::KickBackoff to a running server, resetting its
+# outbound federation backoff so every destination retries immediately. Used
+# after healing a partition instead of waiting out the per-destination backoff
+# (cap 15 min). $1 = hs (hs1|hs2|hs3).
+kick() {
+  local hs=$1
+  if docker kill --signal=SIGUSR2 "neutrino-$hs" >/dev/null 2>&1; then
+    echo "kick: $hs (SIGUSR2 -> KickBackoff)"
+  else
+    echo "kick: $hs not running" >&2
+  fi
+}
+
+# `nctl kick [hs]` — kick one server, or all three when no hs is given.
+cmd_kick() {
+  if [[ -n ${1:-} ]]; then
+    base "$1" >/dev/null # validate hs
+    kick "$1"
+  else
+    local hs
+    for hs in hs1 hs2 hs3; do kick "$hs"; done
+  fi
 }
 
 # ---- per-server room actions ------------------------------------------------
@@ -281,6 +310,7 @@ main() {
       fi
       ;;
     partition) shift; cmd_partition "$@" ;;
+    kick) shift; cmd_kick "$@" ;;
     help | -h | --help | "")
       # Print the header comment block (lines 3..first non-comment), stripping
       # the leading "# ". awk (not a fixed line range) so it can't leak code.
