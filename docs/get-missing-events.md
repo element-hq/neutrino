@@ -18,10 +18,12 @@ via a low-bandwidth transport (CBOR/CoAP per MSC3079). Every byte costs.
 The federation surface is therefore a deliberate, documented subset of
 the spec:
 
-1. **No `Authorization: X-Matrix` header.** We do not read it, parse it,
-   or verify it. Peers in the mesh are presumed trusted; the bytes
-   X-Matrix would cost are not spent. This is a deviation from the
-   server-server spec §"Authentication" — accepted.
+1. **`Authorization: X-Matrix` header required, network-attested.** We parse
+   the `origin`, reject a missing/malformed header or self-impersonation, and
+   member-scope the read (a non-member origin gets 403). We do NOT verify a
+   signature (no signing keys) and do NOT enforce `destination`: origin is
+   trusted because the network layer authenticates the peer, not
+   cryptographically. See `crates/neutrino-http/src/federation/auth.rs`.
 2. **No event signatures.** Events on the wire and in storage carry no
    `signatures` field (per `event-id-design.md`). We don't sign outbound
    PDUs and don't verify inbound ones.
@@ -68,11 +70,9 @@ New `federation/` submodule of `neutrino-http`, mirroring the existing
   )
   ```
 
-No origin extractor. No middleware. When the second federation endpoint
-lands (likely `/send`, which needs an origin string for
-`FederationInbox::record_federation_txn`), the question of "where does
-origin come from in the absence of X-Matrix" is settled then — see
-**Open questions** below.
+The caller's origin comes from the `X-Matrix` header via
+`auth::authenticated_origin` (network-attested — see `federation/auth.rs`); the
+handler authenticates and member-scopes the caller before walking the DAG.
 
 ## Handler
 
@@ -252,24 +252,11 @@ Captured here so the next implementer doesn't re-derive the question:
 - **History-visibility filtering** — gated on a `state_at_event`
   provider on `StateStore`. Acceptable spec gap under trusted-mesh.
 - **`min_depth` filter** — Neutrino has no depth.
-- **X-Matrix auth header** — deliberate spec deviation, low-bandwidth
-  motivated. Never landing.
-- **Per-peer origin tracking** — not needed for this endpoint. See
-  **Open questions** for when `/send` requires it.
 - **Outbound `/get_missing_events`** (we call peers to fill our own
   gaps) — needs state-res to integrate the response.
 
 ## Open questions
 
-- **Origin source on `/send`.** When `/send` lands, the storage trait
-  expects `record_federation_txn(origin, txn_id)`. With no X-Matrix
-  header to read `origin` from, the source has to be: (a) a custom
-  header from the low-bandwidth proxy layer (`neutrino-lb` could set
-  `X-Neutrino-Origin: <peer-name>` after demuxing the CoAP/CBOR
-  envelope), (b) globally unique `txn_id`s so `origin` becomes
-  vestigial in the dedup key, or (c) drop `origin` from the trait
-  entirely and accept (b). Defer until `/send` is on deck — none of
-  these affect `/get_missing_events`.
 - **Wire bytes vs. enrichment for federation responses generally.**
   Pinning here: federation responses ship `Event.raw` verbatim. If a
   future endpoint needs to expose `event_id` to peers (e.g., `/event/{eventId}` — though there the path itself carries the

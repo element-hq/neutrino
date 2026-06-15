@@ -61,6 +61,12 @@ struct App {
     /// worker tasks must never hold a clone, or the channel would never close
     /// and the worker (plus its `store`/`registry` `Arc`s) would leak.
     worker_poke: mpsc::Sender<OwnedRoomId>,
+    /// Peer fetcher for `get_missing_events`, shared with the inbound worker's
+    /// gap-fill and the `/send` handler's anti-entropy reconciliation. The
+    /// outbound sender pool is handed a clone too (see `serve`), so a healed
+    /// link reconciles divergence from a transaction's forward-extremity
+    /// exchange. Held behind a trait object so tests inject a deterministic stub.
+    fetcher: Arc<dyn MissingEventsFetcher>,
     sync_state: Arc<SyncState<SqliteStore>>,
     keys: Option<Value>,
     config: Config,
@@ -201,7 +207,8 @@ impl AppState {
         // It runs wherever the router does (production `serve` and the e2e
         // tests), enumerates any leftover staged rows on startup, and stops when
         // this `AppState` is dropped (the `worker_poke` sender drops with it).
-        let worker_poke = federation::worker::spawn(store.clone(), room_registry.clone(), fetcher);
+        let worker_poke =
+            federation::worker::spawn(store.clone(), room_registry.clone(), fetcher.clone());
         // Receivers are taken later via `subscribe_kick` (one per destination
         // task); the initial receiver is dropped — `send_modify` notifies any
         // live receivers and is a no-op when there are none.
@@ -210,6 +217,7 @@ impl AppState {
             store,
             room_registry,
             worker_poke,
+            fetcher,
             sync_state,
             keys: None,
             config,
@@ -230,6 +238,19 @@ impl AppState {
     /// This homeserver's name, sent as the `origin` on outbound transactions.
     fn server_name(&self) -> String {
         lock_app(self).config.server_name.clone()
+    }
+
+    /// The shared `get_missing_events` fetcher, for the outbound sender pool's
+    /// anti-entropy reconciliation (a peer's forward extremities arrive on a
+    /// transaction *response*, which the sender — not a handler — processes).
+    fn fetcher(&self) -> Arc<dyn MissingEventsFetcher> {
+        lock_app(self).fetcher.clone()
+    }
+
+    /// A clone of the inbound worker poke, for the outbound sender pool: after
+    /// reconciliation stages fetched events it pokes the worker to apply them.
+    fn worker_poke(&self) -> mpsc::Sender<OwnedRoomId> {
+        lock_app(self).worker_poke.clone()
     }
 
     /// The configured cap on concurrent outbound federation transactions.
@@ -287,6 +308,8 @@ pub async fn serve(
         state.outbound_concurrency(),
         state.subscribe_shutdown(),
         state.subscribe_kick(),
+        state.fetcher(),
+        state.worker_poke(),
     );
     let router = build_router(&state);
     // `dispatch` resolves on a terminal command or when every sender is dropped,

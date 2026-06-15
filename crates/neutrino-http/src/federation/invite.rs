@@ -21,15 +21,19 @@
 //! Response is `{ event }` — our copy of the invite event, verbatim. In a
 //! signatures world this is where the resident signature would be added.
 //!
-//! Trusted mesh: no X-Matrix auth, no signature verification (same stance as
-//! `/send` and `/send_join`). The inviting server is taken as the invite
-//! event's `sender` domain — used as the staged row's gap-fill fetch target.
+//! Requires an authenticated `X-Matrix` origin (network-attested — see
+//! [`crate::federation::auth`]); no signature verification (no signing keys).
+//! Unlike send_join/leave it does NOT require `origin == sender.server` on the
+//! hosted-room path (an invite may be authored by a local user yet arrive over
+//! federation, and apply_pdu is authoritative there); the out-of-band path,
+//! which has no state to auth against, DOES require it. The invite event's
+//! `sender` domain is the staged row's gap-fill fetch target.
 
 use axum::{
     Json,
     extract::rejection::JsonRejection,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use neutrino_common::ROOM_VERSION_ID;
@@ -44,7 +48,7 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::federation::client::{FederationClient, FederationClientError};
-use crate::federation::{FedError, stage_and_poke};
+use crate::federation::{FedError, auth, stage_and_poke};
 use crate::room_actor::RoomActorError;
 use crate::{AppState, error_response, lock_app};
 
@@ -71,6 +75,7 @@ pub(crate) struct ResponseBody {
 pub(crate) async fn handle(
     State(state): State<AppState>,
     Path((room_id, event_id)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Result<Json<InviteRequestBody>, JsonRejection>,
 ) -> Result<Json<ResponseBody>, FedError> {
     let body = body
@@ -96,8 +101,9 @@ pub(crate) async fn handle(
     let event =
         from_wire(raw, Vec::new()).map_err(|_| FedError::BadRequest("malformed invite event"))?;
 
-    // Structural validation (spec §invite). No signature / sender-on-origin
-    // checks (trusted mesh, no X-Matrix origin header).
+    // Structural validation (spec §invite). No signature check (no signing
+    // keys). The X-Matrix origin is authenticated below; the origin==sender
+    // constraint is imposed only on the out-of-band path (see below).
     if event.event_id.as_str() != event_id {
         return Err(FedError::BadRequest(
             "event_id in path does not match the event",
@@ -138,6 +144,13 @@ pub(crate) async fn handle(
         ));
     }
 
+    // Require an authenticated `X-Matrix` origin (rejects a missing header or a
+    // peer impersonating us). For a room we host, `apply_pdu` is the authoritative
+    // gate and the inviter may legitimately be a local user, so we do not also
+    // require `origin == sender.server` there. The OOB branch below has no room
+    // state to auth against, so it imposes that check itself.
+    let caller = auth::authenticated_origin(&headers, &our_server)?;
+
     // Keep the wire bytes for the response before either path moves `event`.
     let event_raw = event.raw.clone();
 
@@ -156,8 +169,17 @@ pub(crate) async fn handle(
         )
         .await?;
     } else {
-        // Out-of-band: no room state to auth against. Store the stub so sync can
-        // surface the invite from its `unsigned.invite_room_state`.
+        // Out-of-band: no room state to auth against, and apply_pdu never runs, so
+        // the network-attested origin MUST own the invite's sender (the inviting
+        // server) — otherwise an authenticated peer could plant a stub with a
+        // forged inviter, which sync would surface to the local user verbatim.
+        if caller != event.sender.server_name() {
+            return Err(FedError::Forbidden(
+                "origin server does not own the invite sender",
+            ));
+        }
+        // Store the stub so sync can surface the invite from its
+        // `unsigned.invite_room_state`.
         store.put_invite(&room_id, &invited, &event).await?;
     }
 

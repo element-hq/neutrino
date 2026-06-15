@@ -37,7 +37,7 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 use crate::federation::client::FederationClientError;
-use crate::federation::gapfill::MissingEventsFetcher;
+use crate::federation::gapfill::{MissingEventsFetcher, MissingEventsQuery};
 use crate::{router, router_with_store, router_with_store_and_fetcher};
 
 /// The arguments one `fetch` call was made with, recorded so a test can assert
@@ -117,16 +117,12 @@ impl StubFetcher {
 impl MissingEventsFetcher for StubFetcher {
     async fn fetch(
         &self,
-        _origin: &ServerName,
-        _room_id: &RoomId,
-        latest: &[OwnedEventId],
-        earliest: &[OwnedEventId],
-        limit: u32,
+        q: MissingEventsQuery<'_>,
     ) -> Result<Vec<Box<RawJsonValue>>, FederationClientError> {
         self.calls.lock().unwrap().push(FetchCall {
-            latest: latest.to_vec(),
-            earliest: earliest.to_vec(),
-            limit,
+            latest: q.latest.to_vec(),
+            earliest: q.earliest.to_vec(),
+            limit: q.limit,
         });
         let rebuild = |jsons: &[String]| {
             jsons
@@ -170,6 +166,17 @@ fn alice() -> OwnedUserId {
     "@alice:example.org".parse().unwrap()
 }
 
+/// The canonical remote peer for federation tests — the `X-Matrix` `origin` that
+/// [`drive`] injects on every federation request that doesn't set its own header.
+/// Rooms that federation *reads* target (get_missing_events / backfill) seed a
+/// member from this server so the member-only scoping gate passes.
+const TEST_PEER: &str = "remote.example.org";
+
+/// A user on [`TEST_PEER`].
+fn peer_user() -> OwnedUserId {
+    "@peer:remote.example.org".parse().unwrap()
+}
+
 fn fed_path(room_id: &str) -> String {
     format!("/_matrix/federation/v1/get_missing_events/{room_id}")
 }
@@ -203,7 +210,32 @@ async fn post_raw(
     drive(app, req).await
 }
 
-async fn drive(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
+async fn drive(app: &axum::Router, mut req: Request<Body>) -> (StatusCode, Value) {
+    // Federation endpoints require an `X-Matrix` auth header. Inject a default
+    // (origin = the canonical test peer [`TEST_PEER`]) for any federation request
+    // that didn't set its own, so the many positive-path tests don't each have to.
+    // Tests that exercise auth itself set their own Authorization header (or build
+    // their request without going through `drive`) and are left untouched. The
+    // `destination` is informational — the handlers don't enforce it.
+    if req.uri().path().starts_with("/_matrix/federation/")
+        && !req
+            .headers()
+            .contains_key(axum::http::header::AUTHORIZATION)
+    {
+        req.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static(
+                r#"X-Matrix origin="remote.example.org",destination="example.org""#,
+            ),
+        );
+    }
+    oneshot_json(app, req).await
+}
+
+/// Execute a request and parse the response — the shared tail of [`drive`] (which
+/// also injects a default `X-Matrix` header) and the auth-gate helpers (which set
+/// their own header, or none, and must bypass that injection).
+async fn oneshot_json(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
@@ -252,7 +284,9 @@ async fn build_seeded_router(
     TempDir,
 ) {
     let (store, tempfile) = fresh_store().await;
-    let sender = alice();
+    // Seed the room's members from TEST_PEER so the `X-Matrix` origin that
+    // `drive` injects on the read requests is a member (member-only scoping).
+    let sender = peer_user();
 
     // create event
     let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
@@ -301,6 +335,41 @@ async fn build_seeded_router(
 
     let router = router_with_store(config(), store);
     (router, room_id, create_id, ids, tempfile)
+}
+
+/// Create a room (create + `sender`'s self-join) directly in `store`, returning
+/// the room id and the join event id (sole head of both DAGs). Lets a test seed
+/// several independent rooms in one store — e.g. to prove a handler scopes a
+/// by-id lookup to the requested room. `ts` distinguishes otherwise-identical
+/// create events so each call yields a distinct room id (v12 derives the room id
+/// from the create event's reference hash).
+async fn create_joined_room_in(
+    store: &SqliteStore,
+    sender: &OwnedUserId,
+    ts: u64,
+) -> (OwnedRoomId, OwnedEventId) {
+    let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .origin_server_ts(ts)
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    let create_id = create.event_id.clone();
+    let join = EventBuilder::new(sender.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(sender.as_str().to_owned())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create_id.clone()])
+        .prev_state_events(vec![create_id.clone()])
+        .build()
+        .expect("build join");
+    let join_id = join.event_id.clone();
+    store
+        .create_room(&create, &[join])
+        .await
+        .expect("create_room");
+    (room_id, join_id)
 }
 
 // --- bad request: empty latest_events -----------------------------------
@@ -927,6 +996,185 @@ async fn missing_earliest_events_returns_400() {
         Some("M_INVALID_PARAM"),
         "body = {body}"
     );
+}
+
+// --- include_latest_events returns held heads, room-scoped --------------
+
+#[tokio::test]
+async fn include_latest_events_returns_held_head_scoped_to_room() {
+    // Anti-entropy's pull sets `include_latest_events` so the responder serves
+    // the advertised head itself (not only its ancestors). The held head must be
+    // returned — but scoped to the requested room: `get_events` looks up by id
+    // across all rooms, so without a room filter a caller could name a foreign
+    // room's event id and exfiltrate it.
+    let (store, _tempfile) = fresh_store().await;
+    // Seed both rooms with a TEST_PEER member so the injected `X-Matrix` origin is
+    // a member and passes the read-scoping gate.
+    let peer = peer_user();
+    let (room_a, head_a) = create_joined_room_in(&store, &peer, 1_700_000_000_000).await;
+    let (room_b, head_b) = create_joined_room_in(&store, &peer, 1_700_000_001_000).await;
+    let app = router_with_store(config(), store);
+
+    // (a) With the flag set, the head we hold in *this* room comes back. Walking
+    // back from the join (head_a) with no earliest yields its create ancestor;
+    // `include_latest_events` additionally returns the join (an m.room.member)
+    // itself — absent it, only the create (no state_key-less member) would show.
+    let (status, body) = post_json(
+        &app,
+        &fed_path(room_a.as_str()),
+        &json!({
+            "earliest_events": [],
+            "latest_events": [head_a.as_str()],
+            "include_latest_events": true,
+            "limit": 10,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let head_returned = body
+        .get("events")
+        .and_then(Value::as_array)
+        .expect("events array")
+        .iter()
+        .any(|e| e.get("type").and_then(Value::as_str) == Some("m.room.member"));
+    assert!(
+        head_returned,
+        "include_latest_events must return the held head: {body}"
+    );
+
+    // (b) Naming a head from a *different* room must return nothing, even though
+    // the store holds it — the regression this guards is a cross-room leak.
+    let (status, body) = post_json(
+        &app,
+        &fed_path(room_a.as_str()),
+        &json!({
+            "earliest_events": [],
+            "latest_events": [head_b.as_str()],
+            "include_latest_events": true,
+            "limit": 10,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let events = body
+        .get("events")
+        .and_then(Value::as_array)
+        .expect("events array");
+    assert!(
+        events.is_empty(),
+        "a foreign-room head ({head_b} in {room_b}) must not leak into {room_a}: {body}"
+    );
+}
+
+// --- X-Matrix auth gate -------------------------------------------------
+
+/// POST a federation request with an explicit Authorization header (or none),
+/// bypassing `drive`'s default `X-Matrix` injection — for exercising the auth
+/// gate directly.
+async fn fed_post_with_auth(
+    app: &axum::Router,
+    path: &str,
+    body: &Value,
+    auth: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json");
+    if let Some(a) = auth {
+        builder = builder.header("authorization", a);
+    }
+    let req = builder
+        .body(Body::from(serde_json::to_vec(body).unwrap()))
+        .unwrap();
+    oneshot_json(app, req).await
+}
+
+#[tokio::test]
+async fn get_missing_events_rejects_bad_x_matrix_header() {
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(2).await;
+    let body = json!({ "earliest_events": [], "latest_events": [msgs[1].as_str()], "limit": 10 });
+
+    // Missing header → 401 M_UNAUTHORIZED.
+    let (status, b) = fed_post_with_auth(&app, &fed_path(room_id.as_str()), &body, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "missing header: {b}");
+    assert_eq!(
+        b.get("errcode").and_then(Value::as_str),
+        Some("M_UNAUTHORIZED")
+    );
+
+    // Wrong scheme → 401.
+    let (status, _) = fed_post_with_auth(
+        &app,
+        &fed_path(room_id.as_str()),
+        &body,
+        Some("Bearer nope"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "wrong scheme");
+
+    // Origin claims to be us → 401 (a peer must not impersonate this server).
+    let (status, _) = fed_post_with_auth(
+        &app,
+        &fed_path(room_id.as_str()),
+        &body,
+        Some(r#"X-Matrix origin="example.org",destination="example.org""#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "self origin");
+}
+
+#[tokio::test]
+async fn get_missing_events_rejects_non_member_origin() {
+    // The room is shared only with TEST_PEER. A stranger server that knows the
+    // room id and an event id is still refused — member-only read scoping.
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(2).await;
+    let body = json!({ "earliest_events": [], "latest_events": [msgs[1].as_str()], "limit": 10 });
+
+    let (status, b) = fed_post_with_auth(
+        &app,
+        &fed_path(room_id.as_str()),
+        &body,
+        Some(r#"X-Matrix origin="stranger.example",destination="example.org""#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "non-member must be 403: {b}");
+    assert_eq!(
+        b.get("errcode").and_then(Value::as_str),
+        Some("M_FORBIDDEN")
+    );
+
+    // Positive control: the room's member server IS allowed.
+    let (status, _) = fed_post_with_auth(
+        &app,
+        &fed_path(room_id.as_str()),
+        &body,
+        Some(r#"X-Matrix origin="remote.example.org",destination="example.org""#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "member origin must be allowed");
+}
+
+#[tokio::test]
+async fn send_rejects_x_matrix_origin_mismatch() {
+    // The header origin is network-attested; `body.origin` is self-asserted. They
+    // must agree, or the transaction is rejected.
+    let (app, _store, room_id, alice, join_id, _tempfile) = seed_joined_room().await;
+    let msg = message_on(&alice, &room_id, &join_id, "hi", 1_700_000_001_000);
+    let body = txn(&[&msg]); // body origin = "remote.example.org"
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri(send_path("txn-mismatch"))
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            r#"X-Matrix origin="other.example",destination="example.org""#,
+        )
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let (status, b) = oneshot_json(&app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "origin mismatch: {b}");
 }
 
 // === GET /_matrix/federation/v1/backfill/{roomId} ======================
@@ -2081,14 +2329,183 @@ async fn send_drops_pdu_for_unknown_room() {
     );
 }
 
+#[tokio::test]
+async fn reconcile_converges_on_advertised_head() {
+    // Anti-entropy's whole point: a peer advertises a forward extremity we were
+    // never sent (the divergence a point-in-time fan-out snapshot can produce),
+    // and we converge — pull the head, stage it, and apply it through the normal
+    // worker pipeline — with NO PDU in the transaction. This is the convergence
+    // invariant the mechanism exists to guarantee.
+    let fetcher = StubFetcher::no_progress();
+
+    // Seed a room *shared with the peer*: create ← alice-join ← peer-join, so the
+    // advertising peer (TEST_PEER) is a joined member — required by the reconcile
+    // honour-path's membership gate. `peer-join` is the sole head of both DAGs.
+    let (store, _tempfile) = fresh_store().await;
+    let alice = alice();
+    let peer = peer_user();
+    let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    let alice_join = EventBuilder::new(alice.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(alice.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create.event_id.clone()])
+        .prev_state_events(vec![create.event_id.clone()])
+        .build()
+        .expect("build alice join");
+    let peer_join = EventBuilder::new(peer.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(peer.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![alice_join.event_id.clone()])
+        .prev_state_events(vec![alice_join.event_id.clone()])
+        .build()
+        .expect("build peer join");
+    let head = peer_join.event_id.clone();
+    store
+        .create_room(&create, &[alice_join, peer_join])
+        .await
+        .expect("create_room");
+    let app = router_with_store_and_fetcher(config(), store.clone(), fetcher.clone());
+
+    // The event the peer holds and we lack: a message from the peer on the head,
+    // so once fetched its ancestry is already grounded (no further gap-fill).
+    let missing = message_on(
+        &peer,
+        &room_id,
+        &head,
+        "only on the peer",
+        1_700_000_002_000,
+    );
+    let missing_id = missing.event_id.clone();
+    // The peer serves it from the `get_missing_events` we issue on the pull.
+    fetcher.set_events(&[&missing]);
+
+    // A transaction with NO pdus, advertising the peer's heads: its timeline head
+    // is `missing` (we don't hold it), its state head is our shared join (we do).
+    let body = json!({
+        "origin": TEST_PEER,
+        "origin_server_ts": 1_700_000_000_000u64,
+        "pdus": [],
+        "forward_extremities": {
+            room_id.as_str(): {
+                "timeline": [missing_id.as_str()],
+                "state": [head.as_str()],
+            }
+        }
+    });
+    let (status, resp) = put_json(&app, &send_path("ae-txn"), &body).await;
+    assert_eq!(status, StatusCode::OK, "body = {resp}");
+
+    // We pull the advertised head and the worker applies it: it commits (auth
+    // passes, not rejected) and becomes our timeline head — converged on the
+    // peer's view without any event being pushed to us.
+    let row = wait_committed(&store, missing_id.as_ref()).await;
+    assert!(!row.rejected, "reconciled event must auth-pass and commit");
+    wait_timeline_head(&store, &room_id, missing_id.as_ref()).await;
+
+    // Exactly one pull: the unknown timeline head triggered a fetch; the
+    // already-held state head (our shared join) did not. A regression that
+    // re-fetches held heads, or pulls per-DAG unconditionally, fails here.
+    assert_eq!(
+        fetcher.call_count(),
+        1,
+        "only the unknown head is pulled; the held state head triggers no fetch",
+    );
+}
+
+#[tokio::test]
+async fn reconcile_ignores_advertisement_from_non_member_peer() {
+    // #5 honour-side: the advertising peer (TEST_PEER) is NOT a member of the room
+    // (only alice, local, is). The honour-path's membership gate must drop the
+    // advertisement *without issuing any fetch* — an unauthenticated peer can't
+    // induce us to pull for a room it isn't in. Unit-tests `reconcile_room`
+    // directly (it's awaited, so `call_count` is checked deterministically — no
+    // race against a fire-and-forget task).
+    let fetcher = StubFetcher::no_progress();
+    let (_app, store, room_id, _alice, join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let (poke_tx, _poke_rx) = tokio::sync::mpsc::channel(8);
+    let peer: &ServerName = TEST_PEER.try_into().unwrap();
+
+    // Advertise a head we don't hold. Were the peer a member, this would trigger a
+    // get_missing_events; since it isn't, reconcile returns before fetching.
+    let ghost: OwnedEventId = "$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        .try_into()
+        .unwrap();
+    let advertised = crate::federation::reconcile::ForwardExtremities {
+        timeline: vec![ghost],
+        state: vec![join_id],
+    };
+    crate::federation::reconcile::reconcile_room(
+        &store,
+        &*fetcher,
+        &poke_tx,
+        peer,
+        &room_id,
+        &advertised,
+    )
+    .await;
+
+    assert_eq!(
+        fetcher.call_count(),
+        0,
+        "an advertisement from a non-member peer must trigger no fetch",
+    );
+}
+
+#[tokio::test]
+async fn backfill_rejects_non_member_origin() {
+    // #5 for the backfill consumer (same `server_in_room` gate, separate handler).
+    // The room is shared only with TEST_PEER.
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(2).await;
+    let path = backfill_path(room_id.as_str(), &[msgs[1].as_str()], Some(10));
+
+    // Stranger server (valid header, not self, not in the room) → 403.
+    let req = Request::builder()
+        .method("GET")
+        .uri(&path)
+        .header(
+            "authorization",
+            r#"X-Matrix origin="stranger.example",destination="example.org""#,
+        )
+        .body(Body::empty())
+        .unwrap();
+    let (status, b) = oneshot_json(&app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "non-member backfill: {b}");
+    assert_eq!(
+        b.get("errcode").and_then(Value::as_str),
+        Some("M_FORBIDDEN")
+    );
+
+    // Positive control: the room's member server is allowed.
+    let req = Request::builder()
+        .method("GET")
+        .uri(&path)
+        .header(
+            "authorization",
+            r#"X-Matrix origin="remote.example.org",destination="example.org""#,
+        )
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = oneshot_json(&app, req).await;
+    assert_eq!(status, StatusCode::OK, "member origin must be allowed");
+}
+
 // ===================================================================
 // Server-Server join — inbound make_join + send_join,
-// where WE are the resident server. A remote user (`@zara:remote.example`)
-// joins a room we host.
+// where WE are the resident server. A remote user (`@zara:remote.example.org`)
+// joins a room we host. `@zara`'s server matches the `X-Matrix` origin that
+// `drive` injects, so the sender-on-origin checks pass.
 // ===================================================================
 
 const ALICE: &str = "@alice:example.org";
-const ZARA: &str = "@zara:remote.example";
+const ZARA: &str = "@zara:remote.example.org";
 const YAN: &str = "@yan:other.example";
 
 /// Seed a room created by `alice` (our user). `initial` is a chain of state
@@ -4232,8 +4649,19 @@ async fn reject_then_reinvite_resurrects_stub() {
     );
     let invite_id = invite.event_id.clone();
     let path = invite_path(room_id.as_str(), invite_id.as_str());
+    // The invite's sender lives on `dead`; the inbound X-Matrix origin must own
+    // it (OOB-branch SEC1 check), so advertise that server explicitly rather than
+    // relying on `drive`'s default injected origin.
+    let auth = xm(dead.as_str());
 
-    let (s, _b) = put_json(&a_router, &path, &invite_body(&invite, None)).await;
+    let (s, _b) = fed_req(
+        &a_router,
+        "PUT",
+        &path,
+        Some(&invite_body(&invite, None)),
+        Some(&auth),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
     assert!(
         a_store
@@ -4259,7 +4687,14 @@ async fn reject_then_reinvite_resurrects_stub() {
     );
 
     // Re-invite resurrects the declined stub.
-    let (s, _b) = put_json(&a_router, &path, &invite_body(&invite, None)).await;
+    let (s, _b) = fed_req(
+        &a_router,
+        "PUT",
+        &path,
+        Some(&invite_body(&invite, None)),
+        Some(&auth),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
     assert!(
         a_store
@@ -4268,5 +4703,222 @@ async fn reject_then_reinvite_resurrects_stub() {
             .unwrap()
             .is_some(),
         "a re-invite after a decline must resurrect the stub"
+    );
+}
+
+// === X-Matrix auth gate: per-endpoint coverage ==========================
+//
+// `drive` auto-injects a valid header on positive paths, so these build their
+// requests directly (via `oneshot_json`) to exercise the missing-header (401)
+// and wrong-origin (403) branches on EVERY federation endpoint — not just
+// get_missing_events.
+
+/// An `X-Matrix` Authorization header value advertising `origin`. `destination`
+/// is a fixed placeholder (the handlers don't enforce it).
+fn xm(origin: &str) -> String {
+    format!(r#"X-Matrix origin="{origin}",destination="example.org""#)
+}
+
+/// Drive a federation request with an explicit `auth` header (or none), bypassing
+/// `drive`'s default injection. `body`, when present, is sent as JSON.
+async fn fed_req(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    auth: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(method).uri(path);
+    if let Some(a) = auth {
+        builder = builder.header("authorization", a);
+    }
+    let req = match body {
+        Some(b) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(b).unwrap()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    };
+    oneshot_json(app, req).await
+}
+
+#[tokio::test]
+async fn federation_endpoints_require_x_matrix_header() {
+    // Missing header → 401 M_UNAUTHORIZED on every inbound federation endpoint.
+    // (get_missing_events is covered by get_missing_events_rejects_bad_x_matrix_header.)
+    // Auth runs before apply on each, so structurally-valid but unauthenticated
+    // requests are rejected — proving each handler actually calls authenticated_origin.
+    let (router, _store, room_id, head, _tempfile) = seed_public_room().await;
+    let join = remote_join(&room_id, &head, ZARA);
+    let leave = remote_leave(&room_id, &head, ZARA);
+    let zara: OwnedUserId = ZARA.parse().unwrap();
+    let carol = "@carol:example.org";
+    let invite = member_pdu(
+        &zara,
+        carol,
+        &room_id,
+        "invite",
+        std::slice::from_ref(&head),
+    );
+
+    let cases: Vec<(&str, String, Option<Value>)> = vec![
+        (
+            "PUT",
+            send_path("ae-missing"),
+            Some(json!({ "origin": TEST_PEER, "origin_server_ts": 1u64, "pdus": [] })),
+        ),
+        ("GET", make_join_path(&room_id, ZARA), None),
+        ("GET", make_leave_path(&room_id, ZARA), None),
+        (
+            "PUT",
+            send_join_path(&room_id, &join.event_id),
+            Some(serde_json::from_str(join.raw.get()).unwrap()),
+        ),
+        (
+            "PUT",
+            send_leave_path(&room_id, &leave.event_id),
+            Some(serde_json::from_str(leave.raw.get()).unwrap()),
+        ),
+        (
+            "PUT",
+            invite_path(room_id.as_str(), invite.event_id.as_str()),
+            Some(invite_body(&invite, None)),
+        ),
+        (
+            "GET",
+            backfill_path(room_id.as_str(), &[head.as_str()], Some(10)),
+            None,
+        ),
+    ];
+    for (method, path, body) in &cases {
+        let (status, b) = fed_req(&router, method, path, body.as_ref(), None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{method} {path} without header should be 401: {b}"
+        );
+        assert_eq!(
+            b.get("errcode").and_then(Value::as_str),
+            Some("M_UNAUTHORIZED"),
+            "{method} {path}: {b}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn membership_handshake_rejects_wrong_origin() {
+    // make_join/make_leave: the origin must own the user. send_join/send_leave:
+    // the origin must own the event sender. A valid-but-foreign origin (not self,
+    // != the user/sender server) → 403 M_FORBIDDEN. Pins the negative branch the
+    // positive ZARA tests don't reach.
+    let (router, _store, room_id, head, _tempfile) = seed_public_room().await;
+    let join = remote_join(&room_id, &head, ZARA);
+    let leave = remote_leave(&room_id, &head, ZARA);
+    let foreign = xm("other.example"); // authenticated, but != ZARA's server
+
+    let cases: Vec<(&str, String, Option<Value>)> = vec![
+        ("GET", make_join_path(&room_id, ZARA), None),
+        ("GET", make_leave_path(&room_id, ZARA), None),
+        (
+            "PUT",
+            send_join_path(&room_id, &join.event_id),
+            Some(serde_json::from_str(join.raw.get()).unwrap()),
+        ),
+        (
+            "PUT",
+            send_leave_path(&room_id, &leave.event_id),
+            Some(serde_json::from_str(leave.raw.get()).unwrap()),
+        ),
+    ];
+    for (method, path, body) in &cases {
+        let (status, b) = fed_req(&router, method, path, body.as_ref(), Some(&foreign)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} {path} with foreign origin should be 403: {b}"
+        );
+        assert_eq!(
+            b.get("errcode").and_then(Value::as_str),
+            Some("M_FORBIDDEN"),
+            "{method} {path}: {b}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn invite_oob_rejects_forged_sender() {
+    // SEC1 regression: an out-of-band invite (room we don't host) must have the
+    // authenticated origin own the inviter, or an authenticated peer could plant a
+    // stub with a forged sender that sync surfaces verbatim. The injected origin
+    // is TEST_PEER (remote.example.org); the invite's sender is on bank.example.
+    let (store, _tempfile) = fresh_store().await;
+    let router = router_with_store(config(), store.clone());
+    let forger: OwnedUserId = "@boss:bank.example".parse().unwrap();
+    let invited = alice(); // local
+
+    // Throwaway create → a valid room id we never register (out-of-band).
+    let create = EventBuilder::new(forger.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    let invite = member_pdu(
+        &forger,
+        invited.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&create.event_id),
+    );
+
+    // `put_json` → `drive` injects origin=remote.example.org, which does NOT own
+    // @boss:bank.example.
+    let (status, body) = put_json(
+        &router,
+        &invite_path(room_id.as_str(), invite.event_id.as_str()),
+        &invite_body(&invite, None),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "forged-sender OOB invite: {body}"
+    );
+    assert_eq!(
+        body.get("errcode").and_then(Value::as_str),
+        Some("M_FORBIDDEN")
+    );
+    // Nothing stored.
+    assert!(
+        store
+            .get_invite(&room_id, &invited)
+            .await
+            .unwrap()
+            .is_none(),
+        "a forged-sender invite must not be stored"
+    );
+
+    // Positive control: when the origin DOES own the sender, the stub is stored.
+    let honest = xm("bank.example");
+    let (status, _) = fed_req(
+        &router,
+        "PUT",
+        &invite_path(room_id.as_str(), invite.event_id.as_str()),
+        Some(&invite_body(&invite, None)),
+        Some(&honest),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "honest-origin OOB invite must be accepted"
+    );
+    assert!(
+        store
+            .get_invite(&room_id, &invited)
+            .await
+            .unwrap()
+            .is_some(),
+        "honest OOB invite stub must be stored"
     );
 }

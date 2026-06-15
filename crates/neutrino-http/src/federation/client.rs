@@ -6,7 +6,8 @@
 //!
 //! - **Resolution** is `http://{server_name}` — raw IP:port, no TLS, no
 //!   `.well-known` / SRV lookup.
-//! - **No X-Matrix auth** header and no request signing.
+//! - **X-Matrix header sent** (network-attested origin + destination, no
+//!   key/sig — see [`crate::federation::auth`]); no request signing.
 //! - PDUs are opaque `RawValue`s on the wire, never re-parsed here.
 //!
 //! Consumed by the per-destination sender pool (`federation::sender`).
@@ -15,15 +16,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use std::collections::BTreeMap;
+
 use reqwest::Client;
-use ruma::{EventId, OwnedEventId, RoomId, ServerName, UserId};
+use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId, ServerName, UserId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue as RawJsonValue;
 use tracing::{info, warn};
 
-use crate::federation::gapfill::MissingEventsFetcher;
+use crate::federation::gapfill::{MissingEventsFetcher, MissingEventsQuery};
+use crate::federation::reconcile::ForwardExtremities;
 use crate::federation::{get_missing_events, now_ms};
 
 /// Connection-establishment timeout for a federation request.
@@ -77,17 +81,33 @@ impl FederationClient {
         Self { http, origin }
     }
 
+    /// The `Authorization: X-Matrix origin="…",destination="…"` header value for
+    /// an outbound request to `dest`. No `key`/`sig`: we have no signing key, so
+    /// this is a network-attested identity, not a signature (see
+    /// [`crate::federation::auth`]). Server names contain no `"`/`,`, so the
+    /// values need no escaping.
+    fn x_matrix(&self, dest: &ServerName) -> String {
+        format!(
+            "X-Matrix origin=\"{}\",destination=\"{}\"",
+            self.origin, dest
+        )
+    }
+
     /// `PUT http://{dest}/_matrix/federation/v1/send/{txn_id}` carrying `pdus`
-    /// (and an empty `edus` list — EDUs are out of scope). `Ok(())` on a 2xx;
-    /// the per-PDU result map in the response body is ignored (the spec marks
-    /// `error` advisory, and our durable retry lives in the outbox, not in
-    /// parsing the peer's verdicts).
+    /// (and an empty `edus` list — EDUs are out of scope) plus our
+    /// `forward_extremities` advertisement. The per-PDU result map in the response
+    /// is ignored (the spec marks `error` advisory, and our durable retry lives in
+    /// the outbox), but the response's `forward_extremities` (the peer's heads) is
+    /// returned so the sender can reconcile against them. A response that omits or
+    /// malforms that field yields an empty map — a 2xx is still a successful
+    /// delivery regardless of whether the peer implements reconciliation.
     pub(crate) async fn send_transaction(
         &self,
         dest: &ServerName,
         txn_id: &str,
         pdus: &[Box<RawJsonValue>],
-    ) -> Result<(), FederationClientError> {
+        forward_extremities: &BTreeMap<OwnedRoomId, ForwardExtremities>,
+    ) -> Result<BTreeMap<OwnedRoomId, ForwardExtremities>, FederationClientError> {
         // `txn_id` is locally generated (`{u64}-{u64}`) and `dest` is a
         // validated `ServerName`, so neither needs escaping in the path.
         let url = format!("http://{dest}/_matrix/federation/v1/send/{txn_id}");
@@ -98,12 +118,26 @@ impl FederationClient {
             origin_server_ts: now_ms(),
             pdus,
             edus: &[],
+            forward_extremities,
         };
-        let resp = self.http.put(&url).json(&body).send().await?;
+        let resp = self
+            .http
+            .put(&url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .json(&body)
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "PUT /send").await);
         }
-        Ok(())
+        // Anti-entropy: read the peer's advertised heads. A parse failure (legacy
+        // peer, or a body without the field) is NOT a delivery failure — the 2xx
+        // already committed acceptance — so degrade to an empty advertisement.
+        Ok(resp
+            .json::<TransactionResponse>()
+            .await
+            .map(|r| r.forward_extremities)
+            .unwrap_or_default())
     }
 
     /// `POST http://{dest}/_matrix/federation/v1/get_missing_events/{room_id}`
@@ -113,7 +147,9 @@ impl FederationClient {
     ///
     /// `state_dag` (MSC4242) asks the peer to walk back via `prev_state_events`
     /// rather than `prev_events`; the gap-fill fetcher sets it `true` to close
-    /// a received PDU's missing *state* ancestry.
+    /// a received PDU's missing *state* ancestry. `include_latest_events`
+    /// (anti-entropy) asks the peer to also return the `latest` heads themselves.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn get_missing_events(
         &self,
         dest: &ServerName,
@@ -122,6 +158,7 @@ impl FederationClient {
         earliest: &[OwnedEventId],
         limit: u32,
         state_dag: bool,
+        include_latest_events: bool,
     ) -> Result<Vec<Box<RawJsonValue>>, FederationClientError> {
         // `room_id` goes in a path segment. ruma's `RoomId` localpart is not
         // URL-validated (it may contain `/`, `?`, `#`), so push it through
@@ -130,7 +167,7 @@ impl FederationClient {
         // No trailing slash on the base: `path_segments_mut().push()` appends a
         // segment, so a trailing slash would yield an empty segment + double
         // slash (`…/get_missing_events//{room}`).
-        info!(target: "neutrino_http", %dest, %room_id, limit, state_dag, "outbound POST /_matrix/federation/v1/get_missing_events");
+        info!(target: "neutrino_http", %dest, %room_id, limit, state_dag, include_latest_events, "outbound POST /_matrix/federation/v1/get_missing_events");
         let mut url = reqwest::Url::parse(&format!(
             "http://{dest}/_matrix/federation/v1/get_missing_events"
         ))
@@ -144,8 +181,15 @@ impl FederationClient {
             latest_events: latest,
             limit,
             state_dag,
+            include_latest_events,
         };
-        let resp = self.http.post(url).json(&body).send().await?;
+        let resp = self
+            .http
+            .post(url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .json(&body)
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "POST /get_missing_events").await);
         }
@@ -177,7 +221,12 @@ impl FederationClient {
             .push(user_id.as_str());
         url.query_pairs_mut().append_pair("ver", ver);
 
-        let resp = self.http.get(url).send().await?;
+        let resp = self
+            .http
+            .get(url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "GET /make_join").await);
         }
@@ -203,7 +252,13 @@ impl FederationClient {
             .push(room_id.as_str())
             .push(event_id.as_str());
 
-        let resp = self.http.put(url).json(&event).send().await?;
+        let resp = self
+            .http
+            .put(url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .json(&event)
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "PUT /send_join").await);
         }
@@ -238,7 +293,13 @@ impl FederationClient {
             room_version,
             invite_room_state,
         };
-        let resp = self.http.put(url).json(&body).send().await?;
+        let resp = self
+            .http
+            .put(url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .json(&body)
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "PUT /invite").await);
         }
@@ -268,7 +329,12 @@ impl FederationClient {
             .push(user_id.as_str());
         url.query_pairs_mut().append_pair("ver", ver);
 
-        let resp = self.http.get(url).send().await?;
+        let resp = self
+            .http
+            .get(url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "GET /make_leave").await);
         }
@@ -295,7 +361,13 @@ impl FederationClient {
             .push(room_id.as_str())
             .push(event_id.as_str());
 
-        let resp = self.http.put(url).json(&event).send().await?;
+        let resp = self
+            .http
+            .put(url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .json(&event)
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "PUT /send_leave").await);
         }
@@ -407,16 +479,18 @@ impl ReqwestFetcher {
 impl MissingEventsFetcher for ReqwestFetcher {
     async fn fetch(
         &self,
-        origin: &ServerName,
-        room_id: &RoomId,
-        latest: &[OwnedEventId],
-        earliest: &[OwnedEventId],
-        limit: u32,
+        q: MissingEventsQuery<'_>,
     ) -> Result<Vec<Box<RawJsonValue>>, FederationClientError> {
-        // Gap-fill always walks the state DAG (the ancestry `apply_pdu`
-        // needs), so `state_dag` is fixed `true`.
         self.client
-            .get_missing_events(origin, room_id, latest, earliest, limit, true)
+            .get_missing_events(
+                q.origin,
+                q.room_id,
+                q.latest,
+                q.earliest,
+                q.limit,
+                q.state_dag,
+                q.include_latest_events,
+            )
             .await
     }
 }
@@ -451,6 +525,20 @@ struct TransactionRequest<'a> {
     origin_server_ts: u64,
     pdus: &'a [Box<RawJsonValue>],
     edus: &'a [Box<RawJsonValue>],
+    /// Anti-entropy: our per-room forward extremities. Omitted when empty so a
+    /// transaction with nothing to advertise keeps the legacy wire shape.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    forward_extremities: &'a BTreeMap<OwnedRoomId, ForwardExtremities>,
+}
+
+/// Deserialized `/send` transaction response. The per-PDU `pdus` verdicts are
+/// ignored (advisory); only the anti-entropy `forward_extremities` advertisement
+/// is read. `#[serde(default)]` lets a legacy `{ "pdus": {} }` body decode with
+/// no heads.
+#[derive(Deserialize)]
+struct TransactionResponse {
+    #[serde(default)]
+    forward_extremities: BTreeMap<OwnedRoomId, ForwardExtremities>,
 }
 
 /// Outbound `/get_missing_events` request body. Mirrors the inbound
@@ -464,6 +552,8 @@ struct MissingEventsRequest<'a> {
     latest_events: &'a [OwnedEventId],
     limit: u32,
     state_dag: bool,
+    /// Anti-entropy: ask the peer to also return the `latest_events` it holds.
+    include_latest_events: bool,
 }
 
 #[cfg(test)]
@@ -505,7 +595,7 @@ mod tests {
         let client = FederationClient::new("local.test".to_owned());
         let pdus = [raw(r#"{"n":1}"#), raw(r#"{"n":2}"#)];
         client
-            .send_transaction(&dest, "txn-1", &pdus)
+            .send_transaction(&dest, "txn-1", &pdus, &BTreeMap::new())
             .await
             .unwrap();
 
@@ -535,7 +625,7 @@ mod tests {
         let client = FederationClient::new("local.test".to_owned());
         let pdu = raw("{}");
         let err = client
-            .send_transaction(&dest, "t", std::slice::from_ref(&pdu))
+            .send_transaction(&dest, "t", std::slice::from_ref(&pdu), &BTreeMap::new())
             .await
             .unwrap_err();
         assert!(
@@ -566,7 +656,7 @@ mod tests {
         let earliest = vec![event_id!("$early:example.org").to_owned()];
 
         let events = client
-            .get_missing_events(&dest, &room, &latest, &earliest, 5, true)
+            .get_missing_events(&dest, &room, &latest, &earliest, 5, true, false)
             .await
             .unwrap();
         // Count, content, and order (oldest-first) all preserved.
@@ -600,7 +690,7 @@ mod tests {
         let client = FederationClient::new("local.test".to_owned());
         let room: OwnedRoomId = room_id!("!room:example.org").to_owned();
         let err = client
-            .get_missing_events(&dest, &room, &[], &[], 10, true)
+            .get_missing_events(&dest, &room, &[], &[], 10, true, false)
             .await
             .unwrap_err();
         assert!(
@@ -645,7 +735,7 @@ mod tests {
         let client = FederationClient::new("local.test".to_owned());
         let pdu = raw("{}");
         let err = client
-            .send_transaction(&dest, "t", std::slice::from_ref(&pdu))
+            .send_transaction(&dest, "t", std::slice::from_ref(&pdu), &BTreeMap::new())
             .await
             .unwrap_err();
         assert!(
@@ -667,7 +757,7 @@ mod tests {
         let client = FederationClient::new("local.test".to_owned());
         let room: OwnedRoomId = room_id!("!room:example.org").to_owned();
         let events = client
-            .get_missing_events(&dest, &room, &[], &[], 10, true)
+            .get_missing_events(&dest, &room, &[], &[], 10, true, false)
             .await
             .unwrap();
         assert!(events.is_empty());
@@ -685,7 +775,7 @@ mod tests {
         let client = FederationClient::new("local.test".to_owned());
         let room: OwnedRoomId = room_id!("!room:example.org").to_owned();
         let err = client
-            .get_missing_events(&dest, &room, &[], &[], 10, true)
+            .get_missing_events(&dest, &room, &[], &[], 10, true, false)
             .await
             .unwrap_err();
         assert!(
@@ -703,11 +793,13 @@ mod tests {
         use crate::federation::send::TransactionBody;
 
         let pdu = raw(r#"{"type":"m.room.message"}"#);
+        let fes = BTreeMap::new();
         let txn = TransactionRequest {
             origin: "local.test",
             origin_server_ts: 12345,
             pdus: std::slice::from_ref(&pdu),
             edus: &[],
+            forward_extremities: &fes,
         };
         let txn_json = serde_json::to_value(&txn).unwrap();
         let _: TransactionBody =
@@ -720,9 +812,66 @@ mod tests {
             latest_events: &latest,
             limit: 7,
             state_dag: true,
+            include_latest_events: true,
         };
         let req_json = serde_json::to_value(&req).unwrap();
         let _: RequestBody = serde_json::from_value(req_json)
             .expect("inbound /get_missing_events parses the client's body");
+    }
+
+    /// The anti-entropy `forward_extremities` advertisement must round-trip
+    /// across the two hand-rolled halves: the outbound `TransactionRequest`'s
+    /// field has to parse on the inbound `/send` (`send::TransactionBody`), and
+    /// the inbound response's `forward_extremities` has to parse back into the
+    /// outbound `TransactionResponse`. Catches field-name / shape drift.
+    #[test]
+    fn forward_extremities_round_trip_through_both_send_halves() {
+        use crate::federation::send::TransactionBody;
+
+        let room: OwnedRoomId = room_id!("!r:example.org").to_owned();
+        let mut fes = BTreeMap::new();
+        fes.insert(
+            room.clone(),
+            ForwardExtremities {
+                timeline: vec![event_id!("$t:example.org").to_owned()],
+                state: vec![event_id!("$s:example.org").to_owned()],
+            },
+        );
+
+        // Request half: outbound body parses on the inbound handler.
+        let pdu = raw(r#"{"type":"m.room.message"}"#);
+        let txn = TransactionRequest {
+            origin: "local.test",
+            origin_server_ts: 1,
+            pdus: std::slice::from_ref(&pdu),
+            edus: &[],
+            forward_extremities: &fes,
+        };
+        let txn_json = serde_json::to_value(&txn).unwrap();
+        assert_eq!(
+            txn_json["forward_extremities"][room.as_str()]["state"][0],
+            "$s:example.org"
+        );
+        let _: TransactionBody = serde_json::from_value(txn_json)
+            .expect("inbound /send parses the client's forward_extremities");
+
+        // Response half: an inbound-shaped response parses back into the client.
+        let resp_json = json!({
+            "pdus": {},
+            "forward_extremities": {
+                room.as_str(): { "timeline": ["$t:example.org"], "state": ["$s:example.org"] }
+            }
+        });
+        let resp: TransactionResponse = serde_json::from_value(resp_json)
+            .expect("client parses the inbound /send response forward_extremities");
+        assert_eq!(
+            resp.forward_extremities[&room].state[0],
+            event_id!("$s:example.org")
+        );
+
+        // A legacy response (no field) decodes to an empty advertisement.
+        let legacy: TransactionResponse =
+            serde_json::from_value(json!({ "pdus": {} })).expect("legacy body parses");
+        assert!(legacy.forward_extremities.is_empty());
     }
 }

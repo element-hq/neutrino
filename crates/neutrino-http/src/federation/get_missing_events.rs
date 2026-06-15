@@ -4,16 +4,19 @@
 //! for the design — the algorithm comments below cross-reference the seven
 //! steps from the design doc's §Handler/Algorithm.
 
+use std::collections::HashSet;
+
 use axum::{
     Json,
     extract::{Path, State},
+    http::HeaderMap,
 };
-use neutrino_store::{DagStore, RoomStore};
-use ruma::OwnedRoomId;
+use neutrino_store::{DagStore, EventStore, RoomStore};
+use ruma::{OwnedEventId, OwnedRoomId};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 
-use crate::federation::FedError;
+use crate::federation::{FedError, auth};
 use crate::{AppState, lock_app};
 
 /// Spec default for `limit` when the client omits it.
@@ -69,6 +72,15 @@ pub(crate) struct RequestBody {
     /// received PDU's missing state ancestry.
     #[serde(default)]
     state_dag: bool,
+    /// Anti-entropy (forward-extremity reconciliation): when `true`, the response
+    /// additionally includes any `latest_events` this server *itself holds*, not
+    /// only their ancestors. The unmodified endpoint returns only ancestors of
+    /// `latest_events` — it assumes the caller already has the heads (it received
+    /// them via `/send`). A reconciling caller, by contrast, is missing the
+    /// advertised head itself, so it sets this to retrieve the head and its gap
+    /// in one request. Optional, default `false`.
+    #[serde(default)]
+    include_latest_events: bool,
 }
 
 /// Serializable mirror of `ruma::api::federation::event::get_missing_events::v1::Response`.
@@ -104,6 +116,7 @@ pub(crate) struct ResponseBody {
 pub(crate) async fn handle(
     State(state): State<AppState>,
     Path(room_id): Path<String>,
+    headers: HeaderMap,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ResponseBody>, FedError> {
     // Parse the path-extracted `room_id` manually so malformed IDs surface
@@ -111,6 +124,15 @@ pub(crate) async fn handle(
     // Mirrors the `members` handler precedent in `lib.rs`.
     let room_id: OwnedRoomId = OwnedRoomId::try_from(room_id.as_str())
         .map_err(|_| FedError::BadRequest("invalid room_id"))?;
+
+    // Authenticate the calling server via its `X-Matrix` header (network-attested
+    // origin — see `federation::auth`). Required: this endpoint serves a room's
+    // DAG, so a non-member must not be able to walk it.
+    let (store, our_name) = {
+        let app = lock_app(&state);
+        (app.store.clone(), app.config.server_name.clone())
+    };
+    let origin = auth::authenticated_origin(&headers, &our_name)?;
 
     // Take the raw JSON Value through `Json<Value>` so any malformed body
     // — invalid JSON, wrong content-type, missing required fields when we
@@ -128,16 +150,22 @@ pub(crate) async fn handle(
         return Err(FedError::BadRequest("latest_events must not be empty"));
     }
 
-    let store = {
-        let app = lock_app(&state);
-        app.store.clone()
-    };
-
     // (2) — `missing_events` surfaces an unknown room as
     // `StorageError::InvalidInput` (→ 500), so we pre-check existence via
-    // `RoomStore::room_exists` and map absence to the spec-required 404.
+    // `RoomStore::room_exists` and map absence to the spec-required 404. Order
+    // matters: 404 (unknown room) before the 403 membership gate below, so an
+    // unknown room isn't masked as "you're not a member".
     if !store.room_exists(&room_id).await? {
         return Err(FedError::RoomNotFound);
+    }
+
+    // (2b) — member-only scoping: only a server that shares the room may walk its
+    // DAG. Closes the read-exfiltration hole the bare endpoint had (any caller
+    // who knew a room id could pull its history).
+    if !auth::server_in_room(&store, &room_id, &origin).await? {
+        return Err(FedError::Forbidden(
+            "origin server is not a member of this room",
+        ));
     }
 
     // (3) — saturating cap, not a 400.
@@ -148,7 +176,7 @@ pub(crate) async fn handle(
     // (5)
     let latest: Vec<&ruma::EventId> = body.latest_events.iter().map(|id| id.as_ref()).collect();
     let earliest: Vec<&ruma::EventId> = body.earliest_events.iter().map(|id| id.as_ref()).collect();
-    let events = store
+    let ancestors = store
         .missing_events(&room_id, &latest, &earliest, limit, body.state_dag)
         .await?;
 
@@ -158,7 +186,25 @@ pub(crate) async fn handle(
     // which reverses its walk before responding. The reference hash that
     // produced each event_id was computed over `event.raw`, so peers MUST
     // receive those exact bytes for the event_id to round-trip.
-    let events: Vec<Box<RawJsonValue>> = events.into_iter().rev().map(|e| e.raw).collect();
+    let mut seen: HashSet<OwnedEventId> = ancestors.iter().map(|e| e.event_id.clone()).collect();
+    let mut events: Vec<Box<RawJsonValue>> = ancestors.into_iter().rev().map(|e| e.raw).collect();
+
+    // (6b) — anti-entropy: when `include_latest_events` is set, append any
+    // `latest_events` we hold. They are the newest events, so they follow their
+    // ancestors in oldest-first order; the receiver re-toposorts regardless.
+    // `get_events` returns only the events we actually have, so it both fetches
+    // and existence-filters; dedup against the ancestors (a head may be an
+    // ancestor of another head). `get_events` looks up by ID across all rooms,
+    // so scope to this room — otherwise a caller could name event IDs from a
+    // room it isn't in and exfiltrate them (the ancestor walk above is already
+    // room-scoped via `missing_events`).
+    if body.include_latest_events {
+        for ev in store.get_events(&latest).await? {
+            if ev.room_id == room_id && seen.insert(ev.event_id.clone()) {
+                events.push(ev.raw);
+            }
+        }
+    }
 
     Ok(Json(ResponseBody { events }))
 }

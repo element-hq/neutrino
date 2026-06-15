@@ -1,9 +1,10 @@
 //! Server-to-server (federation) HTTP handlers.
 //!
-//! Currently houses [`get_missing_events`] only — see `docs/get-missing-events.md`
-//! for the design and the trust-model caveats (no X-Matrix auth, no signature
-//! verification, no `min_depth` filter, no history-visibility filter — all
-//! deliberate spec deviations under the trusted-mesh assumption).
+//! Houses the inbound + outbound Server-Server handlers (see the submodules
+//! below). `X-Matrix` origin auth is network-attested (see [`auth`]); the
+//! remaining trust-model caveats are deliberate spec deviations under the
+//! trusted-mesh assumption: no signature verification, no `min_depth` filter,
+//! no history-visibility filter. See `docs/get-missing-events.md` for design.
 //!
 //! New federation endpoints land as sibling modules and register their
 //! routes in `lib.rs::build_router`.
@@ -20,6 +21,7 @@ use rand::Rng;
 use serde_json::json;
 use thiserror::Error;
 
+pub(crate) mod auth;
 pub(crate) mod backfill;
 pub(crate) mod client;
 pub(crate) mod gapfill;
@@ -29,6 +31,7 @@ pub(crate) mod join;
 pub(crate) mod leave;
 pub(crate) mod make_join;
 pub(crate) mod make_leave;
+pub(crate) mod reconcile;
 pub(crate) mod send;
 pub(crate) mod send_join;
 pub(crate) mod send_leave;
@@ -112,6 +115,12 @@ pub(crate) enum FedError {
     /// `M_INVALID_PARAM` shape).
     #[error("bad request: {0}")]
     BadRequest(&'static str),
+    /// 401 `M_UNAUTHORIZED` — the `X-Matrix` authorization header is missing,
+    /// malformed, or impersonates this server. (`destination` is parsed but not
+    /// enforced — see [`auth`].) See [`auth`] for the network-attested
+    /// (non-cryptographic) trust model.
+    #[error("unauthorized: {0}")]
+    Unauthorized(&'static str),
     /// 403 `M_FORBIDDEN` — the user/server is not permitted to perform the
     /// membership change (e.g. an uninvited user joining an invite-only room,
     /// or a `send_join` the auth rules reject).
@@ -157,6 +166,9 @@ impl IntoResponse for FedError {
         let (status, errcode, msg) = match &self {
             FedError::BadRequest(m) => {
                 (StatusCode::BAD_REQUEST, "M_INVALID_PARAM", (*m).to_string())
+            }
+            FedError::Unauthorized(m) => {
+                (StatusCode::UNAUTHORIZED, "M_UNAUTHORIZED", (*m).to_string())
             }
             FedError::Forbidden(m) => (StatusCode::FORBIDDEN, "M_FORBIDDEN", (*m).to_string()),
             FedError::RoomNotFound => (

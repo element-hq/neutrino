@@ -6,20 +6,21 @@
 //!
 //! Reuses `DagStore::events_before` (the seeds-included reverse-chronological
 //! priority-queue walk) rather than a dedicated storage method. Trusted-mesh
-//! deviations match the `get_missing_events` sibling:
-//! no X-Matrix auth, no signature verification, no history-visibility /
-//! redaction filtering.
+//! deviations match the `get_missing_events` sibling: no signature verification,
+//! no history-visibility / redaction filtering. The `X-Matrix` origin is
+//! authenticated and member-only scoped (see handler).
 
 use axum::{
     Json,
     extract::{Path, RawQuery, State},
+    http::HeaderMap,
 };
 use neutrino_store::{EventStore, RoomStore};
 use ruma::{EventId, OwnedEventId, OwnedRoomId};
 use serde::Serialize;
 use serde_json::value::RawValue as RawJsonValue;
 
-use crate::federation::FedError;
+use crate::federation::{FedError, auth};
 use crate::{AppState, lock_app};
 
 /// Spec/Synapse default for `limit` when the requester omits it. Backfill's
@@ -61,6 +62,7 @@ pub(crate) struct ResponseBody {
 pub(crate) async fn handle(
     State(state): State<AppState>,
     Path(room_id): Path<String>,
+    headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<ResponseBody>, FedError> {
     // (1)
@@ -87,9 +89,24 @@ pub(crate) async fn handle(
         (app.store.clone(), app.config.server_name.clone())
     };
 
+    // Authenticate the caller (network-attested `X-Matrix` origin) — `origin`
+    // here is *our* name (the response envelope's `origin`), used as the
+    // expected `destination`.
+    let caller = auth::authenticated_origin(&headers, &origin)?;
+
     // (4)
     if !store.room_exists(&room_id).await? {
         return Err(FedError::RoomNotFound);
+    }
+
+    // (4b) — member-only scoping: backfill is the timeline-DAG analogue of
+    // `get_missing_events` and equally leaks history; only a server sharing the
+    // room may walk it. 404 (above) precedes this 403 so an unknown room isn't
+    // masked as a membership failure.
+    if !auth::server_in_room(&store, &room_id, &caller).await? {
+        return Err(FedError::Forbidden(
+            "origin server is not a member of this room",
+        ));
     }
 
     // (5) — default 10 if absent; saturating upper cap (explicit 0 already

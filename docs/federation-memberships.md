@@ -22,8 +22,9 @@ Hard constraints from CLAUDE.md / project shape:
   place the spec says "sign the event" / "validate signatures" is a no-op for us. We
   still preserve the *data flow* the signatures imply (see §3, federate-then-persist) so
   a future signatures world isn't a rewrite.
-- **No X-Matrix auth** on inbound federation endpoints (trusted mesh) — matches the
-  existing `/send`, `/backfill`, `/get_missing_events` handlers.
+- **X-Matrix auth required** on inbound federation endpoints — network-attested
+  origin (no key/sig), matching `/send`, `/backfill`, `/get_missing_events`. See
+  `crates/neutrino-http/src/federation/auth.rs`.
 - **No EDUs / E2EE / pagination / rate-limiting / access control.**
 - **Restricted rooms are out of scope** (`join_authorised_via_users_server`,
   `M_UNABLE_TO_AUTHORISE_JOIN`, `M_UNABLE_TO_GRANT_JOIN`). Public + invite join rules

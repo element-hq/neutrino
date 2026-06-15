@@ -28,24 +28,39 @@ use crate::federation::client::FederationClientError;
 /// recommends exponentially increasing the limit until all ancestry is seen).
 const INITIAL_GAPFILL_LIMIT: u32 = 10;
 
-/// Fetches missing state-DAG ancestry from a peer to close a gap, via
-/// `POST origin/_matrix/federation/v1/get_missing_events` with `state_dag: true`
-/// (MSC4242). The production impl is
+/// Parameters for one `get_missing_events` fetch. Bundled into a struct so the
+/// trait method and the client call don't grow an unwieldy positional arg list
+/// as MSC4242 (`state_dag`) and anti-entropy (`include_latest_events`) each add a
+/// flag — and so the two adjacent bools are named at every call site rather than
+/// being swappable positional args.
+pub(crate) struct MissingEventsQuery<'a> {
+    pub origin: &'a ServerName,
+    pub room_id: &'a RoomId,
+    /// Heads to walk back from.
+    pub latest: &'a [OwnedEventId],
+    /// Boundary the caller already holds; excluded from the result.
+    pub earliest: &'a [OwnedEventId],
+    pub limit: u32,
+    /// MSC4242: walk `prev_state_events` (the state DAG) rather than `prev_events`.
+    pub state_dag: bool,
+    /// Anti-entropy: also return any `latest` heads the peer itself holds, not
+    /// only their ancestors.
+    pub include_latest_events: bool,
+}
+
+/// Fetches events from a peer via
+/// `POST origin/_matrix/federation/v1/get_missing_events`. The production impl is
 /// [`crate::federation::client::ReqwestFetcher`]; tests inject a stub. Held on
 /// `AppState` as an `Arc<dyn MissingEventsFetcher>`.
 #[async_trait::async_trait]
 pub(crate) trait MissingEventsFetcher: Send + Sync {
-    /// Walk back from `latest` (stopping at `earliest`) up to `limit` events,
-    /// returning opaque PDU bytes oldest-first. `Ok(empty)` means the peer gave
-    /// us nothing new (the caller treats it as an unfillable gap); `Err` is a
-    /// transport/HTTP failure reaching the peer.
+    /// Walk back from `q.latest` (stopping at `q.earliest`) up to `q.limit`
+    /// events, returning opaque PDU bytes oldest-first. `Ok(empty)` means the
+    /// peer gave us nothing new (the caller treats it as an unfillable gap);
+    /// `Err` is a transport/HTTP failure reaching the peer.
     async fn fetch(
         &self,
-        origin: &ServerName,
-        room_id: &RoomId,
-        latest: &[OwnedEventId],
-        earliest: &[OwnedEventId],
-        limit: u32,
+        q: MissingEventsQuery<'_>,
     ) -> Result<Vec<Box<RawJsonValue>>, FederationClientError>;
 }
 
@@ -109,7 +124,17 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
         latest.extend(gap.staged);
 
         let fetched = match fetcher
-            .fetch(origin, room_id, &latest, &earliest, limit)
+            .fetch(MissingEventsQuery {
+                origin,
+                room_id,
+                latest: &latest,
+                earliest: &earliest,
+                limit,
+                // Gap-fill walks the state DAG (the ancestry `apply_pdu` needs)
+                // and only ever wants ancestry, never the heads themselves.
+                state_dag: true,
+                include_latest_events: false,
+            })
             .await
         {
             Ok(fetched) if fetched.is_empty() => {
