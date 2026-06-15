@@ -2,7 +2,8 @@
 members = [
     "./crates/*",
     "./tools/uniffi-bindgen",
-    "./tools/xtask"
+    "./tools/xtask",
+    "./tools/converge"
 ]
 resolver = "3"
 
