@@ -248,7 +248,7 @@ impl RoomActor {
 
         let dests = destinations(&event, &next);
         let dest_refs: Vec<&ServerName> = dests.iter().map(AsRef::as_ref).collect();
-        let advertise = self.advertise_targets(&next);
+        let advertise = self.advertise_targets(&next, &delta);
         let advertise_refs: Vec<&ServerName> = advertise.iter().map(AsRef::as_ref).collect();
         self.store
             .persist_resolved_event(
@@ -277,7 +277,15 @@ impl RoomActor {
     /// to the seed, so we owe nothing; an advertisement arises only when we hold
     /// an extremity concurrent with the join. Must be called *before* adopting
     /// `next` so `self.room` is still the pre-apply state.
-    fn advertise_targets(&self, next: &RoomCore) -> Vec<OwnedServerName> {
+    ///
+    /// `state_delta` is the apply's `current_state` change. An empty delta means
+    /// current state did not move, so the joined set cannot have grown — we skip
+    /// the two full state scans entirely, which is the common case (every
+    /// message and every state event that loses state resolution).
+    fn advertise_targets(&self, next: &RoomCore, state_delta: &StateDelta) -> Vec<OwnedServerName> {
+        if state_delta.is_empty() {
+            return Vec::new();
+        }
         let before = joined_servers(self.room.current_state());
         let after = joined_servers(next.current_state());
         after
@@ -387,7 +395,7 @@ impl RoomActor {
         // may have grown the joined set (the motivating anti-entropy case: a
         // late-delivered remote join), so we still owe an advertisement to any
         // server that just became joined while we hold a concurrent extremity.
-        let advertise = self.advertise_targets(&next);
+        let advertise = self.advertise_targets(&next, &delta);
         let advertise_refs: Vec<&ServerName> = advertise.iter().map(AsRef::as_ref).collect();
         self.store
             .persist_resolved_event(
