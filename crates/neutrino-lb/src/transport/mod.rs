@@ -9,6 +9,8 @@ use async_trait::async_trait;
 use axum::http::Method;
 use tokio_util::sync::CancellationToken;
 
+pub mod http;
+
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
     #[error("wire transport error: {0}")]
