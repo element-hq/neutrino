@@ -3,6 +3,7 @@
 //! `docs/superpowers/specs/2026-06-15-neutrino-lb-cbor-proxy-design.md`.
 
 pub mod codec;
+pub mod egress;
 mod error;
 mod headers;
 pub mod ingress;
