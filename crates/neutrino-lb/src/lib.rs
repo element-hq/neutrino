@@ -5,6 +5,7 @@
 pub mod codec;
 mod error;
 mod headers;
+pub mod ingress;
 pub mod transport;
 
 pub use error::LbError;
