@@ -10,8 +10,11 @@ tests or `neutrino-http`'s `federation/tests.rs`, **not** here.
 
 Current coverage: random episodes of room ops + partition cut/heal, a
 manufactured `m.room.name` conflict across a single cut (origin_server_ts /
-event_id tie-break), the divergence guard, and the `/messages` no-lost-writes
-oracle. The four scenarios below extend that.
+event_id tie-break), the divergence guard, the `/messages` no-lost-writes
+oracle, and **crash/revive** (`CRASH_PROB`% of rounds SIGKILL a live server or
+`docker start` a dead one; the barrier revives any still-down server and the
+convergence gate proves it recovered its committed state + redelivered its
+outbox). The scenarios below extend that.
 
 Shared note on the oracle: `/messages?dir=f` returns the room **timeline**, which
 includes state-event PDUs (not just messages). So `collect_msg_ids` already sees
@@ -21,44 +24,29 @@ event ids the same way messages are ledgered today.
 
 ---
 
-## 1. Crash / restart mid-partition
+## 1. Crash / restart — targeted refinements
 
-**Why e2e-only.** Exercises durable staging (inbound `staged_events`) + durable
-outbox across a real process death, and the worker's startup re-enumeration of
-`staged_rooms`. A single-process test can call the startup path directly but
-cannot reproduce "SIGKILL with parked rows, come back, drain against a live
-peer."
+The baseline landed: `CRASH_PROB`% of rounds crash a random live server
+(`nctl crash` = SIGKILL) or revive a dead one (`nctl revive` = `docker start`);
+the barrier revives any still-down server, and the convergence gate proves it
+recovered its committed state and redelivered its outbox. (The "persistent
+storage" prerequisite this section once listed was a false belief — the rig
+already runs on-disk SQLite under `/data`, durable across a container restart;
+only `compose down -v` wipes it.) The crash target is random and recovery is
+proven against a live cluster.
 
-**Blocking prerequisite — persistent storage.** `docker-compose.yml` currently
-runs each server on in-memory SQLite (tempfile per process → "fresh state on
-every restart"). A restart today **wipes** the DB, so there is nothing to
-recover. First step is a rig change: mount a named volume per server and point
-the DB at a file on it (e.g. `NEUTRINO_DB=/data/neutrino.sqlite`), so state
-survives `docker restart`/`docker start`. Gate this scenario behind that volume
-being present.
+What's still **directed rather than random**, and worth adding:
 
-**New harness primitive.** `async fn restart(&self, hs)` shelling
-`docker kill --signal=SIGKILL neutrino-hs{n}` then `docker start` (ungraceful, to
-prove durability — not a clean shutdown flush). Optionally a `hard_stop`/`start`
-split so the server can be down while a partition state changes.
-
-**Scenario.**
-1. From a converged barrier, cut a link isolating `hsX` from a peer it owes
-   events to (or that owes it events).
-2. Issue ops that must cross that cut (messages + a state change), so rows park
-   in the outbox / inbound staging.
-3. `restart(hsX)` while the link is still cut and rows are still parked.
-4. Wait for `hsX` to come ready again (`wait_ready`).
-5. Heal all links; run the normal barrier + `converge_check`.
-
-**Oracle.** Standard convergence + no-lost-writes. The point is that the parked
-rows survived the kill and drained after restart. Strengthen by asserting the
-specific pre-kill event ids are present on all servers post-heal (ledger them
-explicitly before the kill).
-
-**Open questions.** Which side to kill (sender with parked outbox vs receiver
-with staged inbound — ideally both, as two sub-cases); whether to also kill
-*during* the heal to catch a drain-mid-restart race.
+- **Deterministically kill the owing side.** Today the crash victim is uniform
+  over live servers. A stronger test cuts a link isolating `hsX` from a peer it
+  *owes events to* (or is owed by), issues ops that park rows in `hsX`'s outbox /
+  inbound `staged_events`, then crashes `hsX` while the link is still cut and the
+  rows are still parked — so recovery must drain durable parked rows, not just
+  re-derive current state. Strengthen the oracle by ledgering the specific
+  pre-kill event ids and asserting their presence everywhere post-heal.
+- **Kill during the heal.** Crash `hsX` *while its outbox is mid-drain* (right
+  after a heal) to catch a drain-interrupted-by-restart race — the worker's
+  startup re-enumeration of `staged_rooms` must resume cleanly.
 
 ---
 

@@ -3,6 +3,7 @@
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("neutrino: startup");
     // The local dev binary has no out-of-band command source over FFI, so it
     // holds the sender open and runs until the process is signalled; `entrypoint`
     // needs a receiver to thread into the server's command dispatch.

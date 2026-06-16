@@ -71,11 +71,29 @@ guard against that:
   disagreement) is flagged at the end — that pattern means the partitions stopped
   working and every "converged" assertion passed over nothing.
 
+### 5. Crash recovery (durability under restart)
+
+`CRASH_PROB`% of rounds SIGKILL a live server (`nctl crash` — a hard process
+crash, no graceful shutdown) or `docker start` a dead one (`nctl revive`).
+Unlike a partition, the process is *gone*: anything it had committed must survive
+on disk, and anything it had parked in its outbox must redeliver on restart. The
+container filesystem (and `/data/neutrino.db`) is preserved across the kill —
+only `compose down -v` wipes it — and with WAL + `synchronous = NORMAL` a SIGKILL
+preserves committed data via the OS page cache, so this models a process crash,
+not host power-loss. The barrier revives any still-down server and then the
+normal convergence gate proves the revived server recovered its committed state,
+redelivered its outbox, and reached the same `/state` as everyone else. Like the
+divergence guard, a run whose crashes only ever landed while the server was
+idle/converged (no pending writes to recover) is flagged at the end — that
+recovery was vacuous.
+
 ### Structural invariants
 
 - **hs1 is a fixed anchor** — never leaves, is never kicked, is never demoted —
   so a reachable resident and an admin always exist (rejoins and barriers can't
-  strand the room).
+  strand the room). hs1 *can* be crashed (any server can): a crash is recovered
+  at the next barrier, so the anchor's membership/power survives intact. At least
+  one server is always kept alive, so the rig never fully stalls.
 - **Ban is excluded**: the rig exposes no unban path, so a ban would strand a
   member out of the barrier's all-joined equality check. Churn is leave / kick /
   rejoin only.
@@ -91,19 +109,23 @@ exact-probe battery.
 probability, a topology change (cut a live link / heal a downed one); ~15% a
 **manufactured conflict** (two co-admins write the same state key across an active
 cut — see *Divergence actually happens* above, falling through to a normal
-mutation if no two co-admins are joined); else a model-valid mutating op on a
-random server — message / set-name / power-change / invite / kick / leave / rejoin
-(chosen so it is *meaningful*, not a wall of 403s). All record-tier. After the
-rounds: a **barrier**, then the **exact-probe battery**, then the next episode.
+mutation if no two co-admins are joined); `CRASH_PROB`% (default 10) a
+**crash/revive** (SIGKILL a live server or `docker start` a dead one — see
+*Crash recovery* below); else a model-valid mutating op on a random server —
+message / set-name / power-change / invite / kick / leave / rejoin (chosen so it
+is *meaningful*, not a wall of 403s). All record-tier. After the rounds: a
+**barrier**, then the **exact-probe battery**, then the next episode.
 
 **Barrier (the convergence point):**
 
-1. heal all three links;
-2. rejoin anyone who churned out, so all three are joined and comparable;
-3. poll until all three `/state` maps are identical **and** stable for
+1. revive any crashed server (`docker start`; it recovers committed state and
+   redelivers its durable outbox);
+2. heal all three links;
+3. rejoin anyone who churned out, so all three are joined and comparable;
+4. poll until all three `/state` maps are identical **and** stable for
    `STABLE_POLLS` polls **and** every send-time-audience message is present
    (within `DEADLINE`, default 90s);
-4. re-sync the shadow model from hs1's real state.
+5. re-sync the shadow model from hs1's real state.
 
 ### A concrete episode
 
@@ -131,6 +153,7 @@ a room it still hosts not re-syncing missed state).
 | `STABLE_POLLS` | 2 | consecutive identical polls before "quiescent" |
 | `INTERVAL` | 2 | seconds between convergence-poll attempts |
 | `STRICT_EVENT_PRESENCE` | 1 | set 0 to skip the message-presence check (state equality stays the hard gate) |
+| `CRASH_PROB` | 10 | per-round percent chance of a crash/revive action (0 disables crash testing; clamped to ≤ 55) |
 
 The fuzzer sends no signals itself. A healed link drains on its outbox's own
 schedule because `nctl partition heal` already resets the per-destination backoff

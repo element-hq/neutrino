@@ -6,6 +6,8 @@
 #   Federation:  nctl fedlog [hs]            -> follow federation HTTP requests
 #   Partitions:  nctl partition cut|heal <12|13|23> | nctl partition status
 #                (heal auto-kicks both ends; `nctl kick [hs]` to do it manually)
+#   Crashes:     nctl crash <hs>             -> SIGKILL a server (hard process crash)
+#                nctl revive <hs>            -> restart it (recovers /data on disk)
 #   Room ops:    nctl <hs> <action> ...        (hs = hs1 | hs2 | hs3)
 #
 # Room actions (each acts as that server's single user, @alice:<hs>):
@@ -165,6 +167,38 @@ kick() {
   fi
 }
 
+# `nctl crash <hs>` — SIGKILL a server to model a hard process crash. compose's
+# `restart: "no"` keeps it down until `nctl revive`. The container filesystem
+# (and `/data/neutrino.db`) is preserved — only `down -v` wipes it — so the
+# revived process recovers committed state and redelivers its durable outbox.
+# SIGKILL (not the default SIGTERM) skips graceful shutdown: in-memory-only state
+# is lost, mirroring a real crash.
+cmd_crash() {
+  local hs=${1:-}; [[ -n $hs ]] || die "crash: need <hs>"
+  base "$hs" >/dev/null # validate hs
+  if docker kill -s KILL "neutrino-$hs" >/dev/null 2>&1; then
+    echo "crash: $hs killed (SIGKILL)"
+  else
+    echo "crash: $hs not running" >&2
+  fi
+}
+
+# `nctl revive <hs>` — restart a crashed server. `docker start` reattaches it to
+# its compose networks and the process re-opens `/data/neutrino.db`, recovering
+# everything the crashed process had committed (WAL + synchronous=NORMAL: a
+# process crash preserves committed data via the OS page cache). On startup the
+# server re-arms its outbound sender from the persisted outbox, so any federation
+# transactions parked before the crash resume delivery.
+cmd_revive() {
+  local hs=${1:-}; [[ -n $hs ]] || die "revive: need <hs>"
+  base "$hs" >/dev/null # validate hs
+  if docker start "neutrino-$hs" >/dev/null 2>&1; then
+    echo "revive: $hs started"
+  else
+    die "revive: failed to start neutrino-$hs"
+  fi
+}
+
 # `nctl kick [hs]` — kick one server, or all three when no hs is given.
 cmd_kick() {
   if [[ -n ${1:-} ]]; then
@@ -310,6 +344,8 @@ main() {
       fi
       ;;
     partition) shift; cmd_partition "$@" ;;
+    crash) shift; cmd_crash "$@" ;;
+    revive) shift; cmd_revive "$@" ;;
     kick) shift; cmd_kick "$@" ;;
     help | -h | --help | "")
       # Print the header comment block (lines 3..first non-comment), stripping
