@@ -14,6 +14,9 @@ pub struct NeutrinoConfig {
     /// `context.filesDir`). The DB is `<storage_dir>/neutrino.db`.
     pub storage_dir: String,
     pub outbound_concurrency: u32,
+    /// Optional `neutrino-lb` egress proxy URL (e.g. `http://127.0.0.1:8009`).
+    /// `None` = direct federation.
+    pub federation_proxy: Option<String>,
 }
 
 impl From<NeutrinoConfig> for neutrino_main::Config {
@@ -27,6 +30,7 @@ impl From<NeutrinoConfig> for neutrino_main::Config {
             outbound_concurrency: neutrino_main::Config::clamp_outbound_concurrency(
                 c.outbound_concurrency as usize,
             ),
+            federation_proxy: c.federation_proxy,
         }
     }
 }
@@ -144,6 +148,7 @@ mod tests {
             localpart: "alice".to_string(),
             storage_dir: "/data/neutrino".to_string(),
             outbound_concurrency: 0, // must clamp to 1
+            federation_proxy: Some("http://127.0.0.1:8009".to_owned()),
         };
         let cfg: neutrino_main::Config = nc.into();
         assert_eq!(cfg.server_name, "hs.example");
@@ -151,6 +156,10 @@ mod tests {
         assert_eq!(cfg.localpart, "alice");
         assert_eq!(cfg.storage_dir, std::path::PathBuf::from("/data/neutrino"));
         assert_eq!(cfg.outbound_concurrency, 1);
+        assert_eq!(
+            cfg.federation_proxy,
+            Some("http://127.0.0.1:8009".to_owned())
+        );
     }
 
     #[test]
@@ -186,6 +195,7 @@ mod tests {
             localpart: "alice".to_string(),
             storage_dir: "/data/neutrino".to_string(),
             outbound_concurrency: 4,
+            federation_proxy: None,
         };
         let cfg: neutrino_main::Config = nc.into();
         assert_eq!(cfg.outbound_concurrency, 4);
