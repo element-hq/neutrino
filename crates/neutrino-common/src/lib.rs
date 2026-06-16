@@ -44,6 +44,11 @@ pub struct Config {
     /// The server creates this directory if missing, but not its parents —
     /// those are the caller's responsibility (see `SqliteStore::open_in_dir`).
     pub storage_dir: PathBuf,
+    /// When set, outbound federation requests are routed through this HTTP
+    /// proxy (the `neutrino-lb` egress) instead of going direct. The proxy
+    /// transcodes bodies to CBOR. `None` = direct (the default; preserves the
+    /// pre-sidecar behaviour and all existing tests).
+    pub federation_proxy: Option<String>,
 }
 
 impl Default for Config {
@@ -54,6 +59,7 @@ impl Default for Config {
             localpart: DEFAULT_LOCALPART.to_string(),
             outbound_concurrency: DEFAULT_OUTBOUND_CONCURRENCY,
             storage_dir: PathBuf::from(DEFAULT_STORAGE_DIR),
+            federation_proxy: None,
         }
     }
 }
@@ -71,6 +77,7 @@ impl Config {
                     .as_deref(),
             ),
             storage_dir: storage_dir_from(std::env::var("NEUTRINO_STORAGE_DIR").ok().as_deref()),
+            federation_proxy: std::env::var("NEUTRINO_FEDERATION_PROXY").ok(),
             // `localpart` (and any future non-env field) defaults from `Default`,
             // so the value lives in exactly one place.
             ..Default::default()
@@ -147,6 +154,11 @@ mod tests {
             Config::default().storage_dir,
             std::path::PathBuf::from(DEFAULT_STORAGE_DIR)
         );
+    }
+
+    #[test]
+    fn federation_proxy_defaults_to_none() {
+        assert_eq!(Config::default().federation_proxy, None);
     }
 
     #[test]
