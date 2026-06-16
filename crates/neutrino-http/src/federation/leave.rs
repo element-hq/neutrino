@@ -46,9 +46,13 @@ pub(crate) async fn reject_invite(
     room_id: &RoomId,
     invite: neutrino_common::Event,
 ) -> Response {
-    let (store, own_server) = {
+    let (store, own_server, federation_proxy) = {
         let app = lock_app(state);
-        (app.store.clone(), app.config.server_name.clone())
+        (
+            app.store.clone(),
+            app.config.server_name.clone(),
+            app.config.federation_proxy.clone(),
+        )
     };
 
     // Best-effort federated decline to the inviting server (the invite's sender
@@ -56,7 +60,15 @@ pub(crate) async fn reject_invite(
     // *with its underlying cause* and swallowed — the unconditional local
     // removal below is what the client relies on.
     let dest = invite.sender.server_name().to_owned();
-    if let Err(e) = try_federated_leave(&own_server, &dest, room_id, &user).await {
+    if let Err(e) = try_federated_leave(
+        &own_server,
+        federation_proxy.as_deref(),
+        &dest,
+        room_id,
+        &user,
+    )
+    .await
+    {
         warn!(%room_id, %dest, error = %e, "federated leave (invite reject) failed; rejecting locally anyway");
     }
 
@@ -77,11 +89,12 @@ pub(crate) async fn reject_invite(
 /// error) on any failure, which the caller logs before swallowing it.
 async fn try_federated_leave(
     own_server: &str,
+    proxy: Option<&str>,
     dest: &ServerName,
     room_id: &RoomId,
     user: &UserId,
 ) -> Result<(), String> {
-    let client = FederationClient::new(own_server.to_owned());
+    let client = FederationClient::new(own_server.to_owned(), proxy);
     let template = client
         .make_leave(dest, room_id, user, ROOM_VERSION_ID)
         .await

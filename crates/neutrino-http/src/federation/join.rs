@@ -59,15 +59,16 @@ pub(crate) async fn federated_join_with(
     candidates: &[OwnedServerName],
     timeout: Duration,
 ) -> Response {
-    let (store, worker_poke, own_server) = {
+    let (store, worker_poke, own_server, federation_proxy) = {
         let app = lock_app(state);
         (
             app.store.clone(),
             app.worker_poke.clone(),
             app.config.server_name.clone(),
+            app.config.federation_proxy.clone(),
         )
     };
-    let client = FederationClient::new(own_server);
+    let client = FederationClient::new(own_server, federation_proxy.as_deref());
 
     // Subscribe to the persist watch *before* staging anything (subscribe-
     // before-query: a persist between staging and subscribing can't be missed),
