@@ -59,6 +59,19 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_preserves_representative_federation_bodies() {
+        // The bodies the design spec enumerates, in canonical (sorted-key,
+        // compact) form so the round trip is byte-identical. A send_join-style
+        // PDU, an /invite v2 envelope, and a get_missing_events request.
+        let send_join = r#"{"content":{"membership":"join"},"depth":5,"origin_server_ts":1700000000000,"prev_events":["$abc"],"room_id":"!r","sender":"@u:a.example","state_key":"@u:a.example","type":"m.room.member"}"#;
+        let invite = r#"{"event":{"content":{"membership":"invite"},"sender":"@u:a.example","type":"m.room.member"},"invite_room_state":[],"room_version":"12"}"#;
+        let get_missing_events = r#"{"earliest_events":["$a"],"latest_events":["$b"],"limit":10}"#;
+        for body in [send_join, invite, get_missing_events] {
+            assert_eq!(roundtrip(body), body);
+        }
+    }
+
+    #[test]
     fn empty_body_roundtrips_to_empty() {
         assert_eq!(json_to_cbor(b"").unwrap(), Vec::<u8>::new());
         assert_eq!(cbor_to_json(b"").unwrap(), Vec::<u8>::new());
