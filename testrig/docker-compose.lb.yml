@@ -1,0 +1,53 @@
+# Overlay: run each homeserver behind an IN-PROCESS neutrino-lb sidecar, so the
+# same smoke / converge scripts exercise the low-bandwidth CBOR federation path.
+#
+# Enable by adding this file to the compose invocation. The tooling does it for
+# you when `NEUTRINO_LB=1` is set:
+#
+#   NEUTRINO_LB=1 ./nctl up
+#   NEUTRINO_LB=1 ./smoke.sh
+#   NEUTRINO_LB=1 cargo run -p converge
+#
+# Same image — the `neutrino` binary embeds neutrino-lb and `neutrino-main`
+# co-launches it when `NEUTRINO_LB_INGRESS_BIND` is set (see
+# `neutrino-main::entrypoint`). What changes:
+#
+#   - The homeserver moves off :80 to :8008 (it still speaks JSON: CSAPI +
+#     inbound federation handed to it by the local ingress). It binds 0.0.0.0 so
+#     the CSAPI port can be published to the host.
+#   - The sidecar ingress takes over :80 — the port a peer's `server_name`
+#     (`hsN`) resolves to — so federation between containers is now CBOR. Server
+#     names stay `hsN` (ids stay `@alice:hsN`); only the body encoding changes.
+#   - The egress binds loopback :8009; the homeserver routes outbound there.
+#   - The published host port maps to :8008 (CSAPI), not :80. Host ports
+#     (8001/8002/8003) are unchanged, so nctl / converge are unaffected.
+#
+# Federation still flows over the pair-networks via `hsN:80`, so partition
+# cut/heal and crash testing are unchanged (the ingress + egress live in the
+# same container that gets disconnected).
+name: neutrino-testrig
+
+x-lb-env: &lb-env
+  # Homeserver: JSON CSAPI + inbound federation from the local ingress. Binds
+  # all interfaces so docker can publish the CSAPI port; the ingress reaches it
+  # over loopback (see `neutrino-main::upstream_url`).
+  NEUTRINO_BIND_ADDR: 0.0.0.0:8008
+  # Outbound federation egress (loopback); the in-process sidecar binds it.
+  NEUTRINO_FEDERATION_PROXY: http://127.0.0.1:8009
+  # Public federation port peers' `server_name` resolves to (sidecar ingress).
+  NEUTRINO_LB_INGRESS_BIND: 0.0.0.0:80
+
+services:
+  hs1:
+    environment: *lb-env
+    # !override replaces the base `ports` list instead of merging into it.
+    # Without it, Compose appends and the service publishes host 8001 twice
+    # (->80 from base and ->8008 here), so the second bind fails with
+    # "port is already allocated". Requires Docker Compose v2.24+.
+    ports: !override ["8001:8008"]
+  hs2:
+    environment: *lb-env
+    ports: !override ["8002:8008"]
+  hs3:
+    environment: *lb-env
+    ports: !override ["8003:8008"]

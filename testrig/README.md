@@ -182,3 +182,27 @@ Two scripts drive the rig and assert outcomes:
   converges. It drives this same rig (CSAPI over HTTP) and delegates cut/heal to
   `./nctl partition`. See **[tools/converge/README.md](../tools/converge/README.md)**
   for what it asserts and how a run is structured.
+
+## CBOR federation mode (`neutrino-lb`)
+
+Set **`NEUTRINO_LB=1`** to run the whole rig with each homeserver behind an
+**in-process `neutrino-lb` sidecar**, so federation between containers is
+transcoded JSON↔CBOR over the wire. The same image and the same scripts are
+used — the toggle just layers `docker-compose.lb.yml`:
+
+```sh
+NEUTRINO_LB=1 ./nctl up
+NEUTRINO_LB=1 ./smoke.sh
+NEUTRINO_LB=1 cargo run -p converge
+```
+
+The `neutrino` binary embeds the sidecar; `neutrino-main` co-launches it when
+`NEUTRINO_LB_INGRESS_BIND` is set (see `neutrino-main::entrypoint`). In this mode
+the homeserver moves to `:8008` (it still speaks JSON — CSAPI + the inbound
+federation the local ingress hands it) and the sidecar ingress takes over `:80`,
+the port a peer's `server_name` (`hsN`) resolves to. **Server names and ids are
+unchanged** (`@alice:hs1`), and the published host ports (8001/8002/8003) still
+hit CSAPI — only the inter-container federation body encoding changes. Federation
+still flows over the pair-networks via `hsN:80`, so **partition cut/heal and crash
+testing behave identically** (the ingress + egress live in the same container that
+gets disconnected). Running without the flag is the unchanged direct-JSON baseline.

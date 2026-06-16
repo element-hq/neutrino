@@ -26,6 +26,12 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NCTL="$DIR/nctl"
 COMPOSE=(docker compose -f "$DIR/docker-compose.yml")
+# NEUTRINO_LB=1 layers the in-process-sidecar overlay (CBOR federation). Export
+# it so the nctl invocations below pick up the same mode.
+if [[ "${NEUTRINO_LB:-0}" == "1" ]]; then
+  COMPOSE+=(-f "$DIR/docker-compose.lb.yml")
+  export NEUTRINO_LB
+fi
 declare -A PORT=([hs1]=8001 [hs2]=8002 [hs3]=8003)
 
 DEADLINE=60 # seconds for any single convergence poll

@@ -63,7 +63,7 @@
 //! end (recovery was vacuous) — mirroring the partition divergence guard.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rand::rngs::StdRng;
@@ -217,21 +217,32 @@ struct Config {
     crash_prob: u32,
 }
 
+/// The `-f <file>` compose-file list for the rig, honouring `NEUTRINO_LB=1`
+/// (which layers the in-process-sidecar overlay so converge drives the CBOR
+/// federation path with the same script).
+fn compose_files(rig_dir: &Path) -> Vec<PathBuf> {
+    let mut files = vec![rig_dir.join("docker-compose.yml")];
+    if std::env::var("NEUTRINO_LB").as_deref() == Ok("1") {
+        files.push(rig_dir.join("docker-compose.lb.yml"));
+    }
+    files
+}
+
 /// Best-effort `docker compose down -v` on drop, so a panic still tears the rig
 /// down. The normal paths also call [`Harness::cleanup`] explicitly (it runs
 /// before any `process::exit`, which would skip this guard).
 struct ComposeGuard {
-    compose_file: PathBuf,
+    compose_files: Vec<PathBuf>,
 }
 
 impl Drop for ComposeGuard {
     fn drop(&mut self) {
-        let _ = std::process::Command::new("docker")
-            .arg("compose")
-            .arg("-f")
-            .arg(&self.compose_file)
-            .args(["down", "-v"])
-            .output();
+        let mut cmd = std::process::Command::new("docker");
+        cmd.arg("compose");
+        for f in &self.compose_files {
+            cmd.arg("-f").arg(f);
+        }
+        let _ = cmd.args(["down", "-v"]).output();
     }
 }
 
@@ -1234,12 +1245,12 @@ impl Harness {
     // ---- rig lifecycle ------------------------------------------------------
 
     async fn compose(&self, args: &[&str]) -> bool {
-        let compose_file = self.rig_dir.join("docker-compose.yml");
-        Command::new("docker")
-            .arg("compose")
-            .arg("-f")
-            .arg(&compose_file)
-            .args(args)
+        let mut cmd = Command::new("docker");
+        cmd.arg("compose");
+        for f in compose_files(&self.rig_dir) {
+            cmd.arg("-f").arg(f);
+        }
+        cmd.args(args)
             .output()
             .await
             .map(|o| o.status.success())
@@ -1347,15 +1358,12 @@ impl Harness {
             eprintln!("{val}");
         }
         eprintln!("---- compose logs ----");
-        let compose_file = self.rig_dir.join("docker-compose.yml");
-        if let Ok(o) = Command::new("docker")
-            .arg("compose")
-            .arg("-f")
-            .arg(&compose_file)
-            .args(["logs", "--no-color"])
-            .output()
-            .await
-        {
+        let mut cmd = Command::new("docker");
+        cmd.arg("compose");
+        for f in compose_files(&self.rig_dir) {
+            cmd.arg("-f").arg(f);
+        }
+        if let Ok(o) = cmd.args(["logs", "--no-color"]).output().await {
             eprintln!("{}", String::from_utf8_lossy(&o.stdout));
         }
     }
@@ -1442,7 +1450,7 @@ impl Harness {
 async fn main() {
     let mut h = Harness::new();
     let guard = ComposeGuard {
-        compose_file: h.rig_dir.join("docker-compose.yml"),
+        compose_files: compose_files(&h.rig_dir),
     };
     let result = h.run().await;
     match &result {

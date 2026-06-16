@@ -76,8 +76,22 @@ fn build_lb_config(
     Ok(neutrino_lb::LbConfig {
         ingress_bind,
         egress_bind,
-        upstream: format!("http://{}", config.bind_addr),
+        upstream: upstream_url(&config.bind_addr),
     })
+}
+
+/// The loopback URL the ingress uses to reach the co-located homeserver. When
+/// `bind_addr` binds all interfaces (e.g. `0.0.0.0:8008` in a container, needed
+/// so CSAPI can be port-published), the ingress still reaches it over loopback;
+/// any concrete host is used verbatim.
+fn upstream_url(bind_addr: &str) -> String {
+    match bind_addr.parse::<SocketAddr>() {
+        Ok(addr) if addr.ip().is_unspecified() => {
+            let host = if addr.is_ipv6() { "[::1]" } else { "127.0.0.1" };
+            format!("http://{host}:{}", addr.port())
+        }
+        _ => format!("http://{bind_addr}"),
+    }
 }
 
 #[cfg(test)]
@@ -111,5 +125,14 @@ mod tests {
     fn build_lb_config_rejects_unparseable_ingress() {
         let c = cfg("127.0.0.1:8008", Some("http://127.0.0.1:8009"));
         assert!(build_lb_config(&c, "not-an-addr").is_err());
+    }
+
+    #[test]
+    fn build_lb_config_upstream_loopbacks_an_unspecified_bind() {
+        // A container binds 0.0.0.0 (so CSAPI can be published) but the
+        // co-located ingress must still reach the homeserver over loopback.
+        let c = cfg("0.0.0.0:8008", Some("http://127.0.0.1:8009"));
+        let lb = build_lb_config(&c, "0.0.0.0:80").expect("valid lb config");
+        assert_eq!(lb.upstream, "http://127.0.0.1:8008");
     }
 }

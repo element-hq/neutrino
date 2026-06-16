@@ -85,6 +85,17 @@ jobs:
 
   testrig:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Run the same rig twice: direct JSON federation, and the low-bandwidth
+        # CBOR sidecar overlay (NEUTRINO_LB=1, which layers docker-compose.lb.yml).
+        include:
+          - name: direct
+            lb: "0"
+          - name: lowbandwidth
+            lb: "1"
+    name: testrig (${{ matrix.name }})
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -94,7 +105,8 @@ jobs:
       # the daemon so `smoke.sh`'s `docker compose up` reuses it instead of
       # rebuilding. The Dockerfile is cargo-chef-structured, so the deps layer is
       # cached via type=gha until Cargo.toml/Cargo.lock change. A dedicated cache
-      # scope keeps this separate from the complement job's image cache.
+      # scope keeps this separate from the complement job's image cache. Both
+      # matrix legs share the same image (the LB sidecar is embedded in it).
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
@@ -104,6 +116,8 @@ jobs:
           cache-from: type=gha,scope=testrig
           cache-to: type=gha,mode=max,scope=testrig
       - run: testrig/smoke.sh
+        env:
+          NEUTRINO_LB: ${{ matrix.lb }}
 
   compile:
     runs-on: ubuntu-latest
