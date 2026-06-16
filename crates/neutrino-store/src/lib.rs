@@ -169,17 +169,26 @@ pub trait EventStore: Send + Sync {
     ///       `event`, or a prior event) — the impl asserts this. `destinations`
     ///       are the remote servers this event must be federated to (computed
     ///       by the caller from the post-apply room state); empty for a
-    ///       federation-received event that we don't re-originate.
+    ///       federation-received event that we don't re-originate. `advertise_to`
+    ///       are the servers that just became *joined* in the room's current
+    ///       state by applying this event and to which we therefore owe a
+    ///       forward-extremity advertisement (anti-entropy extension; computed
+    ///       by the caller, see `pending_advertisements`); empty when applying
+    ///       this event grew no server's membership into the joined set.
     /// Post: in a single write transaction — the event is persisted with a
     ///       new `StreamPos` (event row + DAG edges); the current-state delta
     ///       is applied (each `Some(id)` upserts that `(event_type,
     ///       state_key)` row to point at `id`, each `None` deletes the row);
     ///       the room's forward-extremity columns are replaced with
-    ///       `timeline_fes` / `state_fes`; and one `outbox` row is written per
+    ///       `timeline_fes` / `state_fes`; one `outbox` row is written per
     ///       destination (idempotent via `UNIQUE(destination, event_id)`; an
-    ///       empty slice writes none). The `subscribe()` watch advances after
-    ///       commit. This is the persist half of the storage⇄`RoomCore`
-    ///       bridge; `forward_extremities` is the load half.
+    ///       empty slice writes none); and one `pending_advertisements` row is
+    ///       written per `advertise_to` server for `event.room_id` (idempotent
+    ///       via the PK; an empty slice writes none) — same transaction as the
+    ///       event so a crash can't persist the join but drop the obligation to
+    ///       advertise. The `subscribe()` watch advances after commit. This is
+    ///       the persist half of the storage⇄`RoomCore` bridge;
+    ///       `forward_extremities` is the load half.
     async fn persist_resolved_event(
         &self,
         event: &Event,
@@ -187,6 +196,7 @@ pub trait EventStore: Send + Sync {
         state_fes: &BTreeSet<OwnedEventId>,
         current_state_delta: &BTreeMap<(String, String), Option<OwnedEventId>>,
         destinations: &[&ServerName],
+        advertise_to: &[&ServerName],
     ) -> Result<(), StorageError>;
 
     /// Pre:  none.
@@ -480,6 +490,39 @@ pub trait FederationOutbox: Send + Sync {
         &self,
         destination: &ServerName,
         event_ids: &[&EventId],
+    ) -> Result<(), StorageError>;
+
+    /// Pre:  none.
+    /// Post: returns the server names of every destination with at least one
+    ///       pending advertisement obligation (a `pending_advertisements` row)
+    ///       not yet cleared via `remove_advertisements`. The anti-entropy
+    ///       sibling of `pending_destinations`: the outbound supervisor unions
+    ///       the two so a quiescent destination owed only an advertisement still
+    ///       gets a sender task. Same subscribe-before-query caveat applies — the
+    ///       obligation is enqueued in `persist_resolved_event`'s transaction,
+    ///       which advances the same `subscribe()` watch.
+    async fn advertisement_destinations(&self) -> Result<Vec<OwnedServerName>, StorageError>;
+
+    /// Pre:  none (returns empty vec if `destination` has no pending obligations).
+    /// Post: returns the rooms `destination` is owed a forward-extremity
+    ///       advertisement for — the `pending_advertisements` rows for that
+    ///       destination. The sender reads the room's current extremities at
+    ///       send time, so this returns only the rooms, not a snapshot of heads.
+    async fn pending_advertisements(
+        &self,
+        destination: &ServerName,
+    ) -> Result<Vec<OwnedRoomId>, StorageError>;
+
+    /// Pre:  must only be called after the destination returned HTTP 2xx for a
+    ///       `/send` transaction that advertised our forward extremities for
+    ///       these rooms (an advertisement, or a normal FE-carrying transaction
+    ///       that covered them — the piggyback satisfies the obligation).
+    /// Post: removes the matching `(destination, room_id)` rows; idempotent —
+    ///       calling with rooms that have no pending obligation does not error.
+    async fn remove_advertisements(
+        &self,
+        destination: &ServerName,
+        rooms: &[&RoomId],
     ) -> Result<(), StorageError>;
 }
 

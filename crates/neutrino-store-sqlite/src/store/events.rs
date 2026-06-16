@@ -82,6 +82,7 @@ impl EventStore for SqliteStore {
         state_fes: &BTreeSet<OwnedEventId>,
         current_state_delta: &BTreeMap<(String, String), Option<OwnedEventId>>,
         destinations: &[&ServerName],
+        advertise_to: &[&ServerName],
     ) -> Result<(), StorageError> {
         // event_id <-> raw consistency asserted inside `EventRow::from`.
         let event = EventRow::from(event).to_owned();
@@ -91,6 +92,8 @@ impl EventStore for SqliteStore {
         let delta = current_state_delta.clone();
         let destinations: Vec<OwnedServerName> =
             destinations.iter().map(|s| (*s).to_owned()).collect();
+        let advertise_to: Vec<OwnedServerName> =
+            advertise_to.iter().map(|s| (*s).to_owned()).collect();
         let watch_tx = self.watch_tx.clone();
 
         self.run_write(move |conn| -> Result<(), Error> {
@@ -125,6 +128,11 @@ impl EventStore for SqliteStore {
             // Outbox: one row per federation destination, same txn as the
             // event so a crash can't persist the event but drop its delivery.
             insert_outbox_rows(&tx, event.event_id.as_str(), &destinations)?;
+
+            // Anti-entropy: one obligation row per server that just became
+            // joined by this event, same txn so a crash can't persist the join
+            // but drop the duty to advertise our heads to it.
+            insert_advertisement_rows(&tx, room_id.as_str(), &advertise_to)?;
 
             tx.commit()?;
 
@@ -396,6 +404,28 @@ fn insert_outbox_rows(
     Ok(())
 }
 
+/// Insert one `pending_advertisements` row per destination owed a
+/// forward-extremity advertisement for `room_id`, idempotent via the
+/// `(destination, room_id)` PK (repeated triggers coalesce). An empty
+/// `advertise_to` slice writes nothing. Called only from
+/// `persist_resolved_event`, in the same transaction as the join.
+fn insert_advertisement_rows(
+    tx: &Transaction,
+    room_id: &str,
+    advertise_to: &[OwnedServerName],
+) -> Result<(), Error> {
+    if advertise_to.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = tx.prepare(
+        "INSERT OR IGNORE INTO pending_advertisements (destination, room_id) VALUES (?, ?)",
+    )?;
+    for dest in advertise_to {
+        stmt.execute(params![dest.as_str(), room_id])?;
+    }
+    Ok(())
+}
+
 /// Apply a resolved current-state delta within `tx`. Each `Some(id)` upserts
 /// the `(room_id, event_type, state_key)` row to point at `id`; each `None`
 /// removes the row. The upsert derives `event_id`'s `event_type` /
@@ -500,7 +530,7 @@ mod tests {
             .collect();
         let delta = set_delta("m.room.name", "", &name_id);
 
-        s.persist_resolved_event(&name, &timeline, &state, &delta, &[])
+        s.persist_resolved_event(&name, &timeline, &state, &delta, &[], &[])
             .await
             .unwrap();
 
@@ -529,7 +559,7 @@ mod tests {
         let timeline: BTreeSet<OwnedEventId> = [msg_id.clone()].into_iter().collect();
         let state: BTreeSet<OwnedEventId> = [create.event_id.clone()].into_iter().collect();
 
-        s.persist_resolved_event(&msg, &timeline, &state, &BTreeMap::new(), &[])
+        s.persist_resolved_event(&msg, &timeline, &state, &BTreeMap::new(), &[], &[])
             .await
             .unwrap();
 
@@ -561,6 +591,7 @@ mod tests {
             &fe1,
             &set_delta("m.room.name", "", &name_id),
             &[],
+            &[],
         )
         .await
         .unwrap();
@@ -577,7 +608,7 @@ mod tests {
         let state_fe: BTreeSet<OwnedEventId> = [create.event_id.clone()].into_iter().collect();
         let remove: BTreeMap<(String, String), Option<OwnedEventId>> =
             BTreeMap::from([(("m.room.name".to_string(), String::new()), None)]);
-        s.persist_resolved_event(&msg, &fe2, &state_fe, &remove, &[])
+        s.persist_resolved_event(&msg, &fe2, &state_fe, &remove, &[], &[])
             .await
             .unwrap();
 
@@ -600,7 +631,9 @@ mod tests {
         let ghost = event_id!("$ghost:example.org").to_owned();
         let delta = set_delta("m.room.name", "", &ghost);
 
-        let result = s.persist_resolved_event(&msg, &fe, &fe, &delta, &[]).await;
+        let result = s
+            .persist_resolved_event(&msg, &fe, &fe, &delta, &[], &[])
+            .await;
         assert!(
             matches!(result, Err(StorageError::Internal(_))),
             "{result:?}"
@@ -616,7 +649,7 @@ mod tests {
         let msg_id = msg.event_id.clone();
         let fe: BTreeSet<OwnedEventId> = [msg_id.clone()].into_iter().collect();
 
-        s.persist_resolved_event(&msg, &fe, &fe, &BTreeMap::new(), &[])
+        s.persist_resolved_event(&msg, &fe, &fe, &BTreeMap::new(), &[], &[])
             .await
             .unwrap();
 
@@ -1335,7 +1368,7 @@ mod tests {
 
         let dest_a = server_name!("a.example.com");
         let dest_b = server_name!("b.example.com");
-        s.persist_resolved_event(&name, &timeline, &state, &delta, &[dest_a, dest_b])
+        s.persist_resolved_event(&name, &timeline, &state, &delta, &[dest_a, dest_b], &[])
             .await
             .unwrap();
 
@@ -1363,7 +1396,7 @@ mod tests {
         let msg_id = msg.event_id.as_str().to_owned();
         let timeline: BTreeSet<OwnedEventId> = [msg.event_id.clone()].into_iter().collect();
 
-        s.persist_resolved_event(&msg, &timeline, &timeline, &BTreeMap::new(), &[])
+        s.persist_resolved_event(&msg, &timeline, &timeline, &BTreeMap::new(), &[], &[])
             .await
             .unwrap();
 
