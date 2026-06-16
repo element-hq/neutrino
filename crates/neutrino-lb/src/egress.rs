@@ -60,6 +60,10 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
         .iter()
         .map(|(k, v)| (k.as_str().to_owned(), v.as_bytes().to_vec()))
         .collect();
+    // No body-size cap (`usize::MAX`): the body here is our own homeserver's
+    // outbound request (loopback), so it is trusted. Neutrino assumes a trusted
+    // network throughout (see the peer-facing note in `transport::http` and
+    // `neutrino/CLAUDE.md`), so no limit is imposed.
     let json_body = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b.to_vec(),
         Err(e) => {
@@ -91,14 +95,21 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
             return error_response(StatusCode::BAD_GATEWAY);
         }
     };
-    let json_resp = match cbor_to_json(&wire_resp.body) {
-        Ok(b) => b,
-        Err(e) => {
+    match cbor_to_json(&wire_resp.body) {
+        Ok(json_resp) => build_response(wire_resp.status, &wire_resp.headers, json_resp),
+        // A non-2xx whose body we can't decode must keep its status: the
+        // homeserver's sender drops a 4xx but retries a 5xx, so masking the
+        // real code as a generic 502 would invert that decision. Only a 2xx
+        // payload we cannot deliver is a genuine proxy failure.
+        Err(e) if (200..300).contains(&wire_resp.status) => {
             warn!(%e, "egress: CBOR response body decode failed");
-            return error_response(StatusCode::BAD_GATEWAY);
+            error_response(StatusCode::BAD_GATEWAY)
         }
-    };
-    build_response(wire_resp.status, &wire_resp.headers, json_resp)
+        Err(e) => {
+            warn!(%e, status = wire_resp.status, "egress: undecodable error body; forwarding status without it");
+            build_response(wire_resp.status, &wire_resp.headers, Vec::new())
+        }
+    }
 }
 
 fn build_response(status: u16, headers: &[(String, Vec<u8>)], json_body: Vec<u8>) -> Response {
@@ -189,11 +200,67 @@ mod tests {
         let seen = client.seen.lock().unwrap().clone().unwrap();
         assert_eq!(seen.dest, "peer.example:8448");
         assert_eq!(seen.path, "/_matrix/federation/v1/send/9");
+        // The wire body must be CBOR, not JSON — a no-op transcode would fail here.
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&seen.body).is_err(),
+            "egress put JSON on the wire instead of CBOR"
+        );
         let decoded = cbor_to_json(&seen.body).unwrap();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&decoded).unwrap(),
             serde_json::json!({"ping": true})
         );
+
+        token.cancel();
+        let _ = handle.await;
+    }
+
+    // A WireClient that returns a chosen status and an undecodable body.
+    struct StatusClient {
+        status: u16,
+        body: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl WireClient for StatusClient {
+        async fn send(&self, _req: WireRequest) -> Result<WireResponse, WireError> {
+            Ok(WireResponse {
+                status: self.status,
+                headers: vec![],
+                body: self.body.clone(),
+            })
+        }
+    }
+
+    // A peer's non-2xx response whose body isn't valid CBOR must keep its
+    // status, not collapse to a retryable 502.
+    #[tokio::test]
+    async fn preserves_non_2xx_status_when_wire_body_not_cbor() {
+        // 0xff is a lone CBOR "break" — guaranteed to fail decode.
+        let client = Arc::new(StatusClient {
+            status: 404,
+            body: vec![0xff],
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let token = CancellationToken::new();
+        let client_dyn: Arc<dyn WireClient> = client.clone();
+        let server_token = token.clone();
+        let handle = tokio::spawn(async move { serve(addr, client_dyn, server_token).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let http = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{addr}")).unwrap())
+            .build()
+            .unwrap();
+        let resp = http
+            .get("http://peer.example:8448/_matrix/federation/v1/make_join/!r/@u")
+            .send()
+            .await
+            .expect("proxied request");
+
+        assert_eq!(resp.status(), 404, "4xx give-up status must survive");
 
         token.cancel();
         let _ = handle.await;

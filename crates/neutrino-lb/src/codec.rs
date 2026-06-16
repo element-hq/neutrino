@@ -38,6 +38,11 @@ pub fn cbor_to_json(cbor: &[u8]) -> Result<Vec<u8>, CodecError> {
 mod tests {
     use super::*;
 
+    // The byte-identity assertions below rely on `serde_json` re-emitting object
+    // keys in sorted order (its default `BTreeMap`-backed `Map`). The inputs are
+    // pre-sorted and compact, so the round trip is byte-identical. This couples
+    // to `serde_json` NOT having the `preserve_order` feature enabled; if that
+    // ever changes, switch these to semantic `Value == Value` comparisons.
     fn roundtrip(json: &str) -> String {
         let cbor = json_to_cbor(json.as_bytes()).expect("json->cbor");
         let back = cbor_to_json(&cbor).expect("cbor->json");
@@ -52,10 +57,25 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_preserves_large_integers() {
-        // depth / origin_server_ts must not be coerced to float.
-        let canonical = r#"{"depth":9007199254740993,"ts":1700000000000}"#;
-        assert_eq!(roundtrip(canonical), canonical);
+    fn roundtrip_preserves_number_types() {
+        // Each value must survive json→cbor→json with its exact numeric type.
+        // Compared at the `Value` level (which distinguishes the i64/u64/f64
+        // arms of `Number`), so this actually pins the type, not just the
+        // digits — `depth`/`origin_server_ts` must never coerce to float, and a
+        // u64 above i64::MAX must not overflow or clamp.
+        for original in [
+            r#"{"n":9007199254740993}"#,     // 2^53+1: exact integer, not f64
+            r#"{"n":18446744073709551615}"#, // u64::MAX: above i64::MAX
+            r#"{"n":-9007199254740993}"#,    // large negative (i64 arm)
+            r#"{"n":1.5}"#,                  // genuine float stays a float
+            r#"{"n":0}"#,                    // zero is an integer, not 0.0
+        ] {
+            let want: serde_json::Value = serde_json::from_str(original).unwrap();
+            let back = cbor_to_json(&json_to_cbor(original.as_bytes()).expect("json->cbor"))
+                .expect("cbor->json");
+            let got: serde_json::Value = serde_json::from_slice(&back).unwrap();
+            assert_eq!(got, want, "number type/precision lost for {original}");
+        }
     }
 
     #[test]

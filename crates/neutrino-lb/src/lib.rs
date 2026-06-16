@@ -12,6 +12,16 @@ pub mod transport;
 pub use error::LbError;
 
 use std::net::SocketAddr;
+use std::time::Duration;
+
+/// Connect timeout for the proxy's outbound HTTP hops (egress→peer,
+/// ingress→loopback upstream). Mirrors `neutrino-http`'s `FederationClient`:
+/// without it, a black-holing peer would leak an in-flight request on every
+/// sender retry, since the homeserver's own timeout only bounds the loopback
+/// hop to the egress, not the real network leg.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Total request timeout for the proxy's outbound HTTP hops.
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Runtime configuration for the sidecar.
 #[derive(Debug, Clone)]

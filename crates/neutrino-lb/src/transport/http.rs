@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::Router;
@@ -28,10 +29,18 @@ pub struct HttpWireClient {
 
 impl HttpWireClient {
     pub fn new() -> Self {
+        Self::with_timeouts(crate::CONNECT_TIMEOUT, crate::REQUEST_TIMEOUT)
+    }
+
+    fn with_timeouts(connect: Duration, request: Duration) -> Self {
         // Direct connections only: a trusted mesh resolves peers to raw
-        // IP:port, so bypass any ambient proxy.
+        // IP:port, so bypass any ambient proxy. Timeouts bound the real
+        // network leg — the homeserver's own timeout only covers its loopback
+        // hop to the egress, so without these a dead peer leaks this request.
         let http = reqwest::Client::builder()
             .no_proxy()
+            .connect_timeout(connect)
+            .timeout(request)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { http }
@@ -125,6 +134,12 @@ async fn dispatch(State(handler): State<Arc<dyn WireHandler>>, req: Request) -> 
         .iter()
         .map(|(k, v)| (k.as_str().to_owned(), v.as_bytes().to_vec()))
         .collect();
+    // No body-size cap (`usize::MAX`): this is the public peer-facing port, so
+    // an unbounded body is a memory-exhaustion surface. Neutrino deliberately
+    // ignores this — it runs on a trusted network and assumes peers are
+    // well-behaved (the same assumption that lets us skip signatures and auth,
+    // per `neutrino/CLAUDE.md`). A future hostile-peer transport would add a
+    // cap (and the CoAP/UDP transport bounds bodies via blockwise framing).
     let body = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b.to_vec(),
         Err(e) => {
@@ -178,7 +193,7 @@ mod tests {
     use axum::Json;
     use axum::body::Bytes;
     use axum::http::Method;
-    use axum::routing::put;
+    use axum::routing::{get, put};
     use axum::serve;
 
     // Minimal upstream that echoes the request body and a header back, so the
@@ -232,6 +247,36 @@ mod tests {
         assert_eq!(v["auth"], "X-Matrix origin=\"a\"");
         assert_eq!(v["content_type"], "application/cbor");
         assert_eq!(v["body"], "CBORBYTES");
+    }
+
+    // A peer that never answers in time must surface as a Transport error, not
+    // hang forever — the request timeout bounds the real network leg.
+    #[tokio::test]
+    async fn client_times_out_on_a_slow_peer() {
+        let app = Router::new().route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                "too late"
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { serve(listener, app).await.unwrap() });
+
+        let client =
+            HttpWireClient::with_timeouts(Duration::from_millis(500), Duration::from_millis(150));
+        let err = client
+            .send(WireRequest {
+                dest: addr.to_string(),
+                method: Method::GET,
+                path: "/slow".to_owned(),
+                headers: vec![],
+                body: vec![],
+            })
+            .await
+            .expect_err("slow peer must time out");
+        assert!(matches!(err, WireError::Transport(_)), "got {err:?}");
     }
 
     // A WireHandler that echoes the request body and reports the seen path.

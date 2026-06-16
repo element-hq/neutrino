@@ -80,10 +80,13 @@ impl FederationClient {
         builder = match proxy {
             Some(url) => match reqwest::Proxy::all(url) {
                 Ok(p) => builder.proxy(p),
-                Err(e) => {
-                    warn!(%url, %e, "invalid federation_proxy; falling back to direct");
-                    builder.no_proxy()
-                }
+                // `federation_proxy` is validated at startup (`AppState::new`
+                // returns `StartupError::InvalidFederationProxy`). Reaching this
+                // arm means the config was constructed past that check, which is
+                // a programming bug — fail loud rather than silently go direct.
+                Err(e) => unreachable!(
+                    "federation_proxy {url:?} unparseable after startup validation: {e}"
+                ),
             },
             None => builder.no_proxy(),
         };

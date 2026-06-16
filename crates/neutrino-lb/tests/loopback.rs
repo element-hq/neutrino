@@ -4,11 +4,13 @@
 
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use axum::extract::State;
 use axum::routing::put;
 use axum::{Json, Router};
-use neutrino_lb::transport::WireServer;
+use neutrino_lb::codec::cbor_to_json;
 use neutrino_lb::transport::http::{HttpWireClient, HttpWireServer};
+use neutrino_lb::transport::{WireClient, WireError, WireRequest, WireResponse, WireServer};
 use neutrino_lb::{egress, ingress::IngressHandler};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -18,6 +20,22 @@ async fn free_addr() -> std::net::SocketAddr {
     let a = l.local_addr().unwrap();
     drop(l);
     a
+}
+
+/// Wraps the real `HttpWireClient` and records the body it puts on the wire, so
+/// the test can prove the egress→ingress hop actually carries CBOR (and not
+/// JSON) — a no-op transcode would otherwise pass this test silently.
+struct SniffingClient {
+    inner: HttpWireClient,
+    wire_body: Arc<Mutex<Option<Vec<u8>>>>,
+}
+
+#[async_trait]
+impl WireClient for SniffingClient {
+    async fn send(&self, req: WireRequest) -> Result<WireResponse, WireError> {
+        *self.wire_body.lock().unwrap() = Some(req.body.clone());
+        self.inner.send(req).await
+    }
 }
 
 #[tokio::test]
@@ -34,7 +52,10 @@ async fn json_request_survives_egress_ingress_roundtrip() {
                 |State(s): State<Arc<Mutex<Option<serde_json::Value>>>>,
                  body: axum::body::Bytes| async move {
                     *s.lock().unwrap() = Some(serde_json::from_slice(&body).unwrap());
-                    Json(serde_json::json!({"pdus": {}}))
+                    (
+                        [("x-neutrino-test", "header-survives")],
+                        Json(serde_json::json!({"pdus": {}})),
+                    )
                 },
             ),
         )
@@ -53,7 +74,11 @@ async fn json_request_survives_egress_ingress_roundtrip() {
     // 3. Egress on a loopback port, wire client points at the wider network
     //    (here: directly at the ingress, since dest == ingress_addr).
     let egress_addr = free_addr().await;
-    let wire_client: Arc<dyn neutrino_lb::transport::WireClient> = Arc::new(HttpWireClient::new());
+    let wire_body: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let wire_client: Arc<dyn WireClient> = Arc::new(SniffingClient {
+        inner: HttpWireClient::new(),
+        wire_body: wire_body.clone(),
+    });
     let et = token.clone();
     let egress_task =
         tokio::spawn(async move { egress::serve(egress_addr, wire_client, et).await });
@@ -76,6 +101,12 @@ async fn json_request_survives_egress_ingress_roundtrip() {
         .expect("send through proxy");
 
     assert_eq!(resp.status(), 200);
+    // The upstream's response header must survive both sidecar hops
+    // (ingress → wire → egress). Captured before the body consumes `resp`.
+    let survived = resp
+        .headers()
+        .get("x-neutrino-test")
+        .map(|v| v.as_bytes().to_vec());
     // neutrino-lb's reqwest has no `json` feature (production uses `.bytes()`),
     // so decode the body the same way rather than via `resp.json()`.
     let raw = resp.bytes().await.unwrap();
@@ -84,6 +115,29 @@ async fn json_request_survives_egress_ingress_roundtrip() {
     assert_eq!(
         *seen.lock().unwrap(),
         Some(serde_json::json!({"edus": [], "pdus": [{"type": "m.room.message"}]}))
+    );
+
+    // The bytes that crossed the egress→ingress hop must be CBOR, not JSON: a
+    // no-op (identity) transcode would leave JSON on the wire and fail here.
+    let on_wire = wire_body
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("wire body captured");
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&on_wire).is_err(),
+        "wire body parsed as JSON — transcode did not run"
+    );
+    let decoded = cbor_to_json(&on_wire).expect("wire body must be valid CBOR");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&decoded).unwrap(),
+        serde_json::json!({"edus": [], "pdus": [{"type": "m.room.message"}]}),
+    );
+
+    assert_eq!(
+        survived.as_deref(),
+        Some(b"header-survives".as_ref()),
+        "upstream response header must pass through both sidecars"
     );
 
     token.cancel();

@@ -167,10 +167,20 @@ pub enum StartupError {
     Io(#[from] std::io::Error),
     #[error("opening sqlite store: {0}")]
     Store(#[from] StorageError),
+    #[error("invalid federation_proxy: {0}")]
+    InvalidFederationProxy(String),
 }
 
 impl AppState {
     async fn new(config: Config) -> Result<Self, StartupError> {
+        // A configured federation proxy must parse as a proxy URL. Bail at
+        // startup rather than silently falling back to direct federation: in a
+        // sidecar deployment "direct" means sending plain JSON to a peer's
+        // CBOR-only ingress port, which breaks the whole mesh. Fail loudly.
+        if let Some(url) = config.federation_proxy.as_deref() {
+            reqwest::Proxy::all(url)
+                .map_err(|e| StartupError::InvalidFederationProxy(format!("{url}: {e}")))?;
+        }
         // Persistent file-backed store rooted at the configured directory;
         // the store owns the `<dir>/neutrino.db` layout and creates the dir
         // if missing. (`open_in_memory` exists but its shared-cache mode is
@@ -1510,6 +1520,22 @@ mod tests {
         );
         let state = AppState::from_store(test_config(&tmp), store);
         (state, tmp)
+    }
+
+    #[tokio::test]
+    async fn router_bails_on_invalid_federation_proxy() {
+        // A malformed proxy must fail startup, not silently degrade to direct
+        // federation (which would break the CBOR sidecar mesh).
+        let tmp = TempDir::new().expect("tempdir");
+        let mut config = test_config(&tmp);
+        config.federation_proxy = Some("not a url".to_string());
+        let err = super::router(config)
+            .await
+            .expect_err("invalid federation_proxy must abort startup");
+        assert!(
+            matches!(err, super::StartupError::InvalidFederationProxy(_)),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
