@@ -187,7 +187,10 @@ impl AppState {
     /// simplest to construct directly through the trait rather than via the
     /// CSAPI write path.
     pub(crate) fn from_store(config: Config, store: Arc<SqliteStore>) -> Self {
-        let client = Arc::new(FederationClient::new(config.server_name.clone()));
+        let client = Arc::new(FederationClient::new(
+            config.server_name.clone(),
+            config.federation_proxy.as_deref(),
+        ));
         let fetcher: Arc<dyn MissingEventsFetcher> = Arc::new(ReqwestFetcher::new(client));
         Self::from_store_with_fetcher(config, store, fetcher)
     }
@@ -258,6 +261,12 @@ impl AppState {
         lock_app(self).config.outbound_concurrency
     }
 
+    /// The configured `neutrino-lb` egress proxy URL, if any. Threaded into
+    /// every outbound `FederationClient` so all federation routes through it.
+    fn federation_proxy(&self) -> Option<String> {
+        lock_app(self).config.federation_proxy.clone()
+    }
+
     /// Signal every shutdown-aware subsystem (long-polls, the outbound federation
     /// sender) to wind down. Idempotent (`CancellationToken::cancel` is a no-op
     /// once already cancelled, and takes `&self`). Called by the command dispatcher
@@ -310,6 +319,7 @@ pub async fn serve(
         state.subscribe_kick(),
         state.fetcher(),
         state.worker_poke(),
+        state.federation_proxy(),
     );
     let router = build_router(&state);
     // `dispatch` resolves on a terminal command or when every sender is dropped,
