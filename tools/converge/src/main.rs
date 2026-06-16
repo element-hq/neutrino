@@ -10,7 +10,8 @@
 //!     SEED   u64; reproduces an exact op sequence. Omitted -> a fresh seed is
 //!            chosen and printed (and re-printed on failure) so any run replays.
 //!   env knobs: EPISODES (6), ROUNDS_PER_EPISODE (12), DEADLINE (90s),
-//!              INTERVAL (2s), STABLE_POLLS (2), STRICT_EVENT_PRESENCE (1).
+//!              INTERVAL (2s), STABLE_POLLS (2), STRICT_EVENT_PRESENCE (1),
+//!              CRASH_PROB (10).
 //!
 //! ## What it tests
 //!
@@ -44,6 +45,22 @@
 //! sends no SIGUSR2: `nctl`'s heal already resets outbound backoff on both ends
 //! of the healed link, so a healed link drains without any explicit per-poll
 //! kick from here.
+//!
+//! ## Crash testing
+//!
+//! `CRASH_PROB`% of rounds (default 10) instead crash a live server (`nctl
+//! crash` => SIGKILL — no graceful shutdown) or revive a crashed one (`nctl
+//! revive` => `docker start`). This is distinct from a partition: a cut leaves
+//! the process alive (its outbox accrues and retries), a crash kills it
+//! outright. The container filesystem — and `/data/neutrino.db` — survives the
+//! kill (only `compose down -v` wipes it), so the revived process recovers its
+//! committed state and re-arms its outbox sender on startup, redelivering any
+//! federation transaction parked before the crash. With WAL + `synchronous =
+//! NORMAL`, a SIGKILL preserves committed data via the OS page cache, so this
+//! models a process crash, not host power-loss. At least one server is always
+//! kept alive; the barrier revives any still-down server before checking
+//! convergence. A run that crashes only while idle/converged is flagged at the
+//! end (recovery was vacuous) — mirroring the partition divergence guard.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -194,6 +211,10 @@ struct Config {
     interval: Duration,
     stable_polls: u32,
     strict_event_presence: bool,
+    /// Per-round probability (percent) of a crash/revive action. Clamped so the
+    /// fixed topology (30%) + conflict (15%) bands plus this still leave room for
+    /// a mutation, i.e. `crash_prob <= 55`.
+    crash_prob: u32,
 }
 
 /// Best-effort `docker compose down -v` on drop, so a panic still tears the rig
@@ -237,6 +258,8 @@ struct Harness {
 
     // topology: true = link up
     up: HashMap<String, bool>,
+    // process liveness: true = server process running (false between crash/revive)
+    up_proc: HashMap<String, bool>,
     // message event_id -> servers required to hold it (joined at send time)
     msg_accepted: HashMap<String, Vec<String>>,
 
@@ -244,6 +267,13 @@ struct Harness {
     divergence_seen: bool,
     conflict_fired: bool,
     any_cut: bool,
+    crash_fired: bool,
+    // a crash landed while there was recoverable work in flight (writes recorded
+    // since the last barrier) — i.e. the restart had something non-trivial to
+    // recover/redeliver, so convergence-after-crash wasn't vacuous.
+    crash_bit: bool,
+    // 2xx mutations recorded since the last barrier; gates the crash-bit signal.
+    writes_since_barrier: u32,
 }
 
 fn env_u32(key: &str, default: u32) -> u32 {
@@ -266,6 +296,7 @@ impl Harness {
             interval: Duration::from_secs(u64::from(env_u32("INTERVAL", 2))),
             stable_polls: env_u32("STABLE_POLLS", 2),
             strict_event_presence: env_u32("STRICT_EVENT_PRESENCE", 1) == 1,
+            crash_prob: env_u32("CRASH_PROB", 10).min(55),
         };
         let rig_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testrig");
         Harness {
@@ -290,11 +321,15 @@ impl Harness {
             ev_name: None,
             ev_pl: None,
             up: LINKS.iter().map(|k| (k.to_string(), true)).collect(),
+            up_proc: SERVERS.iter().map(|s| (s.to_string(), true)).collect(),
             msg_accepted: HashMap::new(),
             op_log: Vec::new(),
             divergence_seen: false,
             conflict_fired: false,
             any_cut: false,
+            crash_fired: false,
+            crash_bit: false,
+            writes_since_barrier: 0,
         }
     }
 
@@ -321,6 +356,9 @@ impl Harness {
     }
     fn is_up(&self, link: &str) -> bool {
         self.up.get(link).copied().unwrap_or(false)
+    }
+    fn is_proc_up(&self, hs: &str) -> bool {
+        self.up_proc.get(hs).copied().unwrap_or(false)
     }
     /// Power required to send `event_type` as state.
     fn state_req(&self, event_type: &str) -> i64 {
@@ -593,6 +631,7 @@ impl Harness {
         if out.ok {
             self.ledger(&op, &out);
             self.apply_model(&op);
+            self.writes_since_barrier += 1;
             let evid = out.event_id.as_deref().unwrap_or("–");
             self.oplog(&format!("record ok   [{}] evid={evid}", op.label()));
         } else {
@@ -831,8 +870,18 @@ impl Harness {
     }
 
     async fn barrier(&mut self) -> Result<(), String> {
-        self.log("barrier: heal all links, restore membership, converge");
+        self.log("barrier: revive crashed servers, heal all links, restore membership, converge");
         self.sample_divergence().await;
+        // Revive any crashed server first: `docker start` reattaches networks
+        // nondeterministically, so the heal-all below then normalises link state
+        // regardless of what the restart left behind.
+        for hs in SERVERS {
+            if !self.is_proc_up(hs) {
+                self.revive(hs).await?;
+                self.up_proc.insert(hs.to_string(), true);
+                self.note(&format!("revived {hs} (recovers committed state + outbox)"));
+            }
+        }
         for k in LINKS {
             if !self.is_up(k) {
                 self.partition("heal", k).await;
@@ -842,7 +891,9 @@ impl Harness {
         self.ensure_joined("hs2").await?;
         self.ensure_joined("hs3").await?;
         self.converge_check().await?;
-        self.sync_model().await
+        self.sync_model().await?;
+        self.writes_since_barrier = 0;
+        Ok(())
     }
 
     // ---- exact-tier probe battery -------------------------------------------
@@ -922,6 +973,11 @@ impl Harness {
         let name_req = self.state_req("m.room.name");
         let pl_req = self.state_req("m.room.power_levels");
         for s in SERVERS {
+            // A crashed server can't issue anything; skip it as a candidate actor
+            // (it's revived, and its membership reconverged, at the barrier).
+            if !self.is_proc_up(s) {
+                continue;
+            }
             let sp = self.power_of(s);
             if self.memb(s) == "join" {
                 if sp >= self.pl_events_default {
@@ -1028,6 +1084,8 @@ impl Harness {
                     && self.memb(b) == "join"
                     && self.power_of(a) >= req
                     && self.power_of(b) >= req
+                    && self.is_proc_up(a)
+                    && self.is_proc_up(b)
             })
             .collect();
         if pairs.is_empty() {
@@ -1074,6 +1132,9 @@ impl Harness {
                 rb.errcode.as_deref().unwrap_or("rc")
             }
         ));
+        // Accepted conflict writes are recoverable state a later crash must
+        // survive, so they count toward the crash-bit vacuity signal too.
+        self.writes_since_barrier += u32::from(ra.ok) + u32::from(rb.ok);
         if ra.ok && rb.ok {
             self.conflict_fired = true;
             self.assert_divergent(a, b, &format!("conflict-{tag} link={k}"))
@@ -1107,8 +1168,53 @@ impl Harness {
         }
     }
 
+    /// Crash a live server or revive a dead one (biased toward reviving so a
+    /// crash doesn't pin a server down for the whole episode). At least one
+    /// server is always kept alive, so the rig keeps making progress and a
+    /// readable `/state` always exists for the divergence probes. Reviving brings
+    /// a server back fully connected: `docker start` reattaches it to its
+    /// networks, so any cut touching it is healed — the model is squared with
+    /// that here.
+    async fn fuzz_crash(&mut self) -> Result<(), String> {
+        let alive: Vec<&str> = SERVERS.into_iter().filter(|s| self.is_proc_up(s)).collect();
+        let dead: Vec<&str> = SERVERS
+            .into_iter()
+            .filter(|s| !self.is_proc_up(s))
+            .collect();
+        let do_revive = !dead.is_empty() && (alive.len() < 2 || self.rng.random_range(0..2) == 0);
+        if do_revive {
+            let hs = dead[self.rng.random_range(0..dead.len())];
+            self.revive(hs).await?;
+            self.up_proc.insert(hs.to_string(), true);
+            for k in LINKS {
+                let (a, b) = link_servers(k);
+                if (a == hs || b == hs) && !self.is_up(k) {
+                    self.partition("heal", k).await;
+                    self.up.insert(k.to_string(), true);
+                }
+            }
+            self.oplog(&format!(
+                "revive {hs} (restart; recovers /data, fully reconnected)"
+            ));
+        } else if alive.len() >= 2 {
+            let hs = alive[self.rng.random_range(0..alive.len())];
+            self.crash(hs).await;
+            self.up_proc.insert(hs.to_string(), false);
+            self.crash_fired = true;
+            if self.writes_since_barrier > 0 {
+                self.crash_bit = true;
+            }
+            self.oplog(&format!(
+                "crash {hs} (SIGKILL; {} writes recoverable since last barrier)",
+                self.writes_since_barrier
+            ));
+        }
+        Ok(())
+    }
+
     /// ~30% topology change; ~15% manufacture a conflict (falling through to a
-    /// normal mutation when impossible); else a model-valid mutation.
+    /// normal mutation when impossible); `crash_prob`% a crash/revive; else a
+    /// model-valid mutation.
     async fn fuzz_round(&mut self) -> Result<(), String> {
         let roll = self.rng.random_range(0..100);
         if roll < 30 {
@@ -1117,6 +1223,8 @@ impl Harness {
             if !self.fuzz_conflict().await? {
                 self.fuzz_mutate().await;
             }
+        } else if roll < 45 + self.cfg.crash_prob {
+            self.fuzz_crash().await?;
         } else {
             self.fuzz_mutate().await;
         }
@@ -1138,16 +1246,36 @@ impl Harness {
             .unwrap_or(false)
     }
 
+    /// Run `nctl <args>` (best-effort; topology/crash control is fire-and-forget,
+    /// the harness re-reads reality via polls).
+    async fn nctl(&self, args: &[&str]) {
+        let nctl = self.rig_dir.join("nctl");
+        let _ = Command::new(&nctl).args(args).output().await;
+    }
+
     /// Topology control via `nctl partition`. `nctl`'s heal resets outbound
     /// backoff on both ends, so the harness never signals the servers itself.
     async fn partition(&self, action: &str, link: &str) {
-        let nctl = self.rig_dir.join("nctl");
-        let _ = Command::new(&nctl)
-            .arg("partition")
-            .arg(action)
-            .arg(link)
-            .output()
-            .await;
+        self.nctl(&["partition", action, link]).await;
+    }
+
+    /// Hard-crash a server (`nctl crash` => SIGKILL). The process dies with no
+    /// graceful shutdown; `/data` on disk survives, so this models a process
+    /// crash, not host power-loss.
+    async fn crash(&self, hs: &str) {
+        self.nctl(&["crash", hs]).await;
+    }
+
+    /// Restart a crashed server and wait for it to serve again. `docker start`
+    /// recovers `/data` (committed state) and the server re-arms its outbox
+    /// sender on startup; the trailing `nctl kick` resets every peer's backoff so
+    /// delivery to/from the revived server resumes immediately instead of waiting
+    /// out a backoff that built up while it was down.
+    async fn revive(&self, hs: &str) -> Result<(), String> {
+        self.nctl(&["revive", hs]).await;
+        self.wait_ready(hs).await?;
+        self.nctl(&["kick"]).await;
+        Ok(())
     }
 
     async fn wait_ready(&self, hs: &str) -> Result<(), String> {
@@ -1207,7 +1335,12 @@ impl Harness {
         }
         eprintln!("---- final per-server resolved state ----");
         for hs in SERVERS {
-            eprintln!("## {hs}");
+            let proc = if self.is_proc_up(hs) {
+                "alive"
+            } else {
+                "CRASHED (not revived)"
+            };
+            eprintln!("## {hs} [{proc}]");
             let (_, val) = self
                 .get(hs, &format!("{CS}/rooms/{}/state", self.room))
                 .await;
@@ -1243,6 +1376,23 @@ impl Harness {
                  partitions may not be biting, or this seed under-exercised them (try more \
                  EPISODES/ROUNDS_PER_EPISODE, or another seed)",
             );
+        }
+        // Crash coverage is orthogonal to partition divergence: a crash always
+        // forces a real restart + recovery + reconverge at the barrier, but a
+        // crash that lands while the server is idle/converged recovers nothing
+        // interesting. crash_bit means at least one crash had recoverable work.
+        if self.crash_bit {
+            self.note(
+                "process crashes exercised with recoverable work in flight; every revived server \
+                 recovered its committed state, redelivered its outbox, and reconverged",
+            );
+        } else if self.crash_fired {
+            self.note(
+                "crashes fired but only while idle/converged (no writes pending) — recovery was \
+                 trivial; raise CRASH_PROB or run more rounds to crash mid-activity",
+            );
+        } else if self.cfg.crash_prob > 0 {
+            self.note("no crash fired this run (try a higher CRASH_PROB or another seed)");
         }
     }
 

@@ -12,7 +12,11 @@ name: neutrino-testrig
 
 x-hs: &hs
   image: neutrino-testrig:latest
-  # In-memory SQLite (tempfile per process) → fresh state on every restart.
+  # On-disk SQLite under /data inside each container (the default storage dir).
+  # State survives a container restart (`docker start` after a crash/kill), which
+  # is what crash testing relies on; it is wiped only when the container is
+  # removed (`compose down -v`). `restart: "no"` so a SIGKILL'd server stays down
+  # until explicitly revived (the crash-testing path in tools/converge).
   restart: "no"
 
 services:

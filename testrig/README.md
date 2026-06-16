@@ -34,8 +34,10 @@ convergence test needs.
 Each server has exactly one user: `@alice:hs1`, `@alice:hs2`, `@alice:hs3`.
 The default build performs no token check, so the CLI sends no auth.
 
-State is in-memory (a SQLite tempfile per process) and is **wiped on every
-restart**.
+State is on-disk SQLite under `/data` inside each container. It **survives a
+container restart** (`docker start` after a `nctl crash`/kill) — which is what
+crash testing relies on — and is wiped only when the container is **removed**
+(`nctl down` / `compose down -v`).
 
 ## Requirements
 
@@ -68,6 +70,13 @@ ROOM='!...'                                # paste the id
 ./nctl partition heal 13                  # link restored, outbox drains
 ./nctl hs3 sync                            # hs3 has converged
 
+# --- crash tolerance (a hard process crash, not a network cut) ---
+./nctl hs1 msg "$ROOM" "before crash"
+./nctl crash hs3                           # SIGKILL hs3 (stays down; /data on disk survives)
+./nctl hs1 msg "$ROOM" "while hs3 is down" # parks in hs1's outbox for hs3
+./nctl revive hs3                          # docker start: hs3 recovers /data + redelivers
+./nctl hs3 sync                            # hs3 has both messages — nothing lost across the crash
+
 ./nctl down
 ```
 
@@ -80,6 +89,8 @@ ROOM='!...'                                # paste the id
 | `nctl fedlog [hs]` | follow federation HTTP requests (all servers, or one) |
 | `nctl partition cut\|heal <12\|13\|23>` | sever / restore one federation link |
 | `nctl partition status` | show which links are up |
+| `nctl crash <hs>` | SIGKILL a server (hard process crash; stays down) |
+| `nctl revive <hs>` | restart a crashed server (recovers `/data` on disk) |
 | `nctl <hs> create [public\|private] [name]` | create a room, print its id |
 | `nctl <hs> join <roomId> [residentHs]` | join (a `residentHs` hint forces a federated join) |
 | `nctl <hs> msg <roomId> <text>` | send an `m.room.message` |
