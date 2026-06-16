@@ -8,11 +8,20 @@ multi-user-shim = ["neutrino-http/multi-user-shim"]
 
 [dependencies]
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 neutrino-common = { path = "../neutrino-common" }
 neutrino-http = { path = "../neutrino-http" }
+neutrino-lb = { path = "../neutrino-lb" }
 
 [target.'cfg(target_os = "android")'.dependencies]
 paranoid-android = "0.2.2"
+
+[dev-dependencies]
+# Two-node in-process federation test (`tests/lb_inprocess.rs`): drives CSAPI
+# over HTTP and asserts convergence through the embedded `neutrino-lb` sidecars.
+reqwest = { version = "0.13.4", default-features = false }
+serde_json.workspace = true
+tempfile = "3.27.0"

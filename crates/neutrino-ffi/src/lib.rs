@@ -17,6 +17,11 @@ pub struct NeutrinoConfig {
     /// Optional `neutrino-lb` egress proxy URL (e.g. `http://127.0.0.1:8009`).
     /// `None` = direct federation.
     pub federation_proxy: Option<String>,
+    /// When set, runs a `neutrino-lb` sidecar in-process: this is the public
+    /// federation port the ingress binds (what peers' `server_name` resolve to).
+    /// Requires `federation_proxy` (the egress) and a loopback `bind_addr`.
+    /// `None` = no in-process sidecar.
+    pub lb_ingress_bind: Option<String>,
 }
 
 impl From<NeutrinoConfig> for neutrino_main::Config {
@@ -31,6 +36,7 @@ impl From<NeutrinoConfig> for neutrino_main::Config {
                 c.outbound_concurrency as usize,
             ),
             federation_proxy: c.federation_proxy,
+            lb_ingress_bind: c.lb_ingress_bind,
         }
     }
 }
@@ -149,6 +155,7 @@ mod tests {
             storage_dir: "/data/neutrino".to_string(),
             outbound_concurrency: 0, // must clamp to 1
             federation_proxy: Some("http://127.0.0.1:8009".to_owned()),
+            lb_ingress_bind: Some("0.0.0.0:8448".to_owned()),
         };
         let cfg: neutrino_main::Config = nc.into();
         assert_eq!(cfg.server_name, "hs.example");
@@ -160,6 +167,7 @@ mod tests {
             cfg.federation_proxy,
             Some("http://127.0.0.1:8009".to_owned())
         );
+        assert_eq!(cfg.lb_ingress_bind, Some("0.0.0.0:8448".to_owned()));
     }
 
     #[test]
@@ -196,6 +204,7 @@ mod tests {
             storage_dir: "/data/neutrino".to_string(),
             outbound_concurrency: 4,
             federation_proxy: None,
+            lb_ingress_bind: None,
         };
         let cfg: neutrino_main::Config = nc.into();
         assert_eq!(cfg.outbound_concurrency, 4);
