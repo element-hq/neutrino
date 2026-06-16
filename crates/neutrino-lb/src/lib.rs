@@ -3,6 +3,11 @@
 //! `docs/superpowers/specs/2026-06-15-neutrino-lb-cbor-proxy-design.md`.
 
 pub mod codec;
+mod error;
+mod headers;
+pub mod transport;
+
+pub use error::LbError;
 
 use std::net::SocketAddr;
 
