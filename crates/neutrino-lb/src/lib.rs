@@ -64,37 +64,3 @@ pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), 
         r = ingress => r.map_err(LbError::from),
     }
 }
-
-impl LbConfig {
-    /// Build from environment, mirroring `neutrino_common::Config::from_env`.
-    /// `NEUTRINO_LB_INGRESS_BIND` (default `0.0.0.0:8448`),
-    /// `NEUTRINO_LB_EGRESS_BIND` (default `127.0.0.1:8009`),
-    /// `NEUTRINO_LB_UPSTREAM` (default `http://127.0.0.1:8008`).
-    pub fn from_env() -> Result<Self, LbError> {
-        let ingress_bind = std::env::var("NEUTRINO_LB_INGRESS_BIND")
-            .unwrap_or_else(|_| "0.0.0.0:8448".to_owned())
-            .parse()
-            .map_err(|e| {
-                LbError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("NEUTRINO_LB_INGRESS_BIND: {e}"),
-                ))
-            })?;
-        let egress_bind = std::env::var("NEUTRINO_LB_EGRESS_BIND")
-            .unwrap_or_else(|_| "127.0.0.1:8009".to_owned())
-            .parse()
-            .map_err(|e| {
-                LbError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("NEUTRINO_LB_EGRESS_BIND: {e}"),
-                ))
-            })?;
-        let upstream = std::env::var("NEUTRINO_LB_UPSTREAM")
-            .unwrap_or_else(|_| "http://127.0.0.1:8008".to_owned());
-        Ok(Self {
-            ingress_bind,
-            egress_bind,
-            upstream,
-        })
-    }
-}

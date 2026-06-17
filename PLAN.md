@@ -32,7 +32,7 @@ All status points MUST have tests.
 
 ### Low-bandwidth proxy (`neutrino-lb`)
 
-v1 done (JSON↔CBOR over HTTP). `neutrino-lb` is a standalone sidecar that
+v1 done (JSON↔CBOR over HTTP). `neutrino-lb` is an in-process sidecar that
 transcodes Server-Server federation **bodies** between JSON (local side) and
 CBOR (wire side), behind a `WireClient`/`WireServer` trait seam (the future
 CoAP/UDP transport drops in there). `neutrino-http` routes outbound federation
@@ -160,4 +160,10 @@ never use .unwrap() in handler code.
 - Egress, called as an origin server (no destination authority), answers 502 not
   400: the sender retries a 5xx but permanently drops a 4xx, so a recoverable
   misconfig must not silently discard queued PDUs.
+- Removed the vestigial standalone `neutrino-lb` binary (`src/main.rs`) +
+  `LbConfig::from_env` and its `NEUTRINO_LB_EGRESS_BIND`/`_UPSTREAM` env vars:
+  nothing built or ran that binary (the in-process sidecar — `neutrino` +
+  `NEUTRINO_LB_INGRESS_BIND`, what the testrig uses — superseded it). `LbConfig`
+  (the struct) and `serve()` stay; `neutrino-main` builds the config
+  programmatically and runs the sidecar in-process.
   but still surfaces the error at `entrypoint`.
