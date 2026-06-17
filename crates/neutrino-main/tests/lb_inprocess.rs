@@ -160,3 +160,94 @@ async fn two_in_process_nodes_federate_over_cbor() {
         "message sent on A did not converge to B through the in-process neutrino-lb sidecars"
     );
 }
+
+/// #11, teardown arm: when the homeserver winds down (here via
+/// `Command::Shutdown`), `entrypoint`'s `select!` must cancel the sidecar token
+/// and *join* the sidecar before returning `Ok` — the `DendriteService.stop()`
+/// analogue. A hang in that join, or a sidecar that never releases its port, is
+/// exactly what this pins. The federation test above holds the command channel
+/// open for its whole life, so this path was previously unexercised.
+#[tokio::test]
+async fn entrypoint_tears_down_sidecar_when_homeserver_stops() {
+    let hs = free_port().await;
+    let ingress = free_port().await;
+    let egress = free_port().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config = Config {
+        server_name: ingress.to_string(),
+        bind_addr: hs.to_string(),
+        localpart: "alice".to_string(),
+        storage_dir: tmp.path().to_path_buf(),
+        federation_proxy: Some(format!("http://{egress}")),
+        lb_ingress_bind: Some(ingress.to_string()),
+        ..Default::default()
+    };
+
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    // `entrypoint`'s error is `Box<dyn Error>` (not `Send`), so map it to a
+    // `String` inside the task to keep the `JoinHandle` output `Send`.
+    let handle = tokio::spawn(async move {
+        neutrino_main::entrypoint(config, cmd_rx)
+            .await
+            .map_err(|e| e.to_string())
+    });
+
+    // Let the homeserver + sidecar bind.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Wind the homeserver down; entrypoint must cancel + join the sidecar and
+    // return Ok, not hang.
+    cmd_tx.send(Command::Shutdown).expect("send shutdown");
+
+    let res = tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("entrypoint did not return within 5s of shutdown — teardown/join hung")
+        .expect("entrypoint task panicked");
+    assert!(res.is_ok(), "clean shutdown returned an error: {res:?}");
+
+    // The sidecar released the public ingress port — proof it actually wound
+    // down, not merely that entrypoint returned.
+    assert!(
+        TcpListener::bind(ingress).await.is_ok(),
+        "ingress port still held after teardown — sidecar did not stop"
+    );
+}
+
+/// #11, sidecar-fails-first arm: if the public ingress port is already taken the
+/// sidecar's bind fails, and `entrypoint` must surface that as an error
+/// (dropping the homeserver) rather than hang on the still-running homeserver.
+#[tokio::test]
+async fn entrypoint_surfaces_a_sidecar_bind_failure() {
+    let hs = free_port().await;
+    let ingress = free_port().await;
+    let egress = free_port().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    // Occupy the ingress port so the sidecar's bind can't succeed.
+    let _blocker = TcpListener::bind(ingress).await.unwrap();
+
+    let config = Config {
+        server_name: ingress.to_string(),
+        bind_addr: hs.to_string(),
+        localpart: "alice".to_string(),
+        storage_dir: tmp.path().to_path_buf(),
+        federation_proxy: Some(format!("http://{egress}")),
+        lb_ingress_bind: Some(ingress.to_string()),
+        ..Default::default()
+    };
+
+    // Keep the command sender alive so the homeserver stays up: the only way out
+    // of the `select!` is the sidecar failing.
+    let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        neutrino_main::entrypoint(config, cmd_rx),
+    )
+    .await
+    .expect("entrypoint did not return after the sidecar failed to bind");
+    assert!(
+        res.is_err(),
+        "a sidecar bind failure must surface as an error from entrypoint"
+    );
+}

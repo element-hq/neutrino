@@ -307,4 +307,44 @@ mod tests {
         token.cancel();
         let _ = handle.await;
     }
+
+    // The mirror of the above: a *2xx* whose body isn't valid CBOR is a genuine
+    // proxy failure — we can't hand back a success payload we couldn't decode —
+    // so it must surface as a retryable 502, not a 2xx with a broken body.
+    // Pins the `(200..300)` arm in `proxy` (egress.rs).
+    #[tokio::test]
+    async fn masks_2xx_with_undecodable_wire_body_as_bad_gateway() {
+        // 0xff is a lone CBOR "break" — guaranteed to fail decode.
+        let client = Arc::new(StatusClient {
+            status: 200,
+            body: vec![0xff],
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let token = CancellationToken::new();
+        let client_dyn: Arc<dyn WireClient> = client.clone();
+        let server_token = token.clone();
+        let handle = tokio::spawn(async move { serve(addr, client_dyn, server_token).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let http = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{addr}")).unwrap())
+            .build()
+            .unwrap();
+        let resp = http
+            .get("http://peer.example:8448/_matrix/federation/v1/event/$x")
+            .send()
+            .await
+            .expect("proxied request");
+
+        assert_eq!(
+            resp.status(),
+            502,
+            "a 2xx with an undecodable body must become a retryable 502"
+        );
+
+        token.cancel();
+        let _ = handle.await;
+    }
 }
