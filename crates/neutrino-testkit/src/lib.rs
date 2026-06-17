@@ -215,12 +215,6 @@ impl Harness {
         &self.servers[i].name
     }
 
-    /// Backend `host:port` of server `i` — where to drive its CSAPI directly.
-    /// (Owned, since the backend is re-pointed on `revive`.)
-    pub fn backend(&self, i: usize) -> String {
-        self.backend_of(i)
-    }
-
     /// Path to server `i`'s captured stdout+stderr log (one file per server; they
     /// never interleave across servers). Lives for the harness's lifetime, so you
     /// can `tail -f` it during a run; removed when the harness drops.
@@ -344,14 +338,12 @@ impl Harness {
             "http://{}/_matrix/client/v3/join/{room}?server_name={resident}",
             self.backend_of(i)
         );
-        let resp = self
-            .http
-            .post(&url)
-            .json(&json!({}))
-            .send()
-            .await
-            .expect("join request");
-        resp.status().as_u16()
+        // Transport-tolerant like `request`: 0 on a connection error so a caller
+        // polling a crashed/booting peer doesn't panic.
+        match self.http.post(&url).json(&json!({})).send().await {
+            Ok(resp) => resp.status().as_u16(),
+            Err(_) => 0,
+        }
     }
 
     pub async fn leave(&self, i: usize, room: &str) -> u16 {
