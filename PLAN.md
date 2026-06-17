@@ -150,4 +150,13 @@ never use .unwrap() in handler code.
   / `federation_proxy` / `lb_ingress_bind`) into a `FederationMode { Direct |
   Proxied | InProcess }` enum so illegal states are unrepresentable at
   construction (incl. a fallible FFI `TryFrom`) — the current fix validates early
+- Header pass-through is an **allowlist** (`authorization` + `x-matrix-*`), not a
+  denylist: since the body is re-serialized JSON↔CBOR per hop, only headers the
+  proxy explicitly understands may survive — a peer's stale `Content-Encoding` or
+  smuggled framing header can't leak onward. `authorization` carries the
+  `X-Matrix` origin credential the inbound side reads (no signatures); responses
+  carry no semantic headers, so the allowlist forwards nothing on that path.
+- Egress, called as an origin server (no destination authority), answers 502 not
+  400: the sender retries a 5xx but permanently drops a 4xx, so a recoverable
+  misconfig must not silently discard queued PDUs.
   but still surfaces the error at `entrypoint`.

@@ -53,7 +53,12 @@ async fn json_request_survives_egress_ingress_roundtrip() {
                  body: axum::body::Bytes| async move {
                     *s.lock().unwrap() = Some(serde_json::from_slice(&body).unwrap());
                     (
-                        [("x-neutrino-test", "header-survives")],
+                        [
+                            // Allowlisted (X-Matrix family) → must survive both hops.
+                            ("x-matrix-test", "header-survives"),
+                            // Not allowlisted → must be dropped by the proxy.
+                            ("x-neutrino-test", "should-be-dropped"),
+                        ],
                         Json(serde_json::json!({"pdus": {}})),
                     )
                 },
@@ -101,12 +106,14 @@ async fn json_request_survives_egress_ingress_roundtrip() {
         .expect("send through proxy");
 
     assert_eq!(resp.status(), 200);
-    // The upstream's response header must survive both sidecar hops
-    // (ingress → wire → egress). Captured before the body consumes `resp`.
+    // Header policy across both sidecar hops (ingress → wire → egress): an
+    // allowlisted (X-Matrix family) response header survives; a non-allowlisted
+    // one is dropped. Captured before the body consumes `resp`.
     let survived = resp
         .headers()
-        .get("x-neutrino-test")
+        .get("x-matrix-test")
         .map(|v| v.as_bytes().to_vec());
+    let dropped = resp.headers().get("x-neutrino-test").is_some();
     // neutrino-lb's reqwest has no `json` feature (production uses `.bytes()`),
     // so decode the body the same way rather than via `resp.json()`.
     let raw = resp.bytes().await.unwrap();
@@ -137,7 +144,11 @@ async fn json_request_survives_egress_ingress_roundtrip() {
     assert_eq!(
         survived.as_deref(),
         Some(b"header-survives".as_ref()),
-        "upstream response header must pass through both sidecars"
+        "allowlisted (X-Matrix) response header must pass through both sidecars"
+    );
+    assert!(
+        !dropped,
+        "non-allowlisted response header must be dropped by the proxy"
     );
 
     token.cancel();

@@ -1,25 +1,28 @@
-//! Header pass-through policy. The proxy forwards semantic headers
-//! (Authorization / X-Matrix, etc.) but never the framing/hop-by-hop headers,
-//! which the downstream HTTP client recomputes for its own request.
+//! Header pass-through policy. The proxy forwards only the *semantic* Matrix
+//! federation headers and drops everything else. An **allowlist** (not a
+//! denylist) is used deliberately: the body is re-serialized JSON↔CBOR on every
+//! hop, so any header a peer set describing the original body — a stale
+//! `Content-Encoding`, a smuggled `Transfer-Encoding`/`Content-Length` — would
+//! be a lie at the next hop. Listing what may pass, and dropping the rest,
+//! means a header has to be explicitly understood to survive; framing headers
+//! are recomputed per hop by the downstream HTTP client regardless.
 
-/// Lowercase names the proxy must NOT copy through: the body framing headers
-/// (re-set per hop after transcoding changes the length and media type) and
-/// the connection-management hop-by-hop headers.
-const STRIPPED: &[&str] = &[
-    "host",
-    "content-length",
-    "content-type",
-    "transfer-encoding",
-    "connection",
-    "keep-alive",
-    "proxy-connection",
-    "upgrade",
-];
+/// Lowercase header names the proxy forwards verbatim. The only semantic header
+/// this (signature-less, trusted-network) server uses is `authorization`: it
+/// carries the `X-Matrix origin="…",destination="…"` credential the inbound
+/// side reads to authenticate the origin (see `federation::auth`).
+const ALLOWED: &[&str] = &["authorization"];
 
-/// True if `name` (any case) may be forwarded verbatim to the next hop.
+/// Lowercase prefixes the proxy forwards. Reserved for any future
+/// low-bandwidth `X-Matrix-*` header; matches the `X-Matrix` auth scheme family.
+const ALLOWED_PREFIXES: &[&str] = &["x-matrix"];
+
+/// True if `name` (any case) may be forwarded verbatim to the next hop. Matrix
+/// S2S *responses* carry no semantic headers, so on the response path this
+/// forwards nothing.
 pub fn is_forwardable(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    !STRIPPED.contains(&lower.as_str())
+    ALLOWED.contains(&lower.as_str()) || ALLOWED_PREFIXES.iter().any(|p| lower.starts_with(p))
 }
 
 #[cfg(test)]
@@ -37,5 +40,23 @@ mod tests {
     fn forwards_authorization() {
         assert!(is_forwardable("Authorization"));
         assert!(is_forwardable("X-Matrix-Foo"));
+    }
+
+    // Allowlist: anything outside the Matrix auth headers is dropped — including
+    // a peer-supplied header that would *lie* after the body is re-serialized
+    // (e.g. a `Content-Encoding` describing the pre-transcode body, or a smuggled
+    // framing header). A denylist would forward these by default.
+    #[test]
+    fn drops_unlisted_and_misleading_headers() {
+        for h in [
+            "Content-Encoding",
+            "Transfer-Encoding",
+            "X-Custom-Header",
+            "User-Agent",
+            "Cookie",
+            "Forwarded",
+        ] {
+            assert!(!is_forwardable(h), "{h} must be dropped by the allowlist");
+        }
     }
 }

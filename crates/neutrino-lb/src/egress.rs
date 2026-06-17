@@ -45,10 +45,13 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     // Forward-proxy requests carry an absolute-form target, so the authority is
     // the destination server. Its absence means we were called as an origin
-    // server, which is a misconfiguration.
+    // server, which is a misconfiguration — but answer 502 (like every other
+    // egress-internal failure below), not 400: the homeserver's sender drops a
+    // 4xx permanently while it retries a 5xx, and a recoverable misconfig must
+    // not make it silently discard queued PDUs.
     let Some(authority) = parts.uri.authority().map(|a| a.as_str().to_owned()) else {
         warn!(uri = %parts.uri, "egress: request missing authority (not proxied?)");
-        return error_response(StatusCode::BAD_REQUEST);
+        return error_response(StatusCode::BAD_GATEWAY);
     };
     let path = parts
         .uri
@@ -230,6 +233,45 @@ mod tests {
                 body: self.body.clone(),
             })
         }
+    }
+
+    // Called as an origin server — a direct, non-proxied request — the egress
+    // has no destination authority to forward to. It must answer a *retryable*
+    // 5xx, not a 4xx: the homeserver's sender drops a 4xx permanently but
+    // retries a 5xx, so a 4xx here would silently discard queued PDUs on what is
+    // only a (recoverable) misconfiguration.
+    #[tokio::test]
+    async fn missing_authority_is_retryable_5xx_not_4xx() {
+        let client = Arc::new(StatusClient {
+            status: 200,
+            body: json_to_cbor(b"{}").unwrap(),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let token = CancellationToken::new();
+        let client_dyn: Arc<dyn WireClient> = client.clone();
+        let server_token = token.clone();
+        let handle = tokio::spawn(async move { serve(addr, client_dyn, server_token).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Direct (origin-form) request, NOT proxy mode: the request target has
+        // no authority, so the egress is being used as an origin server.
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = http
+            .get(format!("http://{addr}/_matrix/federation/v1/send/1"))
+            .send()
+            .await
+            .expect("direct request");
+
+        assert!(
+            resp.status().is_server_error(),
+            "missing authority must be a retryable 5xx, got {}",
+            resp.status()
+        );
+
+        token.cancel();
+        let _ = handle.await;
     }
 
     // A peer's non-2xx response whose body isn't valid CBOR must keep its
