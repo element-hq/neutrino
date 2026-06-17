@@ -14,3 +14,7 @@ multi-user-shim = ["neutrino-main/multi-user-shim"]
 tokio.workspace = true
 
 neutrino-main = { path = "../neutrino-main" }
+
+[dev-dependencies]
+neutrino-testkit = { path = "../neutrino-testkit" }
+serde_json.workspace = true

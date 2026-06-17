@@ -52,6 +52,26 @@ jobs:
       - run: cargo nextest run -p neutrino-http --features multi-user-shim --lib multi_user
       - run: cargo nextest run -p neutrino-http --features multi-user-shim --test e2e_multi_user
 
+  converge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+      # In-process federation convergence fuzzer (no docker). A fresh seed each
+      # run explores a new op sequence; on failure it prints the seed + full op
+      # log so the exact run reproduces locally with `cargo run -p converge -- <seed>`.
+      - run: cargo run -p converge
+        env:
+          EPISODES: "4"
+          ROUNDS_PER_EPISODE: "12"
+          CRASH_PROB: "15"
+
   complement:
     runs-on: ubuntu-latest
     steps:
@@ -82,42 +102,6 @@ jobs:
       - run: cargo xtask complement
         env:
           SKIP_IMAGE_BUILD: "1"
-
-  testrig:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # Run the same rig twice: direct JSON federation, and the low-bandwidth
-        # CBOR sidecar overlay (NEUTRINO_LB=1, which layers docker-compose.lb.yml).
-        include:
-          - name: direct
-            lb: "0"
-          - name: lowbandwidth
-            lb: "1"
-    name: testrig (${{ matrix.name }})
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          persist-credentials: false
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
-      # Build the rig image once with cross-run layer caching, then load it into
-      # the daemon so `smoke.sh`'s `docker compose up` reuses it instead of
-      # rebuilding. The Dockerfile is cargo-chef-structured, so the deps layer is
-      # cached via type=gha until Cargo.toml/Cargo.lock change. A dedicated cache
-      # scope keeps this separate from the complement job's image cache. Both
-      # matrix legs share the same image (the LB sidecar is embedded in it).
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
-        with:
-          context: .
-          file: testrig/Dockerfile
-          tags: neutrino-testrig:latest
-          load: true
-          cache-from: type=gha,scope=testrig
-          cache-to: type=gha,mode=max,scope=testrig
-      - run: testrig/smoke.sh
-        env:
-          NEUTRINO_LB: ${{ matrix.lb }}
 
   compile:
     runs-on: ubuntu-latest

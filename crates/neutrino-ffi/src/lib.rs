@@ -37,6 +37,8 @@ impl From<NeutrinoConfig> for neutrino_main::Config {
             ),
             federation_proxy: c.federation_proxy,
             lb_ingress_bind: c.lb_ingress_bind,
+            // Startup jitter isn't an FFI-exposed tunable; take the default.
+            ..Default::default()
         }
     }
 }

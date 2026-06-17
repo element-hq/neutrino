@@ -8,11 +8,14 @@ soft-fail, `prev_state_events` validation, txn dedup, rejected-event permanence,
 make_leave/send_leave handshake shape, …) belongs in `neutrino-state` unit/prop
 tests or `neutrino-http`'s `federation/tests.rs`, **not** here.
 
+The rig is now **in-process** (`neutrino-testkit`: real `neutrino` child processes
+on loopback, proxy partitions, SIGKILL crash/revive — no docker, no `nctl`).
+
 Current coverage: random episodes of room ops + partition cut/heal, a
 manufactured `m.room.name` conflict across a single cut (origin_server_ts /
 event_id tie-break), the divergence guard, the `/messages` no-lost-writes
 oracle, and **crash/revive** (`CRASH_PROB`% of rounds SIGKILL a live server or
-`docker start` a dead one; the barrier revives any still-down server and the
+re-spawn a dead one; the barrier revives any still-down server and the
 convergence gate proves it recovered its committed state + redelivered its
 outbox). The scenarios below extend that.
 
@@ -26,14 +29,11 @@ event ids the same way messages are ledgered today.
 
 ## 1. Crash / restart — targeted refinements
 
-The baseline landed: `CRASH_PROB`% of rounds crash a random live server
-(`nctl crash` = SIGKILL) or revive a dead one (`nctl revive` = `docker start`);
-the barrier revives any still-down server, and the convergence gate proves it
-recovered its committed state and redelivered its outbox. (The "persistent
-storage" prerequisite this section once listed was a false belief — the rig
-already runs on-disk SQLite under `/data`, durable across a container restart;
-only `compose down -v` wipes it.) The crash target is random and recovery is
-proven against a live cluster.
+The baseline landed: `CRASH_PROB`% of rounds crash a random live server (SIGKILL
+the real `neutrino` process) or revive a dead one (re-spawn on the same on-disk
+storage); the barrier revives any still-down server, and the convergence gate
+proves it recovered its committed state and redelivered its outbox. The crash
+target is random and recovery is proven against a live cluster.
 
 What's still **directed rather than random**, and worth adding:
 
@@ -137,8 +137,8 @@ path is barely stretched.
   produced during isolation (same mechanism as the message ledger — they show up
   in `/messages?dir=f`) and assert they are all present on `hsX` post-heal. This
   proves the deep ancestry was actually fetched, not just the current tips.
-- Optional confirmation the walk ran: scan `nctl fedlog` (or the server's request
-  log) for `get_missing_events` with `state_dag` from `hsX` after heal.
+- Optional confirmation the walk ran: scan the server's request log for
+  `get_missing_events` with `state_dag` from `hsX` after heal.
 
 **Open questions.** How deep is "deep enough" to force `limit` growth — depends on
 the page size and the exponential schedule; pick a depth comfortably past one
@@ -156,5 +156,5 @@ re-join). This scenario subsumes the standalone "full state-DAG presence" check
   send_join shape, join-rules — all deterministic; put them in
   `neutrino-state` / `federation/tests.rs`.
 - Backoff-drain timing on its own was considered but is implicitly covered:
-  every barrier already waits for a healed link to drain on the
-  `nctl`-heal-reset backoff within `DEADLINE`.
+  every barrier already waits for a healed link to drain on the heal-reset
+  backoff within `DEADLINE`.
