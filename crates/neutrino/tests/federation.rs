@@ -1,11 +1,18 @@
 //! Multi-server federation integration tests, driven by the child-process
-//! harness in [`support`]. Each test spins up real `neutrino` binaries on
-//! loopback and exercises real federation HTTP between them — no docker.
+//! harness in [`neutrino_testkit`]. Each test spins up real `neutrino` binaries
+//! on loopback and exercises real federation HTTP between them — no docker.
 
-mod support;
+use std::path::Path;
 
+use neutrino_testkit::Harness;
 use serde_json::Value;
-use support::Harness;
+
+/// Path to the freshly-built `neutrino` binary. Cargo sets `CARGO_BIN_EXE_neutrino`
+/// for this crate's integration tests and (re)builds it before they run, so it's
+/// never stale.
+fn neutrino_bin() -> &'static Path {
+    env!("CARGO_BIN_EXE_neutrino").as_ref()
+}
 
 /// `m.room.message` body of a timeline event, if it is one.
 fn msg_body(e: &Value) -> Option<&str> {
@@ -49,7 +56,7 @@ async fn tail_convergence_advertises_on_joined_set_growth() {
     const R: usize = 2;
     let e_name = "tail-converge-E";
 
-    let h = Harness::start(3).await;
+    let h = Harness::start(3, neutrino_bin()).await;
     let room = h.create_room(H, "init").await;
     assert!(matches!(h.invite(H, &room, &h.mxid(L)).await, 200..=299));
     assert!(matches!(h.invite(H, &room, &h.mxid(R)).await, 200..=299));
@@ -100,7 +107,7 @@ async fn tail_convergence_advertises_on_joined_set_growth() {
 /// ways (asserted via the sliding-sync timeline).
 #[tokio::test]
 async fn smoke_basic_send_receive() {
-    let h = Harness::start(2).await;
+    let h = Harness::start(2, neutrino_bin()).await;
     let room = h.create_room(0, "smoke").await;
     assert!(matches!(h.invite(0, &room, &h.mxid(1)).await, 200..=299));
     assert!(matches!(h.join(1, &room, h.name(0)).await, 200..=299));
@@ -130,7 +137,7 @@ async fn smoke_basic_send_receive() {
 /// send so it parks in the outbox immediately, and heal + `KickBackoff` redrains.
 #[tokio::test]
 async fn smoke_partition_heal_converges() {
-    let h = Harness::start(2).await;
+    let h = Harness::start(2, neutrino_bin()).await;
     let room = h.create_room(0, "smoke").await;
     assert!(matches!(h.invite(0, &room, &h.mxid(1)).await, 200..=299));
     assert!(matches!(h.join(1, &room, h.name(0)).await, 200..=299));
@@ -165,7 +172,7 @@ async fn smoke_partition_heal_converges() {
 /// and must still receive the losing name event into its timeline.
 #[tokio::test]
 async fn smoke_concurrent_name_resolution() {
-    let h = Harness::start(3).await;
+    let h = Harness::start(3, neutrino_bin()).await;
     let room = h.create_room(0, "smoke").await;
     for p in [1, 2] {
         assert!(matches!(h.invite(0, &room, &h.mxid(p)).await, 200..=299));
@@ -236,7 +243,7 @@ async fn smoke_concurrent_name_resolution() {
 ///   parked row survived the crash. If durability were broken this times out.
 #[tokio::test]
 async fn crash_recovers_committed_state_and_redelivers_outbox() {
-    let mut h = Harness::start(2).await;
+    let mut h = Harness::start(2, neutrino_bin()).await;
     let room = h.create_room(0, "crash").await;
     assert!(matches!(h.invite(0, &room, &h.mxid(1)).await, 200..=299));
     assert!(matches!(h.join(1, &room, h.name(0)).await, 200..=299));

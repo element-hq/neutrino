@@ -1,9 +1,9 @@
 # Convergence fuzzer (`converge`)
 
-A seeded, randomized fuzzer over the three-server federation rig (`hs1`/`hs2`/`hs3`,
-see [testrig/README.md](../../testrig/README.md)). It drives random episodes of
-room operations interleaved with random partition cut/heal, then heals everything
-and asserts the room converges. Run it from the workspace root:
+A seeded, randomized fuzzer over an **in-process** three-server federation rig
+(`hs1`/`hs2`/`hs3`). It drives random episodes of room operations interleaved with
+random partition cut/heal, then heals everything and asserts the room converges.
+Run it from the workspace root — no docker:
 
 ```sh
 cargo run -p converge                 # fresh seed (printed); reproduce a failure with:
@@ -11,13 +11,15 @@ cargo run -p converge -- 16646        # an explicit seed replays the same op seq
 EPISODES=10 ROUNDS_PER_EPISODE=20 cargo run -p converge -- 16646   # longer run
 ```
 
-It brings the rig up via `docker compose` (building the image if absent), drives
-each server's Client-Server API over HTTP, and delegates partition cut/heal to
-[`testrig/nctl`](../../testrig/nctl). The seed drives every random choice through a
+It builds the `neutrino` binary and spawns three real child servers on loopback
+via [`neutrino-testkit`](../../crates/neutrino-testkit) — real federation HTTP
+between them, partitions enforced by a parent-hosted proxy, crash/revive by
+SIGKILL/re-spawn. It drives each server's Client-Server API over HTTP and delegates
+cut/heal/crash/revive to the testkit. The seed drives every random choice through a
 single `StdRng`, so a failing run is replayable. Federation delivery timing is
 asynchronous and *not* seed-controlled, so the seed pins the intended op sequence
-and gives highly reproducible runs, not bit-identical ones. On failure it dumps
-the seed, the full op log, each server's resolved state, and the compose logs.
+and gives highly reproducible runs, not bit-identical ones. On failure it dumps the
+seed, the full op log, and each server's resolved state.
 
 ## What it asserts
 
@@ -73,12 +75,11 @@ guard against that:
 
 ### 5. Crash recovery (durability under restart)
 
-`CRASH_PROB`% of rounds SIGKILL a live server (`nctl crash` — a hard process
-crash, no graceful shutdown) or `docker start` a dead one (`nctl revive`).
-Unlike a partition, the process is *gone*: anything it had committed must survive
-on disk, and anything it had parked in its outbox must redeliver on restart. The
-container filesystem (and `/data/neutrino.db`) is preserved across the kill —
-only `compose down -v` wipes it — and with WAL + `synchronous = NORMAL` a SIGKILL
+`CRASH_PROB`% of rounds SIGKILL a live server (a hard process crash, no graceful
+shutdown) or re-spawn a dead one. Unlike a partition, the process is *gone*:
+anything it had committed must survive on disk, and anything it had parked in its
+outbox must redeliver on restart. The server's storage dir is a parent-owned
+tempdir preserved across the kill, and with WAL + `synchronous = NORMAL` a SIGKILL
 preserves committed data via the OS page cache, so this models a process crash,
 not host power-loss. The barrier revives any still-down server and then the
 normal convergence gate proves the revived server recovered its committed state,
@@ -110,7 +111,7 @@ probability, a topology change (cut a live link / heal a downed one); ~15% a
 **manufactured conflict** (two co-admins write the same state key across an active
 cut — see *Divergence actually happens* above, falling through to a normal
 mutation if no two co-admins are joined); `CRASH_PROB`% (default 10) a
-**crash/revive** (SIGKILL a live server or `docker start` a dead one — see
+**crash/revive** (SIGKILL a live server or re-spawn a dead one — see
 *Crash recovery* below); else a model-valid mutating op on a random server —
 message / set-name / power-change / invite / kick / leave / rejoin (chosen so it
 is *meaningful*, not a wall of 403s). All record-tier. After the rounds: a
@@ -118,7 +119,7 @@ is *meaningful*, not a wall of 403s). All record-tier. After the rounds: a
 
 **Barrier (the convergence point):**
 
-1. revive any crashed server (`docker start`; it recovers committed state and
+1. revive any crashed server (re-spawn; it recovers committed state and
    redelivers its durable outbox);
 2. heal all three links;
 3. rejoin anyone who churned out, so all three are joined and comparable;
@@ -155,7 +156,6 @@ a room it still hosts not re-syncing missed state).
 | `STRICT_EVENT_PRESENCE` | 1 | set 0 to skip the message-presence check (state equality stays the hard gate) |
 | `CRASH_PROB` | 10 | per-round percent chance of a crash/revive action (0 disables crash testing; clamped to ≤ 55) |
 
-The fuzzer sends no signals itself. A healed link drains on its outbox's own
-schedule because `nctl partition heal` already resets the per-destination backoff
-on both ends of the link (`SIGUSR2` → `KickBackoff`), so convergence lands well
-inside `DEADLINE` without any per-poll nudge from the harness.
+A healed link drains promptly because the rig's `heal` resets the per-destination
+backoff on both ends (`SIGUSR2` → `KickBackoff`), so convergence lands well inside
+`DEADLINE` without any per-poll nudge from the harness.
