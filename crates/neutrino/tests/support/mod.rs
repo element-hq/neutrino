@@ -80,6 +80,9 @@ fn spawn_neutrino(server_name: &str, backend: &str, storage: &Path) -> Child {
         .env("NEUTRINO_SERVER_NAME", server_name)
         .env("NEUTRINO_BIND_ADDR", backend)
         .env("NEUTRINO_STORAGE_DIR", storage)
+        // No startup jitter in tests: a revived server should redrain its outbox
+        // immediately, so the crash test doesn't wait out the 30s production guard.
+        .env("NEUTRINO_STARTUP_JITTER_MS", "0")
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -201,8 +204,6 @@ impl Harness {
 
     /// SIGKILL the server's process group — a real abrupt crash. Committed state
     /// must survive on disk; anything parked in its outbox must redeliver on revive.
-    // Exercised by the crash/durability test (next phase).
-    #[allow(dead_code)]
     pub(crate) fn crash(&mut self, i: usize) {
         if let Some(mut child) = self.servers[i].child.take() {
             signal_group(&child, libc::SIGKILL);
@@ -212,7 +213,6 @@ impl Harness {
 
     /// Re-spawn a crashed server with the same env (same backend port + storage
     /// dir) and wait until it serves again.
-    #[allow(dead_code)]
     pub(crate) async fn revive(&mut self, i: usize) {
         let s = &mut self.servers[i];
         if s.child.is_none() {
@@ -497,6 +497,17 @@ impl Harness {
             );
             sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// One-shot: does `i`'s current sliding-sync timeline for `room` contain an
+    /// event matching `pred`? (No polling — for asserting *absence* at a point.)
+    pub(crate) async fn timeline_has(
+        &self,
+        i: usize,
+        room: &str,
+        pred: impl Fn(&Value) -> bool,
+    ) -> bool {
+        self.sync_timeline(i, room).await.iter().any(&pred)
     }
 
     /// Wait until `i`'s sliding-sync timeline for `room` contains an event

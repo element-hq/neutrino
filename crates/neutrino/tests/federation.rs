@@ -218,3 +218,60 @@ async fn smoke_concurrent_name_resolution() {
         assert_eq!(h.current_name(i, &room).await.as_deref(), Some("HS2"));
     }
 }
+
+/// Real-crash durability — the capability the child-process harness exists for.
+/// A SIGKILL'd server must recover its committed state *and* redeliver anything
+/// parked in its durable outbox. Only a genuine process kill (not an in-process
+/// drop) exercises WAL + `synchronous=NORMAL` survival across abrupt termination.
+///
+/// - Server 0 and 1 are joined and converged.
+/// - Cut 0–1, then 0 sends a message. It commits locally on 0 and parks in 0's
+///   outbox for 1 (1 is unreachable). That outbox row is the *only* copy headed
+///   for 1 — nothing else can carry it.
+/// - **SIGKILL server 0** while the message is committed-but-undelivered, then
+///   re-spawn it on the same on-disk storage.
+/// - Check: 0 still has the message after the abrupt kill (committed state
+///   survived), and 1 still does not (the link was never up).
+/// - Heal 0–1. 0's recovered outbox redelivers the message to 1 — proving the
+///   parked row survived the crash. If durability were broken this times out.
+#[tokio::test]
+async fn crash_recovers_committed_state_and_redelivers_outbox() {
+    let mut h = Harness::start(2).await;
+    let room = h.create_room(0, "crash").await;
+    assert!(matches!(h.invite(0, &room, &h.mxid(1)).await, 200..=299));
+    assert!(matches!(h.join(1, &room, h.name(0)).await, 200..=299));
+    h.await_converged(&room, &[0, 1]).await;
+
+    // Park a message in 0's outbox for 1 (link cut → it can't be delivered).
+    h.cut(0, 1);
+    assert!(matches!(
+        h.send_message(0, &room, "pre-crash").await,
+        200..=299
+    ));
+
+    // Abrupt kill while it's committed-but-undelivered, then revive on the same DB.
+    h.crash(0);
+    h.revive(0).await;
+
+    // Committed state survived the SIGKILL: 0 still holds its own message.
+    h.await_timeline(0, &room, "recovered its own committed message", |e| {
+        msg_body(e) == Some("pre-crash")
+    })
+    .await;
+    // 1 still lacks it (0–1 never came up) — so the only path is 0's recovered outbox.
+    assert!(
+        !h.timeline_has(1, &room, |e| msg_body(e) == Some("pre-crash"))
+            .await,
+        "server 1 must not have the message before heal — it exists only in 0's recovered outbox"
+    );
+
+    // Heal: 0's durable outbox redelivers across the crash boundary.
+    h.heal(0, 1);
+    h.await_timeline(
+        1,
+        &room,
+        "received the parked message after crash+revive",
+        |e| msg_body(e) == Some("pre-crash"),
+    )
+    .await;
+}

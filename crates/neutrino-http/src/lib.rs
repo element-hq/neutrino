@@ -258,6 +258,11 @@ impl AppState {
         lock_app(self).config.outbound_concurrency
     }
 
+    /// The configured startup jitter for the outbound sender pool.
+    fn startup_jitter(&self) -> Duration {
+        lock_app(self).config.startup_jitter
+    }
+
     /// Signal every shutdown-aware subsystem (long-polls, the outbound federation
     /// sender) to wind down. Idempotent (`CancellationToken::cancel` is a no-op
     /// once already cancelled, and takes `&self`). Called by the command dispatcher
@@ -306,6 +311,7 @@ pub async fn serve(
         state.store(),
         state.server_name(),
         state.outbound_concurrency(),
+        state.startup_jitter(),
         state.subscribe_shutdown(),
         state.subscribe_kick(),
         state.fetcher(),

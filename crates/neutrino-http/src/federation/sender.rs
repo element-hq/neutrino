@@ -25,7 +25,7 @@
 //! once. Two bounds prevent that thundering herd:
 //!
 //! - **Startup jitter.** Destinations present in the *first* enumeration round
-//!   wait a random `[0, STARTUP_JITTER_MAX]` before their first drain. Spreads
+//!   wait a random `[0, config.startup_jitter]` before their first drain. Spreads
 //!   the restart burst. Destinations discovered *later* (a live send to a new
 //!   peer) drain immediately — no added latency on the common path.
 //! - **A global send semaphore.** At most `NEUTRINO_OUTBOUND_CONCURRENCY` (default
@@ -63,11 +63,6 @@ use crate::federation::gapfill::MissingEventsFetcher;
 use crate::federation::reconcile::{self, ForwardExtremities};
 use crate::federation::{BACKOFF_BASE, MAX_PDUS_PER_TXN, jitter, next_backoff, now_ms};
 
-/// Upper bound on the random delay a startup-present destination waits before
-/// its first drain. Generous on purpose — spreads a fleet of restart-time
-/// retries so they don't flood the network in lockstep.
-const STARTUP_JITTER_MAX: Duration = Duration::from_secs(30);
-
 /// Shared, cheaply-cloneable handles every sender task needs. Bundled so the
 /// per-destination signatures stay readable as the pool grows (mirrors
 /// `worker::WorkerCtx`).
@@ -96,6 +91,7 @@ pub(crate) fn spawn(
     store: Arc<SqliteStore>,
     origin: String,
     concurrency: usize,
+    startup_jitter: Duration,
     shutdown: CancellationToken,
     kick_rx: watch::Receiver<()>,
     fetcher: Arc<dyn MissingEventsFetcher>,
@@ -105,7 +101,7 @@ pub(crate) fn spawn(
         store,
         origin,
         concurrency,
-        STARTUP_JITTER_MAX,
+        startup_jitter,
         shutdown,
         kick_rx,
         fetcher,

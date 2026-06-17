@@ -27,6 +27,8 @@ impl From<NeutrinoConfig> for neutrino_main::Config {
             outbound_concurrency: neutrino_main::Config::clamp_outbound_concurrency(
                 c.outbound_concurrency as usize,
             ),
+            // Startup jitter isn't an FFI-exposed tunable; take the default.
+            ..Default::default()
         }
     }
 }

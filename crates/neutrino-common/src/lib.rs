@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub mod event;
 pub mod event_id;
@@ -10,6 +11,10 @@ const DEFAULT_SERVER_NAME: &str = "localhost";
 const DEFAULT_LOCALPART: &str = "alice";
 /// Default cap on concurrent in-flight outbound federation transactions.
 const DEFAULT_OUTBOUND_CONCURRENCY: usize = 2;
+/// Default upper bound on the random startup delay before a freshly-started
+/// sender first drains its outbox backlog — spreads a fleet's restart-time
+/// retries so they don't flood the network in lockstep. Tests set this to 0.
+const DEFAULT_STARTUP_JITTER_MS: u64 = 30_000;
 /// Default storage directory: a `data/` subdirectory of the process's working
 /// directory rather than the cwd itself, so the server never has to clamp the
 /// permissions of (or scatter its DB sidecars across) a directory it doesn't
@@ -44,6 +49,10 @@ pub struct Config {
     /// The server creates this directory if missing, but not its parents —
     /// those are the caller's responsibility (see `SqliteStore::open_in_dir`).
     pub storage_dir: PathBuf,
+    /// Upper bound on the random delay a freshly-started outbound sender waits
+    /// before its first outbox drain (thundering-herd guard on restart). Default
+    /// 30s; tests set it to 0 so post-restart redelivery is immediate.
+    pub startup_jitter: Duration,
 }
 
 impl Default for Config {
@@ -54,6 +63,7 @@ impl Default for Config {
             localpart: DEFAULT_LOCALPART.to_string(),
             outbound_concurrency: DEFAULT_OUTBOUND_CONCURRENCY,
             storage_dir: PathBuf::from(DEFAULT_STORAGE_DIR),
+            startup_jitter: Duration::from_millis(DEFAULT_STARTUP_JITTER_MS),
         }
     }
 }
@@ -71,6 +81,13 @@ impl Config {
                     .as_deref(),
             ),
             storage_dir: storage_dir_from(std::env::var("NEUTRINO_STORAGE_DIR").ok().as_deref()),
+            startup_jitter: std::env::var("NEUTRINO_STARTUP_JITTER_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .map_or_else(
+                    || Duration::from_millis(DEFAULT_STARTUP_JITTER_MS),
+                    Duration::from_millis,
+                ),
             // `localpart` (and any future non-env field) defaults from `Default`,
             // so the value lives in exactly one place.
             ..Default::default()
