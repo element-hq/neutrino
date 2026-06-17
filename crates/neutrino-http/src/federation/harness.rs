@@ -34,6 +34,7 @@
 //! heal-resets-backoff.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -77,7 +78,12 @@ pub(crate) struct Harness {
     cut: CutSet,
     http: reqwest::Client,
     deadline: Duration,
+    /// Monotonic source of unique `send` transaction ids.
+    txn: AtomicU64,
 }
+
+/// Sliding-sync endpoint (MSC4186 / simplified MSC3575).
+const SYNC: &str = "_matrix/client/unstable/org.matrix.simplified_msc3575/sync";
 
 impl Harness {
     /// Start `n` in-process servers, all links initially up, and wait until each
@@ -97,6 +103,7 @@ impl Harness {
             cut,
             http,
             deadline: Duration::from_secs(20),
+            txn: AtomicU64::new(0),
         };
         for i in 0..n {
             h.await_ready(i).await;
@@ -209,6 +216,33 @@ impl Harness {
         )
         .await
         .0
+    }
+
+    pub(crate) async fn send_message(&self, i: usize, room: &str, body: &str) -> u16 {
+        let txn = self.txn.fetch_add(1, Ordering::Relaxed);
+        self.cs(
+            i,
+            reqwest::Method::PUT,
+            &format!("_matrix/client/v3/rooms/{room}/send/m.room.message/t{txn}"),
+            json!({ "msgtype": "m.text", "body": body }),
+        )
+        .await
+        .0
+    }
+
+    /// Set `target`'s power level (read-modify-write of `m.room.power_levels`,
+    /// since a PUT replaces the whole content).
+    pub(crate) async fn set_power(&self, i: usize, room: &str, target: &str, level: i64) -> u16 {
+        let path = format!("_matrix/client/v3/rooms/{room}/state/m.room.power_levels");
+        let (st, mut content) = self.cs(i, reqwest::Method::GET, &path, Value::Null).await;
+        if !(200..300).contains(&st) {
+            return st;
+        }
+        if !content.get("users").map(Value::is_object).unwrap_or(false) {
+            content["users"] = json!({});
+        }
+        content["users"][target] = json!(level);
+        self.cs(i, reqwest::Method::PUT, &path, content).await.0
     }
 
     /// Resolved `/state` array, or `None` if unreadable.
@@ -331,6 +365,67 @@ impl Harness {
             assert!(
                 Instant::now() < deadline,
                 "servers {who:?} never converged on identical /state"
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// `i`'s sliding-sync timeline for `room` (initial sync, no `pos`, large
+    /// `timeline_limit`) — the same view `/messages` would give, including state
+    /// PDUs. Empty on read failure or if the room isn't in the response.
+    async fn sync_timeline(&self, i: usize, room: &str) -> Vec<Value> {
+        let body =
+            json!({ "lists": { "default": { "ranges": [[0, 99]], "timeline_limit": 1000 } } });
+        let (st, val) = self.cs(i, reqwest::Method::POST, SYNC, body).await;
+        if !(200..300).contains(&st) {
+            return Vec::new();
+        }
+        val.get("rooms")
+            .and_then(|rooms| rooms.get(room))
+            .and_then(|r| r.get("timeline"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Wait until `i`'s sliding-sync timeline for `room` contains an event
+    /// matching `pred`. `desc` names the wait for the panic message.
+    pub(crate) async fn await_timeline(
+        &self,
+        i: usize,
+        room: &str,
+        desc: &str,
+        pred: impl Fn(&Value) -> bool,
+    ) {
+        let deadline = Instant::now() + self.deadline;
+        loop {
+            if self.sync_timeline(i, room).await.iter().any(&pred) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "server {i} timeline: {desc}");
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// `target`'s explicit power level in `i`'s resolved state, if set.
+    async fn current_power(&self, i: usize, room: &str, target: &str) -> Option<i64> {
+        let arr = self.state(i, room).await?;
+        arr.as_array()?
+            .iter()
+            .rev()
+            .find(|e| e.get("type").and_then(Value::as_str) == Some("m.room.power_levels"))
+            .and_then(|e| e.get("content")?.get("users")?.get(target)?.as_i64())
+    }
+
+    pub(crate) async fn await_power(&self, i: usize, room: &str, target: &str, level: i64) {
+        let deadline = Instant::now() + self.deadline;
+        loop {
+            if self.current_power(i, room, target).await == Some(level) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "server {i} never saw {target} at power {level}"
             );
             sleep(Duration::from_millis(50)).await;
         }
@@ -554,6 +649,136 @@ mod tests {
         h.await_converged(&room, &[H, L, R]).await;
         for i in [H, L, R] {
             assert_eq!(h.current_name(i, &room).await.as_deref(), Some(e_name));
+        }
+    }
+
+    /// `m.room.message` body of a timeline event, if it is one.
+    fn msg_body(e: &Value) -> Option<&str> {
+        e.get("content")?.get("body")?.as_str()
+    }
+
+    /// Ported from `testrig/smoke.sh` scenario 1: a room, a join, messages flow
+    /// both ways (asserted via the sliding-sync timeline).
+    #[tokio::test]
+    async fn smoke_basic_send_receive() {
+        let h = Harness::start(2).await;
+        let room = h.create_room(0, "smoke").await;
+        assert!(matches!(h.invite(0, &room, &h.mxid(1)).await, 200..=299));
+        assert!(matches!(h.join(1, &room, h.name(0)).await, 200..=299));
+        h.await_converged(&room, &[0, 1]).await;
+
+        assert!(matches!(
+            h.send_message(0, &room, "basic-from-0").await,
+            200..=299
+        ));
+        h.await_timeline(1, &room, "sees 0's message", |e| {
+            msg_body(e) == Some("basic-from-0")
+        })
+        .await;
+
+        assert!(matches!(
+            h.send_message(1, &room, "basic-from-1").await,
+            200..=299
+        ));
+        h.await_timeline(0, &room, "sees 1's message", |e| {
+            msg_body(e) == Some("basic-from-1")
+        })
+        .await;
+    }
+
+    /// Ported from `smoke.sh` scenario 2: cut the link, both sides send, heal,
+    /// both converge — each receives the other's message. No "let the split
+    /// settle" sleep is needed: the proxy 503s the cut send so it parks in the
+    /// outbox immediately, and heal + `KickBackoff` redrains it.
+    #[tokio::test]
+    async fn smoke_partition_heal_converges() {
+        let h = Harness::start(2).await;
+        let room = h.create_room(0, "smoke").await;
+        assert!(matches!(h.invite(0, &room, &h.mxid(1)).await, 200..=299));
+        assert!(matches!(h.join(1, &room, h.name(0)).await, 200..=299));
+        h.await_converged(&room, &[0, 1]).await;
+
+        h.cut(0, 1);
+        // A local CSAPI write still commits (2xx); only its federation parks.
+        assert!(matches!(
+            h.send_message(0, &room, "split-from-0").await,
+            200..=299
+        ));
+        assert!(matches!(
+            h.send_message(1, &room, "split-from-1").await,
+            200..=299
+        ));
+        h.heal(0, 1);
+
+        h.await_timeline(1, &room, "receives 0's split message after heal", |e| {
+            msg_body(e) == Some("split-from-0")
+        })
+        .await;
+        h.await_timeline(0, &room, "receives 1's split message after heal", |e| {
+            msg_body(e) == Some("split-from-1")
+        })
+        .await;
+    }
+
+    /// Ported from `smoke.sh` scenario 3: concurrent room-name resolution across a
+    /// partition. Server 2 is isolated; servers 0 and 1 (both admins) set
+    /// conflicting names a few ms apart, so server 1's has the strictly-later
+    /// `origin_server_ts`. On heal, server 2 must resolve to that later name
+    /// regardless of the order the two events arrive, and must still receive the
+    /// losing name event into its timeline.
+    #[tokio::test]
+    async fn smoke_concurrent_name_resolution() {
+        let h = Harness::start(3).await;
+        let room = h.create_room(0, "smoke").await;
+        for p in [1, 2] {
+            assert!(matches!(h.invite(0, &room, &h.mxid(p)).await, 200..=299));
+            assert!(matches!(h.join(p, &room, h.name(0)).await, 200..=299));
+        }
+        h.await_converged(&room, &[0, 1, 2]).await;
+
+        // Server 1 needs admin to author m.room.name. Let the promotion reach both
+        // 1 and 2 before splitting, or 2 would reject 1's name when it backfills it.
+        let one = h.mxid(1);
+        assert!(matches!(h.set_power(0, &room, &one, 100).await, 200..=299));
+        h.await_power(1, &room, &one, 100).await;
+        h.await_power(2, &room, &one, 100).await;
+
+        // Isolate server 2 from both peers; the 0–1 link stays up.
+        h.cut(0, 2);
+        h.cut(1, 2);
+
+        // Two conflicting names. The ~5ms gap guarantees server 1's event carries
+        // the strictly-later `origin_server_ts`, so state-res must pick it.
+        assert!(matches!(h.set_name(0, &room, "HS1").await, 200..=299));
+        sleep(Duration::from_millis(5)).await;
+        assert!(matches!(h.set_name(1, &room, "HS2").await, 200..=299));
+
+        // Heal 1–2 first: server 2 learns HS2 (and backfills the losing HS1).
+        h.heal(1, 2);
+        h.await_name(2, &room, "HS2").await;
+
+        // Heal 0–2: HS1 now reaches server 2 directly. Resolution is by timestamp,
+        // not arrival order, so the name stays HS2 — and HS1 lands in the timeline.
+        h.heal(0, 2);
+        let zero = h.mxid(0);
+        h.await_timeline(
+            2,
+            &room,
+            "timeline contains server 0's losing HS1 name",
+            |e| {
+                e.get("type").and_then(Value::as_str) == Some("m.room.name")
+                    && e.get("sender").and_then(Value::as_str) == Some(zero.as_str())
+                    && e.get("content")
+                        .and_then(|c| c.get("name"))
+                        .and_then(Value::as_str)
+                        == Some("HS1")
+            },
+        )
+        .await;
+
+        h.await_converged(&room, &[0, 1, 2]).await;
+        for i in [0, 1, 2] {
+            assert_eq!(h.current_name(i, &room).await.as_deref(), Some("HS2"));
         }
     }
 }

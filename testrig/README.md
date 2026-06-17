@@ -170,10 +170,14 @@ their failure to the caller instead.)
 
 ## Automated tests
 
-Two scripts drive the rig and assert outcomes:
+The three **curated** scenarios that used to live in `smoke.sh` (basic
+send/receive, partition+heal, concurrent room-name state-res) are now an
+in-process `cargo test` — `crates/neutrino-http/src/federation/harness.rs`, which
+stands up the servers in-process with real federation HTTP and toggleable proxy
+partitions (no docker). They run in the normal `cargo nextest run` CI gate.
 
-- `./smoke.sh` — three **curated** scenarios (basic send/receive, partition+heal,
-  concurrent room-name state-res). A fixed CI gate; deterministic by construction.
+The rig itself still drives the **seeded randomized** convergence fuzzer:
+
 - `cargo run -p converge -- [SEED]` — a **seeded randomized** convergence fuzzer:
   random episodes of room ops (message / name / power / invite / kick / leave /
   rejoin) interleaved with random partition cut+heal — plus deliberately
