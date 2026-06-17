@@ -12,18 +12,27 @@ pub async fn entrypoint(
 ) -> Result<(), Box<dyn std::error::Error>> {
     platform::init_tracing();
 
-    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
-    tracing::info!("listening on {}", listener.local_addr()?);
-
     // Embedded low-bandwidth sidecar: when `lb_ingress_bind` is set we run a
     // `neutrino-lb` proxy in-process beside the homeserver (the embedded-on-
     // mobile target — the in-process analogue of the legacy `DendriteService`
     // owning the monolith). The homeserver routes its outbound federation
     // through the egress (`federation_proxy`); the ingress owns the public port
     // peers reach and forwards inbound federation to the homeserver's loopback.
-    match config.lb_ingress_bind.as_deref() {
-        Some(ingress) => {
-            let lb_config = build_lb_config(&config, ingress)?;
+    //
+    // Derive (and so validate) the sidecar config *before* binding the listener:
+    // an illegal in-process combo (no egress, or a non-loopback `bind_addr`)
+    // then fails fast without first claiming the public port.
+    let lb_config = config
+        .lb_ingress_bind
+        .as_deref()
+        .map(|ingress| build_lb_config(&config, ingress))
+        .transpose()?;
+
+    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
+    tracing::info!("listening on {}", listener.local_addr()?);
+
+    match lb_config {
+        Some(lb_config) => {
             tracing::info!(
                 ingress = %lb_config.ingress_bind,
                 egress = %lb_config.egress_bind,
@@ -57,7 +66,8 @@ pub async fn entrypoint(
 /// routes outbound there, and the sidecar binds it); the upstream is the
 /// homeserver's own `bind_addr` (which must be loopback so the ingress reaches
 /// it). Errors if `lb_ingress_bind` is set without a `federation_proxy` egress,
-/// or if either address fails to parse.
+/// if either address fails to parse, or if `bind_addr` is a concrete
+/// non-loopback address (see [`upstream_url`]).
 fn build_lb_config(
     config: &Config,
     ingress: &str,
@@ -73,7 +83,7 @@ fn build_lb_config(
     Ok(neutrino_lb::LbConfig {
         ingress_bind,
         egress_bind,
-        upstream: upstream_url(&config.bind_addr),
+        upstream: upstream_url(&config.bind_addr)?,
     })
 }
 
@@ -97,17 +107,34 @@ fn egress_bind_from_proxy(proxy: &str) -> Result<SocketAddr, String> {
         .map_err(|e| format!("federation_proxy egress {authority:?}: {e}"))
 }
 
-/// The loopback URL the ingress uses to reach the co-located homeserver. When
-/// `bind_addr` binds all interfaces (e.g. `0.0.0.0:8008` in a container, needed
-/// so CSAPI can be port-published), the ingress still reaches it over loopback;
-/// any concrete host is used verbatim.
-fn upstream_url(bind_addr: &str) -> String {
+/// The loopback URL the ingress uses to reach the co-located homeserver. The
+/// homeserver runs in the same process, so the ingress must reach it over
+/// loopback — and in-process mode therefore requires a loopback-reachable
+/// `bind_addr`:
+/// - a loopback address (`127.0.0.1`, `[::1]`) is used verbatim;
+/// - an unspecified bind (`0.0.0.0`, used so CSAPI can be port-published in a
+///   container) still listens on loopback, so it is rewritten to it;
+/// - a concrete *non*-loopback address (e.g. a LAN interface) is **rejected**:
+///   the homeserver would listen only there, so a loopback rewrite would miss
+///   it and a verbatim URL would send the ingress→upstream hop off the loopback
+///   path — exposing the unauthenticated CSAPI on the network. Fail loudly
+///   rather than silently going off-box.
+/// - a non-IP authority (`hostname:port`) can't be classified without
+///   resolution, so it is trusted verbatim.
+fn upstream_url(bind_addr: &str) -> Result<String, String> {
     match bind_addr.parse::<SocketAddr>() {
+        Ok(addr) if addr.ip().is_loopback() => Ok(format!("http://{bind_addr}")),
         Ok(addr) if addr.ip().is_unspecified() => {
             let host = if addr.is_ipv6() { "[::1]" } else { "127.0.0.1" };
-            format!("http://{host}:{}", addr.port())
+            Ok(format!("http://{host}:{}", addr.port()))
         }
-        _ => format!("http://{bind_addr}"),
+        Ok(addr) => Err(format!(
+            "bind_addr {addr} is a concrete non-loopback address; in-process \
+             low-bandwidth mode (lb_ingress_bind set) requires a loopback or \
+             unspecified bind_addr so the sidecar ingress reaches the homeserver \
+             over loopback and the unauthenticated CSAPI stays off the network"
+        )),
+        Err(_) => Ok(format!("http://{bind_addr}")),
     }
 }
 
@@ -187,6 +214,25 @@ mod tests {
         // co-located ingress must still reach the homeserver over loopback.
         let c = cfg("0.0.0.0:8008", Some("http://127.0.0.1:8009"));
         let lb = build_lb_config(&c, "0.0.0.0:80").expect("valid lb config");
+        assert_eq!(lb.upstream, "http://127.0.0.1:8008");
+    }
+
+    // A concrete non-loopback `bind_addr` in in-process mode is rejected: the
+    // homeserver would listen only on that interface, so rewriting the upstream
+    // to loopback would miss it, and using it verbatim sends the ingress→upstream
+    // hop off the loopback path (exposing CSAPI on the network). Fail loudly
+    // rather than silently going off-box.
+    #[test]
+    fn build_lb_config_rejects_non_loopback_bind_addr() {
+        let c = cfg("192.168.1.5:8008", Some("http://127.0.0.1:8009"));
+        assert!(build_lb_config(&c, "0.0.0.0:8448").is_err());
+    }
+
+    // A loopback `bind_addr` is used verbatim (it's already loopback-reachable).
+    #[test]
+    fn build_lb_config_accepts_loopback_bind_addr() {
+        let c = cfg("127.0.0.1:8008", Some("http://127.0.0.1:8009"));
+        let lb = build_lb_config(&c, "0.0.0.0:8448").expect("valid lb config");
         assert_eq!(lb.upstream, "http://127.0.0.1:8008");
     }
 }

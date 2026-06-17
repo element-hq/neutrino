@@ -139,3 +139,15 @@ never use .unwrap() in handler code.
   preserve byte-exact canonical JSON, so if event **signatures** are ever added,
   this proxy would break signature verification — it would have to canonicalize
   identically to the signer on both ends.
+- In-process mode requires a loopback-reachable `bind_addr`: `upstream_url`
+  rejects a concrete non-loopback address (e.g. a LAN interface) rather than
+  sending the ingress→upstream hop off the loopback path (which would expose the
+  unauthenticated CSAPI on the network). Loopback is used verbatim; `0.0.0.0` is
+  rewritten to loopback (it still listens there). The sidecar config is
+  derived/validated *before* binding the listener, so an illegal in-process combo
+  fails fast without first claiming the public port. Deferred (option 2 of the
+  review's finding #4): collapsing the three coupled `Config` fields (`bind_addr`
+  / `federation_proxy` / `lb_ingress_bind`) into a `FederationMode { Direct |
+  Proxied | InProcess }` enum so illegal states are unrepresentable at
+  construction (incl. a fallible FFI `TryFrom`) — the current fix validates early
+  but still surfaces the error at `entrypoint`.
