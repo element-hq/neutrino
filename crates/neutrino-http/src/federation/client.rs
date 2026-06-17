@@ -71,9 +71,7 @@ impl FederationClient {
         // Trusted mesh resolves peers to raw IP:port. Without a proxy we bypass
         // any ambient HTTP proxy (which would otherwise intercept `http://{ip}`
         // traffic). With one (the `neutrino-lb` egress) we route all outbound
-        // federation through it so it can transcode bodies to CBOR. `build()`
-        // only fails on TLS-backend init, which we don't use — fall back to the
-        // default client if so.
+        // federation through it so it can transcode bodies to CBOR.
         let mut builder = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT);
@@ -90,7 +88,14 @@ impl FederationClient {
             },
             None => builder.no_proxy(),
         };
-        let http = builder.build().unwrap_or_else(|_| Client::new());
+        // `build()` only fails on TLS-backend init; this is a plaintext client
+        // (no TLS), so it can't fail. Panic loud rather than fall back to a
+        // default `Client::new()` that silently drops the timeouts and the
+        // proxy/`no_proxy` config above — consistent with the `unreachable!()`
+        // for a bad proxy URL just above, not a silent degrade beside it.
+        let http = builder
+            .build()
+            .expect("plaintext reqwest client always builds; no TLS backend to init");
         Self { http, origin }
     }
 

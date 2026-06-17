@@ -43,7 +43,12 @@ impl IngressHandler {
             .connect_timeout(connect)
             .timeout(request)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            // `build()` only fails on TLS-backend init; this is a plaintext
+            // client (no TLS), so it can't fail. Panic loud rather than fall
+            // back to a default `Client::new()` that silently drops `.no_proxy()`
+            // + the timeouts (re-enabling ambient-proxy hijack and the dead-peer
+            // request leak these settings exist to prevent).
+            .expect("plaintext reqwest client always builds; no TLS backend to init");
         Self { http, upstream }
     }
 
