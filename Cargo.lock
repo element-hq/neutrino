@@ -1111,7 +1111,12 @@ dependencies = [
 name = "neutrino"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "libc",
  "neutrino-main",
+ "reqwest",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

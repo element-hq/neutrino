@@ -97,8 +97,6 @@ pub(crate) mod test_support {
 }
 
 #[cfg(test)]
-mod harness;
-#[cfg(test)]
 mod tests;
 
 /// Errors any federation handler can surface to the HTTP layer.
