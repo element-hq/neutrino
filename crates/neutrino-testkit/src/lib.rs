@@ -1,42 +1,41 @@
-//! Child-process multi-server federation test harness.
+//! In-process multi-server federation test harness.
 //!
-//! Spawns N real `neutrino` binaries (located via `CARGO_BIN_EXE_neutrino`,
-//! which cargo builds before these integration tests run — so the binary under
-//! test is never stale) and drives real federation HTTP between them. No docker.
+//! Spawns N real `neutrino` binaries (at a caller-provided path) on loopback and
+//! drives real federation HTTP between them, with toggleable proxy partitions and
+//! real SIGKILL crash/revive. No docker. Shared by the `neutrino` crate's
+//! integration tests (which pass `env!("CARGO_BIN_EXE_neutrino")`) and the
+//! `converge` fuzzer (which builds + locates the binary itself). Depends on no
+//! other neutrino crate.
 //!
 //! ## Two ports per server, and how partitions work
 //!
-//! Each server gets two loopback ports:
-//! * a **backend** port the child `neutrino` binds (`NEUTRINO_BIND_ADDR`), and
-//! * an **advertised** port served by a parent-hosted toggleable reverse proxy.
+//! Each server gets two loopback ports: a **backend** port the child `neutrino`
+//! binds (`NEUTRINO_BIND_ADDR`), and an **advertised** port served by a
+//! parent-hosted toggleable reverse proxy. `NEUTRINO_SERVER_NAME` is the
+//! advertised `127.0.0.1:<advertised>`, so a peer dials the proxy and the child
+//! stamps that address as its `origin`. The proxy reads the `X-Matrix origin`
+//! header and, if the unordered pair `{self, origin}` is in the shared cut-set,
+//! replies `503` (retryable — the sender parks in its outbox and redelivers on
+//! heal); otherwise it forwards to the backend. The proxy outlives child
+//! crash/revive, so the advertised endpoint is stable while the child is dead.
 //!
-//! `NEUTRINO_SERVER_NAME` is the *advertised* `127.0.0.1:<advertised>`, so a peer
-//! dials the proxy and the child stamps that address as its `origin`. The proxy
-//! reads the `X-Matrix origin` header (every outbound federation request carries
-//! it) and, if the unordered pair `{self, origin}` is in the shared [`CutSet`],
-//! replies `503` (retryable — the sender parks the transaction in its durable
-//! outbox and redelivers on heal); otherwise it forwards to the backend. The
-//! proxy lives in the parent process and outlives child crash/revive, so the
-//! advertised endpoint is stable even while the child is dead (it then 502s,
-//! which peers treat as down).
+//! Drive CSAPI over the [`Harness::backend`] port directly (never partitioned);
+//! the typed CSAPI/await helpers do exactly that.
 //!
 //! ## Crash / revive / heal
 //!
-//! * **crash** = SIGKILL the child's process group — a real abrupt kill, so this
-//!   genuinely exercises on-disk durability (WAL + `synchronous=NORMAL`).
+//! * **crash** = SIGKILL the child's process group (real abrupt kill → genuine
+//!   WAL + `synchronous=NORMAL` durability).
 //! * **revive** = re-spawn the binary with the same env (same backend port and
-//!   storage dir, which the parent owns so it survives the kill).
-//! * **heal** = clear the cut pair and SIGUSR2 the live children, which the
-//!   `neutrino` binary maps to `KickBackoff` so a healed link redrains promptly.
-//!
-//! CSAPI is driven over the backend port directly, so a partition never blinds
-//! the harness, and a server can be fully isolated (both links cut) without
-//! losing its CSAPI.
+//!   parent-owned storage dir, which survives the kill).
+//! * **heal** = clear the cut pair and SIGUSR2 the live children (→ `KickBackoff`,
+//!   so a healed link redrains promptly). Set `NEUTRINO_STARTUP_JITTER_MS=0` (done
+//!   here) so a revived server redrains immediately.
 
 use std::collections::HashSet;
 use std::net::TcpListener as StdTcpListener;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -73,29 +72,52 @@ fn free_port() -> u16 {
     l.local_addr().expect("local addr").port()
 }
 
-/// Spawn the real `neutrino` binary as a child in its own process group (so a
-/// parent panic can't orphan it), configured entirely by env.
-fn spawn_neutrino(server_name: &str, backend: &str, storage: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_neutrino"))
+/// Spawn the `neutrino` binary at `bin` as a child in its own process group (so a
+/// parent panic can't orphan it), configured entirely by env. The child's
+/// stdout+stderr are appended to `log` so a startup failure (e.g. a bind error,
+/// which the binary prints as `Error: …` to stderr and exits) is visible rather
+/// than guessed at — [`Harness::await_ready`] dumps this on timeout.
+fn spawn_neutrino(
+    bin: &Path,
+    server_name: &str,
+    backend: &str,
+    storage: &Path,
+    log: &Path,
+) -> Child {
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .expect("open child log");
+    let err = out.try_clone().expect("clone child log fd");
+    Command::new(bin)
         .env("NEUTRINO_SERVER_NAME", server_name)
         .env("NEUTRINO_BIND_ADDR", backend)
         .env("NEUTRINO_STORAGE_DIR", storage)
-        // No startup jitter in tests: a revived server should redrain its outbox
-        // immediately, so the crash test doesn't wait out the 30s production guard.
+        // No startup jitter in tests: a revived server redrains its outbox at once.
         .env("NEUTRINO_STARTUP_JITTER_MS", "0")
-        .env("RUST_LOG", "warn")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err))
         .process_group(0)
         .spawn()
         .expect("spawn neutrino")
 }
 
-/// Send `sig` to the process (positive pid) or its group (negate the pid).
+/// Send `sig` to the process (positive pid).
 fn signal(pid: u32, sig: i32) {
     // SAFETY: `kill(2)` with a constant signal; an invalid/dead pid just returns ESRCH.
     unsafe {
         libc::kill(pid as i32, sig);
+    }
+}
+
+/// SIGKILL/SIGUSR2 a child's whole process group (negative pid). The child was
+/// spawned with `process_group(0)`, so its pid is its pgid.
+fn signal_group(child: &Child, sig: i32) {
+    // SAFETY: negative pid targets the process group; a dead group yields ESRCH.
+    unsafe {
+        libc::kill(-(child.id() as i32), sig);
     }
 }
 
@@ -104,14 +126,19 @@ struct Server {
     /// stamped as this server's federation `origin`.
     name: String,
     /// `127.0.0.1:<backend-port>` — the child's real router, where CSAPI is driven.
-    backend: String,
+    /// Shared with this server's proxy and re-pointed on `revive` (a revived child
+    /// takes a *fresh* port — reusing the old one races TIME_WAIT on macOS/BSD).
+    backend: Arc<Mutex<String>>,
     /// The running child, or `None` between crash and revive.
     child: Option<Child>,
     /// Parent-owned storage dir; survives child crash/revive (the durability point).
     storage: tempfile::TempDir,
+    /// The child's combined stdout+stderr log (appended across crash/revive).
+    log: PathBuf,
 }
 
-pub(crate) struct Harness {
+pub struct Harness {
+    bin: PathBuf,
     servers: Vec<Server>,
     cut: CutSet,
     http: reqwest::Client,
@@ -120,9 +147,9 @@ pub(crate) struct Harness {
 }
 
 impl Harness {
-    /// Start `n` child-process servers, all links up, and wait until each serves
-    /// through its proxy.
-    pub(crate) async fn start(n: usize) -> Harness {
+    /// Start `n` servers from the `neutrino` binary at `bin`, all links up, and
+    /// wait until each serves through its proxy.
+    pub async fn start(n: usize, bin: &Path) -> Harness {
         let cut: CutSet = Arc::new(Mutex::new(HashSet::new()));
         let http = reqwest::Client::builder()
             .no_proxy()
@@ -134,10 +161,12 @@ impl Harness {
             // on its port. The backend port is discovered-then-passed to the child.
             let proxy_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
             let name = proxy_listener.local_addr().expect("proxy addr").to_string();
-            let backend = format!("127.0.0.1:{}", free_port());
+            let backend_str = format!("127.0.0.1:{}", free_port());
+            let backend = Arc::new(Mutex::new(backend_str.clone()));
             let storage = tempfile::TempDir::new().expect("storage tempdir");
+            let log = storage.path().join("server.log");
 
-            let child = spawn_neutrino(&name, &backend, storage.path());
+            let child = spawn_neutrino(bin, &name, &backend_str, storage.path(), &log);
 
             let proxy = Router::new()
                 .fallback(proxy_handler)
@@ -159,9 +188,11 @@ impl Harness {
                 backend,
                 child: Some(child),
                 storage,
+                log,
             });
         }
         let h = Harness {
+            bin: bin.to_path_buf(),
             servers,
             cut,
             http,
@@ -174,23 +205,40 @@ impl Harness {
         h
     }
 
-    pub(crate) fn name(&self, i: usize) -> &str {
+    /// Override the poll deadline used by the `await_*` helpers (default 20s).
+    pub fn set_deadline(&mut self, d: Duration) {
+        self.deadline = d;
+    }
+
+    /// Advertised `server_name` of server `i` (use as a join's resident, etc.).
+    pub fn name(&self, i: usize) -> &str {
         &self.servers[i].name
     }
 
+    /// Path to server `i`'s captured stdout+stderr log (one file per server; they
+    /// never interleave across servers). Lives for the harness's lifetime, so you
+    /// can `tail -f` it during a run; removed when the harness drops.
+    pub fn log_path(&self, i: usize) -> &Path {
+        &self.servers[i].log
+    }
+
+    fn backend_of(&self, i: usize) -> String {
+        self.servers[i].backend.lock().expect("backend").clone()
+    }
+
     /// `@alice:<server_name>` — each server acts as its single default user.
-    pub(crate) fn mxid(&self, i: usize) -> String {
+    pub fn mxid(&self, i: usize) -> String {
         format!("@alice:{}", self.servers[i].name)
     }
 
     // ---- topology + lifecycle ----------------------------------------------
 
-    pub(crate) fn cut(&self, i: usize, j: usize) {
+    pub fn cut(&self, i: usize, j: usize) {
         let p = pair(self.name(i), self.name(j));
         self.cut.lock().expect("cut-set").insert(p);
     }
 
-    pub(crate) fn heal(&self, i: usize, j: usize) {
+    pub fn heal(&self, i: usize, j: usize) {
         let p = pair(self.name(i), self.name(j));
         self.cut.lock().expect("cut-set").remove(&p);
         // Reset both live senders' backoff (SIGUSR2 -> KickBackoff) so the healed
@@ -204,42 +252,60 @@ impl Harness {
 
     /// SIGKILL the server's process group — a real abrupt crash. Committed state
     /// must survive on disk; anything parked in its outbox must redeliver on revive.
-    pub(crate) fn crash(&mut self, i: usize) {
+    pub fn crash(&mut self, i: usize) {
         if let Some(mut child) = self.servers[i].child.take() {
             signal_group(&child, libc::SIGKILL);
             let _ = child.wait(); // reap the zombie
         }
     }
 
-    /// Re-spawn a crashed server with the same env (same backend port + storage
-    /// dir) and wait until it serves again.
-    pub(crate) async fn revive(&mut self, i: usize) {
-        let s = &mut self.servers[i];
-        if s.child.is_none() {
-            s.child = Some(spawn_neutrino(&s.name, &s.backend, s.storage.path()));
+    /// Re-spawn a crashed server (same advertised name + storage dir, so its
+    /// identity and committed state are unchanged) on a **fresh** backend port,
+    /// re-pointing its proxy. Reusing the old port races TIME_WAIT from the
+    /// crashed server's federation connections — fine on Linux, but macOS/BSD
+    /// rejects the rebind. Then wait until it serves again.
+    pub async fn revive(&mut self, i: usize) {
+        if self.servers[i].child.is_none() {
+            let backend = format!("127.0.0.1:{}", free_port());
+            *self.servers[i].backend.lock().expect("backend") = backend.clone();
+            let child = spawn_neutrino(
+                &self.bin,
+                &self.servers[i].name,
+                &backend,
+                self.servers[i].storage.path(),
+                &self.servers[i].log,
+            );
+            self.servers[i].child = Some(child);
         }
         self.await_ready(i).await;
     }
 
     // ---- CSAPI (always over the backend port — never partitioned) -----------
 
-    async fn cs(&self, i: usize, method: reqwest::Method, path: &str, body: Value) -> (u16, Value) {
-        let url = format!("http://{}/{}", self.servers[i].backend, path);
-        let resp = self
-            .http
-            .request(method, &url)
-            .json(&body)
-            .send()
-            .await
-            .expect("csapi request");
-        let st = resp.status().as_u16();
-        let val = resp.json::<Value>().await.unwrap_or(Value::Null);
-        (st, val)
+    /// Issue a CSAPI request to server `i`'s backend; returns `(status, body)`,
+    /// or `(0, Null)` on a transport error so callers can poll a crashed or
+    /// still-booting peer without panicking.
+    pub async fn request(
+        &self,
+        i: usize,
+        method: reqwest::Method,
+        path: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        let url = format!("http://{}/{}", self.backend_of(i), path);
+        match self.http.request(method, &url).json(&body).send().await {
+            Ok(resp) => {
+                let st = resp.status().as_u16();
+                let val = resp.json::<Value>().await.unwrap_or(Value::Null);
+                (st, val)
+            }
+            Err(_) => (0, Value::Null),
+        }
     }
 
-    pub(crate) async fn create_room(&self, i: usize, name: &str) -> String {
+    pub async fn create_room(&self, i: usize, name: &str) -> String {
         let (st, val) = self
-            .cs(
+            .request(
                 i,
                 reqwest::Method::POST,
                 "_matrix/client/v3/createRoom",
@@ -253,8 +319,8 @@ impl Harness {
             .to_owned()
     }
 
-    pub(crate) async fn invite(&self, i: usize, room: &str, target: &str) -> u16 {
-        self.cs(
+    pub async fn invite(&self, i: usize, room: &str, target: &str) -> u16 {
+        self.request(
             i,
             reqwest::Method::POST,
             &format!("_matrix/client/v3/rooms/{room}/invite"),
@@ -265,25 +331,23 @@ impl Harness {
     }
 
     /// `POST /join/{room}?server_name=<resident>` — join via a resident server.
-    pub(crate) async fn join(&self, i: usize, room: &str, resident: &str) -> u16 {
+    pub async fn join(&self, i: usize, room: &str, resident: &str) -> u16 {
         // `resident` is `127.0.0.1:<port>` — only query-safe chars, so inline it
         // (this reqwest feature set has no `RequestBuilder::query`).
         let url = format!(
             "http://{}/_matrix/client/v3/join/{room}?server_name={resident}",
-            self.servers[i].backend
+            self.backend_of(i)
         );
-        let resp = self
-            .http
-            .post(&url)
-            .json(&json!({}))
-            .send()
-            .await
-            .expect("join request");
-        resp.status().as_u16()
+        // Transport-tolerant like `request`: 0 on a connection error so a caller
+        // polling a crashed/booting peer doesn't panic.
+        match self.http.post(&url).json(&json!({})).send().await {
+            Ok(resp) => resp.status().as_u16(),
+            Err(_) => 0,
+        }
     }
 
-    pub(crate) async fn leave(&self, i: usize, room: &str) -> u16 {
-        self.cs(
+    pub async fn leave(&self, i: usize, room: &str) -> u16 {
+        self.request(
             i,
             reqwest::Method::POST,
             &format!("_matrix/client/v3/rooms/{room}/leave"),
@@ -293,8 +357,8 @@ impl Harness {
         .0
     }
 
-    pub(crate) async fn set_name(&self, i: usize, room: &str, name: &str) -> u16 {
-        self.cs(
+    pub async fn set_name(&self, i: usize, room: &str, name: &str) -> u16 {
+        self.request(
             i,
             reqwest::Method::PUT,
             &format!("_matrix/client/v3/rooms/{room}/state/m.room.name"),
@@ -304,9 +368,9 @@ impl Harness {
         .0
     }
 
-    pub(crate) async fn send_message(&self, i: usize, room: &str, body: &str) -> u16 {
+    pub async fn send_message(&self, i: usize, room: &str, body: &str) -> u16 {
         let txn = self.txn.fetch_add(1, Ordering::Relaxed);
-        self.cs(
+        self.request(
             i,
             reqwest::Method::PUT,
             &format!("_matrix/client/v3/rooms/{room}/send/m.room.message/t{txn}"),
@@ -318,9 +382,11 @@ impl Harness {
 
     /// Set `target`'s power level (read-modify-write of `m.room.power_levels`,
     /// since a PUT replaces the whole content).
-    pub(crate) async fn set_power(&self, i: usize, room: &str, target: &str, level: i64) -> u16 {
+    pub async fn set_power(&self, i: usize, room: &str, target: &str, level: i64) -> u16 {
         let path = format!("_matrix/client/v3/rooms/{room}/state/m.room.power_levels");
-        let (st, mut content) = self.cs(i, reqwest::Method::GET, &path, Value::Null).await;
+        let (st, mut content) = self
+            .request(i, reqwest::Method::GET, &path, Value::Null)
+            .await;
         if !(200..300).contains(&st) {
             return st;
         }
@@ -328,15 +394,17 @@ impl Harness {
             content["users"] = json!({});
         }
         content["users"][target] = json!(level);
-        self.cs(i, reqwest::Method::PUT, &path, content).await.0
+        self.request(i, reqwest::Method::PUT, &path, content)
+            .await
+            .0
     }
 
     // ---- reads --------------------------------------------------------------
 
     /// Resolved `/state` array, or `None` if unreadable.
-    async fn state(&self, i: usize, room: &str) -> Option<Value> {
+    pub async fn state(&self, i: usize, room: &str) -> Option<Value> {
         let (st, val) = self
-            .cs(
+            .request(
                 i,
                 reqwest::Method::GET,
                 &format!("_matrix/client/v3/rooms/{room}/state"),
@@ -347,7 +415,7 @@ impl Harness {
     }
 
     /// Sorted `(type, state_key, event_id)` triples for one server.
-    async fn state_map(&self, i: usize, room: &str) -> Option<Vec<(String, String, String)>> {
+    pub async fn state_map(&self, i: usize, room: &str) -> Option<Vec<(String, String, String)>> {
         let arr = self.state(i, room).await?;
         let arr = arr.as_array()?;
         let mut out = Vec::with_capacity(arr.len());
@@ -367,7 +435,7 @@ impl Harness {
         Some(out)
     }
 
-    pub(crate) async fn current_name(&self, i: usize, room: &str) -> Option<String> {
+    pub async fn current_name(&self, i: usize, room: &str) -> Option<String> {
         let arr = self.state(i, room).await?;
         arr.as_array()?
             .iter()
@@ -377,7 +445,7 @@ impl Harness {
             .map(str::to_owned)
     }
 
-    async fn membership(&self, i: usize, room: &str, mxid: &str) -> String {
+    pub async fn membership(&self, i: usize, room: &str, mxid: &str) -> String {
         let Some(arr) = self.state(i, room).await else {
             return "unreadable".to_owned();
         };
@@ -395,7 +463,7 @@ impl Harness {
     }
 
     /// `target`'s explicit power level in `i`'s resolved state, if set.
-    async fn current_power(&self, i: usize, room: &str, target: &str) -> Option<i64> {
+    pub async fn current_power(&self, i: usize, room: &str, target: &str) -> Option<i64> {
         let arr = self.state(i, room).await?;
         arr.as_array()?
             .iter()
@@ -406,10 +474,10 @@ impl Harness {
 
     /// `i`'s sliding-sync timeline for `room` (initial sync, no `pos`, large
     /// `timeline_limit`) — same coverage as `/messages`, including state PDUs.
-    async fn sync_timeline(&self, i: usize, room: &str) -> Vec<Value> {
+    pub async fn sync_timeline(&self, i: usize, room: &str) -> Vec<Value> {
         let body =
             json!({ "lists": { "default": { "ranges": [[0, 99]], "timeline_limit": 1000 } } });
-        let (st, val) = self.cs(i, reqwest::Method::POST, SYNC, body).await;
+        let (st, val) = self.request(i, reqwest::Method::POST, SYNC, body).await;
         if !(200..300).contains(&st) {
             return Vec::new();
         }
@@ -432,12 +500,29 @@ impl Harness {
             {
                 return;
             }
-            assert!(Instant::now() < deadline, "server {i} never became ready");
+            if Instant::now() >= deadline {
+                panic!(
+                    "server {i} never became ready; last child log:\n{}",
+                    self.child_log_tail(i)
+                );
+            }
             sleep(Duration::from_millis(50)).await;
         }
     }
 
-    pub(crate) async fn await_membership(&self, i: usize, room: &str, mxid: &str, want: &str) {
+    /// The tail (last ~40 lines) of server `i`'s captured stdout+stderr — surfaced
+    /// when it fails to come up, so a startup/bind error is visible not guessed.
+    pub fn child_log_tail(&self, i: usize) -> String {
+        let text = std::fs::read_to_string(&self.servers[i].log).unwrap_or_default();
+        if text.is_empty() {
+            return "(child log empty)".to_owned();
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines.len().saturating_sub(40);
+        lines[start..].join("\n")
+    }
+
+    pub async fn await_membership(&self, i: usize, room: &str, mxid: &str, want: &str) {
         let deadline = Instant::now() + self.deadline;
         loop {
             if self.membership(i, room, mxid).await == want {
@@ -451,7 +536,7 @@ impl Harness {
         }
     }
 
-    pub(crate) async fn await_name(&self, i: usize, room: &str, want: &str) {
+    pub async fn await_name(&self, i: usize, room: &str, want: &str) {
         let deadline = Instant::now() + self.deadline;
         loop {
             if self.current_name(i, room).await.as_deref() == Some(want) {
@@ -465,7 +550,7 @@ impl Harness {
         }
     }
 
-    pub(crate) async fn await_power(&self, i: usize, room: &str, target: &str, level: i64) {
+    pub async fn await_power(&self, i: usize, room: &str, target: &str, level: i64) {
         let deadline = Instant::now() + self.deadline;
         loop {
             if self.current_power(i, room, target).await == Some(level) {
@@ -480,7 +565,7 @@ impl Harness {
     }
 
     /// Wait until every server in `who` has a byte-identical resolved `/state`.
-    pub(crate) async fn await_converged(&self, room: &str, who: &[usize]) {
+    pub async fn await_converged(&self, room: &str, who: &[usize]) {
         let deadline = Instant::now() + self.deadline;
         loop {
             let mut maps = Vec::with_capacity(who.len());
@@ -501,18 +586,13 @@ impl Harness {
 
     /// One-shot: does `i`'s current sliding-sync timeline for `room` contain an
     /// event matching `pred`? (No polling — for asserting *absence* at a point.)
-    pub(crate) async fn timeline_has(
-        &self,
-        i: usize,
-        room: &str,
-        pred: impl Fn(&Value) -> bool,
-    ) -> bool {
+    pub async fn timeline_has(&self, i: usize, room: &str, pred: impl Fn(&Value) -> bool) -> bool {
         self.sync_timeline(i, room).await.iter().any(&pred)
     }
 
     /// Wait until `i`'s sliding-sync timeline for `room` contains an event
     /// matching `pred`. `desc` names the wait for the panic message.
-    pub(crate) async fn await_timeline(
+    pub async fn await_timeline(
         &self,
         i: usize,
         room: &str,
@@ -543,19 +623,11 @@ impl Drop for Harness {
     }
 }
 
-/// SIGKILL/SIGUSR2 a child's whole process group (negative pid). The child was
-/// spawned with `process_group(0)`, so its pid is its pgid.
-fn signal_group(child: &Child, sig: i32) {
-    // SAFETY: `kill(2)` with a negative pid targets the process group; a dead
-    // group just yields ESRCH.
-    unsafe {
-        libc::kill(-(child.id() as i32), sig);
-    }
-}
-
 #[derive(Clone)]
 struct ProxyState {
-    backend: String,
+    /// Re-pointed on `revive` (shared with the `Server`), so the proxy always
+    /// forwards to the live child's current backend port.
+    backend: Arc<Mutex<String>>,
     me: String,
     cut: CutSet,
     client: reqwest::Client,
@@ -591,7 +663,8 @@ async fn proxy_handler(State(st): State<ProxyState>, req: Request) -> Response {
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
-    let url = format!("http://{}{}", st.backend, path_and_query);
+    let backend = st.backend.lock().expect("backend").clone();
+    let url = format!("http://{backend}{path_and_query}");
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
     let mut out = st.client.request(method, &url).body(bytes.to_vec());

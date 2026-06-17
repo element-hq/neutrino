@@ -1,0 +1,17 @@
+[package]
+name = "neutrino-testkit"
+version = "0.1.0"
+edition = "2024"
+
+# In-process multi-server federation test harness: spawns real `neutrino`
+# binaries on loopback and drives real federation HTTP between them, with
+# toggleable proxy partitions and real SIGKILL crash/revive. Shared by the
+# `neutrino` crate's integration tests and the `converge` fuzzer. Depends on no
+# other neutrino crate — it spawns a binary at a caller-provided path.
+[dependencies]
+axum = "0.8.7"
+libc = "0.2.186"
+reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
+serde_json.workspace = true
+tempfile = "3.27.0"
+tokio.workspace = true

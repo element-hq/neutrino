@@ -52,6 +52,26 @@ jobs:
       - run: cargo nextest run -p neutrino-http --features multi-user-shim --lib multi_user
       - run: cargo nextest run -p neutrino-http --features multi-user-shim --test e2e_multi_user
 
+  converge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+      # In-process federation convergence fuzzer (no docker). A fresh seed each
+      # run explores a new op sequence; on failure it prints the seed + full op
+      # log so the exact run reproduces locally with `cargo run -p converge -- <seed>`.
+      - run: cargo run -p converge
+        env:
+          EPISODES: "4"
+          ROUNDS_PER_EPISODE: "12"
+          CRASH_PROB: "15"
+
   complement:
     runs-on: ubuntu-latest
     steps:

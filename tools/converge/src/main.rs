@@ -1,9 +1,12 @@
-//! converge — seeded, randomized convergence fuzzer over the 3-server rig.
+//! converge — seeded, randomized convergence fuzzer over an in-process 3-server
+//! rig (`neutrino-testkit`: real `neutrino` child processes on loopback, proxy
+//! partitions, SIGKILL crash/revive — no docker, no `nctl`).
 //!
-//! The Rust port of the former `testrig/converge.sh`. It drives random episodes
-//! of room operations interleaved with random partition cut/heal, heals
-//! everything at a barrier, and asserts every joined server reaches a
-//! byte-identical resolved `/state` with no locally-accepted message lost.
+//! It drives random episodes of room operations interleaved with random partition
+//! cut/heal, heals everything at a barrier, and asserts every joined server
+//! reaches a byte-identical resolved `/state` with no locally-accepted message
+//! lost. The three logical servers `hs1`/`hs2`/`hs3` are the model's keys; their
+//! real Matrix server-name and address are resolved through the rig.
 //!
 //! Usage:
 //!   converge [SEED]
@@ -23,10 +26,9 @@
 //!
 //! ## Determinism
 //!
-//! One [`StdRng`] seeded from `SEED` is the single source of every choice. Unlike
-//! the bash original there is no shared-`$RANDOM`-stream hazard: room mutations
-//! run over HTTP in-process (no child process burns the stream), so the op
-//! sequence is a pure function of the seed.
+//! One [`StdRng`] seeded from `SEED` is the single source of every choice; the op
+//! sequence is a pure function of the seed (federation *delivery* timing is async
+//! and not seed-controlled, so runs are highly reproducible, not bit-identical).
 //!
 //! ## Two-tier status policy
 //!
@@ -40,20 +42,18 @@
 //!
 //! ## Topology control
 //!
-//! Partition cut/heal is delegated to `testrig/nctl partition`, which owns the
-//! docker-network manipulation (and the `--alias` heal fix). The harness itself
-//! sends no SIGUSR2: `nctl`'s heal already resets outbound backoff on both ends
-//! of the healed link, so a healed link drains without any explicit per-poll
-//! kick from here.
+//! Partition cut/heal is delegated to the rig's proxy cut-set ([`Harness::cut`] /
+//! [`Harness::heal`]); a cut 503s federation between the pair, parking it in the
+//! sender's durable outbox. Heal clears the cut and resets outbound backoff on
+//! both ends (SIGUSR2 -> KickBackoff), so a healed link drains promptly.
 //!
 //! ## Crash testing
 //!
-//! `CRASH_PROB`% of rounds (default 10) instead crash a live server (`nctl
-//! crash` => SIGKILL — no graceful shutdown) or revive a crashed one (`nctl
-//! revive` => `docker start`). This is distinct from a partition: a cut leaves
-//! the process alive (its outbox accrues and retries), a crash kills it
-//! outright. The container filesystem — and `/data/neutrino.db` — survives the
-//! kill (only `compose down -v` wipes it), so the revived process recovers its
+//! `CRASH_PROB`% of rounds (default 10) instead crash a live server (SIGKILL the
+//! real `neutrino` process) or revive a crashed one (re-spawn on the same on-disk
+//! storage). This is distinct from a partition: a cut leaves the process alive
+//! (its outbox accrues and retries), a crash kills it outright. The storage dir
+//! is parent-owned and survives the kill, so the revived process recovers its
 //! committed state and re-arms its outbox sender on startup, redelivering any
 //! federation transaction parked before the crash. With WAL + `synchronous =
 //! NORMAL`, a SIGKILL preserves committed data via the OS page cache, so this
@@ -63,31 +63,27 @@
 //! end (recovery was vacuous) — mirroring the partition divergence guard.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use reqwest::Method;
 use serde_json::{Value, json};
-use tokio::process::Command;
 use tokio::time::sleep;
 
 const CS: &str = "_matrix/client/v3";
 const SERVERS: [&str; 3] = ["hs1", "hs2", "hs3"];
 const LINKS: [&str; 3] = ["12", "13", "23"];
 
-fn port_of(hs: &str) -> u16 {
+/// Logical server label (`"hs1"`/`"hs2"`/`"hs3"`) -> rig index. The labels are
+/// the model's keys; their real Matrix server-name + address are resolved through
+/// the rig (`rig.name(idx)` / `rig.mxid(idx)` / `rig.backend(idx)`).
+fn idx(hs: &str) -> usize {
     match hs {
-        "hs1" => 8001,
-        "hs2" => 8002,
-        "hs3" => 8003,
+        "hs2" => 1,
+        "hs3" => 2,
         _ => 0,
     }
-}
-
-fn mxid(hs: &str) -> String {
-    format!("@alice:{hs}")
 }
 
 /// pair key -> the two server names it separates (`"12"` -> `("hs1","hs2")`).
@@ -217,30 +213,14 @@ struct Config {
     crash_prob: u32,
 }
 
-/// Best-effort `docker compose down -v` on drop, so a panic still tears the rig
-/// down. The normal paths also call [`Harness::cleanup`] explicitly (it runs
-/// before any `process::exit`, which would skip this guard).
-struct ComposeGuard {
-    compose_file: PathBuf,
-}
-
-impl Drop for ComposeGuard {
-    fn drop(&mut self) {
-        let _ = std::process::Command::new("docker")
-            .arg("compose")
-            .arg("-f")
-            .arg(&self.compose_file)
-            .args(["down", "-v"])
-            .output();
-    }
-}
-
 struct Harness {
     cfg: Config,
     seed: u64,
     rng: StdRng,
-    client: reqwest::Client,
-    rig_dir: PathBuf,
+    /// The in-process rig: real `neutrino` child processes + proxy partitions +
+    /// SIGKILL crash/revive. Replaces docker-compose + `nctl`; its `Drop` kills
+    /// the children, so no explicit teardown guard is needed.
+    rig: neutrino_testkit::Harness,
     room: String,
     txn_ctr: u64,
     seq: u64,
@@ -284,7 +264,7 @@ fn env_u32(key: &str, default: u32) -> u32 {
 }
 
 impl Harness {
-    fn new() -> Self {
+    async fn new(bin: &std::path::Path) -> Self {
         let seed = std::env::args()
             .nth(1)
             .and_then(|s| s.parse::<u64>().ok())
@@ -298,13 +278,13 @@ impl Harness {
             strict_event_presence: env_u32("STRICT_EVENT_PRESENCE", 1) == 1,
             crash_prob: env_u32("CRASH_PROB", 10).min(55),
         };
-        let rig_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testrig");
+        let mut rig = neutrino_testkit::Harness::start(SERVERS.len(), bin).await;
+        rig.set_deadline(cfg.deadline);
         Harness {
             cfg,
             seed,
             rng: StdRng::seed_from_u64(seed),
-            client: reqwest::Client::new(),
-            rig_dir,
+            rig,
             room: String::new(),
             txn_ctr: 0,
             seq: 0,
@@ -371,8 +351,14 @@ impl Harness {
 
     // ---- low-level HTTP -----------------------------------------------------
 
-    /// Issue a request; returns `(status, body)` with `(0, Null)` on transport
-    /// error (so read polls tolerate a partitioned/booting peer).
+    /// This server's Matrix user id, `@alice:<dynamic server_name>` (the rig's
+    /// advertised loopback address — not the logical `hsN` label).
+    fn mxid(&self, hs: &str) -> String {
+        self.rig.mxid(idx(hs))
+    }
+
+    /// Issue a CSAPI request to `hs`'s backend; `(0, Null)` on transport error
+    /// (so read polls tolerate a partitioned/booting/crashed peer).
     async fn http(
         &self,
         method: Method,
@@ -380,19 +366,9 @@ impl Harness {
         path: &str,
         body: Option<Value>,
     ) -> (u16, Value) {
-        let url = format!("http://localhost:{}/{}", port_of(hs), path);
-        let mut rb = self.client.request(method, &url);
-        if let Some(b) = body {
-            rb = rb.json(&b);
-        }
-        match rb.send().await {
-            Ok(resp) => {
-                let st = resp.status().as_u16();
-                let txt = resp.text().await.unwrap_or_default();
-                (st, serde_json::from_str(&txt).unwrap_or(Value::Null))
-            }
-            Err(_) => (0, Value::Null),
-        }
+        self.rig
+            .request(idx(hs), method, path, body.unwrap_or(Value::Null))
+            .await
     }
 
     async fn get(&self, hs: &str, path: &str) -> (u16, Value) {
@@ -415,7 +391,9 @@ impl Harness {
     async fn issue(&mut self, op: &Op) -> Outcome {
         match op {
             Op::Join { hs, resident } => {
-                let p = format!("{CS}/join/{}?server_name={resident}", self.room);
+                // `resident` is a logical label; dial its real advertised name.
+                let resident_name = self.rig.name(idx(resident)).to_owned();
+                let p = format!("{CS}/join/{}?server_name={resident_name}", self.room);
                 self.mutate(hs, Method::POST, &p, Some(json!({}))).await
             }
             Op::Leave { hs } => {
@@ -447,7 +425,7 @@ impl Harness {
                     hs,
                     Method::POST,
                     &p,
-                    Some(json!({ "user_id": mxid(target) })),
+                    Some(json!({ "user_id": self.mxid(target) })),
                 )
                 .await
             }
@@ -457,7 +435,7 @@ impl Harness {
                     hs,
                     Method::POST,
                     &p,
-                    Some(json!({"user_id": mxid(target), "reason": "kick"})),
+                    Some(json!({"user_id": self.mxid(target), "reason": "kick"})),
                 )
                 .await
             }
@@ -481,7 +459,7 @@ impl Harness {
         if !content.get("users").map(Value::is_object).unwrap_or(false) {
             content["users"] = json!({});
         }
-        content["users"][mxid(target)] = json!(level);
+        content["users"][self.mxid(target)] = json!(level);
         self.mutate(hs, Method::PUT, &p, Some(content)).await
     }
 
@@ -575,7 +553,7 @@ impl Harness {
             .and_then(|e| e.get("m.room.power_levels"))
             .and_then(Value::as_i64);
         for hs in SERVERS {
-            let u = mxid(hs);
+            let u = self.mxid(hs);
             let p = plc
                 .get("users")
                 .and_then(|us| us.get(&u))
@@ -646,7 +624,7 @@ impl Harness {
     // ---- single-fact polls --------------------------------------------------
 
     async fn poll_member(&self, viewer: &str, subj: &str, want: &str) -> Result<(), String> {
-        let u = mxid(subj);
+        let u = self.mxid(subj);
         let deadline = Instant::now() + self.cfg.deadline;
         loop {
             let (st, val) = self
@@ -669,7 +647,7 @@ impl Harness {
         cmp: &str,
         lvl: i64,
     ) -> Result<(), String> {
-        let u = mxid(subj);
+        let u = self.mxid(subj);
         let deadline = Instant::now() + self.cfg.deadline;
         loop {
             let (st, val) = self
@@ -852,7 +830,7 @@ impl Harness {
             .get(hs, &format!("{CS}/rooms/{}/state", self.room))
             .await;
         let cur = if (200..300).contains(&st) {
-            membership_of(&val, &mxid(hs))
+            membership_of(&val, &self.mxid(hs))
         } else {
             "leave".to_string()
         };
@@ -872,16 +850,10 @@ impl Harness {
     async fn barrier(&mut self) -> Result<(), String> {
         self.log("barrier: revive crashed servers, heal all links, restore membership, converge");
         self.sample_divergence().await;
-        // Heal every link BEFORE reviving. A crashed server that was a cut
-        // endpoint comes back from `docker start` still detached from those
-        // networks: `docker network disconnect` mutates the container's network
-        // set, and `docker start` — unlike `compose up` — restarts with that
-        // reduced set, NOT the compose spec. `docker network connect` works on a
-        // stopped container, so healing first reattaches it; the subsequent
-        // `docker start` then comes up fully wired and its published host port
-        // (which `wait_ready` probes) can forward. Healing *after* revive would
-        // deadlock: `revive` blocks in `wait_ready`, which can never pass while
-        // the revived server has no network behind its published port.
+        // Heal every link, then revive any crashed server. (In-process, revive
+        // re-spawns a real process and needs no link healed first — but healing
+        // up front is the simplest way to reach a fully-connected cluster before
+        // the convergence gate.)
         for k in LINKS {
             if !self.is_up(k) {
                 self.partition("heal", k).await;
@@ -1178,12 +1150,7 @@ impl Harness {
     /// Crash a live server or revive a dead one (biased toward reviving so a
     /// crash doesn't pin a server down for the whole episode). At least one
     /// server is always kept alive, so the rig keeps making progress and a
-    /// readable `/state` always exists for the divergence probes. `docker start`
-    /// does NOT reattach networks a prior `docker network disconnect` removed, so
-    /// any cut touching the revived server is healed *first* (reconnecting the
-    /// stopped container) before it is started — otherwise `wait_ready` can never
-    /// pass for a server that crashed fully partitioned. The model is squared
-    /// with that here.
+    /// readable `/state` always exists for the divergence probes.
     async fn fuzz_crash(&mut self) -> Result<(), String> {
         let alive: Vec<&str> = SERVERS.into_iter().filter(|s| self.is_proc_up(s)).collect();
         let dead: Vec<&str> = SERVERS
@@ -1193,23 +1160,10 @@ impl Harness {
         let do_revive = !dead.is_empty() && (alive.len() < 2 || self.rng.random_range(0..2) == 0);
         if do_revive {
             let hs = dead[self.rng.random_range(0..dead.len())];
-            // Reattach hs's networks BEFORE reviving: `docker start` does not
-            // restore networks a prior `docker network disconnect` removed, so
-            // reconnect them (works on the stopped container) first — otherwise
-            // `revive`'s `wait_ready` can never pass when hs crashed fully
-            // partitioned (its published host port has no network to forward
-            // from). Mirrors the heal-then-revive ordering in `barrier`.
-            for k in LINKS {
-                let (a, b) = link_servers(k);
-                if (a == hs || b == hs) && !self.is_up(k) {
-                    self.partition("heal", k).await;
-                    self.up.insert(k.to_string(), true);
-                }
-            }
             self.revive(hs).await?;
             self.up_proc.insert(hs.to_string(), true);
             self.oplog(&format!(
-                "revive {hs} (restart; heal-then-start, fully reconnected)"
+                "revive {hs} (re-spawn; recovers committed state + outbox)"
             ));
         } else if alive.len() >= 2 {
             let hs = alive[self.rng.random_range(0..alive.len())];
@@ -1246,101 +1200,32 @@ impl Harness {
         Ok(())
     }
 
-    // ---- rig lifecycle ------------------------------------------------------
+    // ---- rig lifecycle (delegated to the in-process testkit) ----------------
 
-    async fn compose(&self, args: &[&str]) -> bool {
-        let compose_file = self.rig_dir.join("docker-compose.yml");
-        Command::new("docker")
-            .arg("compose")
-            .arg("-f")
-            .arg(&compose_file)
-            .args(args)
-            .output()
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+    /// Topology control. The rig's `heal` resets outbound backoff on both ends
+    /// (SIGUSR2 -> KickBackoff), so the harness never signals the servers itself.
+    async fn partition(&mut self, action: &str, link: &str) {
+        let (a, b) = link_servers(link);
+        match action {
+            "cut" => self.rig.cut(idx(a), idx(b)),
+            _ => self.rig.heal(idx(a), idx(b)),
+        }
     }
 
-    /// Run `nctl <args>` (best-effort; topology/crash control is fire-and-forget,
-    /// the harness re-reads reality via polls).
-    async fn nctl(&self, args: &[&str]) {
-        let nctl = self.rig_dir.join("nctl");
-        let _ = Command::new(&nctl).args(args).output().await;
+    /// Hard-crash a server: SIGKILL the real `neutrino` process. `/data` survives
+    /// (parent-owned tempdir), so this models a process crash, not host power-loss.
+    async fn crash(&mut self, hs: &str) {
+        self.rig.crash(idx(hs));
     }
 
-    /// Topology control via `nctl partition`. `nctl`'s heal resets outbound
-    /// backoff on both ends, so the harness never signals the servers itself.
-    async fn partition(&self, action: &str, link: &str) {
-        self.nctl(&["partition", action, link]).await;
-    }
-
-    /// Hard-crash a server (`nctl crash` => SIGKILL). The process dies with no
-    /// graceful shutdown; `/data` on disk survives, so this models a process
-    /// crash, not host power-loss.
-    async fn crash(&self, hs: &str) {
-        self.nctl(&["crash", hs]).await;
-    }
-
-    /// Restart a crashed server and wait for it to serve again. `docker start`
-    /// recovers `/data` (committed state) and the server re-arms its outbox
-    /// sender on startup; the trailing `nctl kick` resets every peer's backoff so
-    /// delivery to/from the revived server resumes immediately instead of waiting
-    /// out a backoff that built up while it was down.
-    ///
-    /// PRECONDITION: any cut link touching `hs` must be healed first. `docker
-    /// start` does not reattach networks a prior `docker network disconnect`
-    /// removed, and `wait_ready` probes the published host port, which cannot
-    /// forward to a container with no network. Callers heal-then-revive.
-    async fn revive(&self, hs: &str) -> Result<(), String> {
-        self.nctl(&["revive", hs]).await;
-        self.wait_ready(hs).await?;
-        self.nctl(&["kick"]).await;
+    /// Re-spawn a crashed server and wait for it to serve again. It re-opens its
+    /// on-disk DB (recovering committed state) and re-arms its outbox sender;
+    /// with `NEUTRINO_STARTUP_JITTER_MS=0` it redrains immediately, and the
+    /// caller's subsequent heal resets peer backoff. Unlike the old docker path
+    /// there is no network to reattach, so links need not be healed first.
+    async fn revive(&mut self, hs: &str) -> Result<(), String> {
+        self.rig.revive(idx(hs)).await;
         Ok(())
-    }
-
-    async fn wait_ready(&self, hs: &str) -> Result<(), String> {
-        let url = format!("http://localhost:{}/_matrix/client/versions", port_of(hs));
-        let deadline = Instant::now() + self.cfg.deadline;
-        loop {
-            if let Ok(r) = self.client.get(&url).send().await
-                && r.status().is_success()
-            {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(format!("{hs} never became ready"));
-            }
-            sleep(Duration::from_secs(1)).await;
-        }
-    }
-
-    async fn bring_up(&mut self) -> Result<(), String> {
-        self.log(&format!(
-            "seed={} episodes={} rounds/episode={} deadline={:?}",
-            self.seed, self.cfg.episodes, self.cfg.rounds_per_episode, self.cfg.deadline
-        ));
-        self.log("starting rig");
-        let have_image = Command::new("docker")
-            .args(["image", "inspect", "neutrino-testrig:latest"])
-            .output()
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        let up_args: &[&str] = if have_image {
-            &["up", "-d"]
-        } else {
-            &["up", "-d", "--build"]
-        };
-        if !self.compose(up_args).await {
-            return Err("compose up failed".into());
-        }
-        self.wait_ready("hs1").await?;
-        self.wait_ready("hs2").await?;
-        self.wait_ready("hs3").await
-    }
-
-    async fn cleanup(&self) {
-        let _ = self.compose(&["down", "-v"]).await;
     }
 
     /// On failure, dump seed + op log + each server's resolved state + rig logs.
@@ -1366,17 +1251,9 @@ impl Harness {
                 .await;
             eprintln!("{val}");
         }
-        eprintln!("---- compose logs ----");
-        let compose_file = self.rig_dir.join("docker-compose.yml");
-        if let Ok(o) = Command::new("docker")
-            .arg("compose")
-            .arg("-f")
-            .arg(&compose_file)
-            .args(["logs", "--no-color"])
-            .output()
-            .await
-        {
-            eprintln!("{}", String::from_utf8_lossy(&o.stdout));
+        eprintln!("---- per-server child log tails ----");
+        for hs in SERVERS {
+            eprintln!("## {hs}\n{}", self.rig.child_log_tail(idx(hs)));
         }
     }
 
@@ -1417,7 +1294,17 @@ impl Harness {
     }
 
     async fn run(&mut self) -> Result<(), String> {
-        self.bring_up().await?;
+        self.log(&format!(
+            "seed={} episodes={} rounds/episode={} deadline={:?}",
+            self.seed, self.cfg.episodes, self.cfg.rounds_per_episode, self.cfg.deadline
+        ));
+        for hs in SERVERS {
+            self.note(&format!(
+                "{hs} = {} (log: {}; `tail -f` it during the run)",
+                self.rig.name(idx(hs)),
+                self.rig.log_path(idx(hs)).display()
+            ));
+        }
         self.log("create room on hs1, join hs2 + hs3");
         self.create_room().await?;
         self.expect_ok(Op::Invite {
@@ -1458,12 +1345,54 @@ impl Harness {
     }
 }
 
+/// Build the `neutrino` binary and return its path. converge isn't a cargo
+/// integration test, so it can't use `CARGO_BIN_EXE_neutrino`; instead it builds
+/// the binary itself (guaranteeing freshness) and reads the executable path from
+/// cargo's JSON artifact stream — robust to the profile / `CARGO_TARGET_DIR`.
+fn build_neutrino() -> Result<std::path::PathBuf, String> {
+    let cargo = option_env!("CARGO").unwrap_or("cargo");
+    let out = std::process::Command::new(cargo)
+        .args([
+            "build",
+            "-p",
+            "neutrino",
+            "--message-format=json-render-diagnostics",
+        ])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!(
+            "cargo build -p neutrino failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let is_neutrino_artifact = v.get("reason").and_then(Value::as_str)
+            == Some("compiler-artifact")
+            && v.get("target")
+                .and_then(|t| t.get("name"))
+                .and_then(Value::as_str)
+                == Some("neutrino");
+        if is_neutrino_artifact && let Some(exe) = v.get("executable").and_then(Value::as_str) {
+            return Ok(std::path::PathBuf::from(exe));
+        }
+    }
+    Err("cargo build produced no `neutrino` executable artifact".into())
+}
+
 #[tokio::main]
 async fn main() {
-    let mut h = Harness::new();
-    let guard = ComposeGuard {
-        compose_file: h.rig_dir.join("docker-compose.yml"),
+    let bin = match build_neutrino() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("CONVERGE FAIL: building neutrino binary: {e}");
+            std::process::exit(1);
+        }
     };
+    let mut h = Harness::new(&bin).await;
     let result = h.run().await;
     match &result {
         Ok(()) => h.log(&format!(
@@ -1475,8 +1404,7 @@ async fn main() {
             h.dump().await;
         }
     }
-    h.cleanup().await;
-    drop(guard);
+    // The rig's `Drop` kills the child servers; no docker teardown to run.
     if result.is_err() {
         std::process::exit(1);
     }

@@ -16,8 +16,5 @@ tokio.workspace = true
 neutrino-main = { path = "../neutrino-main" }
 
 [dev-dependencies]
-axum = "0.8.7"
-libc = "0.2.186"
-reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
+neutrino-testkit = { path = "../neutrino-testkit" }
 serde_json.workspace = true
-tempfile = "3.27.0"

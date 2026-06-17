@@ -4,13 +4,13 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
-# Host-side convergence fuzzer over the 3-server federation rig (testrig/). The
-# Rust port of the former testrig/converge.sh: model, oracle and PRNG live here;
-# docker/partition control is delegated to testrig/nctl. No new workspace
-# dependencies — reqwest/rand/serde_json/tokio are already in the lockfile.
+# Convergence fuzzer over an in-process 3-server federation rig. Model, oracle
+# and PRNG live here; the rig (real `neutrino` child processes + proxy partitions
+# + SIGKILL crash/revive) is `neutrino-testkit`. No docker, no `nctl`.
 
 [dependencies]
 tokio = { workspace = true }
 reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
 serde_json = { workspace = true }
 rand = { workspace = true }
+neutrino-testkit = { path = "../../crates/neutrino-testkit" }
