@@ -1,191 +1,215 @@
-# MSCXXXX: Active forward-extremity advertisement (anti-entropy tail-convergence)
+# MSCXXXX: Forward-extremity advertisement on joined-set growth
 
-The base anti-entropy proposal — [MSCXXXX: Forward-extremity reconciliation on
-federation transactions](msc-anti-entropy.md) — piggybacks each server's forward
-extremities on every `/send` (request and response) and reconciles on receipt.
-That converges any divergence between two servers **that subsequently exchange a
-transaction**. It does not converge a divergence whose triggering event reaches a
-holder *after* organic traffic to a lagging peer has already stopped: the event
-is never carried by any advertisement that peer receives, and — once the room
-goes quiet — nothing re-advertises it. This is the "tail of propagation" gap the
-base MSC explicitly deferred.
+[MSCXXXX: Forward-extremity reconciliation on federation transactions](msc-anti-entropy.md)
+(the base proposal) has each server advertise its per-room forward extremities on
+every `/send` transaction, and reconcile against the forward extremities another
+server advertises. Two servers that exchange a transaction therefore converge any
+divergence between them. A server advertises only as a side effect of traffic it
+is already sending, however. If an event reaches a server after the last
+transaction it sends to a second server that is behind — for example an event
+whose fan-out omitted that second server — no advertisement carries the event to
+it, and once the room is quiet there is no further transaction on which to
+piggyback. The divergence persists until unrelated future traffic flows between
+the two servers.
 
-This extension closes it with **active, de-duplicated forward-extremity
-advertisement**: when a server's forward extremities change and that change has
-not already been conveyed to a joined peer, the server proactively sends that
-peer an extremity-only transaction. A per-destination "last advertised" cache and
-a trailing-edge debounce hold idle and active-traffic chatter at **zero** — a
-standalone advertisement is emitted *only* for the genuinely-uncovered tail, at
-most one (coalesced) message per lagging peer.
+This MSC proposes that a server additionally advertise its forward extremities
+when a second server becomes joined in its current state. The advertisement is
+sent only to the newly-joined server, and only when the advertising server holds
+forward extremities the newly-joined server may not yet have; in every other case
+nothing is sent.
+
+## The unconverged case
+
+A server selects the recipients of an event from its current-state view of the
+room's joined members. A server that is joined in reality but not yet shown as
+joined in that view — typically one that has (re)joined concurrently, or whose
+join the selecting server has not yet applied — is omitted from the fan-out. The
+base proposal relies on a later `/send` between the two servers to advertise the
+omitted event; when no such transaction occurs, the omission is permanent.
+
+```mermaid
+sequenceDiagram
+    participant hs1
+    participant hs2
+    participant hs3
+    Note over hs1: joined view = {hs1, hs3}<br/>hs2 still only invited in hs1's view
+    hs3->>hs1: send_join $J (hs3 re-joins via hs1)
+    Note over hs1: applies $J; fan-out targets {hs3} only
+    hs1-->>hs3: $J
+    Note over hs2: does not receive $J
+    hs2->>hs1: $J2 (hs2's own join, delivered later)
+    Note over hs1: applies $J2; hs2 now joined, but a<br/>federation apply does not re-run fan-out
+    Note over hs1,hs3: hold $J
+    Note over hs2: missing $J; room is now quiet
+```
+
+`hs1` and `hs3` agree that `hs3` is joined; `hs2` continues to believe `hs3` has
+left. No further traffic corrects this.
 
 ## Proposal
 
-### The tail-of-propagation gap
+### Assumptions
 
-Under the base MSC a divergence is closed when the two servers next exchange a
-`/send` carrying forward extremities. Consider three servers and this real trace
-(timestamps from a partition-fuzz run):
+This MSC relies on the base mechanism eventually conveying a server's current
+forward extremities to every server in its joined set. A receiver backfills any
+ancestry below an advertised forward extremity with `get_missing_events` (base
+proposal), so only the forward extremities need reach it, not every individual
+event; a durable, retrying outbox is one way to provide this, but is not required.
+Given this, the only way a joined server can permanently miss an event is if the
+conveying server's current state did not list it as joined at the time — resolved
+exactly when its membership becomes `join` in that state.
 
-- `hs2` authors its last message `$M` while partitioned, with a stale view that
-  omits `hs3` from the fan-out (the base bug class: a concurrently-rejoined peer
-  the sender's snapshot still has as `leave`).
-- After the heal, `$M` reaches `hs1` at `T+27.3s` (normal `hs2→hs1` delivery).
-- But `hs3`'s **last** forward-extremity exchange with `hs1` was `T+25.8s`, and
-  with `hs2` `T+26.2s` — *both before `$M` existed on the peer they were talking
-  to*. Every reconciliation opportunity `hs3` had predates `$M`.
-- The room then goes quiet (no further `/send`). `$M` is held by `hs1` and `hs2`
-  but is never advertised to `hs3` again, so `hs3` never learns it exists and the
-  rooms stay diverged.
+It further assumes the room is not permanently partitioned: each server can, over
+time, exchange transactions with the others directly.
 
-Piggybacking is necessary but not sufficient: it only advertises *as a
-side-effect of traffic that is already flowing*, and the tail of a propagation
-burst has, by definition, no traffic after it.
+### The advertisement
 
-### Active advertisement
+An advertisement is a `PUT /_matrix/federation/v1/send/{txnId}` with an empty
+`pdus` array and a populated `forward_extremities` (base proposal). A server that
+receives one processes it as any other transaction: it reconciles against the
+advertised forward extremities and returns its own, so the sending server also
+reconciles from the response.
 
-A server maintains, per destination, the forward extremities it has **most
-recently advertised** to that peer (`last_advertised[dest]`, per room). This cache
-is updated by *every* outbound transaction that carries `forward_extremities` —
-both piggybacked `/send`s (base MSC) and the standalone advertisements defined
-here — so it always reflects what the peer was last told.
+### Advertising on joined-set growth
 
-When applying an event changes a room's forward extremities, the server:
+A server SHOULD maintain, per `(destination, room)`, the forward extremities it
+most recently advertised to that destination (`last_advertised`), updated by every
+outbound transaction carrying `forward_extremities` — whether a piggybacked
+`/send` (base proposal) or an advertisement.
 
-1. Determines the joined peers for that room (the same set the base MSC scopes
-   advertisements to) and marks each **dirty**.
-2. Arms a short **trailing-edge debounce** timer (re-armed on each subsequent
-   change), so a burst of N applied events coalesces into a single flush rather
-   than N advertisements.
-3. On the timer firing, for each dirty destination it compares the room's current
-   forward extremities against `last_advertised[dest]`. If — and only if — they
-   **differ**, it sends one extremity-only transaction (see below), covering all
-   shared rooms whose advertisement to that peer is stale, and updates the cache.
-   If they match (the peer was already told, e.g. by a piggybacked `/send` that
-   raced ahead), it sends nothing.
+When applying an event causes a server `P` to become joined in a room's current
+state, having not previously been joined, the server:
 
-An **extremity-only transaction** is an ordinary
-`PUT /_matrix/federation/v1/send/{txnId}` with an empty `pdus` array and a
-populated `forward_extremities` (base MSC). The receiver processes it exactly as
-any other transaction: it reconciles against the advertised heads and returns its
-own forward extremities, so the exchange remains bidirectional and the *sender*
-also reconciles from the response.
+1. MUST set `last_advertised[P]` for that room to `P`'s join event (overwriting any
+   previous value). `P` holds its own join event, and its ancestry is reachable
+   from it, so a server whose forward extremities are exactly that join owes `P`
+   nothing.
+2. MUST compare the room's current forward extremities against `last_advertised[P]`.
+   If they differ — the server holds a forward extremity the join does not cover —
+   it MUST send `P` one advertisement and update `last_advertised[P]`. If they are
+   equal it MUST NOT send anything.
 
-### Why this is quiet
+A server MAY wait a short time — for example up to 30 seconds — before sending, so
+that advertisements triggered by several joins at once (multiple servers, or one
+server across multiple shared rooms) coalesce into one transaction per destination.
 
-- **Idle, converged room:** forward extremities don't change, so no timer is ever
-  armed and nothing is sent. Zero bytes on the wire.
-- **Active traffic:** the piggybacked `/send`s already advertise the latest
-  extremities and update `last_advertised`; when the debounce fires it finds the
-  cache already matches and suppresses the standalone send. Effectively zero
-  extra messages.
-- **Tail:** the final FE change after traffic stops is the one case the cache does
-  *not* already cover, so exactly one (coalesced, all-rooms) advertisement is sent
-  per lagging peer. That is the minimum required for correctness.
+### Worked example
 
-The mechanism is **edge-triggered** (on FE change), not periodic, so there are no
-idle wake-ups — distinguishing it from a heartbeat timer.
+Continuing the unconverged case, `hs1` learns `hs2` is joined when it applies
+`$J2`. `hs2` enters `hs1`'s joined set; `hs1` sets `last_advertised[hs2]` to `$J2`
+and finds its current forward extremities `{$J, $J2}` differ from it (it holds
+`$J`), so it advertises.
 
-### Worked example (continued)
+```mermaid
+sequenceDiagram
+    participant hs1
+    participant hs2
+    participant hs3
+    hs2->>hs1: $J2 (hs2's join, delivered after the heal)
+    Note over hs1: hs2 enters joined set; current forward<br/>extremities {$J,$J2} differ from $J2 → advertise
+    hs1->>hs2: PUT /send (pdus: [], forward_extremities: $J, $J2)
+    Note over hs2: holds $J2, not $J
+    hs2->>hs1: get_missing_events($J) [include_latest_events]
+    hs1-->>hs2: $J
+    Note over hs2: applies $J; converged
+```
 
-`hs1` applies `$M` at `T+27.3s`; its timeline forward extremity moves to `$M`.
-That FE change marks `hs3` (a joined peer) dirty and arms the debounce. On firing,
-`hs1`'s current FEs differ from what it last advertised to `hs3` (which predated
-`$M`), so `hs1` sends `hs3` a single extremity-only transaction advertising `$M`.
-`hs3` reconciles (base MSC: one `get_missing_events` with `include_latest_events`),
-pulls `$M`, and converges — with one message, emitted only because the tail was
-genuinely uncovered.
+In a room with a linear state DAG the newly-joined server's join is built on the
+current forward extremity, so applying it makes that join the sole forward
+extremity on every server — equal to the seed — and nothing is sent. An
+advertisement arises only when a server holds a forward extremity concurrent with
+the join.
 
 ## Potential issues
 
-- **Debounce window is a latency/chatter knob.** Too short risks emitting a
-  standalone advertisement that a piggybacked `/send` would have covered a moment
-  later (wasted message); too long adds tail-convergence latency. A window on the
-  order of a second is comfortably above inter-event spacing within a burst and
-  below human-perceptible sync delay. It is a local tuning parameter, not part of
-  the wire protocol.
+The `last_advertised` cache grows with the number of destinations and shared rooms.
+Entries MAY be evicted; a miss costs at most one redundant advertisement, which the
+receiving server de-duplicates.
 
-- **`last_advertised` cache memory.** O(destinations × rooms) sets of
-  forward-extremity event IDs. Forward-extremity sets are small (usually one), and
-  the mesh + shared-room set is bounded for the embedded single-user target, so
-  this is negligible; entries can be evicted (a miss just means one redundant
-  advertisement, which the receiver de-duplicates).
+The joining server may already hold more than just their join event.
+A server may therefore advertise a forward
+extremity the joining server already has, costing one redundant round trip that the
+receiver de-duplicates.
 
-- **Cache is in-memory; lost on restart.** After a restart a server does not know
-  what it last advertised, so the first FE change per peer re-advertises once
-  (a small, one-time burst as each room next changes). Acceptable; persisting the
-  cache is possible but not worth it.
+A server joining through a resident whose state is behind draws an advertisement
+from every up-to-date server. The base proposal's handling of staged-but-unapplied
+events collapses these to a single `get_missing_events` — later advertisers find
+the forward extremities already staged — leaving a bounded number of small
+redundant round trips.
 
-- **Forward-extremity flap.** A state-resolution reorder can move and then restore
-  an extremity; the debounce + cache compare collapse a flap that nets to no
-  change into no send, and a flap that nets to a change into a single send.
+Several servers joining at once can produce up to one advertisement per pair over
+the churn, each suppressed by the seed when the joining server is up to date.
 
-- **Still one round trip per lagging peer per tail.** Unavoidable: a peer that is
-  genuinely missing an event must be told. This is the floor, not overhead.
+Convergence can take more than one round. A server that itself missed the joining
+server's join does not learn it is joined, so does not advertise to it, until it
+learns of the join transitively: an up-to-date server advertises to the joining
+server, which pulls its forward extremities (including the third server's
+membership), whose joined set then grows, and so on. Each round strictly increases
+shared knowledge over a finite set of events, so this terminates, but not
+necessarily in one round.
 
 ## Alternatives
 
-- **Periodic heartbeat.** An otherwise-empty `/send` with `forward_extremities` to
-  each joined peer on a timer. Simpler (no FE-change signal needed), but it either
-  ticks idly (chatter / wake-ups even when fully converged) or needs the same
-  `last_advertised` dedup to stay quiet — at which point it is strictly worse than
-  edge-triggering, since it adds a timer and up-to-one-interval tail latency for
-  no benefit. Rejected as the primary mechanism; the dedup cache is the part worth
-  keeping, and this MSC keeps it.
+Advertise on any forward-extremity change, rather than on joined-set growth. This
+is the more general trigger and is correct, but on a one-to-many fan-out the
+recipients do not `/send` each other, so their caches are never refreshed and each
+advertises to every other — needless transactions that grow with the square of the
+room's server count and reconcile nothing. This MSC keeps that correctness but,
+given that a joined server is eventually told a server's forward extremities,
+narrows the trigger to joined-set growth, so no advertisements arise from ordinary
+traffic.
 
-- **Advertise on every applied event (no debounce, no dedup).** Correct but chatty
-  — one advertisement per event per peer, exactly what the dedup + debounce exist
-  to avoid.
+A periodic heartbeat — an otherwise-empty `/send` carrying `forward_extremities` to
+each joined server on a timer — either sends when fully converged (needless traffic
+and wake-ups) or needs the same de-duplication to stay quiet. A server cannot know
+whether it is behind, so the timer would fire for a condition that may never hold.
+The joined-set-growth trigger fires only when a reconciliation could be required.
 
-- **Piggyback only (base MSC, no extension).** Leaves the tail-of-propagation gap
-  open: a divergence whose event lands after a pair's last exchange never
-  reconciles. This MSC exists precisely to close that.
+A catch-up or full-state push on join re-sends room state to a server when it
+(re)joins. This is rejected in the base proposal for bandwidth, and would not cover
+this case: the lagging server was already joined, and the missing event post-dates
+its join.
 
-- **Catch-up / full-state push on join.** Re-send room state to a peer when it
-  (re)joins. Rejected in the base MSC for bandwidth, and it would not even cover
-  this case — the lagging peer was already joined; the missing event post-dates
-  its join.
+Piggyback only, with no extension, leaves the unconverged case open: a divergence
+whose event lands after a pair's last exchange never reconciles.
 
 ## Security considerations
 
-- **No new amplification surface.** A standalone advertisement is triggered by
-  *our own* forward-extremity changes, never by peer input, so a remote party
-  cannot induce a server to emit advertisements (let alone a flood). The receiving
-  side reuses the base MSC's reconciliation verbatim — advertised heads are only a
-  hint to `get_missing_events`, every pulled event is auth-checked and
-  state-resolved, and the base MSC's caps / rate-limits / shared-room scoping
-  apply unchanged.
+A server that rapidly leaves and rejoins causes each other server to emit at most
+one advertisement to it per rejoin, and only under genuine divergence. The work
+lands on the server that caused it, bounded by the base proposal's rate limits; it
+is not amplification against a third server. A server MAY rate-limit advertisements
+per destination if another server's churn is abusive.
 
-- **Cache cannot be poisoned.** `last_advertised` is keyed by what *we* sent, not
-  by anything a peer supplies, so a malicious peer cannot manipulate it to
-  suppress or force advertisements.
+A server that claims a more-advanced join point than it holds suppresses others'
+advertisements to it, since they seed `last_advertised` from its join. Such a join
+fails auth and DAG validation, as its `prev_events` must exist and resolve; even if
+it did not, the only effect is that the server is not told of events it lacks — it
+starves itself, affecting no other server.
 
-- **Ignoring advertisements is harmless.** A peer that drops our extremity-only
-  transactions simply forgoes reconciliation from us; it does not affect our state
-  and our next FE change re-advertises (the cache still shows the peer as
-  not-yet-told only if our FEs changed again).
-
-- **Extremity-only transactions are cheap.** Empty `pdus`, a small ID list; they
-  carry no events and grant no authority.
-
-There are otherwise no security concerns introduced by this proposal.
+`last_advertised` is keyed by what a server itself sent, seeded from a join it
+auth-checked, and is never written from free-form input from another server, so a
+remote party cannot set it directly. Advertisements carry no events and grant no
+authority: an empty `pdus` array and a small list of IDs, whose worst case is a
+wasted `get_missing_events` bounded by the base proposal's caps.
 
 ## Unstable prefix
 
-This extension introduces **no new wire identifiers**. It reuses the base MSC's
+This MSC introduces no new wire identifiers. It reuses the base proposal's
 `forward_extremities` field on `PUT /_matrix/federation/v1/send/{txnId}`; an
-"extremity-only" advertisement is simply that transaction with an empty `pdus`
-array. The active-advertisement trigger, the `last_advertised` cache, and the
-debounce are all server-local behaviour with no observable wire addition beyond
-transactions that a base-MSC implementation already understands (and that a
-non-implementing peer already ignores).
+advertisement is that transaction with an empty `pdus` array. The trigger, the
+`last_advertised` cache, and the seed-from-join are server-local behaviour, with no
+wire addition beyond transactions a base-proposal implementation already
+understands and a non-implementing server already ignores.
 
 ## Dependencies
 
-This MSC builds directly on
-[MSCXXXX: Forward-extremity reconciliation on federation transactions](msc-anti-entropy.md)
-— it reuses that proposal's `forward_extremities` advertisement, its
-`include_latest_events` reconciliation, and its receipt-side processing
-unchanged; this extension only adds *when* a server proactively advertises. That
-in turn builds on
-[MSC4242](https://github.com/matrix-org/matrix-spec-proposals/pull/4242) (State
+This MSC depends on
+[MSCXXXX: Forward-extremity reconciliation on federation transactions](msc-anti-entropy.md),
+reusing its `forward_extremities` advertisement, its `include_latest_events`
+reconciliation, and its receipt-side processing unchanged; this MSC adds only when a
+server proactively advertises. It relies on the base mechanism eventually conveying
+a server's forward extremities to its joined set, assumes the room is not
+permanently partitioned, and — through the base proposal — depends on
+[MSC4242](https://github.com/matrix-org/matrix-spec-proposals/pull/4242) (state
 DAGs). It assumes room version 12.

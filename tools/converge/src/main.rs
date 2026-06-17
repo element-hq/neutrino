@@ -883,21 +883,28 @@ impl Harness {
     async fn barrier(&mut self) -> Result<(), String> {
         self.log("barrier: revive crashed servers, heal all links, restore membership, converge");
         self.sample_divergence().await;
-        // Revive any crashed server first: `docker start` reattaches networks
-        // nondeterministically, so the heal-all below then normalises link state
-        // regardless of what the restart left behind.
+        // Heal every link BEFORE reviving. A crashed server that was a cut
+        // endpoint comes back from `docker start` still detached from those
+        // networks: `docker network disconnect` mutates the container's network
+        // set, and `docker start` — unlike `compose up` — restarts with that
+        // reduced set, NOT the compose spec. `docker network connect` works on a
+        // stopped container, so healing first reattaches it; the subsequent
+        // `docker start` then comes up fully wired and its published host port
+        // (which `wait_ready` probes) can forward. Healing *after* revive would
+        // deadlock: `revive` blocks in `wait_ready`, which can never pass while
+        // the revived server has no network behind its published port.
+        for k in LINKS {
+            if !self.is_up(k) {
+                self.partition("heal", k).await;
+            }
+            self.up.insert(k.to_string(), true);
+        }
         for hs in SERVERS {
             if !self.is_proc_up(hs) {
                 self.revive(hs).await?;
                 self.up_proc.insert(hs.to_string(), true);
                 self.note(&format!("revived {hs} (recovers committed state + outbox)"));
             }
-        }
-        for k in LINKS {
-            if !self.is_up(k) {
-                self.partition("heal", k).await;
-            }
-            self.up.insert(k.to_string(), true);
         }
         self.ensure_joined("hs2").await?;
         self.ensure_joined("hs3").await?;
@@ -1182,10 +1189,12 @@ impl Harness {
     /// Crash a live server or revive a dead one (biased toward reviving so a
     /// crash doesn't pin a server down for the whole episode). At least one
     /// server is always kept alive, so the rig keeps making progress and a
-    /// readable `/state` always exists for the divergence probes. Reviving brings
-    /// a server back fully connected: `docker start` reattaches it to its
-    /// networks, so any cut touching it is healed — the model is squared with
-    /// that here.
+    /// readable `/state` always exists for the divergence probes. `docker start`
+    /// does NOT reattach networks a prior `docker network disconnect` removed, so
+    /// any cut touching the revived server is healed *first* (reconnecting the
+    /// stopped container) before it is started — otherwise `wait_ready` can never
+    /// pass for a server that crashed fully partitioned. The model is squared
+    /// with that here.
     async fn fuzz_crash(&mut self) -> Result<(), String> {
         let alive: Vec<&str> = SERVERS.into_iter().filter(|s| self.is_proc_up(s)).collect();
         let dead: Vec<&str> = SERVERS
@@ -1195,8 +1204,12 @@ impl Harness {
         let do_revive = !dead.is_empty() && (alive.len() < 2 || self.rng.random_range(0..2) == 0);
         if do_revive {
             let hs = dead[self.rng.random_range(0..dead.len())];
-            self.revive(hs).await?;
-            self.up_proc.insert(hs.to_string(), true);
+            // Reattach hs's networks BEFORE reviving: `docker start` does not
+            // restore networks a prior `docker network disconnect` removed, so
+            // reconnect them (works on the stopped container) first — otherwise
+            // `revive`'s `wait_ready` can never pass when hs crashed fully
+            // partitioned (its published host port has no network to forward
+            // from). Mirrors the heal-then-revive ordering in `barrier`.
             for k in LINKS {
                 let (a, b) = link_servers(k);
                 if (a == hs || b == hs) && !self.is_up(k) {
@@ -1204,8 +1217,10 @@ impl Harness {
                     self.up.insert(k.to_string(), true);
                 }
             }
+            self.revive(hs).await?;
+            self.up_proc.insert(hs.to_string(), true);
             self.oplog(&format!(
-                "revive {hs} (restart; recovers /data, fully reconnected)"
+                "revive {hs} (restart; heal-then-start, fully reconnected)"
             ));
         } else if alive.len() >= 2 {
             let hs = alive[self.rng.random_range(0..alive.len())];
@@ -1282,6 +1297,11 @@ impl Harness {
     /// sender on startup; the trailing `nctl kick` resets every peer's backoff so
     /// delivery to/from the revived server resumes immediately instead of waiting
     /// out a backoff that built up while it was down.
+    ///
+    /// PRECONDITION: any cut link touching `hs` must be healed first. `docker
+    /// start` does not reattach networks a prior `docker network disconnect`
+    /// removed, and `wait_ready` probes the published host port, which cannot
+    /// forward to a container with no network. Callers heal-then-revive.
     async fn revive(&self, hs: &str) -> Result<(), String> {
         self.nctl(&["revive", hs]).await;
         self.wait_ready(hs).await?;

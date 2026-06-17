@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use neutrino_store::{FederationOutbox, StreamPos};
 use neutrino_store_sqlite::SqliteStore;
-use ruma::{EventId, OwnedRoomId, OwnedServerName, ServerName};
+use ruma::{EventId, OwnedRoomId, OwnedServerName, RoomId, ServerName};
 use serde_json::value::RawValue as RawJsonValue;
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -168,7 +168,10 @@ async fn supervise(
     let mut running: HashMap<OwnedServerName, JoinHandle<()>> = HashMap::new();
     let mut first_round = true;
     loop {
-        match ctx.store.pending_destinations().await {
+        // Union the outbox destinations with destinations owed only an
+        // anti-entropy advertisement, so a quiescent peer with no pending PDUs
+        // but a standing advertisement obligation still gets a sender task.
+        match destinations_needing_a_task(&ctx).await {
             Ok(dests) => {
                 for dest in dests {
                     running.entry(dest.clone()).or_insert_with(|| {
@@ -190,7 +193,7 @@ async fn supervise(
                     });
                 }
             }
-            Err(e) => error!(error = %e, "enumerating outbox destinations"),
+            Err(e) => error!(error = %e, "enumerating outbound destinations"),
         }
         first_round = false;
         // Wait for the next persist (which may have added a new destination) or
@@ -209,6 +212,24 @@ async fn supervise(
     for (_, handle) in running.drain() {
         handle.abort();
     }
+}
+
+/// Every destination that needs a running sender task: the union of those with
+/// pending outbox PDUs and those owed an anti-entropy advertisement. A peer in
+/// only the second set has fallen quiet with a standing obligation — the task
+/// it gets here drains that obligation (an empty-`pdus` advertisement) and then
+/// idles like any other.
+async fn destinations_needing_a_task(
+    ctx: &SenderCtx,
+) -> Result<BTreeSet<OwnedServerName>, neutrino_store::StorageError> {
+    let mut dests: BTreeSet<OwnedServerName> = ctx
+        .store
+        .pending_destinations()
+        .await?
+        .into_iter()
+        .collect();
+    dests.extend(ctx.store.advertisement_destinations().await?);
+    Ok(dests)
 }
 
 /// Drain a single destination forever: deliver pending PDUs, then block until
@@ -246,35 +267,130 @@ async fn run_destination(
             }
         };
 
-        if batch.is_empty() {
-            // Fully drained: reset backoff and idle until the next persist.
-            backoff = BACKOFF_BASE;
-            if watch_rx.changed().await.is_err() {
-                return;
+        if !batch.is_empty() {
+            if deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await {
+                backoff = BACKOFF_BASE;
+                continue;
             }
-            continue;
+            // Shutdown (semaphore closed). Stop the task.
+            return;
         }
 
-        if deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await {
-            backoff = BACKOFF_BASE;
-        } else {
-            // Shutdown (semaphore closed). Stop the task.
+        // No PDUs pending. Drain any anti-entropy advertisement obligations
+        // before idling — a quiescent peer owed an advertisement reaches us
+        // only here (a normal `/send` would have cleared it already). Read
+        // faults are transient: back off and retry, same as the PDU read.
+        let adv_rooms = match ctx.store.pending_advertisements(&dest).await {
+            Ok(r) => r,
+            Err(e) => {
+                error!(%dest, error = %e, "reading pending advertisements");
+                if sleep_backoff(&mut backoff, &mut kick_rx).await {
+                    backoff = BACKOFF_BASE;
+                }
+                continue;
+            }
+        };
+        if !adv_rooms.is_empty() {
+            if send_advertisement(&ctx, &dest, &adv_rooms, &mut backoff, &mut kick_rx).await {
+                backoff = BACKOFF_BASE;
+                continue;
+            }
+            return;
+        }
+
+        // Fully drained (no PDUs, no advertisements): reset backoff and idle
+        // until the next persist wakes us.
+        backoff = BACKOFF_BASE;
+        if watch_rx.changed().await.is_err() {
             return;
         }
     }
 }
 
-/// Deliver one batch to `dest`, retrying transient failures in place until the
-/// batch is either delivered+removed or dropped (4xx). Returns `false` only on
-/// shutdown (the global semaphore was closed), signalling the caller to stop.
-///
-/// Per spec the same `txnId` is reused across retries of the *same* batch (the
-/// receiver dedups on `(origin, txnId)`); a fresh id is minted only once a batch
-/// is done, i.e. on the next call. Transient errors (5xx / transport) back off
-/// and retry; a 4xx is an envelope-level reject that retrying can't fix, so the
-/// batch is dropped. A post-2xx `remove_pdus` failure also backs off and retries
-/// (re-sending under the same txnId, which the peer dedups) rather than
-/// hot-looping.
+/// The terminal result of attempting one transaction, after transient (5xx /
+/// transport) failures have been retried in place under one reused `txn_id`.
+enum SendOutcome {
+    /// Peer returned 2xx; carries the forward extremities it advertised back.
+    Delivered(BTreeMap<OwnedRoomId, ForwardExtremities>),
+    /// Peer returned 4xx — the transaction envelope was rejected; retrying it
+    /// can't help, so the caller drops the work that produced it.
+    Rejected,
+    /// The global send semaphore was closed (shutdown); the caller must stop.
+    Shutdown,
+}
+
+/// Send one transaction (`pdus` + advertised `our_fes`) to `dest` under a fixed
+/// `txn_id`, retrying transient failures in place with backoff until the peer
+/// returns a terminal status. The shared core of [`deliver_batch`] and
+/// [`send_advertisement`] — an advertisement is just this with an empty `pdus`
+/// array. The caller owns `txn_id` (so a post-success durable-write fault can
+/// re-call this under the *same* id, which the peer dedups on `(origin, txnId)`)
+/// and decides what `Delivered` / `Rejected` mean for its durable state.
+async fn send_transaction_with_retry(
+    ctx: &SenderCtx,
+    dest: &ServerName,
+    txn_id: &str,
+    pdus: &[Box<RawJsonValue>],
+    our_fes: &BTreeMap<OwnedRoomId, ForwardExtremities>,
+    backoff: &mut Duration,
+    kick_rx: &mut watch::Receiver<()>,
+) -> SendOutcome {
+    let mut attempt = 0u32;
+    loop {
+        // One INFO line per attempt under the `neutrino_http` target (same as the
+        // inbound request log). Retries reuse `txn_id`, so a peer being retried
+        // (e.g. while partitioned) shows as repeating lines with a climbing
+        // `attempt`; `pdus = 0` marks an anti-entropy advertisement. The `/send`
+        // path is spelled out so it surfaces when filtering on `_matrix/federation/`.
+        attempt += 1;
+        info!(
+            target: "neutrino_http",
+            %dest,
+            txn = %txn_id,
+            pdus = pdus.len(),
+            rooms = our_fes.len(),
+            attempt,
+            "outbound PUT /_matrix/federation/v1/send",
+        );
+        // Hold a global permit only around the network call — released before
+        // any backoff sleep, so a slow peer can't pin a concurrency slot.
+        let send_result = match ctx.send_slots.acquire().await {
+            Ok(_permit) => {
+                ctx.client
+                    .send_transaction(dest, txn_id, pdus, our_fes)
+                    .await
+            }
+            // The semaphore is never closed in normal operation; an error here
+            // means shutdown.
+            Err(_) => return SendOutcome::Shutdown,
+        };
+
+        match send_result {
+            Ok(peer_fes) => return SendOutcome::Delivered(peer_fes),
+            // 4xx: the peer rejected the envelope. Retrying is futile.
+            Err(FederationClientError::Status(code)) if (400..500).contains(&code) => {
+                warn!(%dest, code, pdus = pdus.len(), "peer rejected transaction (4xx)");
+                return SendOutcome::Rejected;
+            }
+            // 5xx / transport / URL: transient. Back off and retry under the same
+            // txn_id.
+            Err(e) => {
+                warn!(%dest, error = %e, backoff = ?backoff, "transaction delivery failed; will retry");
+                if sleep_backoff(backoff, kick_rx).await {
+                    *backoff = BACKOFF_BASE;
+                }
+            }
+        }
+    }
+}
+
+/// Deliver one outbox batch to `dest`: a transaction carrying the batch's PDUs
+/// and our forward extremities. On a 2xx the batch is removed from the outbox
+/// and — because the transaction carried our heads — any standing advertisement
+/// obligation for the rooms it covered is cleared (the piggyback IS the
+/// advertisement). A 4xx drops the batch but leaves the obligation (our heads
+/// never landed, so the duty stands). A post-2xx `remove_pdus` fault re-sends
+/// under the same txn id (the peer dedups). Returns `false` only on shutdown.
 async fn deliver_batch(
     ctx: &SenderCtx,
     dest: &ServerName,
@@ -284,11 +400,9 @@ async fn deliver_batch(
 ) -> bool {
     let pdus: Vec<Box<RawJsonValue>> = batch.iter().map(|e| e.raw.clone()).collect();
     let ids: Vec<&EventId> = batch.iter().map(|e| &*e.event_id).collect();
-    let txn_id = ctx.idgen.next_id();
 
-    // Anti-entropy: advertise our forward extremities for every room in this
-    // batch, so the peer can reconcile against us. Computed once at send time
-    // (re-using the same value across retries is fine — it's only a hint).
+    // Advertise our forward extremities for every room in the batch so the peer
+    // reconciles against us. Computed once (reused across retries — it's a hint).
     let mut our_fes: BTreeMap<OwnedRoomId, ForwardExtremities> = BTreeMap::new();
     let rooms: BTreeSet<OwnedRoomId> = batch.iter().map(|e| e.room_id.clone()).collect();
     for room in &rooms {
@@ -298,72 +412,128 @@ async fn deliver_batch(
         }
     }
 
-    let mut attempt = 0u32;
+    let txn_id = ctx.idgen.next_id();
     loop {
-        // One INFO line per send attempt, under the same `neutrino_http` target
-        // as the inbound request log. Retries reuse the same `txn_id`, so a peer
-        // being retried (e.g. while partitioned) shows as repeating lines with a
-        // climbing `attempt`. The `/send` path is spelled out so it surfaces when
-        // filtering federation traffic on `_matrix/federation/`.
-        attempt += 1;
-        info!(
-            target: "neutrino_http",
-            %dest,
-            txn = %txn_id,
-            pdus = pdus.len(),
-            attempt,
-            "outbound PUT /_matrix/federation/v1/send",
-        );
-        // Hold a global permit only around the network call — released before
-        // any backoff sleep, so a slow peer can't pin a concurrency slot.
-        let send_result = match ctx.send_slots.acquire().await {
-            Ok(_permit) => {
-                ctx.client
-                    .send_transaction(dest, &txn_id, &pdus, &our_fes)
-                    .await
-            }
-            // The semaphore is never closed in normal operation; an error here
-            // means shutdown.
-            Err(_) => return false,
-        };
-
-        // `(delivered, peer_fes)`: `peer_fes` is the peer's advertised forward
-        // extremities from a 2xx response (empty on a 4xx drop — there's nothing
-        // to reconcile against a rejection).
-        let (delivered, peer_fes) = match send_result {
-            Ok(peer_fes) => (true, peer_fes),
-            // 4xx: the peer rejected the transaction envelope. Retrying is
-            // futile — treat as delivered so the batch is dropped from the outbox.
-            Err(FederationClientError::Status(code)) if (400..500).contains(&code) => {
-                warn!(%dest, code, pdus = ids.len(), "peer rejected transaction (4xx); dropping batch");
-                (true, BTreeMap::new())
-            }
-            // 5xx / transport / URL: transient. Keep the batch, back off, retry
-            // under the same txn_id.
-            Err(e) => {
-                warn!(%dest, error = %e, backoff = ?backoff, "transaction delivery failed; will retry");
-                if sleep_backoff(backoff, kick_rx).await {
-                    *backoff = BACKOFF_BASE;
+        match send_transaction_with_retry(ctx, dest, &txn_id, &pdus, &our_fes, backoff, kick_rx)
+            .await
+        {
+            SendOutcome::Shutdown => return false,
+            // 4xx: drop the batch (retrying won't help), but DO NOT clear the
+            // advertisement obligation — our heads never landed, so it stands. A
+            // removal fault re-sends (and re-4xxs) under the same txn id.
+            SendOutcome::Rejected => match ctx.store.remove_pdus(dest, &ids).await {
+                Ok(()) => return true,
+                Err(e) => {
+                    error!(%dest, error = %e, "removing rejected PDUs from outbox");
+                    if sleep_backoff(backoff, kick_rx).await {
+                        *backoff = BACKOFF_BASE;
+                    }
                 }
-                continue;
-            }
-        };
-
-        if delivered {
-            match ctx.store.remove_pdus(dest, &ids).await {
+            },
+            SendOutcome::Delivered(peer_fes) => match ctx.store.remove_pdus(dest, &ids).await {
                 Ok(()) => {
-                    // Anti-entropy: reconcile our view against the heads the peer
-                    // advertised in its response. Spawned so a peer round-trip
-                    // doesn't stall this destination's outbox drain.
+                    // The transaction carried `our_fes`, so this 2xx satisfied any
+                    // standing advertisement obligation for the rooms it covered.
+                    if !our_fes.is_empty() {
+                        let room_refs: Vec<&RoomId> = our_fes.keys().map(AsRef::as_ref).collect();
+                        if let Err(e) = ctx.store.remove_advertisements(dest, &room_refs).await {
+                            warn!(%dest, error = %e, "clearing satisfied advertisement obligations");
+                        }
+                    }
+                    // Reconcile against the heads the peer advertised back. Spawned
+                    // so a peer round-trip doesn't stall this destination's drain.
                     spawn_reconcile(ctx, dest, peer_fes);
                     return true;
                 }
                 Err(e) => {
-                    // Rows survive a removal fault; back off and retry rather
-                    // than hot-looping (the re-send is deduped by the peer).
+                    // Rows survive a removal fault; back off and re-send under the
+                    // same txn id (the peer dedups) rather than hot-looping.
                     error!(%dest, error = %e, "removing delivered PDUs from outbox");
                     if sleep_backoff(backoff, kick_rx).await {
                         *backoff = BACKOFF_BASE;
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// Deliver one anti-entropy advertisement to `dest`: an empty-`pdus` transaction
+/// carrying our current forward extremities for the rooms `dest` is owed (MSC
+/// anti-entropy-extension). On a 2xx the obligation rows are cleared and the
+/// peer's response heads are reconciled (symmetric exchange); a 4xx drops the
+/// obligation for what we tried (a malformed empty-`pdus` envelope retrying can't
+/// fix); a transient error retries, leaving the durable rows so a restart
+/// re-sends. Returns `false` only on shutdown.
+///
+/// Only the rooms we actually advertise are cleared on success. Rooms whose
+/// current extremities read back empty (unknown / no heads — not expected for a
+/// room we just applied a join to) carry nothing to advertise; their obligation
+/// rows are cleared up-front so a junk row can't wedge the drain.
+async fn send_advertisement(
+    ctx: &SenderCtx,
+    dest: &ServerName,
+    rooms: &[OwnedRoomId],
+    backoff: &mut Duration,
+    kick_rx: &mut watch::Receiver<()>,
+) -> bool {
+    let mut our_fes: BTreeMap<OwnedRoomId, ForwardExtremities> = BTreeMap::new();
+    for room in rooms {
+        let fes = reconcile::local_extremities(&ctx.store, room).await;
+        if !fes.is_empty() {
+            our_fes.insert(room.clone(), fes);
+        }
+    }
+
+    // Nothing advertisable for any owed room — clear the (junk) obligations and
+    // move on rather than re-reading the same rows forever.
+    if our_fes.is_empty() {
+        let room_refs: Vec<&RoomId> = rooms.iter().map(AsRef::as_ref).collect();
+        if let Err(e) = ctx.store.remove_advertisements(dest, &room_refs).await {
+            warn!(%dest, error = %e, "clearing un-advertisable advertisement obligations");
+        }
+        return true;
+    }
+
+    // Clear only the rooms we actually advertise; an owed room with no heads is
+    // left for the junk-clear branch above to reap on a later pass.
+    let advertised: Vec<&RoomId> = our_fes.keys().map(AsRef::as_ref).collect();
+    let empty_pdus: Vec<Box<RawJsonValue>> = Vec::new();
+    let txn_id = ctx.idgen.next_id();
+    loop {
+        match send_transaction_with_retry(
+            ctx,
+            dest,
+            &txn_id,
+            &empty_pdus,
+            &our_fes,
+            backoff,
+            kick_rx,
+        )
+        .await
+        {
+            SendOutcome::Shutdown => return false,
+            // 4xx on an empty-`pdus` envelope shouldn't happen against a conforming
+            // peer; retrying won't help, so drop the obligation for what we tried.
+            SendOutcome::Rejected => {
+                if let Err(e) = ctx.store.remove_advertisements(dest, &advertised).await {
+                    warn!(%dest, error = %e, "clearing rejected advertisement obligations");
+                }
+                return true;
+            }
+            SendOutcome::Delivered(peer_fes) => {
+                match ctx.store.remove_advertisements(dest, &advertised).await {
+                    Ok(()) => {
+                        spawn_reconcile(ctx, dest, peer_fes);
+                        return true;
+                    }
+                    Err(e) => {
+                        // Rows survive a clear fault; back off and re-send under the
+                        // same txn id (the peer dedups) rather than hot-looping.
+                        error!(%dest, error = %e, "clearing advertisement obligations after send");
+                        if sleep_backoff(backoff, kick_rx).await {
+                            *backoff = BACKOFF_BASE;
+                        }
                     }
                 }
             }
@@ -481,6 +651,10 @@ mod tests {
     #[derive(Default)]
     struct Stub {
         accepted: Mutex<Vec<Vec<Value>>>,
+        /// The `forward_extremities` body field of every request (one entry per
+        /// request, `Value::Null` when absent) — lets anti-entropy tests assert
+        /// an advertisement carried our heads.
+        fes: Mutex<Vec<Value>>,
         txns: Mutex<Vec<String>>,
         attempts: AtomicU64,
         fail_until: u64,
@@ -502,6 +676,10 @@ mod tests {
                             .into_response();
                     }
                     let pdus = body["pdus"].as_array().cloned().unwrap_or_default();
+                    stub.fes
+                        .lock()
+                        .unwrap()
+                        .push(body["forward_extremities"].clone());
                     stub.accepted.lock().unwrap().push(pdus);
                     Json(json!({ "pdus": {} })).into_response()
                 }
@@ -570,6 +748,63 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("outbox for {dest} not drained within timeout");
+    }
+
+    /// Enqueue a durable advertisement obligation for `dest` + `room` by
+    /// persisting a non-state event with `advertise_to = [dest]` (and no outbox
+    /// destination). The event also advances the timeline head, so our heads
+    /// differ from `dest`'s notional join point — exactly the divergence an
+    /// advertisement reconciles. Mirrors what `persist_resolved_event` does on a
+    /// real joined-set-growth trigger.
+    async fn enqueue_advertisement(store: &SqliteStore, room: &RoomId, dest: &ServerName) {
+        use neutrino_store::RoomStore;
+        let alice: OwnedUserId = "@alice:local.test".parse().unwrap();
+        let (timeline, state) = store.forward_extremities(room).await.unwrap().unwrap();
+        let prev = timeline.iter().next().expect("room has a head").clone();
+        let msg = EventBuilder::new(alice, "m.room.message".to_owned())
+            .room_id(room.to_owned())
+            .content(json!({ "msgtype": "m.text", "body": "advertise-me" }))
+            .prev_events(vec![prev])
+            .origin_server_ts(1_700_000_000_123)
+            .build()
+            .unwrap();
+        let new_timeline: BTreeSet<OwnedEventId> = [msg.event_id.clone()].into_iter().collect();
+        store
+            .persist_resolved_event(&msg, &new_timeline, &state, &BTreeMap::new(), &[], &[dest])
+            .await
+            .unwrap();
+    }
+
+    /// Poll until `dest` has no pending advertisement obligation, or panic ~10s.
+    async fn wait_adv_drained(store: &SqliteStore, dest: &ServerName) {
+        for _ in 0..500 {
+            if store.pending_advertisements(dest).await.unwrap().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("advertisement obligation for {dest} not drained within timeout");
+    }
+
+    /// A `SenderCtx` for calling `deliver_batch` / `send_advertisement` directly
+    /// (deterministic, no supervisor/pool timing). One global send permit.
+    fn test_ctx(store: Arc<SqliteStore>) -> SenderCtx {
+        SenderCtx {
+            store,
+            client: Arc::new(FederationClient::new("local.test".to_owned(), None)),
+            idgen: Arc::new(TxnIdGen::new(now_ms())),
+            send_slots: Arc::new(Semaphore::new(1)),
+            fetcher: null_fetcher(),
+            worker_poke: null_poke(),
+        }
+    }
+
+    /// A backoff receiver whose sender is dropped — no kick ever arrives, so
+    /// `sleep_backoff` falls back to a normal timed backoff.
+    fn test_backoff() -> watch::Receiver<()> {
+        let (_tx, mut rx) = watch::channel(());
+        rx.borrow_and_update();
+        rx
     }
 
     // No startup jitter in tests — exercise the full path without the wait.
@@ -787,6 +1022,158 @@ mod tests {
         let accepted = stub.accepted.lock().unwrap();
         assert_eq!(accepted.len(), 1);
         assert_eq!(body_of(&accepted[0][0]), "later");
+    }
+
+    // Anti-entropy: a destination owed only an advertisement (no pending PDUs)
+    // gets a sender task that delivers an empty-`pdus` transaction carrying our
+    // forward extremities, then clears the obligation. The obligation is seeded
+    // into the store *before* the pool starts, so this also covers crash-safety:
+    // a durable obligation persisted in one run is re-sent by a fresh pool.
+    #[tokio::test]
+    async fn sends_advertisement_for_quiescent_obligation() {
+        let stub = Arc::new(Stub::default());
+        let dest = spawn_peer(stub.clone()).await;
+        // n=0: a real room, empty outbox — the only work is the advertisement.
+        let (store, _tmp, room, _ids) = store_with_outbox(&dest, 0).await;
+        enqueue_advertisement(&store, &room, &dest).await;
+
+        drop(spawn_with(
+            store.clone(),
+            "local.test".to_owned(),
+            2,
+            NO_JITTER,
+            no_shutdown(),
+            no_kick(),
+            null_fetcher(),
+            null_poke(),
+            None,
+        ));
+        wait_adv_drained(&store, &dest).await;
+
+        // Exactly one transaction, with no PDUs and our heads for the room.
+        let accepted = stub.accepted.lock().unwrap();
+        assert_eq!(accepted.len(), 1, "one advertisement transaction");
+        assert!(accepted[0].is_empty(), "an advertisement carries no PDUs");
+        let fes = stub.fes.lock().unwrap();
+        assert!(
+            fes[0].get(room.as_str()).is_some(),
+            "advertisement carried our forward extremities for the room: {:?}",
+            fes[0]
+        );
+    }
+
+    // Anti-entropy: a normal FE-carrying `/send` to a destination satisfies a
+    // standing advertisement obligation for the rooms it covers — the piggyback
+    // IS the advertisement, so no separate advertisement transaction is sent.
+    #[tokio::test]
+    async fn covering_send_clears_advertisement_obligation() {
+        let stub = Arc::new(Stub::default());
+        let dest = spawn_peer(stub.clone()).await;
+        // One pending PDU for dest, plus a standing advertisement obligation for
+        // the same room.
+        let (store, _tmp, room, _ids) = store_with_outbox(&dest, 1).await;
+        enqueue_advertisement(&store, &room, &dest).await;
+
+        drop(spawn_with(
+            store.clone(),
+            "local.test".to_owned(),
+            2,
+            NO_JITTER,
+            no_shutdown(),
+            no_kick(),
+            null_fetcher(),
+            null_poke(),
+            None,
+        ));
+        wait_drained(&store, &dest).await;
+        wait_adv_drained(&store, &dest).await;
+
+        // The PDU batch carried our heads and cleared the obligation, so there
+        // is exactly one transaction (the batch), not a second advertisement.
+        let accepted = stub.accepted.lock().unwrap();
+        assert_eq!(
+            accepted.len(),
+            1,
+            "only the PDU batch, no extra advertisement"
+        );
+        assert_eq!(
+            accepted[0].len(),
+            1,
+            "the batch carried the one pending PDU"
+        );
+    }
+
+    // Anti-entropy 4xx handling, advertisement side: a 4xx on an advertisement is
+    // terminal — the obligation is dropped (a malformed empty-pdus envelope can't
+    // be fixed by retrying), not retried forever. Driven through `send_advertisement`
+    // directly so there's no pool-timing nondeterminism.
+    #[tokio::test]
+    async fn advertisement_4xx_drops_obligation() {
+        let stub = Arc::new(Stub {
+            fail_until: u64::MAX,
+            fail_status: 400,
+            ..Stub::default()
+        });
+        let dest = spawn_peer(stub.clone()).await;
+        let (store, _tmp, room, _ids) = store_with_outbox(&dest, 0).await;
+        enqueue_advertisement(&store, &room, &dest).await;
+
+        let ctx = test_ctx(store.clone());
+        let rooms = store.pending_advertisements(&dest).await.unwrap();
+        let mut backoff = BACKOFF_BASE;
+        let mut kick_rx = test_backoff();
+        let proceeded = send_advertisement(&ctx, &dest, &rooms, &mut backoff, &mut kick_rx).await;
+
+        assert!(proceeded, "a 4xx is terminal (returns true), not shutdown");
+        assert!(
+            stub.attempts.load(Ordering::SeqCst) >= 1,
+            "the peer was contacted"
+        );
+        assert!(
+            store
+                .pending_advertisements(&dest)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a 4xx drops the advertisement obligation rather than looping forever"
+        );
+    }
+
+    // Anti-entropy 4xx handling, PDU-batch side (the `sent_ok`-equivalent gate): a
+    // 4xx on a batch drops the batch from the outbox but must NOT clear a standing
+    // advertisement obligation — our forward extremities never landed, so the duty
+    // still stands. Driven through `deliver_batch` directly.
+    #[tokio::test]
+    async fn batch_4xx_keeps_advertisement_obligation() {
+        let stub = Arc::new(Stub {
+            fail_until: u64::MAX,
+            fail_status: 400,
+            ..Stub::default()
+        });
+        let dest = spawn_peer(stub.clone()).await;
+        let (store, _tmp, room, _ids) = store_with_outbox(&dest, 1).await;
+        enqueue_advertisement(&store, &room, &dest).await;
+
+        let ctx = test_ctx(store.clone());
+        let batch = store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await.unwrap();
+        let mut backoff = BACKOFF_BASE;
+        let mut kick_rx = test_backoff();
+        let delivered = deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await;
+
+        assert!(delivered, "a 4xx drops the batch (returns true)");
+        assert!(
+            store
+                .pending_pdus(&dest, usize::MAX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the rejected batch is removed from the outbox"
+        );
+        assert_eq!(
+            store.pending_advertisements(&dest).await.unwrap().len(),
+            1,
+            "a batch 4xx must leave the advertisement obligation intact (heads never landed)"
+        );
     }
 
     #[test]

@@ -35,7 +35,9 @@ use neutrino_state::room_core::{Effect, RoomCore};
 use neutrino_state::{CoreError, FormatError, StateDelta, StateMap};
 use neutrino_store::{EventStore, Membership, RoomStore, StateStore, StorageError};
 use neutrino_store_sqlite::SqliteStore;
-use ruma::{EventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId};
+use ruma::{
+    EventId, OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId,
+};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
@@ -246,6 +248,8 @@ impl RoomActor {
 
         let dests = destinations(&event, &next);
         let dest_refs: Vec<&ServerName> = dests.iter().map(AsRef::as_ref).collect();
+        let advertise = self.advertise_targets(&next, &delta);
+        let advertise_refs: Vec<&ServerName> = advertise.iter().map(AsRef::as_ref).collect();
         self.store
             .persist_resolved_event(
                 &event,
@@ -253,11 +257,42 @@ impl RoomActor {
                 next.state_forward_extremities(),
                 &delta,
                 &dest_refs,
+                &advertise_refs,
             )
             .await?;
         // Commit succeeded — adopt the post-apply state.
         self.room = next;
         Ok(event)
+    }
+
+    /// Anti-entropy (MSC anti-entropy-extension): the servers that just became
+    /// *joined* in the room's current state by the apply that produced `next`,
+    /// and to which we therefore owe a one-shot forward-extremity advertisement.
+    ///
+    /// The trigger is joined-set *growth* — a server in `next`'s joined set that
+    /// was not joined in the pre-apply state (`self.room`, not yet adopted). Our
+    /// own server is never a target. A newly-joined server `P` is then dropped
+    /// unless we hold a forward extremity `P`'s join does not cover: if the room
+    /// is linear, applying `P`'s join made it the sole head on both DAGs, equal
+    /// to the seed, so we owe nothing; an advertisement arises only when we hold
+    /// an extremity concurrent with the join. Must be called *before* adopting
+    /// `next` so `self.room` is still the pre-apply state.
+    ///
+    /// `state_delta` is the apply's `current_state` change. An empty delta means
+    /// current state did not move, so the joined set cannot have grown — we skip
+    /// the two full state scans entirely, which is the common case (every
+    /// message and every state event that loses state resolution).
+    fn advertise_targets(&self, next: &RoomCore, state_delta: &StateDelta) -> Vec<OwnedServerName> {
+        if state_delta.is_empty() {
+            return Vec::new();
+        }
+        let before = joined_servers(self.room.current_state());
+        let after = joined_servers(next.current_state());
+        after
+            .into_iter()
+            .filter(|p| !before.contains(p) && p.as_str() != self.own_server)
+            .filter(|p| we_owe_advertisement(next, p))
+            .collect()
     }
 
     /// Run `apply_pdu` against a *clone* of the live `RoomCore`, off to the
@@ -356,7 +391,12 @@ impl RoomActor {
         let event = persisted.ok_or(RoomActorError::NotApplied)?;
 
         // No outbox rows: a federation-received PDU is not re-originated by us.
-        // Its origin server fans it out to the rest of the room.
+        // Its origin server fans it out to the rest of the room. But applying it
+        // may have grown the joined set (the motivating anti-entropy case: a
+        // late-delivered remote join), so we still owe an advertisement to any
+        // server that just became joined while we hold a concurrent extremity.
+        let advertise = self.advertise_targets(&next, &delta);
+        let advertise_refs: Vec<&ServerName> = advertise.iter().map(AsRef::as_ref).collect();
         self.store
             .persist_resolved_event(
                 &event,
@@ -364,6 +404,7 @@ impl RoomActor {
                 next.state_forward_extremities(),
                 &delta,
                 &[],
+                &advertise_refs,
             )
             .await?;
         self.room = next;
@@ -381,16 +422,7 @@ fn outbound_destinations(
     event: &Event,
     own_server: &str,
 ) -> Vec<OwnedServerName> {
-    let mut servers: BTreeSet<OwnedServerName> = BTreeSet::new();
-
-    for ((event_type, state_key), member) in current_state {
-        if event_type == "m.room.member"
-            && event_membership(member) == Some(Membership::Join)
-            && let Ok(user) = UserId::parse(state_key.as_str())
-        {
-            servers.insert(user.server_name().to_owned());
-        }
-    }
+    let mut servers = joined_servers(current_state);
 
     // A departing member (leave/ban) has already dropped out of the joined set
     // above, so explicitly notify their server of its own departure. Joins are
@@ -410,6 +442,69 @@ fn outbound_destinations(
 
     servers.retain(|s| s.as_str() != own_server);
     servers.into_iter().collect()
+}
+
+/// The set of servers with at least one `join` member in `current_state` — a
+/// room's joined-server set. Shared by [`outbound_destinations`] (fan-out
+/// recipients) and [`RoomActor::advertise_targets`] (anti-entropy
+/// joined-set-growth trigger). Does not exclude our own server; callers that
+/// need to do so filter it out themselves.
+fn joined_servers(current_state: &StateMap<Arc<Event>>) -> BTreeSet<OwnedServerName> {
+    let mut servers: BTreeSet<OwnedServerName> = BTreeSet::new();
+    for ((event_type, state_key), member) in current_state {
+        if event_type == "m.room.member"
+            && event_membership(member) == Some(Membership::Join)
+            && let Ok(user) = UserId::parse(state_key.as_str())
+        {
+            servers.insert(user.server_name().to_owned());
+        }
+    }
+    servers
+}
+
+/// The event ids of `server`'s `join` membership events in `current_state` —
+/// the join point(s) a newly-joined server is known to hold. Used by
+/// [`RoomActor::advertise_targets`] to seed the anti-entropy comparison: a
+/// server whose only forward extremity is its own join owes nothing.
+fn server_join_event_ids(
+    current_state: &StateMap<Arc<Event>>,
+    server: &ServerName,
+) -> BTreeSet<OwnedEventId> {
+    let mut ids: BTreeSet<OwnedEventId> = BTreeSet::new();
+    for ((event_type, state_key), member) in current_state {
+        if event_type == "m.room.member"
+            && event_membership(member) == Some(Membership::Join)
+            && let Ok(user) = UserId::parse(state_key.as_str())
+            && user.server_name() == server
+        {
+            ids.insert(member.event_id.clone());
+        }
+    }
+    ids
+}
+
+/// Anti-entropy advertisement decision for a single newly-joined server `P`,
+/// against the post-apply room `next`: `true` iff we hold a forward extremity
+/// `P`'s join does not cover. The converged (linear) case — our sole head on
+/// *both* DAGs is exactly one of `P`'s join events — owes nothing; every other
+/// shape advertises (a redundant advertisement the receiver de-duplicates is
+/// the safe direction). This is the MSC's "set `last_advertised[P]` to `P`'s
+/// join, then compare against current forward extremities" gate, computed
+/// in-process from the post-apply heads.
+fn we_owe_advertisement(next: &RoomCore, p: &ServerName) -> bool {
+    let timeline = next.forward_extremities();
+    let state = next.state_forward_extremities();
+    // Linear-join shortcut: a single, identical head on both DAGs that is one of
+    // P's own join events means applying the join converged us with P — owe
+    // nothing. Any other shape (a concurrent extremity) advertises.
+    if timeline.len() == 1
+        && timeline == state
+        && let Some(head) = timeline.iter().next()
+        && server_join_event_ids(next.current_state(), p).contains(head)
+    {
+        return false;
+    }
+    true
 }
 
 /// An `m.room.member` event's `content.membership`, parsed through the
@@ -1150,6 +1245,123 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "an invite must not federate over /send"
+        );
+    }
+
+    // ----- anti-entropy: advertise on joined-set growth -----
+
+    /// Drive alice (local) to join + open the room to public, then have a remote
+    /// user join via a federation PDU built on `built_on`. Returns the registry,
+    /// store, room, and the remote join's event id. `built_on` lets the caller
+    /// choose a linear join (on the current head) or a concurrent one (on an
+    /// older head, leaving a forward extremity the join does not cover).
+    async fn join_remote_built_on(
+        concurrent_extremity: bool,
+    ) -> (RoomRegistry, Arc<SqliteStore>, OwnedRoomId) {
+        let (registry, store, room_id, alice) = setup().await;
+        registry
+            .send_event(
+                &room_id,
+                alice.clone(),
+                "m.room.member".to_owned(),
+                Some(alice.to_string()),
+                json!({ "membership": "join" }),
+            )
+            .await
+            .expect("alice join");
+        let rules = registry
+            .send_event(
+                &room_id,
+                alice.clone(),
+                "m.room.join_rules".to_owned(),
+                Some(String::new()),
+                json!({ "join_rule": "public" }),
+            )
+            .await
+            .expect("alice opens public");
+
+        // For the concurrent case, a local message advances the timeline head
+        // off `rules`, so the remote join (built on `rules`) lands concurrent
+        // with it — leaving us holding an extremity the join does not cover.
+        if concurrent_extremity {
+            registry
+                .send_event(
+                    &room_id,
+                    alice.clone(),
+                    "m.room.message".to_owned(),
+                    None,
+                    json!({ "msgtype": "m.text", "body": "concurrent" }),
+                )
+                .await
+                .expect("alice message");
+        }
+
+        let zara: OwnedUserId = ZARA.parse().unwrap();
+        let zara_join = EventBuilder::new(zara.clone(), "m.room.member".to_owned())
+            .room_id(room_id.clone())
+            .state_key(zara.to_string())
+            .content(json!({ "membership": "join" }))
+            .prev_events(vec![rules.event_id.clone()])
+            .prev_state_events(vec![rules.event_id.clone()])
+            .build()
+            .expect("build zara join pdu");
+        registry
+            .apply_pdu(&room_id, zara_join)
+            .await
+            .expect("zara joins via federation");
+        // Precondition: zara is actually joined in current state.
+        assert!(
+            store
+                .current_state_event(&room_id, "m.room.member", zara.as_str())
+                .await
+                .unwrap()
+                .is_some(),
+            "zara must be joined for the trigger to fire"
+        );
+        (registry, store, room_id)
+    }
+
+    #[tokio::test]
+    async fn apply_pdu_join_with_concurrent_extremity_enqueues_advertisement() {
+        // We hold a timeline extremity (the local message) concurrent with
+        // zara's join, so zara's server enters the joined set while our heads
+        // differ from its join — exactly the MSC's unconverged case. We owe
+        // remote.example one advertisement, and our own server nothing.
+        let (_registry, store, room_id) = join_remote_built_on(true).await;
+
+        let owed = store
+            .pending_advertisements(server_name!("remote.example"))
+            .await
+            .unwrap();
+        assert_eq!(
+            owed.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+            [room_id.as_str()],
+            "remote.example is owed an advertisement for the room"
+        );
+        assert!(
+            store
+                .pending_advertisements(server_name!("example.org"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "we never owe ourselves an advertisement"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_pdu_linear_join_enqueues_no_advertisement() {
+        // zara's join is built on the current head, so applying it makes the
+        // join the sole forward extremity on both DAGs — equal to the seed, so
+        // there is nothing to advertise.
+        let (_registry, store, _room_id) = join_remote_built_on(false).await;
+
+        assert!(
+            store
+                .pending_advertisements(server_name!("remote.example"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a linear join leaves us converged with the joiner — no advertisement owed"
         );
     }
 }

@@ -307,3 +307,30 @@ CREATE TABLE oob_invites (
 
 -- invited_oob_rooms(user): direct lookup by the invited user (state_key).
 CREATE INDEX ix_oob_invites_user ON oob_invites(state_key);
+
+-- ----------------------------------------------------------------------------
+-- pending_advertisements — FederationOutbox (anti-entropy extension)
+-- A durable per-(destination, room) obligation to advertise our forward
+-- extremities to a server that has just become *joined* in the room's current
+-- state. MSC anti-entropy-extension: applying a join can make P joined while we
+-- hold a forward extremity P does not yet have; the base piggyback exchange
+-- only reconciles on the next organic transaction, so a room that falls quiet
+-- right after the join would never tell P. The obligation must survive a crash
+-- — persisting the join but losing the "owe P an advertisement" record would
+-- reopen exactly that divergence — so it is written in the SAME transaction as
+-- the join (see `persist_resolved_event`'s `advertise_to`), drained by the
+-- outbound sender (an empty-`pdus` `/send` carrying `forward_extremities`), and
+-- deleted only after a 2xx (never-lose, same posture as `outbox`).
+--
+-- A normal FE-carrying `/send` to the destination covering this room also
+-- clears the row — the piggyback satisfied the obligation. Keyed by
+-- (destination, room_id) so repeated triggers coalesce into one row; INSERT OR
+-- IGNORE on the PK. No FK on `room_id` (the obligation outlives nothing it must
+-- reference structurally; same FK-free posture as `staged_events.room_id`). No
+-- `user_version` bump (additive, no live data, no migration framework — same
+-- policy as the staged_events / oob_invites / FE columns).
+CREATE TABLE pending_advertisements (
+    destination  TEXT NOT NULL,
+    room_id      TEXT NOT NULL,
+    PRIMARY KEY (destination, room_id)
+) STRICT, WITHOUT ROWID;
