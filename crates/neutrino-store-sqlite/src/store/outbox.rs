@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{params, params_from_iter};
 use neutrino_store::{Event, FederationOutbox, StorageError};
-use ruma::{EventId, OwnedServerName, ServerName};
+use ruma::{EventId, OwnedRoomId, OwnedServerName, RoomId, ServerName};
 
 use crate::{
     SqliteStore,
@@ -83,6 +83,75 @@ impl FederationOutbox for SqliteStore {
             binds.push(destination.as_str());
             for id in &event_ids {
                 binds.push(id.as_str());
+            }
+            conn.execute(&query, params_from_iter(binds.iter()))?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn advertisement_destinations(&self) -> Result<Vec<OwnedServerName>, StorageError> {
+        self.run_read(move |conn| -> Result<Vec<OwnedServerName>, Error> {
+            let mut stmt =
+                conn.prepare("SELECT DISTINCT destination FROM pending_advertisements")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+
+            let mut out = Vec::new();
+            for r in rows {
+                let s = r?;
+                let server = OwnedServerName::try_from(s)
+                    .map_err(|e| Error::Internal(format!("malformed destination in DB: {e}")))?;
+                out.push(server);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn pending_advertisements(
+        &self,
+        destination: &ServerName,
+    ) -> Result<Vec<OwnedRoomId>, StorageError> {
+        let destination = destination.to_owned();
+        self.run_read(move |conn| -> Result<Vec<OwnedRoomId>, Error> {
+            let mut stmt =
+                conn.prepare("SELECT room_id FROM pending_advertisements WHERE destination = ?")?;
+            let rows =
+                stmt.query_map(params![destination.as_str()], |row| row.get::<_, String>(0))?;
+
+            let mut out = Vec::new();
+            for r in rows {
+                let s = r?;
+                let room = OwnedRoomId::try_from(s)
+                    .map_err(|e| Error::Internal(format!("malformed room_id in DB: {e}")))?;
+                out.push(room);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn remove_advertisements(
+        &self,
+        destination: &ServerName,
+        rooms: &[&RoomId],
+    ) -> Result<(), StorageError> {
+        if rooms.is_empty() {
+            return Ok(());
+        }
+        let destination = destination.to_owned();
+        let rooms: Vec<String> = rooms.iter().map(|r| r.as_str().to_owned()).collect();
+
+        self.run_write(move |conn| -> Result<(), Error> {
+            let placeholders = vec!["?"; rooms.len()].join(",");
+            let query = format!(
+                "DELETE FROM pending_advertisements \
+                 WHERE destination = ? AND room_id IN ({placeholders})"
+            );
+            let mut binds: Vec<&str> = Vec::with_capacity(rooms.len() + 1);
+            binds.push(destination.as_str());
+            for r in &rooms {
+                binds.push(r.as_str());
             }
             conn.execute(&query, params_from_iter(binds.iter()))?;
             Ok(())
@@ -242,5 +311,62 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    // O10 (anti-entropy): persist_resolved_event with `advertise_to` writes one
+    // pending_advertisements row per destination for the event's room;
+    // advertisement_destinations enumerates them, pending_advertisements lists
+    // a destination's owed rooms, and remove_advertisements clears them
+    // (idempotently).
+    #[tokio::test]
+    async fn pending_advertisements_round_trip() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use neutrino_store::EventStore;
+        use ruma::OwnedEventId;
+
+        let s = store_with_room().await;
+        let msg = message(*ALICE_ROOM_ID, *ALICE_USER_ID, "hi");
+        let timeline: BTreeSet<OwnedEventId> = [msg.event_id.clone()].into_iter().collect();
+        let dest_a = server_name!("a.example.com");
+        let dest_b = server_name!("b.example.com");
+
+        s.persist_resolved_event(
+            &msg,
+            &timeline,
+            &timeline,
+            &BTreeMap::new(),
+            &[],
+            &[dest_a, dest_b],
+        )
+        .await
+        .unwrap();
+
+        // Both destinations are enumerated, and each is owed exactly our room.
+        let mut dests = s.advertisement_destinations().await.unwrap();
+        dests.sort();
+        assert_eq!(
+            dests.iter().map(|d| d.as_str()).collect::<Vec<_>>(),
+            ["a.example.com", "b.example.com"]
+        );
+        let owed = s.pending_advertisements(dest_a).await.unwrap();
+        assert_eq!(
+            owed.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+            [ALICE_ROOM_ID.as_str()]
+        );
+
+        // Clearing dest_a leaves dest_b untouched; a second clear is a no-op.
+        s.remove_advertisements(dest_a, &[*ALICE_ROOM_ID])
+            .await
+            .unwrap();
+        assert!(s.pending_advertisements(dest_a).await.unwrap().is_empty());
+        assert_eq!(s.pending_advertisements(dest_b).await.unwrap().len(), 1);
+        s.remove_advertisements(dest_a, &[*ALICE_ROOM_ID])
+            .await
+            .unwrap();
+        assert_eq!(
+            s.advertisement_destinations().await.unwrap(),
+            vec![server_name!("b.example.com").to_owned()]
+        );
     }
 }
