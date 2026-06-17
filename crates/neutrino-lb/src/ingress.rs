@@ -13,6 +13,16 @@ use crate::codec::{cbor_to_json, json_to_cbor};
 use crate::headers::is_forwardable;
 use crate::transport::{WireHandler, WireRequest, WireResponse};
 
+/// The only path namespace the ingress forwards to the loopback homeserver.
+/// The ingress owns the *public* federation port, but the co-located
+/// `neutrino-http` serves the (unauthenticated, trusted-network) Client-Server
+/// API on the same listener (see `build_router`). Forwarding only
+/// `/_matrix/federation/*` keeps a peer from reaching CSAPI/other routes
+/// through the proxy — restoring the route boundary the single-port homeserver
+/// used to imply when it wasn't network-exposed. No `/_matrix/key/` prefix:
+/// this server has no signing keys and serves no key endpoints.
+const FEDERATION_PREFIX: &str = "/_matrix/federation/";
+
 /// Forwards transcoded requests to the local homeserver.
 pub struct IngressHandler {
     http: reqwest::Client,
@@ -58,7 +68,26 @@ impl WireHandler for IngressHandler {
             }
         };
         let url = format!("{}{}", self.upstream, req.path);
-        let mut rb = self.http.request(req.method, &url);
+        // Parse first, then gate on the *normalized* path: a raw `starts_with`
+        // is bypassable by `..` / percent-encoded-dot traversal (e.g.
+        // `/_matrix/federation/v1/../../client/...`), which the URL parser
+        // collapses into a CSAPI path. Checking `parsed.path()` catches it.
+        let parsed = match reqwest::Url::parse(&url) {
+            Ok(u) => u,
+            Err(e) => {
+                warn!(%e, "ingress: upstream URL parse failed");
+                return Self::bad_gateway();
+            }
+        };
+        if !parsed.path().starts_with(FEDERATION_PREFIX) {
+            warn!(path = %parsed.path(), "ingress: rejecting non-federation path");
+            return WireResponse {
+                status: 404,
+                headers: vec![],
+                body: vec![],
+            };
+        }
+        let mut rb = self.http.request(req.method, parsed);
         for (name, value) in &req.headers {
             if is_forwardable(name) {
                 rb = rb.header(name.as_str(), value.as_slice());
@@ -193,7 +222,8 @@ mod tests {
             .handle(WireRequest {
                 dest: String::new(),
                 method: Method::GET,
-                path: "/anything".to_owned(),
+                // A federation path so the route-gate forwards it.
+                path: "/_matrix/federation/v1/backfill/!r".to_owned(),
                 headers: vec![],
                 body: vec![],
             })
@@ -247,12 +277,80 @@ mod tests {
             .handle(WireRequest {
                 dest: String::new(),
                 method: Method::GET,
-                path: "/whatever".to_owned(),
+                // A federation path so the route-gate forwards it.
+                path: "/_matrix/federation/v1/backfill/!r".to_owned(),
                 headers: vec![],
                 body: vec![],
             })
             .await;
 
         assert_eq!(resp.status, 502);
+    }
+
+    // A peer must not be able to reach the co-resident Client-Server API
+    // through the public federation port: any non-`/_matrix/federation/` path
+    // is 404'd and never forwarded to the loopback upstream.
+    #[tokio::test]
+    async fn rejects_non_federation_path() {
+        let hit: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let hit_c = hit.clone();
+        let app = Router::new().fallback(move || {
+            let hit_c = hit_c.clone();
+            async move {
+                *hit_c.lock().unwrap() = true;
+                Json(serde_json::json!({"ok": true}))
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let handler = IngressHandler::new(format!("http://{addr}"));
+        let resp = handler
+            .handle(WireRequest {
+                dest: String::new(),
+                method: Method::POST,
+                path: "/_matrix/client/v3/createRoom".to_owned(),
+                headers: vec![],
+                body: vec![],
+            })
+            .await;
+
+        assert_eq!(resp.status, 404, "non-federation path must be rejected");
+        assert!(!*hit.lock().unwrap(), "upstream must not be reached");
+    }
+
+    // `..` (and percent-encoded-dot) traversal that the URL parser would
+    // normalize into a CSAPI path must be caught by the post-normalization
+    // gate, not just a raw prefix check.
+    #[tokio::test]
+    async fn rejects_dotdot_traversal_into_csapi() {
+        let hit: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let hit_c = hit.clone();
+        let app = Router::new().fallback(move || {
+            let hit_c = hit_c.clone();
+            async move {
+                *hit_c.lock().unwrap() = true;
+                Json(serde_json::json!({"ok": true}))
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let handler = IngressHandler::new(format!("http://{addr}"));
+        let resp = handler
+            .handle(WireRequest {
+                dest: String::new(),
+                method: Method::POST,
+                // Normalizes to `/_matrix/client/v3/createRoom`.
+                path: "/_matrix/federation/v1/../../client/v3/createRoom".to_owned(),
+                headers: vec![],
+                body: vec![],
+            })
+            .await;
+
+        assert_eq!(resp.status, 404, "traversal escape must be rejected");
+        assert!(!*hit.lock().unwrap(), "upstream must not be reached");
     }
 }

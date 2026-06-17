@@ -22,6 +22,14 @@ use crate::transport::{WireClient, WireError, WireHandler, WireRequest, WireResp
 /// Marks transcoded bodies on the wire.
 const CBOR_CONTENT_TYPE: &str = "application/cbor";
 
+/// Upper bound on a single inbound wire request body. This is the one truly
+/// network-exposed surface (the public federation port), and the body is
+/// buffered whole, CBOR-decoded, *and* re-serialized — so an unbounded body is
+/// a memory-exhaustion / OOM risk (fatal on the embedded-on-mobile target).
+/// A generous cap that no legitimate federation body approaches; the future
+/// CoAP/UDP transport bounds bodies via blockwise framing instead.
+const MAX_WIRE_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 /// reqwest-backed wire client. Sends `req.body` (CBOR) to `http://{dest}{path}`.
 pub struct HttpWireClient {
     http: reqwest::Client,
@@ -93,12 +101,31 @@ impl WireClient for HttpWireClient {
 /// table) to the supplied `WireHandler`.
 pub struct HttpWireServer {
     bind: SocketAddr,
+    max_body_bytes: usize,
 }
 
 impl HttpWireServer {
     pub fn new(bind: SocketAddr) -> Self {
-        Self { bind }
+        Self {
+            bind,
+            max_body_bytes: MAX_WIRE_BODY_BYTES,
+        }
     }
+
+    #[cfg(test)]
+    fn with_max_body_bytes(bind: SocketAddr, max_body_bytes: usize) -> Self {
+        Self {
+            bind,
+            max_body_bytes,
+        }
+    }
+}
+
+/// Shared dispatch state: the ingress handler plus the inbound body cap.
+#[derive(Clone)]
+struct DispatchState {
+    handler: Arc<dyn WireHandler>,
+    max_body_bytes: usize,
 }
 
 #[async_trait]
@@ -108,7 +135,12 @@ impl WireServer for HttpWireServer {
         handler: Arc<dyn WireHandler>,
         shutdown: CancellationToken,
     ) -> Result<(), WireError> {
-        let app = Router::new().fallback(any(dispatch)).with_state(handler);
+        let app = Router::new()
+            .fallback(any(dispatch))
+            .with_state(DispatchState {
+                handler,
+                max_body_bytes: self.max_body_bytes,
+            });
         let listener = TcpListener::bind(self.bind)
             .await
             .map_err(|e| WireError::Serve(e.to_string()))?;
@@ -122,7 +154,7 @@ impl WireServer for HttpWireServer {
 
 /// Catch-all: build a `WireRequest` from the inbound HTTP request (the body is
 /// CBOR), call the handler, write its `WireResponse` back out as CBOR.
-async fn dispatch(State(handler): State<Arc<dyn WireHandler>>, req: Request) -> Response {
+async fn dispatch(State(state): State<DispatchState>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let path = parts
         .uri
@@ -134,20 +166,21 @@ async fn dispatch(State(handler): State<Arc<dyn WireHandler>>, req: Request) -> 
         .iter()
         .map(|(k, v)| (k.as_str().to_owned(), v.as_bytes().to_vec()))
         .collect();
-    // No body-size cap (`usize::MAX`): this is the public peer-facing port, so
-    // an unbounded body is a memory-exhaustion surface. Neutrino deliberately
-    // ignores this — it runs on a trusted network and assumes peers are
-    // well-behaved (the same assumption that lets us skip signatures and auth,
-    // per `neutrino/CLAUDE.md`). A future hostile-peer transport would add a
-    // cap (and the CoAP/UDP transport bounds bodies via blockwise framing).
-    let body = match axum::body::to_bytes(body, usize::MAX).await {
+    // Finite cap on the public peer-facing port (see `MAX_WIRE_BODY_BYTES`): an
+    // unbounded body would be a memory-exhaustion / OOM surface even on a
+    // trusted network (a buggy or misrouted peer, not just a hostile one).
+    // Over-limit (or unreadable) → 413, a 4xx so the sender gives up rather
+    // than retrying a body that won't shrink; a rare transient read error is
+    // conflated into the same code, an acceptable trade for the memory bound.
+    let body = match axum::body::to_bytes(body, state.max_body_bytes).await {
         Ok(b) => b.to_vec(),
         Err(e) => {
-            warn!(%e, "failed to read wire request body");
-            return error_response(StatusCode::BAD_GATEWAY);
+            warn!(%e, max = state.max_body_bytes, "wire request body too large or unreadable");
+            return error_response(StatusCode::PAYLOAD_TOO_LARGE);
         }
     };
-    let wire_resp = handler
+    let wire_resp = state
+        .handler
         .handle(WireRequest {
             dest: String::new(),
             method: parts.method,
@@ -323,6 +356,39 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
         assert_eq!(v["path"], "/_matrix/federation/v1/send/xyz");
         assert_eq!(v["body"], serde_json::json!([1, 2, 3]));
+
+        token.cancel();
+        let _ = handle.await;
+    }
+
+    // A body over the configured cap must be rejected (413) without reaching
+    // the handler — the public-port memory-exhaustion guard.
+    #[tokio::test]
+    async fn server_rejects_oversized_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        // Tiny cap so the test needn't allocate 64 MiB.
+        let server = HttpWireServer::with_max_body_bytes(addr, 8);
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        let handle =
+            tokio::spawn(async move { server.serve(Arc::new(EchoHandler), server_token).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = HttpWireClient::new();
+        let resp = client
+            .send(WireRequest {
+                dest: addr.to_string(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/big".to_owned(),
+                headers: vec![],
+                body: vec![0u8; 100], // > 8-byte cap
+            })
+            .await
+            .expect("send");
+
+        assert_eq!(resp.status, 413, "oversized body must be rejected");
 
         token.cancel();
         let _ = handle.await;

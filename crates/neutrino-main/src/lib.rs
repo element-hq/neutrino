@@ -66,18 +66,35 @@ fn build_lb_config(
         .federation_proxy
         .as_deref()
         .ok_or("lb_ingress_bind is set but federation_proxy (the egress URL) is not")?;
-    let egress = proxy.strip_prefix("http://").unwrap_or(proxy);
     let ingress_bind: SocketAddr = ingress
         .parse()
         .map_err(|e| format!("lb_ingress_bind {ingress:?}: {e}"))?;
-    let egress_bind: SocketAddr = egress
-        .parse()
-        .map_err(|e| format!("federation_proxy egress {egress:?}: {e}"))?;
+    let egress_bind = egress_bind_from_proxy(proxy)?;
     Ok(neutrino_lb::LbConfig {
         ingress_bind,
         egress_bind,
         upstream: upstream_url(&config.bind_addr),
     })
+}
+
+/// The `host:port` the egress must bind, extracted from a `federation_proxy`
+/// URL. That value is validated at startup as a `reqwest::Proxy::all` URL
+/// (`AppState::new`), which accepts an optional `scheme://` and a trailing
+/// path/slash/query — so mirror that here (strip the scheme and anything from
+/// the first path/query/fragment delimiter) rather than assuming a bare
+/// `http://host:port`. This keeps the two validators in agreement: a proxy URL
+/// that passed startup won't then fail to start the in-process sidecar. Still
+/// aborts (returns `Err`) if what remains isn't a bindable `SocketAddr` (e.g. a
+/// hostname needing resolution, which the egress listener can't bind directly).
+fn egress_bind_from_proxy(proxy: &str) -> Result<SocketAddr, String> {
+    let after_scheme = proxy.split_once("://").map_or(proxy, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    authority
+        .parse::<SocketAddr>()
+        .map_err(|e| format!("federation_proxy egress {authority:?}: {e}"))
 }
 
 /// The loopback URL the ingress uses to reach the co-located homeserver. When
@@ -125,6 +142,43 @@ mod tests {
     fn build_lb_config_rejects_unparseable_ingress() {
         let c = cfg("127.0.0.1:8008", Some("http://127.0.0.1:8009"));
         assert!(build_lb_config(&c, "not-an-addr").is_err());
+    }
+
+    // The egress derivation must accept every `federation_proxy` form that
+    // `reqwest::Proxy::all` accepts at startup, so a value that passed startup
+    // validation can't then abort the in-process sidecar.
+    #[test]
+    fn egress_bind_reflects_proxy_all_accepted_forms() {
+        let want: SocketAddr = "127.0.0.1:8009".parse().unwrap();
+        // Trailing slash, trailing path, bare authority (no scheme), and a
+        // non-http scheme are all valid `Proxy::all` inputs.
+        for proxy in [
+            "http://127.0.0.1:8009",
+            "http://127.0.0.1:8009/",
+            "http://127.0.0.1:8009/path",
+            "127.0.0.1:8009",
+            "https://127.0.0.1:8009",
+        ] {
+            assert_eq!(
+                egress_bind_from_proxy(proxy).unwrap(),
+                want,
+                "egress derivation failed for {proxy:?}"
+            );
+        }
+        // IPv6 authority round-trips too.
+        assert_eq!(
+            egress_bind_from_proxy("http://[::1]:8009/").unwrap(),
+            "[::1]:8009".parse().unwrap()
+        );
+    }
+
+    // The abort is kept: a proxy URL whose authority isn't a bindable
+    // SocketAddr (e.g. a hostname) still fails loudly rather than going direct.
+    #[test]
+    fn build_lb_config_rejects_unbindable_egress_authority() {
+        let c = cfg("127.0.0.1:8008", Some("http://localhost:8009"));
+        assert!(build_lb_config(&c, "0.0.0.0:8448").is_err());
+        assert!(egress_bind_from_proxy("http://nope").is_err());
     }
 
     #[test]
