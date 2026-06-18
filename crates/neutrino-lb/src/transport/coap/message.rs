@@ -225,4 +225,32 @@ mod tests {
         let got = parse_response(&resp);
         assert_eq!(got.status, 502);
     }
+
+    #[test]
+    fn methods_round_trip_and_unknown_falls_back_to_get() {
+        // GET/POST/PUT survive the CoAP method mapping; any other method is
+        // intentionally coerced to GET (federation uses only these three — see
+        // `to_coap_method`), a lossy fallback this pins explicitly.
+        for (input, expected) in [
+            (Method::GET, Method::GET),
+            (Method::POST, Method::POST),
+            (Method::PUT, Method::PUT),
+            (Method::DELETE, Method::GET),
+        ] {
+            let wire = WireRequest {
+                dest: String::new(),
+                method: input.clone(),
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![],
+                body: vec![],
+            };
+            let coap = build_request(&wire);
+            let bytes = coap.message.to_bytes().expect("to_bytes");
+            let packet = coap_lite::Packet::from_bytes(&bytes).expect("from_bytes");
+            let mut reparsed: CoapRequest<SocketAddr> = CoapRequest::new();
+            reparsed.message = packet;
+            let got = parse_request(&reparsed);
+            assert_eq!(got.method, expected, "{input} should map to {expected}");
+        }
+    }
 }

@@ -12,6 +12,16 @@ use tokio_util::sync::CancellationToken;
 pub mod coap;
 pub mod http;
 
+/// Upper bound on a single assembled wire body, applied on every leg that
+/// hands a body to the transcode/handler. The public federation port is the
+/// one truly network-exposed surface, and a body is buffered whole,
+/// CBOR-decoded, *and* re-serialized — so an unbounded body is a
+/// memory-exhaustion / OOM risk (fatal on the embedded-on-mobile target). A
+/// generous cap that no legitimate federation body approaches. The HTTP
+/// transport enforces it while buffering; the CoAP transport enforces it on the
+/// assembled (post-reassembly) body — see the OOM note in `transport::coap`.
+pub(crate) const MAX_WIRE_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
     #[error("wire transport error: {0}")]

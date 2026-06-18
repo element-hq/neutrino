@@ -3,13 +3,20 @@
 //! `crate::serve`. The codec stays opaque: this transport carries the CBOR body
 //! verbatim and never inspects it.
 //!
-//! OOM note: unlike `transport::http` (which caps inbound/peer bodies at
-//! `MAX_WIRE_BODY_BYTES`), coap-rs 0.27 / coap-lite 0.13 expose no maximum on
-//! blockwise reassembly — assembled request/response buffers grow unbounded.
-//! This is acceptable under Neutrino's trusted-network assumption (both ends are
-//! ours), but is a weaker guarantee than the HTTP transport. A reassembly cap is
-//! a follow-up (see `PLAN.md`) — it would need to bound the block accumulators in
-//! coap-rs/coap-lite, which the current API does not allow from the outside.
+//! OOM note: this transport enforces `MAX_WIRE_BODY_BYTES` on the *assembled*
+//! body — the ingress refuses an over-cap request with 413 before it reaches the
+//! handler/transcode (`CoapDispatch::handle`), and the egress rejects an over-cap
+//! peer response (`CoapWireClient::send`). That matches the HTTP transport's
+//! handler-facing contract and bounds the JSON↔CBOR transcode amplification + the
+//! loopback forward for a legitimately large body (e.g. a big room's `send_join`
+//! state), which is the realistic case under Neutrino's trusted-network
+//! assumption. What it does *not* bound is the buffer coap-lite 0.13 accumulates
+//! *during* blockwise reassembly: `max_total_message_size` caps only the
+//! negotiated per-block size, not the running total across Block1 chunks (verified
+//! in `coap_lite::block_handler`), so a peer streaming unbounded chunks can still
+//! grow that internal buffer before our post-reassembly check fires. A true
+//! reassembly-time cap is a follow-up (see `PLAN.md`); it needs coap-lite to bound
+//! the block accumulator, which the current API does not allow from the outside.
 
 mod message;
 mod paths;
@@ -22,10 +29,12 @@ pub(crate) const OPT_FWD_HEADER: u16 = 2050;
 /// `application/cbor` (RFC 8949 §9.1).
 pub(crate) const CBOR_CONTENT_FORMAT: u16 = 60;
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use coap::UdpCoAPClient;
 
-use crate::transport::{WireClient, WireError, WireRequest, WireResponse};
+use crate::transport::{MAX_WIRE_BODY_BYTES, WireClient, WireError, WireRequest, WireResponse};
 
 /// Egress wire client over CoAP/UDP. Dials `req.dest` per send; coap-rs handles
 /// CON retransmit and Block1/Block2 blockwise transparently.
@@ -35,17 +44,53 @@ pub struct CoapWireClient {
     /// the response chunk size — is fixed by the responding server's coap-rs
     /// default and not yet tunable; see the module docs / `PLAN.md`.)
     block1_size: Option<usize>,
+    /// Total wall-clock ceiling on a single `send` (dial + the whole blockwise
+    /// exchange). coap-rs bounds each CON block by its own receive-timeout ×
+    /// retries, but nothing bounds a multi-block transfer where a peer answers
+    /// each block slowly-but-just-in-time — so without this a slow/black-hole
+    /// peer pins the egress task and its buffered body indefinitely. Mirrors the
+    /// HTTP transport's `REQUEST_TIMEOUT` rationale (UDP has no connect phase, so
+    /// one total bound covers dial — incl. DNS resolve — and the exchange).
+    request_timeout: Duration,
+    /// Cap on a peer's assembled response body, mirroring the ingress request
+    /// cap. The peer is the untrusted network side and its response is buffered
+    /// then re-transcoded, so an unbounded body is an OOM surface even from a
+    /// non-hostile peer. See the module OOM note.
+    max_body_bytes: usize,
 }
 
 impl CoapWireClient {
     pub fn new() -> Self {
-        Self { block1_size: None }
+        Self {
+            block1_size: None,
+            request_timeout: crate::REQUEST_TIMEOUT,
+            max_body_bytes: MAX_WIRE_BODY_BYTES,
+        }
     }
 
     /// Build a client with a specific Block1 (request) chunk size. `None` keeps
     /// coap-rs's 1024 B default.
     pub fn with_block1_size(block1_size: Option<usize>) -> Self {
-        Self { block1_size }
+        Self {
+            block1_size,
+            ..Self::new()
+        }
+    }
+
+    #[cfg(test)]
+    fn with_request_timeout(request_timeout: Duration) -> Self {
+        Self {
+            request_timeout,
+            ..Self::new()
+        }
+    }
+
+    #[cfg(test)]
+    fn with_max_body_bytes(max_body_bytes: usize) -> Self {
+        Self {
+            max_body_bytes,
+            ..Self::new()
+        }
     }
 }
 
@@ -58,18 +103,41 @@ impl Default for CoapWireClient {
 #[async_trait]
 impl WireClient for CoapWireClient {
     async fn send(&self, req: WireRequest) -> Result<WireResponse, WireError> {
-        let mut client = UdpCoAPClient::new(req.dest.as_str())
+        let dest = req.dest.clone();
+        let block1_size = self.block1_size;
+        let max_body_bytes = self.max_body_bytes;
+        let exchange = async move {
+            let mut client = UdpCoAPClient::new(req.dest.as_str())
+                .await
+                .map_err(|e| WireError::Transport(format!("coap dial {}: {e}", req.dest)))?;
+            if let Some(size) = block1_size {
+                client.set_block1_size(size);
+            }
+            let coap_req = message::build_request(&req);
+            let resp = client
+                .send(coap_req)
+                .await
+                .map_err(|e| WireError::Transport(format!("coap send: {e}")))?;
+            // Bound the peer's (post-reassembly) response before re-transcoding
+            // it — the untrusted-side OOM guard, symmetric with the ingress cap.
+            if resp.message.payload.len() > max_body_bytes {
+                return Err(WireError::Transport(format!(
+                    "peer response body exceeds {max_body_bytes}-byte cap"
+                )));
+            }
+            Ok(message::parse_response(&resp))
+        };
+        // Total ceiling on the whole exchange, so a slow/black-hole peer can't
+        // pin this task past `request_timeout` (the per-block coap-rs retries do
+        // not bound a multi-block transfer). Dropping the future closes the socket.
+        tokio::time::timeout(self.request_timeout, exchange)
             .await
-            .map_err(|e| WireError::Transport(format!("coap dial {}: {e}", req.dest)))?;
-        if let Some(size) = self.block1_size {
-            client.set_block1_size(size);
-        }
-        let coap_req = message::build_request(&req);
-        let resp = client
-            .send(coap_req)
-            .await
-            .map_err(|e| WireError::Transport(format!("coap send: {e}")))?;
-        Ok(message::parse_response(&resp))
+            .map_err(|_| {
+                WireError::Transport(format!(
+                    "coap request to {dest} exceeded {:?}",
+                    self.request_timeout
+                ))
+            })?
     }
 }
 
@@ -77,7 +145,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use coap::Server;
-use coap_lite::CoapRequest;
+use coap_lite::{BlockHandlerConfig, CoapRequest};
 use tokio_util::sync::CancellationToken;
 
 use crate::transport::{WireHandler, WireServer};
@@ -87,17 +155,48 @@ use crate::transport::{WireHandler, WireServer};
 /// blockwise requests and segments large responses internally.
 pub struct CoapWireServer {
     bind: SocketAddr,
+    /// Total framed-message budget (`BlockHandlerConfig.max_total_message_size`).
+    /// `None` uses coap-rs's ~1152 B default. Bounds both the largest accepted
+    /// inbound request datagram and the outbound Block2 fragment size (see the
+    /// `WireKind::Coap` docs for the coupling with the client's `block1_size`).
+    max_message_size: Option<usize>,
+    /// Cap on the assembled inbound request body handed to the handler (the
+    /// network-exposed OOM guard — see the module OOM note). Distinct from
+    /// `max_message_size`, which bounds per-block framing, not the running total.
+    max_body_bytes: usize,
 }
 
 impl CoapWireServer {
     pub fn new(bind: SocketAddr) -> Self {
-        Self { bind }
+        Self {
+            bind,
+            max_message_size: None,
+            max_body_bytes: MAX_WIRE_BODY_BYTES,
+        }
+    }
+
+    /// Build a server with a specific per-message size budget. `None` keeps
+    /// coap-rs's ~1152 B default.
+    pub fn with_max_message_size(bind: SocketAddr, max_message_size: Option<usize>) -> Self {
+        Self {
+            max_message_size,
+            ..Self::new(bind)
+        }
+    }
+
+    #[cfg(test)]
+    fn with_max_body_bytes(bind: SocketAddr, max_body_bytes: usize) -> Self {
+        Self {
+            max_body_bytes,
+            ..Self::new(bind)
+        }
     }
 }
 
 /// Adapter so `coap::Server` can call into our `WireHandler`.
 struct CoapDispatch {
     handler: Arc<dyn WireHandler>,
+    max_body_bytes: usize,
 }
 
 impl CoapDispatch {
@@ -105,10 +204,27 @@ impl CoapDispatch {
         &self,
         mut request: Box<CoapRequest<SocketAddr>>,
     ) -> Box<CoapRequest<SocketAddr>> {
-        let wire_req = message::parse_request(&request);
-        let wire_resp = self.handler.handle(wire_req).await;
-        // `from_packet` populates `response` for any valid request; if absent
-        // (malformed inbound packet) coap-rs answers with its default.
+        // `from_packet` populates `response` for any valid request; if it is
+        // absent (malformed / non-confirmable inbound) we must NOT run the
+        // handler — doing so would forward a side-effecting request upstream
+        // whose reply is then discarded. Let coap-rs answer with its default.
+        if request.response.is_none() {
+            return request;
+        }
+        // Refuse an over-cap assembled body with 413 before it reaches the
+        // handler/transcode — the network-exposed OOM guard, mirroring the HTTP
+        // ingress. (coap-lite has already reassembled it; this still bounds the
+        // downstream transcode + loopback forward — see the module OOM note.)
+        let wire_resp = if request.message.payload.len() > self.max_body_bytes {
+            WireResponse {
+                status: 413,
+                headers: vec![],
+                body: vec![],
+            }
+        } else {
+            let wire_req = message::parse_request(&request);
+            self.handler.handle(wire_req).await
+        };
         if let Some(ref mut response) = request.response {
             message::write_response(response, &wire_resp);
         }
@@ -123,9 +239,21 @@ impl WireServer for CoapWireServer {
         handler: Arc<dyn WireHandler>,
         shutdown: CancellationToken,
     ) -> Result<(), WireError> {
-        let server = Server::new_udp(self.bind)
-            .map_err(|e| WireError::Serve(format!("bind {}: {e}", self.bind)))?;
-        let dispatch = Arc::new(CoapDispatch { handler });
+        let server = match self.max_message_size {
+            Some(max_total_message_size) => Server::new_udp_with_config(
+                self.bind,
+                BlockHandlerConfig {
+                    max_total_message_size,
+                    ..Default::default()
+                },
+            ),
+            None => Server::new_udp(self.bind),
+        }
+        .map_err(|e| WireError::Serve(format!("bind {}: {e}", self.bind)))?;
+        let dispatch = Arc::new(CoapDispatch {
+            handler,
+            max_body_bytes: self.max_body_bytes,
+        });
 
         // `coap::Server::run` has no native shutdown, so race it against the
         // token: when shutdown fires the run future is dropped, closing the
@@ -242,6 +370,45 @@ mod client_tests {
         assert_eq!(resp.status, 200);
         // Server echoes the decoded coap path segments (code f8 + dynamic) + body.
         assert_eq!(resp.body, b"f8/!r:a/$e|\x01\x02\x03");
+    }
+
+    // A peer that answers without an OPT_HTTP_STATUS option must surface as a
+    // retryable 502 through the client (not a panic) — the transport-level twin
+    // of `message::tests::missing_status_option_defaults_to_bad_gateway`, on the
+    // path that actually feeds the federation retry loop.
+    #[tokio::test]
+    async fn missing_status_option_surfaces_502() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = probe.local_addr().unwrap();
+        drop(probe);
+        let server = Server::new_udp(addr).expect("server");
+
+        tokio::spawn(async move {
+            server
+                .run(|mut request: Box<CoapRequest<SocketAddr>>| async move {
+                    // Reply with a body but deliberately no OPT_HTTP_STATUS.
+                    if let Some(ref mut resp) = request.response {
+                        resp.message.payload = b"no-status".to_vec();
+                    }
+                    request
+                })
+                .await
+                .ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = CoapWireClient::new();
+        let resp = client
+            .send(WireRequest {
+                dest: addr.to_string(),
+                method: Method::GET,
+                path: "/_matrix/federation/v1/event/$e".to_owned(),
+                headers: vec![],
+                body: vec![],
+            })
+            .await
+            .expect("send");
+        assert_eq!(resp.status, 502, "missing status must surface as 502");
     }
 }
 
@@ -383,7 +550,11 @@ mod blockwise_tests {
         );
 
         token.cancel();
-        let _ = handle.await;
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(
+            matches!(joined, Ok(Ok(Ok(())))),
+            "server task did not wind down cleanly on cancel: {joined:?}"
+        );
     }
 
     // A configured small Block1 size must still round-trip a request body many
@@ -439,6 +610,321 @@ mod blockwise_tests {
         );
 
         token.cancel();
-        let _ = handle.await;
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(
+            matches!(joined, Ok(Ok(Ok(())))),
+            "server task did not wind down cleanly on cancel: {joined:?}"
+        );
+    }
+
+    // A small server `max_message_size` budget (forked coap-rs `*_with_config`)
+    // forces small Block2 *response* fragments; paired with a coordinated small
+    // Block1 (so inbound request blocks stay within budget — see the coupling in
+    // `WireKind::Coap` docs), a multi-KiB body must still round-trip intact in
+    // both directions. Pins that the budget is applied and the coordinated
+    // constrained-link config works end to end.
+    #[tokio::test]
+    async fn small_message_budget_round_trips_both_directions() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        // 256 B total-message budget -> Block2 response fragments well under it.
+        let handle = tokio::spawn(async move {
+            CoapWireServer::with_max_message_size(addr, Some(256))
+                .serve(Arc::new(PlainEcho), server_token)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 2 KiB body. Block1 at 128 B payload leaves headroom under the 256 B
+        // budget for CoAP option overhead, so inbound is not down-negotiated.
+        let req_body: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
+        let client = CoapWireClient::with_block1_size(Some(128));
+        let resp = client
+            .send(WireRequest {
+                dest: addr.to_string(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![],
+                body: req_body.clone(),
+            })
+            .await
+            .expect("budgeted send");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.body, req_body,
+            "small-budget round-trip corrupted across Block1+Block2"
+        );
+
+        token.cancel();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(
+            matches!(joined, Ok(Ok(Ok(())))),
+            "server task did not wind down cleanly on cancel: {joined:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+    use crate::transport::{WireClient, WireHandler, WireRequest, WireResponse};
+    use axum::http::Method;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    // Echoes the request body and records whether it ran, so the ingress cap can
+    // assert the handler is bypassed for an over-cap body.
+    struct SpyEcho(Arc<AtomicBool>);
+
+    #[async_trait]
+    impl WireHandler for SpyEcho {
+        async fn handle(&self, req: WireRequest) -> WireResponse {
+            self.0.store(true, Ordering::SeqCst);
+            WireResponse {
+                status: 200,
+                headers: vec![],
+                body: req.body,
+            }
+        }
+    }
+
+    // An over-cap inbound body must be refused with 413 before the handler runs
+    // — the network-exposed OOM guard, symmetric with the HTTP ingress.
+    #[tokio::test]
+    async fn server_rejects_oversized_body_with_413() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        let handler_ran = ran.clone();
+        let handle = tokio::spawn(async move {
+            CoapWireServer::with_max_body_bytes(addr, 8)
+                .serve(Arc::new(SpyEcho(handler_ran)), server_token)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = CoapWireClient::new();
+        let resp = client
+            .send(WireRequest {
+                dest: addr.to_string(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![],
+                body: vec![0u8; 100], // > 8-byte cap
+            })
+            .await
+            .expect("send");
+
+        assert_eq!(resp.status, 413, "oversized body must be rejected");
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "handler must not run for an over-cap body"
+        );
+
+        token.cancel();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(
+            matches!(joined, Ok(Ok(Ok(())))),
+            "server task did not wind down cleanly on cancel: {joined:?}"
+        );
+    }
+
+    // A peer response over the client's cap must surface as a Transport error
+    // rather than being buffered + re-transcoded (the untrusted-side OOM guard).
+    #[tokio::test]
+    async fn client_rejects_oversized_response_body() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        let handle = tokio::spawn(async move {
+            // Default 64 MiB cap: the 100-byte request passes; the handler echoes
+            // it back, giving the client a 100-byte response to reject.
+            CoapWireServer::new(addr)
+                .serve(
+                    Arc::new(SpyEcho(Arc::new(AtomicBool::new(false)))),
+                    server_token,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = CoapWireClient::with_max_body_bytes(8); // cap below 100
+        let err = client
+            .send(WireRequest {
+                dest: addr.to_string(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![],
+                body: vec![0u8; 100],
+            })
+            .await
+            .expect_err("oversized peer response must error, not buffer");
+        assert!(matches!(err, WireError::Transport(_)), "got {err:?}");
+
+        token.cancel();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(
+            matches!(joined, Ok(Ok(Ok(())))),
+            "server task did not wind down cleanly on cancel: {joined:?}"
+        );
+    }
+
+    // A black-hole peer (a UDP socket that never answers) must surface as a
+    // Transport error within the client's request timeout, not hang — the CoAP
+    // analogue of the HTTP slow-peer timeout. The outer timeout fails the test if
+    // `send` ever hangs past the bound.
+    #[tokio::test]
+    async fn dead_peer_send_is_bounded_by_request_timeout() {
+        // Bind a socket and never read/respond: every CON goes unanswered.
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sink.local_addr().unwrap();
+
+        let client = CoapWireClient::with_request_timeout(Duration::from_millis(200));
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.send(WireRequest {
+                dest: addr.to_string(),
+                method: Method::GET,
+                path: "/_matrix/federation/v1/event/$e".to_owned(),
+                headers: vec![],
+                body: vec![],
+            }),
+        )
+        .await
+        .expect("send must return within the request timeout, not hang")
+        .expect_err("a black-hole peer must surface a Transport error");
+        assert!(matches!(err, WireError::Transport(_)), "got {err:?}");
+        drop(sink);
+    }
+
+    // The documented Block1/budget mis-coordination failure: a client Block1
+    // payload larger than the server's total-message budget forces a server
+    // down-negotiation the coap-rs client cannot satisfy. The contract (see the
+    // `WireKind::Coap` docs) is that this must NOT silently round-trip — it must
+    // surface as a failure (a transport error, or a non-2xx status), bounded by
+    // the request timeout rather than hanging or corrupting the body.
+    #[tokio::test]
+    async fn mismatched_block1_over_budget_does_not_silently_succeed() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        // Tiny 64 B budget vs a 512 B client request block -> uncoordinated.
+        let handle = tokio::spawn(async move {
+            CoapWireServer::with_max_message_size(addr, Some(64))
+                .serve(
+                    Arc::new(SpyEcho(Arc::new(AtomicBool::new(false)))),
+                    server_token,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 512 B Block1 over a 64 B budget; a short timeout so a (regressed) hang
+        // fails fast rather than waiting the full default.
+        let client = CoapWireClient {
+            block1_size: Some(512),
+            request_timeout: Duration::from_secs(3),
+            max_body_bytes: MAX_WIRE_BODY_BYTES,
+        };
+        let req_body: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
+        let result = client
+            .send(WireRequest {
+                dest: addr.to_string(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![],
+                body: req_body,
+            })
+            .await;
+        match result {
+            Err(WireError::Transport(_)) => {} // down-negotiation surfaced as an error
+            Ok(resp) => assert_ne!(
+                resp.status, 200,
+                "uncoordinated block1/budget must not silently succeed"
+            ),
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
+
+        token.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use crate::transport::{WireHandler, WireRequest, WireResponse};
+    use coap_lite::{CoapRequest, CoapResponse};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Spy(Arc<AtomicBool>);
+
+    #[async_trait]
+    impl WireHandler for Spy {
+        async fn handle(&self, _req: WireRequest) -> WireResponse {
+            self.0.store(true, Ordering::SeqCst);
+            WireResponse {
+                status: 200,
+                headers: vec![],
+                body: vec![],
+            }
+        }
+    }
+
+    // No response slot (malformed / non-confirmable inbound): the handler must
+    // NOT run, so a side-effecting upstream forward with a discarded reply can't
+    // happen.
+    #[tokio::test]
+    async fn skips_handler_when_no_response_slot() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let dispatch = CoapDispatch {
+            handler: Arc::new(Spy(ran.clone())),
+            max_body_bytes: MAX_WIRE_BODY_BYTES,
+        };
+        let mut request: Box<CoapRequest<SocketAddr>> = Box::new(CoapRequest::new());
+        request.response = None;
+        let _ = dispatch.handle(request).await;
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "handler ran without a response slot"
+        );
+    }
+
+    // With a response slot present, the handler runs and its reply is written.
+    #[tokio::test]
+    async fn runs_handler_when_response_slot_present() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let dispatch = CoapDispatch {
+            handler: Arc::new(Spy(ran.clone())),
+            max_body_bytes: MAX_WIRE_BODY_BYTES,
+        };
+        let mut request: Box<CoapRequest<SocketAddr>> = Box::new(CoapRequest::new());
+        request.response = Some(CoapResponse::new(&request.message).expect("response"));
+        let out = dispatch.handle(request).await;
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "handler did not run with a response slot"
+        );
+        assert!(out.response.is_some());
     }
 }

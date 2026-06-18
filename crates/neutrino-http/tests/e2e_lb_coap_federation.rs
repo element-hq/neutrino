@@ -3,7 +3,11 @@
 //! The CoAP twin of `e2e_lb_federation.rs`: same topology and scenario, only the
 //! inter-sidecar wire hop is CoAP over UDP instead of HTTP/TCP. Proves the
 //! `make_join`/`send_join` handshake and an outbox-driven `/send` converge
-//! across the CoAP transport (incl. blockwise on the larger `send_join` body).
+//! across the CoAP transport. A deliberately small, coordinated CoAP budget
+//! (128 B block / 512 B message, set per node below) forces the handshake to
+//! cross Block1/Block2 boundaries, so this genuinely exercises blockwise
+//! reassembly end to end (the defaults would fit an empty room's state in a
+//! single ~1 KiB datagram and never run the blockwise path).
 //!
 //! Lives in `neutrino-http`'s tests (not `neutrino-lb`'s) because it drives full
 //! homeservers; `neutrino-lb` cannot depend on `neutrino-http` (that crate
@@ -74,7 +78,18 @@ async fn start_node(localpart: &str) -> Node {
         ingress_bind: ingress,
         egress_bind: egress,
         upstream: format!("http://{http_addr}"),
-        wire: neutrino_lb::WireKind::Coap { block1_size: None },
+        // Small, *coordinated* CoAP budget so the make_join/send_join handshake
+        // genuinely crosses Block1/Block2 boundaries (with the defaults an empty
+        // room's state fits one ~1 KiB datagram and the blockwise path never
+        // runs). 128 B request blocks force multi-block Block1; the 512 B budget
+        // is below the ~1.5 KiB send_join response (forcing Block2) yet well above
+        // the per-block message size — each block also carries the repeated path
+        // + `authorization` (X-Matrix) options (~165 B), so the budget must clear
+        // `block1_size + options`, not just `block1_size` (256 B is too tight).
+        wire: neutrino_lb::WireKind::Coap {
+            block1_size: Some(128),
+            max_message_size: Some(512),
+        },
     };
     let lb_shutdown = shutdown.clone();
     tokio::spawn(async move {

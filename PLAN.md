@@ -53,6 +53,11 @@ state, Dendrite v1 federation path codes (+ literal fallback), forwarded
 headers + exact HTTP status carried as CoAP options. Selected via
 `LbConfig.wire: WireKind` (`Http` default). Two homeservers converge a join +
 message over CoAP/UDP — see `crates/neutrino-http/tests/e2e_lb_coap_federation.rs`.
+Per-message sizing for constrained links is tunable via
+`WireKind::Coap { block1_size, max_message_size }` (request Block1 payload, and
+the node's total framed-message budget that bounds inbound accept + outbound
+Block2). `max_message_size` requires the `kaylendog/coap-rs` fork (patched in via
+`[patch.crates-io]`), which adds `Server::*_with_config`.
 Design: `docs/superpowers/specs/2026-06-18-neutrino-lb-coap-udp-transport-design.md`;
 plan: `docs/superpowers/plans/2026-06-18-neutrino-lb-coap-udp-transport.md`.
 
@@ -62,15 +67,18 @@ Deferred follow-ups (write-ups, not done):
   `JSON value ⇄ CBOR bytes` transcode. The single-byte CoAP path enums are now
   done (`transport::coap::paths`). MSC3079:
   https://github.com/matrix-org/matrix-spec-proposals/blob/kegan/low-bandwidth/proposals/3079-low-bandwidth-csapi.md
-- CoAP blockwise reassembly cap: coap-rs 0.27 / coap-lite 0.13 expose no maximum
-  on assembled blockwise payloads (the HTTP transport caps at
-  `MAX_WIRE_BODY_BYTES`); acceptable under the trusted-network assumption, but a
-  weaker OOM guarantee. Needs an upstream/forked bound on the block accumulators.
-- CoAP Block2 (response) chunk size: the per-request Block1 size is tunable
-  (`WireKind::Coap { block1_size }`), but the response chunk size is fixed by
-  coap-rs's `Server` (`BlockHandlerConfig::default()`, ~1152 B, no public setter).
-  Tuning response datagrams below that for a small serial MTU needs an upstream
-  patch / fork to expose `BlockHandlerConfig`.
+- CoAP blockwise *reassembly-time* cap: the transport now enforces
+  `MAX_WIRE_BODY_BYTES` on the **assembled** body (ingress → 413, egress →
+  transport error), matching the HTTP transport's handler-facing contract and
+  bounding the transcode + forward of a legitimately large body. What remains: a
+  cap *during* reassembly — coap-lite 0.13's `max_total_message_size` bounds only
+  the negotiated per-block size, not the running total across Block1 chunks, so a
+  peer streaming unbounded chunks can still grow coap-lite's internal buffer
+  before the post-reassembly check fires. Acceptable under the trusted-network
+  assumption; a true bound needs an upstream/forked cap on the block accumulators.
+- Upstream the `coap-rs` `Server::*_with_config` change (carried on the
+  `kaylendog/coap-rs` fork) so the `[patch.crates-io]` git pin can drop. Until
+  then the build depends on the fork rev.
 - SLIP / serial-link framing on top of the CoAP/UDP transport (the
   `cmd/test-coap/bridge` work) — the physical low-bandwidth link.
 - per-hop timeouts on the sidecar's own reqwest clients (`LbConfig.timeouts`);
