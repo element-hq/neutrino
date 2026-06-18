@@ -84,6 +84,7 @@ fn build_lb_config(
         ingress_bind,
         egress_bind,
         upstream: upstream_url(&config.bind_addr)?,
+        wire: neutrino_lb::WireKind::default(),
     })
 }
 

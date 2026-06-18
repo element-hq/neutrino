@@ -3,11 +3,6 @@
 //! `crate::serve`. The codec stays opaque: this transport carries the CBOR body
 //! verbatim and never inspects it.
 
-// The module is built bottom-up (paths -> message -> client/server -> serve);
-// its internals are only fully reachable once `crate::serve` selects the CoAP
-// transport. This allow is removed in that wiring task.
-#![allow(dead_code)]
-
 mod message;
 mod paths;
 
