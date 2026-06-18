@@ -66,6 +66,11 @@ Deferred follow-ups (write-ups, not done):
   on assembled blockwise payloads (the HTTP transport caps at
   `MAX_WIRE_BODY_BYTES`); acceptable under the trusted-network assumption, but a
   weaker OOM guarantee. Needs an upstream/forked bound on the block accumulators.
+- CoAP Block2 (response) chunk size: the per-request Block1 size is tunable
+  (`WireKind::Coap { block1_size }`), but the response chunk size is fixed by
+  coap-rs's `Server` (`BlockHandlerConfig::default()`, ~1152 B, no public setter).
+  Tuning response datagrams below that for a small serial MTU needs an upstream
+  patch / fork to expose `BlockHandlerConfig`.
 - SLIP / serial-link framing on top of the CoAP/UDP transport (the
   `cmd/test-coap/bridge` work) — the physical low-bandwidth link.
 - per-hop timeouts on the sidecar's own reqwest clients (`LbConfig.timeouts`);

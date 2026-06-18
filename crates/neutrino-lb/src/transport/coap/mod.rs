@@ -30,12 +30,22 @@ use crate::transport::{WireClient, WireError, WireRequest, WireResponse};
 /// Egress wire client over CoAP/UDP. Dials `req.dest` per send; coap-rs handles
 /// CON retransmit and Block1/Block2 blockwise transparently.
 pub struct CoapWireClient {
-    _private: (),
+    /// Max bytes per Block1 (request) chunk. `None` uses coap-rs's 1024 B
+    /// default. Lower it to fit a constrained link's datagram budget. (Block2 —
+    /// the response chunk size — is fixed by the responding server's coap-rs
+    /// default and not yet tunable; see the module docs / `PLAN.md`.)
+    block1_size: Option<usize>,
 }
 
 impl CoapWireClient {
     pub fn new() -> Self {
-        Self { _private: () }
+        Self { block1_size: None }
+    }
+
+    /// Build a client with a specific Block1 (request) chunk size. `None` keeps
+    /// coap-rs's 1024 B default.
+    pub fn with_block1_size(block1_size: Option<usize>) -> Self {
+        Self { block1_size }
     }
 }
 
@@ -48,9 +58,12 @@ impl Default for CoapWireClient {
 #[async_trait]
 impl WireClient for CoapWireClient {
     async fn send(&self, req: WireRequest) -> Result<WireResponse, WireError> {
-        let client = UdpCoAPClient::new(req.dest.as_str())
+        let mut client = UdpCoAPClient::new(req.dest.as_str())
             .await
             .map_err(|e| WireError::Transport(format!("coap dial {}: {e}", req.dest)))?;
+        if let Some(size) = self.block1_size {
+            client.set_block1_size(size);
+        }
         let coap_req = message::build_request(&req);
         let resp = client
             .send(coap_req)
@@ -367,6 +380,62 @@ mod blockwise_tests {
         assert!(
             resp.body.iter().all(|b| *b == 0xAB),
             "blockwise payload corrupted"
+        );
+
+        token.cancel();
+        let _ = handle.await;
+    }
+
+    // A configured small Block1 size must still round-trip a request body many
+    // times larger than one block — forcing ~16 Block1 chunks at 64 B and proving
+    // the `set_block1_size` tuning is applied and correct under tiny packets (the
+    // low-bandwidth-link case). Echoes the body back 1:1.
+    struct PlainEcho;
+
+    #[async_trait]
+    impl WireHandler for PlainEcho {
+        async fn handle(&self, req: WireRequest) -> WireResponse {
+            WireResponse {
+                status: 200,
+                headers: vec![],
+                body: req.body,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn small_block1_size_chunks_request_and_round_trips() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        let handle = tokio::spawn(async move {
+            CoapWireServer::new(addr)
+                .serve(Arc::new(PlainEcho), server_token)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 1 KiB body with a 64 B Block1 cap -> ~16 request blocks.
+        let req_body: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let client = CoapWireClient::with_block1_size(Some(64));
+        let resp = client
+            .send(WireRequest {
+                dest: addr.to_string(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![],
+                body: req_body.clone(),
+            })
+            .await
+            .expect("small-block send");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.body, req_body,
+            "small-block request round-trip corrupted"
         );
 
         token.cancel();
