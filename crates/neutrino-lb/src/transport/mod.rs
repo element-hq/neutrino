@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use axum::http::Method;
 use tokio_util::sync::CancellationToken;
 
+pub mod coap;
 pub mod http;
 
 #[derive(Debug, thiserror::Error)]
