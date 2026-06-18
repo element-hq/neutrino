@@ -2,6 +2,14 @@
 //! `CoapWireServer` (peer→ingress), a sibling of `transport::http`, selected in
 //! `crate::serve`. The codec stays opaque: this transport carries the CBOR body
 //! verbatim and never inspects it.
+//!
+//! OOM note: unlike `transport::http` (which caps inbound/peer bodies at
+//! `MAX_WIRE_BODY_BYTES`), coap-rs 0.27 / coap-lite 0.13 expose no maximum on
+//! blockwise reassembly — assembled request/response buffers grow unbounded.
+//! This is acceptable under Neutrino's trusted-network assumption (both ends are
+//! ours), but is a weaker guarantee than the HTTP transport. A reassembly cap is
+//! a follow-up (see `PLAN.md`) — it would need to bound the block accumulators in
+//! coap-rs/coap-lite, which the current API does not allow from the outside.
 
 mod message;
 mod paths;
@@ -287,5 +295,81 @@ mod server_tests {
         token.cancel();
         let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
         assert!(joined.is_ok(), "server did not wind down on cancel");
+    }
+}
+
+#[cfg(test)]
+mod blockwise_tests {
+    use super::*;
+    use crate::transport::{WireClient, WireHandler, WireRequest, WireResponse};
+    use axum::http::Method;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    // Echoes a body 64x larger than the request, exercising Block2 (large
+    // response) on top of Block1 (large request).
+    struct BigEcho;
+
+    #[async_trait]
+    impl WireHandler for BigEcho {
+        async fn handle(&self, req: WireRequest) -> WireResponse {
+            let big = req
+                .body
+                .iter()
+                .cycle()
+                .take(req.body.len() * 64)
+                .copied()
+                .collect();
+            WireResponse {
+                status: 200,
+                headers: vec![],
+                body: big,
+            }
+        }
+    }
+
+    // A body well over one ~1 KiB CoAP block must round-trip intact in both
+    // directions — the load-bearing case (a real `send_join` serializes the whole
+    // room state DAG). Proves coap-rs Block1 (request) + Block2 (response)
+    // reassembly is wired through the transport.
+    #[tokio::test]
+    async fn large_body_round_trips_via_blockwise() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        let handle = tokio::spawn(async move {
+            CoapWireServer::new(addr)
+                .serve(Arc::new(BigEcho), server_token)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 8 KiB request -> 512 KiB response, both far over one datagram.
+        let req_body = vec![0xABu8; 8 * 1024];
+        let client = CoapWireClient::new();
+        let resp = client
+            .send(WireRequest {
+                dest: addr.to_string(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v2/send_join/!r:a/$e".to_owned(),
+                headers: vec![],
+                body: req_body.clone(),
+            })
+            .await
+            .expect("blockwise send");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body.len(), req_body.len() * 64);
+        assert!(
+            resp.body.iter().all(|b| *b == 0xAB),
+            "blockwise payload corrupted"
+        );
+
+        token.cancel();
+        let _ = handle.await;
     }
 }
