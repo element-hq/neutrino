@@ -102,9 +102,22 @@ fn egress_bind_from_proxy(proxy: &str) -> Result<SocketAddr, String> {
         .split(['/', '?', '#'])
         .next()
         .unwrap_or(after_scheme);
-    authority
-        .parse::<SocketAddr>()
-        .map_err(|e| format!("federation_proxy egress {authority:?}: {e}"))
+    let addr: SocketAddr = authority
+        .parse()
+        .map_err(|e| format!("federation_proxy egress {authority:?}: {e}"))?;
+    // The egress is an unauthenticated open forward proxy (no dest allowlist, no
+    // request-body cap) that only ever serves the co-located homeserver over
+    // loopback. A non-loopback bind (a routable interface, or an unspecified
+    // `0.0.0.0`/`[::]`) would expose that relay on the network, so reject it —
+    // symmetric with the `bind_addr`/upstream loopback guard in `upstream_url`.
+    if !addr.ip().is_loopback() {
+        return Err(format!(
+            "federation_proxy egress {addr} is not a loopback address; the \
+             in-process sidecar egress must bind loopback so its unauthenticated \
+             forward proxy stays off the network"
+        ));
+    }
+    Ok(addr)
 }
 
 /// The loopback URL the ingress uses to reach the co-located homeserver. The
@@ -206,6 +219,23 @@ mod tests {
         let c = cfg("127.0.0.1:8008", Some("http://localhost:8009"));
         assert!(build_lb_config(&c, "0.0.0.0:8448").is_err());
         assert!(egress_bind_from_proxy("http://nope").is_err());
+    }
+
+    // The egress local-in port only ever receives the co-located homeserver's
+    // own outbound requests over loopback, and it is an unauthenticated open
+    // forward proxy (no dest allowlist, no request-body cap). Binding it to a
+    // non-loopback address (a routable interface, or `0.0.0.0`) would expose
+    // that relay on the network, so a non-loopback `federation_proxy` egress is
+    // rejected — symmetric with the `bind_addr`/upstream loopback guard.
+    #[test]
+    fn build_lb_config_rejects_non_loopback_egress() {
+        // Unspecified (`0.0.0.0` / `[::]`) — would bind all interfaces.
+        assert!(egress_bind_from_proxy("http://0.0.0.0:8009").is_err());
+        assert!(egress_bind_from_proxy("http://[::]:8009").is_err());
+        // A concrete routable address.
+        assert!(egress_bind_from_proxy("http://192.168.1.5:8009").is_err());
+        let c = cfg("127.0.0.1:8008", Some("http://0.0.0.0:8009"));
+        assert!(build_lb_config(&c, "0.0.0.0:8448").is_err());
     }
 
     #[test]
