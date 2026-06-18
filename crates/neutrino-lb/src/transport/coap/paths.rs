@@ -3,10 +3,6 @@
 //! paths start with `_matrix`, which never collides with a route code, so the
 //! decoder distinguishes coded from literal paths by the first segment.
 
-// `encode`/`decode` gain their non-test caller in message.rs (next task); the
-// allow is removed there.
-#![allow(dead_code)]
-
 /// `(code, template)` pairs. Template segments wrapped in `{}` are dynamic.
 const ROUTES: &[(&str, &str)] = &[
     ("z", "/_matrix/federation/v1/send/{txnId}"),

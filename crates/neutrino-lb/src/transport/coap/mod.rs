@@ -3,18 +3,20 @@
 //! `crate::serve`. The codec stays opaque: this transport carries the CBOR body
 //! verbatim and never inspects it.
 
+// The module is built bottom-up (paths -> message -> client/server -> serve);
+// its internals are only fully reachable once `crate::serve` selects the CoAP
+// transport. This allow is removed in that wiring task.
+#![allow(dead_code)]
+
+mod message;
 mod paths;
 
-// `allow(dead_code)` is removed in the task that first reads these (message.rs).
 /// Exact HTTP status, carried as 2 big-endian bytes (CoAP response codes are not
 /// 1:1 with HTTP, and federation needs the precise code).
-#[allow(dead_code)]
 pub(crate) const OPT_HTTP_STATUS: u16 = 2048;
 /// One forwarded header per occurrence: `name` + 0x00 + `value`.
-#[allow(dead_code)]
 pub(crate) const OPT_FWD_HEADER: u16 = 2050;
 /// `application/cbor` (RFC 8949 §9.1).
-#[allow(dead_code)]
 pub(crate) const CBOR_CONTENT_FORMAT: u16 = 60;
 
 #[cfg(test)]
