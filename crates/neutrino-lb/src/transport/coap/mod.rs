@@ -3,6 +3,8 @@
 //! `crate::serve`. The codec stays opaque: this transport carries the CBOR body
 //! verbatim and never inspects it.
 
+mod paths;
+
 // `allow(dead_code)` is removed in the task that first reads these (message.rs).
 /// Exact HTTP status, carried as 2 big-endian bytes (CoAP response codes are not
 /// 1:1 with HTTP, and federation needs the precise code).
