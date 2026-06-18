@@ -46,13 +46,28 @@ Open question answered: CBOR/CoAP lives in the separate `neutrino-lb` crate,
 **not** baked into the `Event`/`Request`/`Response` types — so it stays out of
 Ruma's way and `neutrino-http`'s Router is untouched.
 
+CoAP/UDP transport done (Layer B). `transport::coap` is a second
+`WireClient`/`WireServer` impl (sibling of `transport::http`) over `coap-rs` +
+`coap-lite`: CON request/response, blockwise (RFC 7959) for large `send_join`
+state, Dendrite v1 federation path codes (+ literal fallback), forwarded
+headers + exact HTTP status carried as CoAP options. Selected via
+`LbConfig.wire: WireKind` (`Http` default). Two homeservers converge a join +
+message over CoAP/UDP — see `crates/neutrino-http/tests/e2e_lb_coap_federation.rs`.
+Design: `docs/superpowers/specs/2026-06-18-neutrino-lb-coap-udp-transport-design.md`;
+plan: `docs/superpowers/plans/2026-06-18-neutrino-lb-coap-udp-transport.md`.
+
 Deferred follow-ups (write-ups, not done):
-- integer-key / enum-key CBOR codec + single-byte CoAP path enums (port of
-  Dendrite `internal/lb` `cbor_codec.go` / `coap_paths*.go`); v1 is an **opaque**
-  `JSON value ⇄ CBOR bytes` transcode. MSC3079:
+- integer-key / enum-key CBOR codec (Layer A; port of Dendrite `internal/lb`
+  `cbor_codec.go` / `cbor_v1.go`); both transports still carry an **opaque**
+  `JSON value ⇄ CBOR bytes` transcode. The single-byte CoAP path enums are now
+  done (`transport::coap::paths`). MSC3079:
   https://github.com/matrix-org/matrix-spec-proposals/blob/kegan/low-bandwidth/proposals/3079-low-bandwidth-csapi.md
-- the CoAP/UDP transport (second `WireClient`/`WireServer` impl, with
-  blockwise/MTU handling) — gated on a Rust CoAP library investigation.
+- CoAP blockwise reassembly cap: coap-rs 0.27 / coap-lite 0.13 expose no maximum
+  on assembled blockwise payloads (the HTTP transport caps at
+  `MAX_WIRE_BODY_BYTES`); acceptable under the trusted-network assumption, but a
+  weaker OOM guarantee. Needs an upstream/forked bound on the block accumulators.
+- SLIP / serial-link framing on top of the CoAP/UDP transport (the
+  `cmd/test-coap/bridge` work) — the physical low-bandwidth link.
 - per-hop timeouts on the sidecar's own reqwest clients (`LbConfig.timeouts`);
   today the originating `FederationClient` request timeout bounds the egress hop.
 
