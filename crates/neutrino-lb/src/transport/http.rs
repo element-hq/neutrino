@@ -33,14 +33,24 @@ const MAX_WIRE_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// reqwest-backed wire client. Sends `req.body` (CBOR) to `http://{dest}{path}`.
 pub struct HttpWireClient {
     http: reqwest::Client,
+    /// Cap on a peer's response body. The peer is the untrusted network side and
+    /// its response is buffered whole then re-transcoded, so an unbounded body
+    /// is an OOM surface (fatal on mobile) even from a non-hostile peer — a
+    /// large room's `send_join` state can be legitimately huge. Mirrors the
+    /// ingress request cap (`MAX_WIRE_BODY_BYTES`).
+    max_body_bytes: usize,
 }
 
 impl HttpWireClient {
     pub fn new() -> Self {
-        Self::with_timeouts(crate::CONNECT_TIMEOUT, crate::REQUEST_TIMEOUT)
+        Self::with_config(
+            crate::CONNECT_TIMEOUT,
+            crate::REQUEST_TIMEOUT,
+            MAX_WIRE_BODY_BYTES,
+        )
     }
 
-    fn with_timeouts(connect: Duration, request: Duration) -> Self {
+    fn with_config(connect: Duration, request: Duration, max_body_bytes: usize) -> Self {
         // Direct connections only: a trusted mesh resolves peers to raw
         // IP:port, so bypass any ambient proxy. Timeouts bound the real
         // network leg — the homeserver's own timeout only covers its loopback
@@ -56,7 +66,24 @@ impl HttpWireClient {
             // + the timeouts (re-enabling ambient-proxy hijack and the dead-peer
             // request leak these settings exist to prevent).
             .expect("plaintext reqwest client always builds; no TLS backend to init");
-        Self { http }
+        Self {
+            http,
+            max_body_bytes,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_timeouts(connect: Duration, request: Duration) -> Self {
+        Self::with_config(connect, request, MAX_WIRE_BODY_BYTES)
+    }
+
+    #[cfg(test)]
+    fn with_max_body_bytes(max_body_bytes: usize) -> Self {
+        Self::with_config(
+            crate::CONNECT_TIMEOUT,
+            crate::REQUEST_TIMEOUT,
+            max_body_bytes,
+        )
     }
 }
 
@@ -77,7 +104,7 @@ impl WireClient for HttpWireClient {
             }
         }
         rb = rb.header(reqwest::header::CONTENT_TYPE, CBOR_CONTENT_TYPE);
-        let resp = rb
+        let mut resp = rb
             .body(req.body)
             .send()
             .await
@@ -88,11 +115,26 @@ impl WireClient for HttpWireClient {
             .iter()
             .map(|(k, v)| (k.as_str().to_owned(), v.as_bytes().to_vec()))
             .collect();
-        let body = resp
-            .bytes()
+        // Bound the peer's response: it is the untrusted network side and the
+        // body is buffered whole then re-transcoded, so `resp.bytes()` (no cap)
+        // is an OOM surface. Accumulate chunk-by-chunk, aborting before the
+        // running total exceeds the cap — we never hold more than the cap plus
+        // one in-flight chunk. (`Content-Length` can be absent or a lie under
+        // chunked encoding, so the count must be over the bytes actually read.)
+        let mut body = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
             .map_err(|e| WireError::Transport(e.to_string()))?
-            .to_vec();
+        {
+            if body.len() + chunk.len() > self.max_body_bytes {
+                return Err(WireError::Transport(format!(
+                    "peer response body exceeds {}-byte cap",
+                    self.max_body_bytes
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
         Ok(WireResponse {
             status,
             headers,
@@ -314,6 +356,35 @@ mod tests {
             })
             .await
             .expect_err("slow peer must time out");
+        assert!(matches!(err, WireError::Transport(_)), "got {err:?}");
+    }
+
+    // A peer's response body over the configured cap must surface as a
+    // Transport error rather than being buffered whole — the OOM guard on the
+    // untrusted (peer-facing) response leg, symmetric with the ingress request
+    // cap. A non-malicious peer can legitimately return a huge body (a large
+    // room's `send_join` state), so this must hold without any hostile intent.
+    #[tokio::test]
+    async fn client_rejects_oversized_response_body() {
+        let app = Router::new().route(
+            "/big",
+            get(|| async { Bytes::from(vec![0u8; 100]) }), // 100-byte response
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { serve(listener, app).await.unwrap() });
+
+        let client = HttpWireClient::with_max_body_bytes(8); // cap below 100
+        let err = client
+            .send(WireRequest {
+                dest: addr.to_string(),
+                method: Method::GET,
+                path: "/big".to_owned(),
+                headers: vec![],
+                body: vec![],
+            })
+            .await
+            .expect_err("oversized peer response must error, not buffer");
         assert!(matches!(err, WireError::Transport(_)), "got {err:?}");
     }
 
