@@ -99,17 +99,20 @@ mod logcat_format {
 }
 
 pub fn init_tracing() {
+    // `try_init` (not `init`): idempotent, so a second `entrypoint` in the same
+    // process — two nodes in a test, or a re-entrant embed — is a no-op rather
+    // than a panic on the already-set global subscriber.
     #[cfg(not(target_os = "android"))]
-    tracing_subscriber::registry()
+    let _ = tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| DEFAULT_FILTER.into()),
         )
         .with(tracing_subscriber::fmt::layer())
-        .init();
+        .try_init();
 
     #[cfg(target_os = "android")]
-    tracing_subscriber::registry()
+    let _ = tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| ANDROID_FILTER.into()),
@@ -122,5 +125,5 @@ pub fn init_tracing() {
                     "io.element.neutrino".to_owned(),
                 )),
         )
-        .init();
+        .try_init();
 }

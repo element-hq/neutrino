@@ -1,0 +1,16 @@
+[package]
+name = "neutrino-lb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ciborium = "0.2.2"
+axum = "0.8.7"
+reqwest = { version = "0.13.4", default-features = false }
+async-trait.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

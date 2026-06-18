@@ -49,6 +49,19 @@ pub struct Config {
     /// The server creates this directory if missing, but not its parents —
     /// those are the caller's responsibility (see `SqliteStore::open_in_dir`).
     pub storage_dir: PathBuf,
+    /// When set, outbound federation requests are routed through this HTTP
+    /// proxy (the `neutrino-lb` egress) instead of going direct. The proxy
+    /// transcodes bodies to CBOR. `None` = direct (the default; preserves the
+    /// pre-sidecar behaviour and all existing tests).
+    pub federation_proxy: Option<String>,
+    /// When set, `neutrino-main` runs a `neutrino-lb` sidecar **in-process**
+    /// alongside the homeserver (the embedded-on-mobile target). This is the
+    /// public federation port peers' `server_name` resolves to — the sidecar's
+    /// ingress binds it. The egress address is taken from `federation_proxy`
+    /// (which must then be set to a loopback URL) and the upstream is
+    /// `bind_addr` (which must then be loopback). `None` = no in-process
+    /// sidecar; `federation_proxy`, if set, points at an external one.
+    pub lb_ingress_bind: Option<String>,
     /// Upper bound on the random delay a freshly-started outbound sender waits
     /// before its first outbox drain (thundering-herd guard on restart). Default
     /// 30s; tests set it to 0 so post-restart redelivery is immediate.
@@ -63,6 +76,8 @@ impl Default for Config {
             localpart: DEFAULT_LOCALPART.to_string(),
             outbound_concurrency: DEFAULT_OUTBOUND_CONCURRENCY,
             storage_dir: PathBuf::from(DEFAULT_STORAGE_DIR),
+            federation_proxy: None,
+            lb_ingress_bind: None,
             startup_jitter: Duration::from_millis(DEFAULT_STARTUP_JITTER_MS),
         }
     }
@@ -81,6 +96,8 @@ impl Config {
                     .as_deref(),
             ),
             storage_dir: storage_dir_from(std::env::var("NEUTRINO_STORAGE_DIR").ok().as_deref()),
+            federation_proxy: std::env::var("NEUTRINO_FEDERATION_PROXY").ok(),
+            lb_ingress_bind: std::env::var("NEUTRINO_LB_INGRESS_BIND").ok(),
             startup_jitter: std::env::var("NEUTRINO_STARTUP_JITTER_MS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
@@ -164,6 +181,11 @@ mod tests {
             Config::default().storage_dir,
             std::path::PathBuf::from(DEFAULT_STORAGE_DIR)
         );
+    }
+
+    #[test]
+    fn federation_proxy_defaults_to_none() {
+        assert_eq!(Config::default().federation_proxy, None);
     }
 
     #[test]

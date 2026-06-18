@@ -96,6 +96,7 @@ pub(crate) fn spawn(
     kick_rx: watch::Receiver<()>,
     fetcher: Arc<dyn MissingEventsFetcher>,
     worker_poke: mpsc::Sender<OwnedRoomId>,
+    federation_proxy: Option<String>,
 ) -> JoinHandle<()> {
     spawn_with(
         store,
@@ -106,6 +107,7 @@ pub(crate) fn spawn(
         kick_rx,
         fetcher,
         worker_poke,
+        federation_proxy,
     )
 }
 
@@ -121,9 +123,10 @@ fn spawn_with(
     kick_rx: watch::Receiver<()>,
     fetcher: Arc<dyn MissingEventsFetcher>,
     worker_poke: mpsc::Sender<OwnedRoomId>,
+    federation_proxy: Option<String>,
 ) -> JoinHandle<()> {
     let watch_rx = store.subscribe();
-    let client = Arc::new(FederationClient::new(origin));
+    let client = Arc::new(FederationClient::new(origin, federation_proxy.as_deref()));
     // Process-startup prefix keeps txn ids unique across restarts; the
     // in-memory counter keeps them unique within a run.
     let idgen = Arc::new(TxnIdGen::new(now_ms()));
@@ -784,7 +787,7 @@ mod tests {
     fn test_ctx(store: Arc<SqliteStore>) -> SenderCtx {
         SenderCtx {
             store,
-            client: Arc::new(FederationClient::new("local.test".to_owned())),
+            client: Arc::new(FederationClient::new("local.test".to_owned(), None)),
             idgen: Arc::new(TxnIdGen::new(now_ms())),
             send_slots: Arc::new(Semaphore::new(1)),
             fetcher: null_fetcher(),
@@ -828,6 +831,7 @@ mod tests {
             no_kick(),
             null_fetcher(),
             null_poke(),
+            None,
         ));
         wait_drained(&store, &dest).await;
 
@@ -864,6 +868,7 @@ mod tests {
             no_kick(),
             null_fetcher(),
             null_poke(),
+            None,
         ));
         wait_drained(&store, &dest).await;
 
@@ -896,6 +901,7 @@ mod tests {
             no_kick(),
             null_fetcher(),
             null_poke(),
+            None,
         ));
         wait_drained(&store, &dest).await; // dropped → outbox empties
 
@@ -919,6 +925,7 @@ mod tests {
             no_kick(),
             null_fetcher(),
             null_poke(),
+            None,
         ));
         wait_drained(&store, &dest).await;
 
@@ -960,6 +967,7 @@ mod tests {
             no_kick(),
             null_fetcher(),
             null_poke(),
+            None,
         ));
 
         // The healthy peer drains despite the dead peer retrying forever.
@@ -991,6 +999,7 @@ mod tests {
             no_kick(),
             null_fetcher(),
             null_poke(),
+            None,
         ));
         // Give the supervisor a moment to reach its idle `changed()` await.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1033,6 +1042,7 @@ mod tests {
             no_kick(),
             null_fetcher(),
             null_poke(),
+            None,
         ));
         wait_adv_drained(&store, &dest).await;
 
@@ -1069,6 +1079,7 @@ mod tests {
             no_kick(),
             null_fetcher(),
             null_poke(),
+            None,
         ));
         wait_drained(&store, &dest).await;
         wait_adv_drained(&store, &dest).await;
@@ -1246,6 +1257,7 @@ mod tests {
             no_kick(),
             null_fetcher(),
             null_poke(),
+            None,
         );
 
         // Let the supervisor enumerate the dead peer and spawn its (forever-retrying)
@@ -1281,6 +1293,7 @@ mod tests {
             no_kick(),
             null_fetcher(),
             null_poke(),
+            None,
         ));
 
         // Wait for at least two attempts — proves it retried after the first 5xx.

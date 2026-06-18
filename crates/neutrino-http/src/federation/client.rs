@@ -67,17 +67,35 @@ pub(crate) struct FederationClient {
 }
 
 impl FederationClient {
-    pub(crate) fn new(origin: String) -> Self {
-        // Direct connections only: a trusted mesh resolves peers to raw
-        // IP:port, so bypass any ambient HTTP proxy (which would otherwise
-        // intercept `http://{ip}` traffic). `build()` only fails on TLS-backend
-        // init, which we don't use — fall back to the default client if so.
-        let http = Client::builder()
-            .no_proxy()
+    pub(crate) fn new(origin: String, proxy: Option<&str>) -> Self {
+        // Trusted mesh resolves peers to raw IP:port. Without a proxy we bypass
+        // any ambient HTTP proxy (which would otherwise intercept `http://{ip}`
+        // traffic). With one (the `neutrino-lb` egress) we route all outbound
+        // federation through it so it can transcode bodies to CBOR.
+        let mut builder = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT);
+        builder = match proxy {
+            Some(url) => match reqwest::Proxy::all(url) {
+                Ok(p) => builder.proxy(p),
+                // `federation_proxy` is validated at startup (`AppState::new`
+                // returns `StartupError::InvalidFederationProxy`). Reaching this
+                // arm means the config was constructed past that check, which is
+                // a programming bug — fail loud rather than silently go direct.
+                Err(e) => unreachable!(
+                    "federation_proxy {url:?} unparseable after startup validation: {e}"
+                ),
+            },
+            None => builder.no_proxy(),
+        };
+        // `build()` only fails on TLS-backend init; this is a plaintext client
+        // (no TLS), so it can't fail. Panic loud rather than fall back to a
+        // default `Client::new()` that silently drops the timeouts and the
+        // proxy/`no_proxy` config above — consistent with the `unreachable!()`
+        // for a bad proxy URL just above, not a silent degrade beside it.
+        let http = builder
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .expect("plaintext reqwest client always builds; no TLS backend to init");
         Self { http, origin }
     }
 
@@ -592,7 +610,7 @@ mod tests {
         );
         let dest = spawn_stub(app).await;
 
-        let client = FederationClient::new("local.test".to_owned());
+        let client = FederationClient::new("local.test".to_owned(), None);
         let pdus = [raw(r#"{"n":1}"#), raw(r#"{"n":2}"#)];
         client
             .send_transaction(&dest, "txn-1", &pdus, &BTreeMap::new())
@@ -622,7 +640,7 @@ mod tests {
         );
         let dest = spawn_stub(app).await;
 
-        let client = FederationClient::new("local.test".to_owned());
+        let client = FederationClient::new("local.test".to_owned(), None);
         let pdu = raw("{}");
         let err = client
             .send_transaction(&dest, "t", std::slice::from_ref(&pdu), &BTreeMap::new())
@@ -650,7 +668,7 @@ mod tests {
         );
         let dest = spawn_stub(app).await;
 
-        let client = FederationClient::new("local.test".to_owned());
+        let client = FederationClient::new("local.test".to_owned(), None);
         let room: OwnedRoomId = room_id!("!room:example.org").to_owned();
         let latest = vec![event_id!("$late:example.org").to_owned()];
         let earliest = vec![event_id!("$early:example.org").to_owned()];
@@ -687,7 +705,7 @@ mod tests {
         );
         let dest = spawn_stub(app).await;
 
-        let client = FederationClient::new("local.test".to_owned());
+        let client = FederationClient::new("local.test".to_owned(), None);
         let room: OwnedRoomId = room_id!("!room:example.org").to_owned();
         let err = client
             .get_missing_events(&dest, &room, &[], &[], 10, true, false)
@@ -732,7 +750,7 @@ mod tests {
         // A port nothing is listening on → connect fails.
         let dest = dead_peer().await;
 
-        let client = FederationClient::new("local.test".to_owned());
+        let client = FederationClient::new("local.test".to_owned(), None);
         let pdu = raw("{}");
         let err = client
             .send_transaction(&dest, "t", std::slice::from_ref(&pdu), &BTreeMap::new())
@@ -754,7 +772,7 @@ mod tests {
         );
         let dest = spawn_stub(app).await;
 
-        let client = FederationClient::new("local.test".to_owned());
+        let client = FederationClient::new("local.test".to_owned(), None);
         let room: OwnedRoomId = room_id!("!room:example.org").to_owned();
         let events = client
             .get_missing_events(&dest, &room, &[], &[], 10, true, false)
@@ -772,7 +790,7 @@ mod tests {
         );
         let dest = spawn_stub(app).await;
 
-        let client = FederationClient::new("local.test".to_owned());
+        let client = FederationClient::new("local.test".to_owned(), None);
         let room: OwnedRoomId = room_id!("!room:example.org").to_owned();
         let err = client
             .get_missing_events(&dest, &room, &[], &[], 10, true, false)

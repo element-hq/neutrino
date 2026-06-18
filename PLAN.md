@@ -32,12 +32,29 @@ All status points MUST have tests.
 
 ### Low-bandwidth proxy (`neutrino-lb`)
 
-Not yet started — the `neutrino-lb` crate does not exist. It must translate
-server-to-server HTTP + JSON into CoAP + CBOR (MSC3079
-https://github.com/matrix-org/matrix-spec-proposals/blob/kegan/low-bandwidth/proposals/3079-low-bandwidth-csapi.md).
+v1 done (JSON↔CBOR over HTTP). `neutrino-lb` is an in-process sidecar that
+transcodes Server-Server federation **bodies** between JSON (local side) and
+CBOR (wire side), behind a `WireClient`/`WireServer` trait seam (the future
+CoAP/UDP transport drops in there). `neutrino-http` routes outbound federation
+through it via the optional `Config.federation_proxy` (reqwest proxy mode);
+`None` = direct (the default, so existing tests/deployments are unchanged). Two
+homeservers behind two sidecars converge a real join + message — see
+`crates/neutrino-http/tests/e2e_lb_federation.rs`. Design:
+`docs/superpowers/specs/2026-06-15-neutrino-lb-cbor-proxy-design.md`.
 
-Open question: should CBOR/CoAP live in a separate crate/proxy or be baked into the
-`Event` / `Request` / `Response` types, and how does that interact with Ruma?
+Open question answered: CBOR/CoAP lives in the separate `neutrino-lb` crate,
+**not** baked into the `Event`/`Request`/`Response` types — so it stays out of
+Ruma's way and `neutrino-http`'s Router is untouched.
+
+Deferred follow-ups (write-ups, not done):
+- integer-key / enum-key CBOR codec + single-byte CoAP path enums (port of
+  Dendrite `internal/lb` `cbor_codec.go` / `coap_paths*.go`); v1 is an **opaque**
+  `JSON value ⇄ CBOR bytes` transcode. MSC3079:
+  https://github.com/matrix-org/matrix-spec-proposals/blob/kegan/low-bandwidth/proposals/3079-low-bandwidth-csapi.md
+- the CoAP/UDP transport (second `WireClient`/`WireServer` impl, with
+  blockwise/MTU handling) — gated on a Rust CoAP library investigation.
+- per-hop timeouts on the sidecar's own reqwest clients (`LbConfig.timeouts`);
+  today the originating `FederationClient` request timeout bounds the egress hop.
 
 ### Sliding sync (MSC4186) gaps
 
@@ -98,3 +115,55 @@ never use .unwrap() in handler code.
 - Any authentication (access tokens) on the client-server API
 - Tracing (distributed tracing / span instrumentation as telemetry) — note: basic HTTP request/response access logging IS in scope; that is not the same thing
 - Restricted rooms (`join_authorised_via_users_server`) — documented, not implemented
+
+## decisions log
+
+### neutrino-lb CBOR proxy (2026-06-16)
+- `neutrino-lb` is a **standalone sidecar proxy**; the CBOR transcode lives in it,
+  not in `neutrino-http`'s HTTP layer.
+- v1 is an **opaque** JSON↔CBOR transcode (no key remapping); the integer-key /
+  enum-key codec is deferred.
+- Outbound handoff is via **reqwest proxy mode** (one `Config.federation_proxy`
+  field, default `None`); no URL construction or Router change in `neutrino-http`.
+- `WireClient`/`WireServer`/`WireHandler` traits are scoped to the **wire hop
+  only**; local hops stay plain HTTP. They are the CoAP seam; v1 ships one
+  HTTP+CBOR impl (`transport::http`) behind them.
+- HTTP-server substrate: **axum (`fallback`) + reqwest**.
+- Deviations from the design spec (deliberate, recorded here rather than left
+  silent): wire types were simplified — `WireRequest.dest: String` (not
+  `OwnedServerName`), `body: Vec<u8>` (not `bytes::Bytes`), `LbConfig.upstream:
+  String` (not `Url`); the `ruma`/`bytes` deps the spec listed were not pulled in.
+  The ingress intentionally drops upstream **response** headers (Matrix S2S
+  responses carry no semantic headers). Per-hop sidecar timeouts
+  (`LbConfig.timeouts`) were not implemented (see deferred follow-ups).
+- Forward risk (out of scope today): the JSON→CBOR→JSON round trip does **not**
+  preserve byte-exact canonical JSON, so if event **signatures** are ever added,
+  this proxy would break signature verification — it would have to canonicalize
+  identically to the signer on both ends.
+- In-process mode requires a loopback-reachable `bind_addr`: `upstream_url`
+  rejects a concrete non-loopback address (e.g. a LAN interface) rather than
+  sending the ingress→upstream hop off the loopback path (which would expose the
+  unauthenticated CSAPI on the network). Loopback is used verbatim; `0.0.0.0` is
+  rewritten to loopback (it still listens there). The sidecar config is
+  derived/validated *before* binding the listener, so an illegal in-process combo
+  fails fast without first claiming the public port. Deferred (option 2 of the
+  review's finding #4): collapsing the three coupled `Config` fields (`bind_addr`
+  / `federation_proxy` / `lb_ingress_bind`) into a `FederationMode { Direct |
+  Proxied | InProcess }` enum so illegal states are unrepresentable at
+  construction (incl. a fallible FFI `TryFrom`) — the current fix validates early
+- Header pass-through is an **allowlist** (`authorization` + `x-matrix-*`), not a
+  denylist: since the body is re-serialized JSON↔CBOR per hop, only headers the
+  proxy explicitly understands may survive — a peer's stale `Content-Encoding` or
+  smuggled framing header can't leak onward. `authorization` carries the
+  `X-Matrix` origin credential the inbound side reads (no signatures); responses
+  carry no semantic headers, so the allowlist forwards nothing on that path.
+- Egress, called as an origin server (no destination authority), answers 502 not
+  400: the sender retries a 5xx but permanently drops a 4xx, so a recoverable
+  misconfig must not silently discard queued PDUs.
+- Removed the vestigial standalone `neutrino-lb` binary (`src/main.rs`) +
+  `LbConfig::from_env` and its `NEUTRINO_LB_EGRESS_BIND`/`_UPSTREAM` env vars:
+  nothing built or ran that binary (the in-process sidecar — `neutrino` +
+  `NEUTRINO_LB_INGRESS_BIND`, what the testrig uses — superseded it). `LbConfig`
+  (the struct) and `serve()` stay; `neutrino-main` builds the config
+  programmatically and runs the sidecar in-process.
+  but still surfaces the error at `entrypoint`.

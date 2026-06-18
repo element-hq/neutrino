@@ -38,3 +38,7 @@ tower = "0.5"
 # tests open file-backed stores on a `NamedTempFile`. Production no longer
 # uses tempfiles — the server persists into `config.storage_dir`.
 tempfile = "3.27.0"
+# Test-only: the two-sidecar federation e2e (`tests/e2e_lb_federation.rs`)
+# stands up `neutrino-lb` proxies in front of two homeservers. neutrino-lb does
+# not depend on neutrino-http, so this dev-dep introduces no cycle.
+neutrino-lb = { path = "../neutrino-lb" }

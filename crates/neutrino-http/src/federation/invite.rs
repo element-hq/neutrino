@@ -216,12 +216,13 @@ pub(crate) async fn federated_invite(
     target: &UserId,
     reason: Option<String>,
 ) -> Response {
-    let (store, registry, own_server) = {
+    let (store, registry, own_server, federation_proxy) = {
         let app = lock_app(state);
         (
             app.store.clone(),
             app.room_registry.clone(),
             app.config.server_name.clone(),
+            app.config.federation_proxy.clone(),
         )
     };
 
@@ -256,7 +257,7 @@ pub(crate) async fn federated_invite(
     //    room_version + stripped `invite_room_state` (the peer merges the latter
     //    into the event's `unsigned` for its sync to render).
     let irs = build_invite_room_state(&*store, room_id, &sender).await;
-    let client = FederationClient::new(own_server);
+    let client = FederationClient::new(own_server, federation_proxy.as_deref());
     let returned = match client
         .invite(
             target.server_name(),
