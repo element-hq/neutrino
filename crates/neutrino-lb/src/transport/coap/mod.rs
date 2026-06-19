@@ -103,6 +103,14 @@ impl Default for CoapWireClient {
 #[async_trait]
 impl WireClient for CoapWireClient {
     async fn send(&self, req: WireRequest) -> Result<WireResponse, WireError> {
+        // A zero Block1 size is a misconfiguration: coap-rs chunks the request
+        // body with `payload.chunks(block1_size)`, and `chunks(0)` panics. Reject
+        // it as a transport error rather than letting it crash the egress task.
+        if self.block1_size == Some(0) {
+            return Err(WireError::Transport(
+                "coap block1_size must be non-zero".to_owned(),
+            ));
+        }
         let dest = req.dest.clone();
         let block1_size = self.block1_size;
         let max_body_bytes = self.max_body_bytes;
@@ -409,6 +417,26 @@ mod client_tests {
             .await
             .expect("send");
         assert_eq!(resp.status, 502, "missing status must surface as 502");
+    }
+
+    // A zero Block1 size is an operator misconfiguration that would panic coap-rs
+    // (`payload.chunks(0)`); the client must reject it as a Transport error before
+    // dialing, not crash the egress task. Body is non-empty so the chunking path
+    // (the panic site) would be reached but for the guard.
+    #[tokio::test]
+    async fn zero_block1_size_errors_instead_of_panicking() {
+        let client = CoapWireClient::with_block1_size(Some(0));
+        let err = client
+            .send(WireRequest {
+                dest: "127.0.0.1:1".to_owned(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![],
+                body: vec![0u8; 64],
+            })
+            .await
+            .expect_err("zero block1_size must error, not panic");
+        assert!(matches!(err, WireError::Transport(_)), "got {err:?}");
     }
 }
 
