@@ -67,6 +67,28 @@ Deferred follow-ups (write-ups, not done):
   `JSON value ⇄ CBOR bytes` transcode. The single-byte CoAP path enums are now
   done (`transport::coap::paths`). MSC3079:
   https://github.com/matrix-org/matrix-spec-proposals/blob/kegan/low-bandwidth/proposals/3079-low-bandwidth-csapi.md
+- value-level wire compression (small-MTU sizing analysis @ MTU 200): per-block
+  cost is dominated by the re-sent Uri-Path. Path enums (done) collapse the fixed
+  prefix to 2 B (1-B value + the mandatory CoAP option header — not 1 B). v12
+  room/event IDs are `sigil + base64(32-B SHA-256)` (44 ch); carrying them as
+  **raw 32 B** is lossless and saves 12 B/ID, but needs a
+  decode→re-encode→verify-or-fall-back-to-text guard (2 trailing base64 bits;
+  event IDs are compared as opaque strings, so a non-canonical re-encode would
+  change identity). Even so, the two-hash-ID endpoints
+  (`send_join`/`invite`/`send_leave`) are **capped at 64-B blocks @ MTU 200**:
+  the two 32-B hashes are ~68 B of irreducible per-block options (128-B blocks
+  need options ≤ 59 B). Only moving room/event IDs into the **once-sent body**
+  (block 0) instead of the per-block path breaks that cap. `/send` + a short
+  `txnId` already reaches 128-B blocks.
+- X-Matrix wire form: the client sends `origin="…",destination="…"` (~55 B for
+  short names) but the inbound side reads **only `origin`** (`auth.rs`). "Bare
+  origin" (one CoAP option, drop `destination` + scheme/quote framing) → ~12 B; a
+  per-peer 1-B index → ~2 B (name-length independent). It must ride **every
+  block** (not body-only) where the network can rewrite source addresses, and
+  would then double as the Block1 reassembly key — coap-lite keys partial
+  assembly on `SocketAddr`, which is unstable under rewrite. send_join's real
+  cost is its **Block2 state-DAG response**, which re-sends these request options
+  on every block pull (the case the legacy stack SZX-hacked to 64 KB to avoid).
 - CoAP blockwise *reassembly-time* cap: the transport now enforces
   `MAX_WIRE_BODY_BYTES` on the **assembled** body (ingress → 413, egress →
   transport error), matching the HTTP transport's handler-facing contract and
