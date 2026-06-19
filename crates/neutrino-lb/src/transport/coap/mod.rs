@@ -956,3 +956,241 @@ mod dispatch_tests {
         assert!(out.response.is_some());
     }
 }
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use crate::transport::{WireClient, WireHandler, WireRequest, WireResponse};
+    use axum::http::Method;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    // Echoes the request body verbatim, so each concurrent caller's response is
+    // identifiable by its own (distinct) body.
+    struct BodyEcho;
+
+    #[async_trait]
+    impl WireHandler for BodyEcho {
+        async fn handle(&self, req: WireRequest) -> WireResponse {
+            WireResponse {
+                status: 200,
+                headers: vec![],
+                body: req.body,
+            }
+        }
+    }
+
+    // Many overlapping `send`s against one server must each receive *their own*
+    // response, never another in-flight request's. CoAP correlates by token/
+    // message-id, and each `send` here opens its own UDP socket, so a response
+    // cannot be mis-delivered — this pins that property and guards against a
+    // future client-pooling change quietly breaking correlation.
+    #[tokio::test]
+    async fn concurrent_requests_correlate_to_their_own_responses() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        let handle = tokio::spawn(async move {
+            CoapWireServer::new(addr)
+                .serve(Arc::new(BodyEcho), server_token)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = Arc::new(CoapWireClient::new());
+        let mut handles = Vec::new();
+        for i in 0u8..16 {
+            let client = client.clone();
+            let dest = addr.to_string();
+            handles.push(tokio::spawn(async move {
+                // Each request carries a unique body keyed by `i`; the echo must
+                // come back byte-for-byte.
+                let body = vec![i; 48 + i as usize];
+                let resp = client
+                    .send(WireRequest {
+                        dest,
+                        method: Method::PUT,
+                        path: format!("/_matrix/federation/v1/send/txn{i}"),
+                        headers: vec![],
+                        body: body.clone(),
+                    })
+                    .await
+                    .expect("concurrent send");
+                (resp, body)
+            }));
+        }
+        for h in handles {
+            let (resp, expected) = h.await.expect("task");
+            assert_eq!(resp.status, 200);
+            assert_eq!(
+                resp.body, expected,
+                "a concurrent request received the wrong response body"
+            );
+        }
+
+        token.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+}
+
+#[cfg(test)]
+mod loss_tests {
+    use super::*;
+    use crate::transport::{WireClient, WireHandler, WireRequest, WireResponse};
+    use axum::http::Method;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::net::UdpSocket;
+    use tokio_util::sync::CancellationToken;
+
+    struct PlainEcho;
+
+    #[async_trait]
+    impl WireHandler for PlainEcho {
+        async fn handle(&self, req: WireRequest) -> WireResponse {
+            WireResponse {
+                status: 200,
+                headers: vec![],
+                body: req.body,
+            }
+        }
+    }
+
+    // A deterministic lossy UDP relay sitting between the client and `server`. It
+    // forwards datagrams both ways but silently drops the client→server datagrams
+    // whose 1-based arrival index is in `drop_to_server` — modelling a lossy radio
+    // link. A dropped CON forces coap-rs to retransmit (5 retries × 2s), so the
+    // transfer must still complete. Runs until `token` fires.
+    async fn run_lossy_relay(
+        front: UdpSocket,
+        server: SocketAddr,
+        drop_to_server: Vec<usize>,
+        token: CancellationToken,
+    ) {
+        let back = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("relay back bind");
+        let mut client_addr: Option<SocketAddr> = None;
+        let mut to_server_seen = 0usize;
+        let mut from_client = vec![0u8; u16::MAX as usize];
+        let mut from_server = vec![0u8; u16::MAX as usize];
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => return,
+                r = front.recv_from(&mut from_client) => {
+                    let Ok((n, src)) = r else { return };
+                    client_addr = Some(src);
+                    to_server_seen += 1;
+                    if drop_to_server.contains(&to_server_seen) {
+                        continue; // drop this datagram; the sender must retransmit
+                    }
+                    let _ = back.send_to(&from_client[..n], server).await;
+                }
+                r = back.recv_from(&mut from_server) => {
+                    let Ok((n, _)) = r else { return };
+                    if let Some(dst) = client_addr {
+                        let _ = front.send_to(&from_server[..n], dst).await;
+                    }
+                }
+            }
+        }
+    }
+
+    // Spawn the echo server and a lossy relay; return (relay_front_addr, tokens).
+    async fn spawn_server_and_relay(drop_to_server: Vec<usize>) -> (SocketAddr, CancellationToken) {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr: SocketAddr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        tokio::spawn(async move {
+            CoapWireServer::new(server_addr)
+                .serve(Arc::new(PlainEcho), server_token)
+                .await
+        });
+
+        let front = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("relay front bind");
+        let front_addr = front.local_addr().unwrap();
+        let relay_token = token.clone();
+        tokio::spawn(run_lossy_relay(
+            front,
+            server_addr,
+            drop_to_server,
+            relay_token,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (front_addr, token)
+    }
+
+    // A dropped initial request datagram must be recovered by coap-rs's CON
+    // retransmission — the body still round-trips, just later. Pins that the
+    // transport survives loss on a single-datagram request (the common lossy-link
+    // case), not only on a lossless loopback.
+    #[tokio::test]
+    async fn dropped_request_datagram_is_retransmitted() {
+        let (relay_addr, token) = spawn_server_and_relay(vec![1]).await;
+
+        // Generous total timeout so the ~2s retransmit comfortably fits.
+        let client = CoapWireClient {
+            block1_size: None,
+            request_timeout: Duration::from_secs(15),
+            max_body_bytes: MAX_WIRE_BODY_BYTES,
+        };
+        let resp = client
+            .send(WireRequest {
+                dest: relay_addr.to_string(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![],
+                body: vec![0x5Au8; 64],
+            })
+            .await
+            .expect("send must recover from the dropped datagram");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, vec![0x5Au8; 64]);
+        token.cancel();
+    }
+
+    // A datagram dropped *mid* blockwise transfer must likewise be retransmitted
+    // and the multi-block body reassembled intact. With a 64 B Block1 a ~2 KiB
+    // body spans many datagrams; dropping the 3rd exercises retransmission of a
+    // single interior block rather than the opening CON.
+    #[tokio::test]
+    async fn blockwise_survives_a_dropped_mid_transfer_datagram() {
+        let (relay_addr, token) = spawn_server_and_relay(vec![3]).await;
+
+        let req_body: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
+        let client = CoapWireClient {
+            block1_size: Some(64),
+            request_timeout: Duration::from_secs(15),
+            max_body_bytes: MAX_WIRE_BODY_BYTES,
+        };
+        let resp = client
+            .send(WireRequest {
+                dest: relay_addr.to_string(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![],
+                body: req_body.clone(),
+            })
+            .await
+            .expect("blockwise send must recover from the mid-transfer drop");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.body, req_body,
+            "blockwise body corrupted after a dropped-and-retransmitted block"
+        );
+        token.cancel();
+    }
+}
