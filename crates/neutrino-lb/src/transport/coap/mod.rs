@@ -29,34 +29,51 @@ pub(crate) const OPT_FWD_HEADER: u16 = 2050;
 /// `application/cbor` (RFC 8949 §9.1).
 pub(crate) const CBOR_CONTENT_FORMAT: u16 = 60;
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use coap::UdpCoAPClient;
+use tokio::sync::Mutex;
 
 use crate::transport::{MAX_WIRE_BODY_BYTES, WireClient, WireError, WireRequest, WireResponse};
 
-/// Egress wire client over CoAP/UDP. Dials `req.dest` per send; coap-rs handles
-/// CON retransmit and Block1/Block2 blockwise transparently.
+/// Egress wire client over CoAP/UDP. Pools one `UdpCoAPClient` per `dest` (see
+/// `pool`); coap-rs handles CON retransmit and Block1/Block2 blockwise
+/// transparently.
 pub struct CoapWireClient {
     /// Max bytes per Block1 (request) chunk. `None` uses coap-rs's 1024 B
     /// default. Lower it to fit a constrained link's datagram budget. (Block2 —
     /// the response chunk size — is fixed by the responding server's coap-rs
     /// default and not yet tunable; see the module docs / `PLAN.md`.)
     block1_size: Option<usize>,
-    /// Total wall-clock ceiling on a single `send` (dial + the whole blockwise
+    /// Total wall-clock ceiling on a single `send` (the whole blockwise
     /// exchange). coap-rs bounds each CON block by its own receive-timeout ×
     /// retries, but nothing bounds a multi-block transfer where a peer answers
     /// each block slowly-but-just-in-time — so without this a slow/black-hole
     /// peer pins the egress task and its buffered body indefinitely. Mirrors the
-    /// HTTP transport's `REQUEST_TIMEOUT` rationale (UDP has no connect phase, so
-    /// one total bound covers dial — incl. DNS resolve — and the exchange).
+    /// HTTP transport's `REQUEST_TIMEOUT` rationale.
     request_timeout: Duration,
     /// Cap on a peer's assembled response body, mirroring the ingress request
     /// cap. The peer is the untrusted network side and its response is buffered
     /// then re-transcoded, so an unbounded body is an OOM surface even from a
     /// non-hostile peer. See the module OOM note.
     max_body_bytes: usize,
+    /// Per-`dest` client pool. `UdpCoAPClient::new` resolves `dest` (a DNS lookup
+    /// for a hostname) and binds a fresh UDP socket + background receive task on
+    /// every call, so a burst of federation requests to one peer would otherwise
+    /// pay that repeatedly; pooling reuses one client per peer. Sharing is safe
+    /// because each request carries a unique token (`next_token`) and coap-rs
+    /// correlates responses by token. A failed or timed-out request evicts its
+    /// client (see `send`): dropping the last `Arc` closes the socket and ends
+    /// the receive task (which holds only a `Weak`), so the next attempt
+    /// re-resolves `dest` (handling a peer that moved) from clean coap-rs state.
+    pool: Mutex<HashMap<String, Arc<UdpCoAPClient>>>,
+    /// Monotonic source of unique per-request CoAP tokens. coap-rs keys its
+    /// response-correlation map by token; the empty default token would alias
+    /// across concurrent requests sharing a pooled client.
+    token_counter: AtomicU32,
 }
 
 impl CoapWireClient {
@@ -65,6 +82,8 @@ impl CoapWireClient {
             block1_size: None,
             request_timeout: crate::REQUEST_TIMEOUT,
             max_body_bytes: MAX_WIRE_BODY_BYTES,
+            pool: Mutex::new(HashMap::new()),
+            token_counter: AtomicU32::new(0),
         }
     }
 
@@ -74,6 +93,52 @@ impl CoapWireClient {
         Self {
             block1_size,
             ..Self::new()
+        }
+    }
+
+    /// The pooled client for `dest`, creating (resolving + binding) one on first
+    /// use. The pool lock is never held across the `await` on construction, so
+    /// concurrent first-sends to different peers don't serialise; a race on the
+    /// same `dest` simply discards the loser's freshly-built client.
+    async fn client_for(&self, dest: &str) -> Result<Arc<UdpCoAPClient>, WireError> {
+        if let Some(client) = self.pool.lock().await.get(dest).cloned() {
+            return Ok(client);
+        }
+        let mut client = UdpCoAPClient::new(dest)
+            .await
+            .map_err(|e| WireError::Transport(format!("coap dial {dest}: {e}")))?;
+        if let Some(size) = self.block1_size {
+            client.set_block1_size(size);
+        }
+        let client = Arc::new(client);
+        Ok(self
+            .pool
+            .lock()
+            .await
+            .entry(dest.to_owned())
+            .or_insert(client)
+            .clone())
+    }
+
+    /// Drop the pooled client for `dest` so the next send rebuilds it.
+    async fn evict(&self, dest: &str) {
+        self.pool.lock().await.remove(dest);
+    }
+
+    /// A unique non-empty CoAP token, so concurrent requests sharing a pooled
+    /// client don't alias in coap-rs's token-keyed response map.
+    fn next_token(&self) -> Vec<u8> {
+        self.token_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .to_be_bytes()
+            .to_vec()
+    }
+
+    #[cfg(test)]
+    fn for_test(block1_size: Option<usize>, request_timeout: Duration) -> Self {
+        Self {
+            request_timeout,
+            ..Self::with_block1_size(block1_size)
         }
     }
 
@@ -112,16 +177,12 @@ impl WireClient for CoapWireClient {
             ));
         }
         let dest = req.dest.clone();
-        let block1_size = self.block1_size;
         let max_body_bytes = self.max_body_bytes;
-        let exchange = async move {
-            let mut client = UdpCoAPClient::new(req.dest.as_str())
-                .await
-                .map_err(|e| WireError::Transport(format!("coap dial {}: {e}", req.dest)))?;
-            if let Some(size) = block1_size {
-                client.set_block1_size(size);
-            }
-            let coap_req = message::build_request(&req);
+        let client = self.client_for(&dest).await?;
+        let token = self.next_token();
+        let exchange = async {
+            let mut coap_req = message::build_request(&req);
+            coap_req.message.set_token(token);
             let resp = client
                 .send(coap_req)
                 .await
@@ -137,15 +198,21 @@ impl WireClient for CoapWireClient {
         };
         // Total ceiling on the whole exchange, so a slow/black-hole peer can't
         // pin this task past `request_timeout` (the per-block coap-rs retries do
-        // not bound a multi-block transfer). Dropping the future closes the socket.
-        tokio::time::timeout(self.request_timeout, exchange)
-            .await
-            .map_err(|_| {
-                WireError::Transport(format!(
-                    "coap request to {dest} exceeded {:?}",
-                    self.request_timeout
-                ))
-            })?
+        // not bound a multi-block transfer).
+        let result = match tokio::time::timeout(self.request_timeout, exchange).await {
+            Ok(inner) => inner,
+            Err(_) => Err(WireError::Transport(format!(
+                "coap request to {dest} exceeded {:?}",
+                self.request_timeout
+            ))),
+        };
+        // On any failure (incl. timeout) drop the pooled client: it closes the
+        // socket, ends the receive task, frees any state an abandoned exchange
+        // left in the token map, and forces the next send to re-resolve `dest`.
+        if result.is_err() {
+            self.evict(&dest).await;
+        }
+        result
     }
 }
 
@@ -867,11 +934,7 @@ mod cap_tests {
 
         // 512 B Block1 over a 64 B budget; a short timeout so a (regressed) hang
         // fails fast rather than waiting the full default.
-        let client = CoapWireClient {
-            block1_size: Some(512),
-            request_timeout: Duration::from_secs(3),
-            max_body_bytes: MAX_WIRE_BODY_BYTES,
-        };
+        let client = CoapWireClient::for_test(Some(512), Duration::from_secs(3));
         let req_body: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
         let result = client
             .send(WireRequest {
@@ -981,11 +1044,12 @@ mod concurrency_tests {
         }
     }
 
-    // Many overlapping `send`s against one server must each receive *their own*
-    // response, never another in-flight request's. CoAP correlates by token/
-    // message-id, and each `send` here opens its own UDP socket, so a response
-    // cannot be mis-delivered — this pins that property and guards against a
-    // future client-pooling change quietly breaking correlation.
+    // Many overlapping `send`s through one (shared, `Arc`-cloned) client must each
+    // receive *their own* response, never another in-flight request's. They share
+    // a single pooled `UdpCoAPClient` for the dest, so correlation rests entirely
+    // on the unique per-request token (`next_token`); coap-rs keys its response map
+    // by token and the empty default token would alias. This is the regression
+    // guard for the per-`dest` client pool.
     #[tokio::test]
     async fn concurrent_requests_correlate_to_their_own_responses() {
         let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1140,11 +1204,7 @@ mod loss_tests {
         let (relay_addr, token) = spawn_server_and_relay(vec![1]).await;
 
         // Generous total timeout so the ~2s retransmit comfortably fits.
-        let client = CoapWireClient {
-            block1_size: None,
-            request_timeout: Duration::from_secs(15),
-            max_body_bytes: MAX_WIRE_BODY_BYTES,
-        };
+        let client = CoapWireClient::for_test(None, Duration::from_secs(15));
         let resp = client
             .send(WireRequest {
                 dest: relay_addr.to_string(),
@@ -1170,11 +1230,7 @@ mod loss_tests {
         let (relay_addr, token) = spawn_server_and_relay(vec![3]).await;
 
         let req_body: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
-        let client = CoapWireClient {
-            block1_size: Some(64),
-            request_timeout: Duration::from_secs(15),
-            max_body_bytes: MAX_WIRE_BODY_BYTES,
-        };
+        let client = CoapWireClient::for_test(Some(64), Duration::from_secs(15));
         let resp = client
             .send(WireRequest {
                 dest: relay_addr.to_string(),
