@@ -316,7 +316,11 @@ pub(crate) async fn setup_room(s: &SqliteStore, room_id: &RoomId, user_id: &User
             "INSERT INTO rooms (room_id, room_version) VALUES (?, ?)",
             params![room_id_owned.as_str(), ROOM_VERSION_ID],
         )?;
-        row.write_into_tx(&tx)?;
+        let stream_pos = row.write_into_tx(&tx)?;
+        // Keep the temporal state-group index complete, matching the real
+        // `create_room` path — otherwise this helper is the only thing that
+        // leaves a known room with no `room_state` rows.
+        crate::store::maintain_room_state(&tx, &row, stream_pos)?;
         tx.commit()?;
         Ok(())
     })

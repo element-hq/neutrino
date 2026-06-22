@@ -63,8 +63,8 @@ use std::sync::Arc;
 
 use deadpool_sqlite::rusqlite::{Connection, OptionalExtension, params};
 use neutrino_common::Event;
-use neutrino_state::StateResError;
 use neutrino_state::provider::StateProvider;
+use neutrino_state::{StateMap, StateResError};
 use ruma::{EventId, OwnedEventId};
 
 use crate::error::Error;
@@ -172,6 +172,66 @@ impl StateProvider for SqliteStateProvider<'_> {
             out.insert(owned);
         }
         Ok(out)
+    }
+
+    fn state_after(
+        &self,
+        event_id: &EventId,
+    ) -> Result<Option<StateMap<OwnedEventId>>, StateResError> {
+        // `room_state` is complete for every room we know about (every path
+        // that persists a state event maintains it), so this is a plain
+        // deterministic read-back: locate the event's room + `stream_pos` and
+        // reconstruct the state-after it. The only `None` is a genuinely
+        // unknown event — the caller then falls back to the recursive walk,
+        // which surfaces the `MissingEvent` verdict itself. Only a SQL fault is
+        // an error.
+        let header: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT room_id, stream_pos FROM events WHERE event_id = ?",
+                params![event_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| Self::into_internal(Error::Sqlite(e)))?;
+        let Some((room_id, stream_pos)) = header else {
+            return Ok(None);
+        };
+
+        // Interval reconstruction: every slot live at `stream_pos`. Intervals
+        // for a slot are disjoint (open-then-close in `maintain_room_state`),
+        // so at most one row per (event_type, state_key) matches — no grouping
+        // needed.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT event_type, state_key, event_id FROM room_state \
+                  WHERE room_id = ? \
+                    AND start_pos <= ? \
+                    AND (end_pos IS NULL OR end_pos > ?)",
+            )
+            .map_err(|e| Self::into_internal(Error::Sqlite(e)))?;
+        let rows = stmt
+            .query_map(params![room_id, stream_pos, stream_pos], |row| {
+                let event_type: String = row.get(0)?;
+                let state_key: String = row.get(1)?;
+                let id: String = row.get(2)?;
+                Ok((event_type, state_key, id))
+            })
+            .map_err(|e| Self::into_internal(Error::Sqlite(e)))?;
+
+        let mut state: StateMap<OwnedEventId> = StateMap::new();
+        for r in rows {
+            let (event_type, state_key, id) =
+                r.map_err(|e| Self::into_internal(Error::Sqlite(e)))?;
+            let owned = OwnedEventId::try_from(id).map_err(|e| {
+                Self::into_internal(Error::Internal(format!(
+                    "malformed event_id in room_state row: {e}"
+                )))
+            })?;
+            state.insert((event_type, state_key), owned);
+        }
+        Ok(Some(state))
     }
 }
 

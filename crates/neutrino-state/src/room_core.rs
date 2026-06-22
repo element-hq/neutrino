@@ -115,6 +115,19 @@ impl StateProvider for ProviderWithLocal<'_> {
         chain.insert(local_id.clone());
         Ok(chain)
     }
+
+    fn state_after(
+        &self,
+        event_id: &EventId,
+    ) -> Result<Option<StateMap<OwnedEventId>>, StateResError> {
+        // The in-flight local event isn't in the index yet — force the
+        // recursive fallback for it (its `prev_state_events` are persisted and
+        // do hit the index). Every other id delegates to the inner provider.
+        if event_id == self.local_event.event_id {
+            return Ok(None);
+        }
+        self.inner.state_after(event_id)
+    }
 }
 
 /// Side-effects emitted by `RoomCore::apply`. The caller (storage and

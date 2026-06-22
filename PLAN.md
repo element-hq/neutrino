@@ -118,6 +118,50 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### temporal state-group index (2026-06-22)
+- State groups are implemented as a **temporal interval table** (`room_state`),
+  not Synapse-style per-event snapshots or snapshot+delta chains. One row per
+  `(room, type, state_key)` value tracks its lifetime `[start_pos, end_pos)`
+  over the `stream_pos` axis. Current state at a point = `end_pos IS NULL`;
+  historic = `start_pos <= P AND (end_pos IS NULL OR end_pos > P)`.
+- Axis is the existing `events.stream_pos`. It is a valid topological order of
+  the state DAG (a child is refused until its `prev_state_events` are
+  persisted), so the interval query reconstructs the DAG-correct state-after
+  **any** event, forks included — no separate state-group ids / edge table.
+- Purpose is correctness *and* speed: authing an old event received over
+  federation needs state-at-that-event, previously a recursive
+  `prev_state_events` walk to the create event on every applied event. The
+  index turns `state_at_heads` into one indexed read per head.
+- Maintenance lives in the storage layer (`maintain_room_state`, called inside
+  the `persist_resolved_event`, `create_room`, and `setup_room` write txns)
+  rather than being plumbed down from `apply_pdu` via a new `Effect`: the store
+  already runs state-res via `SqliteStateProvider`, so it computes the event's
+  state-after from its own `prev_state_events` through the index (bounded, not
+  recursive) and is atomic with the event write by construction. Smaller
+  surface, no cross-crate signature change. A state event that *loses*
+  resolution (empty `current_state` delta) is still recorded — it remains a
+  state-DAG head a later event can name in `prev_state_events`.
+- `current_state` is **kept** as the forward-extremity-merge authority. The
+  index's "live" set (`end_pos IS NULL`) is state-after-the-latest-event, which
+  equals current state only when there is a single state-DAG forward extremity;
+  deriving current state from the index would mean re-running state-res over the
+  FEs on every read (or materialising hypothetical merge events).
+- **No read-side gate.** Every path that persists a state event maintains the
+  index, so `room_state` is complete for every room the server knows about, and
+  `SqliteStateProvider::state_after` reads it back unconditionally (the only
+  `None` is a genuinely unknown event → caller recurses). "No migration" means
+  the schema only ever runs against a fresh DB — there is no legacy un-indexed
+  data to backfill — *not* a per-room tracked/untracked flag (an earlier
+  `rooms.state_tracked` design was scrapped as redundant).
+- Known follow-ups: the index is not maintained for `persist_historical_event`
+  (timeline backfill, no production callers today). If a future backfill path
+  persists **state** events it MUST maintain `room_state` too (out-of-order
+  insertion is correct — closes use monotonic `stream_pos`, so earlier
+  point-in-time queries are unaffected and the diff baseline self-heals — just
+  churnier); leaving them out would make `state_after` silently incomplete. The
+  "slot entirely removed after a fork-merge" transition is exercised only by the
+  linear supersession path + code review, not yet by a dedicated fork test.
+
 ### neutrino-lb CBOR proxy (2026-06-16)
 - `neutrino-lb` is a **standalone sidecar proxy**; the CBOR transcode lives in it,
   not in `neutrino-http`'s HTTP layer.

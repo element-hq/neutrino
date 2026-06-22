@@ -208,6 +208,51 @@ CREATE INDEX ix_current_state_room_member
     WHERE event_type = 'm.room.member';
 
 -- ----------------------------------------------------------------------------
+-- room_state — temporal state-group index (MSC4242 state DAG)
+-- ----------------------------------------------------------------------------
+-- One interval row per (room, type, state_key) value that has ever been part
+-- of the room's resolved state, tracking its lifetime over the `stream_pos`
+-- axis as the server's view of the room evolves. This is the state-group
+-- implementation: rather than a snapshot (or snapshot+delta chain) per event,
+-- a single transition log. It lets state-before-an-event be reconstructed by
+-- an indexed interval query instead of a recursive `prev_state_events` walk
+-- back to the create event — the read path the federation auth of an old
+-- received event needs.
+--
+--   * `start_pos` — the `stream_pos` of the event at which this value entered
+--                   the resolved state for its slot.
+--   * `end_pos`   — the `stream_pos` at which it left (was superseded or
+--                   removed); NULL means it is still live.
+--
+-- `stream_pos` is a valid topological order of the state DAG (a child is never
+-- persisted before its `prev_state_events`), so the interval query
+-- `start_pos <= P AND (end_pos IS NULL OR end_pos > P)` reconstructs the
+-- DAG-correct state-after the event at `P`, forks included — see
+-- `SqliteStateProvider::state_after`. Maintained transactionally by
+-- `maintain_room_state`, called from `persist_resolved_event` and `create_room`
+-- — every path that persists a state event keeps it complete, so it is read
+-- back unconditionally (no per-room gate; the DB only ever runs against a fresh
+-- schema, so there is no un-indexed legacy data).
+--
+-- PK `(room_id, event_type, state_key, start_pos)` is unique because a slot
+-- changes at most once per `stream_pos` (one event), and serves both the
+-- interval query (room prefix) and the open-then-close maintenance. The
+-- partial index covers the live set, which is the maintenance diff baseline.
+CREATE TABLE room_state (
+    room_id     TEXT    NOT NULL,
+    event_type  TEXT    NOT NULL,
+    state_key   TEXT    NOT NULL,
+    event_id    TEXT    NOT NULL,
+    start_pos   INTEGER NOT NULL,
+    end_pos     INTEGER,
+    PRIMARY KEY (room_id, event_type, state_key, start_pos)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX ix_room_state_live
+    ON room_state(room_id, event_type, state_key)
+    WHERE end_pos IS NULL;
+
+-- ----------------------------------------------------------------------------
 -- federation_txns — FederationInbox::record_federation_txn
 -- Minimal: no received_at / GC for V1.
 -- record_federation_txn = INSERT OR IGNORE + check `changes() == 0`.
