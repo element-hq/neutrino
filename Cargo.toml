@@ -27,4 +27,4 @@ async-compat = { git = "https://github.com/element-hq/async-compat", rev = "5a27
 # Fork adds Server::*_with_config so neutrino-lb can set the CoAP per-message
 # size budget (BlockHandlerConfig.max_total_message_size) for Block2/response
 # fragmentation on constrained links.
-coap = { git = "https://github.com/kaylendog/coap-rs", rev = "e295ea4c05ed8c1da510041b9ac8d2b14e06030a" }
+coap = { git = "https://github.com/kaylendog/coap-rs", rev = "5b9c785ce97d0a991547a133dc994458ed50df03" }

@@ -331,8 +331,11 @@ impl WireServer for CoapWireServer {
         });
 
         // `coap::Server::run` has no native shutdown, so race it against the
-        // token: when shutdown fires the run future is dropped, closing the
-        // socket. (coap-rs blanket-impls RequestHandler for closures returning a
+        // token: when shutdown fires the run future is dropped. Our `coap` fork
+        // aborts the listener task(s) on that drop (the `AbortOnDrop` guard in
+        // `Server::run`), which closes the UDP socket — so the public federation
+        // port is released promptly rather than leaked until process exit.
+        // (coap-rs blanket-impls RequestHandler for closures returning a
         // boxed-request future.)
         tokio::select! {
             r = server.run(move |request| {

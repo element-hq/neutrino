@@ -49,19 +49,21 @@ pub struct Config {
     /// The server creates this directory if missing, but not its parents —
     /// those are the caller's responsibility (see `SqliteStore::open_in_dir`).
     pub storage_dir: PathBuf,
-    /// When set, outbound federation requests are routed through this HTTP
-    /// proxy (the `neutrino-lb` egress) instead of going direct. The proxy
-    /// transcodes bodies to CBOR. `None` = direct (the default; preserves the
-    /// pre-sidecar behaviour and all existing tests).
+    /// Outbound federation proxy URL (the `neutrino-lb` egress). **Internal /
+    /// derived — not operator-set.** `neutrino-main` fills this in when it runs
+    /// the in-process sidecar (see `lb_federation_port`), pointing it at the
+    /// loopback egress it allocates; `neutrino-http` reads it to route outbound
+    /// federation through the egress. `None` = direct federation (the default).
     pub federation_proxy: Option<String>,
     /// When set, `neutrino-main` runs a `neutrino-lb` sidecar **in-process**
-    /// alongside the homeserver (the embedded-on-mobile target). This is the
-    /// public federation port peers' `server_name` resolves to — the sidecar's
-    /// ingress binds it. The egress address is taken from `federation_proxy`
-    /// (which must then be set to a loopback URL) and the upstream is
-    /// `bind_addr` (which must then be loopback). `None` = no in-process
-    /// sidecar; `federation_proxy`, if set, points at an external one.
-    pub lb_ingress_bind: Option<String>,
+    /// alongside the homeserver (the embedded-on-mobile target), with the CoAP
+    /// low-bandwidth wire. This is the public federation port peers'
+    /// `server_name` resolves to: the ingress binds `host(bind_addr):port`
+    /// (only the port differs from `bind_addr`). The egress is an internal
+    /// loopback port `neutrino-main` allocates, and the upstream is `bind_addr`
+    /// (which must be loopback-reachable). `None` = direct federation, no
+    /// in-process sidecar (the default).
+    pub lb_federation_port: Option<u16>,
     /// Upper bound on the random delay a freshly-started outbound sender waits
     /// before its first outbox drain (thundering-herd guard on restart). Default
     /// 30s; tests set it to 0 so post-restart redelivery is immediate.
@@ -77,7 +79,7 @@ impl Default for Config {
             outbound_concurrency: DEFAULT_OUTBOUND_CONCURRENCY,
             storage_dir: PathBuf::from(DEFAULT_STORAGE_DIR),
             federation_proxy: None,
-            lb_ingress_bind: None,
+            lb_federation_port: None,
             startup_jitter: Duration::from_millis(DEFAULT_STARTUP_JITTER_MS),
         }
     }
@@ -96,8 +98,12 @@ impl Config {
                     .as_deref(),
             ),
             storage_dir: storage_dir_from(std::env::var("NEUTRINO_STORAGE_DIR").ok().as_deref()),
-            federation_proxy: std::env::var("NEUTRINO_FEDERATION_PROXY").ok(),
-            lb_ingress_bind: std::env::var("NEUTRINO_LB_INGRESS_BIND").ok(),
+            // `federation_proxy` is internal/derived (set by neutrino-main when
+            // the in-process sidecar runs), not an environment knob.
+            federation_proxy: None,
+            lb_federation_port: std::env::var("NEUTRINO_LB_FEDERATION_PORT")
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok()),
             startup_jitter: std::env::var("NEUTRINO_STARTUP_JITTER_MS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
