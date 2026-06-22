@@ -684,7 +684,13 @@ pub fn state_at_heads(
             .get_event(head)?
             .ok_or_else(|| StateResError::MissingEvent(head.clone()))?;
         let mut state_after = (*state_before_head).clone();
-        if let Some(sk) = &head_info.state_key {
+        // A rejected event is not part of state, so it does not contribute its
+        // own slot — matching the index fast path, which never records a
+        // rejected event (`maintain_room_state` skips them). Without this guard
+        // the two paths would disagree for a rejected head.
+        if !head_info.rejected
+            && let Some(sk) = &head_info.state_key
+        {
             state_after.insert((head_info.event_type.clone(), sk.clone()), head.clone());
         }
         state_sets.push(state_after);

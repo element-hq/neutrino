@@ -235,9 +235,16 @@ CREATE INDEX ix_current_state_room_member
 -- schema, so there is no un-indexed legacy data).
 --
 -- PK `(room_id, event_type, state_key, start_pos)` is unique because a slot
--- changes at most once per `stream_pos` (one event), and serves both the
--- interval query (room prefix) and the open-then-close maintenance. The
--- partial index covers the live set, which is the maintenance diff baseline.
+-- changes at most once per `stream_pos` (one event), and serves the
+-- open-then-close maintenance. It does NOT serve the point-in-time read
+-- (`state_after`): that query constrains `room_id` (=) and `start_pos`/`end_pos`
+-- (ranges) but not `event_type`/`state_key`, so against the PK the planner can
+-- only seek on `room_id` and then scans every historic row in the room. The
+-- `ix_room_state_at` index puts `start_pos` directly behind `room_id` so the
+-- range bound is usable — chiefly helping historical reads (auth of an old
+-- received event, the feature's purpose), where `start_pos <= P` prunes events
+-- that did not yet exist at `P`. The partial `ix_room_state_live` index covers
+-- the live set, which is the maintenance diff baseline.
 CREATE TABLE room_state (
     room_id     TEXT    NOT NULL,
     event_type  TEXT    NOT NULL,
@@ -247,6 +254,9 @@ CREATE TABLE room_state (
     end_pos     INTEGER,
     PRIMARY KEY (room_id, event_type, state_key, start_pos)
 ) STRICT, WITHOUT ROWID;
+
+CREATE INDEX ix_room_state_at
+    ON room_state(room_id, start_pos);
 
 CREATE INDEX ix_room_state_live
     ON room_state(room_id, event_type, state_key)

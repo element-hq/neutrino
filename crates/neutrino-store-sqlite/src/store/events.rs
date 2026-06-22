@@ -1926,4 +1926,150 @@ mod tests {
         assert_eq!(map.get(&create_key), Some(&create.event_id));
         assert_eq!(map.len(), 1);
     }
+
+    /// Persist one already-resolved event with trivial heads and an empty
+    /// current-state delta — enough to drive `maintain_room_state` for events
+    /// that aren't part of a linear `create_room` batch (forks, rejects).
+    async fn persist_one(s: &SqliteStore, ev: &Event) {
+        let fe: BTreeSet<OwnedEventId> = std::iter::once(ev.event_id.clone()).collect();
+        s.persist_resolved_event(ev, &fe, &fe, &BTreeMap::new(), &[], &[])
+            .await
+            .unwrap();
+    }
+
+    /// Number of `room_state` rows recorded for `event_id` (its own-slot
+    /// interval, if any).
+    async fn room_state_rows(s: &SqliteStore, event_id: &OwnedEventId) -> i64 {
+        let id = event_id.clone();
+        s.run_read(move |conn| -> Result<i64, Error> {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM room_state WHERE event_id = ?",
+                params![id.as_str()],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Forked state DAG: two competing `m.room.name` events branch off the
+    /// create, then a `m.room.topic` merges both. Exercises the multi-head
+    /// `state_at_heads` path (untested by the linear oracle), the losing-branch
+    /// recording (each fork tip still resolves to its own value at its own
+    /// position), and the slot-removal close — the merge keeps neither name
+    /// (both fork events fail the membership auth rule with no join in state),
+    /// so the contested `m.room.name` slot is dropped at the merge. The index
+    /// must equal the recursive oracle at every event, the merge included.
+    #[tokio::test]
+    async fn room_state_fork_merge_matches_recursive_oracle() {
+        let room = *ALICE_ROOM_ID;
+        let alice = *ALICE_USER_ID;
+        let s = store().await;
+        let create = setup_room(&s, room, alice).await;
+
+        let name_a = make_event(
+            room,
+            alice,
+            "m.room.name",
+            Some(""),
+            json!({"name": "A"}),
+            1,
+            &[&create.event_id],
+            &[&create.event_id],
+        );
+        let name_b = make_event(
+            room,
+            alice,
+            "m.room.name",
+            Some(""),
+            json!({"name": "B"}),
+            2,
+            &[&create.event_id],
+            &[&create.event_id],
+        );
+        let merge = make_event(
+            room,
+            alice,
+            "m.room.topic",
+            Some(""),
+            json!({"topic": "T"}),
+            3,
+            &[&name_a.event_id, &name_b.event_id],
+            &[&name_a.event_id, &name_b.event_id],
+        );
+
+        persist_one(&s, &name_a).await;
+        persist_one(&s, &name_b).await;
+        persist_one(&s, &merge).await;
+
+        let chain = [create, name_a, name_b, merge];
+        let mut inmem = InMemoryStateProvider::new();
+        for ev in &chain {
+            inmem.insert(Arc::new(ev.clone()));
+        }
+        for ev in &chain {
+            let mut recursive = state_res::state_before(&ev.event_id, &inmem).unwrap();
+            if let Some(sk) = &ev.state_key {
+                recursive.insert((ev.event_type.clone(), sk.clone()), ev.event_id.clone());
+            }
+            let indexed = state_after(&s, &ev.event_id).await;
+            assert_eq!(
+                indexed.as_ref(),
+                Some(&recursive),
+                "fork mismatch at {} ({})",
+                ev.event_id,
+                ev.event_type
+            );
+        }
+    }
+
+    /// A rejected state event is persisted to `events` but NOT recorded in the
+    /// index — it is not part of resolved state.
+    #[tokio::test]
+    async fn room_state_rejected_event_not_recorded() {
+        let room = *ALICE_ROOM_ID;
+        let alice = *ALICE_USER_ID;
+        let s = store().await;
+        let create = setup_room(&s, room, alice).await;
+        let mut rejected = make_event(
+            room,
+            alice,
+            "m.room.name",
+            Some(""),
+            json!({"name": "nope"}),
+            1,
+            &[&create.event_id],
+            &[&create.event_id],
+        );
+        rejected.rejected = true;
+        persist_one(&s, &rejected).await;
+        assert_eq!(room_state_rows(&s, &rejected.event_id).await, 0);
+    }
+
+    /// A non-state event records nothing; `state_after` for it reflects the
+    /// state as of its position (messages don't move state).
+    #[tokio::test]
+    async fn room_state_message_not_recorded() {
+        let room = *ALICE_ROOM_ID;
+        let alice = *ALICE_USER_ID;
+        let s = store().await;
+        let create = setup_room(&s, room, alice).await;
+        let msg = make_event(
+            room,
+            alice,
+            "m.room.message",
+            None,
+            json!({"msgtype": "m.text", "body": "hi"}),
+            1,
+            &[&create.event_id],
+            &[&create.event_id],
+        );
+        persist_one(&s, &msg).await;
+        assert_eq!(room_state_rows(&s, &msg.event_id).await, 0);
+
+        let after = state_after(&s, &msg.event_id).await.expect("known event");
+        let create_key = ("m.room.create".to_owned(), String::new());
+        assert_eq!(after.get(&create_key), Some(&create.event_id));
+        assert_eq!(after.len(), 1);
+    }
 }

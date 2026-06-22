@@ -152,15 +152,29 @@ never use .unwrap() in handler code.
   `None` is a genuinely unknown event → caller recurses). "No migration" means
   the schema only ever runs against a fresh DB — there is no legacy un-indexed
   data to backfill — *not* a per-room tracked/untracked flag (an earlier
-  `rooms.state_tracked` design was scrapped as redundant).
-- Known follow-ups: the index is not maintained for `persist_historical_event`
+  `rooms.state_tracked` design was scrapped as redundant). NB the `None` signal
+  keys on the `events` row, not on index presence: a state event reaching
+  `events` *without* `maintain_room_state` would read back a wrong (incomplete)
+  map, not `None`. That invariant ("every state-event write maintains the
+  index") is enforced by a `debug_assert!` in `state_after` (own slot must
+  resolve to the event itself), which fails loud in tests/debug rather than
+  feeding bad state into auth.
+- The point-in-time read is indexed by `ix_room_state_at (room_id, start_pos)`:
+  the PK `(room_id, event_type, state_key, start_pos)` can't serve it (only
+  `room_id` is an equality, the rest are ranges / unconstrained), so without
+  this index the query scans the room's whole history. Confirmed via
+  `EXPLAIN QUERY PLAN`; `(room_id, end_pos)` does *not* help (the planner
+  ignores it through the `end_pos IS NULL OR end_pos > P` OR).
+- Follow-up: the index is not maintained for `persist_historical_event`
   (timeline backfill, no production callers today). If a future backfill path
   persists **state** events it MUST maintain `room_state` too (out-of-order
   insertion is correct — closes use monotonic `stream_pos`, so earlier
   point-in-time queries are unaffected and the diff baseline self-heals — just
-  churnier); leaving them out would make `state_after` silently incomplete. The
-  "slot entirely removed after a fork-merge" transition is exercised only by the
-  linear supersession path + code review, not yet by a dedicated fork test.
+  churnier); leaving them out makes `state_after` return a wrong `Some`, which
+  the `debug_assert!` above would catch. Fork/merge + supersession +
+  slot-removal + losing-branch recording are covered by
+  `room_state_fork_merge_matches_recursive_oracle` (differential vs the
+  recursive walk).
 
 ### neutrino-lb CBOR proxy (2026-06-16)
 - `neutrino-lb` is a **standalone sidecar proxy**; the CBOR transcode lives in it,

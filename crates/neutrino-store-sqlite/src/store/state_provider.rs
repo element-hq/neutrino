@@ -178,23 +178,30 @@ impl StateProvider for SqliteStateProvider<'_> {
         &self,
         event_id: &EventId,
     ) -> Result<Option<StateMap<OwnedEventId>>, StateResError> {
-        // `room_state` is complete for every room we know about (every path
-        // that persists a state event maintains it), so this is a plain
-        // deterministic read-back: locate the event's room + `stream_pos` and
-        // reconstruct the state-after it. The only `None` is a genuinely
-        // unknown event — the caller then falls back to the recursive walk,
-        // which surfaces the `MissingEvent` verdict itself. Only a SQL fault is
-        // an error.
-        let header: Option<(String, i64)> = self
+        // Deterministic read-back of the precomputed interval rows: locate the
+        // event's room + `stream_pos` and reconstruct the state-after it.
+        //
+        // The contract is "complete index, or unknown event". `Ok(None)` means
+        // the event is not in `events` at all → the caller falls back to the
+        // recursive walk, which surfaces the `MissingEvent` verdict. It does
+        // NOT mean "event known but not indexed": a state event present in
+        // `events` but never passed through `maintain_room_state` would read
+        // back a *wrong* (incomplete) map here, not `None`, and the caller
+        // would trust it. The system avoids that by maintaining the index on
+        // every state-event write path; the `debug_assert!` below makes a
+        // violation loud in tests/debug rather than a silent wrong answer. Only
+        // a SQL fault is an error.
+        let header: Option<(String, i64, String, Option<String>)> = self
             .conn
             .query_row(
-                "SELECT room_id, stream_pos FROM events WHERE event_id = ?",
+                "SELECT room_id, stream_pos, event_type, state_key \
+                   FROM events WHERE event_id = ?",
                 params![event_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|e| Self::into_internal(Error::Sqlite(e)))?;
-        let Some((room_id, stream_pos)) = header else {
+        let Some((room_id, stream_pos, event_type, state_key)) = header else {
             return Ok(None);
         };
 
@@ -231,6 +238,22 @@ impl StateProvider for SqliteStateProvider<'_> {
             })?;
             state.insert((event_type, state_key), owned);
         }
+
+        // A maintained state event always records its own slot pointing at
+        // itself at its own `stream_pos`, so the reconstruction at that pos must
+        // contain it. If it doesn't, this event reached `events` without
+        // `maintain_room_state` (a missing write-path), and the map we'd return
+        // is silently wrong — fail loud here rather than feed bad state into
+        // auth. Non-state events have no own slot, so they are exempt.
+        debug_assert!(
+            state_key.as_deref().is_none_or(|sk| {
+                state
+                    .get(&(event_type.clone(), sk.to_owned()))
+                    .is_some_and(|id| id.as_str() == event_id.as_str())
+            }),
+            "room_state index incomplete for state event {event_id}: own slot \
+             absent — a state-event persist path is not calling maintain_room_state"
+        );
         Ok(Some(state))
     }
 }
