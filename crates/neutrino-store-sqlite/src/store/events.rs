@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{OptionalExtension, Transaction, params, params_from_iter};
+use neutrino_state::StateMap;
+use neutrino_state::state_res::{self, StateBeforeCache};
 use neutrino_store::{Direction, Event, EventStore, PaginationToken, StorageError, StreamPos};
 use ruma::{EventId, OwnedEventId, OwnedServerName, RoomId, ServerName};
 use tokio::sync::watch;
@@ -12,6 +14,7 @@ use crate::{
     SqliteStore,
     error::Error,
     row::{EVENT_COLUMNS, EventRow},
+    store::SqliteStateProvider,
 };
 
 #[async_trait]
@@ -124,6 +127,10 @@ impl EventStore for SqliteStore {
                  WHERE room_id = ?",
                 params![timeline_json, state_json, room_id.as_str()],
             )?;
+
+            // Temporal state-group index — maintained in the same txn so it
+            // can never desync from the event write. See `maintain_room_state`.
+            maintain_room_state(&tx, &event, stream_pos)?;
 
             // Outbox: one row per federation destination, same txn as the
             // event so a crash can't persist the event but drop its delivery.
@@ -470,6 +477,138 @@ fn apply_current_state_delta(
     Ok(())
 }
 
+/// Maintain the temporal `room_state` index for one freshly-written event.
+///
+/// Only an accepted state event enters the index: a non-state event never
+/// changes resolved state, and a rejected event (federation persists rejects)
+/// is not part of it. A state event that *loses* state resolution is still
+/// recorded — it remains a state-DAG head a later event can name in its
+/// `prev_state_events`, so its state-after must be resolvable; that it does not
+/// move `current_state` (the FE-merge) is a separate concern.
+///
+/// The event's state-after is `resolve(state-after(prev_state_events)) ∪
+/// {event}` — computed via the index itself (the parents are already recorded,
+/// so this is a bounded read + resolve, never a recursive `prev_state_events`
+/// walk).
+///
+/// Shared by `persist_resolved_event` (the apply path), `create_room` (the
+/// linear createRoom batch), and `setup_room` (tests); each calls it inside its
+/// write transaction so the index cannot desync from the `events` write, and so
+/// every room we know about has a complete index.
+pub(crate) fn maintain_room_state(
+    tx: &Transaction<'_>,
+    event: &Event,
+    stream_pos: i64,
+) -> Result<(), Error> {
+    let Some(state_key) = event.state_key.as_deref() else {
+        return Ok(());
+    };
+    if event.rejected {
+        return Ok(());
+    }
+    let room_id = event.room_id.as_str();
+
+    let mut state_after = {
+        let provider = SqliteStateProvider::new(tx);
+        let mut cache = StateBeforeCache::new();
+        state_res::state_at_heads(&event.prev_state_events, &provider, &mut cache).map_err(|e| {
+            Error::Internal(format!(
+                "room_state: computing state_after({}): {e}",
+                event.event_id
+            ))
+        })?
+    };
+    state_after.insert(
+        (event.event_type.clone(), state_key.to_owned()),
+        event.event_id.clone(),
+    );
+
+    apply_room_state_transition(tx, room_id, &state_after, stream_pos)
+}
+
+/// Record `state_after` (the resolved state-after the event at `stream_pos`)
+/// into the temporal `room_state` index as a set of interval transitions.
+///
+/// The live set (`end_pos IS NULL`) is, by induction, the state-after the
+/// previous state event in stream order. Diffing `state_after` against it per
+/// slot:
+///   * a slot whose value is unchanged is left open;
+///   * a slot with a new value has the live row closed (`end_pos = stream_pos`)
+///     and a fresh row opened (`start_pos = stream_pos`);
+///   * a slot present live but absent from `state_after` is closed.
+///
+/// This keeps each slot's intervals disjoint, so the reconstruction query in
+/// [`SqliteStateProvider::state_after`] never sees overlapping rows.
+fn apply_room_state_transition(
+    tx: &Transaction<'_>,
+    room_id: &str,
+    state_after: &StateMap<OwnedEventId>,
+    stream_pos: i64,
+) -> Result<(), Error> {
+    // Live set = state-after the previous state event.
+    let mut live: StateMap<String> = StateMap::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT event_type, state_key, event_id FROM room_state \
+             WHERE room_id = ? AND end_pos IS NULL",
+        )?;
+        let rows = stmt.query_map(params![room_id], |row| {
+            Ok((
+                (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for r in rows {
+            let (key, id) = r?;
+            live.insert(key, id);
+        }
+    }
+
+    let mut close = tx.prepare(
+        "UPDATE room_state SET end_pos = ? \
+         WHERE room_id = ? AND event_type = ? AND state_key = ? AND end_pos IS NULL",
+    )?;
+    let mut open = tx.prepare(
+        "INSERT INTO room_state \
+             (room_id, event_type, state_key, event_id, start_pos, end_pos) \
+         VALUES (?, ?, ?, ?, ?, NULL)",
+    )?;
+
+    // New / changed slots.
+    for ((event_type, state_key), id) in state_after {
+        match live.get(&(event_type.clone(), state_key.clone())) {
+            Some(current) if current == id.as_str() => {}
+            Some(_) => {
+                close.execute(params![stream_pos, room_id, event_type, state_key])?;
+                open.execute(params![
+                    room_id,
+                    event_type,
+                    state_key,
+                    id.as_str(),
+                    stream_pos
+                ])?;
+            }
+            None => {
+                open.execute(params![
+                    room_id,
+                    event_type,
+                    state_key,
+                    id.as_str(),
+                    stream_pos
+                ])?;
+            }
+        }
+    }
+
+    // Removed slots: live but no longer present.
+    for (event_type, state_key) in live.keys() {
+        if !state_after.contains_key(&(event_type.clone(), state_key.clone())) {
+            close.execute(params![stream_pos, room_id, event_type, state_key])?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -482,11 +621,17 @@ mod tests {
     use ruma::{EventId, OwnedEventId, event_id, room_id, server_name};
     use serde_json::json;
 
+    use std::sync::Arc;
+
+    use neutrino_state::StateMap;
+    use neutrino_state::provider::InMemoryStateProvider;
+    use neutrino_state::state_res;
+
     use crate::SqliteStore;
     use crate::error::Error;
     use crate::tests::{
-        ALICE_ROOM_ID, ALICE_USER_ID, BOB_ROOM_ID, make_event, make_event_with_raw_json, message,
-        message_with_ts, name_event, setup_room, store,
+        ALICE_ROOM_ID, ALICE_USER_ID, BOB_ROOM_ID, create_event, make_event,
+        make_event_with_raw_json, message, message_with_ts, name_event, setup_room, store,
     };
 
     /// Open an in-memory store with a single create event in `*ALICE_ROOM_ID`
@@ -1640,5 +1785,291 @@ mod tests {
             after > initial,
             "watch did not advance after persist_historical_event: {initial:?} -> {after:?}"
         );
+    }
+
+    // ---- room_state temporal index (state-group implementation) ----
+
+    /// A linear state chain in `*ALICE_ROOM_ID`: each event lists the previous
+    /// one as its sole `prev_events` / `prev_state_events`, so it is a single
+    /// path through both DAGs. Includes an `m.room.name` supersession
+    /// (First → Second) to exercise interval close-then-open. Returned in
+    /// stream order, create first.
+    fn linear_state_chain() -> Vec<Event> {
+        let room = *ALICE_ROOM_ID;
+        let alice = *ALICE_USER_ID;
+        let create = create_event(room, alice);
+        let join = make_event(
+            room,
+            alice,
+            "m.room.member",
+            Some(alice.as_str()),
+            json!({"membership": "join"}),
+            1,
+            &[&create.event_id],
+            &[&create.event_id],
+        );
+        let name1 = make_event(
+            room,
+            alice,
+            "m.room.name",
+            Some(""),
+            json!({"name": "First"}),
+            2,
+            &[&join.event_id],
+            &[&join.event_id],
+        );
+        let topic = make_event(
+            room,
+            alice,
+            "m.room.topic",
+            Some(""),
+            json!({"topic": "T"}),
+            3,
+            &[&name1.event_id],
+            &[&name1.event_id],
+        );
+        let name2 = make_event(
+            room,
+            alice,
+            "m.room.name",
+            Some(""),
+            json!({"name": "Second"}),
+            4,
+            &[&topic.event_id],
+            &[&topic.event_id],
+        );
+        vec![create, join, name1, topic, name2]
+    }
+
+    /// Read `state_after(event_id)` through a store-backed provider.
+    async fn state_after(s: &SqliteStore, id: &OwnedEventId) -> Option<StateMap<OwnedEventId>> {
+        let id = id.clone();
+        s.with_state_provider(move |p| p.state_after(&id))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Differential oracle: the temporal index's `state_after(E)` must equal
+    /// the recursive `state_before(E) ∪ {E}` computed against an index-less
+    /// in-memory provider (which always takes the recursive path). Pins the
+    /// index as a faithful cache of the recursion at every event.
+    #[tokio::test]
+    async fn room_state_state_after_matches_recursive_oracle() {
+        let chain = linear_state_chain();
+        let (create, rest) = chain.split_first().unwrap();
+
+        let s = store().await;
+        s.create_room(create, rest).await.unwrap();
+
+        // Recursive oracle over the same events.
+        let mut inmem = InMemoryStateProvider::new();
+        for ev in &chain {
+            inmem.insert(Arc::new(ev.clone()));
+        }
+
+        for ev in &chain {
+            let mut recursive = state_res::state_before(&ev.event_id, &inmem).unwrap();
+            if let Some(sk) = &ev.state_key {
+                recursive.insert((ev.event_type.clone(), sk.clone()), ev.event_id.clone());
+            }
+            let indexed = state_after(&s, &ev.event_id).await;
+            assert_eq!(
+                indexed.as_ref(),
+                Some(&recursive),
+                "state_after mismatch at {} ({})",
+                ev.event_id,
+                ev.event_type
+            );
+        }
+    }
+
+    /// A `m.room.name` supersession is point-in-time: querying at the old
+    /// event's position still sees the old value (its interval stays open
+    /// across that position), at the new event's position the new one.
+    #[tokio::test]
+    async fn room_state_supersession_is_point_in_time() {
+        let chain = linear_state_chain();
+        let (create, rest) = chain.split_first().unwrap();
+        let s = store().await;
+        s.create_room(create, rest).await.unwrap();
+
+        let name_key = ("m.room.name".to_owned(), String::new());
+        let name1_id = chain[2].event_id.clone(); // "First"
+        let name2_id = chain[4].event_id.clone(); // "Second"
+
+        let at_name1 = state_after(&s, &name1_id).await.expect("tracked");
+        let at_name2 = state_after(&s, &name2_id).await.expect("tracked");
+
+        assert_eq!(at_name1.get(&name_key), Some(&name1_id));
+        assert_eq!(at_name2.get(&name_key), Some(&name2_id));
+    }
+
+    /// An event the store has never seen yields `None` — the only `None` case
+    /// now that every known room has a complete index — so the caller falls
+    /// back to the recursive walk (which surfaces the missing-event verdict).
+    #[tokio::test]
+    async fn room_state_unknown_event_returns_none() {
+        let s = store().await;
+        let ghost = name_event(*ALICE_ROOM_ID, *ALICE_USER_ID, "ghost");
+        assert_eq!(state_after(&s, &ghost.event_id).await, None);
+    }
+
+    /// `setup_room` records the create event like the real create path, so its
+    /// state-after is the create slot alone.
+    #[tokio::test]
+    async fn room_state_setup_room_records_create() {
+        let s = store().await;
+        let create = setup_room(&s, *ALICE_ROOM_ID, *ALICE_USER_ID).await;
+        let map = state_after(&s, &create.event_id).await.expect("recorded");
+        let create_key = ("m.room.create".to_owned(), String::new());
+        assert_eq!(map.get(&create_key), Some(&create.event_id));
+        assert_eq!(map.len(), 1);
+    }
+
+    /// Persist one already-resolved event with trivial heads and an empty
+    /// current-state delta — enough to drive `maintain_room_state` for events
+    /// that aren't part of a linear `create_room` batch (forks, rejects).
+    async fn persist_one(s: &SqliteStore, ev: &Event) {
+        let fe: BTreeSet<OwnedEventId> = std::iter::once(ev.event_id.clone()).collect();
+        s.persist_resolved_event(ev, &fe, &fe, &BTreeMap::new(), &[], &[])
+            .await
+            .unwrap();
+    }
+
+    /// Number of `room_state` rows recorded for `event_id` (its own-slot
+    /// interval, if any).
+    async fn room_state_rows(s: &SqliteStore, event_id: &OwnedEventId) -> i64 {
+        let id = event_id.clone();
+        s.run_read(move |conn| -> Result<i64, Error> {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM room_state WHERE event_id = ?",
+                params![id.as_str()],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Forked state DAG: two competing `m.room.name` events branch off the
+    /// create, then a `m.room.topic` merges both. Exercises the multi-head
+    /// `state_at_heads` path (untested by the linear oracle), the losing-branch
+    /// recording (each fork tip still resolves to its own value at its own
+    /// position), and the slot-removal close — the merge keeps neither name
+    /// (both fork events fail the membership auth rule with no join in state),
+    /// so the contested `m.room.name` slot is dropped at the merge. The index
+    /// must equal the recursive oracle at every event, the merge included.
+    #[tokio::test]
+    async fn room_state_fork_merge_matches_recursive_oracle() {
+        let room = *ALICE_ROOM_ID;
+        let alice = *ALICE_USER_ID;
+        let s = store().await;
+        let create = setup_room(&s, room, alice).await;
+
+        let name_a = make_event(
+            room,
+            alice,
+            "m.room.name",
+            Some(""),
+            json!({"name": "A"}),
+            1,
+            &[&create.event_id],
+            &[&create.event_id],
+        );
+        let name_b = make_event(
+            room,
+            alice,
+            "m.room.name",
+            Some(""),
+            json!({"name": "B"}),
+            2,
+            &[&create.event_id],
+            &[&create.event_id],
+        );
+        let merge = make_event(
+            room,
+            alice,
+            "m.room.topic",
+            Some(""),
+            json!({"topic": "T"}),
+            3,
+            &[&name_a.event_id, &name_b.event_id],
+            &[&name_a.event_id, &name_b.event_id],
+        );
+
+        persist_one(&s, &name_a).await;
+        persist_one(&s, &name_b).await;
+        persist_one(&s, &merge).await;
+
+        let chain = [create, name_a, name_b, merge];
+        let mut inmem = InMemoryStateProvider::new();
+        for ev in &chain {
+            inmem.insert(Arc::new(ev.clone()));
+        }
+        for ev in &chain {
+            let mut recursive = state_res::state_before(&ev.event_id, &inmem).unwrap();
+            if let Some(sk) = &ev.state_key {
+                recursive.insert((ev.event_type.clone(), sk.clone()), ev.event_id.clone());
+            }
+            let indexed = state_after(&s, &ev.event_id).await;
+            assert_eq!(
+                indexed.as_ref(),
+                Some(&recursive),
+                "fork mismatch at {} ({})",
+                ev.event_id,
+                ev.event_type
+            );
+        }
+    }
+
+    /// A rejected state event is persisted to `events` but NOT recorded in the
+    /// index — it is not part of resolved state.
+    #[tokio::test]
+    async fn room_state_rejected_event_not_recorded() {
+        let room = *ALICE_ROOM_ID;
+        let alice = *ALICE_USER_ID;
+        let s = store().await;
+        let create = setup_room(&s, room, alice).await;
+        let mut rejected = make_event(
+            room,
+            alice,
+            "m.room.name",
+            Some(""),
+            json!({"name": "nope"}),
+            1,
+            &[&create.event_id],
+            &[&create.event_id],
+        );
+        rejected.rejected = true;
+        persist_one(&s, &rejected).await;
+        assert_eq!(room_state_rows(&s, &rejected.event_id).await, 0);
+    }
+
+    /// A non-state event records nothing; `state_after` for it reflects the
+    /// state as of its position (messages don't move state).
+    #[tokio::test]
+    async fn room_state_message_not_recorded() {
+        let room = *ALICE_ROOM_ID;
+        let alice = *ALICE_USER_ID;
+        let s = store().await;
+        let create = setup_room(&s, room, alice).await;
+        let msg = make_event(
+            room,
+            alice,
+            "m.room.message",
+            None,
+            json!({"msgtype": "m.text", "body": "hi"}),
+            1,
+            &[&create.event_id],
+            &[&create.event_id],
+        );
+        persist_one(&s, &msg).await;
+        assert_eq!(room_state_rows(&s, &msg.event_id).await, 0);
+
+        let after = state_after(&s, &msg.event_id).await.expect("known event");
+        let create_key = ("m.room.create".to_owned(), String::new());
+        assert_eq!(after.get(&create_key), Some(&create.event_id));
+        assert_eq!(after.len(), 1);
     }
 }

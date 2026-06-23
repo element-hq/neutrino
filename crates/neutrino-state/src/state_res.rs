@@ -671,12 +671,26 @@ pub fn state_at_heads(
     }
     let mut state_sets: Vec<StateMap<OwnedEventId>> = Vec::with_capacity(heads.len());
     for head in heads {
+        // Fast path: the temporal state-group index serves state-after `head`
+        // directly, collapsing the recursive `prev_state_events` walk to one
+        // indexed query. `None` (untracked room / index-less provider) falls
+        // back to the recursive computation below — same result, slower.
+        if let Some(state_after) = provider.state_after(head)? {
+            state_sets.push(state_after);
+            continue;
+        }
         let state_before_head = state_before_inner(head, provider, cache)?;
         let head_info = provider
             .get_event(head)?
             .ok_or_else(|| StateResError::MissingEvent(head.clone()))?;
         let mut state_after = (*state_before_head).clone();
-        if let Some(sk) = &head_info.state_key {
+        // A rejected event is not part of state, so it does not contribute its
+        // own slot — matching the index fast path, which never records a
+        // rejected event (`maintain_room_state` skips them). Without this guard
+        // the two paths would disagree for a rejected head.
+        if !head_info.rejected
+            && let Some(sk) = &head_info.state_key
+        {
             state_after.insert((head_info.event_type.clone(), sk.clone()), head.clone());
         }
         state_sets.push(state_after);

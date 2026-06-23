@@ -59,6 +59,29 @@ pub trait StateProvider {
         &self,
         seeds: &HashSet<OwnedEventId>,
     ) -> Result<HashSet<OwnedEventId>, StateResError>;
+
+    /// Resolved **state-after** `event_id`, read directly from the temporal
+    /// state-group index (`room_state`) without walking `prev_state_events`.
+    ///
+    /// - `Ok(Some(map))` — the room is tracked from its create event and the
+    ///   interval query reconstructed its state-after. The map is the full
+    ///   `StateMap` (every `(type, state_key)` live at `event_id`), including
+    ///   `event_id`'s own slot if it is a state event.
+    /// - `Ok(None)` — no index for this event (untracked room, or an impl with
+    ///   no state-group table). The caller falls back to the recursive
+    ///   [`state_at_heads`](crate::state_res::state_at_heads) walk, so this is
+    ///   a performance hint, never a correctness signal.
+    /// - `Err(StateResError::Internal)` — the lookup itself faulted.
+    ///
+    /// The default returns `Ok(None)`: in-memory and test providers have no
+    /// index, so they always drive the recursive path. Only the SQLite-backed
+    /// provider overrides this.
+    fn state_after(
+        &self,
+        _event_id: &EventId,
+    ) -> Result<Option<crate::StateMap<OwnedEventId>>, StateResError> {
+        Ok(None)
+    }
 }
 
 /// In-memory `StateProvider`. Public (not test-cfg) — `RoomCore::apply` uses

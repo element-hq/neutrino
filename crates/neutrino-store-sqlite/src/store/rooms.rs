@@ -10,6 +10,7 @@ use neutrino_store::{Event, RoomStore, StorageError};
 use ruma::{OwnedEventId, RoomId, RoomVersionId};
 use serde_json::Value;
 
+use crate::store::maintain_room_state;
 use crate::{SqliteStore, error::Error, row::EventRow};
 
 #[async_trait]
@@ -114,12 +115,20 @@ impl RoomStore for SqliteStore {
                 params![create_event.room_id.as_str(), ROOM_VERSION_ID],
             )?;
 
-            // 2. Write the create event itself.
-            let mut last_pos = create_event.write_into_tx(&tx)?;
+            // 2. Write the create event itself, and seed the temporal
+            //    state-group index from it, so the room has a complete index
+            //    from genesis.
+            let create_pos = create_event.write_into_tx(&tx)?;
+            maintain_room_state(&tx, &create_event, create_pos)?;
+            let mut last_pos = create_pos;
 
-            // 3. Write every initial event in order.
+            // 3. Write every initial event in order, extending the index. The
+            //    batch is a linear state chain, so each event's
+            //    `prev_state_events` are already written + recorded by the time
+            //    it is processed.
             for ev in &initial_events {
                 last_pos = ev.write_into_tx(&tx)?;
+                maintain_room_state(&tx, ev, last_pos)?;
             }
 
             // 4. Seed the room's forward extremities. createRoom writes a

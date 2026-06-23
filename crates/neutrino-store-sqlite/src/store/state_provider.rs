@@ -63,8 +63,8 @@ use std::sync::Arc;
 
 use deadpool_sqlite::rusqlite::{Connection, OptionalExtension, params};
 use neutrino_common::Event;
-use neutrino_state::StateResError;
 use neutrino_state::provider::StateProvider;
+use neutrino_state::{StateMap, StateResError};
 use ruma::{EventId, OwnedEventId};
 
 use crate::error::Error;
@@ -172,6 +172,89 @@ impl StateProvider for SqliteStateProvider<'_> {
             out.insert(owned);
         }
         Ok(out)
+    }
+
+    fn state_after(
+        &self,
+        event_id: &EventId,
+    ) -> Result<Option<StateMap<OwnedEventId>>, StateResError> {
+        // Deterministic read-back of the precomputed interval rows: locate the
+        // event's room + `stream_pos` and reconstruct the state-after it.
+        //
+        // The contract is "complete index, or unknown event". `Ok(None)` means
+        // the event is not in `events` at all → the caller falls back to the
+        // recursive walk, which surfaces the `MissingEvent` verdict. It does
+        // NOT mean "event known but not indexed": a state event present in
+        // `events` but never passed through `maintain_room_state` would read
+        // back a *wrong* (incomplete) map here, not `None`, and the caller
+        // would trust it. The system avoids that by maintaining the index on
+        // every state-event write path; the `debug_assert!` below makes a
+        // violation loud in tests/debug rather than a silent wrong answer. Only
+        // a SQL fault is an error.
+        let header: Option<(String, i64, String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT room_id, stream_pos, event_type, state_key \
+                   FROM events WHERE event_id = ?",
+                params![event_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|e| Self::into_internal(Error::Sqlite(e)))?;
+        let Some((room_id, stream_pos, event_type, state_key)) = header else {
+            return Ok(None);
+        };
+
+        // Interval reconstruction: every slot live at `stream_pos`. Intervals
+        // for a slot are disjoint (open-then-close in `maintain_room_state`),
+        // so at most one row per (event_type, state_key) matches — no grouping
+        // needed.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT event_type, state_key, event_id FROM room_state \
+                  WHERE room_id = ? \
+                    AND start_pos <= ? \
+                    AND (end_pos IS NULL OR end_pos > ?)",
+            )
+            .map_err(|e| Self::into_internal(Error::Sqlite(e)))?;
+        let rows = stmt
+            .query_map(params![room_id, stream_pos, stream_pos], |row| {
+                let event_type: String = row.get(0)?;
+                let state_key: String = row.get(1)?;
+                let id: String = row.get(2)?;
+                Ok((event_type, state_key, id))
+            })
+            .map_err(|e| Self::into_internal(Error::Sqlite(e)))?;
+
+        let mut state: StateMap<OwnedEventId> = StateMap::new();
+        for r in rows {
+            let (event_type, state_key, id) =
+                r.map_err(|e| Self::into_internal(Error::Sqlite(e)))?;
+            let owned = OwnedEventId::try_from(id).map_err(|e| {
+                Self::into_internal(Error::Internal(format!(
+                    "malformed event_id in room_state row: {e}"
+                )))
+            })?;
+            state.insert((event_type, state_key), owned);
+        }
+
+        // A maintained state event always records its own slot pointing at
+        // itself at its own `stream_pos`, so the reconstruction at that pos must
+        // contain it. If it doesn't, this event reached `events` without
+        // `maintain_room_state` (a missing write-path), and the map we'd return
+        // is silently wrong — fail loud here rather than feed bad state into
+        // auth. Non-state events have no own slot, so they are exempt.
+        debug_assert!(
+            state_key.as_deref().is_none_or(|sk| {
+                state
+                    .get(&(event_type.clone(), sk.to_owned()))
+                    .is_some_and(|id| id.as_str() == event_id.as_str())
+            }),
+            "room_state index incomplete for state event {event_id}: own slot \
+             absent — a state-event persist path is not calling maintain_room_state"
+        );
+        Ok(Some(state))
     }
 }
 
