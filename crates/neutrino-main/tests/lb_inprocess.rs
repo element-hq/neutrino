@@ -1,15 +1,15 @@
 //! In-process composition: `neutrino_main::entrypoint` runs a `neutrino-lb`
 //! sidecar alongside the homeserver, driven entirely by `Config`
-//! (`lb_ingress_bind` + `federation_proxy`) — the embedded-on-mobile topology,
-//! the in-process analogue of the legacy `DendriteService` owning the monolith.
-//! Two such nodes federate over HTTP+CBOR end to end, proving the sidecar is
-//! actually co-launched and wired (egress + ingress) by `entrypoint` itself,
-//! not just by a hand-rolled test harness.
+//! (`lb_federation_port`) — the embedded-on-mobile topology, the in-process
+//! analogue of the legacy `DendriteService` owning the monolith. Two such nodes
+//! federate over CoAP+CBOR/UDP end to end, proving the sidecar is actually
+//! co-launched and wired (egress + ingress) by `entrypoint` itself, not just by
+//! a hand-rolled test harness.
 //!
-//! Per node, all three ports are loopback/ephemeral: the homeserver bind (==
-//! sidecar upstream), the ingress (== `server_name`, the public federation
-//! port), and the egress (== `federation_proxy`, the loopback the homeserver
-//! routes outbound through).
+//! Per node: the homeserver binds a loopback port (== sidecar upstream); the
+//! ingress is `host(bind_addr):lb_federation_port` (== `server_name`, the public
+//! federation port, UDP); the egress is an internal loopback port `entrypoint`
+//! allocates itself.
 #![cfg(not(feature = "multi-user-shim"))]
 
 use std::net::SocketAddr;
@@ -44,16 +44,16 @@ struct Node {
 async fn start_node(localpart: &str) -> Node {
     let hs = free_port().await; // homeserver loopback bind (== sidecar upstream)
     let ingress = free_port().await; // public federation port (== server_name)
-    let egress = free_port().await; // loopback egress (== federation_proxy)
     let tmp = tempfile::TempDir::new().unwrap();
+    // The ingress is derived as `host(bind_addr):lb_federation_port`; `bind_addr`
+    // and `ingress` are both loopback, so `server_name` == the derived ingress.
     let server_name = ingress.to_string();
     let config = Config {
         server_name: server_name.clone(),
         bind_addr: hs.to_string(),
         localpart: localpart.to_string(),
         storage_dir: tmp.path().to_path_buf(),
-        federation_proxy: Some(format!("http://{egress}")),
-        lb_ingress_bind: Some(ingress.to_string()),
+        lb_federation_port: Some(ingress.port()),
         ..Default::default()
     };
 
@@ -171,15 +171,13 @@ async fn two_in_process_nodes_federate_over_cbor() {
 async fn entrypoint_tears_down_sidecar_when_homeserver_stops() {
     let hs = free_port().await;
     let ingress = free_port().await;
-    let egress = free_port().await;
     let tmp = tempfile::TempDir::new().unwrap();
     let config = Config {
         server_name: ingress.to_string(),
         bind_addr: hs.to_string(),
         localpart: "alice".to_string(),
         storage_dir: tmp.path().to_path_buf(),
-        federation_proxy: Some(format!("http://{egress}")),
-        lb_ingress_bind: Some(ingress.to_string()),
+        lb_federation_port: Some(ingress.port()),
         ..Default::default()
     };
 
@@ -207,9 +205,14 @@ async fn entrypoint_tears_down_sidecar_when_homeserver_stops() {
 
     // The sidecar released the public ingress port — proof it actually wound
     // down, not merely that entrypoint returned.
+    // The sidecar released the public ingress port — proof it actually wound
+    // down, not merely that entrypoint returned. The ingress is CoAP over UDP,
+    // so this must be a UDP bind; it relies on the `coap` fork aborting its
+    // listener task on shutdown (without that the UDP socket leaks — see the
+    // shutdown comment in `neutrino-lb`'s `transport::coap`).
     assert!(
-        TcpListener::bind(ingress).await.is_ok(),
-        "ingress port still held after teardown — sidecar did not stop"
+        tokio::net::UdpSocket::bind(ingress).await.is_ok(),
+        "ingress UDP port still held after teardown — sidecar did not stop"
     );
 }
 
@@ -220,19 +223,19 @@ async fn entrypoint_tears_down_sidecar_when_homeserver_stops() {
 async fn entrypoint_surfaces_a_sidecar_bind_failure() {
     let hs = free_port().await;
     let ingress = free_port().await;
-    let egress = free_port().await;
     let tmp = tempfile::TempDir::new().unwrap();
 
-    // Occupy the ingress port so the sidecar's bind can't succeed.
-    let _blocker = TcpListener::bind(ingress).await.unwrap();
+    // Occupy the ingress port so the sidecar's bind can't succeed. The embedded
+    // sidecar's ingress is CoAP over **UDP**, so the blocker must hold the UDP
+    // port (a TCP listener wouldn't collide with a UDP bind).
+    let _blocker = tokio::net::UdpSocket::bind(ingress).await.unwrap();
 
     let config = Config {
         server_name: ingress.to_string(),
         bind_addr: hs.to_string(),
         localpart: "alice".to_string(),
         storage_dir: tmp.path().to_path_buf(),
-        federation_proxy: Some(format!("http://{egress}")),
-        lb_ingress_bind: Some(ingress.to_string()),
+        lb_federation_port: Some(ingress.port()),
         ..Default::default()
     };
 

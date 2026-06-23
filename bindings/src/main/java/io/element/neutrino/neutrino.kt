@@ -1366,6 +1366,20 @@ data class NeutrinoConfig (
     var `storageDir`: kotlin.String
     , 
     var `outboundConcurrency`: kotlin.UInt
+    , 
+    /**
+     * Optional `neutrino-lb` egress proxy URL (e.g. `http://127.0.0.1:8009`).
+     * `None` = direct federation.
+     */
+    var `federationProxy`: kotlin.String?
+    , 
+    /**
+     * When set, runs a `neutrino-lb` sidecar in-process: this is the public
+     * federation port the ingress binds (what peers' `server_name` resolve to).
+     * Requires `federation_proxy` (the egress) and a loopback `bind_addr`.
+     * `None` = no in-process sidecar.
+     */
+    var `lbIngressBind`: kotlin.String?
     
 ){
     
@@ -1387,6 +1401,8 @@ public object FfiConverterTypeNeutrinoConfig: FfiConverterRustBuffer<NeutrinoCon
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
@@ -1395,7 +1411,9 @@ public object FfiConverterTypeNeutrinoConfig: FfiConverterRustBuffer<NeutrinoCon
             FfiConverterString.allocationSize(value.`bindAddr`) +
             FfiConverterString.allocationSize(value.`localpart`) +
             FfiConverterString.allocationSize(value.`storageDir`) +
-            FfiConverterUInt.allocationSize(value.`outboundConcurrency`)
+            FfiConverterUInt.allocationSize(value.`outboundConcurrency`) +
+            FfiConverterOptionalString.allocationSize(value.`federationProxy`) +
+            FfiConverterOptionalString.allocationSize(value.`lbIngressBind`)
     )
 
     override fun write(value: NeutrinoConfig, buf: ByteBuffer) {
@@ -1404,6 +1422,8 @@ public object FfiConverterTypeNeutrinoConfig: FfiConverterRustBuffer<NeutrinoCon
             FfiConverterString.write(value.`localpart`, buf)
             FfiConverterString.write(value.`storageDir`, buf)
             FfiConverterUInt.write(value.`outboundConcurrency`, buf)
+            FfiConverterOptionalString.write(value.`federationProxy`, buf)
+            FfiConverterOptionalString.write(value.`lbIngressBind`, buf)
     }
 }
 
@@ -1446,6 +1466,38 @@ public object FfiConverterTypeCommand: FfiConverterRustBuffer<Command> {
 }
 
 
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?> {
+    override fun read(buf: ByteBuffer): kotlin.String? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterString.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.String?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterString.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.String?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterString.write(value, buf)
+        }
+    }
+}
         /**
          * Spawn an owned Tokio runtime and begin polling the server entrypoint with
          * the supplied configuration. Returns a handle for pushing control commands

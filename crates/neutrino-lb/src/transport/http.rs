@@ -17,18 +17,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::headers::is_forwardable;
-use crate::transport::{WireClient, WireError, WireHandler, WireRequest, WireResponse, WireServer};
+use crate::transport::{
+    MAX_WIRE_BODY_BYTES, WireClient, WireError, WireHandler, WireRequest, WireResponse, WireServer,
+};
 
 /// Marks transcoded bodies on the wire.
 const CBOR_CONTENT_TYPE: &str = "application/cbor";
-
-/// Upper bound on a single inbound wire request body. This is the one truly
-/// network-exposed surface (the public federation port), and the body is
-/// buffered whole, CBOR-decoded, *and* re-serialized — so an unbounded body is
-/// a memory-exhaustion / OOM risk (fatal on the embedded-on-mobile target).
-/// A generous cap that no legitimate federation body approaches; the future
-/// CoAP/UDP transport bounds bodies via blockwise framing instead.
-const MAX_WIRE_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// reqwest-backed wire client. Sends `req.body` (CBOR) to `http://{dest}{path}`.
 pub struct HttpWireClient {
