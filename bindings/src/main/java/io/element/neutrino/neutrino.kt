@@ -951,6 +951,29 @@ private class AndroidSystemCleanable(
 /**
  * @suppress
  */
+public object FfiConverterUShort: FfiConverter<UShort, Short> {
+    override fun lift(value: Short): UShort {
+        return value.toUShort()
+    }
+
+    override fun read(buf: ByteBuffer): UShort {
+        return lift(buf.getShort())
+    }
+
+    override fun lower(value: UShort): Short {
+        return value.toShort()
+    }
+
+    override fun allocationSize(value: UShort) = 2UL
+
+    override fun write(value: UShort, buf: ByteBuffer) {
+        buf.putShort(value.toShort())
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterUInt: FfiConverter<UInt, Int> {
     override fun lift(value: Int): UInt {
         return value.toUInt()
@@ -1368,18 +1391,13 @@ data class NeutrinoConfig (
     var `outboundConcurrency`: kotlin.UInt
     , 
     /**
-     * Optional `neutrino-lb` egress proxy URL (e.g. `http://127.0.0.1:8009`).
-     * `None` = direct federation.
+     * When set, runs the in-process `neutrino-lb` CoAP low-bandwidth sidecar.
+     * This is the public federation port the ingress binds — peers'
+     * `server_name` resolves to `host(bind_addr):lb_federation_port`. The
+     * egress is an internal loopback port the server allocates. `None` = direct
+     * federation (no in-process sidecar).
      */
-    var `federationProxy`: kotlin.String?
-    , 
-    /**
-     * When set, runs a `neutrino-lb` sidecar in-process: this is the public
-     * federation port the ingress binds (what peers' `server_name` resolve to).
-     * Requires `federation_proxy` (the egress) and a loopback `bind_addr`.
-     * `None` = no in-process sidecar.
-     */
-    var `lbIngressBind`: kotlin.String?
+    var `lbFederationPort`: kotlin.UShort?
     
 ){
     
@@ -1401,8 +1419,7 @@ public object FfiConverterTypeNeutrinoConfig: FfiConverterRustBuffer<NeutrinoCon
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterUInt.read(buf),
-            FfiConverterOptionalString.read(buf),
-            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalUShort.read(buf),
         )
     }
 
@@ -1412,8 +1429,7 @@ public object FfiConverterTypeNeutrinoConfig: FfiConverterRustBuffer<NeutrinoCon
             FfiConverterString.allocationSize(value.`localpart`) +
             FfiConverterString.allocationSize(value.`storageDir`) +
             FfiConverterUInt.allocationSize(value.`outboundConcurrency`) +
-            FfiConverterOptionalString.allocationSize(value.`federationProxy`) +
-            FfiConverterOptionalString.allocationSize(value.`lbIngressBind`)
+            FfiConverterOptionalUShort.allocationSize(value.`lbFederationPort`)
     )
 
     override fun write(value: NeutrinoConfig, buf: ByteBuffer) {
@@ -1422,8 +1438,7 @@ public object FfiConverterTypeNeutrinoConfig: FfiConverterRustBuffer<NeutrinoCon
             FfiConverterString.write(value.`localpart`, buf)
             FfiConverterString.write(value.`storageDir`, buf)
             FfiConverterUInt.write(value.`outboundConcurrency`, buf)
-            FfiConverterOptionalString.write(value.`federationProxy`, buf)
-            FfiConverterOptionalString.write(value.`lbIngressBind`, buf)
+            FfiConverterOptionalUShort.write(value.`lbFederationPort`, buf)
     }
 }
 
@@ -1473,28 +1488,28 @@ public object FfiConverterTypeCommand: FfiConverterRustBuffer<Command> {
 /**
  * @suppress
  */
-public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?> {
-    override fun read(buf: ByteBuffer): kotlin.String? {
+public object FfiConverterOptionalUShort: FfiConverterRustBuffer<kotlin.UShort?> {
+    override fun read(buf: ByteBuffer): kotlin.UShort? {
         if (buf.get().toInt() == 0) {
             return null
         }
-        return FfiConverterString.read(buf)
+        return FfiConverterUShort.read(buf)
     }
 
-    override fun allocationSize(value: kotlin.String?): ULong {
+    override fun allocationSize(value: kotlin.UShort?): ULong {
         if (value == null) {
             return 1UL
         } else {
-            return 1UL + FfiConverterString.allocationSize(value)
+            return 1UL + FfiConverterUShort.allocationSize(value)
         }
     }
 
-    override fun write(value: kotlin.String?, buf: ByteBuffer) {
+    override fun write(value: kotlin.UShort?, buf: ByteBuffer) {
         if (value == null) {
             buf.put(0)
         } else {
             buf.put(1)
-            FfiConverterString.write(value, buf)
+            FfiConverterUShort.write(value, buf)
         }
     }
 }
