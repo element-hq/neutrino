@@ -112,11 +112,7 @@ impl Tunnel {
     /// Abort the reader task; its [`AsyncFd`] drops, closing the fd. Idempotent: a
     /// call when no tunnel is running is a no-op.
     pub(crate) fn stop(&self) {
-        let task = self
-            .task
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        let task = self.task.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(task) = task {
             task.abort();
             tracing::info!(target: "neutrino::tunnel", "tunnel reader stopped");
@@ -236,7 +232,14 @@ fn describe_ipv6(buf: &[u8]) -> String {
     format_summary(next_header, "IPv6", &src, &dst, IPV6_HEADER, buf)
 }
 
-fn format_summary(protocol: u8, version: &str, src: &str, dst: &str, l4_offset: usize, buf: &[u8]) -> String {
+fn format_summary(
+    protocol: u8,
+    version: &str,
+    src: &str,
+    dst: &str,
+    l4_offset: usize,
+    buf: &[u8],
+) -> String {
     let (src_str, dst_str) = match l4_ports(buf, l4_offset, protocol) {
         Some((src_port, dst_port)) => (format!("{src}:{src_port}"), format!("{dst}:{dst_port}")),
         None => (src.to_string(), dst.to_string()),
@@ -290,7 +293,10 @@ mod tests {
         pkt[16..20].copy_from_slice(&[10, 0, 0, 2]);
         pkt[20..22].copy_from_slice(&12345u16.to_be_bytes());
         pkt[22..24].copy_from_slice(&443u16.to_be_bytes());
-        assert_eq!(describe(&pkt), "IPv4 TCP 192.168.1.5:12345 -> 10.0.0.2:443 (24 bytes)");
+        assert_eq!(
+            describe(&pkt),
+            "IPv4 TCP 192.168.1.5:12345 -> 10.0.0.2:443 (24 bytes)"
+        );
     }
 
     #[test]
@@ -312,7 +318,10 @@ mod tests {
         pkt[24..40].copy_from_slice(&std::net::Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1).octets());
         pkt[40..42].copy_from_slice(&5353u16.to_be_bytes());
         pkt[42..44].copy_from_slice(&53u16.to_be_bytes());
-        assert_eq!(describe(&pkt), "IPv6 UDP fd00::2:5353 -> fd00::1:53 (44 bytes)");
+        assert_eq!(
+            describe(&pkt),
+            "IPv6 UDP fd00::2:5353 -> fd00::1:53 (44 bytes)"
+        );
     }
 
     #[test]
