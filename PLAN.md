@@ -302,3 +302,22 @@ never use .unwrap() in handler code.
   coap-rs's `QBlockConfig` (CON fields panic) is not leaked into `LbConfig`.
   Cargo: `coap` rev bumped to the Q-Block tip, `coap-lite` pinned to
   `qblock-phase1`, `q-block` feature enabled.
+- Q-Block2 response OOM fix (review I1): the Q-Block client now calls
+  `set_max_total_message_size(max_body_bytes)` in `client_for`, so coap-rs bounds
+  Q-Block2 response reassembly at the cap (`QBlockReceiver` aborts before allocating)
+  instead of leaving it at `usize::MAX` and only catching it post-reassembly. Q-Block1
+  request sizing is unaffected (`send_qblock` uses the static `block1_size`, not the
+  MTU-derived path).
+- `QBlockTuning` config & docs (review group B — I4/I6/I8): `with_qblock` now derives
+  `request_timeout` from the tuning (floor `REQUEST_TIMEOUT`, ≥ 2× coap-rs's
+  `non_receive_timeout * (non_max_retransmit + 2)` linger) so a long custom tuning can't be
+  killed mid-recovery by the outer timeout (I4). Doc corrected: coap-rs's extra fields are
+  *unread* on the NON path, not panicking, and `non_partial_timeout` is a NON-mode (not
+  CON-only) knob (I6). The "both ends must agree" note is reframed as a coap-rs linger-model
+  limitation (RFC 9177 allows independent per-peer timing), with the "linger until exchange
+  completes" follow-up recorded (I8).
+- Open follow-ups from the same review (cross-repo, coap-rs/coap-lite): the *ingress* server
+  reassembly bound is coap-rs's hardcoded 16 MiB and not wired to `MAX_WIRE_BODY_BYTES`,
+  with no cap on concurrent partial transfers (I2); Q-Block1 reassembly is keyed by a
+  predictable Request-Tag with no source-address binding (I3); the detached `drive_send`
+  task outlives timeout/eviction (I5).

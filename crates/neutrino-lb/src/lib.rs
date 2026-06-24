@@ -24,15 +24,23 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// RFC 9177 §6.2 NON-mode Q-Block timing knobs, exposed on `LbConfig` without
-/// leaking coap-rs's `QBlockConfig` (whose CON-only fields panic on the NON
-/// path). Mapped to coap-rs at transport construction.
+/// leaking coap-rs's `QBlockConfig`, whose extra CON-mode fields (`probing_rate`,
+/// `nstart`, `non_probing_wait`) are unread on the NON path. Mapped to coap-rs at
+/// transport construction.
 ///
-/// Both ends of a mesh must use the same values: Q-Block loss recovery only
-/// works while the sender's post-burst linger window and the receiver's
-/// missing-block timer overlap. If you raise `non_receive_timeout` or
-/// `non_max_retransmit`, keep the resulting linger
-/// (`non_receive_timeout * (non_max_retransmit + 2)`) below the transport's
-/// `REQUEST_TIMEOUT`, or a slow recovery can be killed mid-exchange.
+/// RFC 9177 lets peers choose their timing independently — the 4.08 missing-block
+/// exchange is self-describing on the wire. coap-rs's drive model is stricter:
+/// the sender only lingers to service inbound 4.08s for a bounded window after
+/// its burst, so in practice both ends of a mesh should use comparable values, or
+/// a slow recovery can fall outside that window. (Follow-up: make the client
+/// linger until the exchange completes rather than for a fixed window.)
+///
+/// That sender linger is coap-rs's `non_receive_timeout * (non_max_retransmit +
+/// 2)` — an implementation quantity, *not* an RFC constant (the RFC's own
+/// receiver delay grows exponentially with the per-payload retry count, so it can
+/// exceed this linear figure). `CoapWireClient::with_qblock` sizes the
+/// total-exchange timeout to cover this linger automatically, so raising these
+/// knobs no longer risks a recovery being killed mid-exchange by `REQUEST_TIMEOUT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QBlockTuning {
     /// Blocks sent per burst before the inter-burst congestion delay
@@ -59,9 +67,10 @@ impl Default for QBlockTuning {
 }
 
 impl QBlockTuning {
-    /// Map to coap-rs's `QBlockConfig`, leaving its CON-only fields
-    /// (`probing_rate`, `nstart`, `non_probing_wait`, `non_partial_timeout`) at
-    /// their defaults (unread on the NON path).
+    /// Map to coap-rs's `QBlockConfig`, leaving its CON-mode fields
+    /// (`probing_rate`, `nstart`, `non_probing_wait`) and the NON field
+    /// `non_partial_timeout` (a partial-body hold time, not yet wired in coap-rs
+    /// v1) at their defaults — none are read on the NON send/serve path today.
     pub(crate) fn to_qblock_config(self) -> coap::qblock::QBlockConfig {
         coap::qblock::QBlockConfig {
             max_payloads: self.max_payloads,

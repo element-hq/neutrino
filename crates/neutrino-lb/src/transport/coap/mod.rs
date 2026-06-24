@@ -104,10 +104,22 @@ impl CoapWireClient {
     /// Build a Q-Block (RFC 9177) NON-mode client. `block1_size` caps the
     /// per-burst block payload (also the Q-Block block size); `None` keeps
     /// coap-rs's 1024 B default.
+    ///
+    /// `request_timeout` is grown to cover the Q-Block recovery window so a long
+    /// tuning can't be killed mid-recovery by the outer timeout: coap-rs drives
+    /// request-send recovery for `linger = non_receive_timeout *
+    /// (non_max_retransmit + 2)` after the burst, and the response-receive side
+    /// recovers within a comparable window, so the whole exchange's recovery is
+    /// bounded by ~2× linger. We floor at `REQUEST_TIMEOUT`, so the default tuning
+    /// (linger 24 s → 48 s < 60 s) is unchanged; only larger tunings scale it up.
     pub fn with_qblock(block1_size: Option<usize>, qblock: coap::qblock::QBlockConfig) -> Self {
+        let rounds = qblock.non_max_retransmit.saturating_add(2);
+        let linger = qblock.non_receive_timeout.saturating_mul(rounds);
+        let request_timeout = crate::REQUEST_TIMEOUT.max(linger.saturating_mul(2));
         Self {
             block1_size,
             qblock: Some(qblock),
+            request_timeout,
             ..Self::new()
         }
     }
@@ -1511,6 +1523,34 @@ mod qblock_client_tests {
             msg.contains("send_qblock"),
             "over-cap Q-Block2 response should abort in the framing layer \
              (send_qblock), not the post-reassembly check: {msg}"
+        );
+    }
+
+    // `with_qblock` must size `request_timeout` to cover the recovery window so a
+    // long tuning is not killed mid-recovery by the outer timeout. Default tuning
+    // (linger 24 s, 2× = 48 s) stays at the 60 s floor; a large tuning scales up.
+    #[test]
+    fn qblock_request_timeout_covers_recovery_linger() {
+        use std::time::Duration;
+
+        let default_client =
+            CoapWireClient::with_qblock(None, coap::qblock::QBlockConfig::default());
+        assert_eq!(
+            default_client.request_timeout,
+            crate::REQUEST_TIMEOUT,
+            "default tuning's 2× linger (48 s) is below the 60 s floor"
+        );
+
+        // non_receive_timeout 30 s, non_max_retransmit 4 → linger 180 s, 2× = 360 s.
+        let big = coap::qblock::QBlockConfig {
+            non_receive_timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let big_client = CoapWireClient::with_qblock(None, big);
+        assert!(
+            big_client.request_timeout >= Duration::from_secs(360),
+            "request_timeout must cover 2× linger for a large tuning, got {:?}",
+            big_client.request_timeout
         );
     }
 }
