@@ -32,97 +32,53 @@ All status points MUST have tests.
 
 ### Low-bandwidth proxy (`neutrino-lb`)
 
-v1 done (JSON↔CBOR over HTTP). `neutrino-lb` is an in-process sidecar that
-transcodes Server-Server federation **bodies** between JSON (local side) and
-CBOR (wire side), behind a `WireClient`/`WireServer` trait seam (the future
-CoAP/UDP transport drops in there). `neutrino-http` routes outbound federation
-through it via the optional `Config.federation_proxy` (reqwest proxy mode);
-`None` = direct (the default, so existing tests/deployments are unchanged). Two
-homeservers behind two sidecars converge a real join + message — see
-`crates/neutrino-http/tests/e2e_lb_federation.rs`. Design:
-`docs/superpowers/specs/2026-06-15-neutrino-lb-cbor-proxy-design.md`.
+An in-process sidecar that transcodes Server-Server federation **bodies**
+JSON↔CBOR behind a `WireClient`/`WireServer` trait seam. `neutrino-http` routes
+outbound federation through it via the optional `Config.federation_proxy` (`None`
+= direct, the default). The CBOR/CoAP layer is contained in this crate — out of
+Ruma's and the Router's way. Each transport has a two-homeserver join+message e2e
+(`crates/neutrino-http/tests/e2e_lb_*`).
 
-Open question answered: CBOR/CoAP lives in the separate `neutrino-lb` crate,
-**not** baked into the `Event`/`Request`/`Response` types — so it stays out of
-Ruma's way and `neutrino-http`'s Router is untouched.
+Three wire transports, selected by `LbConfig.wire: WireKind`:
+- `Http` — v1, JSON↔CBOR over HTTP (the `WireKind` default; debuggable baseline).
+- `Coap` — CON CoAP/UDP, RFC 7959 blockwise, Dendrite v1 path enums, forwarded
+  headers + exact HTTP status as CoAP options; tunable via
+  `Coap { block1_size, max_message_size }`.
+- `CoapQBlock` — RFC 9177 NON-mode robust transfer (burst + 4.08 missing-block
+  recovery); the **`neutrino-main` default**. Reuses the `Coap` message mapping;
+  tuned via `CoapQBlock { block1_size, qblock: QBlockTuning }` (RFC 9177 §6.2).
 
-CoAP/UDP transport done (Layer B). `transport::coap` is a second
-`WireClient`/`WireServer` impl (sibling of `transport::http`) over `coap-rs` +
-`coap-lite`: CON request/response, blockwise (RFC 7959) for large `send_join`
-state, Dendrite v1 federation path codes (+ literal fallback), forwarded
-headers + exact HTTP status carried as CoAP options. Selected via
-`LbConfig.wire: WireKind` (`Http` default). Two homeservers converge a join +
-message over CoAP/UDP — see `crates/neutrino-http/tests/e2e_lb_coap_federation.rs`.
-Per-message sizing for constrained links is tunable via
-`WireKind::Coap { block1_size, max_message_size }` (request Block1 payload, and
-the node's total framed-message budget that bounds inbound accept + outbound
-Block2). `max_message_size` requires the `kaylendog/coap-rs` fork (patched in via
-`[patch.crates-io]`), which adds `Server::*_with_config`.
-Design: `docs/superpowers/specs/2026-06-18-neutrino-lb-coap-udp-transport-design.md`;
-plan: `docs/superpowers/plans/2026-06-18-neutrino-lb-coap-udp-transport.md`.
-
-Q-Block transport done (RFC 9177 NON-mode). `WireKind::CoapQBlock` is a sibling
-of CON `Coap`: federation bodies travel as non-confirmable Q-Block bursts (up to
-MAX_PAYLOADS unacked) with 4.08 missing-block recovery, via coap-rs
-`send_qblock` / `set_qblock_config` (the `q-block` feature on the
-`kaylendog/coap-rs` fork, backed by `kaylendog/coap-lite` `qblock-phase1`). The
-`message.rs` mapping is reused verbatim. It is the **`neutrino-main` default**;
-CON `Coap` and `Http` remain selectable. Tuning via
-`WireKind::CoapQBlock { block1_size, qblock: QBlockTuning }` (RFC 9177 §6.2
-timing). Two homeservers converge a join + message over Q-Block — see
-`crates/neutrino-http/tests/e2e_lb_coap_qblock_federation.rs`. Design:
-`docs/superpowers/specs/2026-06-24-neutrino-lb-qblock-transport-design.md`; plan:
-`docs/superpowers/plans/2026-06-24-neutrino-lb-qblock-transport.md`.
+DoS posture (the public UDP port is the only network-exposed surface): assembled
+bodies are capped at `MAX_WIRE_BODY_BYTES` (ingress→413, egress→error); the
+Q-Block path also caps response/inbound reassembly *before* allocation, caps
+concurrent inbound transfers, enforces an absolute partial-transfer TTL, binds
+each reassembly to its source address, and derives `request_timeout` from the
+tuning so recovery isn't killed mid-exchange. Needs the `kaylendog/coap-rs` +
+`kaylendog/coap-lite` forks (q-block API, DoS knobs, `Server::*_with_config`),
+rev-pinned in `[patch.crates-io]`. Designs:
+`docs/superpowers/specs/2026-06-{15,18,24}-neutrino-lb-*`.
 
 Deferred follow-ups (write-ups, not done):
-- integer-key / enum-key CBOR codec (Layer A; port of Dendrite `internal/lb`
-  `cbor_codec.go` / `cbor_v1.go`); both transports still carry an **opaque**
-  `JSON value ⇄ CBOR bytes` transcode. The single-byte CoAP path enums are now
-  done (`transport::coap::paths`). MSC3079:
-  https://github.com/matrix-org/matrix-spec-proposals/blob/kegan/low-bandwidth/proposals/3079-low-bandwidth-csapi.md
-- value-level wire compression (small-MTU sizing analysis @ MTU 200): per-block
-  cost is dominated by the re-sent Uri-Path. Path enums (done) collapse the fixed
-  prefix to 2 B (1-B value + the mandatory CoAP option header — not 1 B). v12
-  room/event IDs are `sigil + base64(32-B SHA-256)` (44 ch); carrying them as
-  **raw 32 B** is lossless and saves 12 B/ID, but needs a
-  decode→re-encode→verify-or-fall-back-to-text guard (2 trailing base64 bits;
-  event IDs are compared as opaque strings, so a non-canonical re-encode would
-  change identity). Even so, the two-hash-ID endpoints
-  (`send_join`/`invite`/`send_leave`) are **capped at 64-B blocks @ MTU 200**:
-  the two 32-B hashes are ~68 B of irreducible per-block options (128-B blocks
-  need options ≤ 59 B). Only moving room/event IDs into the **once-sent body**
-  (block 0) instead of the per-block path breaks that cap. `/send` + a short
-  `txnId` already reaches 128-B blocks.
-- X-Matrix wire form: the client sends `origin="…",destination="…"` (~55 B for
-  short names) but the inbound side reads **only `origin`** (`auth.rs`). "Bare
-  origin" (one CoAP option, drop `destination` + scheme/quote framing) → ~12 B; a
-  per-peer 1-B index → ~2 B (name-length independent). It must ride **every
-  block** (not body-only) where the network can rewrite source addresses, and
-  would then double as the Block1 reassembly key — coap-lite keys partial
-  assembly on `SocketAddr`, which is unstable under rewrite. send_join's real
-  cost is its **Block2 state-DAG response**, which re-sends these request options
-  on every block pull (the case the legacy stack SZX-hacked to 64 KB to avoid).
-- CoAP blockwise *reassembly-time* cap: the transport now enforces
-  `MAX_WIRE_BODY_BYTES` on the **assembled** body (ingress → 413, egress →
-  transport error), matching the HTTP transport's handler-facing contract and
-  bounding the transcode + forward of a legitimately large body. What remains: a
-  cap *during* reassembly — coap-lite 0.13's `max_total_message_size` bounds only
-  the negotiated per-block size, not the running total across Block1 chunks, so a
-  peer streaming unbounded chunks can still grow coap-lite's internal buffer
-  before the post-reassembly check fires. Acceptable under the trusted-network
-  assumption; a true bound needs an upstream/forked cap on the block accumulators.
-- Upstream the `coap-rs` `Server::*_with_config` change (carried on the
-  `kaylendog/coap-rs` fork) so the `[patch.crates-io]` git pin can drop. Until
-  then the build depends on the fork rev.
-- SLIP / serial-link framing on top of the CoAP/UDP transport (the
-  `cmd/test-coap/bridge` work) — the physical low-bandwidth link.
-- per-hop timeouts on the sidecar's own reqwest clients (`LbConfig.timeouts`);
-  today the originating `FederationClient` request timeout bounds the egress hop.
-- Q-Block2 (response) per-fragment size knob: v1 has no `max_message_size`
-  equivalent for the Q-Block path; Block2 follows coap-rs's szx default. A knob is
-  a follow-up if a constrained link needs smaller response fragments.
-- FFI/Element X exposure of transport choice: `CoapQBlock` is the `neutrino-main`
-  default, not yet selectable from `NeutrinoConfig` / `DefaultNeutrinoService`.
+- Integer-key/enum-key CBOR codec (Layer A; port of Dendrite `internal/lb`): both
+  transports still carry an **opaque** JSON↔CBOR transcode. CoAP path enums are
+  done (`transport::coap::paths`). (MSC3079.)
+- Wire-size reduction for small MTUs: carry v12 room/event IDs as **raw 32 B**
+  (vs `sigil+base64`, −12 B/ID; needs a re-encode-or-fall-back-to-text guard) and
+  X-Matrix as a bare/indexed origin (~55 B → ~2–12 B; must ride every block and
+  doubles as the reassembly key). send_join's real cost is its Block2 state-DAG
+  response re-sending these options per block.
+- CON-path reassembly-time cap: the Q-Block path now bounds reassembly *before*
+  allocation, but the RFC 7959 CON path still relies on the post-reassembly cap —
+  coap-lite's accumulator isn't externally bounded mid-transfer. Acceptable under
+  the trusted-network assumption.
+- Upstream the fork changes (`Server::*_with_config`, q-block API, DoS knobs) so
+  the `[patch.crates-io]` git pins can drop.
+- SLIP / serial-link framing on the CoAP/UDP transport — the physical link.
+- Per-hop timeouts on the sidecar's own reqwest clients (`LbConfig.timeouts`).
+- Q-Block2 (response) per-fragment size knob (no `max_message_size` equivalent
+  on the Q-Block path yet; Block2 follows coap-rs's szx default).
+- FFI/Element X exposure of transport choice (`CoapQBlock` is the default, not yet
+  selectable from `NeutrinoConfig`).
 
 ### Sliding sync (MSC4186) gaps
 
@@ -295,54 +251,25 @@ never use .unwrap() in handler code.
   but still surfaces the error at `entrypoint`.
 
 ### Q-Block transport (2026-06-24)
-- Q-Block (RFC 9177) NON-mode added as `WireKind::CoapQBlock`, sibling of CON
-  `Coap`; both selectable, CON retained as lossless/debug baseline. Q-Block is the
-  `neutrino-main` default. `message.rs` reused verbatim — Q-Block changes only the
-  send call (`send_qblock`) + config. `QBlockTuning` wraps the NON knobs so
-  coap-rs's `QBlockConfig` (CON fields panic) is not leaked into `LbConfig`.
-  Cargo: `coap` rev bumped to the Q-Block tip, `coap-lite` pinned to
-  `qblock-phase1`, `q-block` feature enabled.
-- Q-Block2 response OOM fix (review I1): the Q-Block client now calls
-  `set_max_total_message_size(max_body_bytes)` in `client_for`, so coap-rs bounds
-  Q-Block2 response reassembly at the cap (`QBlockReceiver` aborts before allocating)
-  instead of leaving it at `usize::MAX` and only catching it post-reassembly. Q-Block1
-  request sizing is unaffected (`send_qblock` uses the static `block1_size`, not the
-  MTU-derived path).
-- `QBlockTuning` config & docs (review group B — I4/I6/I8): `with_qblock` now derives
-  `request_timeout` from the tuning (floor `REQUEST_TIMEOUT`, ≥ 2× coap-rs's
-  `non_receive_timeout * (non_max_retransmit + 2)` linger) so a long custom tuning can't be
-  killed mid-recovery by the outer timeout (I4). Doc corrected: coap-rs's extra fields are
-  *unread* on the NON path, not panicking, and `non_partial_timeout` is a NON-mode (not
-  CON-only) knob (I6). The "both ends must agree" note is reframed as a coap-rs linger-model
-  limitation (RFC 9177 allows independent per-peer timing), with the "linger until exchange
-  completes" follow-up recorded (I8).
-- Cargo reproducibility (review group C — I7): `coap-lite` in `[patch.crates-io]` is now
-  rev-pinned (`d45e952…`) instead of branch-pinned (`qblock-phase1`), so `cargo update` can't
-  silently move it — matching the `coap` rev-pin discipline (Cargo.lock unchanged, same commit).
-  Reconciled the design doc's stale `coap` rev (`0af46cd1e…` → the shipped `df0a355…`) and the
-  `coap-lite` pin mechanism.
-- Q-Block test hardening (review group D): the lossy relay now counts dropped datagrams and the
-  Q-Block loss test asserts the targeted drop actually happened (so "recovery" can't be a vacuous
-  lossless pass — I9); the concurrency test uses 64 B blocks + 256–496 B bodies so it exercises
-  *multi-block* Request-Tag burst demux, not just single-PDU correlation (I10); added a black-hole
-  dead-peer Q-Block timeout test via a `request_timeout`-override test ctor (I12); tightened loose
-  `is_ok()`/`let _` shutdown asserts to `matches!(.., Ok(Ok(Ok(()))))` (I17). Deliberately not done:
-  inject loss into the e2e (I11 — needs a relay between sidecars + server_name rework; unit loss
-  test covers recovery), de-flaking the fast recovery timers (I13 — outer timeouts already prevent
-  hangs), dropping the change-detector/compile-gate tests (I16 — kept per the no-delete-tests rule;
-  the feature-gate test is a real compile guard, the defaults test guards interop-critical
-  constants), and de-duplicating the per-module `PlainEcho`/`BodyEcho` test helpers (I18 — matches
-  existing file style, low value).
-- Q-Block NON-mode DoS hardening (review group A — I2/I3/I5; cross-repo). coap-rs patched
-  (`kaylendog/coap-rs` rev `36cc2dc`): the inbound Q-Block1 reassembly cap is now settable
-  (`set_qblock_max_body_len`), concurrent partial transfers are capped
-  (`set_qblock_max_transfers`, default 64), `non_partial_timeout` is wired as an absolute
-  partial-transfer TTL in `drive_receive`, each reassembly is bound to its first block's source
-  address (cross-source blocks dropped), and the client's background `drive_send` is aborted when
-  `send_qblock` returns. coap-lite needed no changes (`RangeSet` already bounded, `QBlockReceiver`
-  caps before allocating). neutrino-lb bumps the `coap` rev and wires the new knobs in
-  `CoapWireServer::serve`: `set_qblock_max_body_len(max_body_bytes)` (aligns the reassembly abort
-  with the 413 contract — the ingress analogue of I1) and `set_qblock_max_transfers(16)`
-  (`MAX_QBLOCK_INFLIGHT_TRANSFERS`; worst case 16 × 64 MiB). The client token counter now starts
-  from a random base (`random_token_seed`) so Request-Tags aren't predictable — defence in depth
-  for the source binding.
+- Added as `WireKind::CoapQBlock`, a sibling of CON `Coap` (both selectable, CON
+  kept as the lossless/debug baseline); the `neutrino-main` default. `message.rs`
+  reused verbatim — Q-Block changes only the send call + config. `QBlockTuning`
+  exposes just the NON knobs, mapped to coap-rs's `QBlockConfig` at construction.
+- Review hardening (I1 + groups A–D), much of it on the `kaylendog/coap-rs` fork
+  (rev `36cc2dc`):
+  - Reassembly is bounded *before* allocation on both legs — egress response
+    (`set_max_total_message_size` in `client_for`, I1) and ingress request
+    (`set_qblock_max_body_len`, aligned to the 413 contract). Concurrent inbound
+    transfers are capped (`set_qblock_max_transfers(16)`) with an absolute
+    `non_partial_timeout` TTL, so a slow / many-transfer peer can't pin memory (I2).
+  - Each inbound reassembly binds to its source address (cross-source blocks
+    dropped) and the client token base is randomised so Request-Tags aren't
+    guessable (I3); the background `drive_send` is aborted when `send_qblock`
+    returns (I5); `request_timeout` is derived from the tuning so recovery isn't
+    killed mid-exchange (I4).
+  - `coap-lite` rev-pinned for reproducibility (I7); docs corrected — coap-rs's
+    extra NON-config fields are unread, not panicking (I6); tests hardened — loss
+    test proves real recovery, concurrency test is multi-block, dead-peer /
+    oversized / source-binding cases added (I9/I10/I12).
+  - Deferred with rationale: e2e loss injection (I11), recovery-timer de-flake
+    (I13), change-detector / helper-test cleanup (I16/I18).
