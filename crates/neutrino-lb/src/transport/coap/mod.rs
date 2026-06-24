@@ -1295,6 +1295,85 @@ mod loss_tests {
         );
         token.cancel();
     }
+
+    // Spawn a *Q-Block* echo server behind the same lossy relay. The server's
+    // Q-Block config is passed in so its recovery timing can be aligned with the
+    // client's: the client's `drive_send` only lingers to service missing-block
+    // (4.08) requests for `non_receive_timeout * (non_max_retransmit + 2)`, so a
+    // server still using the 4 s default would fire its 4.08 long after the
+    // fast-timed client stopped listening, and the dropped block would never be
+    // recovered. Matching the configs keeps recovery inside that window.
+    async fn spawn_qblock_server_and_relay(
+        drop_to_server: Vec<usize>,
+        server_qcfg: coap::qblock::QBlockConfig,
+    ) -> (SocketAddr, CancellationToken) {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr: SocketAddr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        tokio::spawn(async move {
+            CoapWireServer::with_qblock(server_addr, server_qcfg)
+                .serve(Arc::new(PlainEcho), server_token)
+                .await
+        });
+
+        let front = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("relay front bind");
+        let front_addr = front.local_addr().unwrap();
+        let relay_token = token.clone();
+        tokio::spawn(run_lossy_relay(
+            front,
+            server_addr,
+            drop_to_server,
+            relay_token,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (front_addr, token)
+    }
+
+    // A datagram dropped mid Q-Block burst must be recovered by the 4.08
+    // missing-blocks mechanism and the multi-block body reassembled intact. With
+    // a 64 B block a ~2 KiB body spans many blocks; dropping the 3rd exercises
+    // recovery of an interior burst block (not the opening datagram).
+    #[tokio::test]
+    async fn qblock_survives_a_dropped_mid_burst_datagram() {
+        // Fast recovery timing so the test doesn't wait the 4 s default. The same
+        // config drives both ends so the server's 4.08 fires while the client is
+        // still lingering to service it (see `spawn_qblock_server_and_relay`).
+        let qcfg = coap::qblock::QBlockConfig {
+            non_timeout: Duration::from_millis(50),
+            non_receive_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let (relay_addr, token) = spawn_qblock_server_and_relay(vec![3], qcfg.clone()).await;
+
+        let req_body: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
+        let client = CoapWireClient::with_qblock(Some(64), qcfg);
+        let resp = tokio::time::timeout(
+            Duration::from_secs(15),
+            client.send(WireRequest {
+                dest: relay_addr.to_string(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![],
+                body: req_body.clone(),
+            }),
+        )
+        .await
+        .expect("qblock send must complete within the bound")
+        .expect("qblock send must recover from the dropped burst datagram");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.body, req_body,
+            "qblock body corrupted after a dropped-and-recovered burst block"
+        );
+        token.cancel();
+    }
 }
 
 #[cfg(test)]
