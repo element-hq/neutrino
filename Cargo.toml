@@ -29,7 +29,7 @@ async-compat = { git = "https://github.com/element-hq/async-compat", rev = "5a27
 # fragmentation on constrained links. The rev is bumped to the Q-Block (RFC 9177)
 # tip, which adds CoAPClient::send_qblock + {Server,CoAPClient}::set_qblock_config
 # behind the `q-block` feature (enabled on the dep in neutrino-lb).
-coap = { git = "https://github.com/kaylendog/coap-rs", rev = "0af46cd1ea52a1b0f8f5c1db954aa04131358fa2" }
+coap = { git = "https://github.com/kaylendog/coap-rs", rev = "df0a3558949a3cc98d7a73c274eec23caa6b751d" }
 # coap-rs's q-block feature needs coap-lite's qblock primitives (RangeSet,
 # missing_blocks). coap-rs's own [patch] for coap-lite is ignored when coap-rs is
 # consumed as a dependency, and crates.io coap-lite lacks them, so pin the fork
