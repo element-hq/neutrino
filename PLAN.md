@@ -321,6 +321,18 @@ never use .unwrap() in handler code.
   silently move it — matching the `coap` rev-pin discipline (Cargo.lock unchanged, same commit).
   Reconciled the design doc's stale `coap` rev (`0af46cd1e…` → the shipped `df0a355…`) and the
   `coap-lite` pin mechanism.
+- Q-Block test hardening (review group D): the lossy relay now counts dropped datagrams and the
+  Q-Block loss test asserts the targeted drop actually happened (so "recovery" can't be a vacuous
+  lossless pass — I9); the concurrency test uses 64 B blocks + 256–496 B bodies so it exercises
+  *multi-block* Request-Tag burst demux, not just single-PDU correlation (I10); added a black-hole
+  dead-peer Q-Block timeout test via a `request_timeout`-override test ctor (I12); tightened loose
+  `is_ok()`/`let _` shutdown asserts to `matches!(.., Ok(Ok(Ok(()))))` (I17). Deliberately not done:
+  inject loss into the e2e (I11 — needs a relay between sidecars + server_name rework; unit loss
+  test covers recovery), de-flaking the fast recovery timers (I13 — outer timeouts already prevent
+  hangs), dropping the change-detector/compile-gate tests (I16 — kept per the no-delete-tests rule;
+  the feature-gate test is a real compile guard, the defaults test guards interop-critical
+  constants), and de-duplicating the per-module `PlainEcho`/`BodyEcho` test helpers (I18 — matches
+  existing file style, low value).
 - Open follow-ups from the same review (cross-repo, coap-rs/coap-lite): the *ingress* server
   reassembly bound is coap-rs's hardcoded 16 MiB and not wired to `MAX_WIRE_BODY_BYTES`,
   with no cap on concurrent partial transfers (I2); Q-Block1 reassembly is keyed by a

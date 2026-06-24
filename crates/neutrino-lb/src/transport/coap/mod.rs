@@ -210,6 +210,20 @@ impl CoapWireClient {
             ..Self::with_qblock(block1_size, qblock)
         }
     }
+
+    // A Q-Block client with an explicit `request_timeout`, overriding the value
+    // `with_qblock` derives from the tuning — so a black-hole test need not wait
+    // the 60 s floor.
+    #[cfg(test)]
+    fn with_qblock_and_request_timeout(
+        qblock: coap::qblock::QBlockConfig,
+        request_timeout: Duration,
+    ) -> Self {
+        Self {
+            request_timeout,
+            ..Self::with_qblock(None, qblock)
+        }
+    }
 }
 
 impl Default for CoapWireClient {
@@ -1188,6 +1202,7 @@ mod loss_tests {
     use axum::http::Method;
     use std::net::SocketAddr;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::net::UdpSocket;
     use tokio_util::sync::CancellationToken;
@@ -1214,6 +1229,7 @@ mod loss_tests {
         front: UdpSocket,
         server: SocketAddr,
         drop_to_server: Vec<usize>,
+        dropped: Arc<AtomicUsize>,
         token: CancellationToken,
     ) {
         let back = UdpSocket::bind("127.0.0.1:0")
@@ -1231,7 +1247,9 @@ mod loss_tests {
                     client_addr = Some(src);
                     to_server_seen += 1;
                     if drop_to_server.contains(&to_server_seen) {
-                        continue; // drop this datagram; the sender must retransmit
+                        // drop this datagram; the sender must retransmit/recover.
+                        dropped.fetch_add(1, Ordering::SeqCst);
+                        continue;
                     }
                     let _ = back.send_to(&from_client[..n], server).await;
                 }
@@ -1264,10 +1282,12 @@ mod loss_tests {
             .expect("relay front bind");
         let front_addr = front.local_addr().unwrap();
         let relay_token = token.clone();
+        // CON callers don't assert drop counts; discard the counter.
         tokio::spawn(run_lossy_relay(
             front,
             server_addr,
             drop_to_server,
+            Arc::new(AtomicUsize::new(0)),
             relay_token,
         ));
 
@@ -1340,7 +1360,7 @@ mod loss_tests {
     async fn spawn_qblock_server_and_relay(
         drop_to_server: Vec<usize>,
         server_qcfg: coap::qblock::QBlockConfig,
-    ) -> (SocketAddr, CancellationToken) {
+    ) -> (SocketAddr, CancellationToken, Arc<AtomicUsize>) {
         let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let server_addr: SocketAddr = probe.local_addr().unwrap();
         drop(probe);
@@ -1358,15 +1378,20 @@ mod loss_tests {
             .expect("relay front bind");
         let front_addr = front.local_addr().unwrap();
         let relay_token = token.clone();
+        // Returned so the test can assert the targeted datagram was actually
+        // dropped — otherwise a framing change could make "recovery" a vacuous
+        // lossless pass.
+        let dropped = Arc::new(AtomicUsize::new(0));
         tokio::spawn(run_lossy_relay(
             front,
             server_addr,
             drop_to_server,
+            dropped.clone(),
             relay_token,
         ));
 
         tokio::time::sleep(Duration::from_millis(50)).await;
-        (front_addr, token)
+        (front_addr, token, dropped)
     }
 
     // A datagram dropped mid Q-Block burst must be recovered by the 4.08
@@ -1383,7 +1408,8 @@ mod loss_tests {
             non_receive_timeout: Duration::from_millis(100),
             ..Default::default()
         };
-        let (relay_addr, token) = spawn_qblock_server_and_relay(vec![3], qcfg.clone()).await;
+        let (relay_addr, token, dropped) =
+            spawn_qblock_server_and_relay(vec![3], qcfg.clone()).await;
 
         let req_body: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
         let client = CoapWireClient::with_qblock(Some(64), qcfg);
@@ -1405,6 +1431,13 @@ mod loss_tests {
         assert_eq!(
             resp.body, req_body,
             "qblock body corrupted after a dropped-and-recovered burst block"
+        );
+        // The body matching is only meaningful if a datagram was actually
+        // dropped: in NON mode there is no CON retransmit, so reassembling an
+        // intact body *after a confirmed drop* is Q-Block's 4.08 recovery at work.
+        assert!(
+            dropped.load(Ordering::SeqCst) >= 1,
+            "relay never dropped the targeted datagram — recovery was not exercised"
         );
         token.cancel();
     }
@@ -1553,6 +1586,40 @@ mod qblock_client_tests {
             big_client.request_timeout
         );
     }
+
+    // A black-hole peer on the Q-Block path must surface as a Transport error
+    // within `request_timeout`, not hang — the Q-Block analogue of the CON
+    // `dead_peer_send_is_bounded_by_request_timeout`. Q-Block's post-burst linger
+    // is new timeout-interacting behaviour, so the outer bound must still fire.
+    #[tokio::test]
+    async fn dead_peer_qblock_send_is_bounded_by_request_timeout() {
+        use std::time::Duration;
+
+        // Bind a socket and never answer: the Q-Block burst goes unacknowledged
+        // and no Q-Block2 response ever comes back.
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sink.local_addr().unwrap();
+
+        let client = CoapWireClient::with_qblock_and_request_timeout(
+            coap::qblock::QBlockConfig::default(),
+            Duration::from_millis(300),
+        );
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.send(WireRequest {
+                dest: addr.to_string(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![],
+                body: vec![0u8; 4096], // multi-block burst with the default 1024 B block
+            }),
+        )
+        .await
+        .expect("qblock send must return within request_timeout, not hang")
+        .expect_err("a black-hole peer must surface a Transport error");
+        assert!(matches!(err, WireError::Transport(_)), "got {err:?}");
+        drop(sink);
+    }
 }
 
 #[cfg(test)]
@@ -1618,7 +1685,10 @@ mod qblock_server_tests {
 
         token.cancel();
         let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
-        assert!(joined.is_ok(), "qblock server did not wind down on cancel");
+        assert!(
+            matches!(joined, Ok(Ok(Ok(())))),
+            "qblock server did not wind down cleanly on cancel: {joined:?}"
+        );
     }
 
     // A large body (over one block) must round-trip via the Q-Block burst:
@@ -1705,7 +1775,9 @@ mod qblock_concurrency_tests {
     // Overlapping send_qblock calls through one pooled client must each receive
     // their own response. Q-Block adds background drive tasks + Request-Tag demux
     // on top of token correlation; this is the gate deciding pool-vs-fresh-client
-    // (spec verification gate 1).
+    // (spec verification gate 1). Bodies are sized (with a 64 B block) to span
+    // several Q-Block blocks each, so the test exercises *multi-block burst*
+    // correlation under concurrency — not just the single-PDU case.
     #[tokio::test]
     async fn concurrent_qblock_requests_correlate_to_their_own_responses() {
         let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1721,8 +1793,10 @@ mod qblock_concurrency_tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+        // 64 B blocks so the bodies below (256–496 B) are each ≥4 blocks → genuine
+        // multi-block Q-Block1 up + Q-Block2 down, concurrently, through one client.
         let client = Arc::new(CoapWireClient::with_qblock(
-            None,
+            Some(64),
             coap::qblock::QBlockConfig::default(),
         ));
         let mut handles = Vec::new();
@@ -1730,7 +1804,9 @@ mod qblock_concurrency_tests {
             let client = client.clone();
             let dest = addr.to_string();
             handles.push(tokio::spawn(async move {
-                let body = vec![i; 48 + i as usize];
+                // Distinct byte value AND distinct length per request, so a
+                // cross-wired response is caught by content or by length.
+                let body = vec![i; 256 + i as usize * 16];
                 let resp = client
                     .send(WireRequest {
                         dest,
@@ -1754,6 +1830,10 @@ mod qblock_concurrency_tests {
         }
 
         token.cancel();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(
+            matches!(joined, Ok(Ok(Ok(())))),
+            "qblock server did not wind down cleanly on cancel: {joined:?}"
+        );
     }
 }
