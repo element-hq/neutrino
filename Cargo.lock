@@ -569,7 +569,7 @@ dependencies = [
 [[package]]
 name = "coap-lite"
 version = "0.13.3"
-source = "git+https://github.com/kaylendog/coap-lite?branch=qblock-phase1#d45e95244bde0a65a36bf754eac7908beab7fafe"
+source = "git+https://github.com/kaylendog/coap-lite?rev=d45e95244bde0a65a36bf754eac7908beab7fafe#d45e95244bde0a65a36bf754eac7908beab7fafe"
 dependencies = [
  "coap-message 0.2.3",
  "coap-message 0.3.7",

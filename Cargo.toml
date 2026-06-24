@@ -33,5 +33,7 @@ coap = { git = "https://github.com/kaylendog/coap-rs", rev = "df0a3558949a3cc98d
 # coap-rs's q-block feature needs coap-lite's qblock primitives (RangeSet,
 # missing_blocks). coap-rs's own [patch] for coap-lite is ignored when coap-rs is
 # consumed as a dependency, and crates.io coap-lite lacks them, so pin the fork
-# branch here.
-coap-lite = { git = "https://github.com/kaylendog/coap-lite", branch = "qblock-phase1" }
+# here. Rev-pinned (not branch-pinned) so `cargo update` can't silently move it —
+# reproducibility matters for the embedded/constrained target. The rev is the
+# `qblock-phase1` tip.
+coap-lite = { git = "https://github.com/kaylendog/coap-lite", rev = "d45e95244bde0a65a36bf754eac7908beab7fafe" }

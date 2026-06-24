@@ -316,6 +316,11 @@ never use .unwrap() in handler code.
   CON-only) knob (I6). The "both ends must agree" note is reframed as a coap-rs linger-model
   limitation (RFC 9177 allows independent per-peer timing), with the "linger until exchange
   completes" follow-up recorded (I8).
+- Cargo reproducibility (review group C — I7): `coap-lite` in `[patch.crates-io]` is now
+  rev-pinned (`d45e952…`) instead of branch-pinned (`qblock-phase1`), so `cargo update` can't
+  silently move it — matching the `coap` rev-pin discipline (Cargo.lock unchanged, same commit).
+  Reconciled the design doc's stale `coap` rev (`0af46cd1e…` → the shipped `df0a355…`) and the
+  `coap-lite` pin mechanism.
 - Open follow-ups from the same review (cross-repo, coap-rs/coap-lite): the *ingress* server
   reassembly bound is coap-rs's hardcoded 16 MiB and not wired to `MAX_WIRE_BODY_BYTES`,
   with no cap on concurrent partial transfers (I2); Q-Block1 reassembly is keyed by a
