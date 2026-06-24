@@ -1473,3 +1473,81 @@ mod feature_gate_tests {
         assert_eq!(cfg.max_payloads, 10);
     }
 }
+
+#[cfg(test)]
+mod qblock_concurrency_tests {
+    use super::*;
+    use crate::transport::{WireClient, WireHandler, WireRequest, WireResponse};
+    use axum::http::Method;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    struct BodyEcho;
+
+    #[async_trait]
+    impl WireHandler for BodyEcho {
+        async fn handle(&self, req: WireRequest) -> WireResponse {
+            WireResponse {
+                status: 200,
+                headers: vec![],
+                body: req.body,
+            }
+        }
+    }
+
+    // Overlapping send_qblock calls through one pooled client must each receive
+    // their own response. Q-Block adds background drive tasks + Request-Tag demux
+    // on top of token correlation; this is the gate deciding pool-vs-fresh-client
+    // (spec verification gate 1).
+    #[tokio::test]
+    async fn concurrent_qblock_requests_correlate_to_their_own_responses() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        let handle = tokio::spawn(async move {
+            CoapWireServer::with_qblock(addr, coap::qblock::QBlockConfig::default())
+                .serve(Arc::new(BodyEcho), server_token)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = Arc::new(CoapWireClient::with_qblock(
+            None,
+            coap::qblock::QBlockConfig::default(),
+        ));
+        let mut handles = Vec::new();
+        for i in 0u8..16 {
+            let client = client.clone();
+            let dest = addr.to_string();
+            handles.push(tokio::spawn(async move {
+                let body = vec![i; 48 + i as usize];
+                let resp = client
+                    .send(WireRequest {
+                        dest,
+                        method: Method::PUT,
+                        path: format!("/_matrix/federation/v1/send/txn{i}"),
+                        headers: vec![],
+                        body: body.clone(),
+                    })
+                    .await
+                    .expect("concurrent qblock send");
+                (resp, body)
+            }));
+        }
+        for h in handles {
+            let (resp, expected) = h.await.expect("task");
+            assert_eq!(resp.status, 200);
+            assert_eq!(
+                resp.body, expected,
+                "a concurrent qblock request received the wrong response body"
+            );
+        }
+
+        token.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+}
