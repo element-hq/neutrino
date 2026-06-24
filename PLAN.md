@@ -61,6 +61,19 @@ Block2). `max_message_size` requires the `kaylendog/coap-rs` fork (patched in vi
 Design: `docs/superpowers/specs/2026-06-18-neutrino-lb-coap-udp-transport-design.md`;
 plan: `docs/superpowers/plans/2026-06-18-neutrino-lb-coap-udp-transport.md`.
 
+Q-Block transport done (RFC 9177 NON-mode). `WireKind::CoapQBlock` is a sibling
+of CON `Coap`: federation bodies travel as non-confirmable Q-Block bursts (up to
+MAX_PAYLOADS unacked) with 4.08 missing-block recovery, via coap-rs
+`send_qblock` / `set_qblock_config` (the `q-block` feature on the
+`kaylendog/coap-rs` fork, backed by `kaylendog/coap-lite` `qblock-phase1`). The
+`message.rs` mapping is reused verbatim. It is the **`neutrino-main` default**;
+CON `Coap` and `Http` remain selectable. Tuning via
+`WireKind::CoapQBlock { block1_size, qblock: QBlockTuning }` (RFC 9177 §6.2
+timing). Two homeservers converge a join + message over Q-Block — see
+`crates/neutrino-http/tests/e2e_lb_coap_qblock_federation.rs`. Design:
+`docs/superpowers/specs/2026-06-24-neutrino-lb-qblock-transport-design.md`; plan:
+`docs/superpowers/plans/2026-06-24-neutrino-lb-qblock-transport.md`.
+
 Deferred follow-ups (write-ups, not done):
 - integer-key / enum-key CBOR codec (Layer A; port of Dendrite `internal/lb`
   `cbor_codec.go` / `cbor_v1.go`); both transports still carry an **opaque**
@@ -105,6 +118,11 @@ Deferred follow-ups (write-ups, not done):
   `cmd/test-coap/bridge` work) — the physical low-bandwidth link.
 - per-hop timeouts on the sidecar's own reqwest clients (`LbConfig.timeouts`);
   today the originating `FederationClient` request timeout bounds the egress hop.
+- Q-Block2 (response) per-fragment size knob: v1 has no `max_message_size`
+  equivalent for the Q-Block path; Block2 follows coap-rs's szx default. A knob is
+  a follow-up if a constrained link needs smaller response fragments.
+- FFI/Element X exposure of transport choice: `CoapQBlock` is the `neutrino-main`
+  default, not yet selectable from `NeutrinoConfig` / `DefaultNeutrinoService`.
 
 ### Sliding sync (MSC4186) gaps
 
@@ -275,3 +293,12 @@ never use .unwrap() in handler code.
   (the struct) and `serve()` stay; `neutrino-main` builds the config
   programmatically and runs the sidecar in-process.
   but still surfaces the error at `entrypoint`.
+
+### Q-Block transport (2026-06-24)
+- Q-Block (RFC 9177) NON-mode added as `WireKind::CoapQBlock`, sibling of CON
+  `Coap`; both selectable, CON retained as lossless/debug baseline. Q-Block is the
+  `neutrino-main` default. `message.rs` reused verbatim — Q-Block changes only the
+  send call (`send_qblock`) + config. `QBlockTuning` wraps the NON knobs so
+  coap-rs's `QBlockConfig` (CON fields panic) is not leaked into `LbConfig`.
+  Cargo: `coap` rev bumped to the Q-Block tip, `coap-lite` pinned to
+  `qblock-phase1`, `q-block` feature enabled.
