@@ -82,9 +82,9 @@ fn build_lb_config(
         ingress_bind: ingress_bind_for(&config.bind_addr, fed_port),
         egress_bind,
         upstream: upstream_url(&config.bind_addr)?,
-        wire: neutrino_lb::WireKind::Coap {
+        wire: neutrino_lb::WireKind::CoapQBlock {
             block1_size: None,
-            max_message_size: None,
+            qblock: neutrino_lb::QBlockTuning::default(),
         },
     })
 }
@@ -174,7 +174,7 @@ mod tests {
         assert_eq!(lb.ingress_bind, "0.0.0.0:8448".parse().unwrap());
         assert_eq!(lb.egress_bind, egress());
         assert_eq!(lb.upstream, "http://127.0.0.1:8008");
-        assert!(matches!(lb.wire, neutrino_lb::WireKind::Coap { .. }));
+        assert!(matches!(lb.wire, neutrino_lb::WireKind::CoapQBlock { .. }));
     }
 
     // A concrete loopback `bind_addr` keeps its host; only the port becomes the
