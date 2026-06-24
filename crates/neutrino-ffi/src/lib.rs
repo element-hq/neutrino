@@ -1,5 +1,7 @@
 uniffi::setup_scaffolding!("neutrino");
 
+mod tunnel;
+
 /// FFI-facing server configuration. Mirrors `neutrino_common::Config` so EX
 /// Android can fully configure the embedded homeserver. Kept here (not on the
 /// common `Config`) so UniFFI stays out of the common crates — see the
@@ -64,6 +66,10 @@ impl From<Command> for neutrino_main::Command {
 #[derive(uniffi::Object)]
 pub struct NeutrinoHandle {
     tx: tokio::sync::mpsc::UnboundedSender<neutrino_main::Command>,
+    /// The TUN packet-capture tunnel. Independent of the command channel above:
+    /// the VPN is toggled on/off (each toggle a fresh fd) separately from the
+    /// homeserver's lifetime, so it has its own start/stop. Idle by default.
+    tunnel: tunnel::Tunnel,
 }
 
 #[uniffi::export]
@@ -92,6 +98,38 @@ impl NeutrinoHandle {
     pub fn kick_backoff(&self) {
         self.command(Command::KickBackoff);
     }
+
+    /// Take ownership of an established TUN file descriptor and start reading IP
+    /// packets from it, logging a metadata-only summary of each (see [`tunnel`])
+    /// through the Neutrino tracing stack. Non-blocking: spawns a reader task on the
+    /// server runtime and returns immediately.
+    ///
+    /// `tun_fd` MUST come from `VpnService.Builder.establish()` with ownership
+    /// transferred to native code — on the Kotlin side, pass
+    /// `ParcelFileDescriptor.detachFd()`, NOT `.fd`. It MUST also be set non-blocking
+    /// before being handed over (`Os.fcntlInt(fd, F_SETFL, O_NONBLOCK)`); the reader
+    /// relies on this so a read never stalls the server executor. This crate owns and
+    /// closes the fd from then on; the host must not close it (and must not keep the
+    /// `ParcelFileDescriptor` that produced it open).
+    ///
+    /// `mtu` is the tunnel MTU; currently advisory (reserved for write-back once
+    /// forwarding lands) — the read buffer is sized for the worst case regardless.
+    ///
+    /// The reader runs on the server runtime, so it is cancelled automatically when
+    /// the homeserver shuts down: a tunnel cannot outlive its homeserver. Calling
+    /// this before the server is up (or after it has stopped) is a no-op that closes
+    /// the fd. Safe to call across repeated VPN toggles: each call installs a fresh
+    /// fd, replacing any still-running reader. Pair every `start_tunnel` with a
+    /// [`Self::stop_tunnel`].
+    pub fn start_tunnel(&self, tun_fd: i32, mtu: u32) {
+        self.tunnel.start(tun_fd, mtu);
+    }
+
+    /// Stop the tunnel reader and close the fd. Idempotent: a call when no tunnel is
+    /// running is a no-op. Called on VPN toggle-off and teardown.
+    pub fn stop_tunnel(&self) {
+        self.tunnel.stop();
+    }
 }
 
 /// Spawn an owned Tokio runtime and begin polling the server entrypoint with
@@ -108,6 +146,11 @@ impl NeutrinoHandle {
 pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let config: neutrino_main::Config = config.into();
+    // Published once the runtime is built so `start_tunnel` can spawn its reader
+    // onto this runtime — which is what ties the tunnel's lifetime to the server's.
+    let runtime: std::sync::Arc<std::sync::OnceLock<tokio::runtime::Handle>> =
+        std::sync::Arc::new(std::sync::OnceLock::new());
+    let runtime_publisher = std::sync::Arc::clone(&runtime);
     std::thread::spawn(move || {
         // Neutrino owns its runtime. current_thread = parity with the previous
         // async-compat global (also current_thread); all DB work is offloaded to
@@ -124,6 +167,10 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
                 return;
             }
         };
+        // Publish the handle before blocking so a concurrent `start_tunnel` can spawn
+        // onto this runtime. Tasks spawned from the FFI thread are polled by this
+        // `block_on`; when it returns, `rt` drops and any reader task is cancelled.
+        let _ = runtime_publisher.set(rt.handle().clone());
         rt.block_on(async {
             // The command receiver is threaded into the server; a `Shutdown`
             // command (or every `NeutrinoHandle` being dropped, which closes the
@@ -140,7 +187,10 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
         // stop the closure), so a runaway write can delay this thread's exit.
         // Normal writes are sub-millisecond, so in practice teardown is immediate.
     });
-    NeutrinoHandle { tx }
+    NeutrinoHandle {
+        tx,
+        tunnel: tunnel::Tunnel::new(runtime),
+    }
 }
 
 #[cfg(test)]
@@ -175,7 +225,10 @@ mod tests {
         // `serve`'s dispatch loop drains. (The dispatch/teardown side is tested
         // in neutrino-http, where that logic now lives.)
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let handle = NeutrinoHandle { tx };
+        let handle = NeutrinoHandle {
+            tx,
+            tunnel: tunnel::Tunnel::new(std::sync::Arc::new(std::sync::OnceLock::new())),
+        };
         handle.shutdown();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::Shutdown);
     }
@@ -186,7 +239,10 @@ mod tests {
         // command(KickBackoff) -> `From` -> tx.send lands a `KickBackoff` on the
         // channel `serve`'s dispatch loop drains.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let handle = NeutrinoHandle { tx };
+        let handle = NeutrinoHandle {
+            tx,
+            tunnel: tunnel::Tunnel::new(std::sync::Arc::new(std::sync::OnceLock::new())),
+        };
         handle.kick_backoff();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::KickBackoff);
     }

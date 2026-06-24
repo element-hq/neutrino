@@ -1686,6 +1686,7 @@ dependencies = [
  "async-compat",
  "neutrino-main",
  "tokio",
+ "tracing",
  "uniffi",
 ]
 
