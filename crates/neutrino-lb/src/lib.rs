@@ -26,6 +26,13 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// RFC 9177 §6.2 NON-mode Q-Block timing knobs, exposed on `LbConfig` without
 /// leaking coap-rs's `QBlockConfig` (whose CON-only fields panic on the NON
 /// path). Mapped to coap-rs at transport construction.
+///
+/// Both ends of a mesh must use the same values: Q-Block loss recovery only
+/// works while the sender's post-burst linger window and the receiver's
+/// missing-block timer overlap. If you raise `non_receive_timeout` or
+/// `non_max_retransmit`, keep the resulting linger
+/// (`non_receive_timeout * (non_max_retransmit + 2)`) below the transport's
+/// `REQUEST_TIMEOUT`, or a slow recovery can be killed mid-exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QBlockTuning {
     /// Blocks sent per burst before the inter-burst congestion delay

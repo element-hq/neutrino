@@ -1549,6 +1549,8 @@ mod feature_gate_tests {
     #[test]
     fn qblock_config_type_is_reachable() {
         let cfg = coap::qblock::QBlockConfig::default();
+        // 10 == coap-rs's QBlockConfig::default().max_payloads (RFC 9177 §6.2
+        // MAX_PAYLOADS); a sanity check that the type resolved, not a contract.
         assert_eq!(cfg.max_payloads, 10);
     }
 }
