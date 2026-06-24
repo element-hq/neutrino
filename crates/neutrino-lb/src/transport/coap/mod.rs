@@ -128,6 +128,16 @@ impl CoapWireClient {
         }
         if let Some(cfg) = &self.qblock {
             client.set_qblock_config(cfg.clone());
+            // Bound Q-Block2 response reassembly at the framing layer. Without
+            // this coap-rs builds the receiver with `usize::MAX`, so the
+            // post-reassembly cap in `send` only fires *after* the whole body is
+            // buffered — an OOM surface (fatal on mobile) from a hostile peer's
+            // response. Setting it makes coap-rs abort on the first block that
+            // would exceed the cap, before it allocates. Safe for the request
+            // side: `send_qblock` sizes Q-Block1 from the static `block1_size`,
+            // not from `max_total_message_size` (only the CON `send` path derives
+            // its block size from the MTU), so request blocking is unaffected.
+            client.set_max_total_message_size(Some(self.max_body_bytes));
         }
         let client = Arc::new(client);
         Ok(self
@@ -174,6 +184,18 @@ impl CoapWireClient {
         Self {
             max_body_bytes,
             ..Self::new()
+        }
+    }
+
+    #[cfg(test)]
+    fn with_qblock_and_max_body_bytes(
+        block1_size: Option<usize>,
+        qblock: coap::qblock::QBlockConfig,
+        max_body_bytes: usize,
+    ) -> Self {
+        Self {
+            max_body_bytes,
+            ..Self::with_qblock(block1_size, qblock)
         }
     }
 }
@@ -1427,6 +1449,69 @@ mod qblock_client_tests {
 
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, vec![1, 2, 3, 4]);
+    }
+
+    // A peer Q-Block2 response larger than the client's body cap must abort *in
+    // the framing layer* (coap-rs's reassembly), not after the whole body is
+    // buffered. Regression for the OOM hole where the client never set
+    // `max_total_message_size`, leaving coap-rs's receiver bound at `usize::MAX`.
+    // A 64 B block size + a 2 KiB echo forces a multi-block Q-Block2 response, so
+    // the abort happens mid-stream once the running offset passes the 256 B cap —
+    // the error therefore comes from `send_qblock` (the framing layer), provably
+    // distinct from the post-reassembly `send` check that fires only on a fully
+    // assembled body.
+    #[tokio::test]
+    async fn qblock_client_aborts_oversized_response_in_framing_layer() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = probe.local_addr().unwrap();
+        drop(probe);
+        let mut server = Server::new_udp(addr).expect("server");
+        server.set_qblock_config(coap::qblock::QBlockConfig::default());
+
+        tokio::spawn(async move {
+            server
+                .run(|mut request: Box<CoapRequest<SocketAddr>>| async move {
+                    let echo = request.message.payload.clone();
+                    if let Some(ref mut resp) = request.response {
+                        resp.message.add_option(
+                            CoapOption::Unknown(OPT_HTTP_STATUS),
+                            200u16.to_be_bytes().to_vec(),
+                        );
+                        resp.message.payload = echo;
+                    }
+                    request
+                })
+                .await
+                .ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 64 B blocks, 256 B cap; the server echoes a 2 KiB body, so the
+        // Q-Block2 response spans ~32 blocks and the cap trips long before the
+        // body is whole.
+        let client = CoapWireClient::with_qblock_and_max_body_bytes(
+            Some(64),
+            coap::qblock::QBlockConfig::default(),
+            256,
+        );
+        let err = client
+            .send(WireRequest {
+                dest: addr.to_string(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![],
+                body: vec![0u8; 2048],
+            })
+            .await
+            .expect_err("oversized Q-Block2 response must error, not OOM");
+        let WireError::Transport(msg) = &err else {
+            panic!("expected Transport error, got {err:?}");
+        };
+        assert!(
+            msg.contains("send_qblock"),
+            "over-cap Q-Block2 response should abort in the framing layer \
+             (send_qblock), not the post-reassembly check: {msg}"
+        );
     }
 }
 
