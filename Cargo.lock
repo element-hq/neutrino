@@ -539,7 +539,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "coap"
 version = "0.27.0"
-source = "git+https://github.com/kaylendog/coap-rs?rev=5b9c785ce97d0a991547a133dc994458ed50df03#5b9c785ce97d0a991547a133dc994458ed50df03"
+source = "git+https://github.com/kaylendog/coap-rs?rev=0af46cd1ea52a1b0f8f5c1db954aa04131358fa2#0af46cd1ea52a1b0f8f5c1db954aa04131358fa2"
 dependencies = [
  "async-trait",
  "ciborium",
@@ -569,8 +569,7 @@ dependencies = [
 [[package]]
 name = "coap-lite"
 version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87d56a0c1bcd331e7758fd3dd95ed7dd87d118a3b7dc57d60332e17bc97c3f91"
+source = "git+https://github.com/kaylendog/coap-lite?branch=qblock-phase1#d45e95244bde0a65a36bf754eac7908beab7fafe"
 dependencies = [
  "coap-message 0.2.3",
  "coap-message 0.3.7",

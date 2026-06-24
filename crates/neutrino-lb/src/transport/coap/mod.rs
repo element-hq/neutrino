@@ -1253,3 +1253,15 @@ mod loss_tests {
         token.cancel();
     }
 }
+
+#[cfg(test)]
+mod feature_gate_tests {
+    // Proves the `coap/q-block` feature is enabled and the fork's Q-Block API is
+    // linkable from neutrino-lb: if the feature were off (or the patch missing)
+    // `coap::qblock::QBlockConfig` would not resolve and this would not compile.
+    #[test]
+    fn qblock_config_type_is_reachable() {
+        let cfg = coap::qblock::QBlockConfig::default();
+        assert_eq!(cfg.max_payloads, 10);
+    }
+}
