@@ -23,6 +23,49 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Total request timeout for the proxy's outbound HTTP hops.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// RFC 9177 §6.2 NON-mode Q-Block timing knobs, exposed on `LbConfig` without
+/// leaking coap-rs's `QBlockConfig` (whose CON-only fields panic on the NON
+/// path). Mapped to coap-rs at transport construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QBlockTuning {
+    /// Blocks sent per burst before the inter-burst congestion delay
+    /// (`MAX_PAYLOADS`, default 10).
+    pub max_payloads: u32,
+    /// Base inter-burst delay (`NON_TIMEOUT`, default 2 s).
+    pub non_timeout: Duration,
+    /// Receiver wait-for-gaps base before a missing-block request
+    /// (`NON_RECEIVE_TIMEOUT`, default 4 s).
+    pub non_receive_timeout: Duration,
+    /// Max missing-block recovery rounds (`NON_MAX_RETRANSMIT`, default 4).
+    pub non_max_retransmit: u32,
+}
+
+impl Default for QBlockTuning {
+    fn default() -> Self {
+        Self {
+            max_payloads: 10,
+            non_timeout: Duration::from_secs(2),
+            non_receive_timeout: Duration::from_secs(4),
+            non_max_retransmit: 4,
+        }
+    }
+}
+
+impl QBlockTuning {
+    /// Map to coap-rs's `QBlockConfig`, leaving its CON-only fields
+    /// (`probing_rate`, `nstart`, `non_probing_wait`, `non_partial_timeout`) at
+    /// their defaults (unread on the NON path).
+    pub(crate) fn to_qblock_config(self) -> coap::qblock::QBlockConfig {
+        coap::qblock::QBlockConfig {
+            max_payloads: self.max_payloads,
+            non_timeout: self.non_timeout,
+            non_receive_timeout: self.non_receive_timeout,
+            non_max_retransmit: self.non_max_retransmit,
+            ..Default::default()
+        }
+    }
+}
+
 /// Which wire transport the sidecar pair uses. Both peers must agree on the
 /// transport; the size knobs are local tunings.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -176,5 +219,37 @@ mod serve_selection_tests {
         token.cancel();
         let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
         assert!(joined.is_ok(), "coap serve did not wind down");
+    }
+}
+
+#[cfg(test)]
+mod qblock_tuning_tests {
+    use super::*;
+    use std::time::Duration;
+
+    // Defaults are the RFC 9177 §6.2 NON constants, matching coap-rs/libcoap.
+    #[test]
+    fn defaults_are_rfc9177_non_constants() {
+        let t = QBlockTuning::default();
+        assert_eq!(t.max_payloads, 10);
+        assert_eq!(t.non_timeout, Duration::from_secs(2));
+        assert_eq!(t.non_receive_timeout, Duration::from_secs(4));
+        assert_eq!(t.non_max_retransmit, 4);
+    }
+
+    // Mapping copies the NON knobs through to the coap-rs config verbatim.
+    #[test]
+    fn maps_non_knobs_to_coap_config() {
+        let t = QBlockTuning {
+            max_payloads: 7,
+            non_timeout: Duration::from_millis(500),
+            non_receive_timeout: Duration::from_millis(900),
+            non_max_retransmit: 2,
+        };
+        let c = t.to_qblock_config();
+        assert_eq!(c.max_payloads, 7);
+        assert_eq!(c.non_timeout, Duration::from_millis(500));
+        assert_eq!(c.non_receive_timeout, Duration::from_millis(900));
+        assert_eq!(c.non_max_retransmit, 2);
     }
 }
