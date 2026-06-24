@@ -29,6 +29,28 @@ pub(crate) const OPT_FWD_HEADER: u16 = 2050;
 /// `application/cbor` (RFC 8949 §9.1).
 pub(crate) const CBOR_CONTENT_FORMAT: u16 = 60;
 
+/// Cap on concurrent in-flight Q-Block1 (inbound request) reassemblies on the
+/// public federation port. Each holds up to `max_body_bytes`, so the worst-case
+/// Q-Block1 memory is `MAX_QBLOCK_INFLIGHT_TRANSFERS * MAX_WIRE_BODY_BYTES`. A
+/// trusted low-bandwidth mesh has few concurrent inbound transfers; this is a
+/// DoS backstop against a peer opening many partial transfers, not a throughput
+/// limit.
+const MAX_QBLOCK_INFLIGHT_TRANSFERS: usize = 16;
+
+/// A per-client random starting point for the monotonic CoAP token counter.
+/// coap-rs seeds the Q-Block Request-Tag from the token, so a random base means
+/// an observer can't predict the tags of in-flight transfers — defence in depth
+/// for the server's source-address binding (an attacker spoofing a peer's
+/// address would still have to guess the tag). Monotonic-from-random keeps tokens
+/// collision-free for response correlation, like a TCP initial sequence number.
+/// Uses `RandomState` (OS-seeded) to avoid a dedicated RNG dependency.
+fn random_token_seed() -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish() as u32
+}
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -88,7 +110,7 @@ impl CoapWireClient {
             request_timeout: crate::REQUEST_TIMEOUT,
             max_body_bytes: MAX_WIRE_BODY_BYTES,
             pool: Mutex::new(HashMap::new()),
-            token_counter: AtomicU32::new(0),
+            token_counter: AtomicU32::new(random_token_seed()),
         }
     }
 
@@ -415,6 +437,14 @@ impl WireServer for CoapWireServer {
         .map_err(|e| WireError::Serve(format!("bind {}: {e}", self.bind)))?;
         if let Some(cfg) = self.qblock.clone() {
             server.set_qblock_config(cfg);
+            // Bound the network-exposed Q-Block1 reassembly. Aligning the
+            // per-transfer cap with our assembled-body contract makes coap-rs
+            // abort reassembly at the same threshold the 413 guard enforces (the
+            // ingress analogue of the egress response cap), instead of coap-rs's
+            // hardcoded 16 MiB default; capping concurrent transfers stops a peer
+            // opening many Request-Tags from exhausting memory.
+            server.set_qblock_max_body_len(self.max_body_bytes);
+            server.set_qblock_max_transfers(MAX_QBLOCK_INFLIGHT_TRANSFERS);
         }
         let dispatch = Arc::new(CoapDispatch {
             handler,

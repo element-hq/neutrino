@@ -333,8 +333,16 @@ never use .unwrap() in handler code.
   the feature-gate test is a real compile guard, the defaults test guards interop-critical
   constants), and de-duplicating the per-module `PlainEcho`/`BodyEcho` test helpers (I18 — matches
   existing file style, low value).
-- Open follow-ups from the same review (cross-repo, coap-rs/coap-lite): the *ingress* server
-  reassembly bound is coap-rs's hardcoded 16 MiB and not wired to `MAX_WIRE_BODY_BYTES`,
-  with no cap on concurrent partial transfers (I2); Q-Block1 reassembly is keyed by a
-  predictable Request-Tag with no source-address binding (I3); the detached `drive_send`
-  task outlives timeout/eviction (I5).
+- Q-Block NON-mode DoS hardening (review group A — I2/I3/I5; cross-repo). coap-rs patched
+  (`kaylendog/coap-rs` rev `36cc2dc`): the inbound Q-Block1 reassembly cap is now settable
+  (`set_qblock_max_body_len`), concurrent partial transfers are capped
+  (`set_qblock_max_transfers`, default 64), `non_partial_timeout` is wired as an absolute
+  partial-transfer TTL in `drive_receive`, each reassembly is bound to its first block's source
+  address (cross-source blocks dropped), and the client's background `drive_send` is aborted when
+  `send_qblock` returns. coap-lite needed no changes (`RangeSet` already bounded, `QBlockReceiver`
+  caps before allocating). neutrino-lb bumps the `coap` rev and wires the new knobs in
+  `CoapWireServer::serve`: `set_qblock_max_body_len(max_body_bytes)` (aligns the reassembly abort
+  with the 413 contract — the ingress analogue of I1) and `set_qblock_max_transfers(16)`
+  (`MAX_QBLOCK_INFLIGHT_TRANSFERS`; worst case 16 × 64 MiB). The client token counter now starts
+  from a random base (`random_token_seed`) so Request-Tags aren't predictable — defence in depth
+  for the source binding.
