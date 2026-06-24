@@ -48,6 +48,10 @@ pub struct CoapWireClient {
     /// the response chunk size — is fixed by the responding server's coap-rs
     /// default and not yet tunable; see the module docs / `PLAN.md`.)
     block1_size: Option<usize>,
+    /// When `Some`, `send` uses RFC 9177 Q-Block NON-mode (`send_qblock`) with
+    /// this config; when `None`, the CON path (`send`). Set on the pooled client
+    /// at construction (see `client_for`).
+    qblock: Option<coap::qblock::QBlockConfig>,
     /// Total wall-clock ceiling on a single `send` (the whole blockwise
     /// exchange). coap-rs bounds each CON block by its own receive-timeout ×
     /// retries, but nothing bounds a multi-block transfer where a peer answers
@@ -80,6 +84,7 @@ impl CoapWireClient {
     pub fn new() -> Self {
         Self {
             block1_size: None,
+            qblock: None,
             request_timeout: crate::REQUEST_TIMEOUT,
             max_body_bytes: MAX_WIRE_BODY_BYTES,
             pool: Mutex::new(HashMap::new()),
@@ -92,6 +97,17 @@ impl CoapWireClient {
     pub fn with_block1_size(block1_size: Option<usize>) -> Self {
         Self {
             block1_size,
+            ..Self::new()
+        }
+    }
+
+    /// Build a Q-Block (RFC 9177) NON-mode client. `block1_size` caps the
+    /// per-burst block payload (also the Q-Block block size); `None` keeps
+    /// coap-rs's 1024 B default.
+    pub fn with_qblock(block1_size: Option<usize>, qblock: coap::qblock::QBlockConfig) -> Self {
+        Self {
+            block1_size,
+            qblock: Some(qblock),
             ..Self::new()
         }
     }
@@ -109,6 +125,9 @@ impl CoapWireClient {
             .map_err(|e| WireError::Transport(format!("coap dial {dest}: {e}")))?;
         if let Some(size) = self.block1_size {
             client.set_block1_size(size);
+        }
+        if let Some(cfg) = &self.qblock {
+            client.set_qblock_config(cfg.clone());
         }
         let client = Arc::new(client);
         Ok(self
@@ -183,10 +202,17 @@ impl WireClient for CoapWireClient {
         let exchange = async {
             let mut coap_req = message::build_request(&req);
             coap_req.message.set_token(token);
-            let resp = client
-                .send(coap_req)
-                .await
-                .map_err(|e| WireError::Transport(format!("coap send: {e}")))?;
+            let resp = if self.qblock.is_some() {
+                client
+                    .send_qblock(coap_req)
+                    .await
+                    .map_err(|e| WireError::Transport(format!("coap send_qblock: {e}")))?
+            } else {
+                client
+                    .send(coap_req)
+                    .await
+                    .map_err(|e| WireError::Transport(format!("coap send: {e}")))?
+            };
             // Bound the peer's (post-reassembly) response before re-transcoding
             // it — the untrusted-side OOM guard, symmetric with the ingress cap.
             if resp.message.payload.len() > max_body_bytes {
@@ -1251,6 +1277,60 @@ mod loss_tests {
             "blockwise body corrupted after a dropped-and-retransmitted block"
         );
         token.cancel();
+    }
+}
+
+#[cfg(test)]
+mod qblock_client_tests {
+    use super::*;
+    use crate::transport::{WireClient, WireRequest};
+    use axum::http::Method;
+    use coap::Server;
+    use coap_lite::{CoapOption, CoapRequest};
+    use std::net::SocketAddr;
+
+    // A raw coap-rs server with Q-Block enabled, echoing the request body back as
+    // a 200, so the Q-Block client's send path and response parse are observable.
+    #[tokio::test]
+    async fn qblock_client_sends_and_parses_response() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = probe.local_addr().unwrap();
+        drop(probe);
+        let mut server = Server::new_udp(addr).expect("server");
+        server.set_qblock_config(coap::qblock::QBlockConfig::default());
+
+        tokio::spawn(async move {
+            server
+                .run(|mut request: Box<CoapRequest<SocketAddr>>| async move {
+                    let echo = request.message.payload.clone();
+                    if let Some(ref mut resp) = request.response {
+                        resp.message.add_option(
+                            CoapOption::Unknown(OPT_HTTP_STATUS),
+                            200u16.to_be_bytes().to_vec(),
+                        );
+                        resp.message.payload = echo;
+                    }
+                    request
+                })
+                .await
+                .ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = CoapWireClient::with_qblock(None, coap::qblock::QBlockConfig::default());
+        let resp = client
+            .send(WireRequest {
+                dest: addr.to_string(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![],
+                body: vec![1, 2, 3, 4],
+            })
+            .await
+            .expect("qblock send");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, vec![1, 2, 3, 4]);
     }
 }
 
