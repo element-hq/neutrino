@@ -265,6 +265,9 @@ pub struct CoapWireServer {
     /// network-exposed OOM guard — see the module OOM note). Distinct from
     /// `max_message_size`, which bounds per-block framing, not the running total.
     max_body_bytes: usize,
+    /// When `Some`, `serve` enables RFC 9177 Q-Block NON-mode on the listener via
+    /// `set_qblock_config`; when `None`, the CON path.
+    qblock: Option<coap::qblock::QBlockConfig>,
 }
 
 impl CoapWireServer {
@@ -273,6 +276,7 @@ impl CoapWireServer {
             bind,
             max_message_size: None,
             max_body_bytes: MAX_WIRE_BODY_BYTES,
+            qblock: None,
         }
     }
 
@@ -281,6 +285,16 @@ impl CoapWireServer {
     pub fn with_max_message_size(bind: SocketAddr, max_message_size: Option<usize>) -> Self {
         Self {
             max_message_size,
+            ..Self::new(bind)
+        }
+    }
+
+    /// Build a Q-Block (RFC 9177) NON-mode server. Uses coap-rs's default
+    /// per-message size (no `max_message_size` budget in v1; Block2 follows the
+    /// szx default — see the spec's Block2 follow-up).
+    pub fn with_qblock(bind: SocketAddr, qblock: coap::qblock::QBlockConfig) -> Self {
+        Self {
+            qblock: Some(qblock),
             ..Self::new(bind)
         }
     }
@@ -340,7 +354,7 @@ impl WireServer for CoapWireServer {
         handler: Arc<dyn WireHandler>,
         shutdown: CancellationToken,
     ) -> Result<(), WireError> {
-        let server = match self.max_message_size {
+        let mut server = match self.max_message_size {
             Some(max_total_message_size) => Server::new_udp_with_config(
                 self.bind,
                 BlockHandlerConfig {
@@ -351,6 +365,9 @@ impl WireServer for CoapWireServer {
             None => Server::new_udp(self.bind),
         }
         .map_err(|e| WireError::Serve(format!("bind {}: {e}", self.bind)))?;
+        if let Some(cfg) = self.qblock.clone() {
+            server.set_qblock_config(cfg);
+        }
         let dispatch = Arc::new(CoapDispatch {
             handler,
             max_body_bytes: self.max_body_bytes,
@@ -1331,6 +1348,117 @@ mod qblock_client_tests {
 
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, vec![1, 2, 3, 4]);
+    }
+}
+
+#[cfg(test)]
+mod qblock_server_tests {
+    use super::*;
+    use crate::transport::{WireClient, WireHandler, WireRequest, WireResponse};
+    use axum::http::Method;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    struct PlainEcho;
+
+    #[async_trait]
+    impl WireHandler for PlainEcho {
+        async fn handle(&self, req: WireRequest) -> WireResponse {
+            WireResponse {
+                status: 200,
+                headers: vec![("x-matrix-seen-path".to_owned(), req.path.into_bytes())],
+                body: req.body,
+            }
+        }
+    }
+
+    // A Q-Block server reassembles the request and routes it to our handler, and
+    // the handler's response returns to the Q-Block client — the small-body path
+    // (single PDU each way) proving the serve wiring + dispatch reuse.
+    #[tokio::test]
+    async fn qblock_server_dispatches_and_round_trips() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        let server = CoapWireServer::with_qblock(addr, coap::qblock::QBlockConfig::default());
+        let handle =
+            tokio::spawn(async move { server.serve(Arc::new(PlainEcho), server_token).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = CoapWireClient::with_qblock(None, coap::qblock::QBlockConfig::default());
+        let resp = client
+            .send(WireRequest {
+                dest: addr.to_string(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txnq".to_owned(),
+                headers: vec![],
+                body: vec![7, 7, 7],
+            })
+            .await
+            .expect("qblock send");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, vec![7, 7, 7]);
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| k == "x-matrix-seen-path"
+                    && v == b"/_matrix/federation/v1/send/txnq"),
+            "server mapped path wrong: {:?}",
+            resp.headers
+        );
+
+        token.cancel();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(joined.is_ok(), "qblock server did not wind down on cancel");
+    }
+
+    // A large body (over one block) must round-trip via the Q-Block burst:
+    // multi-block Q-Block1 up, multi-block Q-Block2 down. This is the load-bearing
+    // send_join shape, and it confirms the reassembled request still reaches our
+    // CoapDispatch handler with a populated response slot (verification gate 2).
+    #[tokio::test]
+    async fn qblock_large_body_round_trips() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        let handle = tokio::spawn(async move {
+            CoapWireServer::with_qblock(addr, coap::qblock::QBlockConfig::default())
+                .serve(Arc::new(PlainEcho), server_token)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 4 KiB body with a 128 B Q-Block block -> ~32 blocks each way.
+        let req_body: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let client = CoapWireClient::with_qblock(Some(128), coap::qblock::QBlockConfig::default());
+        let resp = client
+            .send(WireRequest {
+                dest: addr.to_string(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v2/send_join/!r:a/$e".to_owned(),
+                headers: vec![],
+                body: req_body.clone(),
+            })
+            .await
+            .expect("qblock large send");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, req_body, "qblock large body corrupted");
+
+        token.cancel();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(
+            matches!(joined, Ok(Ok(Ok(())))),
+            "qblock server did not wind down cleanly: {joined:?}"
+        );
     }
 }
 
