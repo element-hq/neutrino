@@ -10,6 +10,12 @@ name = "neutrino"
 [dependencies]
 async-compat = "0.2.5"
 
+# Packet logging goes through the Neutrino tracing stack (so it reaches logcat via
+# the host's subscriber).
+tracing.workspace = true
+
+# `tokio` must include the `net` feature for `tokio::io::unix::AsyncFd` (the tunnel
+# reader's readiness primitive).
 tokio.workspace = true
 uniffi.workspace = true
 
