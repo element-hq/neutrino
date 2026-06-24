@@ -91,6 +91,18 @@ pub enum WireKind {
         block1_size: Option<usize>,
         max_message_size: Option<usize>,
     },
+    /// v2 CoAP+CBOR over UDP using RFC 9177 Q-Block NON-mode robust transfer.
+    ///
+    /// Like `Coap`, but the request/response bodies travel as non-confirmable
+    /// Q-Block bursts (up to `MAX_PAYLOADS` blocks unacked) with missing-block
+    /// recovery, instead of CON stop-and-wait — the throughput win on lossy
+    /// serial/radio links. `block1_size` caps the per-burst block payload (`None`
+    /// = coap-rs's 1024 B default); `qblock` carries the RFC 9177 §6.2 timing.
+    /// No `max_message_size` knob this cut (Block2 follows the szx default).
+    CoapQBlock {
+        block1_size: Option<usize>,
+        qblock: QBlockTuning,
+    },
 }
 
 /// Runtime configuration for the sidecar.
@@ -145,6 +157,23 @@ pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), 
                 Arc::new(CoapWireClient::with_block1_size(block1_size));
             let wire_server =
                 CoapWireServer::with_max_message_size(config.ingress_bind, max_message_size);
+            run_pair(
+                config.egress_bind,
+                wire_client,
+                wire_server,
+                ingress_handler,
+                shutdown,
+            )
+            .await
+        }
+        WireKind::CoapQBlock {
+            block1_size,
+            qblock,
+        } => {
+            let cfg = qblock.to_qblock_config();
+            let wire_client: Arc<dyn WireClient> =
+                Arc::new(CoapWireClient::with_qblock(block1_size, cfg.clone()));
+            let wire_server = CoapWireServer::with_qblock(config.ingress_bind, cfg);
             run_pair(
                 config.egress_bind,
                 wire_client,
@@ -219,6 +248,28 @@ mod serve_selection_tests {
         token.cancel();
         let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
         assert!(joined.is_ok(), "coap serve did not wind down");
+    }
+
+    // The CoapQBlock arm must build and bind a UDP listener, then wind down on
+    // cancel (proves the match arm is wired, not just that the enum exists).
+    #[tokio::test]
+    async fn coap_qblock_serve_binds_and_shuts_down() {
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        let handle = tokio::spawn(async move {
+            serve(
+                cfg(WireKind::CoapQBlock {
+                    block1_size: None,
+                    qblock: QBlockTuning::default(),
+                }),
+                server_token,
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        token.cancel();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(joined.is_ok(), "coap qblock serve did not wind down");
     }
 }
 
