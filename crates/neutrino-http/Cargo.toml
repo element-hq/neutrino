@@ -42,3 +42,6 @@ tempfile = "3.27.0"
 # stands up `neutrino-lb` proxies in front of two homeservers. neutrino-lb does
 # not depend on neutrino-http, so this dev-dep introduces no cycle.
 neutrino-lb = { path = "../neutrino-lb" }
+# Test-only: the federation e2e tests open the homeserver's `SqliteStore`
+# themselves to hand into `serve` (which now takes an already-open store).
+neutrino-store-sqlite = { path = "../neutrino-store-sqlite" }

@@ -38,6 +38,12 @@ pub const ROOM_VERSION_ID: &str = "org.matrix.msc4242.12";
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// The homeserver's federation name (the domain in `@user:server_name`).
+    /// **Empty string means "derive it"**: at startup the entrypoint replaces an
+    /// empty `server_name` with one derived from the persisted node secret (a
+    /// stable per-install identity); a non-empty value is used verbatim. The dev
+    /// binary / `from_env` default to a concrete name, so the derive path is for
+    /// callers (e.g. the embedded host) that deliberately leave this empty.
     pub server_name: String,
     pub bind_addr: String,
     pub localpart: String,

@@ -614,8 +614,8 @@ pub trait InviteStore: Send + Sync {
 }
 
 /// The server's persistent node identity: a single opaque 32-byte secret. The
-/// homeserver's federation `server_name` is the iroh node id derived from this
-/// secret (its ed25519 public key), so it must survive restarts — see the
+/// server derives its stable identity from this secret (and, when unconfigured,
+/// its federation `server_name`), so it must survive restarts — see the
 /// `node_identity` table in the SQLite schema.
 #[async_trait]
 pub trait IdentityStore: Send + Sync {

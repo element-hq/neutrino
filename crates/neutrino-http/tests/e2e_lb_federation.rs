@@ -72,7 +72,13 @@ async fn start_node(localpart: &str) -> Node {
     // Full homeserver stack (router + outbound federation sender pool).
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        let _ = neutrino_http::serve(http_listener, config, cmd_rx).await;
+        let store = std::sync::Arc::new(
+            neutrino_store_sqlite::SqliteStore::open_in_dir(&config.storage_dir)
+                .await
+                .unwrap(),
+        );
+
+        let _ = neutrino_http::serve(http_listener, config, store, cmd_rx).await;
     });
 
     // Sidecar: ingress on the public port, egress on loopback, upstream = the

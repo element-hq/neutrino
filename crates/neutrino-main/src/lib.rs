@@ -1,6 +1,7 @@
 mod platform;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 pub use neutrino_common::{Command, Config};
 
@@ -15,8 +16,11 @@ pub async fn entrypoint(
 ) -> Result<(), Box<dyn std::error::Error>> {
     platform::init_tracing();
 
-    // Establish the server's stable identity before anything reads `config`.
-    resolve_server_identity(&mut config).await?;
+    // Open the store once, here, and resolve the server's stable identity from
+    // it before anything reads `config`. The same handle is threaded into the
+    // homeserver (`serve`) so the database is opened exactly once.
+    let store = Arc::new(SqliteStore::open_in_dir(&config.storage_dir).await?);
+    resolve_server_identity(&mut config, &store).await?;
 
     // Embedded low-bandwidth sidecar: when `lb_federation_port` is set we run a
     // `neutrino-lb` proxy in-process beside the homeserver (the embedded-on-
@@ -52,7 +56,7 @@ pub async fn entrypoint(
             );
             let shutdown = CancellationToken::new();
             let lb = neutrino_lb::serve(lb_config, shutdown.clone());
-            let hs = neutrino_http::serve(listener, config, commands);
+            let hs = neutrino_http::serve(listener, config, store, commands);
             tokio::pin!(lb, hs);
             tokio::select! {
                 // The homeserver owns the command channel, so it drives the
@@ -67,7 +71,7 @@ pub async fn entrypoint(
                 r = &mut lb => { r?; }
             }
         }
-        None => neutrino_http::serve(listener, config, commands).await?,
+        None => neutrino_http::serve(listener, config, store, commands).await?,
     }
     Ok(())
 }
@@ -79,14 +83,16 @@ pub async fn entrypoint(
 /// itself deterministically. The secret is persisted **unconditionally** — it
 /// is the server's identity seed, which lower layers (the transport that maps
 /// this name onto a route) consume independently of whether a `server_name` was
-/// configured. When the caller supplies no `server_name` (the embedded path),
-/// derive one from the secret here; a configured name is kept verbatim.
+/// configured. When the caller supplies no `server_name`, derive one from the
+/// secret here; a configured name is kept verbatim.
 ///
-/// Opened and dropped in this scope: the homeserver re-opens the same store when
-/// it serves. This is the one-time identity bootstrap, kept out of the request
-/// layer (`neutrino-http`), which stays agnostic to how its name is chosen.
-async fn resolve_server_identity(config: &mut Config) -> Result<(), Box<dyn std::error::Error>> {
-    let store = SqliteStore::open_in_dir(&config.storage_dir).await?;
+/// Operates on the caller-opened `store` (threaded on into `serve`), so this
+/// identity bootstrap stays out of the request layer (`neutrino-http`, which is
+/// agnostic to how its name is chosen) without re-opening the database.
+async fn resolve_server_identity(
+    config: &mut Config,
+    store: &SqliteStore,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut seed = [0u8; 32];
     rand::rng().fill_bytes(&mut seed);
     let secret = store.get_or_create_node_secret(seed).await?;
@@ -277,6 +283,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn server_identity_from_distinct_secrets_differ() {
+        // Guards against a degenerate impl that ignores the secret (e.g. returns
+        // a constant): different secrets MUST yield different identities, else
+        // every install would name itself identically.
+        assert_ne!(
+            server_identity_from_secret(&[3u8; 32]),
+            server_identity_from_secret(&[4u8; 32]),
+        );
+    }
+
     fn cfg_in(dir: &tempfile::TempDir, server_name: &str) -> Config {
         Config {
             server_name: server_name.to_owned(),
@@ -285,31 +302,48 @@ mod tests {
         }
     }
 
+    async fn open(dir: &tempfile::TempDir) -> SqliteStore {
+        SqliteStore::open_in_dir(dir.path())
+            .await
+            .expect("open store")
+    }
+
     #[tokio::test]
     async fn resolve_identity_derives_name_when_empty() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = open(&tmp).await;
         let mut config = cfg_in(&tmp, "");
-        resolve_server_identity(&mut config).await.expect("resolve");
+        resolve_server_identity(&mut config, &store)
+            .await
+            .expect("resolve");
         assert_eq!(config.server_name.len(), 64, "derived a 64-char identity");
     }
 
     #[tokio::test]
     async fn resolve_identity_keeps_configured_name() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = open(&tmp).await;
         let mut config = cfg_in(&tmp, "hs.example");
-        resolve_server_identity(&mut config).await.expect("resolve");
+        resolve_server_identity(&mut config, &store)
+            .await
+            .expect("resolve");
         assert_eq!(config.server_name, "hs.example", "configured name kept");
     }
 
     #[tokio::test]
     async fn resolve_identity_is_stable_across_restart() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
+        // Resolve, then re-open the store (a "restart") and resolve again: the
+        // persisted secret yields the same derived identity — this is why the
+        // secret is stored, not regenerated.
         let mut first = cfg_in(&tmp, "");
-        resolve_server_identity(&mut first).await.expect("first");
-        // Re-resolve against the same storage dir: the persisted secret yields
-        // the same derived identity (this is why the secret is stored).
+        resolve_server_identity(&mut first, &open(&tmp).await)
+            .await
+            .expect("first");
         let mut second = cfg_in(&tmp, "");
-        resolve_server_identity(&mut second).await.expect("second");
+        resolve_server_identity(&mut second, &open(&tmp).await)
+            .await
+            .expect("second");
         assert_eq!(first.server_name, second.server_name);
     }
 }

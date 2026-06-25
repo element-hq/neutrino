@@ -1,9 +1,9 @@
 //! `IdentityStore` impl on [`crate::SqliteStore`].
 //!
 //! Persists the server's node secret (32 raw bytes) in the single-row
-//! `node_identity` table. The secret is the seed for the iroh node id that the
-//! homeserver uses as its federation identity, so it must be stable across
-//! restarts — stored once, on first start, and read back thereafter.
+//! `node_identity` table. The secret seeds the server's stable identity (from
+//! which its federation `server_name` is derived when unconfigured), so it must
+//! survive restarts — stored once, on first start, and read back thereafter.
 //!
 //! The store does NOT generate the secret: SQLite's `randomblob` is not a
 //! guaranteed CSPRNG, so the caller supplies a freshly-generated seed (from a
