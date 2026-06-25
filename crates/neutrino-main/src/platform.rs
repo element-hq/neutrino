@@ -118,12 +118,14 @@ pub fn init_tracing() {
         // express that in one rule: EnvFilter/Targets match on `::`-delimited path
         // segments, so a `neutrino` directive would NOT match `neutrino_ffi`. A new
         // neutrino crate is picked up automatically. `RUST_LOG` still overrides.
+        // `boxed()` is disambiguated via UFCS: both `FilterExt` and `Layer` define it
+        // for these types (EnvFilter/FilterFn are each both a filter and a layer), so
+        // method syntax is ambiguous — we want the `Filter` one.
         let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
-            Ok(env) => env.boxed(),
-            Err(_) => {
-                tracing_subscriber::filter::filter_fn(|meta| meta.target().starts_with("neutrino"))
-                    .boxed()
-            }
+            Ok(env) => FilterExt::boxed(env),
+            Err(_) => FilterExt::boxed(tracing_subscriber::filter::filter_fn(|meta| {
+                meta.target().starts_with("neutrino")
+            })),
         };
 
         let _ = tracing_subscriber::registry()
