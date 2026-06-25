@@ -330,6 +330,19 @@ mod tests {
     }
 
     #[test]
+    fn non_int_non_text_map_key_errors_without_panic() {
+        // A CBOR map keyed by a bool — a key type our encoder never emits.
+        // Decode must surface it as an error, not panic or silently drop.
+        let value = RawCbor::Map(vec![(RawCbor::Bool(true), RawCbor::Text("v".to_owned()))]);
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&value, &mut cbor).unwrap();
+        assert!(matches!(
+            cbor_to_json(&cbor),
+            Err(CodecError::CborDecode(_))
+        ));
+    }
+
+    #[test]
     fn non_32_byte_cbor_bytes_errors_without_panic() {
         let value = RawCbor::Bytes(vec![1, 2, 3]); // wrong length
         let mut cbor = Vec::new();
