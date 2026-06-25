@@ -3,6 +3,8 @@
 //! follow-up paired with CoAP). Empty input maps to empty output so a
 //! bodyless GET stays bodyless.
 
+mod keys;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
     #[error("invalid JSON body: {0}")]
