@@ -32,12 +32,11 @@ pub use vip::{VIP_PREFIX_BYTE, VIP_SUBNET, VIP_SUBNET_PREFIX_LEN, vip};
 /// the core.
 pub type NodeKey = [u8; 32];
 
-/// Errors surfaced across the relay's two seams.
+/// Errors surfaced across the relay's two seams. Seam *closure* is not an
+/// error — it is signalled by `recv` returning `None` — so the only variant is
+/// a failed packet transfer.
 #[derive(Debug, Error)]
 pub enum RelayError {
-    /// The datagram transport was closed by the embedding layer.
-    #[error("datagram transport closed")]
-    TransportClosed,
     /// Delivering a packet to (or reading one from) the host TUN failed.
     #[error("packet i/o failed: {0}")]
     Io(String),

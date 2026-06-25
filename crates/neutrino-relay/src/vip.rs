@@ -23,10 +23,20 @@ pub const VIP_SUBNET: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0);
 /// outbound IP packet and must consult the [`NeighbourTable`](crate::NeighbourTable)
 /// to recover the node — a vip alone does not reveal its node.
 ///
-/// Truncating to 120 bits trades a vanishing collision probability (birthday
-/// bound around `2^60` nodes, far beyond any embedded deployment) for a
-/// table-free, allocation-free mapping. Node keys are public keys and already
-/// uniformly distributed, so no extra hashing is needed to spread them.
+/// Two collision regimes, kept distinct because they answer different
+/// questions:
+/// - *Accidental* collision between honest nodes follows the birthday bound,
+///   around `2^60` nodes — far beyond any embedded deployment, so truncation to
+///   120 bits is safe at our scale.
+/// - *Targeted* collision (an attacker grinding a key whose vip equals a
+///   victim's, to hijack its route) is a 120-bit second-preimage, ~`2^120`
+///   work — infeasible. This, not the birthday bound, is the property the
+///   ingress anti-spoof check relies on.
+///
+/// Note the corollary: the vip authenticates only the leading 120 bits of the
+/// identity; the remaining key bits are not bound by the address. The leading
+/// bytes of an ed25519 public key are uniformly distributed, so the truncation
+/// spreads addresses without any extra hashing.
 pub fn vip(node: &NodeKey) -> Ipv6Addr {
     let mut octets = [0u8; 16];
     octets[0] = VIP_PREFIX_BYTE;
@@ -61,5 +71,21 @@ mod tests {
         let mut node: NodeKey = [0u8; 32];
         node[..15].copy_from_slice(&[0x11u8; 15]);
         assert_eq!(&vip(&node).octets()[1..16], &[0x11u8; 15]);
+    }
+
+    #[test]
+    fn keys_differing_only_past_byte_15_collide() {
+        // Pins the documented (and security-relevant) truncation: only the
+        // leading 120 bits map into the vip, so two keys identical there but
+        // differing beyond collide. A future "use all 32 bytes" change must
+        // break this test deliberately.
+        let mut a: NodeKey = [0u8; 32];
+        let mut b: NodeKey = [0u8; 32];
+        a[..15].copy_from_slice(&[0x33u8; 15]);
+        b[..15].copy_from_slice(&[0x33u8; 15]);
+        a[20] = 0xaa;
+        b[20] = 0xbb;
+        assert_ne!(a, b);
+        assert_eq!(vip(&a), vip(&b));
     }
 }
