@@ -4,16 +4,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 const DEFAULT_FILTER: &str =
     "neutrino_common=info,neutrino_http=info,neutrino_main=info,neutrino_ffi=info";
 
-// On Android we hand everything *neutrino* emits (all crates at TRACE) to the
-// writer and let Logcat do the filtering by tag / priority — a developer reading
-// Logcat isn't blind to logs the desktop INFO filter would have dropped. We don't
-// blanket-`trace` the world: that buries the neutrino logs under dependency noise
-// (hyper, rusqlite, tokio, …). HTTP request/response lines are emitted under the
-// `neutrino_http` target (see `neutrino-http`), so they're already covered.
-// `RUST_LOG` still overrides.
-#[cfg(target_os = "android")]
-const ANDROID_FILTER: &str = "neutrino_common=trace,neutrino_state=trace,neutrino_store=trace,neutrino_store_sqlite=trace,neutrino_http=trace,neutrino_main=trace,neutrino_ffi=trace";
-
 // Compact, Logcat-friendly event formatter, ported from matrix-rust-sdk's
 // `EventFormatter::for_logcat`. Logcat already records the timestamp and
 // priority for every line, so we omit both and emit just:
@@ -112,18 +102,32 @@ pub fn init_tracing() {
         .try_init();
 
     #[cfg(target_os = "android")]
-    let _ = tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| ANDROID_FILTER.into()),
-        )
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .event_format(logcat_format::LogcatEventFormatter)
-                .with_writer(paranoid_android::AndroidLogMakeWriter::new(
-                    "io.element.neutrino".to_owned(),
-                )),
-        )
-        .try_init();
+    {
+        use tracing_subscriber::{Layer, filter::FilterExt};
+
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .event_format(logcat_format::LogcatEventFormatter)
+            .with_writer(paranoid_android::AndroidLogMakeWriter::new(
+                "io.element.neutrino".to_owned(),
+            ));
+
+        // Default (no RUST_LOG): every level from every `neutrino*` target — all of
+        // our crates (`neutrino_common`, `neutrino_ffi`, …) plus any custom `target:`
+        // — and nothing from dependencies. A raw string prefix is the only way to
+        // express that in one rule: EnvFilter/Targets match on `::`-delimited path
+        // segments, so a `neutrino` directive would NOT match `neutrino_ffi`. A new
+        // neutrino crate is picked up automatically. `RUST_LOG` still overrides.
+        let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
+            Ok(env) => env.boxed(),
+            Err(_) => {
+                tracing_subscriber::filter::filter_fn(|meta| meta.target().starts_with("neutrino"))
+                    .boxed()
+            }
+        };
+
+        let _ = tracing_subscriber::registry()
+            .with(fmt_layer.with_filter(filter))
+            .try_init();
+    }
 }
