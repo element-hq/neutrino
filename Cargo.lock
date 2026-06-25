@@ -539,7 +539,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "coap"
 version = "0.27.0"
-source = "git+https://github.com/kaylendog/coap-rs?rev=36cc2dc6dadacdda3f25f36ed4edcc2ebe1e80c7#36cc2dc6dadacdda3f25f36ed4edcc2ebe1e80c7"
+source = "git+https://github.com/kaylendog/coap-rs?rev=9d9b49b4e26b08aa927282f0f9ae3cbbb67dd059#9d9b49b4e26b08aa927282f0f9ae3cbbb67dd059"
 dependencies = [
  "async-trait",
  "ciborium",
