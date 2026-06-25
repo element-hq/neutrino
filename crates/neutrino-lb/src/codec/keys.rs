@@ -174,7 +174,11 @@ mod tests {
     #[test]
     fn table_has_no_duplicates() {
         assert_eq!(KEY_TO_INT.len(), KEYS.len(), "duplicate string key in KEYS");
-        assert_eq!(INT_TO_KEY.len(), KEYS.len(), "duplicate integer code in KEYS");
+        assert_eq!(
+            INT_TO_KEY.len(),
+            KEYS.len(),
+            "duplicate integer code in KEYS"
+        );
     }
 
     // Every entry resolves both directions.
