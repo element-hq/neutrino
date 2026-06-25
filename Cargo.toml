@@ -26,5 +26,19 @@ proptest = "1"
 async-compat = { git = "https://github.com/element-hq/async-compat", rev = "5a27c8b290f1f1dcfc0c4ec22c464e38528aa591" }
 # Fork adds Server::*_with_config so neutrino-lb can set the CoAP per-message
 # size budget (BlockHandlerConfig.max_total_message_size) for Block2/response
-# fragmentation on constrained links.
-coap = { git = "https://github.com/kaylendog/coap-rs", rev = "5b9c785ce97d0a991547a133dc994458ed50df03" }
+# fragmentation on constrained links, plus the Q-Block (RFC 9177) API
+# (CoAPClient::send_qblock + {Server,CoAPClient}::set_qblock_config) behind the
+# `q-block` feature. This rev also adds the Q-Block DoS hardening neutrino-lb
+# wires up: Server::set_qblock_max_body_len / set_qblock_max_transfers, inbound
+# source-address binding, and an abort-on-return guard on the client send task.
+# This rev also rejects an advertised Q-Block Size exceeding max_body_len in
+# QBlockReceiver::accept, closing a one-datagram OOM (a spoofed Size1/Size2 fed
+# RangeSet::missing() an unbounded allocation on the first recovery tick).
+coap = { git = "https://github.com/kaylendog/coap-rs", rev = "9d9b49b4e26b08aa927282f0f9ae3cbbb67dd059" }
+# coap-rs's q-block feature needs coap-lite's qblock primitives (RangeSet,
+# missing_blocks). coap-rs's own [patch] for coap-lite is ignored when coap-rs is
+# consumed as a dependency, and crates.io coap-lite lacks them, so pin the fork
+# here. Rev-pinned (not branch-pinned) so `cargo update` can't silently move it —
+# reproducibility matters for the embedded/constrained target. The rev is the
+# `qblock-phase1` tip.
+coap-lite = { git = "https://github.com/kaylendog/coap-lite", rev = "d45e95244bde0a65a36bf754eac7908beab7fafe" }

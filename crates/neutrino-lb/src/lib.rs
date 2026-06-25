@@ -23,6 +23,65 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Total request timeout for the proxy's outbound HTTP hops.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// RFC 9177 §6.2 NON-mode Q-Block timing knobs, exposed on `LbConfig` without
+/// leaking coap-rs's `QBlockConfig`, whose extra CON-mode fields (`probing_rate`,
+/// `nstart`, `non_probing_wait`) are unread on the NON path. Mapped to coap-rs at
+/// transport construction.
+///
+/// RFC 9177 lets peers choose their timing independently — the 4.08 missing-block
+/// exchange is self-describing on the wire. coap-rs's drive model is stricter:
+/// the sender only lingers to service inbound 4.08s for a bounded window after
+/// its burst, so in practice both ends of a mesh should use comparable values, or
+/// a slow recovery can fall outside that window. (Follow-up: make the client
+/// linger until the exchange completes rather than for a fixed window.)
+///
+/// That sender linger is coap-rs's `non_receive_timeout * (non_max_retransmit +
+/// 2)` — an implementation quantity, *not* an RFC constant (the RFC's own
+/// receiver delay grows exponentially with the per-payload retry count, so it can
+/// exceed this linear figure). `CoapWireClient::with_qblock` sizes the
+/// total-exchange timeout to cover this linger automatically, so raising these
+/// knobs no longer risks a recovery being killed mid-exchange by `REQUEST_TIMEOUT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QBlockTuning {
+    /// Blocks sent per burst before the inter-burst congestion delay
+    /// (`MAX_PAYLOADS`, default 10).
+    pub max_payloads: u32,
+    /// Base inter-burst delay (`NON_TIMEOUT`, default 2 s).
+    pub non_timeout: Duration,
+    /// Receiver wait-for-gaps base before a missing-block request
+    /// (`NON_RECEIVE_TIMEOUT`, default 4 s).
+    pub non_receive_timeout: Duration,
+    /// Max missing-block recovery rounds (`NON_MAX_RETRANSMIT`, default 4).
+    pub non_max_retransmit: u32,
+}
+
+impl Default for QBlockTuning {
+    fn default() -> Self {
+        Self {
+            max_payloads: 10,
+            non_timeout: Duration::from_secs(2),
+            non_receive_timeout: Duration::from_secs(4),
+            non_max_retransmit: 4,
+        }
+    }
+}
+
+impl QBlockTuning {
+    /// Map to coap-rs's `QBlockConfig`, leaving its CON-mode fields
+    /// (`probing_rate`, `nstart`, `non_probing_wait`) and the NON field
+    /// `non_partial_timeout` (a partial-body hold time, not yet wired in coap-rs
+    /// v1) at their defaults — none are read on the NON send/serve path today.
+    pub(crate) fn to_qblock_config(self) -> coap::qblock::QBlockConfig {
+        coap::qblock::QBlockConfig {
+            max_payloads: self.max_payloads,
+            non_timeout: self.non_timeout,
+            non_receive_timeout: self.non_receive_timeout,
+            non_max_retransmit: self.non_max_retransmit,
+            ..Default::default()
+        }
+    }
+}
+
 /// Which wire transport the sidecar pair uses. Both peers must agree on the
 /// transport; the size knobs are local tunings.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -47,6 +106,18 @@ pub enum WireKind {
     Coap {
         block1_size: Option<usize>,
         max_message_size: Option<usize>,
+    },
+    /// v2 CoAP+CBOR over UDP using RFC 9177 Q-Block NON-mode robust transfer.
+    ///
+    /// Like `Coap`, but the request/response bodies travel as non-confirmable
+    /// Q-Block bursts (up to `MAX_PAYLOADS` blocks unacked) with missing-block
+    /// recovery, instead of CON stop-and-wait — the throughput win on lossy
+    /// serial/radio links. `block1_size` caps the per-burst block payload (`None`
+    /// = coap-rs's 1024 B default); `qblock` carries the RFC 9177 §6.2 timing.
+    /// No `max_message_size` knob this cut (Block2 follows the szx default).
+    CoapQBlock {
+        block1_size: Option<usize>,
+        qblock: QBlockTuning,
     },
 }
 
@@ -102,6 +173,23 @@ pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), 
                 Arc::new(CoapWireClient::with_block1_size(block1_size));
             let wire_server =
                 CoapWireServer::with_max_message_size(config.ingress_bind, max_message_size);
+            run_pair(
+                config.egress_bind,
+                wire_client,
+                wire_server,
+                ingress_handler,
+                shutdown,
+            )
+            .await
+        }
+        WireKind::CoapQBlock {
+            block1_size,
+            qblock,
+        } => {
+            let cfg = qblock.to_qblock_config();
+            let wire_client: Arc<dyn WireClient> =
+                Arc::new(CoapWireClient::with_qblock(block1_size, cfg.clone()));
+            let wire_server = CoapWireServer::with_qblock(config.ingress_bind, cfg);
             run_pair(
                 config.egress_bind,
                 wire_client,
@@ -176,5 +264,59 @@ mod serve_selection_tests {
         token.cancel();
         let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
         assert!(joined.is_ok(), "coap serve did not wind down");
+    }
+
+    // The CoapQBlock arm must build and bind a UDP listener, then wind down on
+    // cancel (proves the match arm is wired, not just that the enum exists).
+    #[tokio::test]
+    async fn coap_qblock_serve_binds_and_shuts_down() {
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        let handle = tokio::spawn(async move {
+            serve(
+                cfg(WireKind::CoapQBlock {
+                    block1_size: None,
+                    qblock: QBlockTuning::default(),
+                }),
+                server_token,
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        token.cancel();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(joined.is_ok(), "coap qblock serve did not wind down");
+    }
+}
+
+#[cfg(test)]
+mod qblock_tuning_tests {
+    use super::*;
+    use std::time::Duration;
+
+    // Defaults are the RFC 9177 §6.2 NON constants, matching coap-rs/libcoap.
+    #[test]
+    fn defaults_are_rfc9177_non_constants() {
+        let t = QBlockTuning::default();
+        assert_eq!(t.max_payloads, 10);
+        assert_eq!(t.non_timeout, Duration::from_secs(2));
+        assert_eq!(t.non_receive_timeout, Duration::from_secs(4));
+        assert_eq!(t.non_max_retransmit, 4);
+    }
+
+    // Mapping copies the NON knobs through to the coap-rs config verbatim.
+    #[test]
+    fn maps_non_knobs_to_coap_config() {
+        let t = QBlockTuning {
+            max_payloads: 7,
+            non_timeout: Duration::from_millis(500),
+            non_receive_timeout: Duration::from_millis(900),
+            non_max_retransmit: 2,
+        };
+        let c = t.to_qblock_config();
+        assert_eq!(c.max_payloads, 7);
+        assert_eq!(c.non_timeout, Duration::from_millis(500));
+        assert_eq!(c.non_receive_timeout, Duration::from_millis(900));
+        assert_eq!(c.non_max_retransmit, 2);
     }
 }
