@@ -29,9 +29,21 @@ pub fn run(args: &CompileArgs) -> Result<(), sh::Error> {
         args.targets.iter().map(String::as_str).collect()
     };
 
-    // 1. Host build so uniffi-bindgen can load the cdylib.
+    // 1. Host build so uniffi-bindgen can load the cdylib. Must match the
+    //    Android feature set (step 2): bindings are generated from THIS cdylib
+    //    (step 3), so a feature whose exports are missing here is missing from
+    //    the Kotlin bindings even though the device .so has it. Hence `ble`.
+    //    On Linux this needs system D-Bus/BlueZ (`bluer`); macOS uses
+    //    CoreBluetooth, no extra system deps.
     Cmd::new("cargo", &root)
-        .args(["build", "--release"])
+        .args([
+            "build",
+            "-p",
+            "neutrino-ffi",
+            "--release",
+            "--features",
+            "ble",
+        ])
         .run()?;
 
     // 2. Android targets via cargo-ndk → jniLibs.
@@ -45,8 +57,15 @@ pub fn run(args: &CompileArgs) -> Result<(), sh::Error> {
     for abi in &abis {
         ndk = ndk.args(["-t", abi]);
     }
-    ndk.args(["build", "-p", "neutrino-ffi", "--release"])
-        .run()?;
+    ndk.args([
+        "build",
+        "-p",
+        "neutrino-ffi",
+        "--release",
+        "--features",
+        "ble",
+    ])
+    .run()?;
 
     // 3. Generate the Kotlin bindings from the host cdylib.
     let lib = format!("./target/release/{}", lib_filename());

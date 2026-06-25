@@ -1,5 +1,9 @@
 uniffi::setup_scaffolding!("neutrino");
 
+#[cfg(feature = "ble")]
+mod ble_android;
+#[cfg(feature = "ble")]
+mod ble_selftest;
 mod tunnel;
 
 /// FFI-facing server configuration. Mirrors `neutrino_common::Config` so EX

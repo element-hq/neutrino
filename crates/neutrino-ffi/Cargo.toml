@@ -20,6 +20,29 @@ tokio.workspace = true
 uniffi.workspace = true
 
 neutrino-main = { path = "../neutrino-main" }
+iroh = { version = "0.98.2", features = ["unstable-custom-transports"] }
+# BLE is the Android medium (`blew` over JNI); on Linux the transport's backend
+# is `bluer`, which needs system D-Bus/BlueZ. Gate it behind `ble` so the default
+# build (desktop LAN, CI) is iroh-only and needs no system Bluetooth stack. The
+# Android .aar build enables `ble`.
+iroh-ble-transport = { version = "0.1.0-alpha.6", optional = true }
+# `iroh::Connection::send_datagram` takes `bytes::Bytes`; used by the BLE
+# self-test (`ble` feature) and the loopback datagram test. Already in the tree
+# transitively via iroh, so no new compile cost.
+bytes = "1"
+
+# Android-only JNI bootstrap for blew (see src/ble_android.rs). `blew` is pulled
+# in directly so we can call its `init_jvm`; cargo unifies it with the copy
+# iroh-ble-transport already depends on. `jni`/`ndk-context` versions match what
+# `blew` uses so the `JavaVM` type is identical. None of these compile for non-
+# Android targets, so the host binding-gen build doesn't pull them.
+[target.'cfg(target_os = "android")'.dependencies]
+blew = { version = "0.2", optional = true }
+jni = { version = "0.22", optional = true }
+ndk-context = { version = "0.1", optional = true }
+
+[features]
+ble = ["dep:iroh-ble-transport", "dep:blew", "dep:jni", "dep:ndk-context"]
 
 [build-dependencies]
 uniffi = { workspace = true, features = ["build"] }

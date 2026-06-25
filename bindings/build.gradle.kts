@@ -15,6 +15,12 @@ dependencies {
     implementation(libs.kotlin.stdlib)
     implementation(libs.androidx.annotation)
     compileOnly(libs.jna) // element x provides JNA
+
+    // Required by the bundled `blew` BLE manager classes (org.jakebot.blew.*),
+    // which back the iroh-over-BLE federation transport. Versions match blew's
+    // own android module (blew-0.2.3/android/build.gradle.kts).
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    implementation("androidx.core:core-ktx:1.9.0")
 }
 
 android {

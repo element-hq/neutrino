@@ -639,6 +639,8 @@ internal object IntegrityCheckingUniffiLib {
     }
     external fun uniffi_neutrino_checksum_func_start(
     ): Short
+    external fun uniffi_neutrino_checksum_func_ble_smoke_test(
+    ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_command(
     ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_kick_backoff(
@@ -683,6 +685,8 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_neutrino_fn_func_start(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
+    external fun uniffi_neutrino_fn_func_ble_smoke_test(`remote`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun ffi_neutrino_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun ffi_neutrino_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1628,6 +1632,38 @@ public object FfiConverterOptionalUShort: FfiConverterRustBuffer<kotlin.UShort?>
         }
     }
 }
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?> {
+    override fun read(buf: ByteBuffer): kotlin.String? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterString.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.String?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterString.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.String?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterString.write(value, buf)
+        }
+    }
+}
         /**
          * Spawn an owned Tokio runtime and begin polling the server entrypoint with
          * the supplied configuration. Returns a handle for pushing control commands
@@ -1648,6 +1684,21 @@ public object FfiConverterOptionalUShort: FfiConverterRustBuffer<kotlin.UShort?>
 }
     )
     }
+    
+
+        /**
+         * Run the BLE smoke test on a dedicated runtime thread and return immediately.
+         * `remote` = `None` → listener (advertise + accept + echo); `Some(node_id)` →
+         * dialer (connect + stream test + datagram test). Results are logged, not
+         * returned (see module docs).
+         */ fun `bleSmokeTest`(`remote`: kotlin.String?)
+        = 
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_neutrino_fn_func_ble_smoke_test(
+    
+        FfiConverterOptionalString.lower(`remote`),_status)
+}
+    
     
 
 
