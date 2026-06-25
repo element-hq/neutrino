@@ -36,6 +36,18 @@ pub fn cbor_to_json(cbor: &[u8]) -> Result<Vec<u8>, CodecError> {
     Ok(serde_json::to_vec(&value)?)
 }
 
+/// True if `s` is a v3+ Matrix event ID: `$` followed by exactly 43 url-safe
+/// base64 characters (the unpadded base64url of a 32-byte reference hash).
+/// Equivalent to Dendrite's `^\$[A-Za-z0-9_-]{43}$`, no regex needed.
+fn is_event_id(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 44
+        && b[0] == b'$'
+        && b[1..]
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,6 +61,37 @@ mod tests {
         let cbor = json_to_cbor(json.as_bytes()).expect("json->cbor");
         let back = cbor_to_json(&cbor).expect("cbor->json");
         String::from_utf8(back).expect("utf8")
+    }
+
+    #[test]
+    fn is_event_id_matches_only_dollar_plus_43_base64url() {
+        // 43 base64url chars after '$' (a real v12 event-id shape).
+        let ok = "$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert_eq!(ok.len(), 44);
+        assert!(is_event_id(ok));
+
+        // A positive case spanning the whole url-safe alphabet (a-z, 0-9, -, _,
+        // A-E = 43 chars), so acceptance isn't vacuously true for just 'A'.
+        let mixed = "$abcdefghijklmnopqrstuvwxyz0123456789-_ABCDE";
+        assert_eq!(mixed.len(), 44);
+        assert!(is_event_id(mixed));
+
+        assert!(!is_event_id("$abc")); // too short
+        // One char too long ('$' + 44 chars): the 43-char window is the point.
+        assert!(!is_event_id(
+            "$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ));
+        assert!(!is_event_id(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        )); // no leading $
+        assert!(!is_event_id(
+            "$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+"
+        )); // '+' not in url-safe alphabet
+        assert!(!is_event_id("")); // empty
+        // Right length but a disallowed char ('!') in the body.
+        assert!(!is_event_id(
+            "$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA!"
+        ));
     }
 
     #[test]
