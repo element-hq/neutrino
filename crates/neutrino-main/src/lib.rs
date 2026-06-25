@@ -4,6 +4,9 @@ use std::net::SocketAddr;
 
 pub use neutrino_common::{Command, Config};
 
+use neutrino_store::IdentityStore;
+use neutrino_store_sqlite::SqliteStore;
+use rand::RngCore;
 use tokio_util::sync::CancellationToken;
 
 pub async fn entrypoint(
@@ -11,6 +14,9 @@ pub async fn entrypoint(
     commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     platform::init_tracing();
+
+    // Establish the server's stable identity before anything reads `config`.
+    resolve_server_identity(&mut config).await?;
 
     // Embedded low-bandwidth sidecar: when `lb_federation_port` is set we run a
     // `neutrino-lb` proxy in-process beside the homeserver (the embedded-on-
@@ -64,6 +70,39 @@ pub async fn entrypoint(
         None => neutrino_http::serve(listener, config, commands).await?,
     }
     Ok(())
+}
+
+/// Ensure the server has a stable identity before serving.
+///
+/// The server is identified by a persistent 32-byte secret, generated once on
+/// first start from a CSPRNG and kept across restarts, so the server names
+/// itself deterministically. The secret is persisted **unconditionally** — it
+/// is the server's identity seed, which lower layers (the transport that maps
+/// this name onto a route) consume independently of whether a `server_name` was
+/// configured. When the caller supplies no `server_name` (the embedded path),
+/// derive one from the secret here; a configured name is kept verbatim.
+///
+/// Opened and dropped in this scope: the homeserver re-opens the same store when
+/// it serves. This is the one-time identity bootstrap, kept out of the request
+/// layer (`neutrino-http`), which stays agnostic to how its name is chosen.
+async fn resolve_server_identity(config: &mut Config) -> Result<(), Box<dyn std::error::Error>> {
+    let store = SqliteStore::open_in_dir(&config.storage_dir).await?;
+    let mut seed = [0u8; 32];
+    rand::rng().fill_bytes(&mut seed);
+    let secret = store.get_or_create_node_secret(seed).await?;
+    if config.server_name.is_empty() {
+        config.server_name = server_identity_from_secret(&secret);
+    }
+    Ok(())
+}
+
+/// Derive a stable, collision-resistant server identity from its secret: the
+/// lowercase-hex fingerprint of the secret's ed25519 public key. This is a
+/// general public-key identity; how the name maps onto a network route is the
+/// transport's concern, not this function's.
+fn server_identity_from_secret(secret: &[u8; 32]) -> String {
+    let signing = ed25519_dalek::SigningKey::from_bytes(secret);
+    hex::encode(signing.verifying_key().to_bytes())
 }
 
 /// Derive the in-process sidecar's [`neutrino_lb::LbConfig`] from the homeserver
@@ -224,5 +263,53 @@ mod tests {
     fn alloc_loopback_egress_is_loopback() {
         let addr = alloc_loopback_egress().expect("allocate egress");
         assert!(addr.ip().is_loopback(), "egress {addr} must be loopback");
+    }
+
+    #[test]
+    fn server_identity_from_secret_is_deterministic_64_hex() {
+        let secret = [3u8; 32];
+        let a = server_identity_from_secret(&secret);
+        assert_eq!(a, server_identity_from_secret(&secret), "deterministic");
+        assert_eq!(a.len(), 64, "64-char hex public-key fingerprint");
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        );
+    }
+
+    fn cfg_in(dir: &tempfile::TempDir, server_name: &str) -> Config {
+        Config {
+            server_name: server_name.to_owned(),
+            storage_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_identity_derives_name_when_empty() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = cfg_in(&tmp, "");
+        resolve_server_identity(&mut config).await.expect("resolve");
+        assert_eq!(config.server_name.len(), 64, "derived a 64-char identity");
+    }
+
+    #[tokio::test]
+    async fn resolve_identity_keeps_configured_name() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = cfg_in(&tmp, "hs.example");
+        resolve_server_identity(&mut config).await.expect("resolve");
+        assert_eq!(config.server_name, "hs.example", "configured name kept");
+    }
+
+    #[tokio::test]
+    async fn resolve_identity_is_stable_across_restart() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut first = cfg_in(&tmp, "");
+        resolve_server_identity(&mut first).await.expect("first");
+        // Re-resolve against the same storage dir: the persisted secret yields
+        // the same derived identity (this is why the secret is stored).
+        let mut second = cfg_in(&tmp, "");
+        resolve_server_identity(&mut second).await.expect("second");
+        assert_eq!(first.server_name, second.server_name);
     }
 }

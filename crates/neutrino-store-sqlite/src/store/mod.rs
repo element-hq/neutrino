@@ -3,6 +3,7 @@
 
 mod dag;
 mod events;
+mod identity;
 mod inbox;
 mod invites;
 mod outbox;
