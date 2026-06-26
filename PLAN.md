@@ -63,7 +63,8 @@ rev-pinned in `[patch.crates-io]`. Designs:
 
 Done:
 - Integer-key CBOR codec (Layer A; port of Dendrite `internal/lb`): all transports
-  now carry the integer-key transcode (`codec::keys`, 137 keys) plus event-ID
+  now carry the integer-key transcode (`codec::keys`, 143 keys: 137 from Dendrite
+  + 6 MSC4242 state-DAG keys) plus event-ID
   →raw-32 B packing with a re-encode/fall-back-to-text guard. CoAP path enums were
   already done (`transport::coap::paths`). (MSC3079.)
 
@@ -212,11 +213,18 @@ never use .unwrap() in handler code.
   not in `neutrino-http`'s HTTP layer.
 - v1 shipped an **opaque** JSON↔CBOR transcode (no key remapping). **Superseded
   2026-06-25:** the codec now does Dendrite-style integer-key remapping
-  (`codec::keys`, 137 keys) + event-ID→raw-32 B packing, in place (no opaque
+  (`codec::keys`) + event-ID→raw-32 B packing, in place (no opaque
   fallback). Wire bytes changed; safe because a sidecar pair always deploys
   together. `canonical`-mode (Dendrite's test-only flag) intentionally not ported
   (YAGNI; `serde_json` already sorts keys). Decode *errors* on a malformed CBOR
   map key where Dendrite silently drops it — no-data-loss over Dendrite parity.
+- **2026-06-26:** Extended the key table with 6 MSC4242 state-DAG keys
+  (codes 138-143: `prev_state_events`, `state_dag`, `partial_state_event_ids`,
+  `partial_auth_chain_ids`, `members_omitted`, `additional_creators`). Codes 138+
+  are neutrino's own (the table is no longer Dendrite-identical; fine — we federate
+  neutrino↔neutrino). Event-ID *values* in these fields auto-pack to 32 B; the
+  event-ID *keys* of `partial_auth_chain_ids` do not yet (deferred follow-up:
+  pack `$`-shaped CBOR map keys as byte-string keys).
 - Outbound handoff is via **reqwest proxy mode** (one `Config.federation_proxy`
   field, default `None`); no URL construction or Router change in `neutrino-http`.
 - `WireClient`/`WireServer`/`WireHandler` traits are scoped to the **wire hop

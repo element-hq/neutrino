@@ -295,6 +295,32 @@ mod tests {
     }
 
     #[test]
+    fn msc4242_prev_state_events_maps_and_packs_event_ids() {
+        // `prev_state_events` (code 138) is on every event under MSC4242; its
+        // values are event IDs, which must auto-pack to 32 bytes like any other
+        // event-id-shaped string. Pins both the new key code and the free win.
+        let event_id = format!("${}", "A".repeat(43));
+        let json = format!(r#"{{"prev_state_events":["{event_id}"]}}"#);
+        let cbor = json_to_cbor(json.as_bytes()).unwrap();
+        let RawCbor::Map(entries) = raw_cbor(&cbor) else {
+            panic!("expected map");
+        };
+        let (_, val) = entries
+            .iter()
+            .find(|(k, _)| matches!(k, RawCbor::Integer(i) if i128::from(*i) == 138))
+            .expect("prev_state_events should map to integer key 138");
+        let RawCbor::Array(arr) = val else {
+            panic!("expected array");
+        };
+        assert!(
+            matches!(&arr[0], RawCbor::Bytes(b) if b.len() == 32),
+            "event id in prev_state_events was not packed to 32 bytes: {:?}",
+            arr[0]
+        );
+        assert_eq!(roundtrip(&json), json);
+    }
+
+    #[test]
     fn non_event_id_dollar_string_stays_text() {
         let json = r#"{"body":"$abc"}"#;
         let cbor = json_to_cbor(json.as_bytes()).unwrap();

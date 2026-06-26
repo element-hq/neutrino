@@ -147,6 +147,13 @@ pub(crate) const KEYS: &[(&str, i64)] = &[
     ("m.room.encryption", 135),
     ("m.room.history_visibility", 136),
     ("notifications", 137),
+    // MSC4242: State DAGs (extends Dendrite's table; codes 138+ are neutrino's).
+    ("prev_state_events", 138),
+    ("state_dag", 139),
+    ("partial_state_event_ids", 140),
+    ("partial_auth_chain_ids", 141),
+    ("members_omitted", 142),
+    ("additional_creators", 143),
 ];
 
 static KEY_TO_INT: LazyLock<HashMap<&'static str, i64>> =
@@ -196,7 +203,10 @@ mod tests {
         assert_eq!(key_to_int("event_id"), Some(1));
         assert_eq!(key_to_int("type"), Some(2));
         assert_eq!(key_to_int("notifications"), Some(137));
-        assert_eq!(KEYS.len(), 137);
+        // MSC4242 additions (codes 138-143).
+        assert_eq!(key_to_int("prev_state_events"), Some(138));
+        assert_eq!(key_to_int("additional_creators"), Some(143));
+        assert_eq!(KEYS.len(), 143);
         assert_eq!(key_to_int("not_a_matrix_key"), None);
     }
 }
