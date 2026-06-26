@@ -78,7 +78,10 @@ fn json_to_cbor_value(value: serde_json::Value) -> Result<CborValue, CodecError>
             for (k, v) in map {
                 let key = match key_to_int(&k) {
                     Some(code) => CborValue::Integer(code.into()),
-                    None => CborValue::Text(k),
+                    // Not a well-known key: pack it like any string value, so an
+                    // event-id-shaped key (e.g. partial_auth_chain_ids) rides as
+                    // 32 raw bytes; everything else stays text.
+                    None => string_to_cbor(k),
                 };
                 out.push((key, json_to_cbor_value(v)?));
             }
@@ -171,9 +174,12 @@ fn cbor_key_to_string(key: CborValue) -> Result<String, CodecError> {
             }
         }
         CborValue::Text(s) => Ok(s),
-        // Our encoder only ever emits Integer or Text keys. Anything else is
-        // corruption: error rather than silently drop it (Dendrite drops such
-        // keys; we prefer surfacing the fault over losing data).
+        // Event-id-shaped keys (e.g. partial_auth_chain_ids) ride as 32 raw
+        // bytes, symmetric with event-id values.
+        CborValue::Bytes(b) => bytes_to_event_id(&b),
+        // Our encoder only ever emits Integer, Text, or Bytes keys. Anything
+        // else is corruption: error rather than silently drop it (Dendrite drops
+        // such keys; we prefer surfacing the fault over losing data).
         other => Err(CodecError::CborDecode(format!(
             "unsupported CBOR map key: {other:?}"
         ))),
@@ -322,6 +328,92 @@ mod tests {
             arr[0]
         );
         assert_eq!(roundtrip(&json), json);
+    }
+
+    #[test]
+    fn event_id_map_keys_pack_to_byte_keys() {
+        // partial_auth_chain_ids (code 141) is a map keyed by event IDs whose
+        // values are arrays of event IDs. Both the keys AND the values must pack
+        // to 32 bytes.
+        // Both must be canonical url-safe base64 of 32 bytes (43 chars). The
+        // final char's low 2 bits must be zero, so end each on 'A' (value 0);
+        // a string like "B"*43 is non-canonical and would (correctly) stay text.
+        let ev = format!("${}", "A".repeat(43));
+        let dep = format!("${}A", "B".repeat(42));
+        let json = format!(r#"{{"partial_auth_chain_ids":{{"{ev}":["{dep}"]}}}}"#);
+        let cbor = json_to_cbor(json.as_bytes()).unwrap();
+
+        let RawCbor::Map(top) = raw_cbor(&cbor) else {
+            panic!("expected map");
+        };
+        // partial_auth_chain_ids -> Integer(141), value is an inner map.
+        let (_, inner) = top
+            .iter()
+            .find(|(k, _)| matches!(k, RawCbor::Integer(i) if i128::from(*i) == 141))
+            .expect("partial_auth_chain_ids key");
+        let RawCbor::Map(entries) = inner else {
+            panic!("expected inner map");
+        };
+        let (key, val) = &entries[0];
+        // The map KEY (an event id) must now be 32 raw bytes, not text.
+        assert!(
+            matches!(key, RawCbor::Bytes(b) if b.len() == 32),
+            "event-id map key was not packed to 32 bytes: {key:?}"
+        );
+        // The value (array of event ids) packs too (existing behavior).
+        let RawCbor::Array(arr) = val else {
+            panic!("expected array value");
+        };
+        assert!(matches!(&arr[0], RawCbor::Bytes(b) if b.len() == 32));
+
+        // Full round trip restores the original JSON exactly.
+        assert_eq!(roundtrip(&json), json);
+    }
+
+    #[test]
+    fn event_id_key_packs_anywhere_not_just_known_fields() {
+        // The transform is field-agnostic: an event-id-shaped key packs to bytes
+        // even at top level, outside any known event-id-map field. ("A"*43 is
+        // canonical base64url of 32 bytes.)
+        let ev = format!("${}", "A".repeat(43));
+        let json = format!(r#"{{"{ev}":"v"}}"#);
+        let cbor = json_to_cbor(json.as_bytes()).unwrap();
+        let RawCbor::Map(entries) = raw_cbor(&cbor) else {
+            panic!("expected map");
+        };
+        assert!(
+            matches!(&entries[0].0, RawCbor::Bytes(b) if b.len() == 32),
+            "top-level event-id key was not packed: {:?}",
+            entries[0].0
+        );
+        assert_eq!(roundtrip(&json), json);
+    }
+
+    #[test]
+    fn non_event_id_map_key_stays_text() {
+        // A non-event-id key (not in the table, not '$'-shaped) must stay text.
+        let json = r#"{"some_random_key":"v"}"#;
+        let cbor = json_to_cbor(json.as_bytes()).unwrap();
+        let RawCbor::Map(entries) = raw_cbor(&cbor) else {
+            panic!("expected map");
+        };
+        assert!(matches!(&entries[0].0, RawCbor::Text(t) if t == "some_random_key"));
+        assert_eq!(roundtrip(json), json);
+    }
+
+    #[test]
+    fn non_32_byte_byte_key_errors_without_panic() {
+        // A CBOR map with a non-32-byte byte-string key must error, not panic.
+        let value = RawCbor::Map(vec![(
+            RawCbor::Bytes(vec![1, 2, 3]),
+            RawCbor::Text("v".to_owned()),
+        )]);
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&value, &mut cbor).unwrap();
+        assert!(matches!(
+            cbor_to_json(&cbor),
+            Err(CodecError::CborDecode(_))
+        ));
     }
 
     #[test]
