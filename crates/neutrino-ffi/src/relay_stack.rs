@@ -31,14 +31,27 @@ use tracing::warn;
 
 use crate::relay_transport::IrohTransport;
 
-/// Decode a federation `server_name` (the peer's iroh node id, hex, with an
-/// optional `:port`) into a relay [`NodeKey`]. `None` if the host isn't a node
-/// id (e.g. a dev `localhost`) — such a name has no tunnel route.
-fn server_name_to_node_key(authority: &str) -> Option<NodeKey> {
-    let host = authority
-        .rsplit_once(':')
-        .map_or(authority, |(host, _port)| host);
-    EndpointId::from_str(host).ok().map(|id| *id.as_bytes())
+/// The port a peer's in-tunnel relay endpoint listens on, used when a
+/// `server_name` carries no explicit `:port` override (Matrix federation's
+/// default port).
+const DEFAULT_FEDERATION_PORT: u16 = 8448;
+
+/// Parse a federation `server_name` (`host[:port]`, where host is the peer's
+/// iroh node id in hex) into its relay [`NodeKey`] and any explicit port
+/// override. `None` if the host isn't a node id (e.g. a dev `localhost`) — such
+/// a name has no tunnel route.
+///
+/// A node id is hex/base32 with no colons, so `rsplit_once(':')` cleanly peels
+/// an optional `:port`. A bracketed IPv6 authority mis-splits, but its host then
+/// fails to parse as a node id and is reported as `None` (passed through), so
+/// the mis-split is harmless.
+fn parse_server_name(authority: &str) -> Option<(NodeKey, Option<&str>)> {
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    let key = *EndpointId::from_str(host).ok()?.as_bytes();
+    Some((key, port))
 }
 
 /// [`DestinationResolver`] for the tunnel: maps a peer `server_name` to the
@@ -48,12 +61,14 @@ pub(crate) struct TunnelResolver;
 
 impl DestinationResolver for TunnelResolver {
     fn resolve(&self, authority: String) -> String {
-        match server_name_to_node_key(&authority) {
-            Some(key) => {
+        match parse_server_name(&authority) {
+            Some((key, port)) => {
                 let v = vip(&key);
-                match authority.rsplit_once(':') {
-                    Some((_host, port)) => format!("[{v}]:{port}"),
-                    None => format!("[{v}]"),
+                // Honour an explicit port override; otherwise the peer's relay
+                // endpoint listens on the federation port.
+                match port {
+                    Some(port) => format!("[{v}]:{port}"),
+                    None => format!("[{v}]:{DEFAULT_FEDERATION_PORT}"),
                 }
             }
             None => {
@@ -99,8 +114,8 @@ impl RelayStack {
     /// Invite-time route registration: record how to route to a peer learned by
     /// `server_name`. No-op if it isn't a node id.
     pub(crate) fn register_peer(&self, server_name: &str) {
-        match server_name_to_node_key(server_name) {
-            Some(key) => self.table.register(key),
+        match parse_server_name(server_name) {
+            Some((key, _port)) => self.table.register(key),
             None => warn!(%server_name, "tunnel: cannot register non-node server_name"),
         }
     }
@@ -142,18 +157,16 @@ mod tests {
     use tokio::time::timeout;
 
     #[test]
-    fn server_name_round_trips_to_node_key() {
+    fn parse_server_name_extracts_key_and_port() {
         let pk = SecretKey::from_bytes(&[9u8; 32]).public();
+        let key = *pk.as_bytes();
+        assert_eq!(parse_server_name(&pk.to_string()), Some((key, None)));
         assert_eq!(
-            server_name_to_node_key(&pk.to_string()),
-            Some(*pk.as_bytes())
+            parse_server_name(&format!("{pk}:8448")),
+            Some((key, Some("8448")))
         );
-        // With a port, and a non-node host.
-        assert_eq!(
-            server_name_to_node_key(&format!("{pk}:8448")),
-            Some(*pk.as_bytes())
-        );
-        assert_eq!(server_name_to_node_key("localhost:8008"), None);
+        // Non-node hosts have no tunnel route.
+        assert_eq!(parse_server_name("localhost:8008"), None);
     }
 
     #[test]
@@ -162,6 +175,11 @@ mod tests {
             TunnelResolver.resolve("localhost:8008".to_owned()),
             "localhost:8008"
         );
+        // A bracketed IPv6 literal is not a node id → dialed verbatim.
+        assert_eq!(
+            TunnelResolver.resolve("[2001:db8::1]:8448".to_owned()),
+            "[2001:db8::1]:8448"
+        );
     }
 
     #[test]
@@ -169,10 +187,15 @@ mod tests {
         let pk = SecretKey::from_bytes(&[5u8; 32]).public();
         let key = *pk.as_bytes();
         let v = vip(&key);
-        assert_eq!(TunnelResolver.resolve(pk.to_string()), format!("[{v}]"));
+        // No port → the default federation port.
         assert_eq!(
-            TunnelResolver.resolve(format!("{pk}:8448")),
-            format!("[{v}]:8448")
+            TunnelResolver.resolve(pk.to_string()),
+            format!("[{v}]:{DEFAULT_FEDERATION_PORT}")
+        );
+        // An explicit override is honoured.
+        assert_eq!(
+            TunnelResolver.resolve(format!("{pk}:7777")),
+            format!("[{v}]:7777")
         );
     }
 
