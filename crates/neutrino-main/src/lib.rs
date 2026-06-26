@@ -2,18 +2,33 @@ mod platform;
 mod tunnel;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub use neutrino_common::{Command, Config};
 
+use neutrino_relay::NeighbourTable;
 use neutrino_store::IdentityStore;
 use neutrino_store_sqlite::SqliteStore;
 use rand::RngCore;
 use tokio_util::sync::CancellationToken;
 
+/// Handed from the entrypoint to an embedding host (the ffi/Android layer) so it
+/// can build the iroh relay over the *same* node identity and neighbour table
+/// the federation routing layer uses here. The host populates the `OnceLock`
+/// view once the server is up; non-embedded callers (the dev binary) pass `None`.
+pub struct TunnelHandoff {
+    /// The persisted node secret — the relay derives its iroh identity from it,
+    /// matching this server's derived `server_name`.
+    pub secret: [u8; 32],
+    /// The route table shared with the federation resolver/route-sink, so routes
+    /// learned here are seen by the relay.
+    pub table: Arc<NeighbourTable>,
+}
+
 pub async fn entrypoint(
     mut config: Config,
     commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
+    handoff: Option<Arc<OnceLock<TunnelHandoff>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     platform::init_tracing();
 
@@ -21,7 +36,14 @@ pub async fn entrypoint(
     // it before anything reads `config`. The same handle is threaded into the
     // homeserver (`serve`) so the database is opened exactly once.
     let store = Arc::new(SqliteStore::open_in_dir(&config.storage_dir).await?);
-    resolve_server_identity(&mut config, &store).await?;
+    let secret = resolve_server_identity(&mut config, &store).await?;
+
+    // Hand the node secret + a shared route table to the embedding host so it can
+    // build the relay over this identity. Created only for the embedded target.
+    if let Some(handoff) = &handoff {
+        let table = Arc::new(NeighbourTable::new());
+        let _ = handoff.set(TunnelHandoff { secret, table });
+    }
 
     // Embedded low-bandwidth sidecar: when `lb_federation_port` is set we run a
     // `neutrino-lb` proxy in-process beside the homeserver (the embedded-on-
@@ -93,14 +115,14 @@ pub async fn entrypoint(
 async fn resolve_server_identity(
     config: &mut Config,
     store: &SqliteStore,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     let mut seed = [0u8; 32];
     rand::rng().fill_bytes(&mut seed);
     let secret = store.get_or_create_node_secret(seed).await?;
     if config.server_name.is_empty() {
         config.server_name = server_identity_from_secret(&secret);
     }
-    Ok(())
+    Ok(secret)
 }
 
 /// Derive a stable, collision-resistant server identity from its secret: the

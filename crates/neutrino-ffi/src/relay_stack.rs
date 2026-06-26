@@ -25,6 +25,11 @@ pub(crate) struct RelayStack {
     table: Arc<NeighbourTable>,
 }
 
+// `build`/`drive`/`node_key` are live (driven by the tunnel); the discovery
+// accessors (`add_peer_addr`/`endpoint_id`/`bound_sockets`) are wired when
+// service discovery lands, and `register`/`spawn` are test seeders — allow until
+// then.
+#[allow(dead_code)]
 impl RelayStack {
     /// Build the transport (identity derived from `secret`) over a `table`
     /// shared with the federation routing layer in `neutrino-main`.
@@ -66,8 +71,8 @@ impl RelayStack {
         self.transport.bound_sockets()
     }
 
-    /// Spawn the relay loop, carrying IP packets between `io` (the host TUN) and
-    /// the wire. Runs until a seam closes.
+    /// Spawn the relay loop on the current runtime, carrying IP packets between
+    /// `io` (the host TUN) and the wire. Runs until a seam closes.
     pub(crate) fn spawn<P: PacketIo + 'static>(&self, io: Arc<P>) -> JoinHandle<()> {
         tokio::spawn(run(
             self.node_key(),
@@ -75,5 +80,18 @@ impl RelayStack {
             io,
             self.transport.clone(),
         ))
+    }
+
+    /// Drive the relay loop in the caller's task (so dropping/aborting that task
+    /// stops the relay and closes `io`). Used by the tunnel driver, whose task is
+    /// aborted on stop / runtime teardown.
+    pub(crate) async fn drive<P: PacketIo + 'static>(&self, io: Arc<P>) {
+        run(
+            self.node_key(),
+            self.table.clone(),
+            io,
+            self.transport.clone(),
+        )
+        .await;
     }
 }

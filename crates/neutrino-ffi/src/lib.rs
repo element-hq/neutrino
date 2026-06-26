@@ -4,16 +4,10 @@ uniffi::setup_scaffolding!("neutrino");
 mod ble_android;
 #[cfg(feature = "ble")]
 mod ble_selftest;
-// The iroh-backed relay transport and the tunnel routing glue (resolver +
-// route registration + assembly). Exercised by their own tests now; wired into
-// the entrypoint with the host TUN in P3b, hence the allow until then.
-#[allow(dead_code)]
+// The iroh-backed relay: transport, assembly, and the host-TUN `PacketIo`. Wired
+// into the live tunnel by `tunnel::Tunnel` (driven by `start_tunnel`).
 mod relay_stack;
-#[allow(dead_code)]
 mod relay_transport;
-// `PacketIo` over the host TUN fd. Tested in CI with a socketpair fake TUN;
-// fed the real VpnService fd by the entrypoint in P3b, hence the allow.
-#[allow(dead_code)]
 mod tun_io;
 mod tunnel;
 
@@ -114,27 +108,28 @@ impl NeutrinoHandle {
         self.command(Command::KickBackoff);
     }
 
-    /// Take ownership of an established TUN file descriptor and start reading IP
-    /// packets from it, logging a metadata-only summary of each (see [`tunnel`])
-    /// through the Neutrino tracing stack. Non-blocking: spawns a reader task on the
-    /// server runtime and returns immediately.
+    /// Take ownership of an established TUN file descriptor and start the packet
+    /// relay over it: IP packets the host writes into the tunnel are carried over
+    /// the wire (iroh) to the destination node, and inbound packets are injected
+    /// back (see [`tunnel`]). Non-blocking: spawns the relay on the server runtime
+    /// and returns immediately.
     ///
     /// `tun_fd` MUST come from `VpnService.Builder.establish()` with ownership
     /// transferred to native code — on the Kotlin side, pass
     /// `ParcelFileDescriptor.detachFd()`, NOT `.fd`. It MUST also be set non-blocking
-    /// before being handed over (`Os.fcntlInt(fd, F_SETFL, O_NONBLOCK)`); the reader
-    /// relies on this so a read never stalls the server executor. This crate owns and
-    /// closes the fd from then on; the host must not close it (and must not keep the
-    /// `ParcelFileDescriptor` that produced it open).
+    /// before being handed over (`Os.fcntlInt(fd, F_SETFL, O_NONBLOCK)`); the relay's
+    /// `AsyncFd` reader relies on this so a read never stalls the server executor.
+    /// This crate owns and closes the fd from then on; the host must not close it (and
+    /// must not keep the `ParcelFileDescriptor` that produced it open).
     ///
-    /// `mtu` is the tunnel MTU; currently advisory (reserved for write-back once
-    /// forwarding lands) — the read buffer is sized for the worst case regardless.
+    /// `mtu` is the tunnel MTU; currently advisory (clamping packets to the iroh
+    /// datagram limit is a relay-layer concern not yet wired — the host sets it).
     ///
-    /// The reader runs on the server runtime, so it is cancelled automatically when
+    /// The relay runs on the server runtime, so it is cancelled automatically when
     /// the homeserver shuts down: a tunnel cannot outlive its homeserver. Calling
-    /// this before the server is up (or after it has stopped) is a no-op that closes
-    /// the fd. Safe to call across repeated VPN toggles: each call installs a fresh
-    /// fd, replacing any still-running reader. Pair every `start_tunnel` with a
+    /// this before the server is up (or before its identity is resolved) is a no-op
+    /// that closes the fd. Safe to call across repeated VPN toggles: each call installs
+    /// a fresh fd, replacing any still-running relay. Pair every `start_tunnel` with a
     /// [`Self::stop_tunnel`].
     pub fn start_tunnel(&self, tun_fd: i32, mtu: u32) {
         self.tunnel.start(tun_fd, mtu);
@@ -166,6 +161,11 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
     let runtime: std::sync::Arc<std::sync::OnceLock<tokio::runtime::Handle>> =
         std::sync::Arc::new(std::sync::OnceLock::new());
     let runtime_publisher = std::sync::Arc::clone(&runtime);
+    // The entrypoint publishes {node secret, shared route table} here once the
+    // server identity is resolved; `start_tunnel` reads it to build the relay.
+    let handoff: std::sync::Arc<std::sync::OnceLock<neutrino_main::TunnelHandoff>> =
+        std::sync::Arc::new(std::sync::OnceLock::new());
+    let handoff_publisher = std::sync::Arc::clone(&handoff);
     std::thread::spawn(move || {
         // Neutrino owns its runtime. current_thread = parity with the previous
         // async-compat global (also current_thread); all DB work is offloaded to
@@ -190,7 +190,7 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
             // The command receiver is threaded into the server; a `Shutdown`
             // command (or every `NeutrinoHandle` being dropped, which closes the
             // channel) drives `serve`'s graceful shutdown and returns here.
-            if let Err(e) = neutrino_main::entrypoint(config, rx).await {
+            if let Err(e) = neutrino_main::entrypoint(config, rx, Some(handoff_publisher)).await {
                 eprintln!("entrypoint exited: {e}");
             }
         });
@@ -204,7 +204,7 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
     });
     NeutrinoHandle {
         tx,
-        tunnel: tunnel::Tunnel::new(runtime),
+        tunnel: tunnel::Tunnel::new(runtime, handoff),
     }
 }
 
@@ -242,7 +242,10 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = NeutrinoHandle {
             tx,
-            tunnel: tunnel::Tunnel::new(std::sync::Arc::new(std::sync::OnceLock::new())),
+            tunnel: tunnel::Tunnel::new(
+                std::sync::Arc::new(std::sync::OnceLock::new()),
+                std::sync::Arc::new(std::sync::OnceLock::new()),
+            ),
         };
         handle.shutdown();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::Shutdown);
@@ -256,7 +259,10 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = NeutrinoHandle {
             tx,
-            tunnel: tunnel::Tunnel::new(std::sync::Arc::new(std::sync::OnceLock::new())),
+            tunnel: tunnel::Tunnel::new(
+                std::sync::Arc::new(std::sync::OnceLock::new()),
+                std::sync::Arc::new(std::sync::OnceLock::new()),
+            ),
         };
         handle.kick_backoff();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::KickBackoff);

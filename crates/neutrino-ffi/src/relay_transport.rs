@@ -80,18 +80,23 @@ impl IrohTransport {
         *self.endpoint.id().as_bytes()
     }
 
+    // The discovery accessors below are wired when service discovery (mDNS/BLE)
+    // lands; until then they're used only via the test seeders.
     /// This endpoint's id, for handing to peers as part of an [`EndpointAddr`].
+    #[allow(dead_code)]
     pub(crate) fn endpoint_id(&self) -> EndpointId {
         self.endpoint.id()
     }
 
     /// The sockets this endpoint is bound to.
+    #[allow(dead_code)]
     pub(crate) fn bound_sockets(&self) -> Vec<SocketAddr> {
         self.endpoint.bound_sockets()
     }
 
     /// Teach the transport how to reach a peer. Keyed by the address's own
     /// endpoint id, so the mapping has a single source of truth.
+    #[allow(dead_code)]
     pub(crate) fn add_peer(&self, addr: EndpointAddr) {
         let key = *addr.id.as_bytes();
         self.addrs
