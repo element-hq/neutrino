@@ -57,9 +57,9 @@ fn parse_token(
 ) -> Result<Option<PaginationToken>, axum::response::Response> {
     match params.get(key).map(String::as_str) {
         None | Some("") | Some("END") => Ok(None),
-        Some(s) => match s.parse::<u64>() {
-            Ok(n) if i64::try_from(n).is_ok() => Ok(Some(PaginationToken(n))),
-            _ => Err(error_response(
+        Some(s) => match s.parse::<i64>() {
+            Ok(n) => Ok(Some(PaginationToken(n))),
+            Err(_) => Err(error_response(
                 StatusCode::BAD_REQUEST,
                 "M_INVALID_PARAM",
                 &format!("'{key}' parameter is invalid"),

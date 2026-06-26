@@ -22,7 +22,7 @@ pub enum StorageError {
 pub struct StreamPos(pub u64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PaginationToken(pub u64);
+pub struct PaginationToken(pub i64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
