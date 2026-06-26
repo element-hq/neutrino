@@ -4,6 +4,11 @@ uniffi::setup_scaffolding!("neutrino");
 mod ble_android;
 #[cfg(feature = "ble")]
 mod ble_selftest;
+// The iroh-backed relay transport. Exercised by its own test now (P3a.1);
+// constructed by the entrypoint once federation is routed through it (P3a.2),
+// hence the allow until that wiring lands.
+#[allow(dead_code)]
+mod relay_transport;
 mod tunnel;
 
 /// FFI-facing server configuration. Mirrors `neutrino_common::Config` so EX

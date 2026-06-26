@@ -9,6 +9,8 @@ name = "neutrino"
 
 [dependencies]
 async-compat = "0.2.5"
+# The relay's `DatagramTransport` is an `#[async_trait]` trait we implement over iroh.
+async-trait.workspace = true
 
 # Packet logging goes through the Neutrino tracing stack (so it reaches logcat via
 # the host's subscriber).
@@ -20,6 +22,7 @@ tokio.workspace = true
 uniffi.workspace = true
 
 neutrino-main = { path = "../neutrino-main" }
+neutrino-relay = { path = "../neutrino-relay" }
 iroh = { version = "0.98.2", features = ["unstable-custom-transports"] }
 # BLE is the Android medium (`blew` over JNI); on Linux the transport's backend
 # is `bluer`, which needs system D-Bus/BlueZ. Gate it behind `ble` so the default
