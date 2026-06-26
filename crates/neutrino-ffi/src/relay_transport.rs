@@ -374,4 +374,21 @@ mod tests {
             .expect("bind");
         assert!(tp.send([9u8; 32], b"x").await.is_err());
     }
+
+    // Load-bearing cross-layer invariant: the relay's `node_key` (iroh endpoint
+    // id) must equal the ed25519 public key that neutrino-main derives the
+    // server_name + vip from for the same secret — otherwise the host would
+    // advertise/route on one vip while the relay filters on another, silently
+    // breaking federation. iroh's node id IS the raw ed25519 pubkey today; this
+    // pins it so a future iroh key-derivation change fails loudly here.
+    #[tokio::test]
+    async fn node_key_matches_ed25519_public_key() {
+        let secret = [7u8; 32];
+        let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
+        let tp = IrohTransport::bind(&secret, loopback).await.expect("bind");
+        let expected = ed25519_dalek::SigningKey::from_bytes(&secret)
+            .verifying_key()
+            .to_bytes();
+        assert_eq!(tp.node_key(), expected);
+    }
 }

@@ -3068,6 +3068,7 @@ dependencies = [
  "async-trait",
  "blew",
  "bytes",
+ "ed25519-dalek 2.2.0",
  "iroh",
  "iroh-ble-transport",
  "jni",

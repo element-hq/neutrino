@@ -48,6 +48,7 @@ ndk-context = { version = "0.1", optional = true }
 ble = ["dep:iroh-ble-transport", "dep:blew", "dep:jni", "dep:ndk-context"]
 
 [dev-dependencies]
+ed25519-dalek = "2.2.0"
 # Test-only: the iroh transport test reuses the relay's in-memory `PacketIo`
 # (its `MemPacketIo`/`ipv6_packet`) instead of duplicating them. `test-support`
 # is a dev-only feature, so production builds never compile the `mem` module.
