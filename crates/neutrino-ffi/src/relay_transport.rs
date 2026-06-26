@@ -98,6 +98,13 @@ impl IrohTransport {
         #[cfg(not(feature = "ble"))]
         let endpoint = builder.bind_addr(bind_addr)?.bind().await?;
 
+        tracing::info!(
+            node_id = %endpoint.id(),
+            sockets = ?endpoint.bound_sockets(),
+            ble = cfg!(feature = "ble"),
+            "relay transport: iroh endpoint bound"
+        );
+
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CAPACITY);
         let conns: ConnMap = Arc::new(AsyncMutex::new(HashMap::new()));
         // Spawn the accept loop with clones (endpoint/conns/tx), NOT an
@@ -188,18 +195,39 @@ impl IrohTransport {
                 return Ok(conn.clone());
             }
         }
-        let addr = self
+        let seeded = self
             .addrs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&dst)
-            .cloned()
-            .ok_or_else(|| RelayError::Io("relay: no known address for peer".to_owned()))?;
+            .cloned();
+        let addr = match seeded {
+            Some(addr) => addr,
+            // No seeded IP address. With the BLE transport present, dial by
+            // endpoint id alone and let the endpoint's `address_lookup` (the BLE
+            // mesh discovery wired in `bind`) resolve a path — this is the device
+            // path: nothing seeds `addrs` on a phone (`add_peer` is the test/LAN
+            // seam only). Without BLE (desktop/CI) an unseeded peer is genuinely
+            // unreachable, so keep failing fast.
+            #[cfg(feature = "ble")]
+            None => EndpointAddr::new(
+                EndpointId::from_bytes(&dst)
+                    .map_err(|e| RelayError::Io(format!("relay: invalid peer id: {e}")))?,
+            ),
+            #[cfg(not(feature = "ble"))]
+            None => {
+                return Err(RelayError::Io(
+                    "relay: no known address for peer".to_owned(),
+                ));
+            }
+        };
+        tracing::debug!(addrs = ?addr.addrs, "relay transport: dialing peer (by id over discovery if no addrs)");
         let conn = self
             .endpoint
             .connect(addr, RELAY_ALPN)
             .await
             .map_err(|e| RelayError::Io(format!("relay connect: {e}")))?;
+        tracing::debug!("relay transport: connection established");
         {
             let mut conns = self.conns.lock().await;
             // A live connection may have appeared while we dialed (a concurrent

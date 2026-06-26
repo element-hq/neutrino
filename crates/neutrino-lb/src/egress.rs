@@ -14,7 +14,7 @@ use axum::response::Response;
 use axum::routing::any;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::codec::{cbor_to_json, json_to_cbor};
 use crate::headers::is_forwardable;
@@ -58,7 +58,8 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
     };
     // Map the destination server_name to the address actually dialled (identity
     // on a direct network; server_name → virtual IP under the tunnel).
-    let dest = state.resolver.resolve(authority);
+    let dest = state.resolver.resolve(authority.clone());
+    debug!(%authority, %dest, "egress: forwarding federation request to resolved destination");
     let path = parts
         .uri
         .path_and_query()

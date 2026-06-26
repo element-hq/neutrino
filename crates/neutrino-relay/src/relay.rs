@@ -1,7 +1,7 @@
 use std::net::Ipv6Addr;
 use std::sync::Arc;
 
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::NodeKey;
 use crate::neighbour::NeighbourTable;
@@ -43,11 +43,13 @@ async fn egress<P: PacketIo, T: DatagramTransport>(table: &NeighbourTable, io: &
         };
         match table.lookup(&dst) {
             Some(node) => {
-                if let Err(err) = transport.send(node, &pkt).await {
-                    warn!(%err, %dst, "egress: transport send failed");
+                debug!(%dst, len = pkt.len(), "egress: routing packet to peer");
+                match transport.send(node, &pkt).await {
+                    Ok(()) => debug!(%dst, "egress: handed packet to transport"),
+                    Err(err) => warn!(%err, %dst, "egress: transport send failed"),
                 }
             }
-            None => trace!(%dst, "egress: no route for destination, dropped"),
+            None => debug!(%dst, "egress: no route for destination, dropped"),
         }
     }
 }
