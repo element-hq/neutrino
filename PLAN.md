@@ -222,9 +222,12 @@ never use .unwrap() in handler code.
   (codes 138-143: `prev_state_events`, `state_dag`, `partial_state_event_ids`,
   `partial_auth_chain_ids`, `members_omitted`, `additional_creators`). Codes 138+
   are neutrino's own (the table is no longer Dendrite-identical; fine — we federate
-  neutrino↔neutrino). Event-ID *values* in these fields auto-pack to 32 B; the
-  event-ID *keys* of `partial_auth_chain_ids` do not yet (deferred follow-up:
-  pack `$`-shaped CBOR map keys as byte-string keys).
+  neutrino↔neutrino). Event-ID *values* in these fields auto-pack to 32 B.
+- **2026-06-26:** Event-ID-shaped CBOR *map keys* now also pack to raw 32 B
+  (symmetric with values), closing the `partial_auth_chain_ids` follow-up. Encode
+  routes non-table object keys through `string_to_cbor`; decode reverses via
+  `bytes_to_event_id`. Field-agnostic (any `$`-shaped canonical key), lossless
+  (non-canonical/non-event-ID keys stay text), no panics.
 - Outbound handoff is via **reqwest proxy mode** (one `Config.federation_proxy`
   field, default `None`); no URL construction or Router change in `neutrino-http`.
 - `WireClient`/`WireServer`/`WireHandler` traits are scoped to the **wire hop
