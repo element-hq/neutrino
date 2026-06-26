@@ -58,7 +58,7 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
     };
     // Map the destination server_name to the address actually dialled (identity
     // on a direct network; server_name → virtual IP under the tunnel).
-    let dest = state.resolver.resolve(&authority);
+    let dest = state.resolver.resolve(authority);
     let path = parts
         .uri
         .path_and_query()
@@ -232,11 +232,10 @@ mod tests {
 
     // A resolver that rewrites the authority, standing in for the tunnel's
     // server_name → virtual-IP mapping.
-    #[derive(Debug)]
     struct RewriteResolver;
 
     impl DestinationResolver for RewriteResolver {
-        fn resolve(&self, authority: &str) -> String {
+        fn resolve(&self, authority: String) -> String {
             format!("rewritten[{authority}]")
         }
     }

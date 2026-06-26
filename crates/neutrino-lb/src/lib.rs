@@ -123,7 +123,7 @@ pub enum WireKind {
 }
 
 /// Runtime configuration for the sidecar.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LbConfig {
     /// Public federation port (what peers' `server_name` resolve to). The
     /// ingress reverse proxy binds here.
@@ -139,8 +139,23 @@ pub struct LbConfig {
     /// How a destination `server_name` is turned into the address the egress
     /// dials. `None` = direct dial (the authority verbatim), which is the
     /// desktop / direct-LAN behaviour. The embedded tunnel build supplies a
-    /// resolver that maps `server_name` → virtual IP and registers the route.
+    /// resolver that maps `server_name` → virtual IP.
     pub resolver: Option<Arc<dyn DestinationResolver>>,
+}
+
+// Hand-written so `DestinationResolver` needn't be `Debug` just to satisfy a
+// derive: a trait object can't print anything useful anyway, so the resolver
+// field shows only whether one is configured.
+impl std::fmt::Debug for LbConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LbConfig")
+            .field("ingress_bind", &self.ingress_bind)
+            .field("egress_bind", &self.egress_bind)
+            .field("upstream", &self.upstream)
+            .field("wire", &self.wire)
+            .field("resolver", &self.resolver.as_ref().map(|_| "<configured>"))
+            .finish()
+    }
 }
 
 use std::sync::Arc;

@@ -79,13 +79,17 @@ pub trait WireServer: Send + Sync {
 /// wire client should actually dial. The default ([`DirectResolver`]) is
 /// identity — dial the authority verbatim, as on a direct-LAN network. The
 /// embedded tunnel build injects a resolver that maps a peer's `server_name` to
-/// its virtual IP (and registers the route so the relay can carry the traffic),
-/// keeping that mapping out of the transport itself — the wire client still
-/// just dials whatever `dest` it is handed.
-pub trait DestinationResolver: Send + Sync + std::fmt::Debug {
-    /// Rewrite a destination authority (`host` or `host:port`) into the address
-    /// to dial.
-    fn resolve(&self, authority: &str) -> String;
+/// its virtual IP, keeping that mapping out of the transport itself — the wire
+/// client still just dials whatever `dest` it is handed.
+///
+/// `resolve` is a **pure** mapping with no side effects. Telling the relay how
+/// to reach a peer (route registration) is a separate concern handled when the
+/// peer's identity is first learned — not on every send through here.
+pub trait DestinationResolver: Send + Sync {
+    /// Map a destination authority (`host` or `host:port`) to the address to
+    /// dial. Takes ownership so the identity case can hand the string straight
+    /// back without re-allocating.
+    fn resolve(&self, authority: String) -> String;
 }
 
 /// Identity [`DestinationResolver`]: dial the authority unchanged. Used whenever
@@ -94,7 +98,27 @@ pub trait DestinationResolver: Send + Sync + std::fmt::Debug {
 pub struct DirectResolver;
 
 impl DestinationResolver for DirectResolver {
-    fn resolve(&self, authority: &str) -> String {
-        authority.to_owned()
+    fn resolve(&self, authority: String) -> String {
+        authority
+    }
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::*;
+
+    #[test]
+    fn direct_resolver_is_identity() {
+        let r = DirectResolver;
+        assert_eq!(r.resolve("peer.example".to_owned()), "peer.example");
+        assert_eq!(
+            r.resolve("peer.example:8448".to_owned()),
+            "peer.example:8448"
+        );
+        // IPv6 bracket form must round-trip untouched.
+        assert_eq!(
+            r.resolve("[2001:db8::1]:8448".to_owned()),
+            "[2001:db8::1]:8448"
+        );
     }
 }
