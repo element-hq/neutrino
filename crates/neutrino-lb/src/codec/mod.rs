@@ -100,6 +100,18 @@ fn string_to_cbor(s: String) -> CborValue {
     CborValue::Text(s)
 }
 
+/// Reverse of the event-id byte packing: a 32-byte CBOR byte string becomes
+/// `$`+base64url; any other length is corruption (error, never panic).
+fn bytes_to_event_id(b: &[u8]) -> Result<String, CodecError> {
+    if b.len() != 32 {
+        return Err(CodecError::CborDecode(format!(
+            "expected 32-byte event-id bytes, got {}",
+            b.len()
+        )));
+    }
+    Ok(format!("${}", URL_SAFE_NO_PAD.encode(b)))
+}
+
 /// Recursively convert a CBOR value tree into JSON, restoring integer keys to
 /// their strings and unpacking 32-byte byte strings to event ids.
 fn cbor_value_to_json(value: CborValue) -> Result<serde_json::Value, CodecError> {
@@ -123,15 +135,7 @@ fn cbor_value_to_json(value: CborValue) -> Result<serde_json::Value, CodecError>
             Some(num) => J::Number(num),
             None => return Err(CodecError::CborDecode(format!("non-finite float: {f}"))),
         },
-        CborValue::Bytes(b) => {
-            if b.len() != 32 {
-                return Err(CodecError::CborDecode(format!(
-                    "expected 32-byte event-id bytes, got {}",
-                    b.len()
-                )));
-            }
-            J::String(format!("${}", URL_SAFE_NO_PAD.encode(&b)))
-        }
+        CborValue::Bytes(b) => J::String(bytes_to_event_id(&b)?),
         CborValue::Text(s) => J::String(s),
         CborValue::Array(arr) => {
             let mut out = Vec::with_capacity(arr.len());
