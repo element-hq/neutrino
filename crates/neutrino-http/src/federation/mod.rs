@@ -23,6 +23,7 @@ use thiserror::Error;
 
 pub(crate) mod auth;
 pub(crate) mod backfill;
+pub(crate) mod backfill_out;
 pub(crate) mod client;
 pub(crate) mod gapfill;
 pub(crate) mod get_missing_events;
