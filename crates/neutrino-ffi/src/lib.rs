@@ -185,6 +185,13 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
     // or an `entrypoint` error below must be visible, not written to a stderr that
     // Android discards. Idempotent (entrypoint calls it too).
     neutrino_main::init_tracing();
+    // In this build reqwest's TLS backend is unified to rustls (pulled in by iroh)
+    // but with no default crypto provider, so building the federation client would
+    // panic ("No rustls crypto provider is configured"). The crypto provider is a
+    // process-global the embedding host must install; do it here, before the server
+    // (or iroh) builds any client. Idempotent: `install_default` returns `Err` if a
+    // provider is already set, which we ignore.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let config: neutrino_main::Config = config.into();
     // Published once the runtime is built so `start_tunnel` can spawn its reader

@@ -24,6 +24,12 @@ uniffi.workspace = true
 neutrino-main = { path = "../neutrino-main" }
 neutrino-relay = { path = "../neutrino-relay" }
 iroh = { version = "0.98.2", features = ["unstable-custom-transports"] }
+# Install rustls' default crypto provider at startup (see `start`). reqwest's TLS
+# backend is unified to rustls (via iroh) with no default provider, so the
+# federation client build panics without this. `ring` is the provider already in
+# the graph (no aws-lc-rs); pin it explicitly. rustls + ring are already
+# transitive deps, so this only exposes them — it adds no new crate to the build.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # BLE is the Android medium (`blew` over JNI); on Linux the transport's backend
 # is `bluer`, which needs system D-Bus/BlueZ. Gate it behind `ble` so the default
 # build (desktop LAN, CI) is iroh-only and needs no system Bluetooth stack. The
