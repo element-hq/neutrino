@@ -367,6 +367,16 @@ pub trait DagStore: Send + Sync {
         limit: usize,
         state_dag: bool,
     ) -> Result<Vec<Event>, StorageError>;
+
+    /// Pre:  none.
+    /// Post: returns the distinct event ids referenced as a `prev` edge by an
+    ///       event in `room_id` whose target is *not* present in `events` —
+    ///       the backward extremities, i.e. the seeds for an outbound
+    ///       `/backfill`. Empty for a fully-grounded room. Order unspecified.
+    async fn backward_extremities(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<OwnedEventId>, StorageError>;
 }
 
 /// The result of [`StagingStore::ancestry_gap`] — a snapshot of one PDU's
