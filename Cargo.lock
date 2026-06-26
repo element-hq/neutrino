@@ -3058,6 +3058,7 @@ dependencies = [
  "iroh-ble-transport",
  "jni",
  "ndk-context",
+ "neutrino-lb",
  "neutrino-main",
  "neutrino-relay",
  "tokio",

@@ -4,9 +4,11 @@ uniffi::setup_scaffolding!("neutrino");
 mod ble_android;
 #[cfg(feature = "ble")]
 mod ble_selftest;
-// The iroh-backed relay transport. Exercised by its own test now (P3a.1);
-// constructed by the entrypoint once federation is routed through it (P3a.2),
-// hence the allow until that wiring lands.
+// The iroh-backed relay transport and the tunnel routing glue (resolver +
+// route registration + assembly). Exercised by their own tests now; wired into
+// the entrypoint with the host TUN in P3b, hence the allow until then.
+#[allow(dead_code)]
+mod relay_stack;
 #[allow(dead_code)]
 mod relay_transport;
 mod tunnel;
