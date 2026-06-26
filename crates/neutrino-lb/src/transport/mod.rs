@@ -74,3 +74,27 @@ pub trait WireServer: Send + Sync {
         shutdown: CancellationToken,
     ) -> Result<(), WireError>;
 }
+
+/// Maps a destination `server_name` (the request authority) to the address the
+/// wire client should actually dial. The default ([`DirectResolver`]) is
+/// identity — dial the authority verbatim, as on a direct-LAN network. The
+/// embedded tunnel build injects a resolver that maps a peer's `server_name` to
+/// its virtual IP (and registers the route so the relay can carry the traffic),
+/// keeping that mapping out of the transport itself — the wire client still
+/// just dials whatever `dest` it is handed.
+pub trait DestinationResolver: Send + Sync + std::fmt::Debug {
+    /// Rewrite a destination authority (`host` or `host:port`) into the address
+    /// to dial.
+    fn resolve(&self, authority: &str) -> String;
+}
+
+/// Identity [`DestinationResolver`]: dial the authority unchanged. Used whenever
+/// no tunnel resolver is configured (desktop / direct-LAN federation).
+#[derive(Debug, Default, Clone)]
+pub struct DirectResolver;
+
+impl DestinationResolver for DirectResolver {
+    fn resolve(&self, authority: &str) -> String {
+        authority.to_owned()
+    }
+}

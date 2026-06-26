@@ -131,6 +131,9 @@ fn build_lb_config(
             block1_size: None,
             qblock: neutrino_lb::QBlockTuning::default(),
         },
+        // Direct dial here; the embedded (FFI) host injects the tunnel resolver
+        // once the relay is wired in (P3).
+        resolver: None,
     })
 }
 

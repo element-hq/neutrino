@@ -10,6 +10,7 @@ pub mod ingress;
 pub mod transport;
 
 pub use error::LbError;
+pub use transport::{DestinationResolver, DirectResolver};
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -135,6 +136,11 @@ pub struct LbConfig {
     pub upstream: String,
     /// Wire transport for the inter-sidecar hop. Defaults to `Http`.
     pub wire: WireKind,
+    /// How a destination `server_name` is turned into the address the egress
+    /// dials. `None` = direct dial (the authority verbatim), which is the
+    /// desktop / direct-LAN behaviour. The embedded tunnel build supplies a
+    /// resolver that maps `server_name` → virtual IP and registers the route.
+    pub resolver: Option<Arc<dyn DestinationResolver>>,
 }
 
 use std::sync::Arc;
@@ -152,6 +158,11 @@ use crate::transport::{WireClient, WireServer};
 /// is chosen by `config.wire`; egress/ingress are identical across both.
 pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), LbError> {
     let ingress_handler = Arc::new(IngressHandler::new(config.upstream.clone()));
+    // Direct dial unless the embedding host injected a tunnel resolver.
+    let resolver = config
+        .resolver
+        .clone()
+        .unwrap_or_else(|| Arc::new(DirectResolver));
     match config.wire {
         WireKind::Http => {
             let wire_client: Arc<dyn WireClient> = Arc::new(HttpWireClient::new());
@@ -161,6 +172,7 @@ pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), 
                 wire_client,
                 wire_server,
                 ingress_handler,
+                resolver,
                 shutdown,
             )
             .await
@@ -178,6 +190,7 @@ pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), 
                 wire_client,
                 wire_server,
                 ingress_handler,
+                resolver,
                 shutdown,
             )
             .await
@@ -195,6 +208,7 @@ pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), 
                 wire_client,
                 wire_server,
                 ingress_handler,
+                resolver,
                 shutdown,
             )
             .await
@@ -209,9 +223,10 @@ async fn run_pair<S: WireServer>(
     wire_client: Arc<dyn WireClient>,
     wire_server: S,
     ingress_handler: Arc<IngressHandler>,
+    resolver: Arc<dyn DestinationResolver>,
     shutdown: CancellationToken,
 ) -> Result<(), LbError> {
-    let egress = egress::serve(egress_bind, wire_client, shutdown.clone());
+    let egress = egress::serve(egress_bind, wire_client, resolver, shutdown.clone());
     let ingress = wire_server.serve(ingress_handler, shutdown.clone());
     tokio::select! {
         r = egress => r.map_err(LbError::from),
@@ -236,6 +251,7 @@ mod serve_selection_tests {
             egress_bind: free("127.0.0.1:0"),
             upstream: "http://127.0.0.1:1".to_owned(),
             wire,
+            resolver: None,
         }
     }
 

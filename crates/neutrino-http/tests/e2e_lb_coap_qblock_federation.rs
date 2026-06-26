@@ -79,6 +79,7 @@ async fn start_node(localpart: &str) -> Node {
             block1_size: Some(64),
             qblock: neutrino_lb::QBlockTuning::default(),
         },
+        resolver: None,
     };
     let lb_shutdown = shutdown.clone();
     tokio::spawn(async move {

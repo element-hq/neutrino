@@ -10,7 +10,10 @@ use axum::routing::put;
 use axum::{Json, Router};
 use neutrino_lb::codec::cbor_to_json;
 use neutrino_lb::transport::http::{HttpWireClient, HttpWireServer};
-use neutrino_lb::transport::{WireClient, WireError, WireRequest, WireResponse, WireServer};
+use neutrino_lb::transport::{
+    DestinationResolver, DirectResolver, WireClient, WireError, WireRequest, WireResponse,
+    WireServer,
+};
 use neutrino_lb::{egress, ingress::IngressHandler};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -85,8 +88,9 @@ async fn json_request_survives_egress_ingress_roundtrip() {
         wire_body: wire_body.clone(),
     });
     let et = token.clone();
+    let resolver: Arc<dyn DestinationResolver> = Arc::new(DirectResolver);
     let egress_task =
-        tokio::spawn(async move { egress::serve(egress_addr, wire_client, et).await });
+        tokio::spawn(async move { egress::serve(egress_addr, wire_client, resolver, et).await });
 
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 

@@ -18,23 +18,26 @@ use tracing::warn;
 
 use crate::codec::{cbor_to_json, json_to_cbor};
 use crate::headers::is_forwardable;
-use crate::transport::{WireClient, WireRequest};
+use crate::transport::{DestinationResolver, WireClient, WireRequest};
 
-/// Shared egress state: the wire client used to reach peers.
+/// Shared egress state: the wire client used to reach peers, and the resolver
+/// that turns a destination `server_name` into the address to dial.
 #[derive(Clone)]
 struct EgressState {
     client: Arc<dyn WireClient>,
+    resolver: Arc<dyn DestinationResolver>,
 }
 
 /// Bind the egress forward proxy on `bind` and run until `shutdown` fires.
 pub async fn serve(
     bind: SocketAddr,
     client: Arc<dyn WireClient>,
+    resolver: Arc<dyn DestinationResolver>,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
     let app = Router::new()
         .fallback(any(proxy))
-        .with_state(EgressState { client });
+        .with_state(EgressState { client, resolver });
     let listener = TcpListener::bind(bind).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
@@ -53,6 +56,9 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
         warn!(uri = %parts.uri, "egress: request missing authority (not proxied?)");
         return error_response(StatusCode::BAD_GATEWAY);
     };
+    // Map the destination server_name to the address actually dialled (identity
+    // on a direct network; server_name → virtual IP under the tunnel).
+    let dest = state.resolver.resolve(&authority);
     let path = parts
         .uri
         .path_and_query()
@@ -84,7 +90,7 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
     let wire_resp = match state
         .client
         .send(WireRequest {
-            dest: authority,
+            dest,
             method: parts.method,
             path,
             headers,
@@ -144,9 +150,14 @@ fn error_response(status: StatusCode) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::{WireError, WireResponse};
+    use crate::transport::{DirectResolver, WireError, WireResponse};
     use async_trait::async_trait;
     use std::sync::Mutex;
+
+    // Identity resolver as a trait object, for the tests that don't rewrite.
+    fn direct() -> Arc<dyn DestinationResolver> {
+        Arc::new(DirectResolver)
+    }
 
     // A WireClient that records the WireRequest and returns a canned CBOR body.
     struct RecordingClient {
@@ -177,7 +188,8 @@ mod tests {
         let token = CancellationToken::new();
         let client_dyn: Arc<dyn WireClient> = client.clone();
         let server_token = token.clone();
-        let handle = tokio::spawn(async move { serve(addr, client_dyn, server_token).await });
+        let handle =
+            tokio::spawn(async move { serve(addr, client_dyn, direct(), server_token).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Drive the egress as a forward proxy: reqwest in proxy mode emits an
@@ -218,6 +230,53 @@ mod tests {
         let _ = handle.await;
     }
 
+    // A resolver that rewrites the authority, standing in for the tunnel's
+    // server_name → virtual-IP mapping.
+    #[derive(Debug)]
+    struct RewriteResolver;
+
+    impl DestinationResolver for RewriteResolver {
+        fn resolve(&self, authority: &str) -> String {
+            format!("rewritten[{authority}]")
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_rewrites_the_dialled_destination() {
+        let client = Arc::new(RecordingClient {
+            seen: Mutex::new(None),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let token = CancellationToken::new();
+        let client_dyn: Arc<dyn WireClient> = client.clone();
+        let resolver: Arc<dyn DestinationResolver> = Arc::new(RewriteResolver);
+        let server_token = token.clone();
+        let handle =
+            tokio::spawn(async move { serve(addr, client_dyn, resolver, server_token).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let http = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{addr}")).unwrap())
+            .build()
+            .unwrap();
+        let _ = http
+            .put("http://peer.example:8448/_matrix/federation/v1/send/9")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(r#"{"ping":true}"#)
+            .send()
+            .await
+            .expect("proxied request");
+
+        // The wire client dials the resolver's output, not the raw authority.
+        let seen = client.seen.lock().unwrap().clone().unwrap();
+        assert_eq!(seen.dest, "rewritten[peer.example:8448]");
+
+        token.cancel();
+        let _ = handle.await;
+    }
+
     // A WireClient that returns a chosen status and an undecodable body.
     struct StatusClient {
         status: u16,
@@ -252,7 +311,8 @@ mod tests {
         let token = CancellationToken::new();
         let client_dyn: Arc<dyn WireClient> = client.clone();
         let server_token = token.clone();
-        let handle = tokio::spawn(async move { serve(addr, client_dyn, server_token).await });
+        let handle =
+            tokio::spawn(async move { serve(addr, client_dyn, direct(), server_token).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Direct (origin-form) request, NOT proxy mode: the request target has
@@ -289,7 +349,8 @@ mod tests {
         let token = CancellationToken::new();
         let client_dyn: Arc<dyn WireClient> = client.clone();
         let server_token = token.clone();
-        let handle = tokio::spawn(async move { serve(addr, client_dyn, server_token).await });
+        let handle =
+            tokio::spawn(async move { serve(addr, client_dyn, direct(), server_token).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let http = reqwest::Client::builder()
@@ -325,7 +386,8 @@ mod tests {
         let token = CancellationToken::new();
         let client_dyn: Arc<dyn WireClient> = client.clone();
         let server_token = token.clone();
-        let handle = tokio::spawn(async move { serve(addr, client_dyn, server_token).await });
+        let handle =
+            tokio::spawn(async move { serve(addr, client_dyn, direct(), server_token).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let http = reqwest::Client::builder()

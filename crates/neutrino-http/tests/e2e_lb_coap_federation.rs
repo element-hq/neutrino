@@ -96,6 +96,7 @@ async fn start_node(localpart: &str) -> Node {
             block1_size: Some(128),
             max_message_size: Some(512),
         },
+        resolver: None,
     };
     let lb_shutdown = shutdown.clone();
     tokio::spawn(async move {

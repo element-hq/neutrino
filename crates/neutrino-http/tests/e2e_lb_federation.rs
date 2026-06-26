@@ -89,6 +89,7 @@ async fn start_node(localpart: &str) -> Node {
         egress_bind: egress,
         upstream: format!("http://{http_addr}"),
         wire: neutrino_lb::WireKind::Http,
+        resolver: None,
     };
     let lb_shutdown = shutdown.clone();
     tokio::spawn(async move {
