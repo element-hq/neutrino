@@ -181,6 +181,10 @@ impl NeutrinoHandle {
 /// immediate; only a runaway closure can delay this thread's exit.
 #[uniffi::export]
 pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
+    // Route logs to logcat before anything that can fail: a runtime-build error
+    // or an `entrypoint` error below must be visible, not written to a stderr that
+    // Android discards. Idempotent (entrypoint calls it too).
+    neutrino_main::init_tracing();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let config: neutrino_main::Config = config.into();
     // Published once the runtime is built so `start_tunnel` can spawn its reader
@@ -205,7 +209,7 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
         {
             Ok(rt) => rt,
             Err(e) => {
-                eprintln!("failed to build runtime: {e}");
+                tracing::error!(error = %e, "neutrino: failed to build the server runtime");
                 return;
             }
         };
@@ -218,7 +222,7 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
             // command (or every `NeutrinoHandle` being dropped, which closes the
             // channel) drives `serve`'s graceful shutdown and returns here.
             if let Err(e) = neutrino_main::entrypoint(config, rx, Some(handoff_tx)).await {
-                eprintln!("entrypoint exited: {e}");
+                tracing::error!(error = %e, "neutrino: server entrypoint exited with an error");
             }
         });
         // `rt` drops here on this OS thread (sync context — safe): the executor

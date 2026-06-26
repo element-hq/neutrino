@@ -18,7 +18,7 @@ use std::time::Duration;
 use neutrino_main::{Command, Config};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 /// Reserve an ephemeral loopback port and free it. A small bind race is
 /// unavoidable (the server re-binds it); the readiness sleep below covers it,
@@ -214,6 +214,57 @@ async fn entrypoint_tears_down_sidecar_when_homeserver_stops() {
         tokio::net::UdpSocket::bind(ingress).await.is_ok(),
         "ingress UDP port still held after teardown — sidecar did not stop"
     );
+}
+
+/// The embedded/mobile FFI config specifically: an **empty** `server_name` (so
+/// the identity is derived from the persisted secret) launched **with a handoff**
+/// (so `peer_sink` is wired into the homeserver). The other tests here use a
+/// concrete name and `None`, so this is the only one exercising the exact shape
+/// `neutrino-ffi::start` builds. Asserts the server stays up at startup (an early
+/// return would have dropped the listener — the failure mode that, on device,
+/// only surfaced as a silently-swallowed error) and that the handoff publishes a
+/// resolved 64-hex identity.
+#[tokio::test]
+async fn embedded_config_with_handoff_comes_up_and_publishes_identity() {
+    let hs = free_port().await;
+    let ingress = free_port().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config = Config {
+        server_name: String::new(),
+        bind_addr: hs.to_string(),
+        localpart: "n".to_string(),
+        storage_dir: tmp.path().to_path_buf(),
+        lb_federation_port: Some(ingress.port()),
+        ..Default::default()
+    };
+
+    let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (handoff_tx, handoff_rx) = watch::channel(None);
+    let handle = tokio::spawn(async move {
+        neutrino_main::entrypoint(config, cmd_rx, Some(handoff_tx))
+            .await
+            .map_err(|e| e.to_string())
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !handle.is_finished(),
+        "embedded entrypoint exited at startup: {:?}",
+        handle.await.expect("join")
+    );
+
+    let published = handoff_rx.borrow();
+    let handoff = published
+        .as_ref()
+        .expect("entrypoint must publish the handoff once identity resolves");
+    assert_eq!(
+        handoff.server_name().len(),
+        64,
+        "derived identity should be a 64-char hex node id, got {:?}",
+        handoff.server_name()
+    );
+    drop(published);
+    handle.abort();
 }
 
 /// #11, sidecar-fails-first arm: if the public ingress port is already taken the

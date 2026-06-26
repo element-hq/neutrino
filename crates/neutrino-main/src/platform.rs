@@ -132,4 +132,36 @@ pub fn init_tracing() {
             .with(fmt_layer.with_filter(filter))
             .try_init();
     }
+
+    install_panic_logger();
+}
+
+/// Route panics through the tracing subscriber installed above (and so to logcat
+/// on Android), once. Without this a panic on a server task — an `unwrap` in a
+/// serve future, say — unwinds to Rust's default hook, which writes to stderr;
+/// Android discards stderr, so the server would vanish (its listener dropped)
+/// with nothing in the log. The previous hook is chained so any host-installed
+/// reporting (e.g. matrix-rust-sdk's) still runs.
+fn install_panic_logger() {
+    use std::sync::Once;
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map(|l| l.to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            let message = info
+                .payload()
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("<non-string panic payload>");
+            // `target: "neutrino_main"` so the Android filter (targets starting
+            // with `neutrino`) captures it.
+            tracing::error!(target: "neutrino_main", %location, "panic in neutrino server: {message}");
+            previous(info);
+        }));
+    });
 }

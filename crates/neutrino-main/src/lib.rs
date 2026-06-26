@@ -72,12 +72,21 @@ impl TunnelHandoff {
     }
 }
 
+/// Install the tracing subscriber that routes our logs to the platform sink
+/// (logcat on Android). Idempotent. [`entrypoint`] calls this itself, but an
+/// embedding host (the FFI) should also call it *before* spawning the server
+/// runtime so that a failure to even build the runtime — or any error returned
+/// from `entrypoint` — is logged rather than written to a stderr nothing reads.
+pub fn init_tracing() {
+    platform::init_tracing();
+}
+
 pub async fn entrypoint(
     mut config: Config,
     commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
     handoff: Option<watch::Sender<Option<TunnelHandoff>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    platform::init_tracing();
+    init_tracing();
 
     // Open the store once, here, and resolve the server's stable identity from
     // it before anything reads `config`. The same handle is threaded into the
@@ -152,11 +161,29 @@ pub async fn entrypoint(
                 r = &mut hs => {
                     shutdown.cancel();
                     let _ = (&mut lb).await;
+                    match &r {
+                        Ok(()) => tracing::info!("homeserver stopped; shut down sidecar"),
+                        Err(e) => tracing::error!(error = %e, "homeserver exited with an error"),
+                    }
                     r?;
                 }
                 // The sidecar runs until `shutdown`, so returning here means it
-                // failed. Surface the error; dropping `hs` stops the homeserver.
-                r = &mut lb => { r?; }
+                // stopped on its own — always a failure (it has no clean early
+                // exit). Surface it loudly; dropping `hs` then stops the homeserver,
+                // which is why a sidecar bind/serve failure takes the whole server
+                // down (and, before this log existed, did so silently).
+                r = &mut lb => {
+                    match &r {
+                        Ok(()) => tracing::error!(
+                            "in-process neutrino-lb sidecar returned unexpectedly; stopping homeserver"
+                        ),
+                        Err(e) => tracing::error!(
+                            error = %e,
+                            "in-process neutrino-lb sidecar failed; stopping homeserver"
+                        ),
+                    }
+                    r?;
+                }
             }
         }
         None => neutrino_http::serve(listener, config, store, commands, peer_sink).await?,
