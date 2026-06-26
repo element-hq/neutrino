@@ -280,6 +280,12 @@ pub trait StateStore: Send + Sync {
     ) -> Result<HashMap<String, Event>, StorageError>;
 
     /// Pre:  none.
+    /// Post: distinct server names with at least one `join` membership in the
+    ///       room's current state. Does NOT exclude our own server (callers
+    ///       filter). Empty if the room is unknown or has no joined members.
+    async fn joined_servers(&self, room_id: &RoomId) -> Result<Vec<OwnedServerName>, StorageError>;
+
+    /// Pre:  none.
     /// Post: returns the `room_id` of every room in which `user_id` has a current
     ///       `m.room.member` event with `content.membership = "join"`; rooms where the
     ///       user has left, been banned, or is only invited are excluded.
