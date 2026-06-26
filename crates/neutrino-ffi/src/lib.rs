@@ -11,6 +11,10 @@ mod ble_selftest;
 mod relay_stack;
 #[allow(dead_code)]
 mod relay_transport;
+// `PacketIo` over the host TUN fd. Tested in CI with a socketpair fake TUN;
+// fed the real VpnService fd by the entrypoint in P3b, hence the allow.
+#[allow(dead_code)]
+mod tun_io;
 mod tunnel;
 
 /// FFI-facing server configuration. Mirrors `neutrino_common::Config` so EX
