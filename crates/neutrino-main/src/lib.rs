@@ -20,8 +20,8 @@ use tokio_util::sync::CancellationToken;
 /// identity resolves waits rather than being lost); non-embedded callers (the
 /// dev binary) pass `None`.
 ///
-/// Fields are private (read via [`secret`](Self::secret)/[`table`](Self::table))
-/// so the node secret isn't a freely-readable public field.
+/// Fields are private (read via the accessors below) so the node secret isn't a
+/// freely-readable public field.
 #[derive(Clone)]
 pub struct TunnelHandoff {
     secret: [u8; 32],

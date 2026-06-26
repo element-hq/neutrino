@@ -148,27 +148,24 @@ impl NeutrinoHandle {
         self.tunnel.stop();
     }
 
-    /// The server's resolved federation name — its derived node id. Empty until
-    /// the server has booted and resolved its identity (call after `start`).
-    /// Since the embedded server no longer takes a configured name, this is how
-    /// the host learns the name to build user ids (`@localpart:server_name`).
-    pub fn server_name(&self) -> String {
+    /// The server's resolved federation name — its derived node id, or `None`
+    /// until the server has booted and resolved its identity (so the host can
+    /// distinguish "not ready yet" from a value rather than racing on an empty
+    /// string). Since the embedded server no longer takes a configured name,
+    /// this is how the host learns the name to build user ids
+    /// (`@localpart:server_name`).
+    pub fn server_name(&self) -> Option<String> {
         self.identity
             .borrow()
             .as_ref()
             .map(|h| h.server_name().to_owned())
-            .unwrap_or_default()
     }
 
     /// This node's own virtual IP — the address to hand `VpnService.addAddress`
-    /// (with a `/128`); the tunnel route is the whole `fd00::/8`. Empty until the
+    /// (with a `/128`); the tunnel route is the whole `fd00::/8`. `None` until the
     /// server has resolved its identity.
-    pub fn tunnel_address(&self) -> String {
-        self.identity
-            .borrow()
-            .as_ref()
-            .map(|h| h.vip().to_owned())
-            .unwrap_or_default()
+    pub fn tunnel_address(&self) -> Option<String> {
+        self.identity.borrow().as_ref().map(|h| h.vip().to_owned())
     }
 }
 

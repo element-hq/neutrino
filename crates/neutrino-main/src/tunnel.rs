@@ -6,8 +6,11 @@
 //! actual transport over the resulting virtual IPs lives in the ffi/TUN layer:
 //! - [`TunnelResolver`] rewrites the federation egress destination to the peer's
 //!   vip (so outbound CoAP/UDP is addressed into the tunnel);
-//! - [`register_route`] seeds the peer's vip→node route when it is first learned
-//!   (invite-time), so the relay can carry the first packet.
+//! - [`register_route`] seeds the peer's vip→node route, so the relay can carry
+//!   the first packet. It's driven by the outbound federation sender (via
+//!   [`TableSink`]), which calls it once per destination when it first spawns
+//!   that destination's send task — i.e. just before the first outbound PDU, not
+//!   at invite time.
 
 use std::sync::Arc;
 
