@@ -1,5 +1,7 @@
-//! In-memory implementations of the relay's two seams, used by the unit tests
-//! to exercise the full egress/ingress flow without a device or wire.
+//! In-memory implementations of the relay's two seams, for exercising the full
+//! egress/ingress flow without a device or wire. Used by this crate's own unit
+//! tests and — via the `test-support` feature — by downstream crates' tests
+//! (e.g. neutrino-ffi's iroh transport test reuses [`MemPacketIo`]).
 
 use std::collections::HashMap;
 use std::net::Ipv6Addr;
@@ -17,14 +19,14 @@ type Datagram = (NodeKey, Vec<u8>);
 /// endpoints by node key, standing in for the real wire. A cloneable handle to
 /// a shared routing table — every endpoint shares one fabric.
 #[derive(Clone, Default)]
-pub(crate) struct MemNetwork {
+pub struct MemNetwork {
     peers: Arc<Mutex<HashMap<NodeKey, mpsc::Sender<Datagram>>>>,
 }
 
 impl MemNetwork {
     /// Create an endpoint for `node`, registering its inbound queue on the
     /// fabric so other endpoints can `send` to it.
-    pub(crate) fn endpoint(&self, node: NodeKey) -> MemTransport {
+    pub fn endpoint(&self, node: NodeKey) -> MemTransport {
         let (tx, rx) = mpsc::channel(64);
         self.peers
             .lock()
@@ -38,7 +40,7 @@ impl MemNetwork {
     }
 }
 
-pub(crate) struct MemTransport {
+pub struct MemTransport {
     node: NodeKey,
     rx: AsyncMutex<mpsc::Receiver<Datagram>>,
     net: MemNetwork,
@@ -68,7 +70,7 @@ impl DatagramTransport for MemTransport {
 
 /// In-memory TUN seam. `recv` yields packets the host "wrote out"; `send`
 /// captures packets the relay delivers inward.
-pub(crate) struct MemPacketIo {
+pub struct MemPacketIo {
     outbound: AsyncMutex<mpsc::Receiver<Vec<u8>>>,
     inbound: mpsc::Sender<Vec<u8>>,
 }
@@ -76,14 +78,14 @@ pub(crate) struct MemPacketIo {
 /// Test-side handle to a [`MemPacketIo`]: [`emit`](Self::emit) plays a local
 /// process writing an outbound packet into the TUN; [`next`](Self::next)
 /// observes a packet the relay delivered inbound.
-pub(crate) struct MemPacketHost {
+pub struct MemPacketHost {
     inject: mpsc::Sender<Vec<u8>>,
     observe: AsyncMutex<mpsc::Receiver<Vec<u8>>>,
 }
 
 /// Build a paired [`MemPacketIo`] (handed to the relay) and [`MemPacketHost`]
 /// (kept by the test to drive and observe it).
-pub(crate) fn mem_packet_io() -> (MemPacketIo, MemPacketHost) {
+pub fn mem_packet_io() -> (MemPacketIo, MemPacketHost) {
     let (out_tx, out_rx) = mpsc::channel(64);
     let (in_tx, in_rx) = mpsc::channel(64);
     (
@@ -113,14 +115,14 @@ impl PacketIo for MemPacketIo {
 }
 
 impl MemPacketHost {
-    pub(crate) async fn emit(&self, packet: Vec<u8>) -> Result<(), RelayError> {
+    pub async fn emit(&self, packet: Vec<u8>) -> Result<(), RelayError> {
         self.inject
             .send(packet)
             .await
             .map_err(|err| RelayError::Io(err.to_string()))
     }
 
-    pub(crate) async fn next(&self) -> Option<Vec<u8>> {
+    pub async fn next(&self) -> Option<Vec<u8>> {
         self.observe.lock().await.recv().await
     }
 }
@@ -128,7 +130,7 @@ impl MemPacketHost {
 /// Build a minimal well-formed IPv6 packet (40-byte header + payload) with the
 /// given addresses. Only the fields the relay reads — the version nibble and
 /// the source/destination addresses — are meaningful; the rest stay zero.
-pub(crate) fn ipv6_packet(src: Ipv6Addr, dst: Ipv6Addr, payload: &[u8]) -> Vec<u8> {
+pub fn ipv6_packet(src: Ipv6Addr, dst: Ipv6Addr, payload: &[u8]) -> Vec<u8> {
     let mut pkt = vec![0u8; 40];
     pkt[0] = 0x60; // version 6, traffic class 0
     pkt[8..24].copy_from_slice(&src.octets());

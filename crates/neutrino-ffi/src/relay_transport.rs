@@ -6,11 +6,13 @@
 //! Carries one IP packet per unreliable QUIC datagram between endpoints. iroh
 //! is confined to this layer (the TUN side); `neutrino-relay` stays
 //! transport-agnostic and speaks only `NodeKey` ([`u8; 32`]). QUIC datagrams
-//! are per-connection, so the transport owns a `NodeKey → Connection` table
-//! (populated by both dialing and accepting — a connection is bidirectional, so
-//! one accepted from a peer is reused to send back to it) plus an accept loop
-//! whose per-connection reader tags each inbound datagram with the
-//! cryptographically-authenticated remote node id.
+//! are per-connection, so the transport keeps a `NodeKey → Connection`
+//! send-side table (populated by dialing on egress and by accepting — a
+//! connection is bidirectional, so one accepted from a peer is reused to send
+//! back). Every connection (dialed or accepted) gets a reader task that tags
+//! each inbound datagram with the cryptographically-authenticated remote node
+//! id; a reader removes its own send-side entry when its connection dies, so
+//! the next send re-dials instead of reusing a dead connection.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -18,8 +20,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use iroh::endpoint::Connection;
 use iroh::endpoint::presets::N0DisableRelay;
+use iroh::endpoint::{Connection, VarInt};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use neutrino_relay::{DatagramTransport, NodeKey, RelayError};
 use tokio::sync::Mutex as AsyncMutex;
@@ -33,11 +35,12 @@ const RELAY_ALPN: &[u8] = b"neutrino/iroh-relay/0";
 /// (back-pressure onto the wire, which is acceptable for a best-effort link).
 const INBOUND_CAPACITY: usize = 256;
 
+/// Send-side route table: the connection to use for sending to each peer.
+type ConnMap = Arc<AsyncMutex<HashMap<NodeKey, Connection>>>;
+
 pub(crate) struct IrohTransport {
     endpoint: Endpoint,
-    /// Live connections keyed by peer, populated by dialing (egress) and
-    /// accepting (a peer dialed us).
-    conns: AsyncMutex<HashMap<NodeKey, Connection>>,
+    conns: ConnMap,
     /// Where to reach a peer. Seeded out of band — service discovery on device,
     /// the test seeds loopback addresses. A peer with no entry that has never
     /// dialed us cannot be reached.
@@ -53,19 +56,17 @@ impl IrohTransport {
     pub(crate) async fn bind(
         secret: &[u8; 32],
         bind_addr: SocketAddr,
-    ) -> Result<Arc<Self>, RelayError> {
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
         let endpoint = Endpoint::builder(N0DisableRelay)
             .secret_key(SecretKey::from_bytes(secret))
             .alpns(vec![RELAY_ALPN.to_vec()])
-            .bind_addr(bind_addr)
-            .map_err(|e| RelayError::Io(format!("relay endpoint bind addr: {e}")))?
+            .bind_addr(bind_addr)?
             .bind()
-            .await
-            .map_err(|e| RelayError::Io(format!("relay endpoint bind: {e}")))?;
+            .await?;
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CAPACITY);
         let this = Arc::new(Self {
             endpoint,
-            conns: AsyncMutex::new(HashMap::new()),
+            conns: Arc::new(AsyncMutex::new(HashMap::new())),
             addrs: Mutex::new(HashMap::new()),
             inbound_tx,
             inbound_rx: AsyncMutex::new(inbound_rx),
@@ -113,22 +114,44 @@ impl IrohTransport {
         });
     }
 
-    /// Register a live connection (dialed or accepted) and start draining its
-    /// datagrams into the inbound queue.
+    /// Adopt an accepted connection: always read from it (the peer may send on
+    /// it), but only take over the send-side route if we have no live
+    /// connection to this peer yet — don't clobber an existing one (glare).
     async fn adopt(&self, conn: Connection) {
         let peer = *conn.remote_id().as_bytes();
-        self.conns.lock().await.insert(peer, conn.clone());
-        Self::spawn_reader(peer, conn, self.inbound_tx.clone());
+        {
+            let mut conns = self.conns.lock().await;
+            let vacant = match conns.get(&peer) {
+                Some(existing) => existing.close_reason().is_some(),
+                None => true,
+            };
+            if vacant {
+                conns.insert(peer, conn.clone());
+            }
+        }
+        Self::spawn_reader(peer, conn, self.conns.clone(), self.inbound_tx.clone());
     }
 
-    fn spawn_reader(peer: NodeKey, conn: Connection, tx: mpsc::Sender<(NodeKey, Vec<u8>)>) {
+    /// Drain a connection's datagrams into the inbound queue until it closes,
+    /// then drop its send-side entry iff the map still points to *this*
+    /// connection — so the next send re-dials and we never evict a newer one.
+    fn spawn_reader(
+        peer: NodeKey,
+        conn: Connection,
+        conns: ConnMap,
+        tx: mpsc::Sender<(NodeKey, Vec<u8>)>,
+    ) {
+        let conn_id = conn.stable_id();
         tokio::spawn(async move {
-            // `read_datagram` errors when the connection closes; that ends the
-            // reader. Each datagram is one IP packet (the relay's invariant).
+            // `read_datagram` errors only on connection close — terminal.
             while let Ok(bytes) = conn.read_datagram().await {
                 if tx.send((peer, bytes.to_vec())).await.is_err() {
                     break; // the relay dropped its receiver
                 }
+            }
+            let mut map = conns.lock().await;
+            if map.get(&peer).map(Connection::stable_id) == Some(conn_id) {
+                map.remove(&peer);
             }
         });
     }
@@ -137,8 +160,10 @@ impl IrohTransport {
     async fn connection(&self, dst: NodeKey) -> Result<Connection, RelayError> {
         {
             let conns = self.conns.lock().await;
-            if let Some(conn) = conns.get(&dst).cloned() {
-                return Ok(conn);
+            if let Some(conn) = conns.get(&dst)
+                && conn.close_reason().is_none()
+            {
+                return Ok(conn.clone());
             }
         }
         let addr = self
@@ -153,8 +178,25 @@ impl IrohTransport {
             .connect(addr, RELAY_ALPN)
             .await
             .map_err(|e| RelayError::Io(format!("relay connect: {e}")))?;
-        self.conns.lock().await.insert(dst, conn.clone());
-        Self::spawn_reader(dst, conn.clone(), self.inbound_tx.clone());
+        {
+            let mut conns = self.conns.lock().await;
+            // A live connection may have appeared while we dialed (a concurrent
+            // dial, or an accepted one): keep it and close our loser.
+            if let Some(existing) = conns.get(&dst)
+                && existing.close_reason().is_none()
+            {
+                let existing = existing.clone();
+                conn.close(VarInt::from_u32(0), b"superseded");
+                return Ok(existing);
+            }
+            conns.insert(dst, conn.clone());
+        }
+        Self::spawn_reader(
+            dst,
+            conn.clone(),
+            self.conns.clone(),
+            self.inbound_tx.clone(),
+        );
         Ok(conn)
     }
 }
@@ -175,67 +217,10 @@ impl DatagramTransport for IrohTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neutrino_relay::{NeighbourTable, PacketIo, run, vip};
-    use std::net::Ipv6Addr;
+    use neutrino_relay::mem::{ipv6_packet, mem_packet_io};
+    use neutrino_relay::{NeighbourTable, run, vip};
     use std::time::Duration;
     use tokio::time::timeout;
-
-    /// In-memory TUN seam for the test (the relay's own is private to it).
-    struct MemPacketIo {
-        outbound: AsyncMutex<mpsc::Receiver<Vec<u8>>>,
-        inbound: mpsc::Sender<Vec<u8>>,
-    }
-
-    struct MemHost {
-        inject: mpsc::Sender<Vec<u8>>,
-        observe: AsyncMutex<mpsc::Receiver<Vec<u8>>>,
-    }
-
-    fn mem_packet_io() -> (Arc<MemPacketIo>, MemHost) {
-        let (out_tx, out_rx) = mpsc::channel(16);
-        let (in_tx, in_rx) = mpsc::channel(16);
-        (
-            Arc::new(MemPacketIo {
-                outbound: AsyncMutex::new(out_rx),
-                inbound: in_tx,
-            }),
-            MemHost {
-                inject: out_tx,
-                observe: AsyncMutex::new(in_rx),
-            },
-        )
-    }
-
-    #[async_trait]
-    impl PacketIo for MemPacketIo {
-        async fn recv(&self) -> Option<Vec<u8>> {
-            self.outbound.lock().await.recv().await
-        }
-        async fn send(&self, packet: &[u8]) -> Result<(), RelayError> {
-            self.inbound
-                .send(packet.to_vec())
-                .await
-                .map_err(|e| RelayError::Io(e.to_string()))
-        }
-    }
-
-    impl MemHost {
-        async fn emit(&self, packet: Vec<u8>) {
-            self.inject.send(packet).await.expect("inject packet");
-        }
-        async fn next(&self) -> Option<Vec<u8>> {
-            self.observe.lock().await.recv().await
-        }
-    }
-
-    fn ipv6_packet(src: Ipv6Addr, dst: Ipv6Addr, payload: &[u8]) -> Vec<u8> {
-        let mut pkt = vec![0u8; 40];
-        pkt[0] = 0x60; // version 6
-        pkt[8..24].copy_from_slice(&src.octets());
-        pkt[24..40].copy_from_slice(&dst.octets());
-        pkt.extend_from_slice(payload);
-        pkt
-    }
 
     /// Pick a node's loopback dialing address from its bound sockets.
     fn loopback_addr(tp: &IrohTransport) -> EndpointAddr {
@@ -274,14 +259,15 @@ mod tests {
         let (a_io, a_host) = mem_packet_io();
         let (b_io, b_host) = mem_packet_io();
 
-        tokio::spawn(run(a_key, a_table, a_io, a_tp));
-        tokio::spawn(run(b_key, b_table.clone(), b_io, b_tp));
+        tokio::spawn(run(a_key, a_table, Arc::new(a_io), a_tp));
+        tokio::spawn(run(b_key, b_table.clone(), Arc::new(b_io), b_tp));
 
         // A → B.
         let to_b = b"hello-b";
         a_host
             .emit(ipv6_packet(vip(&a_key), vip(&b_key), to_b))
-            .await;
+            .await
+            .expect("emit a->b");
         let got = timeout(Duration::from_secs(10), b_host.next())
             .await
             .expect("B receives in time")
@@ -294,11 +280,23 @@ mod tests {
         let to_a = b"hello-a";
         b_host
             .emit(ipv6_packet(vip(&b_key), vip(&a_key), to_a))
-            .await;
+            .await
+            .expect("emit b->a");
         let got = timeout(Duration::from_secs(10), a_host.next())
             .await
             .expect("A receives in time")
             .expect("A channel open");
         assert_eq!(&got[40..], to_a);
+    }
+
+    // The one error the transport itself originates: a destination with no
+    // seeded address that has never dialed us is unroutable.
+    #[tokio::test]
+    async fn send_to_unknown_peer_is_an_error() {
+        let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
+        let tp = IrohTransport::bind(&[3u8; 32], loopback)
+            .await
+            .expect("bind");
+        assert!(tp.send([9u8; 32], b"x").await.is_err());
     }
 }

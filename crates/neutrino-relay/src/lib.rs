@@ -14,8 +14,8 @@ mod relay;
 mod transport;
 mod vip;
 
-#[cfg(test)]
-mod mem;
+#[cfg(any(test, feature = "test-support"))]
+pub mod mem;
 
 use thiserror::Error;
 

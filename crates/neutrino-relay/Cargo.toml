@@ -3,6 +3,11 @@ name = "neutrino-relay"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Exposes the in-memory seam implementations (`mem` module) to downstream
+# crates' tests. Off by default, so production builds never compile them.
+test-support = []
+
 [dependencies]
 async-trait.workspace = true
 thiserror.workspace = true
