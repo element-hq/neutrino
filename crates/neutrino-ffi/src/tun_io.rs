@@ -91,7 +91,7 @@ mod tests {
     use crate::relay_stack::RelayStack;
     use iroh::EndpointAddr;
     use neutrino_relay::mem::ipv6_packet;
-    use neutrino_relay::vip;
+    use neutrino_relay::{NeighbourTable, vip};
     use std::net::SocketAddr;
     use std::os::unix::net::UnixDatagram;
     use std::sync::Arc;
@@ -130,8 +130,12 @@ mod tests {
     #[tokio::test]
     async fn packet_crosses_fake_tun_relay_iroh_relay_fake_tun() {
         let lo: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
-        let a = RelayStack::build(&[1u8; 32], lo).await.expect("build A");
-        let b = RelayStack::build(&[2u8; 32], lo).await.expect("build B");
+        let a = RelayStack::build(&[1u8; 32], lo, Arc::new(NeighbourTable::new()))
+            .await
+            .expect("build A");
+        let b = RelayStack::build(&[2u8; 32], lo, Arc::new(NeighbourTable::new()))
+            .await
+            .expect("build B");
         let a_key = a.node_key();
         let b_key = b.node_key();
 
@@ -142,7 +146,7 @@ mod tests {
             .find(|s| s.ip().is_loopback())
             .expect("loopback socket");
         a.add_peer_addr(EndpointAddr::new(b.endpoint_id()).with_ip_addr(b_sock));
-        a.register_peer(&b.endpoint_id().to_string());
+        a.register(b_key);
 
         let (a_host, a_dev) = fake_tun();
         let (b_host, b_dev) = fake_tun();

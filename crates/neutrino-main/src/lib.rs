@@ -1,4 +1,5 @@
 mod platform;
+mod tunnel;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -131,9 +132,11 @@ fn build_lb_config(
             block1_size: None,
             qblock: neutrino_lb::QBlockTuning::default(),
         },
-        // Direct dial here; the embedded (FFI) host injects the tunnel resolver
-        // once the relay is wired in (P3).
-        resolver: None,
+        // The in-process sidecar is the embedded/tunnel target: map a peer's
+        // node-id `server_name` to its virtual IP so outbound federation is
+        // addressed into the tunnel. Pure and dormant for a non-node
+        // `server_name` (dev/named servers pass through to direct dial).
+        resolver: Some(Arc::new(tunnel::TunnelResolver)),
     })
 }
 

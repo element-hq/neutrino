@@ -23,9 +23,6 @@ uniffi.workspace = true
 
 neutrino-main = { path = "../neutrino-main" }
 neutrino-relay = { path = "../neutrino-relay" }
-# The tunnel resolver implements neutrino-lb's `DestinationResolver` to map a
-# federation `server_name` onto a virtual IP (injected into the lb sidecar).
-neutrino-lb = { path = "../neutrino-lb" }
 iroh = { version = "0.98.2", features = ["unstable-custom-transports"] }
 # BLE is the Android medium (`blew` over JNI); on Linux the transport's backend
 # is `bluer`, which needs system D-Bus/BlueZ. Gate it behind `ble` so the default

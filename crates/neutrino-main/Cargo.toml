@@ -15,6 +15,10 @@ tracing-subscriber.workspace = true
 neutrino-common = { path = "../neutrino-common" }
 neutrino-http = { path = "../neutrino-http" }
 neutrino-lb = { path = "../neutrino-lb" }
+# The pure relay routing layer: `vip()` (server_name→virtual IP) and the
+# `NeighbourTable` the federation resolver/route-sink populate. No iroh — that
+# stays in the ffi/TUN layer; the transport over this table is built there.
+neutrino-relay = { path = "../neutrino-relay" }
 neutrino-store = { path = "../neutrino-store" }
 neutrino-store-sqlite = { path = "../neutrino-store-sqlite" }
 
