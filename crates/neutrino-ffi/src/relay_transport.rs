@@ -63,12 +63,41 @@ impl IrohTransport {
         secret: &[u8; 32],
         bind_addr: SocketAddr,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
-        let endpoint = Endpoint::builder(N0DisableRelay)
-            .secret_key(SecretKey::from_bytes(secret))
-            .alpns(vec![RELAY_ALPN.to_vec()])
-            .bind_addr(bind_addr)?
-            .bind()
-            .await?;
+        let secret_key = SecretKey::from_bytes(secret);
+        // The BLE transport needs our public key; capture it before the key is
+        // moved into the builder.
+        #[cfg(feature = "ble")]
+        let public = secret_key.public();
+        let builder = Endpoint::builder(N0DisableRelay)
+            .secret_key(secret_key)
+            .alpns(vec![RELAY_ALPN.to_vec()]);
+
+        // On the embedded (Android) target, add the BLE custom transport
+        // *alongside* IP, so the relay reaches peers over both LAN and BLE
+        // (phones); the transport's `address_lookup` resolves peers over the BLE
+        // mesh, while LAN peers are seeded via `add_peer`. Desktop/CI is IP-only.
+        #[cfg(feature = "ble")]
+        let endpoint = {
+            // Bootstrap blew's Android JNI layer (no-op off Android), else
+            // `Central::new` panics with "JVM not initialized".
+            crate::ble_android::ensure_initialised()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            let central = Arc::new(iroh_ble_transport::Central::new().await?);
+            let peripheral = Arc::new(iroh_ble_transport::Peripheral::new().await?);
+            let ble = iroh_ble_transport::transport::BleTransport::new(public, central, peripheral)
+                .await?;
+            let lookup = ble.address_lookup();
+            let ble: Arc<dyn iroh::endpoint::transports::CustomTransport> = Arc::new(ble);
+            builder
+                .add_custom_transport(ble)
+                .address_lookup(lookup)
+                .bind_addr(bind_addr)?
+                .bind()
+                .await?
+        };
+        #[cfg(not(feature = "ble"))]
+        let endpoint = builder.bind_addr(bind_addr)?.bind().await?;
+
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CAPACITY);
         let conns: ConnMap = Arc::new(AsyncMutex::new(HashMap::new()));
         // Spawn the accept loop with clones (endpoint/conns/tx), NOT an
@@ -131,8 +160,15 @@ impl IrohTransport {
         tokio::spawn(async move {
             // `read_datagram` errors only on connection close — terminal.
             while let Ok(bytes) = conn.read_datagram().await {
-                if tx.send((peer, bytes.to_vec())).await.is_err() {
-                    break; // the relay dropped its receiver
+                // Best-effort: drop rather than block this reader (which would
+                // stall every peer's inbound — head-of-line) when the host TUN is
+                // slow to drain. Closed channel = the relay is gone → stop.
+                match tx.try_send((peer, bytes.to_vec())) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::trace!("relay transport: inbound queue full, dropping datagram");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
             let mut map = conns.lock().await;

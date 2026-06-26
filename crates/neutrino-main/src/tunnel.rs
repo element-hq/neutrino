@@ -9,6 +9,8 @@
 //! - [`register_route`] seeds the peer's vip→node route when it is first learned
 //!   (invite-time), so the relay can carry the first packet.
 
+use std::sync::Arc;
+
 use neutrino_lb::DestinationResolver;
 use neutrino_relay::{NeighbourTable, NodeKey, vip};
 use tracing::warn;
@@ -63,15 +65,31 @@ impl DestinationResolver for TunnelResolver {
     }
 }
 
-/// Record the relay route to a peer named by `server_name` (invite-time). No-op
-/// for a non-node name.
-// Wired into neutrino-http's invite/membership path (the next P3b stage); used
-// by tests until then.
-#[allow(dead_code)]
+/// Record the relay route to a peer named by `server_name`. No-op for a
+/// non-node name.
 pub(crate) fn register_route(table: &NeighbourTable, server_name: &str) {
     match parse_server_name(server_name) {
         Some((key, _port)) => table.register(key),
         None => warn!(%server_name, "tunnel: cannot register non-node server_name"),
+    }
+}
+
+/// [`neutrino_http::PeerSink`] backed by the relay's shared route table: when the
+/// homeserver first federates with a destination, register its vip→node route so
+/// the relay can carry the first outbound packet.
+pub(crate) struct TableSink {
+    table: Arc<NeighbourTable>,
+}
+
+impl TableSink {
+    pub(crate) fn new(table: Arc<NeighbourTable>) -> Self {
+        Self { table }
+    }
+}
+
+impl neutrino_http::PeerSink for TableSink {
+    fn register(&self, server_name: &str) {
+        register_route(&self.table, server_name);
     }
 }
 

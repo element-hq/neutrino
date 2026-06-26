@@ -189,6 +189,8 @@ mod tests {
         let _ = htx.send(Some(TunnelHandoff::new(
             [7u8; 32],
             Arc::new(NeighbourTable::new()),
+            String::new(),
+            String::new(),
         )));
         let _htx = htx; // keep the sender alive for the receiver
 

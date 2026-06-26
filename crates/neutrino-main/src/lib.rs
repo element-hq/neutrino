@@ -26,13 +26,27 @@ use tokio_util::sync::CancellationToken;
 pub struct TunnelHandoff {
     secret: [u8; 32],
     table: Arc<NeighbourTable>,
+    server_name: String,
+    vip: String,
 }
 
 impl TunnelHandoff {
     /// Construct a handoff. The entrypoint builds one after identity resolution;
     /// also lets the embedding layer's tests build one to exercise the relay.
-    pub fn new(secret: [u8; 32], table: Arc<NeighbourTable>) -> Self {
-        Self { secret, table }
+    /// `server_name` is the resolved name; `vip` is this node's own virtual IP
+    /// (what the host TUN binds), both surfaced to the host via FFI getters.
+    pub fn new(
+        secret: [u8; 32],
+        table: Arc<NeighbourTable>,
+        server_name: String,
+        vip: String,
+    ) -> Self {
+        Self {
+            secret,
+            table,
+            server_name,
+            vip,
+        }
     }
 
     /// The persisted node secret — the relay derives its iroh identity from it,
@@ -45,6 +59,16 @@ impl TunnelHandoff {
     /// learned here are seen by the relay.
     pub fn table(&self) -> &Arc<NeighbourTable> {
         &self.table
+    }
+
+    /// The server's resolved federation name (its node id, for the embedded host).
+    pub fn server_name(&self) -> &str {
+        &self.server_name
+    }
+
+    /// This node's own virtual IP — the address the host TUN binds (`addAddress`).
+    pub fn vip(&self) -> &str {
+        &self.vip
     }
 }
 
@@ -61,12 +85,30 @@ pub async fn entrypoint(
     let store = Arc::new(SqliteStore::open_in_dir(&config.storage_dir).await?);
     let secret = resolve_server_identity(&mut config, &store).await?;
 
-    // Hand the node secret + a shared route table to the embedding host so it can
-    // build the relay over this identity. Created only for the embedded target.
-    if let Some(handoff) = &handoff {
-        let table = Arc::new(NeighbourTable::new());
-        let _ = handoff.send(Some(TunnelHandoff { secret, table }));
-    }
+    // When embedded (a relay host is present), build the shared route table:
+    // hand it to the relay over the handoff so it can build its transport over
+    // this identity, and give the federation sender a sink that registers each
+    // outbound destination's route into the *same* table. `None` for the dev
+    // binary (no relay).
+    let peer_sink: Option<Arc<dyn neutrino_http::PeerSink>> = match &handoff {
+        Some(handoff) => {
+            let table = Arc::new(NeighbourTable::new());
+            // This node's own vip (what the host TUN binds), from the same
+            // ed25519 public key the `server_name` is derived from.
+            let node_key = ed25519_dalek::SigningKey::from_bytes(&secret)
+                .verifying_key()
+                .to_bytes();
+            let vip = neutrino_relay::vip(&node_key).to_string();
+            let _ = handoff.send(Some(TunnelHandoff::new(
+                secret,
+                table.clone(),
+                config.server_name.clone(),
+                vip,
+            )));
+            Some(Arc::new(tunnel::TableSink::new(table)))
+        }
+        None => None,
+    };
 
     // Embedded low-bandwidth sidecar: when `lb_federation_port` is set we run a
     // `neutrino-lb` proxy in-process beside the homeserver (the embedded-on-
@@ -102,7 +144,7 @@ pub async fn entrypoint(
             );
             let shutdown = CancellationToken::new();
             let lb = neutrino_lb::serve(lb_config, shutdown.clone());
-            let hs = neutrino_http::serve(listener, config, store, commands);
+            let hs = neutrino_http::serve(listener, config, store, commands, peer_sink);
             tokio::pin!(lb, hs);
             tokio::select! {
                 // The homeserver owns the command channel, so it drives the
@@ -117,7 +159,7 @@ pub async fn entrypoint(
                 r = &mut lb => { r?; }
             }
         }
-        None => neutrino_http::serve(listener, config, store, commands).await?,
+        None => neutrino_http::serve(listener, config, store, commands, peer_sink).await?,
     }
     Ok(())
 }

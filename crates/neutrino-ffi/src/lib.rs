@@ -18,7 +18,6 @@ mod tunnel;
 /// in `Config::default`/`from_env` for the dev binary.
 #[derive(uniffi::Record)]
 pub struct NeutrinoConfig {
-    pub server_name: String,
     pub bind_addr: String,
     pub localpart: String,
     /// Absolute path to a writable directory the host owns (e.g. Android's
@@ -36,7 +35,11 @@ pub struct NeutrinoConfig {
 impl From<NeutrinoConfig> for neutrino_main::Config {
     fn from(c: NeutrinoConfig) -> Self {
         neutrino_main::Config {
-            server_name: c.server_name,
+            // The embedded server has no operator-set name: it always derives its
+            // identity (a node id) from the persisted secret. An empty
+            // `server_name` triggers that derivation in the entrypoint; the host
+            // reads the result back via `NeutrinoHandle::server_name()`.
+            server_name: String::new(),
             bind_addr: c.bind_addr,
             localpart: c.localpart,
             storage_dir: std::path::PathBuf::from(c.storage_dir),
@@ -79,6 +82,9 @@ pub struct NeutrinoHandle {
     /// the VPN is toggled on/off (each toggle a fresh fd) separately from the
     /// homeserver's lifetime, so it has its own start/stop. Idle by default.
     tunnel: tunnel::Tunnel,
+    /// The server identity, published by the entrypoint once resolved. Read by
+    /// `server_name()` / `tunnel_address()`; empty until the server has booted.
+    identity: tokio::sync::watch::Receiver<Option<neutrino_main::TunnelHandoff>>,
 }
 
 #[uniffi::export]
@@ -140,6 +146,29 @@ impl NeutrinoHandle {
     /// running is a no-op. Called on VPN toggle-off and teardown.
     pub fn stop_tunnel(&self) {
         self.tunnel.stop();
+    }
+
+    /// The server's resolved federation name — its derived node id. Empty until
+    /// the server has booted and resolved its identity (call after `start`).
+    /// Since the embedded server no longer takes a configured name, this is how
+    /// the host learns the name to build user ids (`@localpart:server_name`).
+    pub fn server_name(&self) -> String {
+        self.identity
+            .borrow()
+            .as_ref()
+            .map(|h| h.server_name().to_owned())
+            .unwrap_or_default()
+    }
+
+    /// This node's own virtual IP — the address to hand `VpnService.addAddress`
+    /// (with a `/128`); the tunnel route is the whole `fd00::/8`. Empty until the
+    /// server has resolved its identity.
+    pub fn tunnel_address(&self) -> String {
+        self.identity
+            .borrow()
+            .as_ref()
+            .map(|h| h.vip().to_owned())
+            .unwrap_or_default()
     }
 }
 
@@ -203,9 +232,11 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
         // stop the closure), so a runaway write can delay this thread's exit.
         // Normal writes are sub-millisecond, so in practice teardown is immediate.
     });
+    let identity = handoff_rx.clone();
     NeutrinoHandle {
         tx,
         tunnel: tunnel::Tunnel::new(runtime, handoff_rx),
+        identity,
     }
 }
 
@@ -216,7 +247,6 @@ mod tests {
     #[test]
     fn neutrino_config_maps_to_internal_config() {
         let nc = NeutrinoConfig {
-            server_name: "hs.example".to_string(),
             bind_addr: "127.0.0.1:8008".to_string(),
             localpart: "alice".to_string(),
             storage_dir: "/data/neutrino".to_string(),
@@ -224,7 +254,8 @@ mod tests {
             lb_federation_port: Some(8448),
         };
         let cfg: neutrino_main::Config = nc.into();
-        assert_eq!(cfg.server_name, "hs.example");
+        // Dropped from the FFI surface → empty, which triggers identity derivation.
+        assert_eq!(cfg.server_name, "");
         assert_eq!(cfg.bind_addr, "127.0.0.1:8008");
         assert_eq!(cfg.localpart, "alice");
         assert_eq!(cfg.storage_dir, std::path::PathBuf::from("/data/neutrino"));
@@ -247,6 +278,7 @@ mod tests {
                 std::sync::Arc::new(std::sync::OnceLock::new()),
                 tokio::sync::watch::channel::<Option<neutrino_main::TunnelHandoff>>(None).1,
             ),
+            identity: tokio::sync::watch::channel::<Option<neutrino_main::TunnelHandoff>>(None).1,
         };
         handle.shutdown();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::Shutdown);
@@ -264,6 +296,7 @@ mod tests {
                 std::sync::Arc::new(std::sync::OnceLock::new()),
                 tokio::sync::watch::channel::<Option<neutrino_main::TunnelHandoff>>(None).1,
             ),
+            identity: tokio::sync::watch::channel::<Option<neutrino_main::TunnelHandoff>>(None).1,
         };
         handle.kick_backoff();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::KickBackoff);
@@ -274,7 +307,6 @@ mod tests {
         // Guards against a regression where the clamp emits a constant 1
         // rather than flooring: a non-zero value must pass through unchanged.
         let nc = NeutrinoConfig {
-            server_name: "hs.example".to_string(),
             bind_addr: "127.0.0.1:8008".to_string(),
             localpart: "alice".to_string(),
             storage_dir: "/data/neutrino".to_string(),
