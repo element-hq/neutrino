@@ -24,13 +24,13 @@
 //! `O_NONBLOCK` before handing it over (Android: `Os.fcntlInt(fd, F_SETFL,
 //! O_NONBLOCK)` before `detachFd()`).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use neutrino_main::TunnelHandoff;
-use neutrino_relay::NeighbourTable;
 use tokio::runtime::Handle;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::relay_stack::RelayStack;
@@ -38,7 +38,7 @@ use crate::tun_io::TunPacketIo;
 
 /// UDP bind for the relay's iroh endpoint. Ephemeral port; service discovery
 /// (mDNS/BLE) will advertise the bound address to peers (not yet wired).
-const RELAY_BIND: &str = "0.0.0.0:0";
+const RELAY_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 
 /// Owns the running tunnel relay task, if any. Held by `NeutrinoHandle`; cheap to
 /// construct (no task, no fd) so it can sit on an idle handle.
@@ -47,8 +47,9 @@ pub(crate) struct Tunnel {
     /// relay is spawned onto it, so it is cancelled when the homeserver stops.
     runtime: Arc<OnceLock<Handle>>,
     /// The node secret + shared route table, published by the entrypoint once the
-    /// server identity is resolved. The relay is built over these.
-    handoff: Arc<OnceLock<TunnelHandoff>>,
+    /// server identity is resolved. The relay task awaits it (so a start that
+    /// races ahead of identity resolution waits rather than losing the tunnel).
+    handoff: watch::Receiver<Option<TunnelHandoff>>,
     /// The running relay task, if any. Aborting it stops the relay and closes the
     /// fd (its `TunPacketIo` drops).
     task: Mutex<Option<JoinHandle<()>>>,
@@ -57,7 +58,7 @@ pub(crate) struct Tunnel {
 impl Tunnel {
     pub(crate) fn new(
         runtime: Arc<OnceLock<Handle>>,
-        handoff: Arc<OnceLock<TunnelHandoff>>,
+        handoff: watch::Receiver<Option<TunnelHandoff>>,
     ) -> Self {
         Tunnel {
             runtime,
@@ -82,15 +83,6 @@ impl Tunnel {
             );
             return;
         };
-        let Some(handoff) = self.handoff.get() else {
-            tracing::error!(
-                target: "neutrino::tunnel",
-                "start_tunnel before the server identity is ready; ignoring",
-            );
-            return;
-        };
-        let secret = handoff.secret;
-        let table = handoff.table.clone();
 
         // Recover from a poisoned lock: the state is just an Option<task>.
         let mut guard = self.task.lock().unwrap_or_else(|e| e.into_inner());
@@ -100,7 +92,9 @@ impl Tunnel {
             tracing::warn!(target: "neutrino::tunnel", "start_tunnel while already running; replacing existing relay");
             old.abort();
         }
-        *guard = Some(runtime.spawn(relay_driver(secret, table, tun, mtu)));
+        // The relay task awaits the handoff, so a fd handed over before the
+        // server identity resolves waits (holding the fd) rather than being lost.
+        *guard = Some(runtime.spawn(relay_driver(self.handoff.clone(), tun, mtu)));
         tracing::info!(target: "neutrino::tunnel", "tunnel relay starting: fd={tun_fd}, mtu={mtu}");
     }
 
@@ -124,19 +118,25 @@ impl Drop for Tunnel {
 /// Build the relay over the persisted identity + shared table and carry packets
 /// between the host TUN `tun` and the wire until the task is aborted (stop /
 /// runtime teardown).
-async fn relay_driver(secret: [u8; 32], table: Arc<NeighbourTable>, tun: OwnedFd, mtu: u32) {
+async fn relay_driver(mut handoff: watch::Receiver<Option<TunnelHandoff>>, tun: OwnedFd, mtu: u32) {
     // Clamping the TUN MTU below the iroh datagram limit (so a packet is never
     // dropped as too-large) is a relay-layer concern not yet wired; the host
     // sets the MTU for now.
     let _ = mtu;
-    let bind: SocketAddr = match RELAY_BIND.parse() {
-        Ok(addr) => addr,
-        Err(e) => {
-            tracing::error!(target: "neutrino::tunnel", "invalid relay bind addr ({e})");
+    // Wait for the entrypoint to publish the identity + shared table. This may
+    // already be set (fd arrived after boot) or pending (fd raced ahead).
+    let handoff = match handoff.wait_for(Option::is_some).await {
+        Ok(guard) => (*guard).clone(),
+        Err(_) => {
+            tracing::error!(target: "neutrino::tunnel", "server stopped before identity resolved; tunnel not started");
             return;
         }
     };
-    let stack = match RelayStack::build(&secret, bind, table).await {
+    let Some(handoff) = handoff else {
+        return; // unreachable: `wait_for` guaranteed `is_some`
+    };
+    let stack = match RelayStack::build(handoff.secret(), RELAY_BIND, handoff.table().clone()).await
+    {
         Ok(stack) => stack,
         Err(e) => {
             tracing::error!(target: "neutrino::tunnel", "relay endpoint build failed ({e}); tunnel not started");
@@ -152,4 +152,58 @@ async fn relay_driver(secret: [u8; 32], table: Arc<NeighbourTable>, tun: OwnedFd
     };
     tracing::info!(target: "neutrino::tunnel", "tunnel relay up");
     stack.drive(io).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use neutrino_relay::NeighbourTable;
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::net::UnixDatagram;
+    use std::time::Duration;
+
+    fn empty_handoff() -> watch::Receiver<Option<TunnelHandoff>> {
+        watch::channel(None).1
+    }
+
+    // No runtime published → start is a no-op, but it still OWNS and closes the
+    // fd it was handed (the host end then sees EOF) rather than leaking it.
+    #[test]
+    fn start_without_runtime_closes_the_fd() {
+        let (host, dev) = UnixDatagram::pair().expect("socketpair");
+        let dev_fd = dev.into_raw_fd();
+        let tunnel = Tunnel::new(Arc::new(OnceLock::new()), empty_handoff());
+        tunnel.start(dev_fd, 1500);
+        // Sending to the now-closed peer fails (ECONNREFUSED), confirming close.
+        assert!(host.send(b"probe").is_err());
+    }
+
+    // Full lifecycle: start waits for the handoff, builds the relay over real
+    // iroh + the TUN fd, and stop aborts it — closing the fd.
+    #[tokio::test]
+    async fn start_builds_relay_then_stop_closes_the_fd() {
+        let runtime = Arc::new(OnceLock::new());
+        let _ = runtime.set(tokio::runtime::Handle::current());
+        let (htx, hrx) = watch::channel(None);
+        // A real (any 32-byte) secret + a fresh shared table.
+        let _ = htx.send(Some(TunnelHandoff::new(
+            [7u8; 32],
+            Arc::new(NeighbourTable::new()),
+        )));
+        let _htx = htx; // keep the sender alive for the receiver
+
+        let (host, dev) = UnixDatagram::pair().expect("socketpair");
+        dev.set_nonblocking(true).expect("nonblock dev");
+        let dev_fd = dev.into_raw_fd();
+
+        let tunnel = Tunnel::new(runtime, hrx);
+        tunnel.start(dev_fd, 1500);
+        // Let the relay task resolve the handoff + bind the iroh endpoint.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tunnel.stop();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The relay's TunPacketIo dropped on abort → dev fd closed → send fails.
+        assert!(host.send(b"probe").is_err());
+    }
 }

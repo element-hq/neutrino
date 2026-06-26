@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use iroh::{EndpointAddr, EndpointId};
 use neutrino_relay::{NeighbourTable, NodeKey, PacketIo, run};
+#[cfg(test)]
 use tokio::task::JoinHandle;
 
 use crate::relay_transport::IrohTransport;
@@ -25,11 +26,6 @@ pub(crate) struct RelayStack {
     table: Arc<NeighbourTable>,
 }
 
-// `build`/`drive`/`node_key` are live (driven by the tunnel); the discovery
-// accessors (`add_peer_addr`/`endpoint_id`/`bound_sockets`) are wired when
-// service discovery lands, and `register`/`spawn` are test seeders — allow until
-// then.
-#[allow(dead_code)]
 impl RelayStack {
     /// Build the transport (identity derived from `secret`) over a `table`
     /// shared with the federation routing layer in `neutrino-main`.
@@ -49,30 +45,38 @@ impl RelayStack {
         self.transport.node_key()
     }
 
-    /// Record a route to a peer by node key (the relay/test counterpart to
-    /// `neutrino-main`'s name-based `register_route`).
+    /// Record a route to a peer by node key. Live registration goes through
+    /// `neutrino-main`'s name-based `register_route` on the shared table; this is
+    /// the by-key counterpart used to seed routes in tests.
+    #[cfg(test)]
     pub(crate) fn register(&self, node: NodeKey) {
         self.table.register(node);
     }
 
+    // Discovery accessors: wired when service discovery (mDNS/BLE) lands; until
+    // then they're used only via the tests.
     /// Seed how to reach a peer (service discovery on device; the test seeds a
     /// loopback address).
+    #[allow(dead_code)]
     pub(crate) fn add_peer_addr(&self, addr: EndpointAddr) {
         self.transport.add_peer(addr);
     }
 
     /// This endpoint's id, for building its own advertised [`EndpointAddr`].
+    #[allow(dead_code)]
     pub(crate) fn endpoint_id(&self) -> EndpointId {
         self.transport.endpoint_id()
     }
 
     /// The sockets the transport is bound to.
+    #[allow(dead_code)]
     pub(crate) fn bound_sockets(&self) -> Vec<SocketAddr> {
         self.transport.bound_sockets()
     }
 
-    /// Spawn the relay loop on the current runtime, carrying IP packets between
-    /// `io` (the host TUN) and the wire. Runs until a seam closes.
+    /// Spawn the relay loop on the current runtime (the live path uses [`drive`]
+    /// so it can be aborted by the tunnel task; this detached form is for tests).
+    #[cfg(test)]
     pub(crate) fn spawn<P: PacketIo + 'static>(&self, io: Arc<P>) -> JoinHandle<()> {
         tokio::spawn(run(
             self.node_key(),

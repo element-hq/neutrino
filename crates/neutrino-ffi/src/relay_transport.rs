@@ -26,6 +26,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use neutrino_relay::{DatagramTransport, NodeKey, RelayError};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::warn;
 
 /// ALPN for the federation packet relay.
@@ -47,6 +48,11 @@ pub(crate) struct IrohTransport {
     addrs: Mutex<HashMap<NodeKey, EndpointAddr>>,
     inbound_tx: mpsc::Sender<(NodeKey, Vec<u8>)>,
     inbound_rx: AsyncMutex<mpsc::Receiver<(NodeKey, Vec<u8>)>>,
+    /// The accept-loop task. Aborted on drop so the endpoint (and its UDP
+    /// socket) can close — the loop captures only clones, never an `Arc<Self>`,
+    /// so it doesn't keep this transport alive (which would leak an endpoint per
+    /// VPN re-toggle).
+    accept_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl IrohTransport {
@@ -64,15 +70,22 @@ impl IrohTransport {
             .bind()
             .await?;
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CAPACITY);
-        let this = Arc::new(Self {
+        let conns: ConnMap = Arc::new(AsyncMutex::new(HashMap::new()));
+        // Spawn the accept loop with clones (endpoint/conns/tx), NOT an
+        // `Arc<Self>` — so the transport isn't kept alive by its own loop.
+        let accept_task = tokio::spawn(accept_loop(
+            endpoint.clone(),
+            conns.clone(),
+            inbound_tx.clone(),
+        ));
+        Ok(Arc::new(Self {
             endpoint,
-            conns: Arc::new(AsyncMutex::new(HashMap::new())),
+            conns,
             addrs: Mutex::new(HashMap::new()),
             inbound_tx,
             inbound_rx: AsyncMutex::new(inbound_rx),
-        });
-        this.clone().spawn_accept_loop();
-        Ok(this)
+            accept_task: Mutex::new(Some(accept_task)),
+        }))
     }
 
     /// This node's identity (its iroh endpoint id) as a relay [`NodeKey`].
@@ -103,38 +116,6 @@ impl IrohTransport {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(key, addr);
-    }
-
-    fn spawn_accept_loop(self: Arc<Self>) {
-        tokio::spawn(async move {
-            while let Some(incoming) = self.endpoint.accept().await {
-                let this = self.clone();
-                tokio::spawn(async move {
-                    match incoming.await {
-                        Ok(conn) => this.adopt(conn).await,
-                        Err(err) => warn!(?err, "relay transport: inbound connection failed"),
-                    }
-                });
-            }
-        });
-    }
-
-    /// Adopt an accepted connection: always read from it (the peer may send on
-    /// it), but only take over the send-side route if we have no live
-    /// connection to this peer yet — don't clobber an existing one (glare).
-    async fn adopt(&self, conn: Connection) {
-        let peer = *conn.remote_id().as_bytes();
-        {
-            let mut conns = self.conns.lock().await;
-            let vacant = match conns.get(&peer) {
-                Some(existing) => existing.close_reason().is_some(),
-                None => true,
-            };
-            if vacant {
-                conns.insert(peer, conn.clone());
-            }
-        }
-        Self::spawn_reader(peer, conn, self.conns.clone(), self.inbound_tx.clone());
     }
 
     /// Drain a connection's datagrams into the inbound queue until it closes,
@@ -204,6 +185,59 @@ impl IrohTransport {
         );
         Ok(conn)
     }
+}
+
+impl Drop for IrohTransport {
+    fn drop(&mut self) {
+        // Stop accepting so the endpoint (and its UDP socket) can close. The
+        // accept loop holds only clones, so this Drop fires once the relay drops
+        // its `Arc<Self>` — without this, an endpoint would leak per re-toggle.
+        if let Some(task) = self
+            .accept_task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
+        }
+    }
+}
+
+/// Accept inbound connections (with clones of the shared state, not an
+/// `Arc<IrohTransport>`, so the loop never keeps the transport alive).
+async fn accept_loop(
+    endpoint: Endpoint,
+    conns: ConnMap,
+    inbound_tx: mpsc::Sender<(NodeKey, Vec<u8>)>,
+) {
+    while let Some(incoming) = endpoint.accept().await {
+        let conns = conns.clone();
+        let inbound_tx = inbound_tx.clone();
+        tokio::spawn(async move {
+            match incoming.await {
+                Ok(conn) => adopt(conn, conns, inbound_tx).await,
+                Err(err) => warn!(?err, "relay transport: inbound connection failed"),
+            }
+        });
+    }
+}
+
+/// Adopt an accepted connection: always read from it (the peer may send on it),
+/// but only take over the send-side route if we have no live connection to this
+/// peer yet — don't clobber an existing one (glare).
+async fn adopt(conn: Connection, conns: ConnMap, inbound_tx: mpsc::Sender<(NodeKey, Vec<u8>)>) {
+    let peer = *conn.remote_id().as_bytes();
+    {
+        let mut map = conns.lock().await;
+        let vacant = match map.get(&peer) {
+            Some(existing) => existing.close_reason().is_some(),
+            None => true,
+        };
+        if vacant {
+            map.insert(peer, conn.clone());
+        }
+    }
+    IrohTransport::spawn_reader(peer, conn, conns, inbound_tx);
 }
 
 #[async_trait]

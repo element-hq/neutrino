@@ -30,6 +30,11 @@ fn parse_server_name(authority: &str) -> Option<(NodeKey, Option<&str>)> {
         None => (authority, None),
     };
     let key: NodeKey = hex::decode(host).ok()?.try_into().ok()?;
+    // Reject hex that isn't a valid ed25519 public key — a real node id always
+    // is (it's how `server_name` is derived), so a non-node authority falls
+    // through to direct dial rather than resolving to an unroutable vip. Uses
+    // ed25519-dalek (already a dep), not iroh, keeping this layer iroh-free.
+    ed25519_dalek::VerifyingKey::from_bytes(&key).ok()?;
     Some((key, port))
 }
 
@@ -75,7 +80,11 @@ mod tests {
     use super::*;
 
     fn key_and_name() -> (NodeKey, String) {
-        let key = [0x11u8; 32];
+        // A real ed25519 public key, so it passes the curve-point validation in
+        // `parse_server_name` (the same kind of key a node id always is).
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32])
+            .verifying_key()
+            .to_bytes();
         (key, hex::encode(key))
     }
 

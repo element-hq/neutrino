@@ -2,7 +2,7 @@ mod platform;
 mod tunnel;
 
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 pub use neutrino_common::{Command, Config};
 
@@ -10,25 +10,48 @@ use neutrino_relay::NeighbourTable;
 use neutrino_store::IdentityStore;
 use neutrino_store_sqlite::SqliteStore;
 use rand::RngCore;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 /// Handed from the entrypoint to an embedding host (the ffi/Android layer) so it
 /// can build the iroh relay over the *same* node identity and neighbour table
-/// the federation routing layer uses here. The host populates the `OnceLock`
-/// view once the server is up; non-embedded callers (the dev binary) pass `None`.
+/// the federation routing layer uses here. Published once on a [`watch`] channel
+/// the host's relay task awaits (so a tunnel fd handed over before the server
+/// identity resolves waits rather than being lost); non-embedded callers (the
+/// dev binary) pass `None`.
+///
+/// Fields are private (read via [`secret`](Self::secret)/[`table`](Self::table))
+/// so the node secret isn't a freely-readable public field.
+#[derive(Clone)]
 pub struct TunnelHandoff {
+    secret: [u8; 32],
+    table: Arc<NeighbourTable>,
+}
+
+impl TunnelHandoff {
+    /// Construct a handoff. The entrypoint builds one after identity resolution;
+    /// also lets the embedding layer's tests build one to exercise the relay.
+    pub fn new(secret: [u8; 32], table: Arc<NeighbourTable>) -> Self {
+        Self { secret, table }
+    }
+
     /// The persisted node secret — the relay derives its iroh identity from it,
     /// matching this server's derived `server_name`.
-    pub secret: [u8; 32],
+    pub fn secret(&self) -> &[u8; 32] {
+        &self.secret
+    }
+
     /// The route table shared with the federation resolver/route-sink, so routes
     /// learned here are seen by the relay.
-    pub table: Arc<NeighbourTable>,
+    pub fn table(&self) -> &Arc<NeighbourTable> {
+        &self.table
+    }
 }
 
 pub async fn entrypoint(
     mut config: Config,
     commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
-    handoff: Option<Arc<OnceLock<TunnelHandoff>>>,
+    handoff: Option<watch::Sender<Option<TunnelHandoff>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     platform::init_tracing();
 
@@ -42,7 +65,7 @@ pub async fn entrypoint(
     // build the relay over this identity. Created only for the embedded target.
     if let Some(handoff) = &handoff {
         let table = Arc::new(NeighbourTable::new());
-        let _ = handoff.set(TunnelHandoff { secret, table });
+        let _ = handoff.send(Some(TunnelHandoff { secret, table }));
     }
 
     // Embedded low-bandwidth sidecar: when `lb_federation_port` is set we run a

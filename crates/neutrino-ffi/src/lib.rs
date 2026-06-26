@@ -127,10 +127,11 @@ impl NeutrinoHandle {
     ///
     /// The relay runs on the server runtime, so it is cancelled automatically when
     /// the homeserver shuts down: a tunnel cannot outlive its homeserver. Calling
-    /// this before the server is up (or before its identity is resolved) is a no-op
-    /// that closes the fd. Safe to call across repeated VPN toggles: each call installs
-    /// a fresh fd, replacing any still-running relay. Pair every `start_tunnel` with a
-    /// [`Self::stop_tunnel`].
+    /// this before the runtime exists is a no-op that closes the fd; calling it
+    /// before the server *identity* is resolved is fine — the relay task waits for
+    /// it (holding the fd) rather than dropping the tunnel. Safe to call across
+    /// repeated VPN toggles: each call installs a fresh fd, replacing any
+    /// still-running relay. Pair every `start_tunnel` with a [`Self::stop_tunnel`].
     pub fn start_tunnel(&self, tun_fd: i32, mtu: u32) {
         self.tunnel.start(tun_fd, mtu);
     }
@@ -162,10 +163,10 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
         std::sync::Arc::new(std::sync::OnceLock::new());
     let runtime_publisher = std::sync::Arc::clone(&runtime);
     // The entrypoint publishes {node secret, shared route table} here once the
-    // server identity is resolved; `start_tunnel` reads it to build the relay.
-    let handoff: std::sync::Arc<std::sync::OnceLock<neutrino_main::TunnelHandoff>> =
-        std::sync::Arc::new(std::sync::OnceLock::new());
-    let handoff_publisher = std::sync::Arc::clone(&handoff);
+    // server identity is resolved; the relay task awaits it (so a `start_tunnel`
+    // that races ahead of identity resolution waits rather than losing the tunnel).
+    let (handoff_tx, handoff_rx) =
+        tokio::sync::watch::channel::<Option<neutrino_main::TunnelHandoff>>(None);
     std::thread::spawn(move || {
         // Neutrino owns its runtime. current_thread = parity with the previous
         // async-compat global (also current_thread); all DB work is offloaded to
@@ -190,7 +191,7 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
             // The command receiver is threaded into the server; a `Shutdown`
             // command (or every `NeutrinoHandle` being dropped, which closes the
             // channel) drives `serve`'s graceful shutdown and returns here.
-            if let Err(e) = neutrino_main::entrypoint(config, rx, Some(handoff_publisher)).await {
+            if let Err(e) = neutrino_main::entrypoint(config, rx, Some(handoff_tx)).await {
                 eprintln!("entrypoint exited: {e}");
             }
         });
@@ -204,7 +205,7 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
     });
     NeutrinoHandle {
         tx,
-        tunnel: tunnel::Tunnel::new(runtime, handoff),
+        tunnel: tunnel::Tunnel::new(runtime, handoff_rx),
     }
 }
 
@@ -244,7 +245,7 @@ mod tests {
             tx,
             tunnel: tunnel::Tunnel::new(
                 std::sync::Arc::new(std::sync::OnceLock::new()),
-                std::sync::Arc::new(std::sync::OnceLock::new()),
+                tokio::sync::watch::channel::<Option<neutrino_main::TunnelHandoff>>(None).1,
             ),
         };
         handle.shutdown();
@@ -261,7 +262,7 @@ mod tests {
             tx,
             tunnel: tunnel::Tunnel::new(
                 std::sync::Arc::new(std::sync::OnceLock::new()),
-                std::sync::Arc::new(std::sync::OnceLock::new()),
+                tokio::sync::watch::channel::<Option<neutrino_main::TunnelHandoff>>(None).1,
             ),
         };
         handle.kick_backoff();
