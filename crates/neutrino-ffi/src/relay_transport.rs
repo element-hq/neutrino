@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -45,6 +46,14 @@ pub(crate) const RELAY_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::U
 
 /// ALPN for the federation datagram link.
 const RELAY_ALPN: &[u8] = b"neutrino/iroh-relay/0";
+
+/// Upper bound on a single dial (id-only `connect`, resolved via BLE discovery).
+/// Without it `endpoint.connect` waits forever when discovery never finds the peer
+/// (peer not advertising / out of range / BLE unpaired), so a federation request
+/// would hang until the coap-layer timeout with no indication why. Generous enough
+/// for a real BLE discovery + QUIC handshake, short enough to surface a dead peer
+/// well before the coap request timeout.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bound on buffered inbound datagrams before the per-connection readers block
 /// (back-pressure onto the wire, which is acceptable for a best-effort link).
@@ -234,13 +243,36 @@ impl IrohTransport {
                 return Err(std::io::Error::other("link: no known address for peer"));
             }
         };
-        tracing::debug!(addrs = ?addr.addrs, "datagram link: dialing peer (by id over discovery if no addrs)");
-        let conn = self
-            .endpoint
-            .connect(addr, RELAY_ALPN)
-            .await
-            .map_err(|e| std::io::Error::other(format!("link connect: {e}")))?;
-        tracing::debug!("datagram link: connection established");
+        // Info, not debug: this is the load-bearing federation hop, and a dial that
+        // never resolves is the failure we most need to see. `peer` is the id we
+        // dial; `addrs` is empty on device (id-only, resolved via BLE discovery).
+        let peer = addr.id;
+        tracing::info!(%peer, addrs = ?addr.addrs, "datagram link: dialing peer (id-only over BLE discovery if no addrs)");
+        let conn = match tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            self.endpoint.connect(addr, RELAY_ALPN),
+        )
+        .await
+        {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                tracing::warn!(%peer, error = %e, "datagram link: connect to peer failed");
+                return Err(std::io::Error::other(format!(
+                    "link connect to {peer}: {e}"
+                )));
+            }
+            Err(_) => {
+                tracing::warn!(
+                    %peer,
+                    timeout = ?CONNECT_TIMEOUT,
+                    "datagram link: connect to peer timed out — peer unreachable (not advertising / out of BLE range / discovery found no path)"
+                );
+                return Err(std::io::Error::other(format!(
+                    "link connect to {peer} timed out after {CONNECT_TIMEOUT:?}"
+                )));
+            }
+        };
+        tracing::info!(%peer, "datagram link: connection established");
         {
             let mut conns = self.conns.lock().await;
             // A live connection may have appeared while we dialed (a concurrent
@@ -322,7 +354,13 @@ impl DatagramLink for IrohTransport {
     async fn send(&self, dst: NodeKey, datagram: &[u8]) -> std::io::Result<()> {
         let conn = self.connection(dst).await?;
         conn.send_datagram(Bytes::copy_from_slice(datagram))
-            .map_err(|e| std::io::Error::other(format!("send_datagram: {e}")))
+            .map_err(|e| {
+                // Loud: a datagram larger than the connection's max datagram size is
+                // rejected here, which would otherwise silently drop a federation
+                // block.
+                tracing::warn!(error = %e, len = datagram.len(), "datagram link: send_datagram failed (block exceeds path max datagram size?)");
+                std::io::Error::other(format!("send_datagram: {e}"))
+            })
     }
 
     async fn recv(&self) -> Option<(NodeKey, Vec<u8>)> {

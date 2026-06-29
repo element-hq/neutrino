@@ -225,7 +225,16 @@ fn build_lb_config(
         egress_bind,
         upstream: upstream_url(&config.bind_addr)?,
         wire: neutrino_lb::WireKind::CoapQBlock {
-            block1_size: None,
+            // 512 B per Q-Block1 chunk, NOT coap-rs's 1024 default. Each block's
+            // serialized PDU also carries the request's options — the federation
+            // path (`/_matrix/federation/v2/invite/!room.../$event...`, long with
+            // room+event ids) plus forwarded headers and the Q-Block/Size/
+            // Request-Tag options — and coap-lite caps a serialized message at
+            // `Packet::MAX_SIZE` (1280 B). A 1024 B block + those options exceeds
+            // 1280, so `build_block`'s `to_bytes()` fails on the very first block
+            // and the send silently stalls (coap-rs drops the error). 512 leaves
+            // ample room for options under 1280 and under the iroh datagram MTU.
+            block1_size: Some(512),
             qblock: neutrino_lb::QBlockTuning::default(),
         },
         // The in-process sidecar is the embedded/datagram-link target: map a

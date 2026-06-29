@@ -455,6 +455,11 @@ impl WireClient for IrohCoapWireClient {
             ));
         }
         let node = parse_node(&req.dest)?;
+        // Per-request federation egress trace: the destination node, the request,
+        // and the body size (the load-bearing field — a body over the Q-Block
+        // block size must fit `block size + option overhead` within coap-lite's
+        // 1280 message cap, which is why `block1_size` is kept small).
+        tracing::debug!(dest = %req.dest, method = %req.method, path = %req.path, body_len = req.body.len(), qblock = self.qblock.is_some(), "datagram wire: dispatching federation request");
         let client = self.client_for(node).await;
         let token = self.next_token();
         let result = exchange(
@@ -466,6 +471,14 @@ impl WireClient for IrohCoapWireClient {
             self.request_timeout,
         )
         .await;
+        match &result {
+            Ok(r) => {
+                tracing::debug!(dest = %req.dest, status = r.status, "datagram wire: federation request completed")
+            }
+            Err(e) => {
+                tracing::warn!(dest = %req.dest, error = %e, "datagram wire: federation request failed")
+            }
+        }
         // On failure drop the pooled client: ends the stale receive task and
         // forces a fresh inbox registration on the next send.
         if result.is_err() {
@@ -765,6 +778,85 @@ mod tests {
             .expect("qblock send");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, req_body, "qblock body corrupted");
+        shutdown(token, handle).await;
+    }
+
+    // Reproduces the on-device invite stall: a long federation path + a header,
+    // 1141-byte body, with the DEFAULT 1024 block. Each Q-Block PDU also carries
+    // the request options (the long `/invite/!room.../$event...` path), and a
+    // 1024 payload + those options exceeds coap-lite's 1280 MAX_SIZE, so
+    // `build_block`'s `to_bytes()` fails on the first block and the send stalls.
+    // With a short request timeout this surfaces as an error rather than a 60s
+    // hang. This is exactly what `build_lb_config` avoids by setting block1_size
+    // to 512.
+    // The per-block CoAP PDU = the request's options (path + forwarded headers,
+    // repeated in EVERY block) + the block payload. coap-lite caps a serialized
+    // message at `Packet::MAX_SIZE` (1280 B). With the 1024 default block and a
+    // realistic federation request (long `/invite/!room/$event` path + a few
+    // hundred bytes of forwarded headers), 1024 + options exceeds 1280, so
+    // `build_block`'s `to_bytes()` fails on the first block. coap-rs's `drive_send`
+    // drops that error, so nothing is sent and the exchange hangs to its timeout —
+    // exactly the on-device invite stall. `INVITE_PATH`/`HEADERS` model that.
+    const INVITE_PATH: &str = "/_matrix/federation/v2/invite/!88A_2bLzwjMwxHxn5qqlhVZziTR6FgpPA2Id9z181ho/$XaldBICd02USS2D4qfkuKS0Zmw86YYlucgi_yB7CpkI";
+    fn invite_headers() -> Vec<(String, Vec<u8>)> {
+        // The federation `Authorization: X-Matrix` header is the heavy, always-
+        // present FORWARDABLE option (origin + destination node ids + key + sig);
+        // `content-type` etc. are dropped by the egress allowlist, but this is
+        // forwarded into every block's PDU. ~280 B — enough that a 1024 block's PDU
+        // exceeds coap-lite's 1280 cap, but a 512 block stays under it.
+        let auth = format!(
+            "X-Matrix origin=\"{}\",destination=\"{}\",key=\"ed25519:1\",sig=\"{}\"",
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(86),
+        );
+        vec![
+            ("content-type".to_owned(), b"application/cbor".to_vec()),
+            ("authorization".to_owned(), auth.into_bytes()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn qblock_long_federation_request_overflows_default_1024_block() {
+        let qcfg = coap::qblock::QBlockConfig::default();
+        let (mut client, token, handle) = rig(Some(qcfg.clone()), Some(qcfg), None, None).await;
+        client.request_timeout = std::time::Duration::from_secs(3);
+        let body: Vec<u8> = (0..1141).map(|i| (i % 251) as u8).collect();
+        let result = client
+            .send(WireRequest {
+                dest: hex_node(NODE_B),
+                method: Method::PUT,
+                path: INVITE_PATH.to_owned(),
+                headers: invite_headers(),
+                body,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "default 1024 block + a real federation request must overflow coap-lite's 1280 and stall, got {result:?}"
+        );
+        shutdown(token, handle).await;
+    }
+
+    // The fix: with block1_size=512 (what `build_lb_config` now sets), the same
+    // request round-trips — 512 payload + options stays under 1280.
+    #[tokio::test]
+    async fn qblock_long_federation_request_round_trips_with_512_block() {
+        let qcfg = coap::qblock::QBlockConfig::default();
+        let (client, token, handle) = rig(Some(qcfg.clone()), Some(qcfg), Some(512), None).await;
+        let body: Vec<u8> = (0..1141).map(|i| (i % 251) as u8).collect();
+        let resp = client
+            .send(WireRequest {
+                dest: hex_node(NODE_B),
+                method: Method::PUT,
+                path: INVITE_PATH.to_owned(),
+                headers: invite_headers(),
+                body: body.clone(),
+            })
+            .await
+            .expect("512-block long federation request must round-trip");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, body, "body corrupted");
         shutdown(token, handle).await;
     }
 

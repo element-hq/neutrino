@@ -114,17 +114,34 @@ pub fn init_tracing() {
 
         // Default (no RUST_LOG): every level from every `neutrino*` target — all of
         // our crates (`neutrino_common`, `neutrino_ffi`, …) plus any custom `target:`
-        // — and nothing from dependencies. A raw string prefix is the only way to
-        // express that in one rule: EnvFilter/Targets match on `::`-delimited path
-        // segments, so a `neutrino` directive would NOT match `neutrino_ffi`. A new
-        // neutrino crate is picked up automatically. `RUST_LOG` still overrides.
+        // — PLUS the federation transport stack we depend on. A raw string prefix is
+        // the only way to express the `neutrino*` rule: EnvFilter/Targets match on
+        // `::`-delimited path segments, so a `neutrino` directive would NOT match
+        // `neutrino_ffi`. A new neutrino crate is picked up automatically.
+        //
+        // The federation medium lives in third-party crates (`iroh_ble_transport`,
+        // `blew`, `iroh`). Without them, BLE advertise/scan/discovery/connect
+        // failures are completely invisible — the entire transport is silent, which
+        // is exactly the class of failure we must never hide. Include the BLE stack
+        // down to DEBUG and iroh's QUIC at INFO (its DEBUG/TRACE is per-packet
+        // noise). Note `Level::TRACE > … > Level::ERROR`, so `level <= DEBUG` keeps
+        // everything except TRACE. `RUST_LOG` still overrides the whole thing.
         // `boxed()` is disambiguated via UFCS: both `FilterExt` and `Layer` define it
         // for these types (EnvFilter/FilterFn are each both a filter and a layer), so
         // method syntax is ambiguous — we want the `Filter` one.
         let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
             Ok(env) => FilterExt::boxed(env),
             Err(_) => FilterExt::boxed(tracing_subscriber::filter::filter_fn(|meta| {
-                meta.target().starts_with("neutrino")
+                let target = meta.target();
+                if target.starts_with("neutrino") {
+                    true
+                } else if target.starts_with("iroh_ble_transport") || target.starts_with("blew") {
+                    *meta.level() <= tracing::Level::DEBUG
+                } else if target.starts_with("iroh") {
+                    *meta.level() <= tracing::Level::INFO
+                } else {
+                    false
+                }
             })),
         };
 
