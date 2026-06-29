@@ -33,7 +33,10 @@ All status points MUST have tests.
 ### Low-bandwidth proxy (`neutrino-lb`)
 
 An in-process sidecar that transcodes Server-Server federation **bodies**
-JSON↔CBOR behind a `WireClient`/`WireServer` trait seam. `neutrino-http` routes
+JSON↔CBOR behind a `WireClient`/`WireServer` trait seam. The codec is
+integer-key (well-known Matrix object keys → small ints; event IDs → raw 32 B;
+unknown keys/strings pass through), a port of Dendrite `internal/lb`
+(`codec::keys`). `neutrino-http` routes
 outbound federation through it via the optional `Config.federation_proxy` (`None`
 = direct, the default). The CBOR/CoAP layer is contained in this crate — out of
 Ruma's and the Router's way. Each transport has a two-homeserver join+message e2e
@@ -80,13 +83,17 @@ STEP 3 done: ffi's `IrohTransport` implements `neutrino_main::DatagramLink`
 crate are deleted. `TunnelHandoff` now carries only the resolved `server_name`.
 The federation data path is: homeserver → lb egress (CoAP/CBOR) →
 `IrohCoapWireClient` → `DatagramLink::send(node, datagram)` → iroh over BLE.
+Done:
+- Integer-key CBOR codec (Layer A; port of Dendrite `internal/lb`): all transports
+  now carry the integer-key transcode (`codec::keys`, 143 keys: 137 from Dendrite
+  + 6 MSC4242 state-DAG keys) plus event-ID
+  →raw-32 B packing with a re-encode/fall-back-to-text guard. CoAP path enums were
+  already done (`transport::coap::paths`). (MSC3079.)
 
 Deferred follow-ups (write-ups, not done):
-- Integer-key/enum-key CBOR codec (Layer A; port of Dendrite `internal/lb`): both
-  transports still carry an **opaque** JSON↔CBOR transcode. CoAP path enums are
-  done (`transport::coap::paths`). (MSC3079.)
-- Wire-size reduction for small MTUs: carry v12 room/event IDs as **raw 32 B**
-  (vs `sigil+base64`, −12 B/ID; needs a re-encode-or-fall-back-to-text guard) and
+- Wire-size reduction for small MTUs: carry v12 **room** IDs as **raw 32 B**
+  (vs `sigil+base64`, −12 B/ID; needs a re-encode-or-fall-back-to-text guard like
+  the event-ID path) and
   X-Matrix as a bare/indexed origin (~55 B → ~2–12 B; must ride every block and
   doubles as the reassembly key). send_join's real cost is its Block2 state-DAG
   response re-sending these options per block.
@@ -244,8 +251,23 @@ never use .unwrap() in handler code.
 ### neutrino-lb CBOR proxy (2026-06-16)
 - `neutrino-lb` is a **standalone sidecar proxy**; the CBOR transcode lives in it,
   not in `neutrino-http`'s HTTP layer.
-- v1 is an **opaque** JSON↔CBOR transcode (no key remapping); the integer-key /
-  enum-key codec is deferred.
+- v1 shipped an **opaque** JSON↔CBOR transcode (no key remapping). **Superseded
+  2026-06-25:** the codec now does Dendrite-style integer-key remapping
+  (`codec::keys`) + event-ID→raw-32 B packing, in place (no opaque
+  fallback). Wire bytes changed; safe because a sidecar pair always deploys
+  together. `canonical`-mode (Dendrite's test-only flag) intentionally not ported
+  (YAGNI; `serde_json` already sorts keys). Decode *errors* on a malformed CBOR
+  map key where Dendrite silently drops it — no-data-loss over Dendrite parity.
+- **2026-06-26:** Extended the key table with 6 MSC4242 state-DAG keys
+  (codes 138-143: `prev_state_events`, `state_dag`, `partial_state_event_ids`,
+  `partial_auth_chain_ids`, `members_omitted`, `additional_creators`). Codes 138+
+  are neutrino's own (the table is no longer Dendrite-identical; fine — we federate
+  neutrino↔neutrino). Event-ID *values* in these fields auto-pack to 32 B.
+- **2026-06-26:** Event-ID-shaped CBOR *map keys* now also pack to raw 32 B
+  (symmetric with values), closing the `partial_auth_chain_ids` follow-up. Encode
+  routes non-table object keys through `string_to_cbor`; decode reverses via
+  `bytes_to_event_id`. Field-agnostic (any `$`-shaped canonical key), lossless
+  (non-canonical/non-event-ID keys stay text), no panics.
 - Outbound handoff is via **reqwest proxy mode** (one `Config.federation_proxy`
   field, default `None`); no URL construction or Router change in `neutrino-http`.
 - `WireClient`/`WireServer`/`WireHandler` traits are scoped to the **wire hop
