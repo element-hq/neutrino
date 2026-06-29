@@ -30,6 +30,7 @@
 use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::sync::Arc;
+use std::sync::PoisonError;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -72,7 +73,11 @@ pub struct Hub {
     link: Arc<dyn DatagramLink>,
     /// Per-node client inbox senders. A response datagram for node `n` is pushed
     /// onto `clients[n]`; the matching `IrohClientTransport::recv` drains it.
-    clients: Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<Vec<u8>>>>,
+    /// A `std::sync::Mutex` (never held across an await — every critical section
+    /// is one map op), so the inbox can be installed *synchronously* while the
+    /// egress pool slot is claimed, keeping the pooled client and its inbox in
+    /// lockstep (see [`IrohCoapWireClient::client_for`]).
+    clients: std::sync::Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<Vec<u8>>>>,
     /// The server-side request feed. The drain task pushes inbound *requests*
     /// here; the listener takes the receiver exactly once via [`Hub::take_requests`].
     requests_tx: mpsc::UnboundedSender<NodeDatagram>,
@@ -87,7 +92,7 @@ impl Hub {
         let (requests_tx, requests_rx) = mpsc::unbounded_channel();
         let hub = Arc::new(Self {
             link,
-            clients: Mutex::new(HashMap::new()),
+            clients: std::sync::Mutex::new(HashMap::new()),
             requests_tx,
             requests_rx: Mutex::new(Some(requests_rx)),
         });
@@ -101,13 +106,16 @@ impl Hub {
         self.link.clone()
     }
 
-    /// Register (or replace) the client inbox for `node` and return its receiver.
-    /// Used by [`IrohClientTransport`] so the drain task can route this node's
-    /// response datagrams back to the matching outbound exchange.
-    async fn register_client(&self, node: [u8; 32]) -> mpsc::UnboundedReceiver<Vec<u8>> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.clients.lock().await.insert(node, tx);
-        rx
+    /// Install the inbox sender for `node`, replacing any prior one. Called by the
+    /// egress pool's *winner* (under its pool lock) so the registered inbox and the
+    /// pooled `CoAPClient` are always the same transport — a concurrent first-send
+    /// to the same node can't leave the pool pointing at one transport while the
+    /// drain task routes responses to another's (discarded) inbox.
+    fn install_client(&self, node: [u8; 32], tx: mpsc::UnboundedSender<Vec<u8>>) {
+        self.clients
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(node, tx);
     }
 
     /// Take the server-side requests receiver. Returns `None` if already taken —
@@ -119,8 +127,14 @@ impl Hub {
     /// Route one classified response datagram to its per-node client inbox.
     /// Drops (debug-logged) when no inbox is registered for `node` — e.g. a late
     /// response after the exchange's transport was dropped.
-    async fn deliver_response(&self, node: [u8; 32], bytes: Vec<u8>) {
-        match self.clients.lock().await.get(&node) {
+    fn deliver_response(&self, node: [u8; 32], bytes: Vec<u8>) {
+        let tx = self
+            .clients
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&node)
+            .cloned();
+        match tx {
             Some(tx) => {
                 if tx.send(bytes).is_err() {
                     tracing::debug!("datagram: client inbox closed, dropping response");
@@ -142,7 +156,7 @@ async fn drain_loop(hub: Arc<Hub>) {
                     tracing::debug!("datagram: requests channel closed, dropping request");
                 }
             }
-            Class::Response => hub.deliver_response(node, bytes).await,
+            Class::Response => hub.deliver_response(node, bytes),
             Class::Drop => tracing::debug!("datagram: undecodable datagram, dropping"),
         }
     }
@@ -194,15 +208,24 @@ pub(crate) fn synthetic_addr(node: [u8; 32]) -> SocketAddr {
 pub struct IrohClientTransport {
     node: [u8; 32],
     hub: Arc<Hub>,
-    /// This node's response inbox (from `Hub::register_client`). `Mutex` because
-    /// coap-rs calls `recv` from its receive loop and the trait takes `&self`.
+    /// This node's response inbox (its sender is installed into the Hub by
+    /// [`IrohCoapWireClient::client_for`] when it wins the pool slot). `Mutex`
+    /// because coap-rs calls `recv` from its receive loop and the trait takes
+    /// `&self`.
     inbox: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
 }
 
 impl IrohClientTransport {
-    async fn new(node: [u8; 32], hub: Arc<Hub>) -> Self {
-        let inbox = Mutex::new(hub.register_client(node).await);
-        Self { node, hub, inbox }
+    /// Build a transport bound to `node`, draining `inbox` for this node's response
+    /// datagrams. Construction has no shared side effect: the matching sender is
+    /// installed into the Hub by the pool winner, so a discarded losing build
+    /// registers nothing.
+    fn new(node: [u8; 32], hub: Arc<Hub>, inbox: mpsc::UnboundedReceiver<Vec<u8>>) -> Self {
+        Self {
+            node,
+            hub,
+            inbox: Mutex::new(inbox),
+        }
     }
 }
 
@@ -353,8 +376,13 @@ impl IrohCoapWireClient {
         if let Some(client) = self.pool.lock().await.get(&node).cloned() {
             return client;
         }
-        let transport = IrohClientTransport::new(node, self.hub.clone()).await;
-        let mut client = CoAPClient::from_transport(transport);
+        // Build the (cheap, I/O-free) transport + client outside the pool lock; its
+        // inbox sender (`tx`) is installed into the Hub only if we win the slot
+        // below, so a losing concurrent first-send registers nothing and is just
+        // dropped (its `rx` dies with it).
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut client =
+            CoAPClient::from_transport(IrohClientTransport::new(node, self.hub.clone(), rx));
         if let Some(size) = self.block1_size {
             client.set_block1_size(size);
         }
@@ -365,7 +393,21 @@ impl IrohCoapWireClient {
             client.set_max_total_message_size(Some(self.max_body_bytes));
         }
         let client = Arc::new(client);
-        self.pool.lock().await.entry(node).or_insert(client).clone()
+        // Claim the pool slot and install the matching inbox atomically: the
+        // install is a synchronous map op done while holding the pool lock, so no
+        // other builder can interleave between the slot check and the
+        // registration. This guarantees the pooled client and `Hub.clients[node]`
+        // are the SAME transport even under concurrent first-sends to one peer —
+        // otherwise the drain task could route responses to a discarded
+        // transport's inbox and every request to that peer would time out until an
+        // error rebuilt the client.
+        let mut pool = self.pool.lock().await;
+        if let Some(existing) = pool.get(&node) {
+            return existing.clone();
+        }
+        self.hub.install_client(node, tx);
+        pool.insert(node, client.clone());
+        client
     }
 
     /// Drop the pooled client for `node` so the next send rebuilds it (re-registers
@@ -771,6 +813,102 @@ mod tests {
         assert!(
             second.build_server().await.is_err(),
             "a hub must drive at most one ingress listener"
+        );
+    }
+
+    // Regression for the concurrent first-send race: many overlapping *first*
+    // sends to one node hit the cold pool together and all race through
+    // `client_for`'s build+claim. The fix installs the inbox sender only for the
+    // pool winner, so every request reaches the one pooled client and gets its own
+    // echo. Pre-fix, a losing build could win `Hub.clients` while the pool kept a
+    // different transport, so responses routed to a discarded inbox and these
+    // requests timed out. Distinct per-task bodies also catch any cross-talk. The
+    // short request timeout makes a regression fail fast instead of hanging 60 s.
+    #[tokio::test]
+    async fn concurrent_first_sends_to_one_node_all_succeed() {
+        let (mut client, token, handle) = rig(None, None, None, None).await;
+        client.request_timeout = Duration::from_secs(5);
+        let client = Arc::new(client);
+        let mut tasks = Vec::new();
+        for i in 0u8..16 {
+            let client = client.clone();
+            tasks.push(tokio::spawn(async move {
+                let body = vec![i; 32 + i as usize];
+                let resp = client
+                    .send(WireRequest {
+                        dest: hex_node(NODE_B),
+                        method: Method::PUT,
+                        path: format!("/_matrix/federation/v1/send/txn{i}"),
+                        headers: vec![],
+                        body: body.clone(),
+                    })
+                    .await
+                    .expect("concurrent first-send must not time out");
+                (resp, body)
+            }));
+        }
+        for t in tasks {
+            let (resp, expected) = t.await.expect("task");
+            assert_eq!(resp.status, 200);
+            assert_eq!(
+                resp.body, expected,
+                "a concurrent first-send received the wrong echo"
+            );
+        }
+        shutdown(token, handle).await;
+    }
+
+    /// Encode a CoAP datagram carrying `code` (default header otherwise), so
+    /// `classify` can be exercised on real wire bytes.
+    fn coap_bytes(code: MessageClass) -> Vec<u8> {
+        let mut p = Packet::new();
+        p.header.code = code;
+        p.to_bytes().expect("encode coap packet")
+    }
+
+    // `classify` is the load-bearing demux predicate (the separation UDP got free
+    // from ports): a request-coded datagram routes to the ingress server, every
+    // other valid code to a client inbox. Test the pure fn directly rather than
+    // only via the round-trip rig, which never feeds it a response/empty/garbage.
+    #[test]
+    fn classify_routes_by_coap_code_class() {
+        use coap_lite::{RequestType, ResponseType};
+        // Request codes → the server/listener side.
+        assert!(matches!(
+            classify(&coap_bytes(MessageClass::Request(RequestType::Put))),
+            Class::Request
+        ));
+        assert!(matches!(
+            classify(&coap_bytes(MessageClass::Request(RequestType::Get))),
+            Class::Request
+        ));
+        // Response codes → a client inbox.
+        assert!(matches!(
+            classify(&coap_bytes(MessageClass::Response(ResponseType::Content))),
+            Class::Response
+        ));
+        assert!(matches!(
+            classify(&coap_bytes(MessageClass::Response(ResponseType::NotFound))),
+            Class::Response
+        ));
+        // A bare Empty message (e.g. an ACK/RST) is not a request → client side.
+        assert!(matches!(
+            classify(&coap_bytes(MessageClass::Empty)),
+            Class::Response
+        ));
+    }
+
+    // An undecodable datagram must be DROPPED — never misclassified as a request
+    // (which would let a peer inject garbage into the ingress server) nor as a
+    // response (which would feed a malformed packet to a client exchange).
+    #[test]
+    fn classify_drops_undecodable_datagrams() {
+        assert!(matches!(classify(b""), Class::Drop), "empty");
+        // A CoAP header is 4 bytes; anything shorter fails to parse.
+        assert!(matches!(classify(&[0x40]), Class::Drop), "1-byte");
+        assert!(
+            matches!(classify(&[0x40, 0x01, 0x00]), Class::Drop),
+            "3-byte"
         );
     }
 }
