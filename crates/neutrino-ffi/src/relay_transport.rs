@@ -1,21 +1,26 @@
 // Copyright (c) 2026 Element Creations Ltd.
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial.
 
-//! iroh-backed [`DatagramTransport`] for the packet relay.
+//! iroh-backed [`DatagramLink`] for the low-bandwidth federation transport.
 //!
-//! Carries one IP packet per unreliable QUIC datagram between endpoints. iroh
-//! is confined to this layer (the TUN side); `neutrino-relay` stays
-//! transport-agnostic and speaks only `NodeKey` ([`u8; 32`]). QUIC datagrams
-//! are per-connection, so the transport keeps a `NodeKey → Connection`
-//! send-side table (populated by dialing on egress and by accepting — a
-//! connection is bidirectional, so one accepted from a peer is reused to send
-//! back). Every connection (dialed or accepted) gets a reader task that tags
-//! each inbound datagram with the cryptographically-authenticated remote node
-//! id; a reader removes its own send-side entry when its connection dies, so
-//! the next send re-dials instead of reusing a dead connection.
+//! Carries one CoAP/CBOR datagram per unreliable QUIC datagram between nodes,
+//! keyed by 32-byte node id — no OS socket, no TUN, no virtual IPs. iroh is
+//! confined to this layer; `neutrino-lb` stays iroh-free and speaks only the
+//! [`DatagramLink`] seam (`[u8; 32]` node ids). QUIC datagrams are
+//! per-connection, so the transport keeps a `[u8; 32] → Connection` send-side
+//! table (populated by dialing on egress and by accepting — a connection is
+//! bidirectional, so one accepted from a peer is reused to send back). Every
+//! connection (dialed or accepted) gets a reader task that tags each inbound
+//! datagram with the cryptographically-authenticated remote node id; a reader
+//! removes its own send-side entry when its connection dies, so the next send
+//! re-dials instead of reusing a dead connection.
+//!
+//! The endpoint still binds its own ephemeral loopback UDP socket for QUIC
+//! transport (see [`RELAY_BIND`]); that is iroh-internal and unrelated to the
+//! deleted host-TUN data path.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
@@ -23,13 +28,22 @@ use bytes::Bytes;
 use iroh::endpoint::presets::N0DisableRelay;
 use iroh::endpoint::{Connection, VarInt};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
-use neutrino_relay::{DatagramTransport, NodeKey, RelayError};
+use neutrino_main::DatagramLink;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
-/// ALPN for the federation packet relay.
+/// A node's stable cryptographic identity, as raw public-key bytes — the
+/// [`DatagramLink`] node id. iroh's endpoint id IS these bytes.
+type NodeKey = [u8; 32];
+
+/// UDP bind for the iroh endpoint's QUIC transport. Ephemeral loopback port; on
+/// device the BLE custom transport carries packets to peers and discovery
+/// advertises reachability, so the UDP socket is only iroh's local plumbing.
+pub(crate) const RELAY_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+
+/// ALPN for the federation datagram link.
 const RELAY_ALPN: &[u8] = b"neutrino/iroh-relay/0";
 
 /// Bound on buffered inbound datagrams before the per-connection readers block
@@ -51,14 +65,14 @@ pub(crate) struct IrohTransport {
     /// The accept-loop task. Aborted on drop so the endpoint (and its UDP
     /// socket) can close — the loop captures only clones, never an `Arc<Self>`,
     /// so it doesn't keep this transport alive (which would leak an endpoint per
-    /// VPN re-toggle).
+    /// rebind).
     accept_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl IrohTransport {
     /// Bind an endpoint whose identity is derived from `secret` (the same
-    /// persisted node secret the server's `server_name` is derived from, so
-    /// `vip(self)` names this exact node), and start accepting connections.
+    /// persisted node secret the server's `server_name` is derived from, so this
+    /// endpoint's id equals that node id), and start accepting connections.
     pub(crate) async fn bind(
         secret: &[u8; 32],
         bind_addr: SocketAddr,
@@ -73,7 +87,7 @@ impl IrohTransport {
             .alpns(vec![RELAY_ALPN.to_vec()]);
 
         // On the embedded (Android) target, add the BLE custom transport
-        // *alongside* IP, so the relay reaches peers over both LAN and BLE
+        // *alongside* IP, so federation reaches peers over both LAN and BLE
         // (phones); the transport's `address_lookup` resolves peers over the BLE
         // mesh, while LAN peers are seeded via `add_peer`. Desktop/CI is IP-only.
         #[cfg(feature = "ble")]
@@ -102,7 +116,7 @@ impl IrohTransport {
             node_id = %endpoint.id(),
             sockets = ?endpoint.bound_sockets(),
             ble = cfg!(feature = "ble"),
-            "relay transport: iroh endpoint bound"
+            "datagram link: iroh endpoint bound"
         );
 
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CAPACITY);
@@ -124,7 +138,8 @@ impl IrohTransport {
         }))
     }
 
-    /// This node's identity (its iroh endpoint id) as a relay [`NodeKey`].
+    /// This node's identity (its iroh endpoint id) as a [`NodeKey`].
+    #[allow(dead_code)]
     pub(crate) fn node_key(&self) -> NodeKey {
         *self.endpoint.id().as_bytes()
     }
@@ -168,12 +183,12 @@ impl IrohTransport {
             // `read_datagram` errors only on connection close — terminal.
             while let Ok(bytes) = conn.read_datagram().await {
                 // Best-effort: drop rather than block this reader (which would
-                // stall every peer's inbound — head-of-line) when the host TUN is
-                // slow to drain. Closed channel = the relay is gone → stop.
+                // stall every peer's inbound — head-of-line) when the consumer is
+                // slow to drain. Closed channel = the link is gone → stop.
                 match tx.try_send((peer, bytes.to_vec())) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        tracing::trace!("relay transport: inbound queue full, dropping datagram");
+                        tracing::trace!("datagram link: inbound queue full, dropping datagram");
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
@@ -186,7 +201,7 @@ impl IrohTransport {
     }
 
     /// A live connection to `dst`, dialing (and starting its reader) on a miss.
-    async fn connection(&self, dst: NodeKey) -> Result<Connection, RelayError> {
+    async fn connection(&self, dst: NodeKey) -> std::io::Result<Connection> {
         {
             let conns = self.conns.lock().await;
             if let Some(conn) = conns.get(&dst)
@@ -212,22 +227,20 @@ impl IrohTransport {
             #[cfg(feature = "ble")]
             None => EndpointAddr::new(
                 EndpointId::from_bytes(&dst)
-                    .map_err(|e| RelayError::Io(format!("relay: invalid peer id: {e}")))?,
+                    .map_err(|e| std::io::Error::other(format!("link: invalid peer id: {e}")))?,
             ),
             #[cfg(not(feature = "ble"))]
             None => {
-                return Err(RelayError::Io(
-                    "relay: no known address for peer".to_owned(),
-                ));
+                return Err(std::io::Error::other("link: no known address for peer"));
             }
         };
-        tracing::debug!(addrs = ?addr.addrs, "relay transport: dialing peer (by id over discovery if no addrs)");
+        tracing::debug!(addrs = ?addr.addrs, "datagram link: dialing peer (by id over discovery if no addrs)");
         let conn = self
             .endpoint
             .connect(addr, RELAY_ALPN)
             .await
-            .map_err(|e| RelayError::Io(format!("relay connect: {e}")))?;
-        tracing::debug!("relay transport: connection established");
+            .map_err(|e| std::io::Error::other(format!("link connect: {e}")))?;
+        tracing::debug!("datagram link: connection established");
         {
             let mut conns = self.conns.lock().await;
             // A live connection may have appeared while we dialed (a concurrent
@@ -254,8 +267,8 @@ impl IrohTransport {
 impl Drop for IrohTransport {
     fn drop(&mut self) {
         // Stop accepting so the endpoint (and its UDP socket) can close. The
-        // accept loop holds only clones, so this Drop fires once the relay drops
-        // its `Arc<Self>` — without this, an endpoint would leak per re-toggle.
+        // accept loop holds only clones, so this Drop fires once the last
+        // `Arc<Self>` drops — without this, an endpoint would leak per rebind.
         if let Some(task) = self
             .accept_task
             .lock()
@@ -280,7 +293,7 @@ async fn accept_loop(
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => adopt(conn, conns, inbound_tx).await,
-                Err(err) => warn!(?err, "relay transport: inbound connection failed"),
+                Err(err) => warn!(?err, "datagram link: inbound connection failed"),
             }
         });
     }
@@ -305,11 +318,11 @@ async fn adopt(conn: Connection, conns: ConnMap, inbound_tx: mpsc::Sender<(NodeK
 }
 
 #[async_trait]
-impl DatagramTransport for IrohTransport {
-    async fn send(&self, dst: NodeKey, datagram: &[u8]) -> Result<(), RelayError> {
+impl DatagramLink for IrohTransport {
+    async fn send(&self, dst: NodeKey, datagram: &[u8]) -> std::io::Result<()> {
         let conn = self.connection(dst).await?;
         conn.send_datagram(Bytes::copy_from_slice(datagram))
-            .map_err(|e| RelayError::Io(format!("send_datagram: {e}")))
+            .map_err(|e| std::io::Error::other(format!("send_datagram: {e}")))
     }
 
     async fn recv(&self) -> Option<(NodeKey, Vec<u8>)> {
@@ -320,8 +333,6 @@ impl DatagramTransport for IrohTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neutrino_relay::mem::{ipv6_packet, mem_packet_io};
-    use neutrino_relay::{NeighbourTable, run, vip};
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -335,11 +346,13 @@ mod tests {
         EndpointAddr::new(tp.endpoint_id()).with_ip_addr(sock)
     }
 
-    // Full relay flow over real iroh: inject a packet at A's TUN, watch it reach
-    // B's TUN, then a reply B→A. Exercises dial, accept, bidirectional reuse of
-    // the accepted connection, inbound route learning, and identity-from-secret.
+    // Full link flow over real iroh, driving the `DatagramLink` seam directly:
+    // A sends a datagram to B, B receives it tagged with A's authenticated node
+    // id, then B replies A over the reused (accepted) connection. Exercises dial,
+    // accept, bidirectional reuse, the inbound source tagging, and
+    // identity-from-secret.
     #[tokio::test]
-    async fn packet_relays_a_to_b_to_a_over_iroh() {
+    async fn datagram_relays_a_to_b_to_a_over_iroh() {
         let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
         let a_tp = IrohTransport::bind(&[1u8; 32], loopback)
             .await
@@ -352,44 +365,28 @@ mod tests {
         let b_key = b_tp.node_key();
         assert_ne!(a_key, b_key);
 
-        // A can reach B (the resolver/invite path); B will learn A on inbound.
+        // A can reach B (the egress/dial path); B learns A on inbound.
         a_tp.add_peer(loopback_addr(&b_tp));
-
-        let a_table = Arc::new(NeighbourTable::new());
-        let b_table = Arc::new(NeighbourTable::new());
-        a_table.register(b_key);
-
-        let (a_io, a_host) = mem_packet_io();
-        let (b_io, b_host) = mem_packet_io();
-
-        tokio::spawn(run(a_key, a_table, Arc::new(a_io), a_tp));
-        tokio::spawn(run(b_key, b_table.clone(), Arc::new(b_io), b_tp));
 
         // A → B.
         let to_b = b"hello-b";
-        a_host
-            .emit(ipv6_packet(vip(&a_key), vip(&b_key), to_b))
-            .await
-            .expect("emit a->b");
-        let got = timeout(Duration::from_secs(10), b_host.next())
+        a_tp.send(b_key, to_b).await.expect("send a->b");
+        let (src, got) = timeout(Duration::from_secs(10), b_tp.recv())
             .await
             .expect("B receives in time")
-            .expect("B channel open");
-        assert_eq!(&got[40..], to_b);
-        // B learned the reverse route from the authenticated inbound datagram.
-        assert_eq!(b_table.lookup(&vip(&a_key)), Some(a_key));
+            .expect("B link open");
+        assert_eq!(src, a_key, "datagram tagged with A's authenticated node id");
+        assert_eq!(got, to_b);
 
-        // B → A, routed via the learned entry and the reused (accepted) conn.
+        // B → A, routed via the reused (accepted) connection — B never seeded A.
         let to_a = b"hello-a";
-        b_host
-            .emit(ipv6_packet(vip(&b_key), vip(&a_key), to_a))
-            .await
-            .expect("emit b->a");
-        let got = timeout(Duration::from_secs(10), a_host.next())
+        b_tp.send(a_key, to_a).await.expect("send b->a");
+        let (src, got) = timeout(Duration::from_secs(10), a_tp.recv())
             .await
             .expect("A receives in time")
-            .expect("A channel open");
-        assert_eq!(&got[40..], to_a);
+            .expect("A link open");
+        assert_eq!(src, b_key);
+        assert_eq!(got, to_a);
     }
 
     // The one error the transport itself originates: a destination with no
@@ -403,12 +400,12 @@ mod tests {
         assert!(tp.send([9u8; 32], b"x").await.is_err());
     }
 
-    // Load-bearing cross-layer invariant: the relay's `node_key` (iroh endpoint
+    // Load-bearing cross-layer invariant: the link's `node_key` (iroh endpoint
     // id) must equal the ed25519 public key that neutrino-main derives the
-    // server_name + vip from for the same secret — otherwise the host would
-    // advertise/route on one vip while the relay filters on another, silently
-    // breaking federation. iroh's node id IS the raw ed25519 pubkey today; this
-    // pins it so a future iroh key-derivation change fails loudly here.
+    // server_name from for the same secret — otherwise the host would advertise
+    // one node id while the link answers on another, silently breaking
+    // federation. iroh's node id IS the raw ed25519 pubkey today; this pins it so
+    // a future iroh key-derivation change fails loudly here.
     #[tokio::test]
     async fn node_key_matches_ed25519_public_key() {
         let secret = [7u8; 32];

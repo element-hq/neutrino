@@ -9,20 +9,17 @@ name = "neutrino"
 
 [dependencies]
 async-compat = "0.2.5"
-# The relay's `DatagramTransport` is an `#[async_trait]` trait we implement over iroh.
+# `neutrino_main::DatagramLink` is an `#[async_trait]` trait we implement over iroh.
 async-trait.workspace = true
 
 # Packet logging goes through the Neutrino tracing stack (so it reaches logcat via
 # the host's subscriber).
 tracing.workspace = true
 
-# `tokio` must include the `net` feature for `tokio::io::unix::AsyncFd` (the tunnel
-# reader's readiness primitive).
 tokio.workspace = true
 uniffi.workspace = true
 
 neutrino-main = { path = "../neutrino-main" }
-neutrino-relay = { path = "../neutrino-relay" }
 iroh = { version = "0.98.2", features = ["unstable-custom-transports"] }
 # Install rustls' default crypto provider at startup (see `start`). reqwest's TLS
 # backend is unified to rustls (via iroh) with no default provider, so the
@@ -54,11 +51,9 @@ ndk-context = { version = "0.1", optional = true }
 ble = ["dep:iroh-ble-transport", "dep:blew", "dep:jni", "dep:ndk-context"]
 
 [dev-dependencies]
+# The datagram-link test derives the expected node id from a secret to pin the
+# iroh-id == ed25519-pubkey invariant.
 ed25519-dalek = "2.2.0"
-# Test-only: the iroh transport test reuses the relay's in-memory `PacketIo`
-# (its `MemPacketIo`/`ipv6_packet`) instead of duplicating them. `test-support`
-# is a dev-only feature, so production builds never compile the `mem` module.
-neutrino-relay = { path = "../neutrino-relay", features = ["test-support"] }
 
 [build-dependencies]
 uniffi = { workspace = true, features = ["build"] }

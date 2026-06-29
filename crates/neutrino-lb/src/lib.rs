@@ -10,6 +10,7 @@ pub mod ingress;
 pub mod transport;
 
 pub use error::LbError;
+pub use transport::coap::datagram::DatagramLink;
 pub use transport::{DestinationResolver, DirectResolver};
 
 use std::net::SocketAddr;
@@ -141,6 +142,12 @@ pub struct LbConfig {
     /// desktop / direct-LAN behaviour. The embedded tunnel build supplies a
     /// resolver that maps `server_name` → virtual IP.
     pub resolver: Option<Arc<dyn DestinationResolver>>,
+    /// In-process federation transport. When `Some`, the CoAP wire runs over this
+    /// datagram link (the embedded/iroh build) instead of a UDP socket — keyed by
+    /// 32-byte node id, so `ingress_bind` is unused on this path and the resolver
+    /// must yield a 64-char hex node id as the egress `dest`. `None` = UDP socket
+    /// (dev / direct-LAN), the existing behaviour.
+    pub link: Option<Arc<dyn DatagramLink>>,
 }
 
 // Hand-written so `DestinationResolver` needn't be `Debug` just to satisfy a
@@ -154,6 +161,7 @@ impl std::fmt::Debug for LbConfig {
             .field("upstream", &self.upstream)
             .field("wire", &self.wire)
             .field("resolver", &self.resolver.as_ref().map(|_| "<configured>"))
+            .field("link", &self.link.as_ref().map(|_| "<configured>"))
             .finish()
     }
 }
@@ -163,9 +171,10 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::ingress::IngressHandler;
+use crate::transport::coap::datagram::{Hub, IrohCoapWireClient, IrohCoapWireServer};
 use crate::transport::coap::{CoapWireClient, CoapWireServer};
 use crate::transport::http::{HttpWireClient, HttpWireServer};
-use crate::transport::{WireClient, WireServer};
+use crate::transport::{WireClient, WireError, WireServer};
 
 /// Run both proxy halves until `shutdown` fires. Egress forwards local→wire
 /// (JSON→CBOR); ingress serves wire→local (CBOR→JSON→loopback upstream).
@@ -178,6 +187,13 @@ pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), 
         .resolver
         .clone()
         .unwrap_or_else(|| Arc::new(DirectResolver));
+    // When the embedding host injected a datagram link (the iroh build), the CoAP
+    // wire runs over it instead of a UDP socket; the framing config still comes
+    // from `config.wire`. Selected purely by injection — `None` keeps the existing
+    // UDP socket path 100% intact.
+    if let Some(link) = config.link.clone() {
+        return serve_over_link(link, config, ingress_handler, resolver, shutdown).await;
+    }
     match config.wire {
         WireKind::Http => {
             let wire_client: Arc<dyn WireClient> = Arc::new(HttpWireClient::new());
@@ -231,6 +247,68 @@ pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), 
     }
 }
 
+/// Run the proxy with the CoAP wire over an injected [`DatagramLink`] (the
+/// embedded/iroh build). One [`Hub`] multiplexes both directions over the link
+/// and is shared between the egress client and the ingress server; the framing
+/// (CON / Q-Block, sizes) still comes from `config.wire`. The egress forward
+/// proxy on `egress_bind` and the resolver are transport-independent, so this
+/// reuses [`run_pair`] unchanged. `ingress_bind` is unused on this path (the link
+/// is keyed by node id, not an IP/port).
+async fn serve_over_link(
+    link: Arc<dyn DatagramLink>,
+    config: LbConfig,
+    ingress_handler: Arc<IngressHandler>,
+    resolver: Arc<dyn DestinationResolver>,
+    shutdown: CancellationToken,
+) -> Result<(), LbError> {
+    let hub = Hub::new(link);
+    match config.wire {
+        WireKind::CoapQBlock {
+            block1_size,
+            qblock,
+        } => {
+            let cfg = qblock.to_qblock_config();
+            let wire_client: Arc<dyn WireClient> = Arc::new(IrohCoapWireClient::with_qblock(
+                hub.clone(),
+                block1_size,
+                cfg.clone(),
+            ));
+            let wire_server = IrohCoapWireServer::with_qblock(hub, cfg);
+            run_pair(
+                config.egress_bind,
+                wire_client,
+                wire_server,
+                ingress_handler,
+                resolver,
+                shutdown,
+            )
+            .await
+        }
+        WireKind::Coap {
+            block1_size,
+            max_message_size,
+        } => {
+            let wire_client: Arc<dyn WireClient> =
+                Arc::new(IrohCoapWireClient::new(hub.clone(), block1_size));
+            let wire_server = IrohCoapWireServer::new(hub, max_message_size);
+            run_pair(
+                config.egress_bind,
+                wire_client,
+                wire_server,
+                ingress_handler,
+                resolver,
+                shutdown,
+            )
+            .await
+        }
+        // A link with the HTTP wire is a wiring bug: the datagram path is CoAP-only
+        // (the link carries CoAP datagrams keyed by node id, not TCP/HTTP).
+        WireKind::Http => Err(LbError::from(WireError::Serve(
+            "datagram link requires a CoAP wire kind".to_owned(),
+        ))),
+    }
+}
+
 /// Run the egress forward proxy and the `wire_server` ingress concurrently until
 /// `shutdown` fires; surface whichever half errors first.
 async fn run_pair<S: WireServer>(
@@ -267,7 +345,56 @@ mod serve_selection_tests {
             upstream: "http://127.0.0.1:1".to_owned(),
             wire,
             resolver: None,
+            link: None,
         }
+    }
+
+    /// Test-only [`DatagramLink`] that never yields inbound traffic and accepts
+    /// every send: the Hub's drain task parks on `recv`, so the serve-over-link
+    /// path comes up and winds down on cancel exactly like the UDP arms, without a
+    /// real transport.
+    struct ParkedLink;
+
+    #[async_trait::async_trait]
+    impl DatagramLink for ParkedLink {
+        async fn send(&self, _dst: [u8; 32], _datagram: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn recv(&self) -> Option<([u8; 32], Vec<u8>)> {
+            std::future::pending().await
+        }
+    }
+
+    // The link arm must build the CoAP wire over the injected link (no UDP bind)
+    // and wind down on cancel — proves the link branch is wired, mirroring
+    // `coap_serve_binds_and_shuts_down` for the datagram path.
+    #[tokio::test]
+    async fn link_serve_comes_up_and_shuts_down() {
+        let mut config = cfg(WireKind::CoapQBlock {
+            block1_size: None,
+            qblock: QBlockTuning::default(),
+        });
+        config.link = Some(Arc::new(ParkedLink));
+        let token = CancellationToken::new();
+        let server_token = token.clone();
+        let handle = tokio::spawn(async move { serve(config, server_token).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        token.cancel();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(joined.is_ok(), "link serve did not wind down");
+    }
+
+    // A link configured with the HTTP wire is a wiring bug and must be rejected
+    // (the datagram path is CoAP-only).
+    #[tokio::test]
+    async fn link_with_http_wire_is_rejected() {
+        let mut config = cfg(WireKind::Http);
+        config.link = Some(Arc::new(ParkedLink));
+        let err = serve(config, CancellationToken::new()).await;
+        assert!(
+            matches!(err, Err(LbError::Wire(_))),
+            "HTTP wire over a link must error, got {err:?}"
+        );
     }
 
     #[test]

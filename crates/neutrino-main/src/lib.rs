@@ -5,8 +5,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 pub use neutrino_common::{Command, Config};
+pub use neutrino_lb::DatagramLink;
 
-use neutrino_relay::NeighbourTable;
+use std::future::Future;
+use std::pin::Pin;
+
 use neutrino_store::IdentityStore;
 use neutrino_store_sqlite::SqliteStore;
 use rand::RngCore;
@@ -14,63 +17,40 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 /// Handed from the entrypoint to an embedding host (the ffi/Android layer) so it
-/// can build the iroh relay over the *same* node identity and neighbour table
-/// the federation routing layer uses here. Published once on a [`watch`] channel
-/// the host's relay task awaits (so a tunnel fd handed over before the server
-/// identity resolves waits rather than being lost); non-embedded callers (the
-/// dev binary) pass `None`.
+/// can read the server's resolved federation name once identity resolution
+/// completes. Published once on a [`watch`] channel the host reads back via its
+/// `server_name()` getter; non-embedded callers (the dev binary) pass `None`.
 ///
-/// Fields are private (read via the accessors below) so the node secret isn't a
-/// freely-readable public field.
+/// The node secret now flows to the host via the [`FederationLinkFactory`] (which
+/// builds the iroh datagram link), not this handoff — so the handoff carries only
+/// the identity string the host's getter needs.
 #[derive(Clone)]
 pub struct TunnelHandoff {
-    secret: [u8; 32],
-    table: Arc<NeighbourTable>,
     server_name: String,
-    vip: String,
 }
 
 impl TunnelHandoff {
-    /// Construct a handoff. The entrypoint builds one after identity resolution;
-    /// also lets the embedding layer's tests build one to exercise the relay.
-    /// `server_name` is the resolved name; `vip` is this node's own virtual IP
-    /// (what the host TUN binds), both surfaced to the host via FFI getters.
-    pub fn new(
-        secret: [u8; 32],
-        table: Arc<NeighbourTable>,
-        server_name: String,
-        vip: String,
-    ) -> Self {
-        Self {
-            secret,
-            table,
-            server_name,
-            vip,
-        }
-    }
-
-    /// The persisted node secret — the relay derives its iroh identity from it,
-    /// matching this server's derived `server_name`.
-    pub fn secret(&self) -> &[u8; 32] {
-        &self.secret
-    }
-
-    /// The route table shared with the federation resolver/route-sink, so routes
-    /// learned here are seen by the relay.
-    pub fn table(&self) -> &Arc<NeighbourTable> {
-        &self.table
+    /// Construct a handoff carrying the resolved server name. The entrypoint
+    /// builds one after identity resolution.
+    pub fn new(server_name: String) -> Self {
+        Self { server_name }
     }
 
     /// The server's resolved federation name (its node id, for the embedded host).
     pub fn server_name(&self) -> &str {
         &self.server_name
     }
-
-    /// This node's own virtual IP — the address the host TUN binds (`addAddress`).
-    pub fn vip(&self) -> &str {
-        &self.vip
-    }
 }
+
+/// Result of building the federation datagram link from the node secret.
+pub type DatagramLinkResult =
+    Result<std::sync::Arc<dyn DatagramLink>, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Builds the federation datagram link once the node secret is resolved. ffi
+/// supplies one that binds an iroh transport; the dev binary passes `None`
+/// (plain UDP federation). Async because binding the transport is async.
+pub type FederationLinkFactory =
+    Box<dyn FnOnce([u8; 32]) -> Pin<Box<dyn Future<Output = DatagramLinkResult> + Send>> + Send>;
 
 /// Install the tracing subscriber that routes our logs to the platform sink
 /// (logcat on Android). Idempotent. [`entrypoint`] calls this itself, but an
@@ -85,6 +65,7 @@ pub async fn entrypoint(
     mut config: Config,
     commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
     handoff: Option<watch::Sender<Option<TunnelHandoff>>>,
+    link_factory: Option<FederationLinkFactory>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
@@ -94,30 +75,30 @@ pub async fn entrypoint(
     let store = Arc::new(SqliteStore::open_in_dir(&config.storage_dir).await?);
     let secret = resolve_server_identity(&mut config, &store).await?;
 
-    // When embedded (a relay host is present), build the shared route table:
-    // hand it to the relay over the handoff so it can build its transport over
-    // this identity, and give the federation sender a sink that registers each
-    // outbound destination's route into the *same* table. `None` for the dev
-    // binary (no relay).
-    let peer_sink: Option<Arc<dyn neutrino_http::PeerSink>> = match &handoff {
-        Some(handoff) => {
-            let table = Arc::new(NeighbourTable::new());
-            // This node's own vip (what the host TUN binds), from the same
-            // ed25519 public key the `server_name` is derived from.
-            let node_key = ed25519_dalek::SigningKey::from_bytes(&secret)
-                .verifying_key()
-                .to_bytes();
-            let vip = neutrino_relay::vip(&node_key).to_string();
-            let _ = handoff.send(Some(TunnelHandoff::new(
-                secret,
-                table.clone(),
-                config.server_name.clone(),
-                vip,
-            )));
-            Some(Arc::new(tunnel::TableSink::new(table)))
-        }
+    // Build the federation datagram link from the resolved secret (the embedded
+    // iroh build injects a factory; the dev binary passes `None` for plain UDP
+    // federation). A failed transport bind must fail startup loudly — propagate
+    // with `?` rather than silently falling back to UDP.
+    // The factory's error is `Send + Sync` (so it can cross the ffi task
+    // boundary); widen it to this function's plain `Box<dyn Error>` on the way
+    // out, since the two boxed-trait-object types don't auto-convert via `?`.
+    let link = match link_factory {
+        Some(factory) => Some(
+            factory(secret)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { e })?,
+        ),
         None => None,
     };
+
+    // When embedded, publish the resolved server name to the host over the
+    // handoff (its `server_name()` getter reads it back). The node secret reached
+    // the host via `link_factory` above; outbound federation is addressed by node
+    // id over the datagram link, so there is no route table or peer sink to wire.
+    if let Some(handoff) = &handoff {
+        let _ = handoff.send(Some(TunnelHandoff::new(config.server_name.clone())));
+    }
+    let peer_sink: Option<Arc<dyn neutrino_http::PeerSink>> = None;
 
     // Embedded low-bandwidth sidecar: when `lb_federation_port` is set we run a
     // `neutrino-lb` proxy in-process beside the homeserver (the embedded-on-
@@ -135,7 +116,7 @@ pub async fn entrypoint(
         Some(port) => {
             let egress_bind = alloc_loopback_egress()?;
             config.federation_proxy = Some(format!("http://{egress_bind}"));
-            Some(build_lb_config(&config, port, egress_bind)?)
+            Some(build_lb_config(&config, port, egress_bind, link.clone())?)
         }
         None => None,
     };
@@ -237,6 +218,7 @@ fn build_lb_config(
     config: &Config,
     fed_port: u16,
     egress_bind: SocketAddr,
+    link: Option<Arc<dyn DatagramLink>>,
 ) -> Result<neutrino_lb::LbConfig, Box<dyn std::error::Error>> {
     Ok(neutrino_lb::LbConfig {
         ingress_bind: ingress_bind_for(&config.bind_addr, fed_port),
@@ -246,23 +228,31 @@ fn build_lb_config(
             block1_size: None,
             qblock: neutrino_lb::QBlockTuning::default(),
         },
-        // The in-process sidecar is the embedded/tunnel target: map a peer's
-        // node-id `server_name` to its virtual IP so outbound federation is
-        // addressed into the tunnel. Pure and dormant for a non-node
-        // `server_name` (dev/named servers pass through to direct dial).
-        resolver: Some(Arc::new(tunnel::TunnelResolver)),
+        // The in-process sidecar is the embedded/datagram-link target: map a
+        // peer's node-id `server_name` to its bare 64-char hex node id so the
+        // datagram egress dials the peer's iroh endpoint directly. Dormant for a
+        // non-node `server_name` (dev/named servers pass through to direct dial).
+        resolver: Some(Arc::new(tunnel::TunnelResolver::new())),
+        // The injected federation transport (iroh, embedded build) — when `Some`,
+        // the sidecar's CoAP wire runs over it instead of a UDP socket. `None` for
+        // dev/LAN keeps the UDP path.
+        link,
     })
 }
 
-/// The public federation ingress bind: `bind_addr`'s host with the port set to
-/// `fed_port` (peers reach `host(bind_addr):fed_port`). A non-IP authority
-/// (e.g. `localhost:8008`, the offline/dev fallback) can't be classified, so
-/// fall back to the unspecified IPv4 address — an offline device has no peers,
-/// and the listener must still come up.
+/// The public federation ingress bind: the port peers reach this node on (the
+/// UDP/LAN path; on the embedded datagram-link path inbound federation arrives
+/// over the link, not this socket, but the `LbConfig` still carries the field).
+///
+/// An unspecified `bind_addr` (the embedded `0.0.0.0`/`::` case) binds
+/// IPv6-unspecified `[::]` so a dual-stack listener accepts both families; a
+/// *concrete* host is kept verbatim (dev/test bind a specific loopback); a non-IP
+/// authority (`localhost:8008`, the offline fallback) also takes `[::]` so the
+/// listener still comes up (an offline device has no peers regardless).
 fn ingress_bind_for(bind_addr: &str, fed_port: u16) -> SocketAddr {
     match bind_addr.parse::<SocketAddr>() {
-        Ok(addr) => SocketAddr::new(addr.ip(), fed_port),
-        Err(_) => SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), fed_port),
+        Ok(addr) if !addr.ip().is_unspecified() => SocketAddr::new(addr.ip(), fed_port),
+        _ => SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), fed_port),
     }
 }
 
@@ -328,15 +318,15 @@ mod tests {
         EGRESS.parse().unwrap()
     }
 
-    // The public federation ingress derives its host from `bind_addr` (only the
-    // port changes to the federation port); the egress is supplied (allocated by
-    // `entrypoint`); the wire is CoAP. The Android LAN case binds `0.0.0.0`, so
-    // the ingress is `0.0.0.0:<fed port>`.
+    // The public federation ingress takes the federation port; for the embedded
+    // case `bind_addr` is unspecified (`0.0.0.0`), so the ingress binds IPv6
+    // unspecified (`[::]:<fed port>`) — a dual-stack listener that accepts both
+    // families. The egress is supplied (allocated by `entrypoint`); the wire is CoAP.
     #[test]
     fn build_lb_config_derives_ingress_from_bind_addr_and_port() {
         let c = cfg("0.0.0.0:8008");
-        let lb = build_lb_config(&c, 8448, egress()).expect("valid lb config");
-        assert_eq!(lb.ingress_bind, "0.0.0.0:8448".parse().unwrap());
+        let lb = build_lb_config(&c, 8448, egress(), None).expect("valid lb config");
+        assert_eq!(lb.ingress_bind, "[::]:8448".parse().unwrap());
         assert_eq!(lb.egress_bind, egress());
         assert_eq!(lb.upstream, "http://127.0.0.1:8008");
         assert!(matches!(lb.wire, neutrino_lb::WireKind::CoapQBlock { .. }));
@@ -347,20 +337,19 @@ mod tests {
     #[test]
     fn build_lb_config_ingress_reuses_concrete_host() {
         let c = cfg("127.0.0.1:8008");
-        let lb = build_lb_config(&c, 8448, egress()).expect("valid lb config");
+        let lb = build_lb_config(&c, 8448, egress(), None).expect("valid lb config");
         assert_eq!(lb.ingress_bind, "127.0.0.1:8448".parse().unwrap());
         assert_eq!(lb.upstream, "http://127.0.0.1:8008");
     }
 
     // A non-IP authority (`localhost:port`, the offline/dev fallback) can't be
-    // classified, so the ingress falls back to the unspecified IPv4 address (no
-    // peer can reach an offline device regardless) and the upstream is trusted
-    // verbatim.
+    // classified, so the ingress falls back to IPv6 unspecified (`[::]`; no peer
+    // can reach an offline device regardless) and the upstream is trusted verbatim.
     #[test]
     fn build_lb_config_ingress_falls_back_to_unspecified_for_hostname() {
         let c = cfg("localhost:8008");
-        let lb = build_lb_config(&c, 8448, egress()).expect("valid lb config");
-        assert_eq!(lb.ingress_bind, "0.0.0.0:8448".parse().unwrap());
+        let lb = build_lb_config(&c, 8448, egress(), None).expect("valid lb config");
+        assert_eq!(lb.ingress_bind, "[::]:8448".parse().unwrap());
         assert_eq!(lb.upstream, "http://localhost:8008");
     }
 
@@ -369,7 +358,7 @@ mod tests {
     #[test]
     fn build_lb_config_upstream_loopbacks_an_unspecified_bind() {
         let c = cfg("0.0.0.0:8008");
-        let lb = build_lb_config(&c, 80, egress()).expect("valid lb config");
+        let lb = build_lb_config(&c, 80, egress(), None).expect("valid lb config");
         assert_eq!(lb.upstream, "http://127.0.0.1:8008");
     }
 
@@ -379,7 +368,7 @@ mod tests {
     #[test]
     fn build_lb_config_rejects_non_loopback_bind_addr() {
         let c = cfg("192.168.1.5:8008");
-        assert!(build_lb_config(&c, 8448, egress()).is_err());
+        assert!(build_lb_config(&c, 8448, egress(), None).is_err());
     }
 
     // The self-allocated egress is always a loopback address: it is an

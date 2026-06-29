@@ -649,12 +649,6 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_shutdown(
     ): Short
-    external fun uniffi_neutrino_checksum_method_neutrinohandle_start_tunnel(
-    ): Short
-    external fun uniffi_neutrino_checksum_method_neutrinohandle_stop_tunnel(
-    ): Short
-    external fun uniffi_neutrino_checksum_method_neutrinohandle_tunnel_address(
-    ): Short
     external fun ffi_neutrino_uniffi_contract_version(
     ): Int
 
@@ -685,12 +679,6 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_neutrino_fn_method_neutrinohandle_shutdown(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-    external fun uniffi_neutrino_fn_method_neutrinohandle_start_tunnel(`ptr`: Long,`tunFd`: Int,`mtu`: Int,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_neutrino_fn_method_neutrinohandle_stop_tunnel(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_neutrino_fn_method_neutrinohandle_tunnel_address(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
     external fun uniffi_neutrino_fn_func_start(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     external fun uniffi_neutrino_fn_func_ble_smoke_test(`remote`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1017,29 +1005,6 @@ public object FfiConverterUInt: FfiConverter<UInt, Int> {
 /**
  * @suppress
  */
-public object FfiConverterInt: FfiConverter<Int, Int> {
-    override fun lift(value: Int): Int {
-        return value
-    }
-
-    override fun read(buf: ByteBuffer): Int {
-        return buf.getInt()
-    }
-
-    override fun lower(value: Int): Int {
-        return value
-    }
-
-    override fun allocationSize(value: Int) = 4UL
-
-    override fun write(value: Int, buf: ByteBuffer) {
-        buf.putInt(value)
-    }
-}
-
-/**
- * @suppress
- */
 public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
     // Note: we don't inherit from FfiConverterRustBuffer, because we use a
     // special encoding when lowering/lifting.  We can use `RustBuffer.len` to
@@ -1227,47 +1192,6 @@ public interface NeutrinoHandleInterface {
      */
     fun `shutdown`()
     
-    /**
-     * Take ownership of an established TUN file descriptor and start the packet
-     * relay over it: IP packets the host writes into the tunnel are carried over
-     * the wire (iroh) to the destination node, and inbound packets are injected
-     * back (see [`tunnel`]). Non-blocking: spawns the relay on the server runtime
-     * and returns immediately.
-     *
-     * `tun_fd` MUST come from `VpnService.Builder.establish()` with ownership
-     * transferred to native code — on the Kotlin side, pass
-     * `ParcelFileDescriptor.detachFd()`, NOT `.fd`. It MUST also be set non-blocking
-     * before being handed over (`Os.fcntlInt(fd, F_SETFL, O_NONBLOCK)`); the relay's
-     * `AsyncFd` reader relies on this so a read never stalls the server executor.
-     * This crate owns and closes the fd from then on; the host must not close it (and
-     * must not keep the `ParcelFileDescriptor` that produced it open).
-     *
-     * `mtu` is the tunnel MTU; currently advisory (clamping packets to the iroh
-     * datagram limit is a relay-layer concern not yet wired — the host sets it).
-     *
-     * The relay runs on the server runtime, so it is cancelled automatically when
-     * the homeserver shuts down: a tunnel cannot outlive its homeserver. Calling
-     * this before the runtime exists is a no-op that closes the fd; calling it
-     * before the server *identity* is resolved is fine — the relay task waits for
-     * it (holding the fd) rather than dropping the tunnel. Safe to call across
-     * repeated VPN toggles: each call installs a fresh fd, replacing any
-     * still-running relay. Pair every `start_tunnel` with a [`Self::stop_tunnel`].
-     */
-    fun `startTunnel`(`tunFd`: kotlin.Int, `mtu`: kotlin.UInt)
-    
-    /**
-     * Stop the tunnel reader and close the fd. Idempotent: a call when no tunnel is
-     * running is a no-op. Called on VPN toggle-off and teardown.
-     */
-    fun `stopTunnel`()
-    
-    /**
-     * This node's own virtual IP — the address to hand `VpnService.addAddress`
-     * (with a `/128`); the tunnel route is the whole `fd00::/8`. `None` until the
-     * server has resolved its identity.
-     */
-    fun `tunnelAddress`(): kotlin.String?
-    
     companion object
 }
 
@@ -1441,78 +1365,6 @@ open class NeutrinoHandle: Disposable, AutoCloseable, NeutrinoHandleInterface
 }
     }
     
-    
-
-    
-    /**
-     * Take ownership of an established TUN file descriptor and start the packet
-     * relay over it: IP packets the host writes into the tunnel are carried over
-     * the wire (iroh) to the destination node, and inbound packets are injected
-     * back (see [`tunnel`]). Non-blocking: spawns the relay on the server runtime
-     * and returns immediately.
-     *
-     * `tun_fd` MUST come from `VpnService.Builder.establish()` with ownership
-     * transferred to native code — on the Kotlin side, pass
-     * `ParcelFileDescriptor.detachFd()`, NOT `.fd`. It MUST also be set non-blocking
-     * before being handed over (`Os.fcntlInt(fd, F_SETFL, O_NONBLOCK)`); the relay's
-     * `AsyncFd` reader relies on this so a read never stalls the server executor.
-     * This crate owns and closes the fd from then on; the host must not close it (and
-     * must not keep the `ParcelFileDescriptor` that produced it open).
-     *
-     * `mtu` is the tunnel MTU; currently advisory (clamping packets to the iroh
-     * datagram limit is a relay-layer concern not yet wired — the host sets it).
-     *
-     * The relay runs on the server runtime, so it is cancelled automatically when
-     * the homeserver shuts down: a tunnel cannot outlive its homeserver. Calling
-     * this before the runtime exists is a no-op that closes the fd; calling it
-     * before the server *identity* is resolved is fine — the relay task waits for
-     * it (holding the fd) rather than dropping the tunnel. Safe to call across
-     * repeated VPN toggles: each call installs a fresh fd, replacing any
-     * still-running relay. Pair every `start_tunnel` with a [`Self::stop_tunnel`].
-     */override fun `startTunnel`(`tunFd`: kotlin.Int, `mtu`: kotlin.UInt)
-        = 
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_neutrino_fn_method_neutrinohandle_start_tunnel(
-        it,
-        FfiConverterInt.lower(`tunFd`),FfiConverterUInt.lower(`mtu`),_status)
-}
-    }
-    
-    
-
-    
-    /**
-     * Stop the tunnel reader and close the fd. Idempotent: a call when no tunnel is
-     * running is a no-op. Called on VPN toggle-off and teardown.
-     */override fun `stopTunnel`()
-        = 
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_neutrino_fn_method_neutrinohandle_stop_tunnel(
-        it,
-        _status)
-}
-    }
-    
-    
-
-    
-    /**
-     * This node's own virtual IP — the address to hand `VpnService.addAddress`
-     * (with a `/128`); the tunnel route is the whole `fd00::/8`. `None` until the
-     * server has resolved its identity.
-     */override fun `tunnelAddress`(): kotlin.String? {
-            return FfiConverterOptionalString.lift(
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_neutrino_fn_method_neutrinohandle_tunnel_address(
-        it,
-        _status)
-}
-    }
-    )
-    }
     
 
     

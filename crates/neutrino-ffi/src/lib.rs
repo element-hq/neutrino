@@ -4,12 +4,12 @@ uniffi::setup_scaffolding!("neutrino");
 mod ble_android;
 #[cfg(feature = "ble")]
 mod ble_selftest;
-// The iroh-backed relay: transport, assembly, and the host-TUN `PacketIo`. Wired
-// into the live tunnel by `tunnel::Tunnel` (driven by `start_tunnel`).
-mod relay_stack;
+// The iroh-backed datagram link: implements `neutrino_main::DatagramLink` over an
+// iroh QUIC endpoint (keyed by 32-byte node ids). Built in `start` and injected
+// into the entrypoint via a `FederationLinkFactory`.
 mod relay_transport;
-mod tun_io;
-mod tunnel;
+
+use relay_transport::{IrohTransport, RELAY_BIND};
 
 /// FFI-facing server configuration. Mirrors `neutrino_common::Config` so EX
 /// Android can fully configure the embedded homeserver. Kept here (not on the
@@ -78,12 +78,8 @@ impl From<Command> for neutrino_main::Command {
 #[derive(uniffi::Object)]
 pub struct NeutrinoHandle {
     tx: tokio::sync::mpsc::UnboundedSender<neutrino_main::Command>,
-    /// The TUN packet-capture tunnel. Independent of the command channel above:
-    /// the VPN is toggled on/off (each toggle a fresh fd) separately from the
-    /// homeserver's lifetime, so it has its own start/stop. Idle by default.
-    tunnel: tunnel::Tunnel,
     /// The server identity, published by the entrypoint once resolved. Read by
-    /// `server_name()` / `tunnel_address()`; empty until the server has booted.
+    /// `server_name()`; empty until the server has booted.
     identity: tokio::sync::watch::Receiver<Option<neutrino_main::TunnelHandoff>>,
 }
 
@@ -114,40 +110,6 @@ impl NeutrinoHandle {
         self.command(Command::KickBackoff);
     }
 
-    /// Take ownership of an established TUN file descriptor and start the packet
-    /// relay over it: IP packets the host writes into the tunnel are carried over
-    /// the wire (iroh) to the destination node, and inbound packets are injected
-    /// back (see [`tunnel`]). Non-blocking: spawns the relay on the server runtime
-    /// and returns immediately.
-    ///
-    /// `tun_fd` MUST come from `VpnService.Builder.establish()` with ownership
-    /// transferred to native code — on the Kotlin side, pass
-    /// `ParcelFileDescriptor.detachFd()`, NOT `.fd`. It MUST also be set non-blocking
-    /// before being handed over (`Os.fcntlInt(fd, F_SETFL, O_NONBLOCK)`); the relay's
-    /// `AsyncFd` reader relies on this so a read never stalls the server executor.
-    /// This crate owns and closes the fd from then on; the host must not close it (and
-    /// must not keep the `ParcelFileDescriptor` that produced it open).
-    ///
-    /// `mtu` is the tunnel MTU; currently advisory (clamping packets to the iroh
-    /// datagram limit is a relay-layer concern not yet wired — the host sets it).
-    ///
-    /// The relay runs on the server runtime, so it is cancelled automatically when
-    /// the homeserver shuts down: a tunnel cannot outlive its homeserver. Calling
-    /// this before the runtime exists is a no-op that closes the fd; calling it
-    /// before the server *identity* is resolved is fine — the relay task waits for
-    /// it (holding the fd) rather than dropping the tunnel. Safe to call across
-    /// repeated VPN toggles: each call installs a fresh fd, replacing any
-    /// still-running relay. Pair every `start_tunnel` with a [`Self::stop_tunnel`].
-    pub fn start_tunnel(&self, tun_fd: i32, mtu: u32) {
-        self.tunnel.start(tun_fd, mtu);
-    }
-
-    /// Stop the tunnel reader and close the fd. Idempotent: a call when no tunnel is
-    /// running is a no-op. Called on VPN toggle-off and teardown.
-    pub fn stop_tunnel(&self) {
-        self.tunnel.stop();
-    }
-
     /// The server's resolved federation name — its derived node id, or `None`
     /// until the server has booted and resolved its identity (so the host can
     /// distinguish "not ready yet" from a value rather than racing on an empty
@@ -159,13 +121,6 @@ impl NeutrinoHandle {
             .borrow()
             .as_ref()
             .map(|h| h.server_name().to_owned())
-    }
-
-    /// This node's own virtual IP — the address to hand `VpnService.addAddress`
-    /// (with a `/128`); the tunnel route is the whole `fd00::/8`. `None` until the
-    /// server has resolved its identity.
-    pub fn tunnel_address(&self) -> Option<String> {
-        self.identity.borrow().as_ref().map(|h| h.vip().to_owned())
     }
 }
 
@@ -194,16 +149,22 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let config: neutrino_main::Config = config.into();
-    // Published once the runtime is built so `start_tunnel` can spawn its reader
-    // onto this runtime — which is what ties the tunnel's lifetime to the server's.
-    let runtime: std::sync::Arc<std::sync::OnceLock<tokio::runtime::Handle>> =
-        std::sync::Arc::new(std::sync::OnceLock::new());
-    let runtime_publisher = std::sync::Arc::clone(&runtime);
-    // The entrypoint publishes {node secret, shared route table} here once the
-    // server identity is resolved; the relay task awaits it (so a `start_tunnel`
-    // that races ahead of identity resolution waits rather than losing the tunnel).
+    // The entrypoint publishes the resolved server name here once identity
+    // resolution completes; `server_name()` reads it back.
     let (handoff_tx, handoff_rx) =
         tokio::sync::watch::channel::<Option<neutrino_main::TunnelHandoff>>(None);
+    // Build the federation datagram link from the resolved node secret: an iroh
+    // QUIC endpoint, addressed by 32-byte node id, carrying the sidecar's
+    // CoAP/CBOR wire over BLE (no OS socket / TUN / virtual IPs). The entrypoint
+    // calls this once it has resolved the secret, then injects the link into the
+    // lb sidecar. A bind failure is widened to `entrypoint`'s boxed error and
+    // fails startup loudly (logged on the runtime thread below).
+    let link_factory: neutrino_main::FederationLinkFactory = Box::new(move |secret| {
+        Box::pin(async move {
+            let transport = IrohTransport::bind(&secret, RELAY_BIND).await?;
+            Ok(transport as std::sync::Arc<dyn neutrino_main::DatagramLink>)
+        })
+    });
     std::thread::spawn(move || {
         // Neutrino owns its runtime. current_thread = parity with the previous
         // async-compat global (also current_thread); all DB work is offloaded to
@@ -220,15 +181,13 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
                 return;
             }
         };
-        // Publish the handle before blocking so a concurrent `start_tunnel` can spawn
-        // onto this runtime. Tasks spawned from the FFI thread are polled by this
-        // `block_on`; when it returns, `rt` drops and any reader task is cancelled.
-        let _ = runtime_publisher.set(rt.handle().clone());
         rt.block_on(async {
             // The command receiver is threaded into the server; a `Shutdown`
             // command (or every `NeutrinoHandle` being dropped, which closes the
             // channel) drives `serve`'s graceful shutdown and returns here.
-            if let Err(e) = neutrino_main::entrypoint(config, rx, Some(handoff_tx)).await {
+            if let Err(e) =
+                neutrino_main::entrypoint(config, rx, Some(handoff_tx), Some(link_factory)).await
+            {
                 tracing::error!(error = %e, "neutrino: server entrypoint exited with an error");
             }
         });
@@ -240,11 +199,9 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
         // stop the closure), so a runaway write can delay this thread's exit.
         // Normal writes are sub-millisecond, so in practice teardown is immediate.
     });
-    let identity = handoff_rx.clone();
     NeutrinoHandle {
         tx,
-        tunnel: tunnel::Tunnel::new(runtime, handoff_rx),
-        identity,
+        identity: handoff_rx,
     }
 }
 
@@ -282,10 +239,6 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = NeutrinoHandle {
             tx,
-            tunnel: tunnel::Tunnel::new(
-                std::sync::Arc::new(std::sync::OnceLock::new()),
-                tokio::sync::watch::channel::<Option<neutrino_main::TunnelHandoff>>(None).1,
-            ),
             identity: tokio::sync::watch::channel::<Option<neutrino_main::TunnelHandoff>>(None).1,
         };
         handle.shutdown();
@@ -300,10 +253,6 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = NeutrinoHandle {
             tx,
-            tunnel: tunnel::Tunnel::new(
-                std::sync::Arc::new(std::sync::OnceLock::new()),
-                tokio::sync::watch::channel::<Option<neutrino_main::TunnelHandoff>>(None).1,
-            ),
             identity: tokio::sync::watch::channel::<Option<neutrino_main::TunnelHandoff>>(None).1,
         };
         handle.kick_backoff();
