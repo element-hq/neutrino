@@ -165,6 +165,24 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### datagram origin↔node binding (2026-06-29)
+- The iroh datagram link is the one trust boundary (the homeserver itself runs no
+  signature checks — trusted mesh). `federation::auth` trusts `X-Matrix origin`
+  *only because the network layer authenticated the peer*, so that binding MUST be
+  enforced at the transport. The datagram ingress (`CoapDispatch.node_binding` →
+  `Hub::origin_binding_violation`) rejects (401) any request whose claimed origin
+  node id ≠ the link-authenticated source node — a peer may assert only its own
+  origin. Enforced in neutrino-lb's datagram path only; UDP/HTTP (trusted LAN, no
+  peer auth) keep prior behaviour. open/permissionless federation is intended, so
+  there is deliberately NO peer allowlist — anyone may connect, but no one may
+  impersonate another node.
+- Soundness prerequisite: the node↔synthetic-`SocketAddr` map is now a lossless
+  bijection (`Hub::addr_for`/`node_for`, a monotonic counter), not the prior
+  18-of-32-byte hash. coap-rs stamps `request.source` from the responder address,
+  so the exact source node must be recoverable from it; the old lossy projection
+  was a grindable 144-bit-prefix collision that would let a peer be resolved as
+  another node.
+
 ### temporal state-group index (2026-06-22)
 - State groups are implemented as a **temporal interval table** (`room_state`),
   not Synapse-style per-event snapshots or snapshot+delta chains. One row per

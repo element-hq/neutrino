@@ -78,9 +78,9 @@ impl From<Command> for neutrino_main::Command {
 #[derive(uniffi::Object)]
 pub struct NeutrinoHandle {
     tx: tokio::sync::mpsc::UnboundedSender<neutrino_main::Command>,
-    /// The server identity, published by the entrypoint once resolved. Read by
-    /// `server_name()`; empty until the server has booted.
-    identity: tokio::sync::watch::Receiver<Option<neutrino_main::TunnelHandoff>>,
+    /// The server identity (its resolved `server_name`/node id), published by the
+    /// entrypoint once resolved. Read by `server_name()`; `None` until booted.
+    identity: tokio::sync::watch::Receiver<Option<String>>,
 }
 
 #[uniffi::export]
@@ -117,10 +117,7 @@ impl NeutrinoHandle {
     /// this is how the host learns the name to build user ids
     /// (`@localpart:server_name`).
     pub fn server_name(&self) -> Option<String> {
-        self.identity
-            .borrow()
-            .as_ref()
-            .map(|h| h.server_name().to_owned())
+        self.identity.borrow().clone()
     }
 }
 
@@ -151,8 +148,7 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
     let config: neutrino_main::Config = config.into();
     // The entrypoint publishes the resolved server name here once identity
     // resolution completes; `server_name()` reads it back.
-    let (handoff_tx, handoff_rx) =
-        tokio::sync::watch::channel::<Option<neutrino_main::TunnelHandoff>>(None);
+    let (handoff_tx, handoff_rx) = tokio::sync::watch::channel::<Option<String>>(None);
     // Build the federation datagram link from the resolved node secret: an iroh
     // QUIC endpoint, addressed by 32-byte node id, carrying the sidecar's
     // CoAP/CBOR wire over BLE (no OS socket / TUN / virtual IPs). The entrypoint
@@ -239,7 +235,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = NeutrinoHandle {
             tx,
-            identity: tokio::sync::watch::channel::<Option<neutrino_main::TunnelHandoff>>(None).1,
+            identity: tokio::sync::watch::channel::<Option<String>>(None).1,
         };
         handle.shutdown();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::Shutdown);
@@ -253,7 +249,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = NeutrinoHandle {
             tx,
-            identity: tokio::sync::watch::channel::<Option<neutrino_main::TunnelHandoff>>(None).1,
+            identity: tokio::sync::watch::channel::<Option<String>>(None).1,
         };
         handle.kick_backoff();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::KickBackoff);

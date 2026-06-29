@@ -78,13 +78,13 @@ pub trait WireServer: Send + Sync {
 /// Maps a destination `server_name` (the request authority) to the address the
 /// wire client should actually dial. The default ([`DirectResolver`]) is
 /// identity — dial the authority verbatim, as on a direct-LAN network. The
-/// embedded tunnel build injects a resolver that maps a peer's `server_name` to
-/// its virtual IP, keeping that mapping out of the transport itself — the wire
-/// client still just dials whatever `dest` it is handed.
+/// embedded datagram build injects a resolver that maps a peer's `server_name`
+/// to its bare 64-char hex node id (what the datagram egress dials by), keeping
+/// that mapping out of the transport itself — the wire client still just dials
+/// whatever `dest` it is handed.
 ///
-/// `resolve` is a **pure** mapping with no side effects. Telling the relay how
-/// to reach a peer (route registration) is a separate concern handled when the
-/// peer's identity is first learned — not on every send through here.
+/// `resolve` is a **pure** mapping with no side effects: it just rewrites the
+/// authority, nothing more.
 pub trait DestinationResolver: Send + Sync {
     /// Map a destination authority (`host` or `host:port`) to the address to
     /// dial. Takes ownership so the identity case can hand the string straight

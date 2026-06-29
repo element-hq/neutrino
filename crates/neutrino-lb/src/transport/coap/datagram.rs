@@ -22,10 +22,25 @@
 //!
 //! coap-rs is structured around `SocketAddr`: it keys per-peer blockwise / Q-Block
 //! reassembly state by `Responder::address()`, and `ClientTransport::recv`
-//! returns an informational `Option<SocketAddr>`. We have no real address, so
-//! [`synthetic_addr`] derives a deterministic, collision-free-per-node
-//! `SocketAddr` PURELY as that in-process key. It is never bound and never put on
-//! a wire; the real routing is the 32-byte node id carried alongside.
+//! returns an informational `Option<SocketAddr>`. We have no real address, so the
+//! [`Hub`] hands each 32-byte node a UNIQUE synthetic `SocketAddr` PURELY as that
+//! in-process key ([`Hub::addr_for`]). It is never bound and never put on a wire;
+//! the real routing is the 32-byte node id carried alongside.
+//!
+//! The mapping is a lossless **bijection** (a monotonic counter), not a hash of
+//! the node bytes — because the *exact* source node must be recoverable from
+//! `request.source` ([`Hub::node_for`]) for the origin↔node binding below. A
+//! lossy projection would let a peer grind a key whose projection collides a
+//! victim's and be resolved as the victim.
+//!
+//! ## Why an origin↔node binding
+//!
+//! The link cryptographically authenticates the source node, and a peer's
+//! federation `server_name` IS that node's hex id. `federation::auth` trusts the
+//! `X-Matrix origin` header *solely because the network layer authenticated the
+//! peer* — so this layer MUST enforce that an authenticated peer asserts only its
+//! own origin. [`Hub::origin_binding_violation`] rejects a request whose claimed
+//! `origin` node id ≠ the authenticated source node (impersonation).
 
 use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
@@ -82,6 +97,21 @@ pub struct Hub {
     /// here; the listener takes the receiver exactly once via [`Hub::take_requests`].
     requests_tx: mpsc::UnboundedSender<NodeDatagram>,
     requests_rx: Mutex<Option<mpsc::UnboundedReceiver<NodeDatagram>>>,
+    /// Lossless node ↔ synthetic-`SocketAddr` bijection (see the module note).
+    /// A `std::sync::Mutex` (every critical section is one or two map ops, never
+    /// held across an await).
+    addrs: std::sync::Mutex<AddrRegistry>,
+}
+
+/// The node ↔ synthetic-`SocketAddr` bijection. A monotonic counter mints a fresh
+/// address per node, so distinct nodes never alias and the exact node is
+/// recoverable from any address it minted — the soundness requirement for the
+/// origin↔node binding.
+#[derive(Default)]
+struct AddrRegistry {
+    next: u128,
+    node_to_addr: HashMap<[u8; 32], SocketAddr>,
+    addr_to_node: HashMap<SocketAddr, [u8; 32]>,
 }
 
 impl Hub {
@@ -95,6 +125,7 @@ impl Hub {
             clients: std::sync::Mutex::new(HashMap::new()),
             requests_tx,
             requests_rx: Mutex::new(Some(requests_rx)),
+            addrs: std::sync::Mutex::new(AddrRegistry::default()),
         });
         tokio::spawn(drain_loop(hub.clone()));
         hub
@@ -143,6 +174,90 @@ impl Hub {
             None => tracing::debug!("datagram: no client inbox for node, dropping response"),
         }
     }
+
+    /// The stable synthetic `SocketAddr` for `node`, minting one on first use.
+    /// Purely an in-process coap-rs key — never bound, never on a wire. Distinct
+    /// nodes get distinct addresses (a monotonic counter), so the mapping is a
+    /// bijection and [`Hub::node_for`] recovers the exact node.
+    fn addr_for(&self, node: [u8; 32]) -> SocketAddr {
+        let mut reg = self.addrs.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(addr) = reg.node_to_addr.get(&node) {
+            return *addr;
+        }
+        let id = reg.next;
+        reg.next = reg.next.wrapping_add(1);
+        let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(id), 0, 0, 0));
+        reg.node_to_addr.insert(node, addr);
+        reg.addr_to_node.insert(addr, node);
+        addr
+    }
+
+    /// Recover the exact node a synthetic `SocketAddr` was minted for, or `None`
+    /// if it was not minted by this hub.
+    fn node_for(&self, addr: SocketAddr) -> Option<[u8; 32]> {
+        self.addrs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .addr_to_node
+            .get(&addr)
+            .copied()
+    }
+
+    /// SECURITY — the trust-boundary binding `federation::auth` defers to. The
+    /// link authenticates the source node, and a peer's federation `server_name`
+    /// IS that node's 64-hex id, so a peer may assert only its OWN origin. Returns
+    /// `true` if the request MUST be rejected: a forwarded `X-Matrix origin` whose
+    /// node id ≠ the authenticated source `node` (impersonation), or a malformed
+    /// origin / unrecognised source over an authenticated link. A request with no
+    /// `authorization` header claims no server identity, so it is left for the
+    /// upstream's own auth gate (a 401 on protected routes) rather than
+    /// over-rejected here (e.g. an unauthenticated `/version`).
+    pub(super) fn origin_binding_violation(
+        &self,
+        source: Option<SocketAddr>,
+        headers: &[(String, Vec<u8>)],
+    ) -> bool {
+        let Some((_, value)) = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        else {
+            return false; // no claimed origin — defer to the upstream auth gate
+        };
+        // A server identity is now being asserted; it MUST match the authenticated
+        // source node. An unknown source or unparseable origin is a hard reject.
+        let Some(node) = source.and_then(|addr| self.node_for(addr)) else {
+            return true;
+        };
+        // The origin is a `server_name` == 64-hex node id; decode and compare bytes
+        // (case-insensitive via `parse_node`) rather than re-encoding the node.
+        match std::str::from_utf8(value)
+            .ok()
+            .and_then(xmatrix_origin)
+            .and_then(|origin| parse_node(origin).ok())
+        {
+            Some(claimed) => claimed != node,
+            None => true,
+        }
+    }
+}
+
+/// Extract the unquoted `origin` auth-param from an `X-Matrix origin="…",…`
+/// Authorization value, for the transport-layer identity binding
+/// ([`Hub::origin_binding_violation`]). `None` if the scheme prefix or `origin`
+/// is absent. Mirrors `neutrino_http::federation::auth`'s parse, kept local so
+/// this Matrix-agnostic transport needn't depend on the http crate; it extracts
+/// the bytes only — the http layer still owns the real auth policy.
+fn xmatrix_origin(value: &str) -> Option<&str> {
+    let params = value.strip_prefix("X-Matrix ")?;
+    for part in params.split(',') {
+        let Some((key, val)) = part.split_once('=') else {
+            continue;
+        };
+        if key.trim() == "origin" {
+            return Some(val.trim().trim_matches('"'));
+        }
+    }
+    None
 }
 
 /// The single drain task: pull each inbound datagram off the link, classify it,
@@ -189,20 +304,6 @@ fn classify(bytes: &[u8]) -> Class {
     }
 }
 
-/// A deterministic, collision-free-per-node `SocketAddr` used PURELY as coap-rs's
-/// in-process per-peer key — never bound, never on a wire. The first 16 node-id
-/// bytes form the IPv6 address and the next 2 the port, so distinct nodes map to
-/// distinct addresses (collisions only on a deliberate 144-bit prefix match, not
-/// by accident). The client transport's `recv` return and the responder's
-/// `address()` for a node MUST agree on this value, since coap-rs keys per-peer
-/// reassembly state by it.
-pub(crate) fn synthetic_addr(node: [u8; 32]) -> SocketAddr {
-    let mut ip = [0u8; 16];
-    ip.copy_from_slice(&node[..16]);
-    let port = u16::from_be_bytes([node[16], node[17]]);
-    SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(ip), port, 0, 0))
-}
-
 /// coap-rs [`ClientTransport`](coap::client::ClientTransport) bound to one peer
 /// node. Sends go straight to the link; receives drain this node's Hub inbox.
 pub struct IrohClientTransport {
@@ -244,7 +345,7 @@ impl coap::client::ClientTransport for IrohClientTransport {
                 // practice; the clamp is defensive.
                 let n = bytes.len().min(buf.len());
                 buf[..n].copy_from_slice(&bytes[..n]);
-                Ok((n, Some(synthetic_addr(self.node))))
+                Ok((n, Some(self.hub.addr_for(self.node))))
             }
             // Hub gone (link closed): end coap-rs's receive loop cleanly rather
             // than spinning. `BrokenPipe` is the natural "peer/link went away".
@@ -277,7 +378,7 @@ impl Listener for IrohCoapListener {
                 let responder = Arc::new(IrohResponder {
                     node,
                     link: hub.link(),
-                    addr: synthetic_addr(node),
+                    addr: hub.addr_for(node),
                 });
                 if sender.send((bytes, responder)).is_err() {
                     break; // server loop gone
@@ -558,6 +659,9 @@ impl WireServer for IrohCoapWireServer {
         let dispatch = Arc::new(CoapDispatch {
             handler,
             max_body_bytes: self.max_body_bytes,
+            // The datagram ingress is the authenticated trust boundary: bind every
+            // request's claimed origin to its source node via the hub.
+            node_binding: Some(self.hub.clone()),
         });
         // Same shutdown discipline as the UDP server: race `run` against the
         // token; dropping the run future aborts the listener task (AbortOnDrop in
@@ -696,12 +800,25 @@ mod tests {
         );
     }
 
-    // synthetic_addr must be deterministic and distinct per node — it is coap-rs's
-    // only per-peer reassembly key.
-    #[test]
-    fn synthetic_addr_is_deterministic_and_distinct() {
-        assert_eq!(synthetic_addr(NODE_A), synthetic_addr(NODE_A));
-        assert_ne!(synthetic_addr(NODE_A), synthetic_addr(NODE_B));
+    // The node↔addr registry must be a lossless bijection: stable per node,
+    // distinct across nodes, and the exact node recoverable from any minted addr.
+    // This is the soundness requirement for the origin↔node binding — a lossy map
+    // would let a peer be resolved as a different node.
+    #[tokio::test]
+    async fn addr_registry_is_a_lossless_bijection() {
+        let (link, _peer) = MockLink::pair(NODE_A, NODE_B);
+        let hub = Hub::new(link);
+        let addr_a = hub.addr_for(NODE_A);
+        let addr_b = hub.addr_for(NODE_B);
+        // Stable per node, distinct across nodes.
+        assert_eq!(addr_a, hub.addr_for(NODE_A));
+        assert_ne!(addr_a, addr_b);
+        // The exact node is recoverable; an addr this hub never minted resolves
+        // to nothing.
+        assert_eq!(hub.node_for(addr_a), Some(NODE_A));
+        assert_eq!(hub.node_for(addr_b), Some(NODE_B));
+        let unminted = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(u128::MAX), 9999, 0, 0));
+        assert_eq!(hub.node_for(unminted), None);
     }
 
     #[test]
@@ -906,6 +1023,98 @@ mod tests {
             second.build_server().await.is_err(),
             "a hub must drive at most one ingress listener"
         );
+    }
+
+    /// An `Authorization: X-Matrix origin="<server>"` header value.
+    fn xmatrix_auth(origin: &str) -> (String, Vec<u8>) {
+        (
+            "authorization".to_owned(),
+            format!("X-Matrix origin=\"{origin}\",destination=\"x\"").into_bytes(),
+        )
+    }
+
+    // SECURITY: the rig authenticates the inbound peer as NODE_A (B's link yields
+    // that source). A request whose `X-Matrix origin` is NODE_A's own id is the
+    // peer asserting its own identity, so it must be accepted and echoed.
+    #[tokio::test]
+    async fn authenticated_origin_matching_source_node_is_accepted() {
+        let (client, token, handle) = rig(None, None, None, None).await;
+        let resp = client
+            .send(WireRequest {
+                dest: hex_node(NODE_B),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![xmatrix_auth(&hex_node(NODE_A))],
+                body: vec![1, 2, 3],
+            })
+            .await
+            .expect("send");
+        assert_eq!(resp.status, 200, "own-origin request must be accepted");
+        assert_eq!(resp.body, vec![1, 2, 3]);
+        shutdown(token, handle).await;
+    }
+
+    // SECURITY (SEC1): the authenticated peer is NODE_A, but the request claims to
+    // be NODE_B. That is impersonation over an authenticated link and MUST be
+    // rejected with 401 before the handler runs — the EchoHandler can only ever
+    // return 200, so a 401 proves the binding refused it pre-dispatch.
+    #[tokio::test]
+    async fn spoofed_origin_is_rejected_with_401() {
+        let (client, token, handle) = rig(None, None, None, None).await;
+        let resp = client
+            .send(WireRequest {
+                dest: hex_node(NODE_B),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                // Claims NODE_B while the link authenticated the sender as NODE_A.
+                headers: vec![xmatrix_auth(&hex_node(NODE_B))],
+                body: vec![1, 2, 3],
+            })
+            .await
+            .expect("send");
+        assert_eq!(resp.status, 401, "a foreign origin must be rejected");
+        assert!(resp.body.is_empty(), "rejected request must not be echoed");
+        shutdown(token, handle).await;
+    }
+
+    // A malformed origin (not a 64-hex node id) on an authenticated link cannot be
+    // bound to the source node, so it is rejected rather than trusted.
+    #[tokio::test]
+    async fn malformed_origin_is_rejected_with_401() {
+        let (client, token, handle) = rig(None, None, None, None).await;
+        let resp = client
+            .send(WireRequest {
+                dest: hex_node(NODE_B),
+                method: Method::GET,
+                path: "/_matrix/federation/v1/event/$e".to_owned(),
+                headers: vec![xmatrix_auth("not-a-node-id.example")],
+                body: vec![],
+            })
+            .await
+            .expect("send");
+        assert_eq!(resp.status, 401, "an unbindable origin must be rejected");
+        shutdown(token, handle).await;
+    }
+
+    // A request with NO authorization header asserts no server identity, so the
+    // transport binding must NOT reject it — the upstream homeserver's own auth
+    // gate decides (a protected route 401s there). Proves we don't over-reject
+    // unauthenticated routes like `/version`.
+    #[tokio::test]
+    async fn missing_authorization_is_passed_through() {
+        let (client, token, handle) = rig(None, None, None, None).await;
+        let resp = client
+            .send(WireRequest {
+                dest: hex_node(NODE_B),
+                method: Method::GET,
+                path: "/_matrix/federation/v1/version".to_owned(),
+                headers: vec![],
+                body: vec![],
+            })
+            .await
+            .expect("send");
+        assert_eq!(resp.status, 200, "no-auth request must reach the handler");
+        shutdown(token, handle).await;
     }
 
     // Regression for the concurrent first-send race: many overlapping *first*

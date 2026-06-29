@@ -2,7 +2,7 @@
 //!
 //! A peer's federation `server_name` is its node id (lowercase hex, as derived
 //! by [`server_identity_from_secret`](crate::server_identity_from_secret)).
-//! [`TunnelResolver`] is the one pure, iroh-free step that maps that name onto
+//! [`NodeIdResolver`] is the one pure, iroh-free step that maps that name onto
 //! the wire: it rewrites the federation egress destination to the peer's bare
 //! 64-char hex node id, which the sidecar's datagram egress
 //! (`IrohCoapWireClient`) parses and dials the peer's iroh endpoint by. The
@@ -41,15 +41,15 @@ fn parse_server_name(authority: &str) -> Option<(NodeKey, Option<&str>)> {
 /// its bare 64-char hex node id (the datagram egress addresses peers by node id,
 /// not by an IP/port). Non-node authorities pass through unchanged so direct-dial
 /// federation is unaffected.
-pub(crate) struct TunnelResolver;
+pub(crate) struct NodeIdResolver;
 
-impl TunnelResolver {
+impl NodeIdResolver {
     pub(crate) fn new() -> Self {
         Self
     }
 }
 
-impl DestinationResolver for TunnelResolver {
+impl DestinationResolver for NodeIdResolver {
     fn resolve(&self, authority: String) -> String {
         match parse_server_name(&authority) {
             // The datagram egress (`IrohCoapWireClient`) parses `dest` as a
@@ -57,7 +57,7 @@ impl DestinationResolver for TunnelResolver {
             // return the bare node id — no vip, no port.
             Some((key, _port)) => hex::encode(key),
             None => {
-                warn!(%authority, "tunnel resolver: server_name is not a node id; dialing verbatim");
+                warn!(%authority, "node-id resolver: server_name is not a node id; dialing verbatim");
                 authority
             }
         }
@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn resolver_maps_node_name_to_hex() {
         let (key, name) = key_and_name();
-        let resolver = TunnelResolver::new();
+        let resolver = NodeIdResolver::new();
         // A bare node-id name resolves to itself (the 64-char hex node id the
         // datagram egress dials by) — no vip/port rewrite.
         assert_eq!(resolver.resolve(name.clone()), hex::encode(key));
@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn resolver_passes_through_non_node_authority() {
-        let resolver = TunnelResolver::new();
+        let resolver = NodeIdResolver::new();
         assert_eq!(
             resolver.resolve("localhost:8008".to_owned()),
             "localhost:8008"

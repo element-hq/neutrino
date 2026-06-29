@@ -57,7 +57,7 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
         return error_response(StatusCode::BAD_GATEWAY);
     };
     // Map the destination server_name to the address actually dialled (identity
-    // on a direct network; server_name → virtual IP under the tunnel).
+    // on a direct network; server_name → 64-char hex node id on the datagram link).
     let dest = state.resolver.resolve(authority.clone());
     debug!(%authority, %dest, "egress: forwarding federation request to resolved destination");
     let path = parts

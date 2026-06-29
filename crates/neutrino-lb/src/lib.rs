@@ -139,8 +139,8 @@ pub struct LbConfig {
     pub wire: WireKind,
     /// How a destination `server_name` is turned into the address the egress
     /// dials. `None` = direct dial (the authority verbatim), which is the
-    /// desktop / direct-LAN behaviour. The embedded tunnel build supplies a
-    /// resolver that maps `server_name` → virtual IP.
+    /// desktop / direct-LAN behaviour. The embedded datagram build supplies a
+    /// resolver that maps `server_name` → its 64-char hex node id.
     pub resolver: Option<Arc<dyn DestinationResolver>>,
     /// In-process federation transport. When `Some`, the CoAP wire runs over this
     /// datagram link (the embedded/iroh build) instead of a UDP socket — keyed by

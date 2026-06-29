@@ -78,7 +78,7 @@ async fn start_node(localpart: &str) -> Node {
                 .unwrap(),
         );
 
-        let _ = neutrino_http::serve(http_listener, config, store, cmd_rx, None).await;
+        let _ = neutrino_http::serve(http_listener, config, store, cmd_rx).await;
     });
 
     // Sidecar: ingress on the public port, egress on loopback, upstream = the

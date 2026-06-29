@@ -218,8 +218,8 @@ async fn entrypoint_tears_down_sidecar_when_homeserver_stops() {
 
 /// The embedded/mobile FFI config specifically: an **empty** `server_name` (so
 /// the identity is derived from the persisted secret) launched **with a handoff**
-/// (so `peer_sink` is wired into the homeserver). The other tests here use a
-/// concrete name and `None`, so this is the only one exercising the exact shape
+/// (so the resolved identity is published back to the host). The other tests here
+/// use a concrete name and `None`, so this is the only one exercising the exact shape
 /// `neutrino-ffi::start` builds. Asserts the server stays up at startup (an early
 /// return would have dropped the listener — the failure mode that, on device,
 /// only surfaced as a silently-swallowed error) and that the handoff publishes a
@@ -254,14 +254,13 @@ async fn embedded_config_with_handoff_comes_up_and_publishes_identity() {
     );
 
     let published = handoff_rx.borrow();
-    let handoff = published
+    let server_name = published
         .as_ref()
         .expect("entrypoint must publish the handoff once identity resolves");
     assert_eq!(
-        handoff.server_name().len(),
+        server_name.len(),
         64,
-        "derived identity should be a 64-char hex node id, got {:?}",
-        handoff.server_name()
+        "derived identity should be a 64-char hex node id, got {server_name:?}"
     );
     drop(published);
     handle.abort();

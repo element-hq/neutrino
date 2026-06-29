@@ -323,25 +323,11 @@ impl AppState {
     }
 }
 
-/// Sink notified when the server gains an outbound federation destination.
-///
-/// The embedding host (the relay/TUN layer) uses it to ensure a route to the
-/// peer exists before the first outbound packet. [`serve`] threads it to the
-/// outbound sender, which calls [`register`](PeerSink::register) once when it
-/// first spawns a task for a destination — so every peer we federate with is
-/// registered, not just those learned via an invite. The dev binary and tests
-/// pass `None` (no relay).
-pub trait PeerSink: Send + Sync {
-    /// Record that `server_name` is now an outbound federation destination.
-    fn register(&self, server_name: &str);
-}
-
 pub async fn serve(
     listener: TcpListener,
     config: Config,
     store: Arc<SqliteStore>,
     commands: mpsc::UnboundedReceiver<Command>,
-    peer_sink: Option<Arc<dyn PeerSink>>,
 ) -> Result<(), StartupError> {
     // The caller (the entrypoint) opens the store, resolves the server identity
     // from it, and hands the live handle in — so we build state around it rather
@@ -361,7 +347,6 @@ pub async fn serve(
         state.fetcher(),
         state.worker_poke(),
         state.federation_proxy(),
-        peer_sink,
     );
     let router = build_router(&state);
     // `dispatch` resolves on a terminal command or when every sender is dropped,
@@ -1672,7 +1657,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let (tx, rx) = mpsc::unbounded_channel();
-        let server = tokio::spawn(super::serve(listener, config, store, rx, None));
+        let server = tokio::spawn(super::serve(listener, config, store, rx));
 
         // Give the sender supervisor a moment to discover the dead peer and
         // spawn its per-destination task (which will be retrying the dead peer).

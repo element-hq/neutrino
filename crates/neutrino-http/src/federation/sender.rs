@@ -97,7 +97,6 @@ pub(crate) fn spawn(
     fetcher: Arc<dyn MissingEventsFetcher>,
     worker_poke: mpsc::Sender<OwnedRoomId>,
     federation_proxy: Option<String>,
-    peer_sink: Option<Arc<dyn crate::PeerSink>>,
 ) -> JoinHandle<()> {
     spawn_with(
         store,
@@ -109,7 +108,6 @@ pub(crate) fn spawn(
         fetcher,
         worker_poke,
         federation_proxy,
-        peer_sink,
     )
 }
 
@@ -126,7 +124,6 @@ fn spawn_with(
     fetcher: Arc<dyn MissingEventsFetcher>,
     worker_poke: mpsc::Sender<OwnedRoomId>,
     federation_proxy: Option<String>,
-    peer_sink: Option<Arc<dyn crate::PeerSink>>,
 ) -> JoinHandle<()> {
     let watch_rx = store.subscribe();
     let client = Arc::new(FederationClient::new(origin, federation_proxy.as_deref()));
@@ -151,7 +148,6 @@ fn spawn_with(
         startup_jitter_max,
         shutdown,
         kick_rx,
-        peer_sink,
     ))
 }
 
@@ -164,7 +160,6 @@ async fn supervise(
     startup_jitter_max: Duration,
     shutdown: CancellationToken,
     kick_rx: watch::Receiver<()>,
-    peer_sink: Option<Arc<dyn crate::PeerSink>>,
 ) {
     let mut running: HashMap<OwnedServerName, JoinHandle<()>> = HashMap::new();
     let mut first_round = true;
@@ -176,12 +171,6 @@ async fn supervise(
             Ok(dests) => {
                 for dest in dests {
                     running.entry(dest.clone()).or_insert_with(|| {
-                        // First time we federate with this destination: tell the
-                        // relay/TUN layer so it can ensure a route before the
-                        // first packet (no-op when there's no relay).
-                        if let Some(sink) = &peer_sink {
-                            sink.register(dest.as_str());
-                        }
                         // Only the startup backlog gets jittered; a destination
                         // discovered mid-run is a single live send, not a flood.
                         let initial_delay = if first_round {
@@ -827,50 +816,6 @@ mod tests {
             .to_owned()
     }
 
-    /// Records the `server_name`s a `PeerSink` is asked to register.
-    #[derive(Default)]
-    struct RecordingSink(std::sync::Mutex<Vec<String>>);
-
-    impl crate::PeerSink for RecordingSink {
-        fn register(&self, server_name: &str) {
-            self.0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(server_name.to_owned());
-        }
-    }
-
-    // The sender registers each outbound destination's route with the peer sink
-    // the first time it federates with that destination (so the relay can route
-    // the first packet).
-    #[tokio::test]
-    async fn registers_each_destination_with_the_peer_sink() {
-        let stub = Arc::new(Stub::default());
-        let dest = spawn_peer(stub.clone()).await;
-        let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 1).await;
-        let sink = Arc::new(RecordingSink::default());
-
-        drop(spawn_with(
-            store.clone(),
-            "local.test".to_owned(),
-            2,
-            NO_JITTER,
-            no_shutdown(),
-            no_kick(),
-            null_fetcher(),
-            null_poke(),
-            None,
-            Some(sink.clone()),
-        ));
-        wait_drained(&store, &dest).await;
-
-        let registered = sink.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        assert!(
-            registered.iter().any(|s| s == dest.as_str()),
-            "peer sink saw {registered:?}, expected {dest}"
-        );
-    }
-
     #[tokio::test]
     async fn delivers_pending_and_drains_outbox() {
         let stub = Arc::new(Stub::default());
@@ -886,7 +831,6 @@ mod tests {
             no_kick(),
             null_fetcher(),
             null_poke(),
-            None,
             None,
         ));
         wait_drained(&store, &dest).await;
@@ -925,7 +869,6 @@ mod tests {
             null_fetcher(),
             null_poke(),
             None,
-            None,
         ));
         wait_drained(&store, &dest).await;
 
@@ -959,7 +902,6 @@ mod tests {
             null_fetcher(),
             null_poke(),
             None,
-            None,
         ));
         wait_drained(&store, &dest).await; // dropped → outbox empties
 
@@ -983,7 +925,6 @@ mod tests {
             no_kick(),
             null_fetcher(),
             null_poke(),
-            None,
             None,
         ));
         wait_drained(&store, &dest).await;
@@ -1027,7 +968,6 @@ mod tests {
             null_fetcher(),
             null_poke(),
             None,
-            None,
         ));
 
         // The healthy peer drains despite the dead peer retrying forever.
@@ -1059,7 +999,6 @@ mod tests {
             no_kick(),
             null_fetcher(),
             null_poke(),
-            None,
             None,
         ));
         // Give the supervisor a moment to reach its idle `changed()` await.
@@ -1104,7 +1043,6 @@ mod tests {
             null_fetcher(),
             null_poke(),
             None,
-            None,
         ));
         wait_adv_drained(&store, &dest).await;
 
@@ -1141,7 +1079,6 @@ mod tests {
             no_kick(),
             null_fetcher(),
             null_poke(),
-            None,
             None,
         ));
         wait_drained(&store, &dest).await;
@@ -1321,7 +1258,6 @@ mod tests {
             null_fetcher(),
             null_poke(),
             None,
-            None,
         );
 
         // Let the supervisor enumerate the dead peer and spawn its (forever-retrying)
@@ -1357,7 +1293,6 @@ mod tests {
             no_kick(),
             null_fetcher(),
             null_poke(),
-            None,
             None,
         ));
 

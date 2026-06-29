@@ -416,6 +416,13 @@ impl CoapWireServer {
 struct CoapDispatch {
     handler: Arc<dyn WireHandler>,
     max_body_bytes: usize,
+    /// Set only on the authenticated datagram ingress (the iroh build). When
+    /// present, every inbound request's claimed `X-Matrix origin` is bound to the
+    /// link-authenticated source node before the handler runs — a peer may assert
+    /// only its own origin (see [`datagram::Hub::origin_binding_violation`]). The
+    /// UDP/HTTP transports run on a trusted LAN with no peer authentication, so
+    /// they leave this `None` and keep `federation::auth`'s existing behaviour.
+    node_binding: Option<Arc<datagram::Hub>>,
 }
 
 impl CoapDispatch {
@@ -434,16 +441,30 @@ impl CoapDispatch {
         // handler/transcode — the network-exposed OOM guard, mirroring the HTTP
         // ingress. (coap-lite has already reassembled it; this still bounds the
         // downstream transcode + loopback forward — see the module OOM note.)
-        let wire_resp = if request.message.payload.len() > self.max_body_bytes {
-            WireResponse {
-                status: 413,
-                headers: vec![],
-                body: vec![],
-            }
-        } else {
-            let wire_req = message::parse_request(&request);
-            self.handler.handle(wire_req).await
-        };
+        let wire_resp =
+            if request.message.payload.len() > self.max_body_bytes {
+                WireResponse {
+                    status: 413,
+                    headers: vec![],
+                    body: vec![],
+                }
+            } else {
+                let wire_req = message::parse_request(&request);
+                // Authenticated datagram ingress: a peer may assert only its own
+                // origin. Reject (401) before the handler runs if the claimed
+                // `X-Matrix origin` is not the link-authenticated source node.
+                if self.node_binding.as_ref().is_some_and(|hub| {
+                    hub.origin_binding_violation(request.source, &wire_req.headers)
+                }) {
+                    WireResponse {
+                        status: 401,
+                        headers: vec![],
+                        body: vec![],
+                    }
+                } else {
+                    self.handler.handle(wire_req).await
+                }
+            };
         if let Some(ref mut response) = request.response {
             message::write_response(response, &wire_resp);
         }
@@ -483,6 +504,8 @@ impl WireServer for CoapWireServer {
         let dispatch = Arc::new(CoapDispatch {
             handler,
             max_body_bytes: self.max_body_bytes,
+            // UDP runs on a trusted LAN with no peer authentication — no binding.
+            node_binding: None,
         });
 
         // `coap::Server::run` has no native shutdown, so race it against the
@@ -1149,6 +1172,7 @@ mod dispatch_tests {
         let dispatch = CoapDispatch {
             handler: Arc::new(Spy(ran.clone())),
             max_body_bytes: MAX_WIRE_BODY_BYTES,
+            node_binding: None,
         };
         let mut request: Box<CoapRequest<SocketAddr>> = Box::new(CoapRequest::new());
         request.response = None;
@@ -1166,6 +1190,7 @@ mod dispatch_tests {
         let dispatch = CoapDispatch {
             handler: Arc::new(Spy(ran.clone())),
             max_body_bytes: MAX_WIRE_BODY_BYTES,
+            node_binding: None,
         };
         let mut request: Box<CoapRequest<SocketAddr>> = Box::new(CoapRequest::new());
         request.response = Some(CoapResponse::new(&request.message).expect("response"));

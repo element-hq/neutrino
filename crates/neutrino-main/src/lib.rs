@@ -1,5 +1,5 @@
 mod platform;
-mod tunnel;
+mod resolver;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,32 +15,6 @@ use neutrino_store_sqlite::SqliteStore;
 use rand::RngCore;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-
-/// Handed from the entrypoint to an embedding host (the ffi/Android layer) so it
-/// can read the server's resolved federation name once identity resolution
-/// completes. Published once on a [`watch`] channel the host reads back via its
-/// `server_name()` getter; non-embedded callers (the dev binary) pass `None`.
-///
-/// The node secret now flows to the host via the [`FederationLinkFactory`] (which
-/// builds the iroh datagram link), not this handoff — so the handoff carries only
-/// the identity string the host's getter needs.
-#[derive(Clone)]
-pub struct TunnelHandoff {
-    server_name: String,
-}
-
-impl TunnelHandoff {
-    /// Construct a handoff carrying the resolved server name. The entrypoint
-    /// builds one after identity resolution.
-    pub fn new(server_name: String) -> Self {
-        Self { server_name }
-    }
-
-    /// The server's resolved federation name (its node id, for the embedded host).
-    pub fn server_name(&self) -> &str {
-        &self.server_name
-    }
-}
 
 /// Result of building the federation datagram link from the node secret.
 pub type DatagramLinkResult =
@@ -64,7 +38,12 @@ pub fn init_tracing() {
 pub async fn entrypoint(
     mut config: Config,
     commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
-    handoff: Option<watch::Sender<Option<TunnelHandoff>>>,
+    // Published once identity resolution completes so an embedding host (the
+    // ffi/Android layer) can read the server's resolved federation name (its node
+    // id) back off the watch channel. The node secret flows to the host via
+    // `link_factory`, not here, so this carries only the identity string;
+    // non-embedded callers (the dev binary) pass `None`.
+    handoff: Option<watch::Sender<Option<String>>>,
     link_factory: Option<FederationLinkFactory>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
@@ -92,13 +71,12 @@ pub async fn entrypoint(
     };
 
     // When embedded, publish the resolved server name to the host over the
-    // handoff (its `server_name()` getter reads it back). The node secret reached
-    // the host via `link_factory` above; outbound federation is addressed by node
-    // id over the datagram link, so there is no route table or peer sink to wire.
+    // handoff (the host reads it back off the watch channel). The node secret
+    // reached the host via `link_factory` above; outbound federation is addressed
+    // by node id over the datagram link, so there is no route table to wire.
     if let Some(handoff) = &handoff {
-        let _ = handoff.send(Some(TunnelHandoff::new(config.server_name.clone())));
+        let _ = handoff.send(Some(config.server_name.clone()));
     }
-    let peer_sink: Option<Arc<dyn neutrino_http::PeerSink>> = None;
 
     // Embedded low-bandwidth sidecar: when `lb_federation_port` is set we run a
     // `neutrino-lb` proxy in-process beside the homeserver (the embedded-on-
@@ -134,7 +112,7 @@ pub async fn entrypoint(
             );
             let shutdown = CancellationToken::new();
             let lb = neutrino_lb::serve(lb_config, shutdown.clone());
-            let hs = neutrino_http::serve(listener, config, store, commands, peer_sink);
+            let hs = neutrino_http::serve(listener, config, store, commands);
             tokio::pin!(lb, hs);
             tokio::select! {
                 // The homeserver owns the command channel, so it drives the
@@ -167,7 +145,7 @@ pub async fn entrypoint(
                 }
             }
         }
-        None => neutrino_http::serve(listener, config, store, commands, peer_sink).await?,
+        None => neutrino_http::serve(listener, config, store, commands).await?,
     }
     Ok(())
 }
@@ -241,7 +219,7 @@ fn build_lb_config(
         // peer's node-id `server_name` to its bare 64-char hex node id so the
         // datagram egress dials the peer's iroh endpoint directly. Dormant for a
         // non-node `server_name` (dev/named servers pass through to direct dial).
-        resolver: Some(Arc::new(tunnel::TunnelResolver::new())),
+        resolver: Some(Arc::new(resolver::NodeIdResolver::new())),
         // The injected federation transport (iroh, embedded build) — when `Some`,
         // the sidecar's CoAP wire runs over it instead of a UDP socket. `None` for
         // dev/LAN keeps the UDP path.

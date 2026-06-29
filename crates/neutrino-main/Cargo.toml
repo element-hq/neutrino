@@ -20,7 +20,7 @@ neutrino-store-sqlite = { path = "../neutrino-store-sqlite" }
 
 # Server-identity derivation: a stable name from the persisted node secret. The
 # secret is opaque entropy; the public-key fingerprint is one general encoding
-# of it (NOT iroh-specific — iroh stays in the ffi/TUN layer).
+# of it (NOT iroh-specific — iroh stays in the ffi layer).
 ed25519-dalek = "2.2.0"
 hex = "0.4.3"
 rand.workspace = true
