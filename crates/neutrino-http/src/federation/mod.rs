@@ -9,64 +9,29 @@
 //! New federation endpoints land as sibling modules and register their
 //! routes in `lib.rs::build_router`.
 
-use std::time::Duration;
-
 use axum::{
     Json,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
 use neutrino_store::StorageError;
-use rand::Rng;
 use serde_json::json;
 use thiserror::Error;
 
 pub(crate) mod auth;
 pub(crate) mod backfill;
 pub(crate) mod client;
-pub(crate) mod gapfill;
 pub(crate) mod get_missing_events;
 pub(crate) mod invite;
 pub(crate) mod join;
 pub(crate) mod leave;
 pub(crate) mod make_join;
 pub(crate) mod make_leave;
-pub(crate) mod reconcile;
 pub(crate) mod send;
 pub(crate) mod send_join;
 pub(crate) mod send_leave;
-pub(crate) mod sender;
-pub(crate) mod worker;
 
-/// Spec maximum PDUs per federation transaction
-/// (<https://spec.matrix.org/v1.18/server-server-api/#transactions>). The
-/// inbound `/send` handler rejects a transaction carrying more than this; the
-/// outbound sender chunks to it. One constant so the two halves can't drift.
-pub(crate) const MAX_PDUS_PER_TXN: usize = 50;
-
-/// Backoff floor after a transient failure (outbound delivery, inbound
-/// staging). Shared so the two retry loops can't drift.
-pub(crate) const BACKOFF_BASE: Duration = Duration::from_secs(1);
-/// Backoff ceiling. The exponential sequence (1, 2, 4, 8, … s) is clamped here.
-pub(crate) const BACKOFF_CAP: Duration = Duration::from_secs(15 * 60);
-
-/// Double the backoff ceiling, clamped at [`BACKOFF_CAP`].
-pub(crate) fn next_backoff(current: Duration) -> Duration {
-    current.saturating_mul(2).min(BACKOFF_CAP)
-}
-
-/// Full jitter: a uniform random duration in `[0, ceiling]`. Spreads retries
-/// (and startup) so a fleet of senders / a gap-fill loop doesn't thunder a
-/// recovering peer in lockstep.
-pub(crate) fn jitter(ceiling: Duration) -> Duration {
-    let max_ms = ceiling.as_millis() as u64;
-    if max_ms == 0 {
-        return Duration::ZERO;
-    }
-    Duration::from_millis(rand::rng().random_range(0..=max_ms))
-}
-
-/// Shared test scaffolding for the federation HTTP tests (`client`, `sender`).
+/// Shared test scaffolding for the federation HTTP tests (`client`).
 #[cfg(test)]
 pub(crate) mod test_support {
     use axum::Router;
@@ -193,18 +158,6 @@ impl IntoResponse for FedError {
     }
 }
 
-/// Milliseconds since the Unix epoch, for the federation transaction
-/// `origin_server_ts`. Saturates to 0 on a pre-epoch clock — never panics (no
-/// `unwrap` on `SystemTime`). Shared by the inbound `backfill` response and the
-/// outbound `client`.
-pub(crate) fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// Walk `prev_events` back from `heads` (seeds included, newest-first, capped at
 /// `limit`) and return the events' wire bytes verbatim. Shared by `/backfill`
 /// and `send_join`'s `timeline` (both want "recent PDUs as raw bytes").
@@ -227,8 +180,8 @@ pub(crate) async fn events_before_raw(
 /// reject is a 403, an unknown room a 404, a malformed/unauthorisable event a
 /// 400, and storage / lost-result faults a 500. The human-readable strings are
 /// deliberately membership-agnostic so the two endpoints share one mapping.
-pub(crate) fn map_apply_err(err: crate::room_actor::RoomActorError) -> FedError {
-    use crate::room_actor::RoomActorError;
+pub(crate) fn map_apply_err(err: neutrino_engine::RoomActorError) -> FedError {
+    use neutrino_engine::RoomActorError;
     match err {
         RoomActorError::Rejected => {
             FedError::Forbidden("you are not permitted to perform this membership change")
@@ -288,31 +241,4 @@ pub(crate) fn complete_membership_template(
             None
         }
     }
-}
-
-/// Stage a batch of already-parsed PDUs for one room, then poke the worker to
-/// drain them. Shared staging primitive — `stage_pdu` is idempotent by event
-/// id, so re-staging is a no-op. Used by the outbound-join ingest; the inbound
-/// `/send` handler keeps its own loop because it must build a per-PDU result
-/// map. The poke is awaited (not `try_send`) so a single fresh-room ingest
-/// can't be silently dropped and left to stall.
-pub(crate) async fn stage_and_poke(
-    store: &impl neutrino_store::StagingStore,
-    worker_poke: &tokio::sync::mpsc::Sender<ruma::OwnedRoomId>,
-    origin: &ruma::ServerName,
-    room_id: &ruma::RoomId,
-    events: &[neutrino_common::Event],
-) -> Result<(), neutrino_store::StorageError> {
-    for ev in events {
-        if ev.room_id != *room_id {
-            continue; // never stage a cross-room event a peer slipped in
-        }
-        store
-            .stage_pdu(origin, &ev.room_id, &ev.event_id, &ev.raw)
-            .await?;
-    }
-    if worker_poke.send(room_id.to_owned()).await.is_err() {
-        tracing::warn!(%room_id, "worker poke failed; staged events will drain on the next poke or restart");
-    }
-    Ok(())
 }

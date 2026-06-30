@@ -2441,8 +2441,8 @@ async fn reconcile_ignores_advertisement_from_non_member_peer() {
         timeline: vec![ghost],
         state: vec![join_id],
     };
-    crate::federation::reconcile::reconcile_room(
-        &store,
+    neutrino_engine::reconcile::reconcile_room(
+        &*store,
         &*fetcher,
         &poke_tx,
         peer,

@@ -45,10 +45,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 use tracing::warn;
 
-use crate::federation::reconcile;
 use crate::federation::{FedError, auth};
 use crate::{AppState, lock_app};
-use neutrino_engine::ForwardExtremities;
+use neutrino_engine::{ForwardExtremities, reconcile};
 
 /// Inbound federation transaction body.
 ///
@@ -119,7 +118,7 @@ pub(crate) async fn handle(
     let body: TransactionBody = serde_json::from_value(body_value)
         .map_err(|_| FedError::BadRequest("body shape does not match the spec"))?;
 
-    if body.pdus.len() > super::MAX_PDUS_PER_TXN {
+    if body.pdus.len() > neutrino_engine::MAX_PDUS_PER_TXN {
         return Err(FedError::BadRequest("transaction exceeds 50 PDUs"));
     }
 
@@ -233,7 +232,7 @@ pub(crate) async fn handle(
     resp_rooms.extend(advertised.keys().cloned());
     let mut forward_extremities = BTreeMap::new();
     for room in &resp_rooms {
-        let fes = reconcile::local_extremities(&store, room).await;
+        let fes = reconcile::local_extremities(&*store, room).await;
         if !fes.is_empty() {
             forward_extremities.insert(room.clone(), fes);
         }
@@ -248,7 +247,7 @@ pub(crate) async fn handle(
         let worker_poke = worker_poke.clone();
         let origin = body.origin.clone();
         tokio::spawn(async move {
-            reconcile::reconcile_room(&store, &*fetcher, &worker_poke, &origin, &room, &heads)
+            reconcile::reconcile_room(&*store, &*fetcher, &worker_poke, &origin, &room, &heads)
                 .await;
         });
     }

@@ -5,7 +5,22 @@ edition = "2024"
 
 [dependencies]
 async-trait.workspace = true
+rand.workspace = true
 ruma.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+neutrino-common = { path = "../neutrino-common" }
+neutrino-state = { path = "../neutrino-state" }
+neutrino-store = { path = "../neutrino-store" }
+
+[dev-dependencies]
+# The runtime tests open a real in-memory SQLite store (no production dep on
+# store-sqlite — engine stays backend-agnostic; only its tests bind a concrete
+# backend). store-sqlite does not depend on engine, so this is acyclic.
+neutrino-store-sqlite = { path = "../neutrino-store-sqlite" }
+tempfile = "3.27.0"

@@ -3051,10 +3051,19 @@ name = "neutrino-engine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "neutrino-common",
+ "neutrino-state",
+ "neutrino-store",
+ "neutrino-store-sqlite",
+ "rand 0.9.4",
  "ruma",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

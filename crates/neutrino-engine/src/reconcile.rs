@@ -19,14 +19,29 @@
 use std::collections::BTreeSet;
 
 use neutrino_state::event_id::from_wire;
-use neutrino_store::{EventStore, RoomStore, StagingStore};
-use neutrino_store_sqlite::SqliteStore;
+use neutrino_store::{StateStore, StorageBackend};
 use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId, ServerName};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::federation::auth;
-use neutrino_engine::{ForwardExtremities, MissingEventsFetcher, MissingEventsQuery};
+use crate::ports::{ForwardExtremities, MissingEventsFetcher, MissingEventsQuery};
+
+/// Whether `server` has a joined member in `room_id`. A store-backed predicate
+/// (not an `X-Matrix` check): the advertised heads a peer sends are
+/// attacker-controllable, so reconciliation only honours an advertisement from a
+/// peer that actually shares the room. Also gates the read-scoped federation
+/// handlers (`backfill`, `get_missing_events`) in `neutrino-http`.
+pub async fn server_in_room(
+    store: &impl StateStore,
+    room_id: &RoomId,
+    server: &ServerName,
+) -> Result<bool, neutrino_store::StorageError> {
+    Ok(store
+        .joined_members(room_id)
+        .await?
+        .keys()
+        .any(|user| user.server_name() == server))
+}
 
 /// Initial `limit` for a reconciliation fetch. We only need the advertised
 /// head(s) staged — the worker's state-DAG gap-fill grounds anything deeper — so
@@ -43,7 +58,10 @@ fn sample_ids(ids: &[OwnedEventId]) -> Vec<&str> {
 /// This server's current forward extremities for `room_id`, in the wire shape,
 /// for advertising to a peer. Empty if the room is unknown or the lookup faults
 /// (best-effort: a missing advertisement just means no reconciliation this round).
-pub(crate) async fn local_extremities(store: &SqliteStore, room_id: &RoomId) -> ForwardExtremities {
+pub async fn local_extremities(
+    store: &impl StorageBackend,
+    room_id: &RoomId,
+) -> ForwardExtremities {
     match store.forward_extremities(room_id).await {
         Ok(Some((timeline, state))) => ForwardExtremities {
             timeline: timeline.into_iter().collect(),
@@ -59,8 +77,8 @@ pub(crate) async fn local_extremities(store: &SqliteStore, room_id: &RoomId) -> 
 /// worker to auth + apply. Best-effort — logs and returns on any peer/storage
 /// fault; the next advertisement retries. A no-op when we hold every advertised
 /// head (the common, converged case): only set-membership checks, no peer call.
-pub(crate) async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
-    store: &SqliteStore,
+pub async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
+    store: &impl StorageBackend,
     fetcher: &F,
     worker_poke: &mpsc::Sender<OwnedRoomId>,
     peer: &ServerName,
@@ -75,7 +93,7 @@ pub(crate) async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
     // induce us to fetch from it for any room we host — even one it isn't in.
     // (The fetched events are still independently auth-checked by the worker, so
     // this is a fetch-amplification scope, not an integrity gate.)
-    match auth::server_in_room(store, room_id, peer).await {
+    match server_in_room(store, room_id, peer).await {
         Ok(true) => {}
         Ok(false) => return,
         Err(e) => {
@@ -154,7 +172,7 @@ pub(crate) async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
 /// Returns the ids of the events it newly staged.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
-    store: &SqliteStore,
+    store: &impl StorageBackend,
     fetcher: &F,
     peer: &ServerName,
     room_id: &RoomId,

@@ -13,7 +13,6 @@
 //! Consumed by the per-destination sender pool (`federation::sender`).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use std::collections::BTreeMap;
@@ -31,7 +30,8 @@ use neutrino_engine::{
     TransportError,
 };
 
-use crate::federation::{get_missing_events, now_ms};
+use crate::federation::get_missing_events;
+use neutrino_engine::now_ms;
 
 /// Connection-establishment timeout for a federation request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -567,29 +567,6 @@ impl MissingEventsFetcher for ReqwestFetcher {
     }
 }
 
-/// Monotonic transaction-id source: `{startup_prefix}-{counter}`. The prefix
-/// (a process-startup timestamp, supplied by the caller) keeps ids unique
-/// across restarts; the counter keeps them unique within a run. Receivers
-/// dedup on `(origin, txn_id)` via `FederationInbox::record_federation_txn`.
-pub(crate) struct TxnIdGen {
-    prefix: u64,
-    counter: AtomicU64,
-}
-
-impl TxnIdGen {
-    pub(crate) fn new(prefix: u64) -> Self {
-        Self {
-            prefix,
-            counter: AtomicU64::new(0),
-        }
-    }
-
-    pub(crate) fn next_id(&self) -> String {
-        let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        format!("{}-{}", self.prefix, n)
-    }
-}
-
 /// Outbound transaction body. Borrows everything — no clones on the send path.
 #[derive(Serialize)]
 struct TransactionRequest<'a> {
@@ -643,6 +620,7 @@ mod tests {
 
     use super::*;
     use crate::federation::test_support::{dead_peer, spawn_stub};
+    use neutrino_engine::TxnIdGen;
 
     fn raw(json_str: &str) -> Box<RawJsonValue> {
         RawJsonValue::from_string(json_str.to_owned()).unwrap()

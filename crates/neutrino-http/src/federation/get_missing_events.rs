@@ -162,7 +162,7 @@ pub(crate) async fn handle(
     // (2b) — member-only scoping: only a server that shares the room may walk its
     // DAG. Closes the read-exfiltration hole the bare endpoint had (any caller
     // who knew a room id could pull its history).
-    if !auth::server_in_room(&store, &room_id, &origin).await? {
+    if !neutrino_engine::reconcile::server_in_room(&*store, &room_id, &origin).await? {
         return Err(FedError::Forbidden(
             "origin server is not a member of this room",
         ));

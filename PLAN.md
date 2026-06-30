@@ -146,12 +146,12 @@ Intentional gaps in the sliding-sync implementation — see `MSC4186-gaps.md`:
 - fold the repeated `FederationClient` PUT-event idiom into one helper
 - federated-invite error-code parity with the local invite path
 - OOB-invite join review leftovers (noted, not blocking): `federated_join_if_remote` runs twice on the `join_by_id_or_alias`→`join` fall-through; a single private `join_core(hints)` would collapse it. No single shared "is this room remote / who is the inviter's resident server" predicate (invite/leave/join each re-derive it).
-- `neutrino-engine` extraction phases 2-3 (Phase 0 + Phase 1 landed 2026-06-30):
-  physically move the room runtime (registry/actor/worker/sender-policy/reconcile)
-  out of `neutrino-http` into `neutrino-engine` (the outbound ports + crossing
-  types already live there as of Phase 1), then slim the handlers to glue. Add an
-  in-memory `StorageBackend` double then (when the engine crate wants to test
-  without the sqlite dep).
+- `neutrino-engine` extraction COMPLETE (phases 0-2 landed 2026-06-30): the room
+  runtime lives in `neutrino-engine`; `neutrino-http` is axum glue + transport
+  impls. No in-memory `StorageBackend` double was needed — the engine tests open a
+  real sqlite `:memory:` via a dev-dep (store-sqlite doesn't depend on engine, so
+  it's acyclic). Remaining *optional* follow-on: split `neutrino-http` into c2s and
+  s2s route groups (now trivial — both are thin layers over the engine).
 - multi-server / idempotency federation tests
 - port the relevant Synapse + Complement membership-endpoint tests
 - `storage_dir` empty-string handling: an exported-but-empty `NEUTRINO_STORAGE_DIR=` (and the FFI
@@ -177,6 +177,35 @@ never use .unwrap() in handler code.
 - Restricted rooms (`join_authorised_via_users_server`) — documented, not implemented
 
 ## decisions log
+
+### room runtime moved into `neutrino-engine` (2026-06-30)
+- Phase 2 of the extraction: `room_actor` (RoomActor/RoomRegistry), `sender`,
+  `worker`, `reconcile`, `gapfill` physically moved from `neutrino-http` into
+  `neutrino-engine`, along with the shared runtime utilities (backoff/jitter
+  consts, `TxnIdGen`, `now_ms`, `stage_and_poke`) and `server_in_room` (a
+  store-backed membership predicate, now in `engine::reconcile`). `auth.rs`'s
+  X-Matrix `authenticated_origin` stays in http; `map_apply_err`
+  (RoomActorError→FedError) stays in http as the handler-side adapter.
+- **2a (in-place generic-ization) first, then 2b (move):** `sender`/`worker`/
+  `reconcile`/`gapfill`/`server_in_room` were made generic over
+  `S: StorageBackend (+ WithStateProvider)` while still in http (tests green),
+  so the physical move was a near-pure relocation. Same pattern as Phase 0.
+- **Engine deps:** prod = common, state, store(traits), ruma, rand, tokio,
+  tokio-util, tracing, serde(_json), async-trait, thiserror. **Dev-only** =
+  store-sqlite + tempfile (the runtime tests open a real `:memory:` store). No
+  production dep on a concrete backend; no cycle (store-sqlite ⊀ engine).
+- **No hand-rolled in-memory `StorageBackend`:** the deferred Phase-0 question is
+  moot — engine tests bind sqlite via the dev-dep, so a second impl would be pure
+  duplication.
+- **Sender tests rewritten to an engine-local `FederationTransport` stub** (no
+  axum/reqwest): the 14 sender tests assert sender *behaviour* (drain / retry /
+  4xx-drop / txn-id reuse / advertisement), all observable at the one-method
+  port. The stub records decoded PDUs + serialised forward-extremities so the
+  assertions are preserved verbatim. Real-HTTP wire coverage stays in the
+  `e2e_lb_*` + `neutrino` federation tests. (Per the readability discussion with
+  Kegan: one port method is not a "shadow API".)
+- `now_ms` / `MAX_PDUS_PER_TXN` are engine-owned (`pub`) and imported by the http
+  handlers/transport that still need them.
 
 ### engine outbound ports — `neutrino-engine` crate created (2026-06-30)
 - Phase 1 of the extraction: created the `neutrino-engine` crate holding only the

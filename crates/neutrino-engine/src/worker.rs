@@ -57,17 +57,16 @@ use std::time::{Duration, Instant};
 
 use neutrino_common::Event;
 use neutrino_state::event_id::from_wire;
-use neutrino_store::{StagedPdu, StagingStore};
-use neutrino_store_sqlite::SqliteStore;
+use neutrino_store::{StagedPdu, StorageBackend, WithStateProvider};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, RoomId};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::federation::gapfill::fill_state_ancestry;
-use crate::federation::{BACKOFF_BASE, jitter, next_backoff};
+use crate::gapfill::fill_state_ancestry;
+use crate::ports::MissingEventsFetcher;
 use crate::room_actor::{RoomActorError, RoomRegistry};
-use neutrino_engine::MissingEventsFetcher;
+use crate::util::{BACKOFF_BASE, jitter, next_backoff};
 
 /// Buffer for the in-process poke channel. A poke is just a room id; the
 /// supervisor coalesces duplicates (re-reading the room's staged rows each
@@ -78,14 +77,26 @@ const POKE_BUFFER: usize = 256;
 
 /// Shared, cheaply-cloned handles a worker task needs. Each field is an `Arc`
 /// (or a `Copy` `Duration`), so cloning into a spawned task is near-free.
-#[derive(Clone)]
-struct WorkerCtx {
-    store: Arc<SqliteStore>,
-    registry: Arc<RoomRegistry<SqliteStore>>,
+struct WorkerCtx<S> {
+    store: Arc<S>,
+    registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
     /// Backoff floor; [`BACKOFF_BASE`] in production, near-zero in tests so the
     /// retry path runs without real delays.
     backoff_base: Duration,
+}
+
+// Hand-written so the bound is `S` (not `S: Clone`) — `Arc`s + a `Copy`
+// `Duration` clone regardless of `S`. `#[derive(Clone)]` would demand `S: Clone`.
+impl<S> Clone for WorkerCtx<S> {
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            registry: self.registry.clone(),
+            fetcher: self.fetcher.clone(),
+            backoff_base: self.backoff_base,
+        }
+    }
 }
 
 /// A running room task plus the handle used to wake it (a fresh poke) or stop
@@ -101,9 +112,9 @@ struct RoomTask {
 ///
 /// Must be called from within a Tokio runtime (it spawns the supervisor task) —
 /// every caller is on an async path (`serve`, the test routers).
-pub(crate) fn spawn(
-    store: Arc<SqliteStore>,
-    registry: Arc<RoomRegistry<SqliteStore>>,
+pub fn spawn<S: StorageBackend + WithStateProvider + 'static>(
+    store: Arc<S>,
+    registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
 ) -> mpsc::Sender<OwnedRoomId> {
     spawn_with(store, registry, fetcher, BACKOFF_BASE)
@@ -111,9 +122,9 @@ pub(crate) fn spawn(
 
 /// Inner spawn with the backoff floor made explicit, so tests can drive the
 /// full supervisor → task path without real backoff delays.
-fn spawn_with(
-    store: Arc<SqliteStore>,
-    registry: Arc<RoomRegistry<SqliteStore>>,
+fn spawn_with<S: StorageBackend + WithStateProvider + 'static>(
+    store: Arc<S>,
+    registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
     backoff_base: Duration,
 ) -> mpsc::Sender<OwnedRoomId> {
@@ -131,7 +142,10 @@ fn spawn_with(
 /// Discovery loop: ensure every room with staged PDUs has a running drain task.
 /// Enumerates the staging backlog once on startup (restart recovery), then runs
 /// off in-process pokes until the channel closes (shutdown).
-async fn supervise(ctx: WorkerCtx, mut poke_rx: mpsc::Receiver<OwnedRoomId>) {
+async fn supervise<S: StorageBackend + WithStateProvider + 'static>(
+    ctx: WorkerCtx<S>,
+    mut poke_rx: mpsc::Receiver<OwnedRoomId>,
+) {
     let mut rooms: HashMap<OwnedRoomId, RoomTask> = HashMap::new();
 
     // Restart recovery: drain whatever was left staged by a previous run.
@@ -157,7 +171,11 @@ async fn supervise(ctx: WorkerCtx, mut poke_rx: mpsc::Receiver<OwnedRoomId>) {
 }
 
 /// Spawn a drain task for `room` if none is running, else wake the running one.
-fn ensure_running(rooms: &mut HashMap<OwnedRoomId, RoomTask>, ctx: &WorkerCtx, room: OwnedRoomId) {
+fn ensure_running<S: StorageBackend + WithStateProvider + 'static>(
+    rooms: &mut HashMap<OwnedRoomId, RoomTask>,
+    ctx: &WorkerCtx<S>,
+    room: OwnedRoomId,
+) {
     if let Some(task) = rooms.get(&room) {
         // Already draining → wake it so it re-reads the (now larger) backlog.
         // A stored permit covers the race where the task is between "drained
@@ -180,7 +198,11 @@ struct Backoff {
 
 /// Drain one room forever: apply eligible staged PDUs, then block until poked
 /// (or until a backing-off PDU becomes eligible). Owns the room's backoff map.
-async fn run_room(ctx: WorkerCtx, room: OwnedRoomId, notify: Arc<Notify>) {
+async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
+    ctx: WorkerCtx<S>,
+    room: OwnedRoomId,
+    notify: Arc<Notify>,
+) {
     let mut backoff: HashMap<OwnedEventId, Backoff> = HashMap::new();
     loop {
         let rows = match ctx.store.staged_for_room(&room).await {
@@ -235,7 +257,10 @@ async fn run_room(ctx: WorkerCtx, room: OwnedRoomId, notify: Arc<Notify>) {
 
 /// Parse each eligible staged row to a [`Staged`]; a row whose bytes no longer
 /// round-trip through `from_wire` is unstaged and skipped.
-async fn parse_or_drop(ctx: &WorkerCtx, eligible: &[StagedPdu]) -> Vec<Staged> {
+async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
+    ctx: &WorkerCtx<S>,
+    eligible: &[StagedPdu],
+) -> Vec<Staged> {
     let mut out = Vec::with_capacity(eligible.len());
     for p in eligible {
         match from_wire(p.raw.clone(), Vec::new()) {
@@ -261,8 +286,8 @@ struct Staged {
 
 /// Integrate one staged PDU through the actor, updating `backoff` per the
 /// drain-pass disposition (see the module docs).
-async fn process_one(
-    ctx: &WorkerCtx,
+async fn process_one<S: StorageBackend + WithStateProvider + 'static>(
+    ctx: &WorkerCtx<S>,
     room: &RoomId,
     staged: Staged,
     backoff: &mut HashMap<OwnedEventId, Backoff>,
@@ -283,7 +308,7 @@ async fn process_one(
         // gap — back off rather than spin re-applying. `Err` (unfillable / peer
         // failure) also backs off.
         Err(RoomActorError::Apply(e)) if e.is_retryable() => {
-            match fill_state_ancestry(&ctx.store, &staged.origin, &staged.event, &*ctx.fetcher)
+            match fill_state_ancestry(&*ctx.store, &staged.origin, &staged.event, &*ctx.fetcher)
                 .await
             {
                 Ok(true) => {
@@ -328,7 +353,10 @@ async fn process_one(
 
 /// Delete `id` from staging, logging (not propagating) a removal fault — a
 /// surviving row is harmless (re-applied idempotently next pass).
-async fn unstage(ctx: &WorkerCtx, id: &OwnedEventId) {
+async fn unstage<S: StorageBackend + WithStateProvider + 'static>(
+    ctx: &WorkerCtx<S>,
+    id: &OwnedEventId,
+) {
     if let Err(e) = ctx.store.unstage_events(&[id.as_ref()]).await {
         error!(%id, error = %e, "unstaging processed PDU");
     }

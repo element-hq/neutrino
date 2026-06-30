@@ -28,8 +28,8 @@ use serde::Serialize;
 use serde_json::value::RawValue as RawJsonValue;
 
 use crate::federation::{FedError, auth};
-use crate::room_actor::RoomActorError;
 use crate::{AppState, lock_app};
+use neutrino_engine::RoomActorError;
 
 /// `make_join` response: the membership-event `template` plus the room's
 /// version. (MSC4242 `omit_members` / `partial_state` is out of scope, so no

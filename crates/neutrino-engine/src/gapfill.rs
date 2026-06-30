@@ -18,10 +18,10 @@
 
 use neutrino_common::Event;
 use neutrino_state::event_id::from_wire;
-use neutrino_store::{RoomStore, StagingStore};
+use neutrino_store::StorageBackend;
 use ruma::{EventId, OwnedEventId, RoomId, ServerName};
 
-use neutrino_engine::{MissingEventsFetcher, MissingEventsQuery};
+use crate::ports::{MissingEventsFetcher, MissingEventsQuery};
 
 /// Initial `limit` for the first gap-fill request; doubled each round (MSC4242
 /// recommends exponentially increasing the limit until all ancestry is seen).
@@ -56,7 +56,7 @@ const INITIAL_GAPFILL_LIMIT: u32 = 10;
 /// only stop early by *grounding* or by the peer running out of new events; a
 /// trusted peer never feeds an infinite distinct chain.
 pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
-    store: &neutrino_store_sqlite::SqliteStore,
+    store: &impl StorageBackend,
     origin: &ServerName,
     event: &Event,
     fetcher: &F,
@@ -152,10 +152,7 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
 /// The room's state-DAG forward extremities — the committed bottom boundary
 /// (`earliest_events`) for a state-DAG gap-fill walk. Best-effort: empty if the
 /// room is unknown or the lookup faults.
-async fn state_dag_boundary(
-    store: &neutrino_store_sqlite::SqliteStore,
-    room_id: &RoomId,
-) -> Vec<OwnedEventId> {
+async fn state_dag_boundary(store: &impl StorageBackend, room_id: &RoomId) -> Vec<OwnedEventId> {
     match store.forward_extremities(room_id).await {
         Ok(Some((_timeline, state))) => state.into_iter().collect(),
         _ => Vec::new(),

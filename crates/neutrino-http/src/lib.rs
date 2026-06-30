@@ -36,15 +36,13 @@ mod federation;
 mod legacy_sync;
 mod membership;
 mod messages;
-mod room_actor;
 mod sliding_sync;
 
 #[cfg(feature = "multi-user-shim")]
 mod multi_user;
 
 use federation::client::{FederationClient, ReqwestFetcher};
-use neutrino_engine::MissingEventsFetcher;
-use room_actor::{RoomActorError, RoomRegistry};
+use neutrino_engine::{MissingEventsFetcher, RoomActorError, RoomRegistry};
 use sliding_sync::{SyncError, SyncState};
 
 struct App {
@@ -227,7 +225,7 @@ impl AppState {
         // tests), enumerates any leftover staged rows on startup, and stops when
         // this `AppState` is dropped (the `worker_poke` sender drops with it).
         let worker_poke =
-            federation::worker::spawn(store.clone(), room_registry.clone(), fetcher.clone());
+            neutrino_engine::worker::spawn(store.clone(), room_registry.clone(), fetcher.clone());
         // Receivers are taken later via `subscribe_kick` (one per destination
         // task); the initial receiver is dropped — `send_modify` notifies any
         // live receivers and is a no-op when there are none.
@@ -341,7 +339,7 @@ pub async fn serve(
         state.server_name(),
         state.federation_proxy().as_deref(),
     ));
-    let sender_task = federation::sender::spawn(
+    let sender_task = neutrino_engine::sender::spawn(
         state.store(),
         transport,
         state.outbound_concurrency(),

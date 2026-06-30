@@ -49,7 +49,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use neutrino_store::{FederationOutbox, StreamPos};
+use neutrino_store::{StorageBackend, StreamPos};
+#[cfg(test)]
 use neutrino_store_sqlite::SqliteStore;
 use ruma::{EventId, OwnedRoomId, OwnedServerName, RoomId, ServerName};
 use serde_json::value::RawValue as RawJsonValue;
@@ -58,20 +59,15 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use neutrino_engine::{
-    FederationTransport, ForwardExtremities, MissingEventsFetcher, TransportError,
-};
-
-use crate::federation::client::TxnIdGen;
-use crate::federation::reconcile;
-use crate::federation::{BACKOFF_BASE, MAX_PDUS_PER_TXN, jitter, next_backoff, now_ms};
+use crate::ports::{FederationTransport, ForwardExtremities, MissingEventsFetcher, TransportError};
+use crate::reconcile;
+use crate::util::{BACKOFF_BASE, MAX_PDUS_PER_TXN, TxnIdGen, jitter, next_backoff, now_ms};
 
 /// Shared, cheaply-cloneable handles every sender task needs. Bundled so the
 /// per-destination signatures stay readable as the pool grows (mirrors
 /// `worker::WorkerCtx`).
-#[derive(Clone)]
-struct SenderCtx {
-    store: Arc<SqliteStore>,
+struct SenderCtx<S> {
+    store: Arc<S>,
     transport: Arc<dyn FederationTransport>,
     idgen: Arc<TxnIdGen>,
     send_slots: Arc<Semaphore>,
@@ -83,6 +79,22 @@ struct SenderCtx {
     worker_poke: mpsc::Sender<OwnedRoomId>,
 }
 
+// Hand-written so the bound is `S` (not `S: Clone`) — every field is an `Arc`/
+// channel that clones regardless of `S`. `#[derive(Clone)]` would spuriously
+// demand `S: Clone`.
+impl<S> Clone for SenderCtx<S> {
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            transport: self.transport.clone(),
+            idgen: self.idgen.clone(),
+            send_slots: self.send_slots.clone(),
+            fetcher: self.fetcher.clone(),
+            worker_poke: self.worker_poke.clone(),
+        }
+    }
+}
+
 /// Spawn the outbound sender pool. Returns the supervisor's `JoinHandle` so
 /// the caller can await it after the shutdown token fires.
 ///
@@ -90,8 +102,8 @@ struct SenderCtx {
 /// destination added concurrently with startup can't be missed (the watch will
 /// have advanced, waking the supervisor's first `changed()`).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn(
-    store: Arc<SqliteStore>,
+pub fn spawn<S: StorageBackend + 'static>(
+    store: Arc<S>,
     transport: Arc<dyn FederationTransport>,
     concurrency: usize,
     startup_jitter: Duration,
@@ -115,8 +127,8 @@ pub(crate) fn spawn(
 /// Inner spawn with the flood-control bounds made explicit, so tests can run
 /// the full supervisor → task path with zero startup jitter.
 #[allow(clippy::too_many_arguments)]
-fn spawn_with(
-    store: Arc<SqliteStore>,
+fn spawn_with<S: StorageBackend + 'static>(
+    store: Arc<S>,
     transport: Arc<dyn FederationTransport>,
     concurrency: usize,
     startup_jitter_max: Duration,
@@ -153,8 +165,8 @@ fn spawn_with(
 /// Discovery loop: ensure every destination with pending PDUs has a running
 /// sender task. Runs until the shutdown token is cancelled or the store's watch
 /// sender is dropped. On exit, aborts all per-destination child tasks.
-async fn supervise(
-    ctx: SenderCtx,
+async fn supervise<S: StorageBackend + 'static>(
+    ctx: SenderCtx<S>,
     mut watch_rx: watch::Receiver<StreamPos>,
     startup_jitter_max: Duration,
     shutdown: CancellationToken,
@@ -214,8 +226,8 @@ async fn supervise(
 /// only the second set has fallen quiet with a standing obligation — the task
 /// it gets here drains that obligation (an empty-`pdus` advertisement) and then
 /// idles like any other.
-async fn destinations_needing_a_task(
-    ctx: &SenderCtx,
+async fn destinations_needing_a_task<S: StorageBackend + 'static>(
+    ctx: &SenderCtx<S>,
 ) -> Result<BTreeSet<OwnedServerName>, neutrino_store::StorageError> {
     let mut dests: BTreeSet<OwnedServerName> = ctx
         .store
@@ -229,8 +241,8 @@ async fn destinations_needing_a_task(
 
 /// Drain a single destination forever: deliver pending PDUs, then block until
 /// the next persist wakes us. Owns its own backoff state.
-async fn run_destination(
-    ctx: SenderCtx,
+async fn run_destination<S: StorageBackend + 'static>(
+    ctx: SenderCtx<S>,
     dest: OwnedServerName,
     mut watch_rx: watch::Receiver<StreamPos>,
     mut kick_rx: watch::Receiver<()>,
@@ -321,8 +333,8 @@ enum SendOutcome {
 /// array. The caller owns `txn_id` (so a post-success durable-write fault can
 /// re-call this under the *same* id, which the peer dedups on `(origin, txnId)`)
 /// and decides what `Delivered` / `Rejected` mean for its durable state.
-async fn send_transaction_with_retry(
-    ctx: &SenderCtx,
+async fn send_transaction_with_retry<S: StorageBackend + 'static>(
+    ctx: &SenderCtx<S>,
     dest: &ServerName,
     txn_id: &str,
     pdus: &[Box<RawJsonValue>],
@@ -386,8 +398,8 @@ async fn send_transaction_with_retry(
 /// advertisement). A 4xx drops the batch but leaves the obligation (our heads
 /// never landed, so the duty stands). A post-2xx `remove_pdus` fault re-sends
 /// under the same txn id (the peer dedups). Returns `false` only on shutdown.
-async fn deliver_batch(
-    ctx: &SenderCtx,
+async fn deliver_batch<S: StorageBackend + 'static>(
+    ctx: &SenderCtx<S>,
     dest: &ServerName,
     batch: &[neutrino_common::Event],
     backoff: &mut Duration,
@@ -401,7 +413,7 @@ async fn deliver_batch(
     let mut our_fes: BTreeMap<OwnedRoomId, ForwardExtremities> = BTreeMap::new();
     let rooms: BTreeSet<OwnedRoomId> = batch.iter().map(|e| e.room_id.clone()).collect();
     for room in &rooms {
-        let fes = reconcile::local_extremities(&ctx.store, room).await;
+        let fes = reconcile::local_extremities(&*ctx.store, room).await;
         if !fes.is_empty() {
             our_fes.insert(room.clone(), fes);
         }
@@ -465,8 +477,8 @@ async fn deliver_batch(
 /// current extremities read back empty (unknown / no heads — not expected for a
 /// room we just applied a join to) carry nothing to advertise; their obligation
 /// rows are cleared up-front so a junk row can't wedge the drain.
-async fn send_advertisement(
-    ctx: &SenderCtx,
+async fn send_advertisement<S: StorageBackend + 'static>(
+    ctx: &SenderCtx<S>,
     dest: &ServerName,
     rooms: &[OwnedRoomId],
     backoff: &mut Duration,
@@ -474,7 +486,7 @@ async fn send_advertisement(
 ) -> bool {
     let mut our_fes: BTreeMap<OwnedRoomId, ForwardExtremities> = BTreeMap::new();
     for room in rooms {
-        let fes = reconcile::local_extremities(&ctx.store, room).await;
+        let fes = reconcile::local_extremities(&*ctx.store, room).await;
         if !fes.is_empty() {
             our_fes.insert(room.clone(), fes);
         }
@@ -539,8 +551,8 @@ async fn send_advertisement(
 /// Spawn a best-effort reconciliation task per room the peer advertised in its
 /// transaction response. Fire-and-forget: a healed link's divergence is closed
 /// off the outbox's hot path (see [`reconcile::reconcile_room`]).
-fn spawn_reconcile(
-    ctx: &SenderCtx,
+fn spawn_reconcile<S: StorageBackend + 'static>(
+    ctx: &SenderCtx<S>,
     dest: &ServerName,
     peer_fes: BTreeMap<OwnedRoomId, ForwardExtremities>,
 ) {
@@ -550,7 +562,7 @@ fn spawn_reconcile(
         let worker_poke = ctx.worker_poke.clone();
         let dest = dest.to_owned();
         tokio::spawn(async move {
-            reconcile::reconcile_room(&store, &*fetcher, &worker_poke, &dest, &room, &heads).await;
+            reconcile::reconcile_room(&*store, &*fetcher, &worker_poke, &dest, &room, &heads).await;
         });
     }
 }
@@ -590,20 +602,15 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use axum::{
-        Json, Router, extract::Path, http::StatusCode, response::IntoResponse, routing::put,
-    };
     use neutrino_common::ROOM_VERSION_ID;
     use neutrino_state::event_id::EventBuilder;
-    use neutrino_store::{EventStore, RoomStore};
-    use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
+    use neutrino_store::{EventStore, FederationOutbox, RoomStore};
+    use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId};
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
     use super::*;
-    use crate::federation::BACKOFF_CAP;
-    use crate::federation::client::FederationClient;
-    use crate::federation::test_support::{dead_peer, spawn_stub};
+    use crate::util::BACKOFF_CAP;
 
     /// A shutdown token that never fires — for tests exercising non-shutdown paths.
     fn no_shutdown() -> CancellationToken {
@@ -625,7 +632,7 @@ mod tests {
     impl MissingEventsFetcher for NoFetcher {
         async fn fetch(
             &self,
-            _q: neutrino_engine::MissingEventsQuery<'_>,
+            _q: crate::ports::MissingEventsQuery<'_>,
         ) -> Result<Vec<Box<RawJsonValue>>, TransportError> {
             Ok(Vec::new())
         }
@@ -634,13 +641,6 @@ mod tests {
         Arc::new(NoFetcher)
     }
 
-    /// A real `FederationClient` (origin `local.test`, no proxy) as the
-    /// transport — the sender tests drive the actual send path against a mock
-    /// peer addressed by the outbox `dest`, so they need the concrete client,
-    /// not a stub.
-    fn test_transport() -> Arc<dyn FederationTransport> {
-        Arc::new(FederationClient::new("local.test".to_owned(), None))
-    }
     /// A worker-poke sender whose receiver is dropped — `try_send` just fails,
     /// which reconciliation tolerates. Reconciliation never fires in these tests
     /// anyway (see [`NoFetcher`]).
@@ -648,48 +648,67 @@ mod tests {
         mpsc::channel(1).0
     }
 
-    /// Stub federation peer. `fail_until` requests return `fail_status`; the
-    /// rest 200 and have their `pdus` array recorded (one entry per accepted
-    /// transaction). `attempts` counts *every* request, success or not; `txns`
-    /// records the txn_id of every request (to assert SPEC1 reuse on retry).
+    /// In-process [`FederationTransport`] stub — the sender pool's outbound port,
+    /// not an HTTP peer. The runtime is tested against transport *outcomes*
+    /// (deliver / 4xx / 5xx / unreachable) directly; the on-the-wire Matrix
+    /// round-trip is covered by the `e2e_lb_*` + `neutrino` federation tests.
+    ///
+    /// The first `fail_until` calls to a non-`dead` destination return
+    /// `Status(fail_status)`; the rest succeed and record their PDUs +
+    /// advertised forward extremities. A destination in `dead` always fails
+    /// `Transient` (an unreachable peer). `attempts`/`txns` count every
+    /// recorded (non-`dead`) call (to assert retry + txn-id reuse).
     #[derive(Default)]
     struct Stub {
+        /// Decoded PDUs of every accepted transaction (one `Vec` per txn).
         accepted: Mutex<Vec<Vec<Value>>>,
-        /// The `forward_extremities` body field of every request (one entry per
-        /// request, `Value::Null` when absent) — lets anti-entropy tests assert
-        /// an advertisement carried our heads.
+        /// The advertised `forward_extremities` of every accepted transaction,
+        /// as JSON — lets anti-entropy tests assert an advertisement carried our
+        /// heads (`fes[0].get(room).is_some()`).
         fes: Mutex<Vec<Value>>,
         txns: Mutex<Vec<String>>,
         attempts: AtomicU64,
         fail_until: u64,
         fail_status: u16,
+        /// Destinations that are unreachable (always `Transient`).
+        dead: Mutex<BTreeSet<OwnedServerName>>,
     }
 
-    /// Bind a stub peer (via the shared `spawn_stub`) and return its
-    /// `ServerName` (`127.0.0.1:{port}`) — what the sender resolves to `http://…`.
-    async fn spawn_peer(stub: Arc<Stub>) -> OwnedServerName {
-        let app = Router::new().route(
-            "/_matrix/federation/v1/send/{txn}",
-            put(move |Path(txn): Path<String>, Json(body): Json<Value>| {
-                let stub = stub.clone();
-                async move {
-                    stub.txns.lock().unwrap().push(txn);
-                    let n = stub.attempts.fetch_add(1, Ordering::SeqCst);
-                    if n < stub.fail_until {
-                        return (StatusCode::from_u16(stub.fail_status).unwrap(), "fail")
-                            .into_response();
-                    }
-                    let pdus = body["pdus"].as_array().cloned().unwrap_or_default();
-                    stub.fes
-                        .lock()
-                        .unwrap()
-                        .push(body["forward_extremities"].clone());
-                    stub.accepted.lock().unwrap().push(pdus);
-                    Json(json!({ "pdus": {} })).into_response()
-                }
-            }),
-        );
-        spawn_stub(app).await
+    #[async_trait::async_trait]
+    impl FederationTransport for Stub {
+        async fn send_transaction(
+            &self,
+            dest: &ServerName,
+            txn_id: &str,
+            pdus: &[Box<RawJsonValue>],
+            forward_extremities: &BTreeMap<OwnedRoomId, ForwardExtremities>,
+        ) -> Result<BTreeMap<OwnedRoomId, ForwardExtremities>, TransportError> {
+            if self.dead.lock().unwrap().contains(dest) {
+                return Err(TransportError::Transient("unreachable".to_owned()));
+            }
+            self.txns.lock().unwrap().push(txn_id.to_owned());
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_until {
+                return Err(TransportError::Status(self.fail_status));
+            }
+            let decoded: Vec<Value> = pdus
+                .iter()
+                .map(|p| serde_json::from_str(p.get()).expect("stub pdu is valid JSON"))
+                .collect();
+            self.fes
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(forward_extremities).unwrap());
+            self.accepted.lock().unwrap().push(decoded);
+            // The peer reports no forward extremities, so reconciliation never fires.
+            Ok(BTreeMap::new())
+        }
+    }
+
+    /// A fixed destination name. The stub ignores reachability, so any valid
+    /// `ServerName` works as an outbox target.
+    fn peer() -> OwnedServerName {
+        "peer.test".parse().unwrap()
     }
 
     /// Open a store, create a room, and enqueue `n` linked message events to
@@ -792,10 +811,13 @@ mod tests {
 
     /// A `SenderCtx` for calling `deliver_batch` / `send_advertisement` directly
     /// (deterministic, no supervisor/pool timing). One global send permit.
-    fn test_ctx(store: Arc<SqliteStore>) -> SenderCtx {
+    fn test_ctx(
+        store: Arc<SqliteStore>,
+        transport: Arc<dyn FederationTransport>,
+    ) -> SenderCtx<SqliteStore> {
         SenderCtx {
             store,
-            transport: Arc::new(FederationClient::new("local.test".to_owned(), None)),
+            transport,
             idgen: Arc::new(TxnIdGen::new(now_ms())),
             send_slots: Arc::new(Semaphore::new(1)),
             fetcher: null_fetcher(),
@@ -827,12 +849,12 @@ mod tests {
     #[tokio::test]
     async fn delivers_pending_and_drains_outbox() {
         let stub = Arc::new(Stub::default());
-        let dest = spawn_peer(stub.clone()).await;
+        let dest = peer();
         let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 3).await;
 
         drop(spawn_with(
             store.clone(),
-            test_transport(),
+            stub.clone(),
             2,
             NO_JITTER,
             no_shutdown(),
@@ -863,12 +885,12 @@ mod tests {
             fail_status: 500,
             ..Stub::default()
         });
-        let dest = spawn_peer(stub.clone()).await;
+        let dest = peer();
         let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 1).await;
 
         drop(spawn_with(
             store.clone(),
-            test_transport(),
+            stub.clone(),
             2,
             NO_JITTER,
             no_shutdown(),
@@ -895,12 +917,12 @@ mod tests {
             fail_status: 400,
             ..Stub::default()
         });
-        let dest = spawn_peer(stub.clone()).await;
+        let dest = peer();
         let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 1).await;
 
         drop(spawn_with(
             store.clone(),
-            test_transport(),
+            stub.clone(),
             2,
             NO_JITTER,
             no_shutdown(),
@@ -918,12 +940,12 @@ mod tests {
     #[tokio::test]
     async fn chunks_backlog_over_the_50_pdu_cap() {
         let stub = Arc::new(Stub::default());
-        let dest = spawn_peer(stub.clone()).await;
+        let dest = peer();
         let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 60).await;
 
         drop(spawn_with(
             store.clone(),
-            test_transport(),
+            stub.clone(),
             2,
             NO_JITTER,
             no_shutdown(),
@@ -946,9 +968,10 @@ mod tests {
 
     #[tokio::test]
     async fn dead_peer_does_not_block_healthy_one() {
-        let healthy_stub = Arc::new(Stub::default());
-        let healthy = spawn_peer(healthy_stub.clone()).await;
-        let dead = dead_peer().await;
+        let stub = Arc::new(Stub::default());
+        let healthy = peer();
+        let dead: OwnedServerName = "dead.test".parse().unwrap();
+        stub.dead.lock().unwrap().insert(dead.clone());
 
         // One store, both destinations enqueued.
         let (store, _tmp, room_id, _ids) = store_with_outbox(&healthy, 2).await;
@@ -964,7 +987,7 @@ mod tests {
 
         drop(spawn_with(
             store.clone(),
-            test_transport(),
+            stub.clone(),
             2,
             NO_JITTER,
             no_shutdown(),
@@ -989,13 +1012,13 @@ mod tests {
     async fn discovers_destination_added_after_startup() {
         // Pool starts against an empty outbox; a later persist must wake it.
         let stub = Arc::new(Stub::default());
-        let dest = spawn_peer(stub.clone()).await;
+        let dest = peer();
         // n=0: a real room exists but the outbox starts empty.
         let (store, _tmp, room_id, _ids) = store_with_outbox(&dest, 0).await;
 
         drop(spawn_with(
             store.clone(),
-            test_transport(),
+            stub.clone(),
             2,
             NO_JITTER,
             no_shutdown(),
@@ -1030,14 +1053,14 @@ mod tests {
     #[tokio::test]
     async fn sends_advertisement_for_quiescent_obligation() {
         let stub = Arc::new(Stub::default());
-        let dest = spawn_peer(stub.clone()).await;
+        let dest = peer();
         // n=0: a real room, empty outbox — the only work is the advertisement.
         let (store, _tmp, room, _ids) = store_with_outbox(&dest, 0).await;
         enqueue_advertisement(&store, &room, &dest).await;
 
         drop(spawn_with(
             store.clone(),
-            test_transport(),
+            stub.clone(),
             2,
             NO_JITTER,
             no_shutdown(),
@@ -1065,7 +1088,7 @@ mod tests {
     #[tokio::test]
     async fn covering_send_clears_advertisement_obligation() {
         let stub = Arc::new(Stub::default());
-        let dest = spawn_peer(stub.clone()).await;
+        let dest = peer();
         // One pending PDU for dest, plus a standing advertisement obligation for
         // the same room.
         let (store, _tmp, room, _ids) = store_with_outbox(&dest, 1).await;
@@ -1073,7 +1096,7 @@ mod tests {
 
         drop(spawn_with(
             store.clone(),
-            test_transport(),
+            stub.clone(),
             2,
             NO_JITTER,
             no_shutdown(),
@@ -1110,11 +1133,11 @@ mod tests {
             fail_status: 400,
             ..Stub::default()
         });
-        let dest = spawn_peer(stub.clone()).await;
+        let dest = peer();
         let (store, _tmp, room, _ids) = store_with_outbox(&dest, 0).await;
         enqueue_advertisement(&store, &room, &dest).await;
 
-        let ctx = test_ctx(store.clone());
+        let ctx = test_ctx(store.clone(), stub.clone());
         let rooms = store.pending_advertisements(&dest).await.unwrap();
         let mut backoff = BACKOFF_BASE;
         let mut kick_rx = test_backoff();
@@ -1146,11 +1169,11 @@ mod tests {
             fail_status: 400,
             ..Stub::default()
         });
-        let dest = spawn_peer(stub.clone()).await;
+        let dest = peer();
         let (store, _tmp, room, _ids) = store_with_outbox(&dest, 1).await;
         enqueue_advertisement(&store, &room, &dest).await;
 
-        let ctx = test_ctx(store.clone());
+        let ctx = test_ctx(store.clone(), stub.clone());
         let batch = store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await.unwrap();
         let mut backoff = BACKOFF_BASE;
         let mut kick_rx = test_backoff();
@@ -1244,13 +1267,15 @@ mod tests {
     /// (the supervisor only returned when the store's persist-watch closed).
     #[tokio::test]
     async fn supervisor_returns_on_shutdown() {
-        let dead = dead_peer().await;
+        let dead: OwnedServerName = "dead.test".parse().unwrap();
+        let stub = Arc::new(Stub::default());
+        stub.dead.lock().unwrap().insert(dead.clone());
         let (store, _tmp, _room, _ids) = store_with_outbox(&dead, 1).await;
         let shutdown = CancellationToken::new();
 
         let supervisor = spawn_with(
             store.clone(),
-            test_transport(),
+            stub.clone(),
             2,
             NO_JITTER,
             shutdown.clone(),
@@ -1280,12 +1305,12 @@ mod tests {
             fail_status: 500,
             ..Stub::default()
         });
-        let dest = spawn_peer(stub.clone()).await;
+        let dest = peer();
         let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 1).await;
 
         drop(spawn_with(
             store.clone(),
-            test_transport(),
+            stub.clone(),
             2,
             NO_JITTER,
             no_shutdown(),

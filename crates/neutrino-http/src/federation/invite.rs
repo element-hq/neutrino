@@ -48,9 +48,9 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::federation::client::{FederationClient, FederationClientError};
-use crate::federation::{FedError, auth, stage_and_poke};
-use crate::room_actor::RoomActorError;
+use crate::federation::{FedError, auth};
 use crate::{AppState, error_response, lock_app};
+use neutrino_engine::{RoomActorError, stage_and_poke};
 
 /// v2 `/invite` request envelope: the PDU plus the room version and an optional
 /// stripped `invite_room_state` for the invitee to render the room. The v2

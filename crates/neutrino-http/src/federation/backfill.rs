@@ -103,7 +103,7 @@ pub(crate) async fn handle(
     // `get_missing_events` and equally leaks history; only a server sharing the
     // room may walk it. 404 (above) precedes this 403 so an unknown room isn't
     // masked as a membership failure.
-    if !auth::server_in_room(&store, &room_id, &caller).await? {
+    if !neutrino_engine::reconcile::server_in_room(&*store, &room_id, &caller).await? {
         return Err(FedError::Forbidden(
             "origin server is not a member of this room",
         ));
@@ -144,7 +144,7 @@ pub(crate) async fn handle(
 
     Ok(Json(ResponseBody {
         origin,
-        origin_server_ts: crate::federation::now_ms(),
+        origin_server_ts: neutrino_engine::now_ms(),
         pdus,
     }))
 }
