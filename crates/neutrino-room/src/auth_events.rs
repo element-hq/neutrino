@@ -112,8 +112,8 @@ fn add_unique(keys: &mut Vec<(String, String)>, event_type: &str, state_key: Str
 mod tests {
     use super::*;
     use crate::test_utils::next_ts;
-    use neutrino_common::ROOM_VERSION_ID;
-    use neutrino_common::event_builder::EventBuilder;
+    use neutrino_event::ROOM_VERSION_ID;
+    use neutrino_event::event_builder::EventBuilder;
     use ruma::room_id;
     use serde_json::{Value, json};
     use std::collections::{HashMap, HashSet};

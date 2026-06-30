@@ -30,10 +30,10 @@ pub(crate) mod test_utils {
 // The canonical `Event` type and the `RoomVersion` enum live in
 // `neutrino-common` so storage and state-machine code share them. See
 // `event-id-design.md` for the rationale.
-pub use neutrino_common::Event;
+pub use neutrino_event::Event;
 // `FormatError` is event-scoped (wire-format / provider-free semantic rules)
 // and lives in `neutrino-common`; `CoreError` wraps it here.
-use neutrino_common::FormatError;
+use neutrino_event::FormatError;
 
 /// Resolved room state: one entry per `(event_type, state_key)` pair.
 pub type StateMap<V> = HashMap<(String, String), V>;

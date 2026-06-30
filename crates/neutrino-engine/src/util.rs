@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use neutrino_common::Event;
+use neutrino_event::Event;
 use neutrino_store::{StagingStore, StorageError};
 use rand::Rng;
 use ruma::{OwnedRoomId, RoomId, ServerName};

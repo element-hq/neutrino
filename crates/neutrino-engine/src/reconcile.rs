@@ -18,7 +18,7 @@
 
 use std::collections::BTreeSet;
 
-use neutrino_common::event_builder::from_wire;
+use neutrino_event::event_builder::from_wire;
 use neutrino_store::{StateStore, StorageBackend};
 use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId, ServerName};
 use tokio::sync::mpsc;

@@ -1013,7 +1013,7 @@ fn update_sent(sent: &mut RoomSent, state_events: &[Event], deleted: &[(String, 
 mod unit_tests {
     use std::collections::HashMap;
 
-    use neutrino_common::Event;
+    use neutrino_event::Event;
     use ruma::events::StateEventType;
     use ruma::{event_id, room_id, user_id};
 

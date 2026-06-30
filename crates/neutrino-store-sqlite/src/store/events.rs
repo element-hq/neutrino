@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{OptionalExtension, Transaction, params, params_from_iter};
-use neutrino_state::StateMap;
-use neutrino_state::state_res::{self, StateBeforeCache};
+use neutrino_room::StateMap;
+use neutrino_room::state_res::{self, StateBeforeCache};
 use neutrino_store::{Direction, Event, EventStore, PaginationToken, StorageError, StreamPos};
 use ruma::{EventId, OwnedEventId, OwnedServerName, RoomId, ServerName};
 use tokio::sync::watch;
@@ -614,7 +614,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use deadpool_sqlite::rusqlite::params;
-    use neutrino_common::Event;
+    use neutrino_event::Event;
     use neutrino_store::{
         Direction, EventStore, PaginationToken, RoomStore, StateStore, StorageError, StreamPos,
         WithStateProvider,
@@ -624,9 +624,9 @@ mod tests {
 
     use std::sync::Arc;
 
-    use neutrino_state::StateMap;
-    use neutrino_state::provider::InMemoryStateProvider;
-    use neutrino_state::state_res;
+    use neutrino_room::StateMap;
+    use neutrino_room::provider::InMemoryStateProvider;
+    use neutrino_room::state_res;
 
     use crate::SqliteStore;
     use crate::error::Error;
@@ -832,7 +832,7 @@ mod tests {
     // we want to pin.
     async fn write_event_directly(
         s: &SqliteStore,
-        ev: &neutrino_common::Event,
+        ev: &neutrino_event::Event,
     ) -> Result<(), neutrino_store::StorageError> {
         let row = crate::row::EventRow::unchecked(ev).to_owned();
         s.run_write(move |conn| -> Result<(), Error> {

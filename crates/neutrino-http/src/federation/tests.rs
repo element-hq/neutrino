@@ -24,9 +24,9 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use neutrino_common::ROOM_VERSION_ID;
-use neutrino_common::event_builder::EventBuilder;
 use neutrino_ctl::Config;
+use neutrino_event::ROOM_VERSION_ID;
+use neutrino_event::event_builder::EventBuilder;
 use neutrino_store::{
     EventStore, FederationOutbox, InviteStore, RoomStore, StagingStore, StateStore,
 };
@@ -87,19 +87,19 @@ impl StubFetcher {
         })
     }
 
-    fn raws_of(events: &[&neutrino_common::Event]) -> Vec<String> {
+    fn raws_of(events: &[&neutrino_event::Event]) -> Vec<String> {
         events.iter().map(|e| e.raw.get().to_owned()).collect()
     }
 
     /// Make subsequent `fetch` calls return these events (their canonical raw
     /// bytes), the same batch every call. Used after seeding.
-    fn set_events(&self, events: &[&neutrino_common::Event]) {
+    fn set_events(&self, events: &[&neutrino_event::Event]) {
         *self.outcome.lock().unwrap() = StubOutcome::Events(Self::raws_of(events));
     }
 
     /// Make `fetch` return each batch in turn (one per round). Used to drive a
     /// multi-round gap-fill where the peer reveals ancestry incrementally.
-    fn set_sequence(&self, batches: Vec<Vec<&neutrino_common::Event>>) {
+    fn set_sequence(&self, batches: Vec<Vec<&neutrino_event::Event>>) {
         let q = batches.iter().map(|b| Self::raws_of(b)).collect();
         *self.outcome.lock().unwrap() = StubOutcome::Sequence(q);
     }
@@ -1450,7 +1450,7 @@ fn send_path(txn_id: &str) -> String {
 
 /// Wrap PDU events into a transaction envelope. `pdus` are the events' raw wire
 /// bytes embedded verbatim — exactly how a peer would send them.
-fn txn(pdus: &[&neutrino_common::Event]) -> Value {
+fn txn(pdus: &[&neutrino_event::Event]) -> Value {
     let pdus: Vec<Value> = pdus
         .iter()
         .map(|e| serde_json::from_str(e.raw.get()).expect("pdu raw is valid JSON"))
@@ -1526,7 +1526,7 @@ fn message_on(
     head: &OwnedEventId,
     body: &str,
     ts: u64,
-) -> neutrino_common::Event {
+) -> neutrino_event::Event {
     EventBuilder::new(sender.clone(), "m.room.message".to_owned())
         .room_id(room_id.clone())
         .content(json!({ "msgtype": "m.text", "body": body }))
@@ -1546,7 +1546,7 @@ fn topic_on(
     head: &OwnedEventId,
     topic: &str,
     ts: u64,
-) -> neutrino_common::Event {
+) -> neutrino_event::Event {
     EventBuilder::new(sender.clone(), "m.room.topic".to_owned())
         .room_id(room_id.clone())
         .state_key(String::new())
@@ -1568,7 +1568,7 @@ fn topic_on(
 // guards against a hang.
 
 /// Poll until `id` is committed (present in `events`), returning the row.
-async fn wait_committed(store: &SqliteStore, id: &ruma::EventId) -> neutrino_common::Event {
+async fn wait_committed(store: &SqliteStore, id: &ruma::EventId) -> neutrino_event::Event {
     for _ in 0..500 {
         if let Some(e) = store.get_events(&[id]).await.unwrap().into_iter().next() {
             return e;
@@ -2140,10 +2140,10 @@ async fn send_ignores_edus() {
 async fn send_rejects_oversized_transaction() {
     let (app, _store, room_id, alice, join_id, _tempfile) = seed_joined_room().await;
     // 51 PDUs > the 50 spec maximum.
-    let events: Vec<neutrino_common::Event> = (0..51)
+    let events: Vec<neutrino_event::Event> = (0..51)
         .map(|i| message_on(&alice, &room_id, &join_id, "x", 1_700_000_001_000 + i))
         .collect();
-    let refs: Vec<&neutrino_common::Event> = events.iter().collect();
+    let refs: Vec<&neutrino_event::Event> = events.iter().collect();
 
     let (status, body) = put_json(&app, &send_path("txn1"), &txn(&refs)).await;
 
@@ -2581,7 +2581,7 @@ async fn seed_public_room() -> (
 
 /// Build a completed remote `m.room.member`/`join` event referencing `head`
 /// (as the joining server would after `make_join`).
-fn remote_join(room_id: &RoomId, head: &OwnedEventId, user: &str) -> neutrino_common::Event {
+fn remote_join(room_id: &RoomId, head: &OwnedEventId, user: &str) -> neutrino_event::Event {
     let user: OwnedUserId = user.parse().expect("user");
     EventBuilder::new(user.clone(), "m.room.member".to_owned())
         .room_id(room_id.to_owned())
@@ -2986,7 +2986,7 @@ fn config_for(server_name: &str, localpart: &str) -> Config {
 }
 
 /// `content.membership` of an event, if present.
-fn membership_str(ev: &neutrino_common::Event) -> Option<String> {
+fn membership_str(ev: &neutrino_event::Event) -> Option<String> {
     serde_json::from_str::<Value>(ev.content.get())
         .ok()
         .and_then(|c| {
@@ -3416,7 +3416,7 @@ fn parse_server_names_handles_repeats_and_encoded_colon() {
 
 /// Parse an event's canonical wire bytes into a JSON `Value` (for embedding in
 /// a stub resident's canned responses).
-fn raw_to_value(ev: &neutrino_common::Event) -> Value {
+fn raw_to_value(ev: &neutrino_event::Event) -> Value {
     serde_json::from_str(ev.raw.get()).expect("event raw is valid JSON")
 }
 
@@ -3696,7 +3696,7 @@ fn inviter() -> OwnedUserId {
 /// (the v2 endpoint wraps the PDU). `invite_room_state` is the optional stripped
 /// state the inviting server includes; the handler merges it into the stored
 /// event's `unsigned`.
-fn invite_body(event: &neutrino_common::Event, invite_room_state: Option<Value>) -> Value {
+fn invite_body(event: &neutrino_event::Event, invite_room_state: Option<Value>) -> Value {
     let mut body = json!({
         "event": serde_json::from_str::<Value>(event.raw.get()).unwrap(),
         "room_version": ROOM_VERSION_ID,
@@ -3715,7 +3715,7 @@ fn member_pdu(
     room_id: &OwnedRoomId,
     membership: &str,
     prevs: &[OwnedEventId],
-) -> neutrino_common::Event {
+) -> neutrino_event::Event {
     EventBuilder::new(sender.clone(), "m.room.member".to_owned())
         .room_id(room_id.clone())
         .state_key(target.to_owned())
@@ -4221,7 +4221,7 @@ fn send_leave_path(room_id: &RoomId, event_id: &OwnedEventId) -> String {
 }
 
 /// A completed remote `m.room.member`/`leave` (self-leave) referencing `head`.
-fn remote_leave(room_id: &RoomId, head: &OwnedEventId, user: &str) -> neutrino_common::Event {
+fn remote_leave(room_id: &RoomId, head: &OwnedEventId, user: &str) -> neutrino_event::Event {
     let user: OwnedUserId = user.parse().expect("user");
     EventBuilder::new(user.clone(), "m.room.member".to_owned())
         .room_id(room_id.to_owned())
@@ -4501,7 +4501,7 @@ async fn serve_resident_with_invite(
     String,
     Arc<SqliteStore>,
     OwnedRoomId,
-    neutrino_common::Event,
+    neutrino_event::Event,
     TempDir,
 ) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

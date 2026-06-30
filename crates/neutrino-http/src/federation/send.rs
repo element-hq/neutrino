@@ -3,7 +3,7 @@
 //! A transaction is an envelope of up to 50 PDUs (plus EDUs, which this server
 //! stubs out — they are deserialized for shape validation and dropped). Each
 //! PDU is a fully-formed v12 event; we parse it via
-//! [`neutrino_common::event_builder::from_wire`] (which derives the event_id from the
+//! [`neutrino_event::event_builder::from_wire`] (which derives the event_id from the
 //! reference hash, verifies/redacts on content-hash mismatch, and runs the
 //! format + semantic validators).
 //!
@@ -38,7 +38,7 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
-use neutrino_common::event_builder::from_wire;
+use neutrino_event::event_builder::from_wire;
 use neutrino_store::{FederationInbox, StagingStore};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName};
 use serde::{Deserialize, Serialize};

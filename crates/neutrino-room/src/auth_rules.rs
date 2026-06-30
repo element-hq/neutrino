@@ -896,8 +896,8 @@ mod tests {
     use super::*;
     use crate::provider::InMemoryStateProvider;
     use crate::test_utils::next_ts;
-    use neutrino_common::ROOM_VERSION_ID;
-    use neutrino_common::event_builder::EventBuilder;
+    use neutrino_event::ROOM_VERSION_ID;
+    use neutrino_event::event_builder::EventBuilder;
     use ruma::RoomId;
     use serde_json::{Value, json};
 

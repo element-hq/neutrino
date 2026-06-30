@@ -6,7 +6,7 @@
 //!
 //! Wire-format parsing (`parse_event`) and the provider-free semantic rules
 //! (`validate_pdu`) are event-scoped and live in
-//! [`neutrino_common::validate`]. `RoomCore::apply` runs `validate_pdu`
+//! [`neutrino_event::validate`]. `RoomCore::apply` runs `validate_pdu`
 //! (event-scoped) and then `validate_references` (room-scoped) before the auth
 //! checks.
 
@@ -81,8 +81,8 @@ mod tests {
     use super::*;
     use crate::ReferenceError;
     use crate::provider::InMemoryStateProvider;
-    use neutrino_common::ROOM_VERSION_ID;
-    use neutrino_common::validate::parse_event;
+    use neutrino_event::ROOM_VERSION_ID;
+    use neutrino_event::validate::parse_event;
     use ruma::OwnedEventId;
     use serde_json::value::RawValue;
     use serde_json::{Value, json};

@@ -23,7 +23,7 @@ use axum::{
     extract::{Path, RawQuery, State},
     http::HeaderMap,
 };
-use neutrino_common::ROOM_VERSION_ID;
+use neutrino_event::ROOM_VERSION_ID;
 use neutrino_store::RoomStore;
 use ruma::{OwnedRoomId, OwnedUserId};
 use serde::Serialize;

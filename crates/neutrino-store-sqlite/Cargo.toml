@@ -13,8 +13,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
-neutrino-common = { path = "../neutrino-common" }
-neutrino-state = { path = "../neutrino-state" }
+neutrino-event = { path = "../neutrino-event" }
+neutrino-room = { path = "../neutrino-room" }
 neutrino-store = { path = "../neutrino-store" }
 uuid = { version = "1.23.1", features = ["v4"] }
 

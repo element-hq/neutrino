@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use neutrino_common::event_view;
+use neutrino_event::event_view;
 use neutrino_store::Membership;
 use ruma::OwnedRoomId;
 use ruma::api::client::sync::sync_events::v5;

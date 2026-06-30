@@ -144,7 +144,7 @@ pub(crate) async fn handle(
 
     Ok(Json(ResponseBody {
         origin,
-        origin_server_ts: neutrino_common::now_ms(),
+        origin_server_ts: neutrino_event::now_ms(),
         pdus,
     }))
 }

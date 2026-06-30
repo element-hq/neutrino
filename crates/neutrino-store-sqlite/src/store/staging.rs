@@ -205,7 +205,7 @@ mod tests {
     }
 
     /// Build a state event on the given state-DAG head.
-    fn state_event(prev_state: &[&ruma::EventId], ts: u64) -> neutrino_common::Event {
+    fn state_event(prev_state: &[&ruma::EventId], ts: u64) -> neutrino_event::Event {
         make_event(
             *ALICE_ROOM_ID,
             *ALICE_USER_ID,

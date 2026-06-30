@@ -31,7 +31,7 @@ use neutrino_engine::{
 };
 
 use crate::federation::get_missing_events;
-use neutrino_common::now_ms;
+use neutrino_event::now_ms;
 
 /// Connection-establishment timeout for a federation request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);

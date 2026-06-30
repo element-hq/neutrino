@@ -23,8 +23,8 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use neutrino_common::ROOM_VERSION_ID;
-use neutrino_common::event_builder::from_wire;
+use neutrino_event::ROOM_VERSION_ID;
+use neutrino_event::event_builder::from_wire;
 use neutrino_store::{InviteStore, RoomStore, StagingStore, StateStore, StreamPos};
 use ruma::{OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId};
 use serde_json::json;
@@ -398,7 +398,7 @@ async fn wait_for_join(
 }
 
 /// True if an `m.room.member` event's `content.membership` is `join`.
-fn membership_is_join(event: &neutrino_common::Event) -> bool {
+fn membership_is_join(event: &neutrino_event::Event) -> bool {
     event.content_str("membership").as_deref() == Some("join")
 }
 

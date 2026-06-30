@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use async_trait::async_trait;
-pub use neutrino_common::Event;
+pub use neutrino_event::Event;
 use ruma::{
     EventId, OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, RoomVersionId,
     ServerName, UserId,
@@ -118,7 +118,7 @@ pub trait RoomStore: Send + Sync {
     ///       yet been written by `persist_resolved_event` reads back as two
     ///       empty sets (the columns default to `[]`); the caller treats that
     ///       as "not yet populated". Used to bootstrap an in-memory
-    ///       `RoomCore` (see `neutrino_state::RoomCore::hydrate`).
+    ///       `RoomCore` (see `neutrino_room::RoomCore::hydrate`).
     async fn forward_extremities(
         &self,
         room_id: &RoomId,
@@ -160,7 +160,7 @@ pub trait EventStore: Send + Sync {
     async fn persist_historical_event(&self, event: &Event) -> Result<(), StorageError>;
 
     /// Pre:  `event.room_id` must exist; `event` is the just-accepted output
-    ///       of `neutrino_state::RoomCore::apply`; `timeline_fes` /
+    ///       of `neutrino_room::RoomCore::apply`; `timeline_fes` /
     ///       `state_fes` are the head-sets that apply produced (read off the
     ///       post-apply `RoomCore`); and `current_state_delta` is the
     ///       `Effect::UpdateCurrentState` payload apply emitted (empty for a
@@ -673,13 +673,13 @@ impl<T> StorageBackend for T where
 /// `R` must own its result — the provider lives only for the call to `f`, so a
 /// returned value cannot borrow from it.
 ///
-/// [`StateProvider`]: neutrino_state::provider::StateProvider
+/// [`StateProvider`]: neutrino_room::provider::StateProvider
 pub trait WithStateProvider: Send + Sync {
     fn with_state_provider<F, R>(
         &self,
         f: F,
     ) -> impl std::future::Future<Output = Result<R, StorageError>> + Send
     where
-        F: for<'a> FnOnce(&'a dyn neutrino_state::provider::StateProvider) -> R + Send + 'static,
+        F: for<'a> FnOnce(&'a dyn neutrino_room::provider::StateProvider) -> R + Send + 'static,
         R: Send + 'static;
 }

@@ -1,4 +1,4 @@
-//! [`neutrino_state::StateProvider`] impl backed by a borrowed
+//! [`neutrino_room::StateProvider`] impl backed by a borrowed
 //! [`rusqlite::Connection`].
 //!
 //! `StateProvider` is a synchronous trait — by design (the state-res
@@ -53,18 +53,18 @@
 //!   (federation backfill can reference parents we haven't yet seen),
 //!   so the join is the only way to detect a dangling edge.
 //!
-//! [`StateResError::MissingEvent`]: neutrino_state::StateResError::MissingEvent
+//! [`StateResError::MissingEvent`]: neutrino_room::StateResError::MissingEvent
 //! [`SqliteStore`]: crate::SqliteStore
-//! [`get_event`]: neutrino_state::provider::StateProvider::get_event
-//! [`auth_chain`]: neutrino_state::provider::StateProvider::auth_chain
+//! [`get_event`]: neutrino_room::provider::StateProvider::get_event
+//! [`auth_chain`]: neutrino_room::provider::StateProvider::auth_chain
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use deadpool_sqlite::rusqlite::{Connection, OptionalExtension, params};
-use neutrino_common::Event;
-use neutrino_state::provider::StateProvider;
-use neutrino_state::{StateMap, StateResError};
+use neutrino_event::Event;
+use neutrino_room::provider::StateProvider;
+use neutrino_room::{StateMap, StateResError};
 use ruma::{EventId, OwnedEventId};
 
 use crate::error::Error;
@@ -293,7 +293,7 @@ mod tests {
         body: &str,
         ts: u64,
         auth_events: Vec<OwnedEventId>,
-    ) -> neutrino_common::Event {
+    ) -> neutrino_event::Event {
         let mut ev = make_event(
             *ALICE_ROOM_ID,
             *ALICE_USER_ID,

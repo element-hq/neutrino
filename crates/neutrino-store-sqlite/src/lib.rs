@@ -14,7 +14,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use deadpool_sqlite::{Config, Hook, HookError, Pool, Runtime, rusqlite::Connection};
-use neutrino_state::provider::StateProvider;
+use neutrino_room::provider::StateProvider;
 use neutrino_store::{StorageError, StreamPos, WithStateProvider};
 use tokio::sync::watch;
 

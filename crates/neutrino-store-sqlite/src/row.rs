@@ -13,7 +13,7 @@
 use std::{borrow::Cow, ops::Deref};
 
 use deadpool_sqlite::rusqlite::{Row, Transaction, params};
-use neutrino_common::Event;
+use neutrino_event::Event;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -93,7 +93,7 @@ impl<'a> EventRow<'a> {
 fn debug_assert_event_id_matches_raw(event: &Event) {
     #[cfg(debug_assertions)]
     {
-        match neutrino_common::event_id::compute_event_id(&event.raw) {
+        match neutrino_event::event_id::compute_event_id(&event.raw) {
             Ok(computed) if computed == event.event_id => {}
             Ok(computed) => panic!(
                 "EventRow::from: event.event_id ({}) does not match reference \

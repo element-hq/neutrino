@@ -217,8 +217,8 @@ pub(crate) fn complete_membership_template(
     room_id: &ruma::RoomId,
     user: &ruma::UserId,
     membership: &str,
-) -> Option<neutrino_common::Event> {
-    use neutrino_common::event_builder::{EventBuilder, from_wire};
+) -> Option<neutrino_event::Event> {
+    use neutrino_event::event_builder::{EventBuilder, from_wire};
     let raw = serde_json::value::RawValue::from_string(template.get().to_owned()).ok()?;
     let parsed = match from_wire(raw, Vec::new()) {
         Ok(parsed) => parsed,

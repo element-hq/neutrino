@@ -16,7 +16,7 @@
 //!    `prev_state_events` arrays yield distinct reference hashes. The
 //!    existing case test only proves the property for one pair.
 
-use neutrino_common::event_id::{content_hash, reference_hash};
+use neutrino_event::event_id::{content_hash, reference_hash};
 use proptest::prelude::*;
 use ruma::canonical_json::{CanonicalJsonObject, CanonicalJsonValue};
 use serde_json::{Value, json};
