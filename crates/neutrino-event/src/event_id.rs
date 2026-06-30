@@ -1,7 +1,7 @@
 //! Hashing and event-id derivation for v12 / MSC4242.
 //!
 //! Used by:
-//! - `EventBuilder` in `neutrino-state::event_id` (server-authored events)
+//! - `EventBuilder` in `neutrino-state::event_builder` (server-authored events)
 //! - `Event::from_wire` here in `neutrino-common::event` (federation receive)
 //!
 //! Layered as:

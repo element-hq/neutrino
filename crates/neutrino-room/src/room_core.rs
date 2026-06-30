@@ -57,17 +57,17 @@
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
-use neutrino_common::Event;
+use neutrino_event::event_builder::EventBuilder;
+use neutrino_event::{Event, FormatError};
 use ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId};
 use serde_json::Value;
 
 use crate::auth_events::calculate_auth_events;
 use crate::auth_rules::check_auth_rules;
-use crate::event_id::EventBuilder;
 use crate::provider::StateProvider;
 use crate::state_res;
 use crate::validate;
-use crate::{CoreError, FormatError, ReferenceError, StateDelta, StateMap, StateResError};
+use crate::{CoreError, ReferenceError, StateDelta, StateMap, StateResError};
 
 /// Provider wrapper that transparently resolves a single `local_event` —
 /// the event currently being applied — while delegating everything else to
@@ -347,7 +347,7 @@ impl RoomCore {
         // DROP: semantic rules (no provider). Defence-in-depth — the builder /
         // wire-parser already ran this, but we re-run so a hand-constructed
         // `Event` doesn't bypass it. A malformed event is not a valid PDU.
-        validate::validate_pdu(&event)?;
+        neutrino_event::validate::validate_pdu(&event)?;
 
         // Reference validation, classified: a "bad reference" (rejected /
         // non-state / different-room prev_state, rejected create) is a REJECT
@@ -546,11 +546,11 @@ fn current_state_delta(old: &StateMap<Arc<Event>>, new: &StateMap<OwnedEventId>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_id::EventBuilder;
     use crate::provider::InMemoryStateProvider;
     use crate::test_utils::next_ts;
-    use neutrino_common::ROOM_VERSION_ID;
-    use neutrino_common::event_id::room_id_from_create;
+    use neutrino_event::ROOM_VERSION_ID;
+    use neutrino_event::event_builder::EventBuilder;
+    use neutrino_event::event_id::room_id_from_create;
     use serde_json::json;
 
     /// Build a create event by `creator` (no additional_creators, federate=true).

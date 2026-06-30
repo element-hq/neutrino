@@ -1,12 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
 
-use ruma::canonical_json::CanonicalJsonError;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 use thiserror::Error;
 
 pub mod auth_events;
 pub mod auth_rules;
-pub mod event_id;
 pub mod provider;
 pub mod room_core;
 pub mod state_res;
@@ -32,7 +30,10 @@ pub(crate) mod test_utils {
 // The canonical `Event` type and the `RoomVersion` enum live in
 // `neutrino-common` so storage and state-machine code share them. See
 // `event-id-design.md` for the rationale.
-pub use neutrino_common::Event;
+pub use neutrino_event::Event;
+// `FormatError` is event-scoped (wire-format / provider-free semantic rules)
+// and lives in `neutrino-common`; `CoreError` wraps it here.
+use neutrino_event::FormatError;
 
 /// Resolved room state: one entry per `(event_type, state_key)` pair.
 pub type StateMap<V> = HashMap<(String, String), V>;
@@ -45,105 +46,6 @@ pub type StateMap<V> = HashMap<(String, String), V>;
 /// `BTreeMap` (not `HashMap`) so the iteration order the persist layer sees
 /// is deterministic.
 pub type StateDelta = BTreeMap<(String, String), Option<OwnedEventId>>;
-
-/// Errors raised by format validation — wire-format violations that
-/// reject the event outright, before any state lookup happens.
-#[derive(Debug, Error)]
-pub enum FormatError {
-    #[error("invalid JSON: {0}")]
-    InvalidJson(#[from] serde_json::Error),
-
-    /// PDU schema: a required top-level field is absent.
-    #[error("missing required field: {0}")]
-    MissingField(&'static str),
-
-    /// PDU schema: a field is present but the JSON value has the wrong shape.
-    #[error("field `{field}` has wrong shape, expected {expected}")]
-    InvalidFieldType {
-        field: &'static str,
-        expected: &'static str,
-    },
-
-    /// PDU schema: an event-id-like field could not be parsed as a Matrix ID.
-    #[error("field `{field}` contains malformed id: {value}")]
-    MalformedId { field: &'static str, value: String },
-
-    /// PDU schema: the assembled event JSON could not be encoded as canonical
-    /// JSON. Raised when caller-supplied `content` / `unsigned` contains a
-    /// float, an out-of-range integer, or another value canonical JSON forbids.
-    #[error("event JSON is not canonical-JSON encodable: {0}")]
-    NonCanonical(CanonicalJsonError),
-
-    /// MSC4242: `auth_events` is removed from the wire and must not be present.
-    /// Cross-ref synapse `events/__init__.py`:
-    /// `assert "auth_events" not in event_dict` for the MSC4242 event class.
-    #[error("auth_events field is not permitted on the wire under MSC4242")]
-    AuthEventsPresent,
-
-    /// PDU schema: `prev_events` > 20 entries.
-    #[error("prev_events exceeds 20 entries")]
-    TooManyPrevEvents,
-
-    /// MSC4242: `prev_state_events` > 20 entries.
-    #[error("prev_state_events exceeds 20 entries")]
-    TooManyPrevStateEvents,
-
-    /// v12 rule 1.1: "If it has any `prev_events`, reject."
-    #[error("m.room.create event has prev_events")]
-    CreateHasPrevEvents,
-
-    /// MSC4242: "If it has any `prev_state_events`, reject."
-    #[error("m.room.create event has prev_state_events")]
-    CreateHasPrevStateEvents,
-
-    /// v12 rule 1.2: "If the event has a `room_id`, reject."
-    #[error("m.room.create event has a room_id field")]
-    CreateHasRoomId,
-
-    /// v12 rule 1.3: "If `content.room_version` is present and is not a
-    /// recognised version, reject."
-    #[error("unrecognised room_version: {0}")]
-    UnrecognisedRoomVersion(String),
-
-    /// v12 rule 1.4: "If `additional_creators` is present in `content` and is
-    /// not an array of strings where each string passes the same user ID
-    /// validation applied to `sender`, reject."
-    #[error("additional_creators is not an array of valid user ids")]
-    InvalidAdditionalCreators,
-
-    /// v12 rule 5.1: "If there is no `state_key` property, or no `membership`
-    /// property in `content`, reject."
-    #[error("m.room.member event missing state_key")]
-    MemberMissingStateKey,
-
-    /// v12 rule 5.1: "If there is no `state_key` property, or no `membership`
-    /// property in `content`, reject."
-    #[error("m.room.member event missing content.membership")]
-    MemberMissingMembership,
-
-    /// v12 rule 9: "If the event has a `state_key` that starts with an `@` and
-    /// does not match the `sender`, reject."
-    #[error("state_key starts with @ but does not match sender")]
-    StateKeyAtSignSenderMismatch,
-
-    /// v12 rule 10.1: "If any of the properties `users_default`,
-    /// `events_default`, `state_default`, `ban`, `redact`, `kick`, or `invite`
-    /// in `content` are present and not an integer, reject."
-    #[error("power_levels field `{0}` is not an integer")]
-    PowerLevelsBadIntField(&'static str),
-
-    /// v12 rule 10.2: "If either of the properties `events` or `notifications`
-    /// in `content` are present and not an object with values that are
-    /// integers, reject."
-    #[error("power_levels field `{0}` is not an object of integer values")]
-    PowerLevelsBadObjectField(&'static str),
-
-    /// v12 rule 10.3: "If the `users` property in `content` is not an object
-    /// with keys that are valid user IDs with values that are integers,
-    /// reject."
-    #[error("power_levels users field is not {{valid-user-id: int}}")]
-    PowerLevelsBadUsers,
-}
 
 /// Errors raised by the v12 authorization rules.
 ///

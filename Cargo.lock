@@ -3034,25 +3034,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "neutrino-common"
+name = "neutrino-ctl"
 version = "0.1.0"
-dependencies = [
- "base64",
- "proptest",
- "ruma",
- "serde",
- "serde_json",
- "sha2 0.11.0-rc.5",
- "thiserror 2.0.18",
-]
 
 [[package]]
 name = "neutrino-engine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "neutrino-common",
- "neutrino-state",
+ "neutrino-event",
+ "neutrino-room",
  "neutrino-store",
  "neutrino-store-sqlite",
  "rand 0.9.4",
@@ -3064,6 +3055,19 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "neutrino-event"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "proptest",
+ "ruma",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0-rc.5",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3092,10 +3096,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
- "neutrino-common",
+ "neutrino-ctl",
  "neutrino-engine",
+ "neutrino-event",
  "neutrino-lb",
- "neutrino-state",
+ "neutrino-room",
  "neutrino-store",
  "neutrino-store-sqlite",
  "rand 0.9.4",
@@ -3139,7 +3144,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "hex",
- "neutrino-common",
+ "neutrino-ctl",
  "neutrino-http",
  "neutrino-lb",
  "neutrino-store",
@@ -3156,10 +3161,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "neutrino-state"
+name = "neutrino-room"
 version = "0.1.0"
 dependencies = [
- "neutrino-common",
+ "neutrino-event",
  "proptest",
  "ruma",
  "serde",
@@ -3172,8 +3177,8 @@ name = "neutrino-store"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "neutrino-common",
- "neutrino-state",
+ "neutrino-event",
+ "neutrino-room",
  "ruma",
  "serde_json",
  "thiserror 2.0.18",
@@ -3187,8 +3192,8 @@ dependencies = [
  "async-trait",
  "deadpool-sqlite",
  "lazy_static",
- "neutrino-common",
- "neutrino-state",
+ "neutrino-event",
+ "neutrino-room",
  "neutrino-store",
  "ruma",
  "serde",

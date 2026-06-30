@@ -59,7 +59,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use neutrino_common::now_ms;
+use neutrino_event::now_ms;
 
 use crate::ports::{FederationTransport, ForwardExtremities, MissingEventsFetcher, TransportError};
 use crate::reconcile;
@@ -379,7 +379,7 @@ async fn send_transaction_with_retry<S: StorageBackend + 'static>(
 async fn deliver_batch<S: StorageBackend + 'static>(
     ctx: &SenderCtx<S>,
     dest: &ServerName,
-    batch: &[neutrino_common::Event],
+    batch: &[neutrino_event::Event],
     backoff: &mut Duration,
     kick_rx: &mut watch::Receiver<()>,
 ) -> bool {
@@ -580,8 +580,8 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use neutrino_common::ROOM_VERSION_ID;
-    use neutrino_state::event_id::EventBuilder;
+    use neutrino_event::ROOM_VERSION_ID;
+    use neutrino_event::event_builder::EventBuilder;
     use neutrino_store::{EventStore, FederationOutbox, RoomStore};
     use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId};
     use serde_json::{Value, json};

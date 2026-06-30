@@ -817,9 +817,9 @@ pub fn resolve_state(
 mod tests {
     use super::*;
     use crate::Event;
-    use crate::event_id::EventBuilder;
     use crate::provider::InMemoryStateProvider;
     use crate::test_utils::next_ts;
+    use neutrino_event::event_builder::EventBuilder;
     use ruma::{room_id, user_id};
     use serde_json::json;
     use std::collections::HashMap;
@@ -1128,8 +1128,8 @@ mod tests {
 
     // ===== power_of_sender / reverse_topological_power_sort / iterative_auth_checks =====
 
-    use neutrino_common::ROOM_VERSION_ID;
-    use neutrino_common::event_id::room_id_from_create;
+    use neutrino_event::ROOM_VERSION_ID;
+    use neutrino_event::event_id::room_id_from_create;
     use ruma::{OwnedRoomId, RoomId};
 
     /// Build an `m.room.create` event. `additional_creators` is a slice of

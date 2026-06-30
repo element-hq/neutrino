@@ -14,9 +14,9 @@
 #![allow(dead_code)]
 
 use lazy_static::lazy_static;
-use neutrino_common::Event;
-use neutrino_common::ROOM_VERSION_ID;
-use neutrino_common::event_id::compute_event_id;
+use neutrino_event::Event;
+use neutrino_event::ROOM_VERSION_ID;
+use neutrino_event::event_id::compute_event_id;
 use neutrino_store_sqlite::SqliteStore;
 use ruma::{EventId, OwnedEventId, RoomId, UserId, room_id, user_id};
 use serde_json::{Value, json, value::RawValue};

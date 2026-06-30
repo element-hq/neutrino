@@ -55,8 +55,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use neutrino_common::Event;
-use neutrino_state::event_id::from_wire;
+use neutrino_event::Event;
+use neutrino_event::event_builder::from_wire;
 use neutrino_store::{StagedPdu, StorageBackend, WithStateProvider};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, RoomId};
 use tokio::sync::{Notify, mpsc};
@@ -434,8 +434,8 @@ fn toposort(items: Vec<Staged>) -> Vec<Staged> {
 
 #[cfg(test)]
 mod tests {
-    use neutrino_common::ROOM_VERSION_ID;
-    use neutrino_state::event_id::EventBuilder;
+    use neutrino_event::ROOM_VERSION_ID;
+    use neutrino_event::event_builder::EventBuilder;
     use ruma::{OwnedUserId, server_name};
     use serde_json::json;
 

@@ -36,8 +36,8 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use neutrino_common::ROOM_VERSION_ID;
-use neutrino_state::event_id::from_wire;
+use neutrino_event::ROOM_VERSION_ID;
+use neutrino_event::event_builder::from_wire;
 use neutrino_store::{InviteStore, RoomStore, StateStore};
 use ruma::events::AnyStrippedStateEvent;
 use ruma::serde::Raw;

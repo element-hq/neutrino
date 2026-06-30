@@ -12,7 +12,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-neutrino-common = { path = "../neutrino-common" }
+neutrino-ctl = { path = "../neutrino-ctl" }
 neutrino-http = { path = "../neutrino-http" }
 neutrino-lb = { path = "../neutrino-lb" }
 neutrino-store = { path = "../neutrino-store" }

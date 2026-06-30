@@ -12,11 +12,12 @@ use axum::{
     response::IntoResponse,
     routing::{get, post, put},
 };
-use neutrino_common::{Command, Config, Event, ROOM_VERSION_ID};
-use neutrino_state::event_id::EventBuilder;
-use neutrino_state::provider::InMemoryStateProvider;
-use neutrino_state::room_core::{Effect, RoomCore};
-use neutrino_state::{CoreError, FormatError};
+use neutrino_ctl::{Command, Config};
+use neutrino_event::event_builder::EventBuilder;
+use neutrino_event::{Event, FormatError, ROOM_VERSION_ID};
+use neutrino_room::CoreError;
+use neutrino_room::provider::InMemoryStateProvider;
+use neutrino_room::room_core::{Effect, RoomCore};
 use neutrino_store::{RoomStore, StateStore, StorageError};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5;
@@ -1613,8 +1614,8 @@ mod tests {
         // a live sender task does NOT block `serve` from returning after
         // `Command::Shutdown`. (That the supervisor actually aborts its children
         // is pinned by `sender::tests::supervisor_returns_on_shutdown`.)
-        use neutrino_common::ROOM_VERSION_ID;
-        use neutrino_state::event_id::EventBuilder;
+        use neutrino_event::ROOM_VERSION_ID;
+        use neutrino_event::event_builder::EventBuilder;
         use neutrino_store::{EventStore, RoomStore};
 
         let tmp = TempDir::new().expect("tempdir");

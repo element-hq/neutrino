@@ -23,9 +23,10 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 
-neutrino-common = { path = "../neutrino-common" }
+neutrino-event = { path = "../neutrino-event" }
+neutrino-ctl = { path = "../neutrino-ctl" }
 neutrino-engine = { path = "../neutrino-engine" }
-neutrino-state = { path = "../neutrino-state" }
+neutrino-room = { path = "../neutrino-room" }
 neutrino-store = { path = "../neutrino-store" }
 neutrino-store-sqlite = { path = "../neutrino-store-sqlite" }
 reqwest = { version = "0.13.4", default-features = false, features = ["json"] }

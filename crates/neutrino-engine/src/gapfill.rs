@@ -1,7 +1,7 @@
 //! Closing a received PDU's missing state-DAG ancestry by fetching it from a
 //! peer into the pre-auth staging cache.
 //!
-//! `RoomCore::apply_pdu` returns a *retryable* [`CoreError`](neutrino_state::CoreError)
+//! `RoomCore::apply_pdu` returns a *retryable* [`CoreError`](neutrino_room::CoreError)
 //! when an event's `prev_state_events` ancestry (the auth-relevant state DAG,
 //! MSC4242) doesn't reach `m.room.create` in our store. We must *authorise*
 //! every PDU — concurrency reorders operations, so even a trusted peer's event
@@ -16,8 +16,8 @@
 //! ancestry and freshly-received PDUs flow through the *same* loop, so there is
 //! no separate "promote" step.
 
-use neutrino_common::Event;
-use neutrino_state::event_id::from_wire;
+use neutrino_event::Event;
+use neutrino_event::event_builder::from_wire;
 use neutrino_store::StorageBackend;
 use ruma::{EventId, OwnedEventId, RoomId, ServerName};
 

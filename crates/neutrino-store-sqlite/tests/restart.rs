@@ -19,7 +19,7 @@ mod common;
 use std::str::FromStr;
 use std::time::Duration;
 
-use neutrino_common::ROOM_VERSION_ID;
+use neutrino_event::ROOM_VERSION_ID;
 use neutrino_store::{
     EventStore, FederationInbox, FederationOutbox, RoomStore, StateStore, StreamPos,
 };

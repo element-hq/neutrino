@@ -1,39 +1,140 @@
-//! Validation.
+//! Event-scoped validation: wire-format parsing and provider-free semantic
+//! rules.
 //!
 //! `parse_event`: pure-JSON wire format (required fields, JSON
 //! types, ID parsing). No I/O, no semantic-rule decisions.
 //! `validate_pdu`: semantic rules that work off a parsed `Event`
 //! and need no provider (count limits, create structural rules, rule 9,
 //! per-type content shape).
-//! `validate_references`: existential checks that require provider
-//! lookups (v12 rule 2 + MSC4242 `prev_state_events` triad).
+//!
+//! Reference validation (v12 rule 2 + the MSC4242 `prev_state_events` triad)
+//! requires provider lookups against a single room's DAG, so it is room-scoped
+//! and lives in `neutrino-state` (`validate::validate_references`).
 //!
 //! `validate_pdu` is split out of `parse_event` so downstream callers
 //! (`RoomCore::apply`) don't have to take "you ran parse_event already" as
-//! a precondition. Both `EventBuilder::build` / `Event::from_wire` and
+//! a precondition. Both `EventBuilder::build` / `from_wire` and
 //! `RoomCore::apply` run validate_pdu explicitly; apply also runs it
 //! defensively so a hand-constructed `Event` can't bypass the semantic
 //! checks.
 //!
-//! Every check is annotated inline with its spec citation. Anything that
-//! requires resolved room state is deferred to `check_auth_rules`.
+//! Every check is annotated inline with its spec citation.
 
-use neutrino_common::ROOM_VERSION_ID;
+use ruma::canonical_json::CanonicalJsonError;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
+use thiserror::Error;
 
-use crate::provider::StateProvider;
-use crate::{Event, FormatError, ReferenceError};
+use crate::{Event, ROOM_VERSION_ID};
 
 const MAX_PREV_EVENTS: usize = 20;
 const MAX_PREV_STATE_EVENTS: usize = 20;
+
+/// Errors raised by format validation — wire-format violations that
+/// reject the event outright, before any state lookup happens.
+#[derive(Debug, Error)]
+pub enum FormatError {
+    #[error("invalid JSON: {0}")]
+    InvalidJson(#[from] serde_json::Error),
+
+    /// PDU schema: a required top-level field is absent.
+    #[error("missing required field: {0}")]
+    MissingField(&'static str),
+
+    /// PDU schema: a field is present but the JSON value has the wrong shape.
+    #[error("field `{field}` has wrong shape, expected {expected}")]
+    InvalidFieldType {
+        field: &'static str,
+        expected: &'static str,
+    },
+
+    /// PDU schema: an event-id-like field could not be parsed as a Matrix ID.
+    #[error("field `{field}` contains malformed id: {value}")]
+    MalformedId { field: &'static str, value: String },
+
+    /// PDU schema: the assembled event JSON could not be encoded as canonical
+    /// JSON. Raised when caller-supplied `content` / `unsigned` contains a
+    /// float, an out-of-range integer, or another value canonical JSON forbids.
+    #[error("event JSON is not canonical-JSON encodable: {0}")]
+    NonCanonical(CanonicalJsonError),
+
+    /// MSC4242: `auth_events` is removed from the wire and must not be present.
+    /// Cross-ref synapse `events/__init__.py`:
+    /// `assert "auth_events" not in event_dict` for the MSC4242 event class.
+    #[error("auth_events field is not permitted on the wire under MSC4242")]
+    AuthEventsPresent,
+
+    /// PDU schema: `prev_events` > 20 entries.
+    #[error("prev_events exceeds 20 entries")]
+    TooManyPrevEvents,
+
+    /// MSC4242: `prev_state_events` > 20 entries.
+    #[error("prev_state_events exceeds 20 entries")]
+    TooManyPrevStateEvents,
+
+    /// v12 rule 1.1: "If it has any `prev_events`, reject."
+    #[error("m.room.create event has prev_events")]
+    CreateHasPrevEvents,
+
+    /// MSC4242: "If it has any `prev_state_events`, reject."
+    #[error("m.room.create event has prev_state_events")]
+    CreateHasPrevStateEvents,
+
+    /// v12 rule 1.2: "If the event has a `room_id`, reject."
+    #[error("m.room.create event has a room_id field")]
+    CreateHasRoomId,
+
+    /// v12 rule 1.3: "If `content.room_version` is present and is not a
+    /// recognised version, reject."
+    #[error("unrecognised room_version: {0}")]
+    UnrecognisedRoomVersion(String),
+
+    /// v12 rule 1.4: "If `additional_creators` is present in `content` and is
+    /// not an array of strings where each string passes the same user ID
+    /// validation applied to `sender`, reject."
+    #[error("additional_creators is not an array of valid user ids")]
+    InvalidAdditionalCreators,
+
+    /// v12 rule 5.1: "If there is no `state_key` property, or no `membership`
+    /// property in `content`, reject."
+    #[error("m.room.member event missing state_key")]
+    MemberMissingStateKey,
+
+    /// v12 rule 5.1: "If there is no `state_key` property, or no `membership`
+    /// property in `content`, reject."
+    #[error("m.room.member event missing content.membership")]
+    MemberMissingMembership,
+
+    /// v12 rule 9: "If the event has a `state_key` that starts with an `@` and
+    /// does not match the `sender`, reject."
+    #[error("state_key starts with @ but does not match sender")]
+    StateKeyAtSignSenderMismatch,
+
+    /// v12 rule 10.1: "If any of the properties `users_default`,
+    /// `events_default`, `state_default`, `ban`, `redact`, `kick`, or `invite`
+    /// in `content` are present and not an integer, reject."
+    #[error("power_levels field `{0}` is not an integer")]
+    PowerLevelsBadIntField(&'static str),
+
+    /// v12 rule 10.2: "If either of the properties `events` or `notifications`
+    /// in `content` are present and not an object with values that are
+    /// integers, reject."
+    #[error("power_levels field `{0}` is not an object of integer values")]
+    PowerLevelsBadObjectField(&'static str),
+
+    /// v12 rule 10.3: "If the `users` property in `content` is not an object
+    /// with keys that are valid user IDs with values that are integers,
+    /// reject."
+    #[error("power_levels users field is not {{valid-user-id: int}}")]
+    PowerLevelsBadUsers,
+}
 
 /// Parse a raw event JSON into an `Event`. Wire-format only:
 /// required field presence, JSON value types, ID parsing. Semantic rules
 /// (count limits, create structural constraints, rule 9, per-type content
 /// shape) belong to [`validate_pdu`]; reference validation belongs to
-/// [`validate_references`].
+/// `neutrino-state`'s `validate::validate_references`.
 ///
 /// `event_id` is provided by the caller: under v12 it derives from the event's
 /// reference hash, which is computed by a separate event-building step. This
@@ -184,7 +285,7 @@ pub fn parse_event(
 /// Split out of [`parse_event`] so callers don't have to take "you ran
 /// parse_event" as an implicit precondition for the semantic rules: a
 /// hand-constructed `Event` that bypassed parse_event still has to satisfy
-/// these checks before [`RoomCore::apply`] will accept it.
+/// these checks before `RoomCore::apply` will accept it.
 ///
 /// Checks:
 /// - **MSC4242**: `prev_events` ≤ `MAX_PREV_EVENTS`,
@@ -431,67 +532,6 @@ fn check_power_levels(content: &Map<String, Value>) -> Result<(), FormatError> {
         }
     }
     Ok(())
-}
-
-/// Validate that everything this event refers to actually resolves.
-///
-/// Checks:
-/// - **v12 rule 2**: the event's `room_id` is the event ID of an accepted
-///   `m.room.create` event (with the sigil `!` instead of `$`).
-/// - **MSC4242 prev_state_events triad**: each entry must exist in the store,
-///   belong to the same room as this event, have a `state_key` (i.e. be a
-///   state event), and not be rejected.
-///
-/// Create events bypass all checks: they introduce the room, they have no
-/// `prev_state_events` (wire-format rule F4), and they are the create event whose
-/// existence rule 2 demands.
-pub fn validate_references(
-    event: &Event,
-    provider: &dyn StateProvider,
-) -> Result<(), ReferenceError> {
-    if event.event_type == "m.room.create" {
-        return Ok(());
-    }
-
-    // v12 rule 2.
-    let derived_create_id = derive_create_event_id(&event.room_id)
-        .ok_or_else(|| ReferenceError::MalformedRoomId(event.room_id.clone()))?;
-    let create = provider
-        .get_event(&derived_create_id)?
-        .ok_or_else(|| ReferenceError::UnknownRoom(event.room_id.clone()))?;
-    if create.rejected {
-        return Err(ReferenceError::RoomRejected(event.room_id.clone()));
-    }
-    if create.event_type != "m.room.create" {
-        return Err(ReferenceError::RoomTypeMismatch(derived_create_id));
-    }
-
-    // MSC4242 prev_state_events triad.
-    for psid in &event.prev_state_events {
-        let ps = provider
-            .get_event(psid)?
-            .ok_or_else(|| ReferenceError::PrevStateNotFound(psid.clone()))?;
-        if ps.rejected {
-            return Err(ReferenceError::PrevStateRejected(psid.clone()));
-        }
-        if ps.state_key.is_none() {
-            return Err(ReferenceError::PrevStateNotStateEvent(psid.clone()));
-        }
-        if ps.room_id != event.room_id {
-            return Err(ReferenceError::PrevStateDifferentRoom(psid.clone()));
-        }
-    }
-
-    Ok(())
-}
-
-/// Derive the create event's ID from a v12 room_id by swapping the `!` sigil
-/// for `$`. Returns `None` if the room_id is somehow malformed (shouldn't
-/// happen for a value that already passed `OwnedRoomId` parsing, but the
-/// graceful fallback keeps `validate_references` panic-free).
-pub(crate) fn derive_create_event_id(room_id: &OwnedRoomId) -> Option<OwnedEventId> {
-    let rest = room_id.as_str().strip_prefix('!')?;
-    format!("${rest}").parse().ok()
 }
 
 #[cfg(test)]
@@ -1024,207 +1064,5 @@ mod tests {
         // base_event has no signatures field — still accepted.
         parse_event(raw(base_event()), eid("$e:example.org"), vec![])
             .expect("missing signatures accepted under trusted-network policy");
-    }
-
-    // =====================================================================
-    // validate_references
-    // =====================================================================
-
-    use crate::ReferenceError;
-    use crate::provider::InMemoryStateProvider;
-    use std::sync::Arc;
-
-    /// Helper around `InMemoryStateProvider::insert` for the validate tests.
-    /// `validate_references` only calls `get_event`, so the embedded
-    /// `Event.auth_events` is irrelevant here (left empty by `parse_event`
-    /// callers). `rejected` is set on the `Event` before insertion.
-    fn insert_event(provider: &mut InMemoryStateProvider, mut event: Event, rejected: bool) {
-        event.rejected = rejected;
-        provider.insert(Arc::new(event));
-    }
-
-    fn make_event(json: Value, event_id: &str) -> Event {
-        parse_event(raw(json), eid(event_id), vec![]).expect("test event valid")
-    }
-
-    fn make_create(event_id: &str) -> Event {
-        make_event(base_create(), event_id)
-    }
-
-    fn make_message(room_id: &str, prev_state: Vec<&str>, event_id: &str) -> Event {
-        let mut v = base_event();
-        v["room_id"] = json!(room_id);
-        v["prev_state_events"] = json!(
-            prev_state
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect::<Vec<_>>()
-        );
-        make_event(v, event_id)
-    }
-
-    fn make_state_event(room_id: &str, event_id: &str) -> Event {
-        // A state event in `room_id` (m.room.topic with state_key "").
-        let mut v = base_event();
-        v["type"] = json!("m.room.topic");
-        v["state_key"] = json!("");
-        v["room_id"] = json!(room_id);
-        v["content"] = json!({ "topic": "hello" });
-        make_event(v, event_id)
-    }
-
-    #[test]
-    fn refs_create_event_skips_all_checks() {
-        let create = make_create("$create:example.org");
-        let provider = InMemoryStateProvider::new();
-        validate_references(&create, &provider).expect("create event bypasses ref checks");
-    }
-
-    #[test]
-    fn refs_happy_path_known_room() {
-        let mut provider = InMemoryStateProvider::new();
-        insert_event(&mut provider, make_create("$create:example.org"), false);
-        let msg = make_message("!create:example.org", vec![], "$msg:example.org");
-        validate_references(&msg, &provider).expect("known room");
-    }
-
-    // v12 rule 2: unknown room
-    #[test]
-    fn refs_unknown_room_rejected() {
-        let provider = InMemoryStateProvider::new();
-        let msg = make_message("!doesnotexist:example.org", vec![], "$msg:example.org");
-        assert!(matches!(
-            validate_references(&msg, &provider),
-            Err(ReferenceError::UnknownRoom(_))
-        ));
-    }
-
-    // v12 rule 2: create event is rejected
-    #[test]
-    fn refs_rejected_create_rejects_event() {
-        let mut provider = InMemoryStateProvider::new();
-        insert_event(&mut provider, make_create("$create:example.org"), true);
-        let msg = make_message("!create:example.org", vec![], "$msg:example.org");
-        assert!(matches!(
-            validate_references(&msg, &provider),
-            Err(ReferenceError::RoomRejected(_))
-        ));
-    }
-
-    // v12 rule 2 defensive: derived id resolves to a non-create event.
-    #[test]
-    fn refs_non_create_at_derived_id_rejected() {
-        let mut provider = InMemoryStateProvider::new();
-        // Store a non-create event at id "$create:example.org".
-        insert_event(
-            &mut provider,
-            make_state_event("!somewhere:example.org", "$create:example.org"),
-            false,
-        );
-        let msg = make_message("!create:example.org", vec![], "$msg:example.org");
-        assert!(matches!(
-            validate_references(&msg, &provider),
-            Err(ReferenceError::RoomTypeMismatch(_))
-        ));
-    }
-
-    // MSC4242 triad: prev_state_event not in store
-    #[test]
-    fn refs_prev_state_not_found_rejected() {
-        let mut provider = InMemoryStateProvider::new();
-        insert_event(&mut provider, make_create("$create:example.org"), false);
-        let msg = make_message(
-            "!create:example.org",
-            vec!["$missing:example.org"],
-            "$msg:example.org",
-        );
-        assert!(matches!(
-            validate_references(&msg, &provider),
-            Err(ReferenceError::PrevStateNotFound(_))
-        ));
-    }
-
-    // MSC4242 triad: prev_state_event is rejected
-    #[test]
-    fn refs_prev_state_rejected_rejects_event() {
-        let mut provider = InMemoryStateProvider::new();
-        insert_event(&mut provider, make_create("$create:example.org"), false);
-        insert_event(
-            &mut provider,
-            make_state_event("!create:example.org", "$rejected:example.org"),
-            true,
-        );
-        let msg = make_message(
-            "!create:example.org",
-            vec!["$rejected:example.org"],
-            "$msg:example.org",
-        );
-        assert!(matches!(
-            validate_references(&msg, &provider),
-            Err(ReferenceError::PrevStateRejected(_))
-        ));
-    }
-
-    // MSC4242 triad: prev_state_event has no state_key (i.e. not a state event)
-    #[test]
-    fn refs_prev_state_non_state_event_rejected() {
-        let mut provider = InMemoryStateProvider::new();
-        insert_event(&mut provider, make_create("$create:example.org"), false);
-        // make_message() produces an m.room.message without state_key.
-        let non_state = make_message("!create:example.org", vec![], "$msg-ref:example.org");
-        insert_event(&mut provider, non_state, false);
-        let msg = make_message(
-            "!create:example.org",
-            vec!["$msg-ref:example.org"],
-            "$msg:example.org",
-        );
-        assert!(matches!(
-            validate_references(&msg, &provider),
-            Err(ReferenceError::PrevStateNotStateEvent(_))
-        ));
-    }
-
-    // MSC4242 triad: prev_state_event belongs to a different room
-    #[test]
-    fn refs_prev_state_different_room_rejected() {
-        let mut provider = InMemoryStateProvider::new();
-        insert_event(&mut provider, make_create("$create:example.org"), false);
-        // A state event whose room_id is a different room.
-        insert_event(
-            &mut provider,
-            make_state_event("!other:example.org", "$other-state:example.org"),
-            false,
-        );
-        let msg = make_message(
-            "!create:example.org",
-            vec!["$other-state:example.org"],
-            "$msg:example.org",
-        );
-        assert!(matches!(
-            validate_references(&msg, &provider),
-            Err(ReferenceError::PrevStateDifferentRoom(_))
-        ));
-    }
-
-    #[test]
-    fn refs_multiple_prev_state_all_valid() {
-        let mut provider = InMemoryStateProvider::new();
-        insert_event(&mut provider, make_create("$create:example.org"), false);
-        insert_event(
-            &mut provider,
-            make_state_event("!create:example.org", "$state1:example.org"),
-            false,
-        );
-        insert_event(
-            &mut provider,
-            make_state_event("!create:example.org", "$state2:example.org"),
-            false,
-        );
-        let msg = make_message(
-            "!create:example.org",
-            vec!["$state1:example.org", "$state2:example.org"],
-            "$msg:example.org",
-        );
-        validate_references(&msg, &provider).expect("all references valid");
     }
 }

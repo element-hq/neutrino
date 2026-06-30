@@ -17,13 +17,18 @@ read PLAN.md at the start of every session before doing anything else.
 - Ruma for Matrix types
 - tracing + tracing-subscriber (logging)
 ## crate structure - keep big dependencies separate (namely UniFFI) to improve compile times and avoid rebuilds, etc.
-neutrino - local development binary
-neutrino-main - server entrypoint, common between neutrino and neutrino-ffi
-neutrino-http - top-level router, could potentially be split into c2s and s2s APIs in the future
-neutrino-store - storage trait
-neutrino-store-sqlite - SQLite implementation of storage trait
-neutrino-common - common type definitions
+Crates are organised by scope, narrowest first: `event` = everything event-scoped, `room` = everything single-room-scoped, `engine` = everything multi-room-scoped. `ctl` is the orthogonal server-wide control plane. The dependency stack is a clean gradient: ctl/event (base, no internal deps) → room → engine → http → main → ffi/neutrino.
+
+neutrino-ctl - server control plane: `Config` (+ `from_env`) and `Command` (host-pushed control). Zero dependencies; base sibling of neutrino-event.
+neutrino-event - everything event-scoped: the canonical `Event` PDU, content/reference hashing + event-id derivation, event→ruma views, wire-format parsing + provider-free semantic validation (`parse_event`/`validate_pdu`), the server-side `EventBuilder` + inbound `from_wire`, and `FormatError`. No internal deps. `ROOM_VERSION_ID` and the shared `now_ms()` clock util also live here.
+neutrino-room - everything single-room-scoped: v12 auth rules, state resolution (state-res), provider-backed reference validation (`validate_references`), `RoomCore` (per-room state machine), and the `StateProvider` read trait. Depends on neutrino-event.
+neutrino-engine - everything multi-room-scoped: the room runtime. `RoomRegistry` + per-room actor, inbound worker + outbound sender, anti-entropy reconcile + state-DAG gapfill, and the federation transport ports (`FederationTransport`, `MissingEventsFetcher`) so the engine never names reqwest.
+neutrino-store - storage trait (`StorageBackend` + the fine-grained per-area store traits, `WithStateProvider`).
+neutrino-store-sqlite - SQLite implementation of the storage traits (`SqliteStore`) + the SQLite-backed `StateProvider`.
+neutrino-http - top-level router + C-S and S-S handlers, could potentially be split into c2s and s2s APIs in the future (the `federation/` subtree is already a self-contained S-S unit).
+neutrino-main - server entrypoint, common between neutrino and neutrino-ffi; composes the stack and re-exports `Config`/`Command` from neutrino-ctl.
 neutrino-ffi - UniFFI binding layer, calls into neutrino-main and neutrino-lb
+neutrino - local development binary
 neutrino-lb - Low-bandwidth bidirectional proxy - translates server-to-server HTTP + JSON requests into CoAP + CBOR (CBOR could be done in HTTP layer?) - see MSC3079 https://github.com/matrix-org/matrix-spec-proposals/blob/kegan/low-bandwidth/proposals/3079-low-bandwidth-csapi.md 
 
 ## coding rules
@@ -212,7 +217,7 @@ signature change ripples through another, or when explicitly asked for a
 
 ## Parallelisation
 When a task fans out across independent crates / modules (e.g., updating
-test fixtures in each of `neutrino-state`, `neutrino-http`,
+test fixtures in each of `neutrino-room`, `neutrino-http`,
 `neutrino-store-sqlite`), run subagents in parallel — single message,
 multiple `Agent` tool calls. Sequential subagents on independent work
 costs ~3-4× wall-clock for no benefit.

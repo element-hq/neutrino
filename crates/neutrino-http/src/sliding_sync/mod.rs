@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use neutrino_common::event_view::StateEventConversionError;
+use neutrino_event::event_view::StateEventConversionError;
 use neutrino_store::{StorageBackend, StorageError};
 use ruma::OneTimeKeyAlgorithm;
 use ruma::UInt;

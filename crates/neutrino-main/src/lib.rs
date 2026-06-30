@@ -4,7 +4,7 @@ mod resolver;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-pub use neutrino_common::{Command, Config};
+pub use neutrino_ctl::{Command, Config};
 pub use neutrino_lb::DatagramLink;
 
 use std::future::Future;

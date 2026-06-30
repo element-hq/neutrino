@@ -138,8 +138,8 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use neutrino_common::Event;
-    use neutrino_common::event_id::compute_event_id;
+    use neutrino_event::Event;
+    use neutrino_event::event_id::compute_event_id;
     use neutrino_store::{InviteStore, Membership};
     use neutrino_store_sqlite::SqliteStore;
     use ruma::{RoomId, UserId, room_id, user_id};

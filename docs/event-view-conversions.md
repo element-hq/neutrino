@@ -5,7 +5,7 @@ Status: landed 2026-05-27 (branch `kaylendog/fix/sss-eventid`). The bits flagged
 
 ## Goal
 
-Conventional Rust `From` / `TryFrom` impls converting `neutrino_common::Event`
+Conventional Rust `From` / `TryFrom` impls converting `neutrino_event::Event`
 to ruma's client-facing `Raw<T>` shapes, so the CSAPI delivers events with the
 server-computed fields (`event_id`, and `room_id` on create events) that v12 /
 MSC4242 wire bytes deliberately omit.
@@ -34,8 +34,8 @@ which could never match.
 
 ## Module location
 
-Module: `crates/neutrino-common/src/event_view.rs`, declared from `lib.rs`.
-The `ruma` dep on `neutrino-common` gained the `events` feature so the
+Module: `crates/neutrino-event/src/event_view.rs`, declared from `lib.rs`.
+The `ruma` dep on `neutrino-event` gained the `events` feature so the
 `Raw<AnyXxx>` types are reachable directly (was implicitly enabled
 transitively via `neutrino-http`'s `client-api-s` feature).
 
@@ -56,7 +56,7 @@ Fallible — state-shaped targets require `Event.state_key.is_some()`:
 - `impl TryFrom<&Event> for Raw<AnyStrippedStateEvent>`
   — `invite_state` / `knock_state` (MSC1772 stripped form)
 
-All four are orphan-rule-legal because `Event` (local to `neutrino-common`)
+All four are orphan-rule-legal because `Event` (local to `neutrino-event`)
 appears as a type parameter to the trait — the local-type anchor the orphan
 rule requires.
 
@@ -147,7 +147,7 @@ federation peers verify the reference hash against the wire bytes.
 
 ## Tests
 
-Unit tests in `neutrino-common::event_view::tests` (13 total):
+Unit tests in `neutrino-event::event_view::tests` (13 total):
 
 - `from_event_for_sync_timeline_injects_event_id`
 - `from_event_for_sync_timeline_create_event_carries_room_id`
@@ -163,7 +163,7 @@ Unit tests in `neutrino-common::event_view::tests` (13 total):
 - `strip_state_event_drops_non_canonical_fields`
 - `strip_state_event_returns_empty_for_non_object_input`
 
-In `neutrino-state::event_id::tests`:
+In `neutrino-room::event_id::tests`:
 
 - `build_output_raw_lacks_event_id` — pins that `EventBuilder` never
   serialises `event_id` into `raw` for either create or non-create

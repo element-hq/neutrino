@@ -1,10 +1,13 @@
+//! Server control plane: configuration and out-of-band control commands.
+//!
+//! This is the broadest-scoped crate in the tree (whole-server lifecycle) and
+//! deliberately depends on nothing — it sits at the base alongside
+//! `neutrino-common` (event-scoped types) so every layer above can read the
+//! server's [`Config`] and accept host-pushed [`Command`]s without pulling in
+//! Matrix data types.
+
 use std::path::PathBuf;
 use std::time::Duration;
-
-pub mod event;
-pub mod event_id;
-pub mod event_view;
-pub use event::Event;
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8008";
 const DEFAULT_SERVER_NAME: &str = "localhost";
@@ -20,33 +23,6 @@ const DEFAULT_STARTUP_JITTER_MS: u64 = 30_000;
 /// permissions of (or scatter its DB sidecars across) a directory it doesn't
 /// own. The dev binary lands here; Android always overrides it over the FFI.
 const DEFAULT_STORAGE_DIR: &str = "./data";
-
-/// Wire identifier for the only room version this server speaks.
-///
-/// MSC4242 (State DAGs) is layered on top of Matrix room version 12. The MSC
-/// has not been merged into the spec yet, so the wire form is the unstable
-/// `org.matrix.msc4242.12`, not the bare `"12"` ruma uses for the merged v12.
-/// Stored verbatim in `rooms.room_version`, emitted in the `m.room.create`
-/// event's `content.room_version`, and validated against on every inbound
-/// create event.
-///
-/// We can't use `ruma::RoomVersionId::V12` for this — ruma doesn't model
-/// MSC4242, so `RoomVersionId::from_str(ROOM_VERSION_ID)` parses as
-/// `RoomVersionId::Custom("org.matrix.msc4242.12")`. Compare against this
-/// string directly instead.
-pub const ROOM_VERSION_ID: &str = "org.matrix.msc4242.12";
-
-/// Milliseconds since the Unix epoch, for the federation transaction
-/// `origin_server_ts`. Saturates to 0 on a pre-epoch clock — never panics (no
-/// `unwrap` on `SystemTime`). Shared by the inbound `backfill` response, the
-/// outbound federation client, and the engine's transaction-id source.
-pub fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 #[derive(Debug, Clone)]
 pub struct Config {

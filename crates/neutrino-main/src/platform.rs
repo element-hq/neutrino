@@ -2,7 +2,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[cfg(not(target_os = "android"))]
 const DEFAULT_FILTER: &str =
-    "neutrino_common=info,neutrino_http=info,neutrino_main=info,neutrino_ffi=info";
+    "neutrino_event=info,neutrino_http=info,neutrino_main=info,neutrino_ffi=info";
 
 // Compact, Logcat-friendly event formatter, ported from matrix-rust-sdk's
 // `EventFormatter::for_logcat`. Logcat already records the timestamp and
@@ -113,7 +113,7 @@ pub fn init_tracing() {
             ));
 
         // Default (no RUST_LOG): every level from every `neutrino*` target — all of
-        // our crates (`neutrino_common`, `neutrino_ffi`, …) plus any custom `target:`
+        // our crates (`neutrino_event`, `neutrino_ffi`, …) plus any custom `target:`
         // — PLUS the federation transport stack we depend on. A raw string prefix is
         // the only way to express the `neutrino*` rule: EnvFilter/Targets match on
         // `::`-delimited path segments, so a `neutrino` directive would NOT match

@@ -19,9 +19,9 @@
 
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{OptionalExtension, params};
-use neutrino_common::Event;
-use neutrino_common::event_id::compute_event_id;
-use neutrino_state::validate::parse_event;
+use neutrino_event::Event;
+use neutrino_event::event_id::compute_event_id;
+use neutrino_event::validate::parse_event;
 use neutrino_store::{InviteStore, StorageError};
 use ruma::{OwnedRoomId, RoomId, UserId};
 use serde_json::value::RawValue as RawJsonValue;
@@ -121,8 +121,8 @@ impl InviteStore for SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use neutrino_common::Event;
-    use neutrino_common::event_id::compute_event_id;
+    use neutrino_event::Event;
+    use neutrino_event::event_id::compute_event_id;
     use neutrino_store::InviteStore;
     use ruma::{RoomId, UserId, room_id, user_id};
     use serde_json::value::RawValue;

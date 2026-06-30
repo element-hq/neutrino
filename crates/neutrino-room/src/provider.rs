@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use neutrino_common::Event;
+use neutrino_event::Event;
 use ruma::{EventId, OwnedEventId};
 
 use crate::StateResError;

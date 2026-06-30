@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use neutrino_common::ROOM_VERSION_ID;
-use neutrino_common::event_id::compute_event_id;
+use neutrino_event::ROOM_VERSION_ID;
+use neutrino_event::event_id::compute_event_id;
 use neutrino_store::{Event, EventStore, InviteStore, RoomStore};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5::{Request, request};

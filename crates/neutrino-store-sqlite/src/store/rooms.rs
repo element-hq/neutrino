@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{OptionalExtension, params};
-use neutrino_common::ROOM_VERSION_ID;
+use neutrino_event::ROOM_VERSION_ID;
 use neutrino_store::{Event, RoomStore, StorageError};
 use ruma::{OwnedEventId, RoomId, RoomVersionId};
 use serde_json::Value;
@@ -249,7 +249,7 @@ mod tests {
     use std::str::FromStr;
 
     use deadpool_sqlite::rusqlite::params;
-    use neutrino_common::ROOM_VERSION_ID;
+    use neutrino_event::ROOM_VERSION_ID;
     use neutrino_store::{EventStore, RoomStore, StorageError, StreamPos};
     use ruma::{RoomVersionId, event_id, room_id};
     use serde_json::json;

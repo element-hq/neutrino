@@ -27,7 +27,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use neutrino_common::ROOM_VERSION_ID;
+use neutrino_event::ROOM_VERSION_ID;
 use neutrino_store::InviteStore;
 use ruma::{OwnedUserId, RoomId, ServerName, UserId};
 use serde_json::json;
@@ -44,7 +44,7 @@ pub(crate) async fn reject_invite(
     state: &AppState,
     user: OwnedUserId,
     room_id: &RoomId,
-    invite: neutrino_common::Event,
+    invite: neutrino_event::Event,
 ) -> Response {
     let (store, own_server, federation_proxy) = {
         let app = lock_app(state);
@@ -116,7 +116,7 @@ async fn try_federated_leave(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neutrino_state::event_id::EventBuilder;
+    use neutrino_event::event_builder::EventBuilder;
     use serde_json::Value;
 
     /// CVE regression: a hostile make_leave template (wrong type, attacker
@@ -135,7 +135,7 @@ mod tests {
         // server would hand back something valid-on-the-wire).
         let foreign_room = EventBuilder::new(attacker.clone(), "m.room.create".to_owned())
             .state_key(String::new())
-            .content(json!({ "room_version": neutrino_common::ROOM_VERSION_ID }))
+            .content(json!({ "room_version": neutrino_event::ROOM_VERSION_ID }))
             .build()
             .unwrap();
         let foreign_room_id = foreign_room.room_id.clone();
