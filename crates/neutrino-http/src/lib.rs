@@ -12,7 +12,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post, put},
 };
-use neutrino_ctl::{Command, Config};
+use neutrino_ctl::{Command, Config, DiscoveryRegistry};
 use neutrino_event::event_builder::EventBuilder;
 use neutrino_event::{Event, FormatError, ROOM_VERSION_ID};
 use neutrino_room::CoreError;
@@ -68,6 +68,11 @@ struct App {
     fetcher: Arc<dyn MissingEventsFetcher>,
     sync_state: Arc<SyncState<SqliteStore>>,
     keys: Option<Value>,
+    /// Out-of-band peer discovery (BLE mesh): the host pushes the set of
+    /// currently-visible peers here and the user-directory search handler reads
+    /// it. Shared (`Arc`) so the host can hold a write handle while the router
+    /// reads — see [`AppState::discovery`].
+    discovery: Arc<DiscoveryRegistry>,
     config: Config,
     /// Latching cancellation signal shared with long-polls and the outbound
     /// federation sender. Fired once by [`AppState::begin_shutdown`]; after
@@ -238,6 +243,7 @@ impl AppState {
             fetcher,
             sync_state,
             keys: None,
+            discovery: Arc::new(DiscoveryRegistry::new()),
             config,
             shutdown,
             kick_backoff,
@@ -256,6 +262,13 @@ impl AppState {
     /// This homeserver's name, sent as the `origin` on outbound transactions.
     fn server_name(&self) -> String {
         lock_app(self).config.server_name.clone()
+    }
+
+    /// The shared out-of-band discovery registry. The host writes the visible
+    /// peer set through this handle (via the FFI); the user-directory search
+    /// handler reads it.
+    pub fn discovery(&self) -> Arc<DiscoveryRegistry> {
+        lock_app(self).discovery.clone()
     }
 
     /// The shared `get_missing_events` fetcher, for the outbound sender pool's
@@ -460,6 +473,10 @@ fn build_router(state: &AppState) -> Router {
             post(signatures_upload),
         )
         .route("/_matrix/client/v3/profile/{user_id}", get(profile))
+        .route(
+            "/_matrix/client/v3/user_directory/search",
+            post(user_directory_search),
+        )
         .route(
             "/_matrix/client/v3/user/{user_id}/account_data/{account_data_type}",
             get(get_account_data),
@@ -1015,6 +1032,46 @@ async fn profile(axum::extract::Path(_user_id): axum::extract::Path<String>) -> 
     }))
 }
 
+/// Default result cap when the client omits `limit`
+/// (https://spec.matrix.org/v1.18/client-server-api/#post_matrixclientv3user_directorysearch).
+fn default_search_limit() -> usize {
+    10
+}
+
+#[derive(serde::Deserialize)]
+struct SearchRequest {
+    search_term: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+/// `POST /_matrix/client/v3/user_directory/search`.
+///
+/// The embedded server has no Matrix-level user directory: it answers from the
+/// out-of-band [`DiscoveryRegistry`] (peers seen over the BLE mesh). Each peer's
+/// user id is rebuilt as `@{localpart}:{server_name}` from its stored fields; a
+/// peer whose advertised data doesn't form a syntactically valid id is skipped
+/// rather than failing the whole search.
+async fn user_directory_search(
+    state: State<AppState>,
+    Json(req): Json<SearchRequest>,
+) -> Json<Value> {
+    let mut matches = state.discovery().search(&req.search_term);
+    // The spec caps the list at `limit` and flags whether that truncated it.
+    let limited = matches.len() > req.limit;
+    matches.truncate(req.limit);
+    let results: Vec<Value> = matches
+        .into_iter()
+        .filter_map(|(server_name, peer)| {
+            let user_id: OwnedUserId = format!("@{}:{}", peer.localpart, server_name)
+                .parse()
+                .ok()?;
+            Some(json!({ "user_id": user_id, "display_name": peer.display_name }))
+        })
+        .collect();
+    Json(json!({ "results": results, "limited": limited }))
+}
+
 async fn get_account_data(
     axum::extract::Path((_user_id, _account_data_type)): axum::extract::Path<(String, String)>,
 ) -> (StatusCode, Json<Value>) {
@@ -1555,6 +1612,69 @@ mod tests {
             matches!(err, super::StartupError::InvalidFederationProxy(_)),
             "got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn user_directory_search_matches_discovered_peers() {
+        use neutrino_ctl::DiscoveredPeer;
+
+        let (state, _tmp) = test_state().await;
+        let reg = state.discovery();
+        let mk = |dn: &str| DiscoveredPeer {
+            localpart: "n".to_string(),
+            display_name: dn.to_string(),
+            last_seen_ms: 0,
+        };
+        reg.upsert("nodealice".to_string(), mk("Alice"));
+        reg.upsert("nodebob".to_string(), mk("Bob"));
+
+        let body = super::user_directory_search(
+            axum::extract::State(state.clone()),
+            axum::Json(super::SearchRequest {
+                search_term: "ali".to_string(),
+                limit: 10,
+            }),
+        )
+        .await
+        .0;
+
+        assert_eq!(body["limited"], serde_json::json!(false));
+        let results = body["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 1);
+        // user_id is rebuilt from the peer's localpart + server_name (the key).
+        assert_eq!(results[0]["user_id"], serde_json::json!("@n:nodealice"));
+        assert_eq!(results[0]["display_name"], serde_json::json!("Alice"));
+    }
+
+    #[tokio::test]
+    async fn user_directory_search_honours_limit_and_flags_truncation() {
+        use neutrino_ctl::DiscoveredPeer;
+
+        let (state, _tmp) = test_state().await;
+        let reg = state.discovery();
+        for i in 0..3 {
+            reg.upsert(
+                format!("node{i}"),
+                DiscoveredPeer {
+                    localpart: "n".to_string(),
+                    display_name: format!("Peer {i}"),
+                    last_seen_ms: 0,
+                },
+            );
+        }
+
+        let body = super::user_directory_search(
+            axum::extract::State(state.clone()),
+            axum::Json(super::SearchRequest {
+                search_term: "peer".to_string(),
+                limit: 2,
+            }),
+        )
+        .await
+        .0;
+
+        assert_eq!(body["limited"], serde_json::json!(true));
+        assert_eq!(body["results"].as_array().expect("results").len(), 2);
     }
 
     #[tokio::test]

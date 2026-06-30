@@ -6,6 +6,9 @@
 //! server's [`Config`] and accept host-pushed [`Command`]s without pulling in
 //! Matrix data types.
 
+mod discovery;
+pub use discovery::{DiscoveredPeer, DiscoveryRegistry};
+
 use std::path::PathBuf;
 use std::time::Duration;
 

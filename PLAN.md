@@ -178,6 +178,42 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### user discovery over BLE — registry + directory search (2026-06-30)
+- The embedded server has no Matrix user directory; peers are learned out of
+  band over the BLE mesh. Each device advertises its display name + node id
+  (manufacturer data, company id `0xDFFF`); a search of the invite box answers
+  from the discovered set.
+- `DiscoveryRegistry` lives in `neutrino-ctl` (server-wide host-pushed state, the
+  read-queried sibling of `Command` — `Command` flows through the mpsc and is
+  *consumed*, this is *queried*, so it's a shared `Arc<DiscoveryRegistry>` read
+  directly by the handler, not the command channel). Keyed by `server_name`
+  (== node id; stored as a plain `String`, NOT iroh's `NodeId`, so ctl gains no
+  iroh coupling — it's the same identifier federation already keys on).
+- Registry stays **localpart-agnostic**: `DiscoveredPeer` carries `localpart`
+  verbatim and the registry never builds a user id. The embedded host (ffi,
+  iroh-aware) supplies the fixed constant `n`, but that's the host's choice — a
+  future multi-user host needs no registry change.
+- Write model is **snapshot replacement** (`replace`, one call per scan): a peer
+  out of range simply stops appearing, no removal bookkeeping. `upsert` kept for
+  incremental callers. `search` is case-insensitive substring on display name,
+  sorted `(display_name, server_name)` for determinism; the handler applies the
+  `limit` cap + `limited` flag.
+- `POST /_matrix/client/v3/user_directory/search` rebuilds `@{localpart}:{server_name}`
+  per hit and skips any peer whose advertised fields don't parse to a valid id
+  (defensive, not fatal). Hand-rolled request/response JSON (matching the spec
+  wire shape) + ruma `OwnedUserId` for id validation — avoids enabling a new ruma
+  feature, consistent with the `members`/`profile` handlers.
+- **Done so far:** registry (-ctl) + endpoint + `AppState::discovery()` wiring +
+  tests. **Outstanding:** (1) FFI `set_discovered_peers` snapshot handoff —
+  surface the `Arc<DiscoveryRegistry>` from `serve`/`entrypoint` onto
+  `NeutrinoHandle`, add `display_name` to `NeutrinoConfig` (also de-stubs
+  `/profile`); (2) Android — fork `blew` to extended advertising
+  (`startAdvertisingSet`, `setLegacyMode(false)`; the 32 B node id + ≤20 B name
+  overflow the 31 B legacy cap) + manufacturer data `0xDFFF` =
+  `[version][node_id:32][display_name]`, and switch the scanner to
+  `setLegacy(false)` + surface `getManufacturerSpecificData(0xDFFF)` up to a new
+  discovery callback that calls `set_discovered_peers`.
+
 ### room runtime moved into `neutrino-engine` (2026-06-30)
 - Phase 2 of the extraction: `room_actor` (RoomActor/RoomRegistry), `sender`,
   `worker`, `reconcile`, `gapfill` physically moved from `neutrino-http` into
