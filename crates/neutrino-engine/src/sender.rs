@@ -2,7 +2,7 @@
 //!
 //! Drains the durable `outbox` (populated atomically with each accepted event
 //! — see `EventStore::persist_resolved_event`) and PUTs transactions to peers
-//! via [`FederationClient`]. This is where the "events MUST eventually be sent
+//! via `neutrino-http`'s `FederationClient`. This is where the "events MUST eventually be sent
 //! / never lost / retry on restart" clause of the Server-Server `/send` task
 //! lives.
 //!
@@ -14,7 +14,7 @@
 //!   the destination drains empty it blocks on a [`watch::Receiver<StreamPos>`]
 //!   clone (advanced by every persist) and re-drains on the next wake-up.
 //! - **A supervisor task** owns the discovery side: on startup and on every
-//!   watch advance it enumerates [`FederationOutbox::pending_destinations`] and
+//!   watch advance it enumerates [`neutrino_store::FederationOutbox::pending_destinations`] and
 //!   spawns a task for any destination not already running. Idle destination
 //!   tasks stay alive (bounded by the size of the mesh) rather than being
 //!   reaped and respawned.
@@ -29,7 +29,7 @@
 //!   the restart burst. Destinations discovered *later* (a live send to a new
 //!   peer) drain immediately — no added latency on the common path.
 //! - **A global send semaphore.** At most `NEUTRINO_OUTBOUND_CONCURRENCY` (default
-//!   [`DEFAULT_OUTBOUND_CONCURRENCY`], min 1) transactions are in flight across
+//!   `DEFAULT_OUTBOUND_CONCURRENCY`, min 1) transactions are in flight across
 //!   all destinations at once. A backing-off destination holds no permit, so it
 //!   never starves a healthy one.
 //!
@@ -40,8 +40,8 @@
 //!   an individual PDU). Retrying won't help, so the batch is dropped from the
 //!   outbox and we move on.
 //! - **5xx / transport / unreachable** = transient. Retry the same batch after
-//!   an exponential backoff (full jitter, doubling [`BACKOFF_BASE`] → capped at
-//!   [`BACKOFF_CAP`]); never remove until a 2xx. Backoff state is in-memory
+//!   an exponential backoff (full jitter, doubling `BACKOFF_BASE` → capped at
+//!   `BACKOFF_CAP`); never remove until a 2xx. Backoff state is in-memory
 //!   only, so a restart re-enumerates and retries within the startup jitter
 //!   window — restarting the app is a way to "kick" a stuck destination.
 
@@ -59,9 +59,11 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use neutrino_common::now_ms;
+
 use crate::ports::{FederationTransport, ForwardExtremities, MissingEventsFetcher, TransportError};
 use crate::reconcile;
-use crate::util::{BACKOFF_BASE, MAX_PDUS_PER_TXN, TxnIdGen, jitter, next_backoff, now_ms};
+use crate::util::{BACKOFF_BASE, MAX_PDUS_PER_TXN, TxnIdGen, jitter, next_backoff};
 
 /// Shared, cheaply-cloneable handles every sender task needs. Bundled so the
 /// per-destination signatures stay readable as the pool grows (mirrors
@@ -100,34 +102,10 @@ impl<S> Clone for SenderCtx<S> {
 ///
 /// Subscribes to the persist watch *before* the first enumeration so a
 /// destination added concurrently with startup can't be missed (the watch will
-/// have advanced, waking the supervisor's first `changed()`).
+/// have advanced, waking the supervisor's first `changed()`). Tests pass a zero
+/// `startup_jitter_max` to run the full supervisor → task path without the wait.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn<S: StorageBackend + 'static>(
-    store: Arc<S>,
-    transport: Arc<dyn FederationTransport>,
-    concurrency: usize,
-    startup_jitter: Duration,
-    shutdown: CancellationToken,
-    kick_rx: watch::Receiver<()>,
-    fetcher: Arc<dyn MissingEventsFetcher>,
-    worker_poke: mpsc::Sender<OwnedRoomId>,
-) -> JoinHandle<()> {
-    spawn_with(
-        store,
-        transport,
-        concurrency,
-        startup_jitter,
-        shutdown,
-        kick_rx,
-        fetcher,
-        worker_poke,
-    )
-}
-
-/// Inner spawn with the flood-control bounds made explicit, so tests can run
-/// the full supervisor → task path with zero startup jitter.
-#[allow(clippy::too_many_arguments)]
-fn spawn_with<S: StorageBackend + 'static>(
     store: Arc<S>,
     transport: Arc<dyn FederationTransport>,
     concurrency: usize,
@@ -568,7 +546,7 @@ fn spawn_reconcile<S: StorageBackend + 'static>(
 }
 
 /// Sleep for a full-jittered interval in `[0, *backoff]`, then advance the
-/// backoff ceiling toward [`BACKOFF_CAP`](crate::federation::BACKOFF_CAP).
+/// backoff ceiling toward [`BACKOFF_CAP`](crate::util::BACKOFF_CAP).
 ///
 /// Returns `true` if a `KickBackoff` (`kick_rx` advanced — the host signalled
 /// connectivity restored) interrupts the wait: the caller resets `*backoff` to
@@ -852,7 +830,7 @@ mod tests {
         let dest = peer();
         let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 3).await;
 
-        drop(spawn_with(
+        drop(spawn(
             store.clone(),
             stub.clone(),
             2,
@@ -888,7 +866,7 @@ mod tests {
         let dest = peer();
         let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 1).await;
 
-        drop(spawn_with(
+        drop(spawn(
             store.clone(),
             stub.clone(),
             2,
@@ -920,7 +898,7 @@ mod tests {
         let dest = peer();
         let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 1).await;
 
-        drop(spawn_with(
+        drop(spawn(
             store.clone(),
             stub.clone(),
             2,
@@ -943,7 +921,7 @@ mod tests {
         let dest = peer();
         let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 60).await;
 
-        drop(spawn_with(
+        drop(spawn(
             store.clone(),
             stub.clone(),
             2,
@@ -985,7 +963,7 @@ mod tests {
             .unwrap();
         store.persist_event(&ev, &[&dead]).await.unwrap();
 
-        drop(spawn_with(
+        drop(spawn(
             store.clone(),
             stub.clone(),
             2,
@@ -1016,7 +994,7 @@ mod tests {
         // n=0: a real room exists but the outbox starts empty.
         let (store, _tmp, room_id, _ids) = store_with_outbox(&dest, 0).await;
 
-        drop(spawn_with(
+        drop(spawn(
             store.clone(),
             stub.clone(),
             2,
@@ -1058,7 +1036,7 @@ mod tests {
         let (store, _tmp, room, _ids) = store_with_outbox(&dest, 0).await;
         enqueue_advertisement(&store, &room, &dest).await;
 
-        drop(spawn_with(
+        drop(spawn(
             store.clone(),
             stub.clone(),
             2,
@@ -1094,7 +1072,7 @@ mod tests {
         let (store, _tmp, room, _ids) = store_with_outbox(&dest, 1).await;
         enqueue_advertisement(&store, &room, &dest).await;
 
-        drop(spawn_with(
+        drop(spawn(
             store.clone(),
             stub.clone(),
             2,
@@ -1273,7 +1251,7 @@ mod tests {
         let (store, _tmp, _room, _ids) = store_with_outbox(&dead, 1).await;
         let shutdown = CancellationToken::new();
 
-        let supervisor = spawn_with(
+        let supervisor = spawn(
             store.clone(),
             stub.clone(),
             2,
@@ -1308,7 +1286,7 @@ mod tests {
         let dest = peer();
         let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 1).await;
 
-        drop(spawn_with(
+        drop(spawn(
             store.clone(),
             stub.clone(),
             2,

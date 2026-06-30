@@ -37,18 +37,6 @@ pub(crate) fn jitter(ceiling: Duration) -> Duration {
     Duration::from_millis(rand::rng().random_range(0..=max_ms))
 }
 
-/// Milliseconds since the Unix epoch, for the federation transaction
-/// `origin_server_ts`. Saturates to 0 on a pre-epoch clock — never panics (no
-/// `unwrap` on `SystemTime`). Shared by the inbound `backfill` response and the
-/// outbound `client`.
-pub fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// Monotonic transaction-id source: `{startup_prefix}-{counter}`. The prefix
 /// (a process-startup timestamp, supplied by the caller) keeps ids unique
 /// across restarts; the counter keeps them unique within a run. Receivers

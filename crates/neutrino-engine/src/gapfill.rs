@@ -10,7 +10,7 @@
 //! is parked in a pre-auth staging cache rather than persisted as history.
 //!
 //! This module owns the *fetch-into-staging* half ([`fill_state_ancestry`]).
-//! The *apply* half is the inbound worker's drain loop ([`crate::federation::worker`]):
+//! The *apply* half is the inbound worker's drain loop ([`crate::worker`]):
 //! once the gap is staged, the worker re-reads the room's staged rows,
 //! toposorts them, and applies each through the per-room actor — staged
 //! ancestry and freshly-received PDUs flow through the *same* loop, so there is

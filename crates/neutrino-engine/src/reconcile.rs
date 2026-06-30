@@ -11,8 +11,8 @@
 //! it into the pre-auth cache, and poke the inbound worker to auth + apply it.
 //!
 //! No new apply path: staging + the worker drain are exactly the inbound `/send`
-//! pipeline (`crate::federation::send` / `crate::federation::worker`), and the
-//! state-DAG gap-fill (`crate::federation::gapfill`) grounds anything deeper than
+//! pipeline (the inbound `/send` handler / [`crate::worker`]), and the
+//! state-DAG gap-fill (`gapfill`) grounds anything deeper than
 //! one fetch. Reconciliation only ever *adds work to that pipeline*; it grants no
 //! trust — a fetched event is auth-checked and state-resolved like any other PDU.
 

@@ -1,7 +1,7 @@
 //! CSAPI membership-change endpoints (testing scope). Each handler emits one
 //! `m.room.member` state event through the room actor; authorisation (v12
 //! rule 5), state resolution, and persistence all happen inside
-//! [`crate::room_actor::RoomRegistry::send_event`] unchanged. See
+//! [`neutrino_engine::RoomRegistry::send_event`] unchanged. See
 //! `docs/superpowers/specs/2026-06-02-membership-endpoints-design.md`.
 
 use axum::{

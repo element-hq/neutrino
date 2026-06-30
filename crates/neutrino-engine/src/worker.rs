@@ -1,13 +1,13 @@
 //! The inbound staging worker: drains pre-auth staged PDUs into the per-room
 //! actor, off the HTTP request path.
 //!
-//! The inbound `/send` handler ([`crate::federation::send`]) durably *stages*
+//! The inbound `/send` handler (in `neutrino-http`) durably *stages*
 //! each received PDU and returns 200 immediately. This worker does the actual
 //! integration asynchronously, so a slow auth / gap-fill round-trip can't block
 //! the response and a PDU is never lost (presence in `staged_events` = pending;
 //! it is unstaged only once durably applied).
 //!
-//! ## Shape (mirrors the outbound [`sender`](crate::federation::sender) pool)
+//! ## Shape (mirrors the outbound [`sender`](crate::sender) pool)
 //!
 //! - **One task per room.** A room's PDUs are integrated serially through the
 //!   per-room actor, so there is never overlapping work (or duplicate gap-fill
@@ -15,7 +15,7 @@
 //!   per-room [`Notify`] until poked again (it never exits on its own — the
 //!   set of rooms is bounded by the rooms we are in).
 //! - **A supervisor task** owns discovery. On startup it enumerates
-//!   [`StagingStore::staged_rooms`] (restart recovery — staged rows survive a
+//!   [`neutrino_store::StagingStore::staged_rooms`] (restart recovery — staged rows survive a
 //!   crash) and spawns a task per room. Then it serves an in-process **poke**
 //!   channel: the `/send` handler sends the room id of each freshly-staged PDU,
 //!   and the supervisor either spawns that room's task or wakes the running one.
@@ -34,7 +34,7 @@
 //! - **Ok** (accepted / soft-failed / rejected — federation persists rejects):
 //!   unstage it.
 //! - **Retryable** (missing `prev_state_events` ancestry): fetch the gap into
-//!   staging ([`fill_state_ancestry`]) — those fetched rows are the *same kind*
+//!   staging (`fill_state_ancestry`) — those fetched rows are the *same kind*
 //!   of staged row, so the next drain pass toposorts and applies them ahead of
 //!   this PDU. There is no separate "promote" step. On an unfillable gap / peer
 //!   failure, back the PDU off.
@@ -47,7 +47,7 @@
 //! In-memory, per staged event (a wedged PDU is *skipped* during its backoff
 //! window, never dequeued, so it doesn't block eligible siblings or fresh
 //! arrivals). Full-jitter exponential, shared with the outbound sender
-//! ([`crate::federation::BACKOFF_BASE`] → [`crate::federation::BACKOFF_CAP`]).
+//! (`BACKOFF_BASE` → `BACKOFF_CAP`).
 //! It never permanently gives up (never-lose); a restart clears the map and
 //! re-drains (the "kick it by restarting" path).
 

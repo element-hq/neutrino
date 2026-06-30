@@ -12,7 +12,7 @@
 //! The handler does **not** integrate PDUs synchronously. It durably **stages**
 //! each parsed PDU into the pre-auth `staged_events` table (keyed by the
 //! event_id it just computed) and returns 200 immediately. The background
-//! worker ([`crate::federation::worker`]) toposorts, auth-checks, gap-fills, and
+//! worker ([`neutrino_engine::worker`]) toposorts, auth-checks, gap-fills, and
 //! persists each room's staged PDUs off the request path. This keeps the
 //! response off the auth + peer-backfill round-trips, and means a PDU is
 //! durably accepted before it is acknowledged — `RoomCore`'s persisted-check
