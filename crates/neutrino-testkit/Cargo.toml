@@ -12,6 +12,12 @@ edition = "2024"
 axum = "0.8.7"
 libc = "0.2.186"
 reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
+# reqwest is on a no-provider rustls backend (iroh, via workspace feature
+# unification), so a crypto provider must be installed before building a client
+# (see `install_crypto_provider`). Already in the lock graph; ring matches ffi.
+# Kept self-contained: this harness deliberately depends on no other neutrino
+# crate, so it installs the provider itself rather than reusing neutrino-lb's.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde_json.workspace = true
 tempfile = "3.27.0"
 tokio.workspace = true

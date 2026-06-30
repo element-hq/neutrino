@@ -121,6 +121,7 @@ async fn message_converges_through_coap_sidecars() {
     // Let both sidecars bind their UDP listeners and the servers come up.
     tokio::time::sleep(Duration::from_millis(250)).await;
 
+    neutrino_lb::install_crypto_provider();
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
 
     // 1. A creates a public room (so B can join by server-name hint, no invite).

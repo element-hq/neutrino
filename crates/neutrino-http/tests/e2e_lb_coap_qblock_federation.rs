@@ -103,6 +103,7 @@ async fn message_converges_through_qblock_sidecars() {
 
     tokio::time::sleep(Duration::from_millis(250)).await;
 
+    neutrino_lb::install_crypto_provider();
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
 
     // 1. A creates a public room.

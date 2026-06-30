@@ -117,6 +117,7 @@ async fn message_converges_through_lb_sidecars() {
     // A plain client (no ambient proxy) talking directly to each homeserver's
     // loopback CSAPI. The federation hop between the servers is what goes
     // through the sidecars; these CSAPI calls do not.
+    neutrino_lb::install_crypto_provider();
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
 
     // 1. A creates a public room (so B can join by server-name hint, no invite).

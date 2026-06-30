@@ -95,6 +95,7 @@ async fn json_request_survives_egress_ingress_roundtrip() {
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
     // 4. Act as neutrino-http: send through the egress proxy to `ingress_addr`.
+    neutrino_lb::install_crypto_provider();
     let http = reqwest::Client::builder()
         .proxy(reqwest::Proxy::all(format!("http://{egress_addr}")).unwrap())
         .build()

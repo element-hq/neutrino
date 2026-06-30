@@ -195,6 +195,7 @@ mod tests {
 
         // Drive the egress as a forward proxy: reqwest in proxy mode emits an
         // absolute-form request to `http://peer.example/...`.
+        crate::install_crypto_provider();
         let http = reqwest::Client::builder()
             .proxy(reqwest::Proxy::all(format!("http://{addr}")).unwrap())
             .build()
@@ -257,6 +258,7 @@ mod tests {
             tokio::spawn(async move { serve(addr, client_dyn, resolver, server_token).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+        crate::install_crypto_provider();
         let http = reqwest::Client::builder()
             .proxy(reqwest::Proxy::all(format!("http://{addr}")).unwrap())
             .build()
@@ -317,6 +319,7 @@ mod tests {
 
         // Direct (origin-form) request, NOT proxy mode: the request target has
         // no authority, so the egress is being used as an origin server.
+        crate::install_crypto_provider();
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
         let resp = http
             .get(format!("http://{addr}/_matrix/federation/v1/send/1"))
@@ -353,6 +356,7 @@ mod tests {
             tokio::spawn(async move { serve(addr, client_dyn, direct(), server_token).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+        crate::install_crypto_provider();
         let http = reqwest::Client::builder()
             .proxy(reqwest::Proxy::all(format!("http://{addr}")).unwrap())
             .build()
@@ -390,6 +394,7 @@ mod tests {
             tokio::spawn(async move { serve(addr, client_dyn, direct(), server_token).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+        crate::install_crypto_provider();
         let http = reqwest::Client::builder()
             .proxy(reqwest::Proxy::all(format!("http://{addr}")).unwrap())
             .build()

@@ -25,6 +25,23 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Total request timeout for the proxy's outbound HTTP hops.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Install rustls' ring crypto provider as the process default, once.
+///
+/// `iroh` (in the ffi build) unifies reqwest's TLS backend onto rustls with NO
+/// default crypto provider, and `cargo test --workspace` feature-unifies that
+/// onto every crate's reqwest — so any process that builds a `reqwest::Client`
+/// panics at build time ("No rustls crypto provider is configured") unless a
+/// provider is installed first. Every reqwest-client constructor on the
+/// federation path calls this; `neutrino-ffi::start` installs the same provider.
+/// Idempotent: `install_default` returns `Err` if one is already set (we ignore
+/// it), and the `Once` keeps repeat calls from every construction site cheap.
+pub fn install_crypto_provider() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// RFC 9177 §6.2 NON-mode Q-Block timing knobs, exposed on `LbConfig` without
 /// leaking coap-rs's `QBlockConfig`, whose extra CON-mode fields (`probing_rate`,
 /// `nstart`, `non_probing_wait`) are unread on the NON path. Mapped to coap-rs at

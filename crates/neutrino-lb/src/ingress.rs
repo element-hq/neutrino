@@ -38,6 +38,7 @@ impl IngressHandler {
     fn with_timeouts(upstream: String, connect: Duration, request: Duration) -> Self {
         // Bound the loopback hop to `neutrino-http`: a hung upstream must not
         // pin this wire-handler task (and its buffers) indefinitely.
+        crate::install_crypto_provider();
         let http = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(connect)
