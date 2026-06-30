@@ -70,7 +70,13 @@ async fn start_node(localpart: &str) -> Node {
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        let _ = neutrino_http::serve(http_listener, config, cmd_rx).await;
+        let store = std::sync::Arc::new(
+            neutrino_store_sqlite::SqliteStore::open_in_dir(&config.storage_dir)
+                .await
+                .unwrap(),
+        );
+
+        let _ = neutrino_http::serve(http_listener, config, store, cmd_rx).await;
     });
 
     let shutdown = CancellationToken::new();
@@ -90,6 +96,8 @@ async fn start_node(localpart: &str) -> Node {
             block1_size: Some(128),
             max_message_size: Some(512),
         },
+        resolver: None,
+        link: None,
     };
     let lb_shutdown = shutdown.clone();
     tokio::spawn(async move {
@@ -113,6 +121,7 @@ async fn message_converges_through_coap_sidecars() {
     // Let both sidecars bind their UDP listeners and the servers come up.
     tokio::time::sleep(Duration::from_millis(250)).await;
 
+    neutrino_lb::install_crypto_provider();
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
 
     // 1. A creates a public room (so B can join by server-name hint, no invite).

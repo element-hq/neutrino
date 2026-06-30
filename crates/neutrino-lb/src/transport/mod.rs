@@ -74,3 +74,51 @@ pub trait WireServer: Send + Sync {
         shutdown: CancellationToken,
     ) -> Result<(), WireError>;
 }
+
+/// Maps a destination `server_name` (the request authority) to the address the
+/// wire client should actually dial. The default ([`DirectResolver`]) is
+/// identity — dial the authority verbatim, as on a direct-LAN network. The
+/// embedded datagram build injects a resolver that maps a peer's `server_name`
+/// to its bare 64-char hex node id (what the datagram egress dials by), keeping
+/// that mapping out of the transport itself — the wire client still just dials
+/// whatever `dest` it is handed.
+///
+/// `resolve` is a **pure** mapping with no side effects: it just rewrites the
+/// authority, nothing more.
+pub trait DestinationResolver: Send + Sync {
+    /// Map a destination authority (`host` or `host:port`) to the address to
+    /// dial. Takes ownership so the identity case can hand the string straight
+    /// back without re-allocating.
+    fn resolve(&self, authority: String) -> String;
+}
+
+/// Identity [`DestinationResolver`]: dial the authority unchanged. Used whenever
+/// no tunnel resolver is configured (desktop / direct-LAN federation).
+#[derive(Debug, Default, Clone)]
+pub struct DirectResolver;
+
+impl DestinationResolver for DirectResolver {
+    fn resolve(&self, authority: String) -> String {
+        authority
+    }
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::*;
+
+    #[test]
+    fn direct_resolver_is_identity() {
+        let r = DirectResolver;
+        assert_eq!(r.resolve("peer.example".to_owned()), "peer.example");
+        assert_eq!(
+            r.resolve("peer.example:8448".to_owned()),
+            "peer.example:8448"
+        );
+        // IPv6 bracket form must round-trip untouched.
+        assert_eq!(
+            r.resolve("[2001:db8::1]:8448".to_owned()),
+            "[2001:db8::1]:8448"
+        );
+    }
+}

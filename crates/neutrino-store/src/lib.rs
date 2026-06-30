@@ -613,6 +613,24 @@ pub trait InviteStore: Send + Sync {
     async fn invited_oob_rooms(&self, user_id: &UserId) -> Result<Vec<OwnedRoomId>, StorageError>;
 }
 
+/// The server's persistent node identity: a single opaque 32-byte secret. The
+/// server derives its stable identity from this secret (and, when unconfigured,
+/// its federation `server_name`), so it must survive restarts — see the
+/// `node_identity` table in the SQLite schema.
+#[async_trait]
+pub trait IdentityStore: Send + Sync {
+    /// Pre:  `fresh_seed` is 32 cryptographically-random bytes from the caller.
+    ///       The store does not generate keys itself (SQLite's `randomblob` is
+    ///       not a guaranteed CSPRNG), so generation lives caller-side.
+    /// Post: stores `fresh_seed` as the node secret on the first call and
+    ///       returns it; on every later call (and after a restart) returns the
+    ///       already-persisted secret, ignoring `fresh_seed` — first write wins.
+    async fn get_or_create_node_secret(
+        &self,
+        fresh_seed: [u8; 32],
+    ) -> Result<[u8; 32], StorageError>;
+}
+
 /// Combined storage interface. Use as a generic bound: `S: StorageBackend`.
 pub trait StorageBackend:
     RoomStore
@@ -623,6 +641,7 @@ pub trait StorageBackend:
     + FederationInbox
     + StagingStore
     + InviteStore
+    + IdentityStore
 {
 }
 
@@ -635,5 +654,6 @@ impl<T> StorageBackend for T where
         + FederationInbox
         + StagingStore
         + InviteStore
+        + IdentityStore
 {
 }

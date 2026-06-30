@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Copyright (c) 2026 Element Creations Ltd.
+  SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial.
+
+  BLE permissions required by the bundled `blew` backend (iroh-over-BLE
+  federation). These merge into the consuming app's manifest; the runtime
+  permissions (SCAN/CONNECT/ADVERTISE) must still be requested by the app.
+  Mirrors blew-0.2.3/android/src/main/AndroidManifest.xml.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- BLE scanning/connecting (Android 12+). `neverForLocation` lets scan
+         results be delivered without Location Services being enabled. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+
+    <!-- Pre-Android 12 fallbacks -->
+    <uses-permission android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="30" />
+
+    <uses-feature android:name="android.hardware.bluetooth_le"
+        android:required="true" />
+</manifest>

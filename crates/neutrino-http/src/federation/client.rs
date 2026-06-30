@@ -66,12 +66,31 @@ pub(crate) struct FederationClient {
     origin: String,
 }
 
+/// Install rustls' ring crypto provider as the process default, once.
+///
+/// reqwest's TLS backend is unified to rustls with NO default crypto provider
+/// (iroh, via `cargo test --workspace` feature unification), so building a
+/// `reqwest::Client` panics ("No rustls crypto provider is configured") unless a
+/// provider is installed first. `neutrino-lb` and `neutrino-ffi` install the same
+/// one; this lib carries its own since neutrino-lb is only a dev-dependency here.
+/// Idempotent (`install_default` is a no-op if one is already set); the `Once`
+/// keeps repeat calls from every `FederationClient::new` cheap.
+fn install_crypto_provider() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 impl FederationClient {
     pub(crate) fn new(origin: String, proxy: Option<&str>) -> Self {
         // Trusted mesh resolves peers to raw IP:port. Without a proxy we bypass
         // any ambient HTTP proxy (which would otherwise intercept `http://{ip}`
         // traffic). With one (the `neutrino-lb` egress) we route all outbound
         // federation through it so it can transcode bodies to CBOR.
+        // reqwest is on a no-provider rustls backend (iroh, via workspace feature
+        // unification); install the crypto provider before building any client.
+        install_crypto_provider();
         let mut builder = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT);

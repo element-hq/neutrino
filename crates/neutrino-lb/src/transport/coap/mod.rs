@@ -18,6 +18,7 @@
 //! reassembly-time cap is a follow-up (see `PLAN.md`); it needs coap-lite to bound
 //! the block accumulator, which the current API does not allow from the outside.
 
+pub mod datagram;
 mod message;
 mod paths;
 
@@ -57,6 +58,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use coap::UdpCoAPClient;
+use coap::client::{ClientTransport, CoAPClient};
 use tokio::sync::Mutex;
 
 use crate::transport::{MAX_WIRE_BODY_BYTES, WireClient, WireError, WireRequest, WireResponse};
@@ -266,42 +268,20 @@ impl WireClient for CoapWireClient {
             ));
         }
         let dest = req.dest.clone();
-        let max_body_bytes = self.max_body_bytes;
         let client = self.client_for(&dest).await?;
         let token = self.next_token();
-        let exchange = async {
-            let mut coap_req = message::build_request(&req);
-            coap_req.message.set_token(token);
-            let resp = if self.qblock.is_some() {
-                client
-                    .send_qblock(coap_req)
-                    .await
-                    .map_err(|e| WireError::Transport(format!("coap send_qblock: {e}")))?
-            } else {
-                client
-                    .send(coap_req)
-                    .await
-                    .map_err(|e| WireError::Transport(format!("coap send: {e}")))?
-            };
-            // Bound the peer's (post-reassembly) response before re-transcoding
-            // it — the untrusted-side OOM guard, symmetric with the ingress cap.
-            if resp.message.payload.len() > max_body_bytes {
-                return Err(WireError::Transport(format!(
-                    "peer response body exceeds {max_body_bytes}-byte cap"
-                )));
-            }
-            Ok(message::parse_response(&resp))
-        };
-        // Total ceiling on the whole exchange, so a slow/black-hole peer can't
-        // pin this task past `request_timeout` (the per-block coap-rs retries do
-        // not bound a multi-block transfer).
-        let result = match tokio::time::timeout(self.request_timeout, exchange).await {
-            Ok(inner) => inner,
-            Err(_) => Err(WireError::Transport(format!(
-                "coap request to {dest} exceeded {:?}",
-                self.request_timeout
-            ))),
-        };
+        // Drive the actual exchange through the transport-agnostic helper shared
+        // with the iroh datagram client (see `datagram`); the only UDP-specific
+        // part is `client_for` (pooling + `UdpCoAPClient::new`) above.
+        let result = exchange(
+            &client,
+            &req,
+            token,
+            self.qblock.is_some(),
+            self.max_body_bytes,
+            self.request_timeout,
+        )
+        .await;
         // On any failure (incl. timeout) drop the pooled client: it closes the
         // socket, ends the receive task, frees any state an abandoned exchange
         // left in the token map, and forces the next send to re-resolve `dest`.
@@ -309,6 +289,60 @@ impl WireClient for CoapWireClient {
             self.evict(&dest).await;
         }
         result
+    }
+}
+
+/// Transport-agnostic CoAP request/response exchange, shared by the UDP client
+/// (`CoapWireClient`) and the iroh datagram client (`datagram::IrohCoapWireClient`).
+/// The ONLY transport-specific concern either path adds is how the
+/// `CoAPClient<T>` is built/pooled; the security-relevant logic — token tagging,
+/// CON-vs-Q-Block send selection, the untrusted-side response body cap, the
+/// whole-exchange timeout that bounds a slow/black-hole peer — lives here once.
+///
+/// `qblock` selects `send_qblock` (RFC 9177 NON-mode) over `send` (CON); it
+/// mirrors `CoapWireClient::qblock.is_some()`. The caller is responsible for any
+/// post-failure cleanup (e.g. the UDP pool eviction) since that *is* transport
+/// specific.
+async fn exchange<T: ClientTransport + 'static>(
+    client: &CoAPClient<T>,
+    req: &WireRequest,
+    token: Vec<u8>,
+    qblock: bool,
+    max_body_bytes: usize,
+    request_timeout: Duration,
+) -> Result<WireResponse, WireError> {
+    let do_exchange = async {
+        let mut coap_req = message::build_request(req);
+        coap_req.message.set_token(token);
+        let resp = if qblock {
+            client
+                .send_qblock(coap_req)
+                .await
+                .map_err(|e| WireError::Transport(format!("coap send_qblock: {e}")))?
+        } else {
+            client
+                .send(coap_req)
+                .await
+                .map_err(|e| WireError::Transport(format!("coap send: {e}")))?
+        };
+        // Bound the peer's (post-reassembly) response before re-transcoding it —
+        // the untrusted-side OOM guard, symmetric with the ingress cap.
+        if resp.message.payload.len() > max_body_bytes {
+            return Err(WireError::Transport(format!(
+                "peer response body exceeds {max_body_bytes}-byte cap"
+            )));
+        }
+        Ok(message::parse_response(&resp))
+    };
+    // Total ceiling on the whole exchange, so a slow/black-hole peer can't pin
+    // this task past `request_timeout` (the per-block coap-rs retries do not
+    // bound a multi-block transfer).
+    match tokio::time::timeout(request_timeout, do_exchange).await {
+        Ok(inner) => inner,
+        Err(_) => Err(WireError::Transport(format!(
+            "coap request to {} exceeded {request_timeout:?}",
+            req.dest
+        ))),
     }
 }
 
@@ -382,6 +416,13 @@ impl CoapWireServer {
 struct CoapDispatch {
     handler: Arc<dyn WireHandler>,
     max_body_bytes: usize,
+    /// Set only on the authenticated datagram ingress (the iroh build). When
+    /// present, every inbound request's claimed `X-Matrix origin` is bound to the
+    /// link-authenticated source node before the handler runs — a peer may assert
+    /// only its own origin (see [`datagram::Hub::origin_binding_violation`]). The
+    /// UDP/HTTP transports run on a trusted LAN with no peer authentication, so
+    /// they leave this `None` and keep `federation::auth`'s existing behaviour.
+    node_binding: Option<Arc<datagram::Hub>>,
 }
 
 impl CoapDispatch {
@@ -400,16 +441,30 @@ impl CoapDispatch {
         // handler/transcode — the network-exposed OOM guard, mirroring the HTTP
         // ingress. (coap-lite has already reassembled it; this still bounds the
         // downstream transcode + loopback forward — see the module OOM note.)
-        let wire_resp = if request.message.payload.len() > self.max_body_bytes {
-            WireResponse {
-                status: 413,
-                headers: vec![],
-                body: vec![],
-            }
-        } else {
-            let wire_req = message::parse_request(&request);
-            self.handler.handle(wire_req).await
-        };
+        let wire_resp =
+            if request.message.payload.len() > self.max_body_bytes {
+                WireResponse {
+                    status: 413,
+                    headers: vec![],
+                    body: vec![],
+                }
+            } else {
+                let wire_req = message::parse_request(&request);
+                // Authenticated datagram ingress: a peer may assert only its own
+                // origin. Reject (401) before the handler runs if the claimed
+                // `X-Matrix origin` is not the link-authenticated source node.
+                if self.node_binding.as_ref().is_some_and(|hub| {
+                    hub.origin_binding_violation(request.source, &wire_req.headers)
+                }) {
+                    WireResponse {
+                        status: 401,
+                        headers: vec![],
+                        body: vec![],
+                    }
+                } else {
+                    self.handler.handle(wire_req).await
+                }
+            };
         if let Some(ref mut response) = request.response {
             message::write_response(response, &wire_resp);
         }
@@ -449,6 +504,8 @@ impl WireServer for CoapWireServer {
         let dispatch = Arc::new(CoapDispatch {
             handler,
             max_body_bytes: self.max_body_bytes,
+            // UDP runs on a trusted LAN with no peer authentication — no binding.
+            node_binding: None,
         });
 
         // `coap::Server::run` has no native shutdown, so race it against the
@@ -1115,6 +1172,7 @@ mod dispatch_tests {
         let dispatch = CoapDispatch {
             handler: Arc::new(Spy(ran.clone())),
             max_body_bytes: MAX_WIRE_BODY_BYTES,
+            node_binding: None,
         };
         let mut request: Box<CoapRequest<SocketAddr>> = Box::new(CoapRequest::new());
         request.response = None;
@@ -1132,6 +1190,7 @@ mod dispatch_tests {
         let dispatch = CoapDispatch {
             handler: Arc::new(Spy(ran.clone())),
             max_body_bytes: MAX_WIRE_BODY_BYTES,
+            node_binding: None,
         };
         let mut request: Box<CoapRequest<SocketAddr>> = Box::new(CoapRequest::new());
         request.response = Some(CoapResponse::new(&request.message).expect("response"));

@@ -15,6 +15,15 @@ tracing-subscriber.workspace = true
 neutrino-common = { path = "../neutrino-common" }
 neutrino-http = { path = "../neutrino-http" }
 neutrino-lb = { path = "../neutrino-lb" }
+neutrino-store = { path = "../neutrino-store" }
+neutrino-store-sqlite = { path = "../neutrino-store-sqlite" }
+
+# Server-identity derivation: a stable name from the persisted node secret. The
+# secret is opaque entropy; the public-key fingerprint is one general encoding
+# of it (NOT iroh-specific — iroh stays in the ffi layer).
+ed25519-dalek = "2.2.0"
+hex = "0.4.3"
+rand.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 paranoid-android = "0.2.2"

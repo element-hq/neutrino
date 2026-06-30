@@ -172,15 +172,21 @@ pub enum StartupError {
 }
 
 impl AppState {
-    async fn new(config: Config) -> Result<Self, StartupError> {
-        // A configured federation proxy must parse as a proxy URL. Bail at
-        // startup rather than silently falling back to direct federation: in a
-        // sidecar deployment "direct" means sending plain JSON to a peer's
-        // CBOR-only ingress port, which breaks the whole mesh. Fail loudly.
+    /// Validate `Config` fields that must be well-formed before serving. A
+    /// configured federation proxy must parse as a proxy URL — bail at startup
+    /// rather than silently falling back to direct federation: in a sidecar
+    /// deployment "direct" means sending plain JSON to a peer's CBOR-only ingress
+    /// port, which breaks the whole mesh. Fail loudly.
+    fn validate_config(config: &Config) -> Result<(), StartupError> {
         if let Some(url) = config.federation_proxy.as_deref() {
             reqwest::Proxy::all(url)
                 .map_err(|e| StartupError::InvalidFederationProxy(format!("{url}: {e}")))?;
         }
+        Ok(())
+    }
+
+    async fn new(config: Config) -> Result<Self, StartupError> {
+        Self::validate_config(&config)?;
         // Persistent file-backed store rooted at the configured directory;
         // the store owns the `<dir>/neutrino.db` layout and creates the dir
         // if missing. (`open_in_memory` exists but its shared-cache mode is
@@ -320,9 +326,14 @@ impl AppState {
 pub async fn serve(
     listener: TcpListener,
     config: Config,
+    store: Arc<SqliteStore>,
     commands: mpsc::UnboundedReceiver<Command>,
 ) -> Result<(), StartupError> {
-    let state = AppState::new(config).await?;
+    // The caller (the entrypoint) opens the store, resolves the server identity
+    // from it, and hands the live handle in — so we build state around it rather
+    // than re-opening the same DB.
+    AppState::validate_config(&config)?;
+    let state = AppState::from_store(config, store);
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
     // enumeration resumes delivery of anything left undelivered.
@@ -1646,7 +1657,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let (tx, rx) = mpsc::unbounded_channel();
-        let server = tokio::spawn(super::serve(listener, config, rx));
+        let server = tokio::spawn(super::serve(listener, config, store, rx));
 
         // Give the sender supervisor a moment to discover the dead peer and
         // spawn its per-destination task (which will be retrying the dead peer).

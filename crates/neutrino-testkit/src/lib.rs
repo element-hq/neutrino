@@ -146,11 +146,28 @@ pub struct Harness {
     txn: AtomicU64,
 }
 
+/// Install rustls' ring crypto provider as the process default, once.
+///
+/// reqwest's TLS backend is unified to rustls with NO default crypto provider
+/// (iroh, via `cargo test --workspace` feature unification), so building a
+/// `reqwest::Client` panics unless a provider is installed first. This harness
+/// depends on no other neutrino crate (it spawns a binary), so it installs the
+/// provider itself rather than reusing `neutrino_lb::install_crypto_provider`.
+/// Idempotent (`install_default` is a no-op if one is already set); the `Once`
+/// keeps repeat calls cheap.
+fn install_crypto_provider() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 impl Harness {
     /// Start `n` servers from the `neutrino` binary at `bin`, all links up, and
     /// wait until each serves through its proxy.
     pub async fn start(n: usize, bin: &Path) -> Harness {
         let cut: CutSet = Arc::new(Mutex::new(HashSet::new()));
+        install_crypto_provider();
         let http = reqwest::Client::builder()
             .no_proxy()
             .build()

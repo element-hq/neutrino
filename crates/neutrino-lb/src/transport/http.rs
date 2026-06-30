@@ -49,6 +49,7 @@ impl HttpWireClient {
         // IP:port, so bypass any ambient proxy. Timeouts bound the real
         // network leg — the homeserver's own timeout only covers its loopback
         // hop to the egress, so without these a dead peer leaks this request.
+        crate::install_crypto_provider();
         let http = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(connect)

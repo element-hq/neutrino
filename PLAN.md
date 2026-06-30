@@ -61,6 +61,28 @@ tuning so recovery isn't killed mid-exchange. Needs the `kaylendog/coap-rs` +
 rev-pinned in `[patch.crates-io]`. Designs:
 `docs/superpowers/specs/2026-06-{15,18,24}-neutrino-lb-*`.
 
+In-process datagram transport (`transport::coap::datagram`, STEP 1 done): an
+additive iroh-free CoAP path beside the UDP one, for the embedded/Android target.
+Replaces the OS UDP socket with a `DatagramLink` trait (ffi implements it over an
+iroh QUIC endpoint, keyed by 32-byte node ids — no socket/IP/ports). A `Hub` runs
+one drain task that classifies each inbound datagram by CoAP header code
+(request→server listener, else→per-node client inbox). `IrohCoapWireClient` /
+`IrohCoapWireServer` reuse the shared `exchange` helper + `CoapDispatch` from the
+UDP path. Wired into `LbConfig`/`serve` (STEP 2 done): `LbConfig.link:
+Option<Arc<dyn DatagramLink>>` selects the path purely by injection — `Some`
+routes the CoAP wire over the link, `None` keeps UDP. `neutrino-main::entrypoint`
+takes a `FederationLinkFactory` (4th param) that builds the link from the resolved
+node secret; `TunnelResolver` now yields the bare 64-char hex node id (not a vip).
+Not yet implemented in ffi.
+
+STEP 3 done: ffi's `IrohTransport` implements `neutrino_main::DatagramLink`
+(iroh QUIC datagram keyed by 32-byte node id); `start()` builds it via a
+`FederationLinkFactory` injected into `entrypoint`. The TUN/IP-relay data path
+(`Tunnel`/`RelayStack`/`relay_driver`/`TunPacketIo`/`start_tunnel`/`stop_tunnel`/
+`tunnel_address`, `TableSink`, the route table + vip) and the `neutrino-relay`
+crate are deleted. `TunnelHandoff` now carries only the resolved `server_name`.
+The federation data path is: homeserver → lb egress (CoAP/CBOR) →
+`IrohCoapWireClient` → `DatagramLink::send(node, datagram)` → iroh over BLE.
 Done:
 - Integer-key CBOR codec (Layer A; port of Dendrite `internal/lb`): all transports
   now carry the integer-key transcode (`codec::keys`, 143 keys: 137 from Dendrite
@@ -149,6 +171,24 @@ never use .unwrap() in handler code.
 - Restricted rooms (`join_authorised_via_users_server`) — documented, not implemented
 
 ## decisions log
+
+### datagram origin↔node binding (2026-06-29)
+- The iroh datagram link is the one trust boundary (the homeserver itself runs no
+  signature checks — trusted mesh). `federation::auth` trusts `X-Matrix origin`
+  *only because the network layer authenticated the peer*, so that binding MUST be
+  enforced at the transport. The datagram ingress (`CoapDispatch.node_binding` →
+  `Hub::origin_binding_violation`) rejects (401) any request whose claimed origin
+  node id ≠ the link-authenticated source node — a peer may assert only its own
+  origin. Enforced in neutrino-lb's datagram path only; UDP/HTTP (trusted LAN, no
+  peer auth) keep prior behaviour. open/permissionless federation is intended, so
+  there is deliberately NO peer allowlist — anyone may connect, but no one may
+  impersonate another node.
+- Soundness prerequisite: the node↔synthetic-`SocketAddr` map is now a lossless
+  bijection (`Hub::addr_for`/`node_for`, a monotonic counter), not the prior
+  18-of-32-byte hash. coap-rs stamps `request.source` from the responder address,
+  so the exact source node must be recoverable from it; the old lossy projection
+  was a grindable 144-bit-prefix collision that would let a peer be resolved as
+  another node.
 
 ### temporal state-group index (2026-06-22)
 - State groups are implemented as a **temporal interval table** (`room_state`),

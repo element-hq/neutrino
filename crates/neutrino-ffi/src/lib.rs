@@ -1,6 +1,15 @@
 uniffi::setup_scaffolding!("neutrino");
 
-mod tunnel;
+#[cfg(feature = "ble")]
+mod ble_android;
+#[cfg(feature = "ble")]
+mod ble_selftest;
+// The iroh-backed datagram link: implements `neutrino_main::DatagramLink` over an
+// iroh QUIC endpoint (keyed by 32-byte node ids). Built in `start` and injected
+// into the entrypoint via a `FederationLinkFactory`.
+mod relay_transport;
+
+use relay_transport::{IrohTransport, RELAY_BIND};
 
 /// FFI-facing server configuration. Mirrors `neutrino_common::Config` so EX
 /// Android can fully configure the embedded homeserver. Kept here (not on the
@@ -9,7 +18,6 @@ mod tunnel;
 /// in `Config::default`/`from_env` for the dev binary.
 #[derive(uniffi::Record)]
 pub struct NeutrinoConfig {
-    pub server_name: String,
     pub bind_addr: String,
     pub localpart: String,
     /// Absolute path to a writable directory the host owns (e.g. Android's
@@ -27,7 +35,11 @@ pub struct NeutrinoConfig {
 impl From<NeutrinoConfig> for neutrino_main::Config {
     fn from(c: NeutrinoConfig) -> Self {
         neutrino_main::Config {
-            server_name: c.server_name,
+            // The embedded server has no operator-set name: it always derives its
+            // identity (a node id) from the persisted secret. An empty
+            // `server_name` triggers that derivation in the entrypoint; the host
+            // reads the result back via `NeutrinoHandle::server_name()`.
+            server_name: String::new(),
             bind_addr: c.bind_addr,
             localpart: c.localpart,
             storage_dir: std::path::PathBuf::from(c.storage_dir),
@@ -66,10 +78,9 @@ impl From<Command> for neutrino_main::Command {
 #[derive(uniffi::Object)]
 pub struct NeutrinoHandle {
     tx: tokio::sync::mpsc::UnboundedSender<neutrino_main::Command>,
-    /// The TUN packet-capture tunnel. Independent of the command channel above:
-    /// the VPN is toggled on/off (each toggle a fresh fd) separately from the
-    /// homeserver's lifetime, so it has its own start/stop. Idle by default.
-    tunnel: tunnel::Tunnel,
+    /// The server identity (its resolved `server_name`/node id), published by the
+    /// entrypoint once resolved. Read by `server_name()`; `None` until booted.
+    identity: tokio::sync::watch::Receiver<Option<String>>,
 }
 
 #[uniffi::export]
@@ -99,36 +110,14 @@ impl NeutrinoHandle {
         self.command(Command::KickBackoff);
     }
 
-    /// Take ownership of an established TUN file descriptor and start reading IP
-    /// packets from it, logging a metadata-only summary of each (see [`tunnel`])
-    /// through the Neutrino tracing stack. Non-blocking: spawns a reader task on the
-    /// server runtime and returns immediately.
-    ///
-    /// `tun_fd` MUST come from `VpnService.Builder.establish()` with ownership
-    /// transferred to native code — on the Kotlin side, pass
-    /// `ParcelFileDescriptor.detachFd()`, NOT `.fd`. It MUST also be set non-blocking
-    /// before being handed over (`Os.fcntlInt(fd, F_SETFL, O_NONBLOCK)`); the reader
-    /// relies on this so a read never stalls the server executor. This crate owns and
-    /// closes the fd from then on; the host must not close it (and must not keep the
-    /// `ParcelFileDescriptor` that produced it open).
-    ///
-    /// `mtu` is the tunnel MTU; currently advisory (reserved for write-back once
-    /// forwarding lands) — the read buffer is sized for the worst case regardless.
-    ///
-    /// The reader runs on the server runtime, so it is cancelled automatically when
-    /// the homeserver shuts down: a tunnel cannot outlive its homeserver. Calling
-    /// this before the server is up (or after it has stopped) is a no-op that closes
-    /// the fd. Safe to call across repeated VPN toggles: each call installs a fresh
-    /// fd, replacing any still-running reader. Pair every `start_tunnel` with a
-    /// [`Self::stop_tunnel`].
-    pub fn start_tunnel(&self, tun_fd: i32, mtu: u32) {
-        self.tunnel.start(tun_fd, mtu);
-    }
-
-    /// Stop the tunnel reader and close the fd. Idempotent: a call when no tunnel is
-    /// running is a no-op. Called on VPN toggle-off and teardown.
-    pub fn stop_tunnel(&self) {
-        self.tunnel.stop();
+    /// The server's resolved federation name — its derived node id, or `None`
+    /// until the server has booted and resolved its identity (so the host can
+    /// distinguish "not ready yet" from a value rather than racing on an empty
+    /// string). Since the embedded server no longer takes a configured name,
+    /// this is how the host learns the name to build user ids
+    /// (`@localpart:server_name`).
+    pub fn server_name(&self) -> Option<String> {
+        self.identity.borrow().clone()
     }
 }
 
@@ -144,13 +133,34 @@ impl NeutrinoHandle {
 /// immediate; only a runaway closure can delay this thread's exit.
 #[uniffi::export]
 pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
+    // Route logs to logcat before anything that can fail: a runtime-build error
+    // or an `entrypoint` error below must be visible, not written to a stderr that
+    // Android discards. Idempotent (entrypoint calls it too).
+    neutrino_main::init_tracing();
+    // In this build reqwest's TLS backend is unified to rustls (pulled in by iroh)
+    // but with no default crypto provider, so building the federation client would
+    // panic ("No rustls crypto provider is configured"). The crypto provider is a
+    // process-global the embedding host must install; do it here, before the server
+    // (or iroh) builds any client. Idempotent: `install_default` returns `Err` if a
+    // provider is already set, which we ignore.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let config: neutrino_main::Config = config.into();
-    // Published once the runtime is built so `start_tunnel` can spawn its reader
-    // onto this runtime — which is what ties the tunnel's lifetime to the server's.
-    let runtime: std::sync::Arc<std::sync::OnceLock<tokio::runtime::Handle>> =
-        std::sync::Arc::new(std::sync::OnceLock::new());
-    let runtime_publisher = std::sync::Arc::clone(&runtime);
+    // The entrypoint publishes the resolved server name here once identity
+    // resolution completes; `server_name()` reads it back.
+    let (handoff_tx, handoff_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+    // Build the federation datagram link from the resolved node secret: an iroh
+    // QUIC endpoint, addressed by 32-byte node id, carrying the sidecar's
+    // CoAP/CBOR wire over BLE (no OS socket / TUN / virtual IPs). The entrypoint
+    // calls this once it has resolved the secret, then injects the link into the
+    // lb sidecar. A bind failure is widened to `entrypoint`'s boxed error and
+    // fails startup loudly (logged on the runtime thread below).
+    let link_factory: neutrino_main::FederationLinkFactory = Box::new(move |secret| {
+        Box::pin(async move {
+            let transport = IrohTransport::bind(&secret, RELAY_BIND).await?;
+            Ok(transport as std::sync::Arc<dyn neutrino_main::DatagramLink>)
+        })
+    });
     std::thread::spawn(move || {
         // Neutrino owns its runtime. current_thread = parity with the previous
         // async-compat global (also current_thread); all DB work is offloaded to
@@ -163,20 +173,18 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
         {
             Ok(rt) => rt,
             Err(e) => {
-                eprintln!("failed to build runtime: {e}");
+                tracing::error!(error = %e, "neutrino: failed to build the server runtime");
                 return;
             }
         };
-        // Publish the handle before blocking so a concurrent `start_tunnel` can spawn
-        // onto this runtime. Tasks spawned from the FFI thread are polled by this
-        // `block_on`; when it returns, `rt` drops and any reader task is cancelled.
-        let _ = runtime_publisher.set(rt.handle().clone());
         rt.block_on(async {
             // The command receiver is threaded into the server; a `Shutdown`
             // command (or every `NeutrinoHandle` being dropped, which closes the
             // channel) drives `serve`'s graceful shutdown and returns here.
-            if let Err(e) = neutrino_main::entrypoint(config, rx).await {
-                eprintln!("entrypoint exited: {e}");
+            if let Err(e) =
+                neutrino_main::entrypoint(config, rx, Some(handoff_tx), Some(link_factory)).await
+            {
+                tracing::error!(error = %e, "neutrino: server entrypoint exited with an error");
             }
         });
         // `rt` drops here on this OS thread (sync context — safe): the executor
@@ -189,7 +197,7 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
     });
     NeutrinoHandle {
         tx,
-        tunnel: tunnel::Tunnel::new(runtime),
+        identity: handoff_rx,
     }
 }
 
@@ -200,7 +208,6 @@ mod tests {
     #[test]
     fn neutrino_config_maps_to_internal_config() {
         let nc = NeutrinoConfig {
-            server_name: "hs.example".to_string(),
             bind_addr: "127.0.0.1:8008".to_string(),
             localpart: "alice".to_string(),
             storage_dir: "/data/neutrino".to_string(),
@@ -208,7 +215,8 @@ mod tests {
             lb_federation_port: Some(8448),
         };
         let cfg: neutrino_main::Config = nc.into();
-        assert_eq!(cfg.server_name, "hs.example");
+        // Dropped from the FFI surface → empty, which triggers identity derivation.
+        assert_eq!(cfg.server_name, "");
         assert_eq!(cfg.bind_addr, "127.0.0.1:8008");
         assert_eq!(cfg.localpart, "alice");
         assert_eq!(cfg.storage_dir, std::path::PathBuf::from("/data/neutrino"));
@@ -227,7 +235,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = NeutrinoHandle {
             tx,
-            tunnel: tunnel::Tunnel::new(std::sync::Arc::new(std::sync::OnceLock::new())),
+            identity: tokio::sync::watch::channel::<Option<String>>(None).1,
         };
         handle.shutdown();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::Shutdown);
@@ -241,7 +249,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = NeutrinoHandle {
             tx,
-            tunnel: tunnel::Tunnel::new(std::sync::Arc::new(std::sync::OnceLock::new())),
+            identity: tokio::sync::watch::channel::<Option<String>>(None).1,
         };
         handle.kick_backoff();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::KickBackoff);
@@ -252,7 +260,6 @@ mod tests {
         // Guards against a regression where the clamp emits a constant 1
         // rather than flooring: a non-zero value must pass through unchanged.
         let nc = NeutrinoConfig {
-            server_name: "hs.example".to_string(),
             bind_addr: "127.0.0.1:8008".to_string(),
             localpart: "alice".to_string(),
             storage_dir: "/data/neutrino".to_string(),

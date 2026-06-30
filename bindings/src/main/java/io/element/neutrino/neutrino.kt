@@ -639,15 +639,15 @@ internal object IntegrityCheckingUniffiLib {
     }
     external fun uniffi_neutrino_checksum_func_start(
     ): Short
+    external fun uniffi_neutrino_checksum_func_ble_smoke_test(
+    ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_command(
     ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_kick_backoff(
     ): Short
+    external fun uniffi_neutrino_checksum_method_neutrinohandle_server_name(
+    ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_shutdown(
-    ): Short
-    external fun uniffi_neutrino_checksum_method_neutrinohandle_start_tunnel(
-    ): Short
-    external fun uniffi_neutrino_checksum_method_neutrinohandle_stop_tunnel(
     ): Short
     external fun ffi_neutrino_uniffi_contract_version(
     ): Int
@@ -675,14 +675,14 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_neutrino_fn_method_neutrinohandle_kick_backoff(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_neutrino_fn_method_neutrinohandle_server_name(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_neutrino_fn_method_neutrinohandle_shutdown(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_neutrino_fn_method_neutrinohandle_start_tunnel(`ptr`: Long,`tunFd`: Int,`mtu`: Int,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_neutrino_fn_method_neutrinohandle_stop_tunnel(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_neutrino_fn_func_start(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
+    external fun uniffi_neutrino_fn_func_ble_smoke_test(`remote`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun ffi_neutrino_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun ffi_neutrino_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1005,29 +1005,6 @@ public object FfiConverterUInt: FfiConverter<UInt, Int> {
 /**
  * @suppress
  */
-public object FfiConverterInt: FfiConverter<Int, Int> {
-    override fun lift(value: Int): Int {
-        return value
-    }
-
-    override fun read(buf: ByteBuffer): Int {
-        return buf.getInt()
-    }
-
-    override fun lower(value: Int): Int {
-        return value
-    }
-
-    override fun allocationSize(value: Int) = 4UL
-
-    override fun write(value: Int, buf: ByteBuffer) {
-        buf.putInt(value)
-    }
-}
-
-/**
- * @suppress
- */
 public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
     // Note: we don't inherit from FfiConverterRustBuffer, because we use a
     // special encoding when lowering/lifting.  We can use `RustBuffer.len` to
@@ -1199,43 +1176,21 @@ public interface NeutrinoHandleInterface {
     fun `kickBackoff`()
     
     /**
+     * The server's resolved federation name — its derived node id, or `None`
+     * until the server has booted and resolved its identity (so the host can
+     * distinguish "not ready yet" from a value rather than racing on an empty
+     * string). Since the embedded server no longer takes a configured name,
+     * this is how the host learns the name to build user ids
+     * (`@localpart:server_name`).
+     */
+    fun `serverName`(): kotlin.String?
+    
+    /**
      * Gracefully stop the server. Convenience for `command(Command::Shutdown)`;
      * preserves the pre-existing FFI method so existing Android callers keep
      * working unchanged.
      */
     fun `shutdown`()
-    
-    /**
-     * Take ownership of an established TUN file descriptor and start reading IP
-     * packets from it, logging a metadata-only summary of each (see [`tunnel`])
-     * through the Neutrino tracing stack. Non-blocking: spawns a reader task on the
-     * server runtime and returns immediately.
-     *
-     * `tun_fd` MUST come from `VpnService.Builder.establish()` with ownership
-     * transferred to native code — on the Kotlin side, pass
-     * `ParcelFileDescriptor.detachFd()`, NOT `.fd`. It MUST also be set non-blocking
-     * before being handed over (`Os.fcntlInt(fd, F_SETFL, O_NONBLOCK)`); the reader
-     * relies on this so a read never stalls the server executor. This crate owns and
-     * closes the fd from then on; the host must not close it (and must not keep the
-     * `ParcelFileDescriptor` that produced it open).
-     *
-     * `mtu` is the tunnel MTU; currently advisory (reserved for write-back once
-     * forwarding lands) — the read buffer is sized for the worst case regardless.
-     *
-     * The reader runs on the server runtime, so it is cancelled automatically when
-     * the homeserver shuts down: a tunnel cannot outlive its homeserver. Calling
-     * this before the server is up (or after it has stopped) is a no-op that closes
-     * the fd. Safe to call across repeated VPN toggles: each call installs a fresh
-     * fd, replacing any still-running reader. Pair every `start_tunnel` with a
-     * [`Self::stop_tunnel`].
-     */
-    fun `startTunnel`(`tunFd`: kotlin.Int, `mtu`: kotlin.UInt)
-    
-    /**
-     * Stop the tunnel reader and close the fd. Idempotent: a call when no tunnel is
-     * running is a no-op. Called on VPN toggle-off and teardown.
-     */
-    fun `stopTunnel`()
     
     companion object
 }
@@ -1376,6 +1331,27 @@ open class NeutrinoHandle: Disposable, AutoCloseable, NeutrinoHandleInterface
 
     
     /**
+     * The server's resolved federation name — its derived node id, or `None`
+     * until the server has booted and resolved its identity (so the host can
+     * distinguish "not ready yet" from a value rather than racing on an empty
+     * string). Since the embedded server no longer takes a configured name,
+     * this is how the host learns the name to build user ids
+     * (`@localpart:server_name`).
+     */override fun `serverName`(): kotlin.String? {
+            return FfiConverterOptionalString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_neutrino_fn_method_neutrinohandle_server_name(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Gracefully stop the server. Convenience for `command(Command::Shutdown)`;
      * preserves the pre-existing FFI method so existing Android callers keep
      * working unchanged.
@@ -1384,58 +1360,6 @@ open class NeutrinoHandle: Disposable, AutoCloseable, NeutrinoHandleInterface
     callWithHandle {
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_neutrino_fn_method_neutrinohandle_shutdown(
-        it,
-        _status)
-}
-    }
-    
-    
-
-    
-    /**
-     * Take ownership of an established TUN file descriptor and start reading IP
-     * packets from it, logging a metadata-only summary of each (see [`tunnel`])
-     * through the Neutrino tracing stack. Non-blocking: spawns a reader task on the
-     * server runtime and returns immediately.
-     *
-     * `tun_fd` MUST come from `VpnService.Builder.establish()` with ownership
-     * transferred to native code — on the Kotlin side, pass
-     * `ParcelFileDescriptor.detachFd()`, NOT `.fd`. It MUST also be set non-blocking
-     * before being handed over (`Os.fcntlInt(fd, F_SETFL, O_NONBLOCK)`); the reader
-     * relies on this so a read never stalls the server executor. This crate owns and
-     * closes the fd from then on; the host must not close it (and must not keep the
-     * `ParcelFileDescriptor` that produced it open).
-     *
-     * `mtu` is the tunnel MTU; currently advisory (reserved for write-back once
-     * forwarding lands) — the read buffer is sized for the worst case regardless.
-     *
-     * The reader runs on the server runtime, so it is cancelled automatically when
-     * the homeserver shuts down: a tunnel cannot outlive its homeserver. Calling
-     * this before the server is up (or after it has stopped) is a no-op that closes
-     * the fd. Safe to call across repeated VPN toggles: each call installs a fresh
-     * fd, replacing any still-running reader. Pair every `start_tunnel` with a
-     * [`Self::stop_tunnel`].
-     */override fun `startTunnel`(`tunFd`: kotlin.Int, `mtu`: kotlin.UInt)
-        = 
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_neutrino_fn_method_neutrinohandle_start_tunnel(
-        it,
-        FfiConverterInt.lower(`tunFd`),FfiConverterUInt.lower(`mtu`),_status)
-}
-    }
-    
-    
-
-    
-    /**
-     * Stop the tunnel reader and close the fd. Idempotent: a call when no tunnel is
-     * running is a no-op. Called on VPN toggle-off and teardown.
-     */override fun `stopTunnel`()
-        = 
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_neutrino_fn_method_neutrinohandle_stop_tunnel(
         it,
         _status)
 }
@@ -1491,8 +1415,6 @@ public object FfiConverterTypeNeutrinoHandle: FfiConverter<NeutrinoHandle, Long>
  * in `Config::default`/`from_env` for the dev binary.
  */
 data class NeutrinoConfig (
-    var `serverName`: kotlin.String
-    , 
     var `bindAddr`: kotlin.String
     , 
     var `localpart`: kotlin.String
@@ -1532,14 +1454,12 @@ public object FfiConverterTypeNeutrinoConfig: FfiConverterRustBuffer<NeutrinoCon
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
-            FfiConverterString.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterOptionalUShort.read(buf),
         )
     }
 
     override fun allocationSize(value: NeutrinoConfig) = (
-            FfiConverterString.allocationSize(value.`serverName`) +
             FfiConverterString.allocationSize(value.`bindAddr`) +
             FfiConverterString.allocationSize(value.`localpart`) +
             FfiConverterString.allocationSize(value.`storageDir`) +
@@ -1548,7 +1468,6 @@ public object FfiConverterTypeNeutrinoConfig: FfiConverterRustBuffer<NeutrinoCon
     )
 
     override fun write(value: NeutrinoConfig, buf: ByteBuffer) {
-            FfiConverterString.write(value.`serverName`, buf)
             FfiConverterString.write(value.`bindAddr`, buf)
             FfiConverterString.write(value.`localpart`, buf)
             FfiConverterString.write(value.`storageDir`, buf)
@@ -1628,6 +1547,38 @@ public object FfiConverterOptionalUShort: FfiConverterRustBuffer<kotlin.UShort?>
         }
     }
 }
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?> {
+    override fun read(buf: ByteBuffer): kotlin.String? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterString.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.String?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterString.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.String?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterString.write(value, buf)
+        }
+    }
+}
         /**
          * Spawn an owned Tokio runtime and begin polling the server entrypoint with
          * the supplied configuration. Returns a handle for pushing control commands
@@ -1648,6 +1599,21 @@ public object FfiConverterOptionalUShort: FfiConverterRustBuffer<kotlin.UShort?>
 }
     )
     }
+    
+
+        /**
+         * Run the BLE smoke test on a dedicated runtime thread and return immediately.
+         * `remote` = `None` → listener (advertise + accept + echo); `Some(node_id)` →
+         * dialer (connect + stream test + datagram test). Results are logged, not
+         * returned (see module docs).
+         */ fun `bleSmokeTest`(`remote`: kotlin.String?)
+        = 
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_neutrino_fn_func_ble_smoke_test(
+    
+        FfiConverterOptionalString.lower(`remote`),_status)
+}
+    
     
 
 

@@ -72,7 +72,13 @@ async fn start_node(localpart: &str) -> Node {
     // Full homeserver stack (router + outbound federation sender pool).
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        let _ = neutrino_http::serve(http_listener, config, cmd_rx).await;
+        let store = std::sync::Arc::new(
+            neutrino_store_sqlite::SqliteStore::open_in_dir(&config.storage_dir)
+                .await
+                .unwrap(),
+        );
+
+        let _ = neutrino_http::serve(http_listener, config, store, cmd_rx).await;
     });
 
     // Sidecar: ingress on the public port, egress on loopback, upstream = the
@@ -83,6 +89,8 @@ async fn start_node(localpart: &str) -> Node {
         egress_bind: egress,
         upstream: format!("http://{http_addr}"),
         wire: neutrino_lb::WireKind::Http,
+        resolver: None,
+        link: None,
     };
     let lb_shutdown = shutdown.clone();
     tokio::spawn(async move {
@@ -109,6 +117,7 @@ async fn message_converges_through_lb_sidecars() {
     // A plain client (no ambient proxy) talking directly to each homeserver's
     // loopback CSAPI. The federation hop between the servers is what goes
     // through the sidecars; these CSAPI calls do not.
+    neutrino_lb::install_crypto_provider();
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
 
     // 1. A creates a public room (so B can join by server-name hint, no invite).

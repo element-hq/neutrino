@@ -389,3 +389,20 @@ CREATE TABLE pending_advertisements (
     room_id      TEXT NOT NULL,
     PRIMARY KEY (destination, room_id)
 ) STRICT, WITHOUT ROWID;
+
+-- ----------------------------------------------------------------------------
+-- node_identity — IdentityStore
+-- ----------------------------------------------------------------------------
+-- The server's persistent node secret: 32 raw bytes, generated once on first
+-- start by the caller (a Rust CSPRNG — NOT SQLite's `randomblob`, which is not
+-- a guaranteed CSPRNG; see `get_or_create_node_secret`) and stable across
+-- restarts. The server derives its stable identity (and, when unconfigured, its
+-- federation `server_name`) from this secret, so it MUST survive restarts —
+-- hence persisting the secret, not just a session key. How that identity maps
+-- onto a network route is the transport layer's concern, not this table's.
+-- Single row, pinned to `id = 0`. No `user_version` bump (additive, no live
+-- data, no migration framework — same policy as the other late tables).
+CREATE TABLE node_identity (
+    id     INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
+    secret BLOB    NOT NULL CHECK (length(secret) = 32)
+) STRICT;

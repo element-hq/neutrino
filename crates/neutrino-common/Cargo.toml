@@ -8,7 +8,7 @@ base64 = "0.22.1"
 ruma = { workspace = true, features = ["events"] }
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.11.0"
+sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
