@@ -178,6 +178,35 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### BLE invite failures: sync wake on OOB invite + vendored iroh-ble-transport (2026-06-30)
+- Two independent bugs surfaced when `/invite` failed over BLE (sender pixel.log,
+  receiver recv.log).
+- **Bug B (in-tree, fixed):** an inbound OOB federated invite is stored via
+  `InviteStore::put_invite` (the `oob_invites` table), which — unlike
+  `persist_event` — never bumped the stream watch, so an in-flight sliding-sync
+  long-poll only surfaced the invite at its next poll (~10-30s, the observed
+  delay). Fix: `put_invite`/`remove_invite` now call
+  `SqliteStore::notify_watch_changed`, which `send_modify`s the watch to fire a
+  `changed()` edge **without** advancing the `StreamPos` cursor — preserving both
+  `build_response`'s head read and `notify_watch`'s monotonic guard for real
+  events. Regression test `long_poll_wakes_on_oob_invite`.
+- **Bug A (vendored dep, fix UNVERIFIED in sandbox):** after a peer restarts under
+  a new BLE MAC, the sender deadlocks dialing the stale address. Root cause in
+  `iroh-ble-transport`: the send path sets `entry.pipe = None` when its outbound
+  channel closes on a dead link but leaves the entry `Connected`; the wedged-pipe
+  watchdog skipped pipeless entries, so the entry kept pinning its prefix
+  (`active_prefix_bindings`) and `note_discovery` rejected the new MAC as
+  `ActivelyPinned` forever — no fresh GATT connect ever fired. **Vendored the dep
+  in-house** at `vendor/iroh-ble-transport` (path dep from neutrino-ffi; Kegan
+  expects further changes). Fix: the watchdog now also wedges a `Connected` entry
+  with `pipe == None` once it has been pipeless past `CONNECTED_IDLE_DEADLINE`
+  (gated on time-in-`Connected` to preserve the legitimate connect/L2CAP-upgrade
+  install window). Tests added, but the crate pulls `blew`→`bluer`→`libdbus-sys`
+  (no `dbus-1` / uncached here) so it **cannot be compiled or tested in the
+  sandbox — needs an on-device / Linux-with-dbus build to verify.** Recovery is
+  bounded by the 45s deadline; faster dead-link detection at send time is a
+  possible follow-up (riskier — `pipe: None` is also a tolerated transient).
+
 ### room runtime moved into `neutrino-engine` (2026-06-30)
 - Phase 2 of the extraction: `room_actor` (RoomActor/RoomRegistry), `sender`,
   `worker`, `reconcile`, `gapfill` physically moved from `neutrino-http` into

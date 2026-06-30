@@ -1667,6 +1667,72 @@ async fn long_poll_wakes_on_new_event() {
     );
 }
 
+/// An inbound out-of-band federated invite (`InviteStore::put_invite`) must
+/// wake an in-flight long-poll, not leave it parked until timeout. This is the
+/// regression for the observed ~30s invite-appearance delay: `put_invite`
+/// writes the `oob_invites` table but used to skip the stream-watch bump, so
+/// the federation `PUT /invite` landed silently and the invitee's open `/sync`
+/// only surfaced it on its next poll. Mirrors `long_poll_wakes_on_new_event`,
+/// but the wake is driven by an invite rather than a room event.
+#[tokio::test]
+async fn long_poll_wakes_on_oob_invite() {
+    let (store, _tmp) = fresh_store().await;
+    let user = user_id!("@alice:example.org");
+    let inviter = user_id!("@bob:other.example.org");
+    // A room we do NOT host — the OOB-invite path (no create event, no state).
+    let room = room_id!("!remote:other.example.org");
+    let state_arc = Arc::new(SyncState::new(store.clone(), no_shutdown()));
+
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+
+    // Initial sync: no invite yet, so no rooms.
+    let mut req1 = Request::new();
+    req1.lists = lists.clone();
+    let resp1 = handle(&state_arc, user, req1).await.unwrap();
+    assert!(resp1.rooms.is_empty(), "no rooms before the invite arrives");
+
+    // Federation delivers the invite ~50ms into the long-poll.
+    let store_for_task = store.clone();
+    let waker_user = user.to_owned();
+    let waker_room = room.to_owned();
+    let waker_inviter = inviter.to_owned();
+    let waker = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let invite = oob_invite_event(&waker_room, &waker_user, &waker_inviter, "Remote Room", 200);
+        store_for_task
+            .put_invite(&waker_room, &waker_user, &invite)
+            .await
+            .unwrap();
+    });
+
+    let mut req2 = Request::new();
+    req2.pos = Some(resp1.pos);
+    req2.lists = lists;
+    req2.timeout = Some(std::time::Duration::from_millis(2000));
+
+    let start = std::time::Instant::now();
+    let resp2 = handle(&state_arc, user, req2).await.unwrap();
+    let elapsed = start.elapsed();
+    waker.await.unwrap();
+
+    // A working notify wakes the poll near-immediately after the ~50ms invite.
+    // A broken notify would only return at the 2s timeout — same ceiling
+    // rationale as `long_poll_wakes_on_new_event`.
+    assert!(
+        elapsed < std::time::Duration::from_millis(1500),
+        "should wake on the invite well before the 2s timeout, got {elapsed:?}"
+    );
+    let room_res = resp2
+        .rooms
+        .get(room)
+        .expect("the invited room surfaces on the woken poll");
+    assert!(
+        room_res.invite_state.is_some(),
+        "the woken poll carries the invite's stripped invite_state"
+    );
+}
+
 #[tokio::test]
 async fn retry_with_same_pos_returns_cached_response() {
     let (store, _tmp) = fresh_store().await;
