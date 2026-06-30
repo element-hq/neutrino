@@ -3152,6 +3152,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "neutrino-common",
+ "neutrino-state",
  "ruma",
  "serde_json",
  "thiserror 2.0.18",

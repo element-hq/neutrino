@@ -51,7 +51,7 @@ struct App {
     store: Arc<SqliteStore>,
     /// Per-room state-machine actors. CSAPI writes go through here so they
     /// are DAG-linked, auth-checked, and state-resolved.
-    room_registry: Arc<RoomRegistry>,
+    room_registry: Arc<RoomRegistry<SqliteStore>>,
     /// In-process poke to the inbound staging worker. The `/send` handler sends
     /// the room id of each freshly-staged PDU; the worker spawns or wakes that
     /// room's drain task. Best-effort (`try_send`): a full buffer just means the

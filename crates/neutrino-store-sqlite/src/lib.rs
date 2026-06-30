@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use deadpool_sqlite::{Config, Hook, HookError, Pool, Runtime, rusqlite::Connection};
 use neutrino_state::provider::StateProvider;
-use neutrino_store::{StorageError, StreamPos};
+use neutrino_store::{StorageError, StreamPos, WithStateProvider};
 use tokio::sync::watch;
 
 /// Wall-clock ceiling for any single `run_write` call. The writer pool is
@@ -302,22 +302,18 @@ impl SqliteStore {
             ))),
         }
     }
+}
 
-    /// Run a closure with a read-only [`StateProvider`] backed by this store,
-    /// on a reader connection. This is the connection-bridging primitive the
-    /// per-room actor uses to drive `RoomCore::apply`: `run_read` and
-    /// `SqliteStateProvider` are `pub(crate)`/connection-bound, so the
-    /// orchestration in `neutrino-http` can't build a provider itself — but it
-    /// owns the state machine. `f` runs the apply (a read: immutable events +
-    /// auth chains, no write transaction) and returns whatever the caller
-    /// needs, typically `(RoomCore, Result<Vec<Effect>, CoreError>)`.
-    ///
-    /// `R` must own its result: the provider lives only for the duration of
-    /// `f`, so a returned value cannot borrow from it. Keeping the apply types
-    /// (`RoomCore` / `Effect` / `CoreError`) in `R` means this crate never
-    /// names them — storage stays ignorant of the state machine, knowing only
-    /// the `StateProvider` trait it already implements.
-    pub async fn with_state_provider<F, R>(&self, f: F) -> Result<R, StorageError>
+/// The connection-bridging primitive the per-room actor drives `RoomCore::apply`
+/// through: `run_read` and `SqliteStateProvider` are `pub(crate)`/connection-
+/// bound, so the engine can't build a provider itself — but it owns the state
+/// machine. `f` runs the apply (a read: immutable events + auth chains, no write
+/// transaction). Keeping the apply types (`RoomCore` / `Effect` / `CoreError`)
+/// inside `R` means this crate never names them — storage stays ignorant of the
+/// state machine, knowing only the `StateProvider` trait it implements. See
+/// [`WithStateProvider`] for the contract.
+impl WithStateProvider for SqliteStore {
+    async fn with_state_provider<F, R>(&self, f: F) -> Result<R, StorageError>
     where
         F: for<'a> FnOnce(&'a dyn StateProvider) -> R + Send + 'static,
         R: Send + 'static,

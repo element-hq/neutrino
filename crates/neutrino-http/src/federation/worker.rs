@@ -80,7 +80,7 @@ const POKE_BUFFER: usize = 256;
 #[derive(Clone)]
 struct WorkerCtx {
     store: Arc<SqliteStore>,
-    registry: Arc<RoomRegistry>,
+    registry: Arc<RoomRegistry<SqliteStore>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
     /// Backoff floor; [`BACKOFF_BASE`] in production, near-zero in tests so the
     /// retry path runs without real delays.
@@ -102,7 +102,7 @@ struct RoomTask {
 /// every caller is on an async path (`serve`, the test routers).
 pub(crate) fn spawn(
     store: Arc<SqliteStore>,
-    registry: Arc<RoomRegistry>,
+    registry: Arc<RoomRegistry<SqliteStore>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
 ) -> mpsc::Sender<OwnedRoomId> {
     spawn_with(store, registry, fetcher, BACKOFF_BASE)
@@ -112,7 +112,7 @@ pub(crate) fn spawn(
 /// full supervisor → task path without real backoff delays.
 fn spawn_with(
     store: Arc<SqliteStore>,
-    registry: Arc<RoomRegistry>,
+    registry: Arc<RoomRegistry<SqliteStore>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
     backoff_base: Duration,
 ) -> mpsc::Sender<OwnedRoomId> {
