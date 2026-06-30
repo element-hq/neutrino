@@ -30,9 +30,9 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
-use neutrino_common::Event;
+use neutrino_common::{Event, FormatError};
 use neutrino_state::room_core::{Effect, RoomCore};
-use neutrino_state::{CoreError, FormatError, StateDelta, StateMap};
+use neutrino_state::{CoreError, StateDelta, StateMap};
 use neutrino_store::{Membership, StorageBackend, StorageError, WithStateProvider};
 #[cfg(test)]
 use neutrino_store_sqlite::SqliteStore;
@@ -757,7 +757,7 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomRegistry<S> {
 mod tests {
     use super::*;
     use neutrino_common::ROOM_VERSION_ID;
-    use neutrino_state::event_builder::EventBuilder;
+    use neutrino_common::event_builder::EventBuilder;
     use neutrino_store::{EventStore, FederationOutbox, RoomStore, StateStore};
     use ruma::server_name;
     use serde_json::json;

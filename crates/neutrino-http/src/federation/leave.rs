@@ -116,7 +116,7 @@ async fn try_federated_leave(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neutrino_state::event_builder::EventBuilder;
+    use neutrino_common::event_builder::EventBuilder;
     use serde_json::Value;
 
     /// CVE regression: a hostile make_leave template (wrong type, attacker

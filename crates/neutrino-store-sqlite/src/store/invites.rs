@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{OptionalExtension, params};
 use neutrino_common::Event;
 use neutrino_common::event_id::compute_event_id;
-use neutrino_state::validate::parse_event;
+use neutrino_common::validate::parse_event;
 use neutrino_store::{InviteStore, StorageError};
 use ruma::{OwnedRoomId, RoomId, UserId};
 use serde_json::value::RawValue as RawJsonValue;

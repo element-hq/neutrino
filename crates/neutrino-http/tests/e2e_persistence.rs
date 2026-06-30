@@ -3,7 +3,7 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use neutrino_common::Config;
+use neutrino_ctl::Config;
 use neutrino_http::router;
 use serde_json::{Value, json};
 use tower::ServiceExt; // oneshot

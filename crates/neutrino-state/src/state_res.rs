@@ -817,9 +817,9 @@ pub fn resolve_state(
 mod tests {
     use super::*;
     use crate::Event;
-    use crate::event_builder::EventBuilder;
     use crate::provider::InMemoryStateProvider;
     use crate::test_utils::next_ts;
+    use neutrino_common::event_builder::EventBuilder;
     use ruma::{room_id, user_id};
     use serde_json::json;
     use std::collections::HashMap;

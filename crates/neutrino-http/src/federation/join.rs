@@ -24,7 +24,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use neutrino_common::ROOM_VERSION_ID;
-use neutrino_state::event_builder::from_wire;
+use neutrino_common::event_builder::from_wire;
 use neutrino_store::{InviteStore, RoomStore, StagingStore, StateStore, StreamPos};
 use ruma::{OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId};
 use serde_json::json;

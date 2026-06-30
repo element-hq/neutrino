@@ -18,7 +18,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use neutrino_common::{Command, Config};
+use neutrino_ctl::{Command, Config};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;

@@ -20,7 +20,7 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
-use neutrino_state::event_builder::from_wire;
+use neutrino_common::event_builder::from_wire;
 use ruma::OwnedRoomId;
 use serde_json::value::RawValue as RawJsonValue;
 use serde_json::{Value, json};

@@ -3047,6 +3047,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "neutrino-ctl"
+version = "0.1.0"
+
+[[package]]
 name = "neutrino-engine"
 version = "0.1.0"
 dependencies = [
@@ -3093,6 +3097,7 @@ dependencies = [
  "async-trait",
  "axum",
  "neutrino-common",
+ "neutrino-ctl",
  "neutrino-engine",
  "neutrino-lb",
  "neutrino-state",
@@ -3139,7 +3144,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "hex",
- "neutrino-common",
+ "neutrino-ctl",
  "neutrino-http",
  "neutrino-lb",
  "neutrino-store",

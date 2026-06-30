@@ -29,7 +29,7 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
-use neutrino_state::event_builder::from_wire;
+use neutrino_common::event_builder::from_wire;
 use neutrino_store::{DagStore, EventStore, RoomStore};
 use ruma::{EventId, OwnedEventId, OwnedRoomId};
 use serde::Serialize;

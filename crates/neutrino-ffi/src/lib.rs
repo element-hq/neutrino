@@ -9,7 +9,7 @@ mod relay_transport;
 
 use relay_transport::{IrohTransport, RELAY_BIND};
 
-/// FFI-facing server configuration. Mirrors `neutrino_common::Config` so EX
+/// FFI-facing server configuration. Mirrors `neutrino_ctl::Config` so EX
 /// Android can fully configure the embedded homeserver. Kept here (not on the
 /// common `Config`) so UniFFI stays out of the common crates — see the
 /// crate-structure rule in CLAUDE.md. All fields are required; defaults live
@@ -54,7 +54,7 @@ impl From<NeutrinoConfig> for neutrino_main::Config {
     }
 }
 
-/// FFI-facing control command. Mirrors `neutrino_common::Command` (re-exported
+/// FFI-facing control command. Mirrors `neutrino_ctl::Command` (re-exported
 /// as `neutrino_main::Command`) so EX Android can drive the embedded server.
 /// Kept here, not on the common `Command`, so UniFFI stays out of the common
 /// crates — the same split as `NeutrinoConfig` / `Config`.

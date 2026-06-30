@@ -18,7 +18,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use neutrino_common::event_id::{
+use crate::event_id::{
     b64_unpadded, content_hash, event_id_from_hash, redact_to_canonical_bytes, reference_hash,
     verify_content_hash,
 };
@@ -355,7 +355,7 @@ mod tests {
     fn build_create_event_derives_room_id_from_event_id() {
         let ev = EventBuilder::new(user("@alice:example.org"), "m.room.create".to_owned())
             .state_key(String::new())
-            .content(json!({ "room_version": neutrino_common::ROOM_VERSION_ID }))
+            .content(json!({ "room_version": crate::ROOM_VERSION_ID }))
             .origin_server_ts(1_700_000_000_000)
             .build()
             .expect("create event builds");
@@ -387,7 +387,7 @@ mod tests {
     fn build_output_raw_lacks_event_id() {
         let create = EventBuilder::new(user("@alice:example.org"), "m.room.create".to_owned())
             .state_key(String::new())
-            .content(json!({ "room_version": neutrino_common::ROOM_VERSION_ID }))
+            .content(json!({ "room_version": crate::ROOM_VERSION_ID }))
             .origin_server_ts(1_700_000_000_000)
             .build()
             .expect("create event builds");
@@ -415,7 +415,7 @@ mod tests {
     fn build_message_event_round_trips() {
         let create = EventBuilder::new(user("@alice:example.org"), "m.room.create".to_owned())
             .state_key(String::new())
-            .content(json!({ "room_version": neutrino_common::ROOM_VERSION_ID }))
+            .content(json!({ "room_version": crate::ROOM_VERSION_ID }))
             .build()
             .expect("create");
         let msg = EventBuilder::new(user("@alice:example.org"), "m.room.message".to_owned())
@@ -600,7 +600,7 @@ mod tests {
         // caller sees the specific rule that fired.
         let err = EventBuilder::new(user("@a:d"), "m.room.create".to_owned())
             .state_key(String::new())
-            .content(json!({ "room_version": neutrino_common::ROOM_VERSION_ID }))
+            .content(json!({ "room_version": crate::ROOM_VERSION_ID }))
             .prev_events(vec![eid("$bogus:d")])
             .origin_server_ts(1)
             .build()
@@ -635,7 +635,7 @@ mod tests {
     fn from_wire_round_trips_create_event_with_derived_room_id() {
         let built = EventBuilder::new(user("@a:d"), "m.room.create".to_owned())
             .state_key(String::new())
-            .content(json!({ "room_version": neutrino_common::ROOM_VERSION_ID }))
+            .content(json!({ "room_version": crate::ROOM_VERSION_ID }))
             .origin_server_ts(42)
             .build()
             .expect("create");

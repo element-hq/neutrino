@@ -581,7 +581,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use neutrino_common::ROOM_VERSION_ID;
-    use neutrino_state::event_builder::EventBuilder;
+    use neutrino_common::event_builder::EventBuilder;
     use neutrino_store::{EventStore, FederationOutbox, RoomStore};
     use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId};
     use serde_json::{Value, json};

@@ -24,6 +24,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 neutrino-common = { path = "../neutrino-common" }
+neutrino-ctl = { path = "../neutrino-ctl" }
 neutrino-engine = { path = "../neutrino-engine" }
 neutrino-state = { path = "../neutrino-state" }
 neutrino-store = { path = "../neutrino-store" }
