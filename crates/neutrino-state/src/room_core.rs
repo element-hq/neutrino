@@ -63,7 +63,7 @@ use serde_json::Value;
 
 use crate::auth_events::calculate_auth_events;
 use crate::auth_rules::check_auth_rules;
-use crate::event_id::EventBuilder;
+use crate::event_builder::EventBuilder;
 use crate::provider::StateProvider;
 use crate::state_res;
 use crate::validate;
@@ -546,7 +546,7 @@ fn current_state_delta(old: &StateMap<Arc<Event>>, new: &StateMap<OwnedEventId>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_id::EventBuilder;
+    use crate::event_builder::EventBuilder;
     use crate::provider::InMemoryStateProvider;
     use crate::test_utils::next_ts;
     use neutrino_common::ROOM_VERSION_ID;

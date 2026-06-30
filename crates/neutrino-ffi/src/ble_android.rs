@@ -16,8 +16,8 @@
 //! to iterate on first build.
 //!
 //! On non-Android hosts (the binding-generation build, which compiles `ble` on
-//! the host so the Kotlin bindings include `ble_selftest`) this is a no-op:
-//! `blew` uses CoreBluetooth / `bluer` there and needs no JNI bootstrap.
+//! the host) this is a no-op: `blew` uses CoreBluetooth / `bluer` there and
+//! needs no JNI bootstrap.
 
 #[cfg(target_os = "android")]
 mod imp {

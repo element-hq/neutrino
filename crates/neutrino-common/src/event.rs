@@ -23,7 +23,7 @@ use serde_json::value::RawValue;
 /// Parsed view of a Matrix v12 PDU.
 ///
 /// Constructed by the format-validation pass (`neutrino-state::validate`)
-/// and by the server-side event builder (`neutrino-state::event_id`).
+/// and by the server-side event builder (`neutrino-state::event_builder`).
 /// Round-trips through `Event.raw` byte-for-byte.
 #[derive(Debug, Clone)]
 pub struct Event {

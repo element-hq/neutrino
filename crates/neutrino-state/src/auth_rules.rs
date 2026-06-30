@@ -894,7 +894,7 @@ fn check_rule_10_power_levels(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_id::EventBuilder;
+    use crate::event_builder::EventBuilder;
     use crate::provider::InMemoryStateProvider;
     use crate::test_utils::next_ts;
     use neutrino_common::ROOM_VERSION_ID;

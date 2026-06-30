@@ -111,7 +111,7 @@ fn add_unique(keys: &mut Vec<(String, String)>, event_type: &str, state_key: Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_id::EventBuilder;
+    use crate::event_builder::EventBuilder;
     use crate::test_utils::next_ts;
     use neutrino_common::ROOM_VERSION_ID;
     use ruma::room_id;

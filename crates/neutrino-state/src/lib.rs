@@ -6,7 +6,7 @@ use thiserror::Error;
 
 pub mod auth_events;
 pub mod auth_rules;
-pub mod event_id;
+pub mod event_builder;
 pub mod provider;
 pub mod room_core;
 pub mod state_res;

@@ -2,8 +2,6 @@ uniffi::setup_scaffolding!("neutrino");
 
 #[cfg(feature = "ble")]
 mod ble_android;
-#[cfg(feature = "ble")]
-mod ble_selftest;
 // The iroh-backed datagram link: implements `neutrino_main::DatagramLink` over an
 // iroh QUIC endpoint (keyed by 32-byte node ids). Built in `start` and injected
 // into the entrypoint via a `FederationLinkFactory`.

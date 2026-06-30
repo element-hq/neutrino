@@ -13,7 +13,7 @@ use axum::{
     routing::{get, post, put},
 };
 use neutrino_common::{Command, Config, Event, ROOM_VERSION_ID};
-use neutrino_state::event_id::EventBuilder;
+use neutrino_state::event_builder::EventBuilder;
 use neutrino_state::provider::InMemoryStateProvider;
 use neutrino_state::room_core::{Effect, RoomCore};
 use neutrino_state::{CoreError, FormatError};
@@ -1614,7 +1614,7 @@ mod tests {
         // `Command::Shutdown`. (That the supervisor actually aborts its children
         // is pinned by `sender::tests::supervisor_returns_on_shutdown`.)
         use neutrino_common::ROOM_VERSION_ID;
-        use neutrino_state::event_id::EventBuilder;
+        use neutrino_state::event_builder::EventBuilder;
         use neutrino_store::{EventStore, RoomStore};
 
         let tmp = TempDir::new().expect("tempdir");

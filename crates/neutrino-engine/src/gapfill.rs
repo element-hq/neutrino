@@ -17,7 +17,7 @@
 //! no separate "promote" step.
 
 use neutrino_common::Event;
-use neutrino_state::event_id::from_wire;
+use neutrino_state::event_builder::from_wire;
 use neutrino_store::StorageBackend;
 use ruma::{EventId, OwnedEventId, RoomId, ServerName};
 

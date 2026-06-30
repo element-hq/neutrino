@@ -25,7 +25,7 @@ use neutrino_common::ROOM_VERSION_ID;
 use neutrino_common::event_id::room_id_from_create;
 use neutrino_state::auth_events::{auth_event_keys, calculate_auth_events};
 use neutrino_state::auth_rules::check_auth_rules;
-use neutrino_state::event_id::EventBuilder;
+use neutrino_state::event_builder::EventBuilder;
 use neutrino_state::provider::{InMemoryStateProvider, StateProvider};
 use neutrino_state::room_core::{Effect, RoomCore};
 use neutrino_state::state_res::{

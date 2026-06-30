@@ -757,7 +757,7 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomRegistry<S> {
 mod tests {
     use super::*;
     use neutrino_common::ROOM_VERSION_ID;
-    use neutrino_state::event_id::EventBuilder;
+    use neutrino_state::event_builder::EventBuilder;
     use neutrino_store::{EventStore, FederationOutbox, RoomStore, StateStore};
     use ruma::server_name;
     use serde_json::json;
