@@ -203,11 +203,18 @@ never use .unwrap() in handler code.
   (defensive, not fatal). Hand-rolled request/response JSON (matching the spec
   wire shape) + ruma `OwnedUserId` for id validation — avoids enabling a new ruma
   feature, consistent with the `members`/`profile` handlers.
-- **Done so far:** registry (-ctl) + endpoint + `AppState::discovery()` wiring +
-  tests. **Outstanding:** (1) FFI `set_discovered_peers` snapshot handoff —
-  surface the `Arc<DiscoveryRegistry>` from `serve`/`entrypoint` onto
-  `NeutrinoHandle`, add `display_name` to `NeutrinoConfig` (also de-stubs
-  `/profile`); (2) Android — fork `blew` to extended advertising
+- **FFI handoff (done):** the `Arc<DiscoveryRegistry>` is dependency-injected —
+  ffi `start` creates it, keeps a clone on `NeutrinoHandle`, and passes a clone
+  through `entrypoint` (new trailing `Option<Arc<DiscoveryRegistry>>` param,
+  defaulted; non-embedded callers pass `None`) → `serve` (required `Arc` param)
+  → `AppState::from_store_with_discovery`. `NeutrinoHandle::set_discovered_peers(
+  Vec<DiscoveredPeer{node_id, display_name}>)` replaces the snapshot, stamping
+  the fixed localpart `n` and a `last_seen_ms` clock read. `display_name` added
+  to `NeutrinoConfig`/`Config`; `/profile` de-stubbed (self → configured name,
+  peer → registry lookup by `server_name`, unknown → `{}`). ctl/http/main/dev
+  binary compile + clippy-clean + tests green; **ffi itself is unbuildable in
+  the sandbox** (bluer/iroh uncached) — verified by review + the buildable stack.
+- **Outstanding:** Android — fork `blew` to extended advertising
   (`startAdvertisingSet`, `setLegacyMode(false)`; the 32 B node id + ≤20 B name
   overflow the 31 B legacy cap) + manufacturer data `0xDFFF` =
   `[version][node_id:32][display_name]`, and switch the scanner to

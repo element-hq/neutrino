@@ -207,21 +207,35 @@ impl AppState {
     /// simplest to construct directly through the trait rather than via the
     /// CSAPI write path.
     pub(crate) fn from_store(config: Config, store: Arc<SqliteStore>) -> Self {
+        Self::from_store_with_discovery(config, store, Arc::new(DiscoveryRegistry::new()))
+    }
+
+    /// Like [`AppState::from_store`] but with a caller-owned discovery registry.
+    /// The production path ([`serve`]) injects the registry the host holds a
+    /// write handle to (so its BLE-discovery callback and the router read the
+    /// same set); [`from_store`] passes a fresh empty one for tests/the dev binary.
+    pub(crate) fn from_store_with_discovery(
+        config: Config,
+        store: Arc<SqliteStore>,
+        discovery: Arc<DiscoveryRegistry>,
+    ) -> Self {
         let client = Arc::new(FederationClient::new(
             config.server_name.clone(),
             config.federation_proxy.as_deref(),
         ));
         let fetcher: Arc<dyn MissingEventsFetcher> = Arc::new(ReqwestFetcher::new(client));
-        Self::from_store_with_fetcher(config, store, fetcher)
+        Self::from_store_with_fetcher(config, store, fetcher, discovery)
     }
 
-    /// Like [`AppState::from_store`] but with an explicit gap-fill `fetcher`.
-    /// The federation gap-fill tests inject a deterministic stub here instead
-    /// of the reqwest client (which would otherwise reach the network).
+    /// Like [`AppState::from_store`] but with an explicit gap-fill `fetcher`
+    /// (and discovery registry). The federation gap-fill tests inject a
+    /// deterministic stub fetcher here instead of the reqwest client (which
+    /// would otherwise reach the network).
     fn from_store_with_fetcher(
         config: Config,
         store: Arc<SqliteStore>,
         fetcher: Arc<dyn MissingEventsFetcher>,
+        discovery: Arc<DiscoveryRegistry>,
     ) -> Self {
         let shutdown = CancellationToken::new();
         let sync_state = Arc::new(SyncState::new(store.clone(), shutdown.clone()));
@@ -243,7 +257,7 @@ impl AppState {
             fetcher,
             sync_state,
             keys: None,
-            discovery: Arc::new(DiscoveryRegistry::new()),
+            discovery,
             config,
             shutdown,
             kick_backoff,
@@ -340,12 +354,17 @@ pub async fn serve(
     config: Config,
     store: Arc<SqliteStore>,
     commands: mpsc::UnboundedReceiver<Command>,
+    // Out-of-band peer discovery registry. The embedding host holds a clone and
+    // pushes the visible peer set into it; the user-directory search handler
+    // reads it. Non-embedded callers (the dev binary / e2e tests) pass a fresh
+    // empty one — discovery is a no-op without the BLE side channel.
+    discovery: Arc<DiscoveryRegistry>,
 ) -> Result<(), StartupError> {
     // The caller (the entrypoint) opens the store, resolves the server identity
     // from it, and hands the live handle in — so we build state around it rather
     // than re-opening the same DB.
     AppState::validate_config(&config)?;
-    let state = AppState::from_store(config, store);
+    let state = AppState::from_store_with_discovery(config, store, discovery);
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
     // enumeration resumes delivery of anything left undelivered.
@@ -444,7 +463,12 @@ pub(crate) fn router_with_store_and_fetcher(
     store: Arc<SqliteStore>,
     fetcher: Arc<dyn MissingEventsFetcher>,
 ) -> Router {
-    let state = AppState::from_store_with_fetcher(config, store, fetcher);
+    let state = AppState::from_store_with_fetcher(
+        config,
+        store,
+        fetcher,
+        Arc::new(DiscoveryRegistry::new()),
+    );
     build_router(&state)
 }
 
@@ -1026,10 +1050,31 @@ async fn signatures_upload(state: State<AppState>, body: Json<Value>) -> Json<Va
     Json(json!({}))
 }
 
-async fn profile(axum::extract::Path(_user_id): axum::extract::Path<String>) -> Json<Value> {
-    Json(json!({
-        "displayname": "Alice",
-    }))
+/// `GET /_matrix/client/v3/profile/{user_id}`.
+///
+/// Resolves the local user's display name from config, and a discovered peer's
+/// from the [`DiscoveryRegistry`] (matched on the user id's `server_name`). An
+/// unknown user yields an empty profile (`{}`) — the spec permits an absent
+/// `displayname`, and the embedded server has no profile store to 404 against.
+async fn profile(
+    state: State<AppState>,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+) -> Json<Value> {
+    let app = lock_app(&state.0);
+    let displayname = if user_id == app.config.user_id() {
+        // Self: the configured display name (the one advertised over BLE).
+        (!app.config.display_name.is_empty()).then(|| app.config.display_name.clone())
+    } else {
+        // A discovered peer? Match on the server_name (the user id's domain).
+        user_id
+            .rsplit_once(':')
+            .and_then(|(_, server_name)| app.discovery.get(server_name))
+            .map(|peer| peer.display_name)
+    };
+    match displayname {
+        Some(dn) => Json(json!({ "displayname": dn })),
+        None => Json(json!({})),
+    }
 }
 
 /// Default result cap when the client omits `limit`
@@ -1779,7 +1824,13 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let (tx, rx) = mpsc::unbounded_channel();
-        let server = tokio::spawn(super::serve(listener, config, store, rx));
+        let server = tokio::spawn(super::serve(
+            listener,
+            config,
+            store,
+            rx,
+            Arc::new(super::DiscoveryRegistry::new()),
+        ));
 
         // Give the sender supervisor a moment to discover the dead peer and
         // spawn its per-destination task (which will be retrying the dead peer).

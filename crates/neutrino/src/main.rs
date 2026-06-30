@@ -21,7 +21,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _commands_tx = commands_tx;
     // The dev binary runs the homeserver directly with no embedded relay/TUN, so
     // no tunnel handoff and no injected federation link (plain UDP federation).
-    neutrino_main::entrypoint(neutrino_main::Config::from_env(), commands_rx, None, None).await
+    neutrino_main::entrypoint(
+        neutrino_main::Config::from_env(),
+        commands_rx,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 /// Translate SIGUSR2 into [`neutrino_main::Command::KickBackoff`] for the local

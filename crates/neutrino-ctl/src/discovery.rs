@@ -59,6 +59,12 @@ impl DiscoveryRegistry {
         self.write().insert(server_name, peer);
     }
 
+    /// The peer currently known at `server_name`, if any. Used by `/profile`
+    /// to resolve a discovered peer's display name.
+    pub fn get(&self, server_name: &str) -> Option<DiscoveredPeer> {
+        self.read().get(server_name).cloned()
+    }
+
     /// Peers whose display name contains `term` (case-insensitive), returned as
     /// `(server_name, peer)` pairs sorted by `(display_name, server_name)` so
     /// results are deterministic. An empty `term` matches every peer. The

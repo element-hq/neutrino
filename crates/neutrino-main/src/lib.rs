@@ -4,7 +4,7 @@ mod resolver;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-pub use neutrino_ctl::{Command, Config};
+pub use neutrino_ctl::{Command, Config, DiscoveredPeer, DiscoveryRegistry};
 pub use neutrino_lb::DatagramLink;
 
 use std::future::Future;
@@ -45,8 +45,14 @@ pub async fn entrypoint(
     // non-embedded callers (the dev binary) pass `None`.
     handoff: Option<watch::Sender<Option<String>>>,
     link_factory: Option<FederationLinkFactory>,
+    // Out-of-band peer discovery registry. The embedding host (ffi) supplies the
+    // `Arc` it keeps a write handle to, so its BLE-discovery callback and the
+    // homeserver's user-directory search read the same set. Non-embedded callers
+    // (the dev binary / tests) pass `None` and a fresh empty registry is used.
+    discovery: Option<Arc<DiscoveryRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
+    let discovery = discovery.unwrap_or_else(|| Arc::new(DiscoveryRegistry::new()));
 
     // Open the store once, here, and resolve the server's stable identity from
     // it before anything reads `config`. The same handle is threaded into the
@@ -112,7 +118,7 @@ pub async fn entrypoint(
             );
             let shutdown = CancellationToken::new();
             let lb = neutrino_lb::serve(lb_config, shutdown.clone());
-            let hs = neutrino_http::serve(listener, config, store, commands);
+            let hs = neutrino_http::serve(listener, config, store, commands, discovery);
             tokio::pin!(lb, hs);
             tokio::select! {
                 // The homeserver owns the command channel, so it drives the
@@ -145,7 +151,7 @@ pub async fn entrypoint(
                 }
             }
         }
-        None => neutrino_http::serve(listener, config, store, commands).await?,
+        None => neutrino_http::serve(listener, config, store, commands, discovery).await?,
     }
     Ok(())
 }
