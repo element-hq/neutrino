@@ -18,10 +18,6 @@ use relay_transport::{IrohTransport, RELAY_BIND};
 pub struct NeutrinoConfig {
     pub bind_addr: String,
     pub localpart: String,
-    /// Display name for this device's user. Returned by `/profile` for the
-    /// local user and advertised over the BLE discovery side channel. The host
-    /// prompts for it at startup (≤20 bytes, enforced host-side).
-    pub display_name: String,
     /// Absolute path to a writable directory the host owns (e.g. Android's
     /// `context.filesDir`). The DB is `<storage_dir>/neutrino.db`.
     pub storage_dir: String,
@@ -44,7 +40,6 @@ impl From<NeutrinoConfig> for neutrino_main::Config {
             server_name: String::new(),
             bind_addr: c.bind_addr,
             localpart: c.localpart,
-            display_name: c.display_name,
             storage_dir: std::path::PathBuf::from(c.storage_dir),
             // Floor-to-1 invariant lives on `Config`, shared with `from_env`.
             outbound_concurrency: neutrino_main::Config::clamp_outbound_concurrency(
@@ -268,7 +263,6 @@ mod tests {
         let nc = NeutrinoConfig {
             bind_addr: "127.0.0.1:8008".to_string(),
             localpart: "alice".to_string(),
-            display_name: "Alice".to_string(),
             storage_dir: "/data/neutrino".to_string(),
             outbound_concurrency: 0, // must clamp to 1
             lb_federation_port: Some(8448),
@@ -278,7 +272,6 @@ mod tests {
         assert_eq!(cfg.server_name, "");
         assert_eq!(cfg.bind_addr, "127.0.0.1:8008");
         assert_eq!(cfg.localpart, "alice");
-        assert_eq!(cfg.display_name, "Alice");
         assert_eq!(cfg.storage_dir, std::path::PathBuf::from("/data/neutrino"));
         assert_eq!(cfg.outbound_concurrency, 1);
         assert_eq!(cfg.lb_federation_port, Some(8448));
@@ -352,7 +345,6 @@ mod tests {
         let nc = NeutrinoConfig {
             bind_addr: "127.0.0.1:8008".to_string(),
             localpart: "alice".to_string(),
-            display_name: String::new(),
             storage_dir: "/data/neutrino".to_string(),
             outbound_concurrency: 4,
             lb_federation_port: None,

@@ -18,7 +18,7 @@ use neutrino_event::{Event, FormatError, ROOM_VERSION_ID};
 use neutrino_room::CoreError;
 use neutrino_room::provider::InMemoryStateProvider;
 use neutrino_room::room_core::{Effect, RoomCore};
-use neutrino_store::{RoomStore, StateStore, StorageError};
+use neutrino_store::{IdentityStore, RoomStore, StateStore, StorageError};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5;
 use ruma::events::AnyTimelineEvent;
@@ -497,6 +497,10 @@ fn build_router(state: &AppState) -> Router {
             post(signatures_upload),
         )
         .route("/_matrix/client/v3/profile/{user_id}", get(profile))
+        .route(
+            "/_matrix/client/v3/profile/{user_id}/displayname",
+            get(get_display_name).put(put_display_name),
+        )
         .route(
             "/_matrix/client/v3/user_directory/search",
             post(user_directory_search),
@@ -1050,30 +1054,89 @@ async fn signatures_upload(state: State<AppState>, body: Json<Value>) -> Json<Va
     Json(json!({}))
 }
 
-/// `GET /_matrix/client/v3/profile/{user_id}`.
-///
-/// Resolves the local user's display name from config, and a discovered peer's
-/// from the [`DiscoveryRegistry`] (matched on the user id's `server_name`). An
-/// unknown user yields an empty profile (`{}`) — the spec permits an absent
-/// `displayname`, and the embedded server has no profile store to 404 against.
+/// Product default for the local user's display name, returned by `/profile`
+/// until the client sets one via `PUT .../displayname`.
+const DEFAULT_DISPLAY_NAME: &str = "Neutrino";
+
+/// Resolve a user's display name: the local user's from the persistent
+/// [`IdentityStore`] (falling back to [`DEFAULT_DISPLAY_NAME`]), a discovered
+/// peer's from the [`DiscoveryRegistry`] (matched on the user id's
+/// `server_name`). `None` only for an unknown remote user.
+async fn resolve_display_name(state: &AppState, user_id: &str) -> Option<String> {
+    let (is_self, store, discovery) = {
+        let app = lock_app(state);
+        (
+            user_id == app.config.user_id(),
+            app.store.clone(),
+            app.discovery.clone(),
+        )
+    };
+    if is_self {
+        return Some(
+            store
+                .get_display_name()
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| DEFAULT_DISPLAY_NAME.to_string()),
+        );
+    }
+    user_id
+        .rsplit_once(':')
+        .and_then(|(_, server_name)| discovery.get(server_name))
+        .map(|peer| peer.display_name)
+}
+
+/// `GET /_matrix/client/v3/profile/{user_id}` and the `/displayname` keyed
+/// variant. An unknown remote user yields an empty profile (`{}`) — the spec
+/// permits an absent `displayname`, and there is no profile store to 404 a
+/// never-seen peer against.
 async fn profile(
     state: State<AppState>,
     axum::extract::Path(user_id): axum::extract::Path<String>,
 ) -> Json<Value> {
-    let app = lock_app(&state.0);
-    let displayname = if user_id == app.config.user_id() {
-        // Self: the configured display name (the one advertised over BLE).
-        (!app.config.display_name.is_empty()).then(|| app.config.display_name.clone())
-    } else {
-        // A discovered peer? Match on the server_name (the user id's domain).
-        user_id
-            .rsplit_once(':')
-            .and_then(|(_, server_name)| app.discovery.get(server_name))
-            .map(|peer| peer.display_name)
-    };
-    match displayname {
+    match resolve_display_name(&state.0, &user_id).await {
         Some(dn) => Json(json!({ "displayname": dn })),
         None => Json(json!({})),
+    }
+}
+
+/// `GET /_matrix/client/v3/profile/{user_id}/displayname` — the keyed variant
+/// of [`profile`], returning only the `displayname` field.
+async fn get_display_name(
+    state: State<AppState>,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+) -> Json<Value> {
+    match resolve_display_name(&state.0, &user_id).await {
+        Some(dn) => Json(json!({ "displayname": dn })),
+        None => Json(json!({})),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SetDisplayNameRequest {
+    #[serde(default)]
+    displayname: String,
+}
+
+/// `PUT /_matrix/client/v3/profile/{user_id}/displayname`
+/// (https://spec.matrix.org/v1.18/client-server-api/#put_matrixclientv3profileuseriddisplayname).
+/// Persists the local user's display name in the [`IdentityStore`]. The embedded
+/// server is single-user, so the path `user_id` is the local user by
+/// construction; the name is stored verbatim.
+async fn put_display_name(
+    state: State<AppState>,
+    axum::extract::Path(_user_id): axum::extract::Path<String>,
+    Json(req): Json<SetDisplayNameRequest>,
+) -> axum::response::Response {
+    let store = lock_app(&state.0).store.clone();
+    match store.set_display_name(&req.displayname).await {
+        Ok(()) => Json(json!({})).into_response(),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &e.to_string(),
+        ),
     }
 }
 
@@ -1720,6 +1783,70 @@ mod tests {
 
         assert_eq!(body["limited"], serde_json::json!(true));
         assert_eq!(body["results"].as_array().expect("results").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn profile_default_then_persisted_display_name() {
+        let (state, _tmp) = test_state().await;
+        // test_config: localpart "alice", server_name "127.0.0.1".
+        let self_id = "@alice:127.0.0.1".to_string();
+
+        // Unset → product default "Neutrino".
+        let body = super::profile(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(self_id.clone()),
+        )
+        .await
+        .0;
+        assert_eq!(body["displayname"], json!("Neutrino"));
+
+        // Persist via PUT, then GET reflects it (and survives in the store).
+        super::put_display_name(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(self_id.clone()),
+            axum::Json(super::SetDisplayNameRequest {
+                displayname: "Zaphod".to_string(),
+            }),
+        )
+        .await;
+        let body = super::profile(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(self_id),
+        )
+        .await
+        .0;
+        assert_eq!(body["displayname"], json!("Zaphod"));
+    }
+
+    #[tokio::test]
+    async fn profile_resolves_peer_from_registry_and_unknown_is_empty() {
+        use neutrino_ctl::DiscoveredPeer;
+        let (state, _tmp) = test_state().await;
+        state.discovery().upsert(
+            "peernode".to_string(),
+            DiscoveredPeer {
+                localpart: "n".to_string(),
+                display_name: "Trillian".to_string(),
+                last_seen_ms: 0,
+            },
+        );
+
+        let body = super::profile(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("@n:peernode".to_string()),
+        )
+        .await
+        .0;
+        assert_eq!(body["displayname"], json!("Trillian"));
+
+        // An unknown remote user → empty profile.
+        let body = super::profile(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("@x:unknownserver".to_string()),
+        )
+        .await
+        .0;
+        assert_eq!(body, json!({}));
     }
 
     #[tokio::test]

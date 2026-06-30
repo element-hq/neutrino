@@ -38,10 +38,6 @@ pub struct Config {
     pub server_name: String,
     pub bind_addr: String,
     pub localpart: String,
-    /// Display name advertised for this server's user, returned by `/profile`
-    /// for the local user and broadcast over the discovery side channel. Empty
-    /// by default (the dev binary); the embedded host sets it at startup.
-    pub display_name: String,
     /// Max outbound federation transactions in flight across all destinations
     /// at once (the sender pool's global concurrency bound). Always ≥ 1.
     pub outbound_concurrency: usize,
@@ -77,7 +73,6 @@ impl Default for Config {
             server_name: DEFAULT_SERVER_NAME.to_string(),
             bind_addr: DEFAULT_BIND_ADDR.to_string(),
             localpart: DEFAULT_LOCALPART.to_string(),
-            display_name: String::new(),
             outbound_concurrency: DEFAULT_OUTBOUND_CONCURRENCY,
             storage_dir: PathBuf::from(DEFAULT_STORAGE_DIR),
             federation_proxy: None,

@@ -209,11 +209,19 @@ never use .unwrap() in handler code.
   defaulted; non-embedded callers pass `None`) → `serve` (required `Arc` param)
   → `AppState::from_store_with_discovery`. `NeutrinoHandle::set_discovered_peers(
   Vec<DiscoveredPeer{node_id, display_name}>)` replaces the snapshot, stamping
-  the fixed localpart `n` and a `last_seen_ms` clock read. `display_name` added
-  to `NeutrinoConfig`/`Config`; `/profile` de-stubbed (self → configured name,
-  peer → registry lookup by `server_name`, unknown → `{}`). ctl/http/main/dev
+  the fixed localpart `n` and a `last_seen_ms` clock read. ctl/http/main/dev
   binary compile + clippy-clean + tests green; **ffi itself is unbuildable in
   the sandbox** (bluer/iroh uncached) — verified by review + the buildable stack.
+- **Local display name is persisted in the store, not config (2026-06-30).**
+  The client sets it via `PUT /_matrix/client/v3/profile/{user}/displayname`
+  (+ `GET .../displayname`), so it MUST persist — it lives in the `IdentityStore`,
+  not a startup `Config` field (an earlier `Config.display_name` was removed as a
+  redundant second source of truth). The `node_identity` table was replaced by a
+  key/value `server_identity` table (`key='secret'` → 32 B, `key='displayname'`
+  → text; room for more k/v facts without a schema change — no migration, fresh
+  DB only). `IdentityStore` gained `get_display_name`/`set_display_name`.
+  `/profile` resolves: self → stored name (default **"Neutrino"**, not "Alice"),
+  discovered peer → registry by `server_name`, unknown remote → `{}`.
 - **Outstanding:** Android — fork `blew` to extended advertising
   (`startAdvertisingSet`, `setLegacyMode(false)`; the 32 B node id + ≤20 B name
   overflow the 31 B legacy cap) + manufacturer data `0xDFFF` =
