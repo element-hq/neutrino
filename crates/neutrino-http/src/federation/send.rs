@@ -45,9 +45,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 use tracing::warn;
 
-use crate::federation::reconcile::{self, ForwardExtremities};
+use crate::federation::reconcile;
 use crate::federation::{FedError, auth};
 use crate::{AppState, lock_app};
+use neutrino_engine::ForwardExtremities;
 
 /// Inbound federation transaction body.
 ///

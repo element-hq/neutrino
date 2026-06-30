@@ -146,11 +146,12 @@ Intentional gaps in the sliding-sync implementation — see `MSC4186-gaps.md`:
 - fold the repeated `FederationClient` PUT-event idiom into one helper
 - federated-invite error-code parity with the local invite path
 - OOB-invite join review leftovers (noted, not blocking): `federated_join_if_remote` runs twice on the `join_by_id_or_alias`→`join` fall-through; a single private `join_core(hints)` would collapse it. No single shared "is this room remote / who is the inviter's resident server" predicate (invite/leave/join each re-derive it).
-- `neutrino-engine` extraction phases 1-3 (Phase 0 landed 2026-06-30): define
-  outbound ports (`FederationTransport`, promote `MissingEventsFetcher`), move the
-  room runtime (registry/actor/worker/sender-policy) into a new crate, slim
-  handlers to glue. Add an in-memory `StorageBackend` double then (when the engine
-  crate wants to test without the sqlite dep).
+- `neutrino-engine` extraction phases 2-3 (Phase 0 + Phase 1 landed 2026-06-30):
+  physically move the room runtime (registry/actor/worker/sender-policy/reconcile)
+  out of `neutrino-http` into `neutrino-engine` (the outbound ports + crossing
+  types already live there as of Phase 1), then slim the handlers to glue. Add an
+  in-memory `StorageBackend` double then (when the engine crate wants to test
+  without the sqlite dep).
 - multi-server / idempotency federation tests
 - port the relevant Synapse + Complement membership-endpoint tests
 - `storage_dir` empty-string handling: an exported-but-empty `NEUTRINO_STORAGE_DIR=` (and the FFI
@@ -176,6 +177,30 @@ never use .unwrap() in handler code.
 - Restricted rooms (`join_authorised_via_users_server`) — documented, not implemented
 
 ## decisions log
+
+### engine outbound ports — `neutrino-engine` crate created (2026-06-30)
+- Phase 1 of the extraction: created the `neutrino-engine` crate holding only the
+  outbound port traits and the types that cross them. No runtime code moved yet —
+  the runtime (still in `neutrino-http`) now depends on engine traits, not on
+  http/reqwest types, so Phase 2 is a near-pure file move.
+- Two ports: `FederationTransport::send_transaction` (the per-destination sender
+  pool's only network call) and `MissingEventsFetcher::fetch` (promoted from the
+  `pub(crate)` trait in `gapfill.rs`). Both object-safe → honest `dyn`.
+- Three types relocated into engine: `MissingEventsQuery`, `ForwardExtremities`
+  (+ `is_empty`), and a new neutral `TransportError { Status(u16), Transient }`
+  replacing `FederationClientError` at the boundary — `FederationClientError`
+  carries `reqwest::Error` and must NOT leak into engine. `FederationClientError`
+  stays in http for the membership-client methods (`make_join`/`send_join`/… —
+  handler-driven, not runtime, deliberately not ported). `From<FederationClientError>
+  for TransportError` maps `Status → Status`, else `Transient(display)`.
+- The inversion: `sender::spawn` now takes an injected `Arc<dyn FederationTransport>`
+  instead of building the `FederationClient` from `origin`/`federation_proxy`;
+  `serve()` constructs the client and injects it. The direct-vs-lb-proxy routing
+  stays inside the http `FederationClient` impl, so engine is transport-oblivious
+  (verified: the three `e2e_lb_*` proxy tests still pass).
+- Engine deps are minimal (ruma, serde, serde_json, async-trait, thiserror) — no
+  reqwest, no axum, no neutrino-common/store/state yet; those arrive in Phase 2
+  when the runtime moves.
 
 ### room runtime decoupled from concrete store (2026-06-30)
 - Phase 0 of the planned `neutrino-engine` extraction: make the `StorageBackend`

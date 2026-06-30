@@ -43,7 +43,7 @@ mod sliding_sync;
 mod multi_user;
 
 use federation::client::{FederationClient, ReqwestFetcher};
-use federation::gapfill::MissingEventsFetcher;
+use neutrino_engine::MissingEventsFetcher;
 use room_actor::{RoomActorError, RoomRegistry};
 use sliding_sync::{SyncError, SyncState};
 
@@ -337,16 +337,19 @@ pub async fn serve(
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
     // enumeration resumes delivery of anything left undelivered.
+    let transport = Arc::new(FederationClient::new(
+        state.server_name(),
+        state.federation_proxy().as_deref(),
+    ));
     let sender_task = federation::sender::spawn(
         state.store(),
-        state.server_name(),
+        transport,
         state.outbound_concurrency(),
         state.startup_jitter(),
         state.subscribe_shutdown(),
         state.subscribe_kick(),
         state.fetcher(),
         state.worker_poke(),
-        state.federation_proxy(),
     );
     let router = build_router(&state);
     // `dispatch` resolves on a terminal command or when every sender is dropped,

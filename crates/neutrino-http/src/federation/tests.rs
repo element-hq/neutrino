@@ -36,9 +36,8 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-use crate::federation::client::FederationClientError;
-use crate::federation::gapfill::{MissingEventsFetcher, MissingEventsQuery};
 use crate::{router, router_with_store, router_with_store_and_fetcher};
+use neutrino_engine::{MissingEventsFetcher, MissingEventsQuery, TransportError};
 
 /// The arguments one `fetch` call was made with, recorded so a test can assert
 /// the gap-fill loop targets the right frontier / boundary / limit.
@@ -118,7 +117,7 @@ impl MissingEventsFetcher for StubFetcher {
     async fn fetch(
         &self,
         q: MissingEventsQuery<'_>,
-    ) -> Result<Vec<Box<RawJsonValue>>, FederationClientError> {
+    ) -> Result<Vec<Box<RawJsonValue>>, TransportError> {
         self.calls.lock().unwrap().push(FetchCall {
             latest: q.latest.to_vec(),
             earliest: q.earliest.to_vec(),
@@ -136,7 +135,7 @@ impl MissingEventsFetcher for StubFetcher {
             StubOutcome::Sequence(batches) => {
                 Ok(batches.pop_front().map(|b| rebuild(&b)).unwrap_or_default())
             }
-            StubOutcome::Error(code) => Err(FederationClientError::Status(*code)),
+            StubOutcome::Error(code) => Err(TransportError::Status(*code)),
         }
     }
 }
@@ -2438,7 +2437,7 @@ async fn reconcile_ignores_advertisement_from_non_member_peer() {
     let ghost: OwnedEventId = "$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         .try_into()
         .unwrap();
-    let advertised = crate::federation::reconcile::ForwardExtremities {
+    let advertised = neutrino_engine::ForwardExtremities {
         timeline: vec![ghost],
         state: vec![join_id],
     };

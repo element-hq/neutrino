@@ -22,35 +22,16 @@ use neutrino_state::event_id::from_wire;
 use neutrino_store::{EventStore, RoomStore, StagingStore};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId, ServerName};
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::federation::auth;
-use crate::federation::gapfill::{MissingEventsFetcher, MissingEventsQuery};
+use neutrino_engine::{ForwardExtremities, MissingEventsFetcher, MissingEventsQuery};
 
 /// Initial `limit` for a reconciliation fetch. We only need the advertised
 /// head(s) staged — the worker's state-DAG gap-fill grounds anything deeper — so
 /// a modest page suffices; it is not the whole-ancestry budget.
 const RECONCILE_LIMIT: u32 = 50;
-
-/// A room's advertised forward extremities — the anti-entropy wire shape carried
-/// on `/send` requests and responses. Both head-sets are advertised: the timeline
-/// DAG heads and the state DAG heads (MSC4242), so a peer can tell message-DAG
-/// divergence from state-DAG divergence and walk the right edges to reconcile.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub(crate) struct ForwardExtremities {
-    #[serde(default)]
-    pub timeline: Vec<OwnedEventId>,
-    #[serde(default)]
-    pub state: Vec<OwnedEventId>,
-}
-
-impl ForwardExtremities {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.timeline.is_empty() && self.state.is_empty()
-    }
-}
 
 /// The first few event ids as a loggable list — a debugging aid on the
 /// anti-entropy log lines. The set is usually ≤ 3 (a room's forward extremities),

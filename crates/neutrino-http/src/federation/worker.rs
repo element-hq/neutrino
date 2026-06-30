@@ -64,9 +64,10 @@ use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::federation::gapfill::{MissingEventsFetcher, fill_state_ancestry};
+use crate::federation::gapfill::fill_state_ancestry;
 use crate::federation::{BACKOFF_BASE, jitter, next_backoff};
 use crate::room_actor::{RoomActorError, RoomRegistry};
+use neutrino_engine::MissingEventsFetcher;
 
 /// Buffer for the in-process poke channel. A poke is just a room id; the
 /// supervisor coalesces duplicates (re-reading the room's staged rows each

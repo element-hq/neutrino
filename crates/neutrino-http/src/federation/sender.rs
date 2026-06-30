@@ -58,9 +58,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::federation::client::{FederationClient, FederationClientError, TxnIdGen};
-use crate::federation::gapfill::MissingEventsFetcher;
-use crate::federation::reconcile::{self, ForwardExtremities};
+use neutrino_engine::{
+    FederationTransport, ForwardExtremities, MissingEventsFetcher, TransportError,
+};
+
+use crate::federation::client::TxnIdGen;
+use crate::federation::reconcile;
 use crate::federation::{BACKOFF_BASE, MAX_PDUS_PER_TXN, jitter, next_backoff, now_ms};
 
 /// Shared, cheaply-cloneable handles every sender task needs. Bundled so the
@@ -69,7 +72,7 @@ use crate::federation::{BACKOFF_BASE, MAX_PDUS_PER_TXN, jitter, next_backoff, no
 #[derive(Clone)]
 struct SenderCtx {
     store: Arc<SqliteStore>,
-    client: Arc<FederationClient>,
+    transport: Arc<dyn FederationTransport>,
     idgen: Arc<TxnIdGen>,
     send_slots: Arc<Semaphore>,
     /// Anti-entropy: peer fetcher for reconciling against the forward extremities
@@ -89,25 +92,23 @@ struct SenderCtx {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     store: Arc<SqliteStore>,
-    origin: String,
+    transport: Arc<dyn FederationTransport>,
     concurrency: usize,
     startup_jitter: Duration,
     shutdown: CancellationToken,
     kick_rx: watch::Receiver<()>,
     fetcher: Arc<dyn MissingEventsFetcher>,
     worker_poke: mpsc::Sender<OwnedRoomId>,
-    federation_proxy: Option<String>,
 ) -> JoinHandle<()> {
     spawn_with(
         store,
-        origin,
+        transport,
         concurrency,
         startup_jitter,
         shutdown,
         kick_rx,
         fetcher,
         worker_poke,
-        federation_proxy,
     )
 }
 
@@ -116,17 +117,15 @@ pub(crate) fn spawn(
 #[allow(clippy::too_many_arguments)]
 fn spawn_with(
     store: Arc<SqliteStore>,
-    origin: String,
+    transport: Arc<dyn FederationTransport>,
     concurrency: usize,
     startup_jitter_max: Duration,
     shutdown: CancellationToken,
     kick_rx: watch::Receiver<()>,
     fetcher: Arc<dyn MissingEventsFetcher>,
     worker_poke: mpsc::Sender<OwnedRoomId>,
-    federation_proxy: Option<String>,
 ) -> JoinHandle<()> {
     let watch_rx = store.subscribe();
-    let client = Arc::new(FederationClient::new(origin, federation_proxy.as_deref()));
     // Process-startup prefix keeps txn ids unique across restarts; the
     // in-memory counter keeps them unique within a run.
     let idgen = Arc::new(TxnIdGen::new(now_ms()));
@@ -136,7 +135,7 @@ fn spawn_with(
     let send_slots = Arc::new(Semaphore::new(concurrency.max(1)));
     let ctx = SenderCtx {
         store,
-        client,
+        transport,
         idgen,
         send_slots,
         fetcher,
@@ -352,7 +351,7 @@ async fn send_transaction_with_retry(
         // any backoff sleep, so a slow peer can't pin a concurrency slot.
         let send_result = match ctx.send_slots.acquire().await {
             Ok(_permit) => {
-                ctx.client
+                ctx.transport
                     .send_transaction(dest, txn_id, pdus, our_fes)
                     .await
             }
@@ -364,7 +363,7 @@ async fn send_transaction_with_retry(
         match send_result {
             Ok(peer_fes) => return SendOutcome::Delivered(peer_fes),
             // 4xx: the peer rejected the envelope. Retrying is futile.
-            Err(FederationClientError::Status(code)) if (400..500).contains(&code) => {
+            Err(TransportError::Status(code)) if (400..500).contains(&code) => {
                 warn!(%dest, code, pdus = pdus.len(), "peer rejected transaction (4xx)");
                 return SendOutcome::Rejected;
             }
@@ -603,6 +602,7 @@ mod tests {
 
     use super::*;
     use crate::federation::BACKOFF_CAP;
+    use crate::federation::client::FederationClient;
     use crate::federation::test_support::{dead_peer, spawn_stub};
 
     /// A shutdown token that never fires — for tests exercising non-shutdown paths.
@@ -625,13 +625,21 @@ mod tests {
     impl MissingEventsFetcher for NoFetcher {
         async fn fetch(
             &self,
-            _q: crate::federation::gapfill::MissingEventsQuery<'_>,
-        ) -> Result<Vec<Box<RawJsonValue>>, FederationClientError> {
+            _q: neutrino_engine::MissingEventsQuery<'_>,
+        ) -> Result<Vec<Box<RawJsonValue>>, TransportError> {
             Ok(Vec::new())
         }
     }
     fn null_fetcher() -> Arc<dyn MissingEventsFetcher> {
         Arc::new(NoFetcher)
+    }
+
+    /// A real `FederationClient` (origin `local.test`, no proxy) as the
+    /// transport — the sender tests drive the actual send path against a mock
+    /// peer addressed by the outbox `dest`, so they need the concrete client,
+    /// not a stub.
+    fn test_transport() -> Arc<dyn FederationTransport> {
+        Arc::new(FederationClient::new("local.test".to_owned(), None))
     }
     /// A worker-poke sender whose receiver is dropped — `try_send` just fails,
     /// which reconciliation tolerates. Reconciliation never fires in these tests
@@ -787,7 +795,7 @@ mod tests {
     fn test_ctx(store: Arc<SqliteStore>) -> SenderCtx {
         SenderCtx {
             store,
-            client: Arc::new(FederationClient::new("local.test".to_owned(), None)),
+            transport: Arc::new(FederationClient::new("local.test".to_owned(), None)),
             idgen: Arc::new(TxnIdGen::new(now_ms())),
             send_slots: Arc::new(Semaphore::new(1)),
             fetcher: null_fetcher(),
@@ -824,14 +832,13 @@ mod tests {
 
         drop(spawn_with(
             store.clone(),
-            "local.test".to_owned(),
+            test_transport(),
             2,
             NO_JITTER,
             no_shutdown(),
             no_kick(),
             null_fetcher(),
             null_poke(),
-            None,
         ));
         wait_drained(&store, &dest).await;
 
@@ -861,14 +868,13 @@ mod tests {
 
         drop(spawn_with(
             store.clone(),
-            "local.test".to_owned(),
+            test_transport(),
             2,
             NO_JITTER,
             no_shutdown(),
             no_kick(),
             null_fetcher(),
             null_poke(),
-            None,
         ));
         wait_drained(&store, &dest).await;
 
@@ -894,14 +900,13 @@ mod tests {
 
         drop(spawn_with(
             store.clone(),
-            "local.test".to_owned(),
+            test_transport(),
             2,
             NO_JITTER,
             no_shutdown(),
             no_kick(),
             null_fetcher(),
             null_poke(),
-            None,
         ));
         wait_drained(&store, &dest).await; // dropped → outbox empties
 
@@ -918,14 +923,13 @@ mod tests {
 
         drop(spawn_with(
             store.clone(),
-            "local.test".to_owned(),
+            test_transport(),
             2,
             NO_JITTER,
             no_shutdown(),
             no_kick(),
             null_fetcher(),
             null_poke(),
-            None,
         ));
         wait_drained(&store, &dest).await;
 
@@ -960,14 +964,13 @@ mod tests {
 
         drop(spawn_with(
             store.clone(),
-            "local.test".to_owned(),
+            test_transport(),
             2,
             NO_JITTER,
             no_shutdown(),
             no_kick(),
             null_fetcher(),
             null_poke(),
-            None,
         ));
 
         // The healthy peer drains despite the dead peer retrying forever.
@@ -992,14 +995,13 @@ mod tests {
 
         drop(spawn_with(
             store.clone(),
-            "local.test".to_owned(),
+            test_transport(),
             2,
             NO_JITTER,
             no_shutdown(),
             no_kick(),
             null_fetcher(),
             null_poke(),
-            None,
         ));
         // Give the supervisor a moment to reach its idle `changed()` await.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1035,14 +1037,13 @@ mod tests {
 
         drop(spawn_with(
             store.clone(),
-            "local.test".to_owned(),
+            test_transport(),
             2,
             NO_JITTER,
             no_shutdown(),
             no_kick(),
             null_fetcher(),
             null_poke(),
-            None,
         ));
         wait_adv_drained(&store, &dest).await;
 
@@ -1072,14 +1073,13 @@ mod tests {
 
         drop(spawn_with(
             store.clone(),
-            "local.test".to_owned(),
+            test_transport(),
             2,
             NO_JITTER,
             no_shutdown(),
             no_kick(),
             null_fetcher(),
             null_poke(),
-            None,
         ));
         wait_drained(&store, &dest).await;
         wait_adv_drained(&store, &dest).await;
@@ -1250,14 +1250,13 @@ mod tests {
 
         let supervisor = spawn_with(
             store.clone(),
-            "local.test".to_owned(),
+            test_transport(),
             2,
             NO_JITTER,
             shutdown.clone(),
             no_kick(),
             null_fetcher(),
             null_poke(),
-            None,
         );
 
         // Let the supervisor enumerate the dead peer and spawn its (forever-retrying)
@@ -1286,14 +1285,13 @@ mod tests {
 
         drop(spawn_with(
             store.clone(),
-            "local.test".to_owned(),
+            test_transport(),
             2,
             NO_JITTER,
             no_shutdown(),
             no_kick(),
             null_fetcher(),
             null_poke(),
-            None,
         ));
 
         // Wait for at least two attempts — proves it retried after the first 5xx.
