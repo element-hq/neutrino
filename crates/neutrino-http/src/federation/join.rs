@@ -334,7 +334,7 @@ async fn ingest_state_dag(
 
     // Stage every event + poke the worker (cross-room events are skipped inside;
     // the poke is awaited so a fresh-room ingest can't be silently dropped).
-    crate::federation::stage_and_poke(store, worker_poke, origin, room_id, &events)
+    neutrino_engine::stage_and_poke(store, worker_poke, origin, room_id, &events)
         .await
         .map_err(|_| "could not stage room state")
 }

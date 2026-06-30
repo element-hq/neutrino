@@ -36,6 +36,18 @@ const DEFAULT_STORAGE_DIR: &str = "./data";
 /// string directly instead.
 pub const ROOM_VERSION_ID: &str = "org.matrix.msc4242.12";
 
+/// Milliseconds since the Unix epoch, for the federation transaction
+/// `origin_server_ts`. Saturates to 0 on a pre-epoch clock — never panics (no
+/// `unwrap` on `SystemTime`). Shared by the inbound `backfill` response, the
+/// outbound federation client, and the engine's transaction-id source.
+pub fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// The homeserver's federation name (the domain in `@user:server_name`).

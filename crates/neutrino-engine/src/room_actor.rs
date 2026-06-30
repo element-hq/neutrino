@@ -33,7 +33,8 @@ use std::sync::{Arc, Mutex};
 use neutrino_common::Event;
 use neutrino_state::room_core::{Effect, RoomCore};
 use neutrino_state::{CoreError, FormatError, StateDelta, StateMap};
-use neutrino_store::{EventStore, Membership, RoomStore, StateStore, StorageError};
+use neutrino_store::{Membership, StorageBackend, StorageError, WithStateProvider};
+#[cfg(test)]
 use neutrino_store_sqlite::SqliteStore;
 use ruma::{
     EventId, OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId,
@@ -127,16 +128,16 @@ enum Command {
 
 /// The owned state machine for one room. Lives inside a spawned task; the
 /// only handle to it is the mpsc `Sender` held in the [`RoomRegistry`].
-struct RoomActor {
+struct RoomActor<S> {
     room: RoomCore,
-    store: Arc<SqliteStore>,
+    store: Arc<S>,
     /// This homeserver's own name, excluded from every outbound destination
     /// set so we never federate an event back to ourselves. Held as a `String`
     /// (the config form) since it's only ever compared by value.
     own_server: String,
 }
 
-impl RoomActor {
+impl<S: StorageBackend + WithStateProvider + 'static> RoomActor<S> {
     async fn run(mut self, mut rx: mpsc::Receiver<Command>) {
         while let Some(cmd) = rx.recv().await {
             match cmd {
@@ -592,16 +593,16 @@ fn log_apply(
 /// embedded single-user homeserver — the live room set is small and bounded by
 /// the device's own membership, so there's no idle-eviction / LRU policy. If
 /// this ever backs a multi-tenant deployment, add one.
-pub struct RoomRegistry {
-    store: Arc<SqliteStore>,
+pub struct RoomRegistry<S> {
+    store: Arc<S>,
     /// This homeserver's own name, handed to each spawned actor so it can
     /// exclude itself from outbound federation destinations.
     own_server: String,
     actors: Mutex<HashMap<OwnedRoomId, mpsc::Sender<Command>>>,
 }
 
-impl RoomRegistry {
-    pub fn new(store: Arc<SqliteStore>, own_server: String) -> Self {
+impl<S: StorageBackend + WithStateProvider + 'static> RoomRegistry<S> {
+    pub fn new(store: Arc<S>, own_server: String) -> Self {
         Self {
             store,
             own_server,
@@ -757,7 +758,7 @@ mod tests {
     use super::*;
     use neutrino_common::ROOM_VERSION_ID;
     use neutrino_state::event_id::EventBuilder;
-    use neutrino_store::{FederationOutbox, RoomStore};
+    use neutrino_store::{EventStore, FederationOutbox, RoomStore, StateStore};
     use ruma::server_name;
     use serde_json::json;
 
@@ -769,7 +770,12 @@ mod tests {
     /// the create event — no members yet), and return the registry, store,
     /// room id, and alice's user id. createRoom seeds the forward extremities
     /// to the create event, so the actor can bootstrap.
-    async fn setup() -> (RoomRegistry, Arc<SqliteStore>, OwnedRoomId, OwnedUserId) {
+    async fn setup() -> (
+        RoomRegistry<SqliteStore>,
+        Arc<SqliteStore>,
+        OwnedRoomId,
+        OwnedUserId,
+    ) {
         let store = Arc::new(SqliteStore::open_in_memory().await.expect("open store"));
         let alice: OwnedUserId = ALICE.parse().expect("alice");
         let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
@@ -971,7 +977,7 @@ mod tests {
     /// room id, creator id, and the create event's id — enough to author a
     /// federation PDU that references the create as its parent.
     async fn setup_with_create_id() -> (
-        RoomRegistry,
+        RoomRegistry<SqliteStore>,
         Arc<SqliteStore>,
         OwnedRoomId,
         OwnedUserId,
@@ -1085,8 +1091,12 @@ mod tests {
     /// remote user `@zara:remote.example` joins via a federation PDU. Returns
     /// everything needed to drive further sends. After this, `remote.example`
     /// has a *joined* member, so subsequent local events must federate to it.
-    async fn setup_with_remote_member() -> (RoomRegistry, Arc<SqliteStore>, OwnedRoomId, OwnedUserId)
-    {
+    async fn setup_with_remote_member() -> (
+        RoomRegistry<SqliteStore>,
+        Arc<SqliteStore>,
+        OwnedRoomId,
+        OwnedUserId,
+    ) {
         let (registry, store, room_id, alice) = setup().await;
         registry
             .send_event(
@@ -1257,7 +1267,7 @@ mod tests {
     /// older head, leaving a forward extremity the join does not cover).
     async fn join_remote_built_on(
         concurrent_extremity: bool,
-    ) -> (RoomRegistry, Arc<SqliteStore>, OwnedRoomId) {
+    ) -> (RoomRegistry<SqliteStore>, Arc<SqliteStore>, OwnedRoomId) {
         let (registry, store, room_id, alice) = setup().await;
         registry
             .send_event(

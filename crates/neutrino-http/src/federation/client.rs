@@ -13,7 +13,6 @@
 //! Consumed by the per-destination sender pool (`federation::sender`).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use std::collections::BTreeMap;
@@ -26,9 +25,13 @@ use serde_json::Value;
 use serde_json::value::RawValue as RawJsonValue;
 use tracing::{info, warn};
 
-use crate::federation::gapfill::{MissingEventsFetcher, MissingEventsQuery};
-use crate::federation::reconcile::ForwardExtremities;
-use crate::federation::{get_missing_events, now_ms};
+use neutrino_engine::{
+    FederationTransport, ForwardExtremities, MissingEventsFetcher, MissingEventsQuery,
+    TransportError,
+};
+
+use crate::federation::get_missing_events;
+use neutrino_common::now_ms;
 
 /// Connection-establishment timeout for a federation request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -497,6 +500,37 @@ pub(crate) struct MakeLeaveResponse {
 
 /// The production [`MissingEventsFetcher`]: a thin adapter that closes a
 /// received PDU's missing state ancestry by asking the originating peer via
+/// Map the reqwest-backed client error onto the engine's neutral
+/// [`TransportError`] at the port boundary: status codes pass through (the
+/// sender still distinguishes 4xx from 5xx), everything else collapses to a
+/// rendered `Transient` so `reqwest::Error` never escapes into `neutrino-engine`.
+impl From<FederationClientError> for TransportError {
+    fn from(e: FederationClientError) -> Self {
+        match e {
+            FederationClientError::Status(code) => TransportError::Status(code),
+            other => TransportError::Transient(other.to_string()),
+        }
+    }
+}
+
+/// Outbound-delivery port. Delegates to the inherent
+/// [`FederationClient::send_transaction`] (disambiguated by the explicit path,
+/// since the trait method shares its name) and maps the error.
+#[async_trait::async_trait]
+impl FederationTransport for FederationClient {
+    async fn send_transaction(
+        &self,
+        dest: &ServerName,
+        txn_id: &str,
+        pdus: &[Box<RawJsonValue>],
+        forward_extremities: &BTreeMap<OwnedRoomId, ForwardExtremities>,
+    ) -> Result<BTreeMap<OwnedRoomId, ForwardExtremities>, TransportError> {
+        FederationClient::send_transaction(self, dest, txn_id, pdus, forward_extremities)
+            .await
+            .map_err(TransportError::from)
+    }
+}
+
 /// [`FederationClient::get_missing_events`] with MSC4242 `state_dag: true`.
 /// Holds its own `FederationClient` (a separate reqwest pool from the sender
 /// pool's — see `AppState::from_store`: a second pool is cheap and avoids a
@@ -517,7 +551,7 @@ impl MissingEventsFetcher for ReqwestFetcher {
     async fn fetch(
         &self,
         q: MissingEventsQuery<'_>,
-    ) -> Result<Vec<Box<RawJsonValue>>, FederationClientError> {
+    ) -> Result<Vec<Box<RawJsonValue>>, TransportError> {
         self.client
             .get_missing_events(
                 q.origin,
@@ -529,29 +563,7 @@ impl MissingEventsFetcher for ReqwestFetcher {
                 q.include_latest_events,
             )
             .await
-    }
-}
-
-/// Monotonic transaction-id source: `{startup_prefix}-{counter}`. The prefix
-/// (a process-startup timestamp, supplied by the caller) keeps ids unique
-/// across restarts; the counter keeps them unique within a run. Receivers
-/// dedup on `(origin, txn_id)` via `FederationInbox::record_federation_txn`.
-pub(crate) struct TxnIdGen {
-    prefix: u64,
-    counter: AtomicU64,
-}
-
-impl TxnIdGen {
-    pub(crate) fn new(prefix: u64) -> Self {
-        Self {
-            prefix,
-            counter: AtomicU64::new(0),
-        }
-    }
-
-    pub(crate) fn next_id(&self) -> String {
-        let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        format!("{}-{}", self.prefix, n)
+            .map_err(TransportError::from)
     }
 }
 
@@ -608,6 +620,7 @@ mod tests {
 
     use super::*;
     use crate::federation::test_support::{dead_peer, spawn_stub};
+    use neutrino_engine::TxnIdGen;
 
     fn raw(json_str: &str) -> Box<RawJsonValue> {
         RawJsonValue::from_string(json_str.to_owned()).unwrap()

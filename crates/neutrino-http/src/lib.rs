@@ -36,22 +36,20 @@ mod federation;
 mod legacy_sync;
 mod membership;
 mod messages;
-mod room_actor;
 mod sliding_sync;
 
 #[cfg(feature = "multi-user-shim")]
 mod multi_user;
 
 use federation::client::{FederationClient, ReqwestFetcher};
-use federation::gapfill::MissingEventsFetcher;
-use room_actor::{RoomActorError, RoomRegistry};
+use neutrino_engine::{MissingEventsFetcher, RoomActorError, RoomRegistry};
 use sliding_sync::{SyncError, SyncState};
 
 struct App {
     store: Arc<SqliteStore>,
     /// Per-room state-machine actors. CSAPI writes go through here so they
     /// are DAG-linked, auth-checked, and state-resolved.
-    room_registry: Arc<RoomRegistry>,
+    room_registry: Arc<RoomRegistry<SqliteStore>>,
     /// In-process poke to the inbound staging worker. The `/send` handler sends
     /// the room id of each freshly-staged PDU; the worker spawns or wakes that
     /// room's drain task. Best-effort (`try_send`): a full buffer just means the
@@ -227,7 +225,7 @@ impl AppState {
         // tests), enumerates any leftover staged rows on startup, and stops when
         // this `AppState` is dropped (the `worker_poke` sender drops with it).
         let worker_poke =
-            federation::worker::spawn(store.clone(), room_registry.clone(), fetcher.clone());
+            neutrino_engine::worker::spawn(store.clone(), room_registry.clone(), fetcher.clone());
         // Receivers are taken later via `subscribe_kick` (one per destination
         // task); the initial receiver is dropped — `send_modify` notifies any
         // live receivers and is a no-op when there are none.
@@ -337,16 +335,19 @@ pub async fn serve(
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
     // enumeration resumes delivery of anything left undelivered.
-    let sender_task = federation::sender::spawn(
-        state.store(),
+    let transport = Arc::new(FederationClient::new(
         state.server_name(),
+        state.federation_proxy().as_deref(),
+    ));
+    let sender_task = neutrino_engine::sender::spawn(
+        state.store(),
+        transport,
         state.outbound_concurrency(),
         state.startup_jitter(),
         state.subscribe_shutdown(),
         state.subscribe_kick(),
         state.fetcher(),
         state.worker_poke(),
-        state.federation_proxy(),
     );
     let router = build_router(&state);
     // `dispatch` resolves on a terminal command or when every sender is dropped,

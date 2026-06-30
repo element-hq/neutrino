@@ -22,9 +22,7 @@
 
 use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
-use neutrino_store::StateStore;
-use neutrino_store_sqlite::SqliteStore;
-use ruma::{OwnedServerName, RoomId, ServerName};
+use ruma::OwnedServerName;
 
 use crate::federation::FedError;
 
@@ -81,23 +79,6 @@ pub(crate) fn authenticated_origin(
         ));
     }
     Ok(origin)
-}
-
-/// True if `server` has at least one joined member in `room_id` — i.e. we share
-/// the room with that server. Gates member-only reads (`/get_missing_events`,
-/// `/backfill`) and honoured anti-entropy advertisements. Derives the joined-
-/// server set from the existing indexed `joined_members` query; at embedded-
-/// homeserver scale a dedicated `joined_servers` store method isn't warranted.
-pub(crate) async fn server_in_room(
-    store: &SqliteStore,
-    room_id: &RoomId,
-    server: &ServerName,
-) -> Result<bool, neutrino_store::StorageError> {
-    Ok(store
-        .joined_members(room_id)
-        .await?
-        .keys()
-        .any(|user| user.server_name() == server))
 }
 
 #[cfg(test)]

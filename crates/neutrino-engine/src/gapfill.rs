@@ -10,7 +10,7 @@
 //! is parked in a pre-auth staging cache rather than persisted as history.
 //!
 //! This module owns the *fetch-into-staging* half ([`fill_state_ancestry`]).
-//! The *apply* half is the inbound worker's drain loop ([`crate::federation::worker`]):
+//! The *apply* half is the inbound worker's drain loop ([`crate::worker`]):
 //! once the gap is staged, the worker re-reads the room's staged rows,
 //! toposorts them, and applies each through the per-room actor — staged
 //! ancestry and freshly-received PDUs flow through the *same* loop, so there is
@@ -18,51 +18,14 @@
 
 use neutrino_common::Event;
 use neutrino_state::event_id::from_wire;
-use neutrino_store::{RoomStore, StagingStore};
+use neutrino_store::StorageBackend;
 use ruma::{EventId, OwnedEventId, RoomId, ServerName};
-use serde_json::value::RawValue as RawJsonValue;
 
-use crate::federation::client::FederationClientError;
+use crate::ports::{MissingEventsFetcher, MissingEventsQuery};
 
 /// Initial `limit` for the first gap-fill request; doubled each round (MSC4242
 /// recommends exponentially increasing the limit until all ancestry is seen).
 const INITIAL_GAPFILL_LIMIT: u32 = 10;
-
-/// Parameters for one `get_missing_events` fetch. Bundled into a struct so the
-/// trait method and the client call don't grow an unwieldy positional arg list
-/// as MSC4242 (`state_dag`) and anti-entropy (`include_latest_events`) each add a
-/// flag — and so the two adjacent bools are named at every call site rather than
-/// being swappable positional args.
-pub(crate) struct MissingEventsQuery<'a> {
-    pub origin: &'a ServerName,
-    pub room_id: &'a RoomId,
-    /// Heads to walk back from.
-    pub latest: &'a [OwnedEventId],
-    /// Boundary the caller already holds; excluded from the result.
-    pub earliest: &'a [OwnedEventId],
-    pub limit: u32,
-    /// MSC4242: walk `prev_state_events` (the state DAG) rather than `prev_events`.
-    pub state_dag: bool,
-    /// Anti-entropy: also return any `latest` heads the peer itself holds, not
-    /// only their ancestors.
-    pub include_latest_events: bool,
-}
-
-/// Fetches events from a peer via
-/// `POST origin/_matrix/federation/v1/get_missing_events`. The production impl is
-/// [`crate::federation::client::ReqwestFetcher`]; tests inject a stub. Held on
-/// `AppState` as an `Arc<dyn MissingEventsFetcher>`.
-#[async_trait::async_trait]
-pub(crate) trait MissingEventsFetcher: Send + Sync {
-    /// Walk back from `q.latest` (stopping at `q.earliest`) up to `q.limit`
-    /// events, returning opaque PDU bytes oldest-first. `Ok(empty)` means the
-    /// peer gave us nothing new (the caller treats it as an unfillable gap);
-    /// `Err` is a transport/HTTP failure reaching the peer.
-    async fn fetch(
-        &self,
-        q: MissingEventsQuery<'_>,
-    ) -> Result<Vec<Box<RawJsonValue>>, FederationClientError>;
-}
 
 /// Fetch `event`'s missing state-DAG ancestry into the staging cache until it
 /// is grounded (every `prev_state_events` path reaches an event we hold).
@@ -93,7 +56,7 @@ pub(crate) trait MissingEventsFetcher: Send + Sync {
 /// only stop early by *grounding* or by the peer running out of new events; a
 /// trusted peer never feeds an infinite distinct chain.
 pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
-    store: &neutrino_store_sqlite::SqliteStore,
+    store: &impl StorageBackend,
     origin: &ServerName,
     event: &Event,
     fetcher: &F,
@@ -189,10 +152,7 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
 /// The room's state-DAG forward extremities — the committed bottom boundary
 /// (`earliest_events`) for a state-DAG gap-fill walk. Best-effort: empty if the
 /// room is unknown or the lookup faults.
-async fn state_dag_boundary(
-    store: &neutrino_store_sqlite::SqliteStore,
-    room_id: &RoomId,
-) -> Vec<OwnedEventId> {
+async fn state_dag_boundary(store: &impl StorageBackend, room_id: &RoomId) -> Vec<OwnedEventId> {
     match store.forward_extremities(room_id).await {
         Ok(Some((_timeline, state))) => state.into_iter().collect(),
         _ => Vec::new(),

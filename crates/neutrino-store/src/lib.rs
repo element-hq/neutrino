@@ -657,3 +657,29 @@ impl<T> StorageBackend for T where
         + IdentityStore
 {
 }
+
+/// Bridge a store to a read-only [`StateProvider`] view of itself.
+///
+/// The per-room actor in the engine owns the state machine (`RoomCore`) but
+/// not a store connection, so it cannot build a provider directly. This hands
+/// it one for the duration of `f` — `f` runs the apply (a read: immutable
+/// events + auth chains, no write transaction) and returns an owned result.
+///
+/// Kept out of [`StorageBackend`] deliberately: the generic method is not
+/// object-safe, so folding it into the super-trait would make
+/// `dyn StorageBackend` impossible. Consumers bound on both:
+/// `S: StorageBackend + WithStateProvider`.
+///
+/// `R` must own its result — the provider lives only for the call to `f`, so a
+/// returned value cannot borrow from it.
+///
+/// [`StateProvider`]: neutrino_state::provider::StateProvider
+pub trait WithStateProvider: Send + Sync {
+    fn with_state_provider<F, R>(
+        &self,
+        f: F,
+    ) -> impl std::future::Future<Output = Result<R, StorageError>> + Send
+    where
+        F: for<'a> FnOnce(&'a dyn neutrino_state::provider::StateProvider) -> R + Send + 'static,
+        R: Send + 'static;
+}

@@ -146,6 +146,12 @@ Intentional gaps in the sliding-sync implementation — see `MSC4186-gaps.md`:
 - fold the repeated `FederationClient` PUT-event idiom into one helper
 - federated-invite error-code parity with the local invite path
 - OOB-invite join review leftovers (noted, not blocking): `federated_join_if_remote` runs twice on the `join_by_id_or_alias`→`join` fall-through; a single private `join_core(hints)` would collapse it. No single shared "is this room remote / who is the inviter's resident server" predicate (invite/leave/join each re-derive it).
+- `neutrino-engine` extraction COMPLETE (phases 0-2 landed 2026-06-30): the room
+  runtime lives in `neutrino-engine`; `neutrino-http` is axum glue + transport
+  impls. No in-memory `StorageBackend` double was needed — the engine tests open a
+  real sqlite `:memory:` via a dev-dep (store-sqlite doesn't depend on engine, so
+  it's acyclic). Remaining *optional* follow-on: split `neutrino-http` into c2s and
+  s2s route groups (now trivial — both are thin layers over the engine).
 - multi-server / idempotency federation tests
 - port the relevant Synapse + Complement membership-endpoint tests
 - `storage_dir` empty-string handling: an exported-but-empty `NEUTRINO_STORAGE_DIR=` (and the FFI
@@ -171,6 +177,85 @@ never use .unwrap() in handler code.
 - Restricted rooms (`join_authorised_via_users_server`) — documented, not implemented
 
 ## decisions log
+
+### room runtime moved into `neutrino-engine` (2026-06-30)
+- Phase 2 of the extraction: `room_actor` (RoomActor/RoomRegistry), `sender`,
+  `worker`, `reconcile`, `gapfill` physically moved from `neutrino-http` into
+  `neutrino-engine`, along with the shared runtime utilities (backoff/jitter
+  consts, `TxnIdGen`, `now_ms`, `stage_and_poke`) and `server_in_room` (a
+  store-backed membership predicate, now in `engine::reconcile`). `auth.rs`'s
+  X-Matrix `authenticated_origin` stays in http; `map_apply_err`
+  (RoomActorError→FedError) stays in http as the handler-side adapter.
+- **2a (in-place generic-ization) first, then 2b (move):** `sender`/`worker`/
+  `reconcile`/`gapfill`/`server_in_room` were made generic over
+  `S: StorageBackend (+ WithStateProvider)` while still in http (tests green),
+  so the physical move was a near-pure relocation. Same pattern as Phase 0.
+- **Engine deps:** prod = common, state, store(traits), ruma, rand, tokio,
+  tokio-util, tracing, serde(_json), async-trait, thiserror. **Dev-only** =
+  store-sqlite + tempfile (the runtime tests open a real `:memory:` store). No
+  production dep on a concrete backend; no cycle (store-sqlite ⊀ engine).
+- **No hand-rolled in-memory `StorageBackend`:** the deferred Phase-0 question is
+  moot — engine tests bind sqlite via the dev-dep, so a second impl would be pure
+  duplication.
+- **Sender tests rewritten to an engine-local `FederationTransport` stub** (no
+  axum/reqwest): the 14 sender tests assert sender *behaviour* (drain / retry /
+  4xx-drop / txn-id reuse / advertisement), all observable at the one-method
+  port. The stub records decoded PDUs + serialised forward-extremities so the
+  assertions are preserved verbatim. Real-HTTP wire coverage stays in the
+  `e2e_lb_*` + `neutrino` federation tests. (Per the readability discussion with
+  Kegan: one port method is not a "shadow API".)
+- `now_ms` / `MAX_PDUS_PER_TXN` are engine-owned (`pub`) and imported by the http
+  handlers/transport that still need them.
+
+### engine outbound ports — `neutrino-engine` crate created (2026-06-30)
+- Phase 1 of the extraction: created the `neutrino-engine` crate holding only the
+  outbound port traits and the types that cross them. No runtime code moved yet —
+  the runtime (still in `neutrino-http`) now depends on engine traits, not on
+  http/reqwest types, so Phase 2 is a near-pure file move.
+- Two ports: `FederationTransport::send_transaction` (the per-destination sender
+  pool's only network call) and `MissingEventsFetcher::fetch` (promoted from the
+  `pub(crate)` trait in `gapfill.rs`). Both object-safe → honest `dyn`.
+- Three types relocated into engine: `MissingEventsQuery`, `ForwardExtremities`
+  (+ `is_empty`), and a new neutral `TransportError { Status(u16), Transient }`
+  replacing `FederationClientError` at the boundary — `FederationClientError`
+  carries `reqwest::Error` and must NOT leak into engine. `FederationClientError`
+  stays in http for the membership-client methods (`make_join`/`send_join`/… —
+  handler-driven, not runtime, deliberately not ported). `From<FederationClientError>
+  for TransportError` maps `Status → Status`, else `Transient(display)`.
+- The inversion: `sender::spawn` now takes an injected `Arc<dyn FederationTransport>`
+  instead of building the `FederationClient` from `origin`/`federation_proxy`;
+  `serve()` constructs the client and injects it. The direct-vs-lb-proxy routing
+  stays inside the http `FederationClient` impl, so engine is transport-oblivious
+  (verified: the three `e2e_lb_*` proxy tests still pass).
+- Engine deps are minimal (ruma, serde, serde_json, async-trait, thiserror) — no
+  reqwest, no axum, no neutrino-common/store/state yet; those arrive in Phase 2
+  when the runtime moves.
+
+### room runtime decoupled from concrete store (2026-06-30)
+- Phase 0 of the planned `neutrino-engine` extraction: make the `StorageBackend`
+  trait genuinely load-bearing instead of cosmetic. `RoomActor` / `RoomRegistry`
+  were hardcoded to `Arc<SqliteStore>`; they are now generic
+  `<S: StorageBackend + WithStateProvider>`, so the room-runtime code compiles
+  against the trait surface alone — proving it sufficient.
+- `with_state_provider` moved from an inherent `SqliteStore` method to a new
+  `neutrino_store::WithStateProvider` trait (implemented by `SqliteStore`). It is
+  a **generic** method (HRTB closure + owned return `R`), so it is NOT
+  object-safe — `dyn StorageBackend` is impossible. Hence the runtime is generic,
+  not `dyn`, and `WithStateProvider` is kept OUT of the `StorageBackend`
+  super-trait so `dyn StorageBackend` stays available for any future read-only
+  consumer.
+- New workspace dep `neutrino-store → neutrino-state`: the trait references both
+  `StorageError` (store) and `StateProvider` (state), so its only acyclic home is
+  `neutrino-store`. `neutrino-state` does not depend on `neutrino-store`, so no
+  cycle. This is the seam-1 coupling from the extraction sketch.
+- The `App` composition root in `neutrino-http` still instantiates with the
+  concrete `SqliteStore` (and `worker`/`SyncState` name it) — intentional: http
+  is the composition root and may know the concrete backend. Only the runtime
+  *internals* are store-agnostic.
+- Deliberately did NOT add a hand-rolled in-memory `StorageBackend` double: tests
+  already use `SqliteStore::open_in_memory()`, so a second impl would duplicate
+  it, and its only payoff (engine tests without the sqlite dep) does not exist
+  until the `neutrino-engine` crate does. Deferred to the extraction.
 
 ### datagram origin↔node binding (2026-06-29)
 - The iroh datagram link is the one trust boundary (the homeserver itself runs no

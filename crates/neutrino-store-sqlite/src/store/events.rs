@@ -617,6 +617,7 @@ mod tests {
     use neutrino_common::Event;
     use neutrino_store::{
         Direction, EventStore, PaginationToken, RoomStore, StateStore, StorageError, StreamPos,
+        WithStateProvider,
     };
     use ruma::{EventId, OwnedEventId, event_id, room_id, server_name};
     use serde_json::json;
