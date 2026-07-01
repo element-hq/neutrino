@@ -2430,9 +2430,8 @@ dependencies = [
 [[package]]
 name = "iroh-ble-transport"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d0116b93f749a0cc80e422990da1872dedb96650c0a8fa99db7c6e072cec96d"
 dependencies = [
+ "anyhow",
  "arc-swap",
  "async-stream",
  "async-trait",
@@ -2445,11 +2444,13 @@ dependencies = [
  "n0-watcher",
  "noq-udp",
  "parking_lot",
+ "rand 0.9.4",
  "serde",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

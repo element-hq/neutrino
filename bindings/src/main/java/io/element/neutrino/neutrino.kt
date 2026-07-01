@@ -639,8 +639,6 @@ internal object IntegrityCheckingUniffiLib {
     }
     external fun uniffi_neutrino_checksum_func_start(
     ): Short
-    external fun uniffi_neutrino_checksum_func_ble_smoke_test(
-    ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_command(
     ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_kick_backoff(
@@ -681,8 +679,6 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_neutrino_fn_func_start(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
-    external fun uniffi_neutrino_fn_func_ble_smoke_test(`remote`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
     external fun ffi_neutrino_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun ffi_neutrino_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1408,7 +1404,7 @@ public object FfiConverterTypeNeutrinoHandle: FfiConverter<NeutrinoHandle, Long>
 
 
 /**
- * FFI-facing server configuration. Mirrors `neutrino_common::Config` so EX
+ * FFI-facing server configuration. Mirrors `neutrino_ctl::Config` so EX
  * Android can fully configure the embedded homeserver. Kept here (not on the
  * common `Config`) so UniFFI stays out of the common crates — see the
  * crate-structure rule in CLAUDE.md. All fields are required; defaults live
@@ -1479,7 +1475,7 @@ public object FfiConverterTypeNeutrinoConfig: FfiConverterRustBuffer<NeutrinoCon
 
 
 /**
- * FFI-facing control command. Mirrors `neutrino_common::Command` (re-exported
+ * FFI-facing control command. Mirrors `neutrino_ctl::Command` (re-exported
  * as `neutrino_main::Command`) so EX Android can drive the embedded server.
  * Kept here, not on the common `Command`, so UniFFI stays out of the common
  * crates — the same split as `NeutrinoConfig` / `Config`.
@@ -1599,21 +1595,6 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
 }
     )
     }
-    
-
-        /**
-         * Run the BLE smoke test on a dedicated runtime thread and return immediately.
-         * `remote` = `None` → listener (advertise + accept + echo); `Some(node_id)` →
-         * dialer (connect + stream test + datagram test). Results are logged, not
-         * returned (see module docs).
-         */ fun `bleSmokeTest`(`remote`: kotlin.String?)
-        = 
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_neutrino_fn_func_ble_smoke_test(
-    
-        FfiConverterOptionalString.lower(`remote`),_status)
-}
-    
     
 
 

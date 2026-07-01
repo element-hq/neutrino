@@ -228,6 +228,118 @@ never use .unwrap() in handler code.
   `[version][node_id:32][display_name]`, and switch the scanner to
   `setLegacy(false)` + surface `getManufacturerSpecificData(0xDFFF)` up to a new
   discovery callback that calls `set_discovered_peers`.
+### BLE permanent-wedge on peer restart: registry dial-stage timeout + Dead revive (2026-07-01)
+- **Symptom:** force-stop a BLE peer then bring it back → permanently unreachable,
+  symmetric on both devices ("as if BLE is off"), never recovers.
+- **Root cause (registry state machine, `iroh-ble-transport`):** an entry that
+  reaches `Handshaking` (QUIC handshake stalled on a re-established link) is stuck
+  forever — `Handshaking` has no tick timeout, `handle_advertised` is a no-op
+  (`_ => {}`) for `Handshaking`/`Connecting`/`Connected`/`Draining`/`Dead`, and
+  `handle_send_datagram` only *buffers* (Handshaking/Connecting) or *rejects*
+  (Connected-no-pipe/Draining/Dead) — none re-dial. So sends buffer into a
+  never-completing handshake, adverts are ignored, and GC never reaps it.
+- **Why only now:** disabling relay/DNS (correct for the offline BLE-mesh target)
+  forces all traffic onto the BLE custom transport. WiFi+iroh-DNS testing resolved
+  peers' IPs and connected over the IP transport, so the BLE registry was never
+  exercised — the wedge was always latent. NOT caused by the discovery-disable;
+  revealed by it. Discovery itself is healthy (confirmed: scanner sees the peer
+  strongly, `discovered[prefix]` is current). iroh's `resolve_remote`
+  (path_state.rs) also short-circuits on a cached path, but the BLE token resolves
+  live to `discovered[prefix]`, so that isn't the blocker.
+- **Fix 1:** `DIAL_STAGE_DEADLINE` (10s) — `handle_tick` now times out a
+  `Connecting`/`Handshaking` entry, closes any half-open channel, and drops it to
+  `Reconnecting` (or `Dead` past `MAX_CONNECT_ATTEMPTS`) so it re-dials.
+- **Fix 2:** `handle_advertised` revives a `Dead` peer that starts advertising
+  again into a fresh dial (mirrors the `Unknown` arm; resets `consecutive_failures`)
+  instead of waiting out `DEAD_GC_TTL` + a subsequent send.
+- 4 unit tests added. Vendored crate ⇒ not compilable in-sandbox (no dbus);
+  rustfmt-checked, CI verifies. Keep the discovery-disable (BLE-only is correct).
+- **Follow-up (same day):** recovery was still ~78s (3 retries) because a dead
+  pipe wasn't torn down until the 20s wedged-pipe watchdog. `handle_stalled` (the
+  reliable-LINK_DEAD `Stalled` handler) only drained `Connected` and dropped the
+  `Stalled` for any other phase — including `Handshaking`, the common case (pipe
+  dies mid-handshake, peer never ACKs). Fixed: `handle_stalled` now drains
+  `Connected` **or** `Handshaking` → teardown at ~6s not ~20s. Also added always-on
+  registry phase-transition logging at `info` (snapshot `PhaseKind` per peer in
+  `handle()` before dispatch, log change/create/remove after) so future wedges are
+  debuggable from logs. The deeper root — a *fresh* BLE connection passing no data
+  for the first 1-2 tries (peer ACKs nothing despite a healthy pipe + correct MTU)
+  — is still open; needs trace-level (`iroh_ble_transport::transport::reliable=trace`)
+  fragment RX/TX logs on both ends to pin.
+- **Root cause found (trace):** the failing leg is **peripheral→central GATT notify**,
+  and it's in the Kotlin glue (`bindings/.../BlePeripheralManager.kt`), not the Rust.
+  The per-device notify semaphore was released only by `onNotificationSent`; when the
+  Android stack accepts `notifyCharacteristicChanged` but can't transmit it
+  (`ais_request_cback: Unable to send GATT server response`), that callback never
+  fires → the permit wedges for the whole connection → the receiver can't notify its
+  QUIC handshake response → LINK_DEAD, 2-3 retries (~78s). Fixed by replacing the
+  held-until-callback semaphore with a self-healing in-flight **deadline** (reopens on
+  `onNotificationSent` OR after `NOTIFY_INFLIGHT_TIMEOUT_MS=500` if the callback is
+  lost). Kotlin not compilable in-sandbox; verified by inspection, Kegan builds.
+  Rust registry `handle_stalled` (Connected|Handshaking) + `Handshaking` tick timeout
+  + Dead-revive-on-advert speed each failed-attempt teardown as defence-in-depth.
+
+### Offline sync hang: disable iroh DNS discovery + executor-stall watchdog (2026-07-01)
+- **Symptom:** creating a room with **no network** hung — the client's `/sync`
+  long-polls never returned (nor hit their 30s timeout). Reproduces only offline
+  (works with network), and intermittently.
+- **iroh discovery disabled.** `Endpoint::builder(N0DisableRelay)` applies the
+  full `N0` preset, which *appends* a `PkarrPublisher` + `DnsAddressLookup` both
+  targeting `dns.iroh.link`; `.address_lookup()` appends, so those ran alongside
+  the BLE lookup. Offline they churn (constant failed DNS/pkarr). Switched to the
+  `Minimal` preset + explicit `RelayMode::Disabled` so BLE is the only address
+  lookup — an offline BLE-mesh homeserver must never touch `dns.iroh.link`.
+  Verified on the non-ble path (`cargo test -p neutrino-ffi relay_transport`).
+- **Mechanism honestly unconfirmed.** iroh's discovery is fully async
+  (`TokioResolver`/`TokioRuntimeProvider`; no `block_on`/`block_in_place` in iroh
+  source) and the failing log shows the executor *alive* (pkarr retries,
+  createRoom returns) — so it is **not** a hard thread-block. Leading theory:
+  offline netcheck/discovery churn *starves* the single-threaded (`current_thread`)
+  FFI runtime, so the long-poll's 30s timer isn't serviced. The long-poll loop
+  itself is sound (`remaining` shrinks monotonically → can't exceed 30s unless the
+  task is never polled). Disabling discovery removes the most likely churn source
+  but is not proven to be the sole cause.
+- **Executor-stall watchdog added** (`neutrino-ffi/src/watchdog.rs`) precisely
+  because the fix isn't provable and the hang is intermittent: an in-runtime task
+  bumps a monotonic heartbeat; an off-runtime OS thread (holds a `Weak`, exits with
+  the runtime) logs a loud `WARN` when the heartbeat lags >3s. Turns a future
+  recurrence into a timestamped, greppable event and distinguishes "executor
+  stalled" from "client stopped syncing". Pure `evaluate()` decision unit-tested.
+  Deeper root-cause tier (deferred, not implemented): `tokio_unstable` +
+  `Handle::dump()` on stall for per-task backtraces, gated behind a debug feature.
+- **Runtime stays `current_thread`** — defensible for an embedded single-user
+  server (footprint, `!Send` ergonomics, trivial load). Multi-thread would only
+  *mask* an executor-blocking bug, not fix it; revisit only as post-root-cause
+  hardening.
+
+### BLE invite failures: sync wake on OOB invite + vendored iroh-ble-transport (2026-06-30)
+- Two independent bugs surfaced when `/invite` failed over BLE (sender pixel.log,
+  receiver recv.log).
+- **Bug B (in-tree, fixed):** an inbound OOB federated invite is stored via
+  `InviteStore::put_invite` (the `oob_invites` table), which — unlike
+  `persist_event` — never bumped the stream watch, so an in-flight sliding-sync
+  long-poll only surfaced the invite at its next poll (~10-30s, the observed
+  delay). Fix: `put_invite`/`remove_invite` now call
+  `SqliteStore::notify_watch_changed`, which `send_modify`s the watch to fire a
+  `changed()` edge **without** advancing the `StreamPos` cursor — preserving both
+  `build_response`'s head read and `notify_watch`'s monotonic guard for real
+  events. Regression test `long_poll_wakes_on_oob_invite`.
+- **Bug A (vendored dep, fix UNVERIFIED in sandbox):** after a peer restarts under
+  a new BLE MAC, the sender deadlocks dialing the stale address. Root cause in
+  `iroh-ble-transport`: the send path sets `entry.pipe = None` when its outbound
+  channel closes on a dead link but leaves the entry `Connected`; the wedged-pipe
+  watchdog skipped pipeless entries, so the entry kept pinning its prefix
+  (`active_prefix_bindings`) and `note_discovery` rejected the new MAC as
+  `ActivelyPinned` forever — no fresh GATT connect ever fired. **Vendored the dep
+  in-house** at `vendor/iroh-ble-transport` (path dep from neutrino-ffi; Kegan
+  expects further changes). Fix: the watchdog now also wedges a `Connected` entry
+  with `pipe == None` once it has been pipeless past `CONNECTED_IDLE_DEADLINE`
+  (gated on time-in-`Connected` to preserve the legitimate connect/L2CAP-upgrade
+  install window). Tests added, but the crate pulls `blew`→`bluer`→`libdbus-sys`
+  (no `dbus-1` / uncached here) so it **cannot be compiled or tested in the
+  sandbox — needs an on-device / Linux-with-dbus build to verify.** Recovery is
+  bounded by the 45s deadline; faster dead-link detection at send time is a
+  possible follow-up (riskier — `pipe: None` is also a tolerated transient).
 
 ### room runtime moved into `neutrino-engine` (2026-06-30)
 - Phase 2 of the extraction: `room_actor` (RoomActor/RoomRegistry), `sender`,

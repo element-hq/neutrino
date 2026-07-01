@@ -10,6 +10,10 @@ FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY tools ./tools
+# neutrino-ffi has a path dependency on the vendored iroh-ble-transport crate, so
+# the workspace manifest can't be loaded without it — even though `neutrino` (the
+# only bin built here) doesn't enable the `ble` feature that pulls it in.
+COPY vendor ./vendor
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
@@ -25,6 +29,7 @@ RUN cargo chef cook --release --recipe-path recipe.json --bin neutrino
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY tools ./tools
+COPY vendor ./vendor
 RUN cargo build --release --bin neutrino --features multi-user-shim
 
 # Runtime: nginx sidecar terminates TLS on 8448 and proxies plain HTTP on 8008.

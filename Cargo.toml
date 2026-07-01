@@ -3,7 +3,20 @@ members = [
     "./crates/*",
     "./tools/uniffi-bindgen",
     "./tools/xtask",
-    "./tools/converge"
+    "./tools/converge",
+    "./vendor/iroh-ble-transport"
+]
+# `vendor/iroh-ble-transport` is a member (shared lockfile, reachable via `-p`
+# and neutrino-ffi's optional `ble` feature) but is deliberately excluded from
+# the default set: bare `cargo clippy`/`cargo nextest run` skip it, so they don't
+# pull `blew` → `bluer` → `libdbus-sys` (needs system D-Bus). It still builds in
+# the `compile` CI job via `neutrino-ffi --features ble` (which installs libdbus).
+# Do NOT add `--workspace` to the clippy/test CI steps — that would re-include it.
+default-members = [
+    "./crates/*",
+    "./tools/uniffi-bindgen",
+    "./tools/xtask",
+    "./tools/converge",
 ]
 resolver = "3"
 
