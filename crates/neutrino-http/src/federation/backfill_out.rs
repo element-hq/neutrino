@@ -24,12 +24,9 @@ const MAX_SEEDS: usize = 5;
 /// Run ONE outbound backfill round for `room_id`. Best-effort: returns the
 /// number of new historical events persisted (0 on any no-op / failure).
 /// Never errors out to the caller — logs and returns 0.
-// No production caller yet — the scheduler/trigger that drives a round (e.g. a
-// client-requested or idle-loop backfill) lands in a follow-up. This is the
-// single live head of the outbound-backfill chain (`backfill_once` →
-// `persist_pdus` → `FederationClient::backfill`); the lower links are no longer
-// dead once this is. Exercised by the unit tests below in the meantime.
-#[allow(dead_code)]
+// The single live head of the outbound-backfill chain (`backfill_once` →
+// `persist_pdus` → `FederationClient::backfill`); its production caller is the
+// backward-underflow trigger in the `/messages` handler (`messages.rs`).
 pub(crate) async fn backfill_once(
     store: &SqliteStore,
     client: &FederationClient,
