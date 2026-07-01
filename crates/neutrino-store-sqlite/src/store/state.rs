@@ -32,7 +32,7 @@ use std::collections::{BTreeSet, HashMap};
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{OptionalExtension, params, params_from_iter};
 use neutrino_store::{Event, Membership, StateStore, StorageError};
-use ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
+use ruma::{OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, UserId};
 
 use crate::{
     SqliteStore,
@@ -159,6 +159,32 @@ impl StateStore for SqliteStore {
                 out.push(id);
             }
             Ok(out)
+        })
+        .await
+    }
+
+    async fn joined_servers(&self, room_id: &RoomId) -> Result<Vec<OwnedServerName>, StorageError> {
+        let room_id = room_id.to_owned();
+
+        self.run_read(move |conn| -> Result<Vec<OwnedServerName>, Error> {
+            // `room_id` + `event_type` + `membership` narrows within the
+            // `current_state` member index; DISTINCT dedups state_keys at the
+            // SQL layer, the `BTreeSet` dedups again at server-name granularity.
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT state_key FROM current_state \
+                 WHERE room_id = ? AND event_type = 'm.room.member' AND membership = 'join'",
+            )?;
+            let rows = stmt.query_map(params![room_id.as_str()], |row| row.get::<_, String>(0))?;
+
+            let mut servers = BTreeSet::new();
+            for r in rows {
+                let state_key = r?;
+                let user = ruma::UserId::parse(state_key.as_str()).map_err(|e| {
+                    Error::Internal(format!("malformed member state_key in DB: {e}"))
+                })?;
+                servers.insert(user.server_name().to_owned());
+            }
+            Ok(servers.into_iter().collect())
         })
         .await
     }
@@ -294,7 +320,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use neutrino_store::{EventStore, Membership, RoomStore, StateStore};
-    use ruma::{event_id, room_id};
+    use ruma::{event_id, room_id, user_id};
 
     use crate::tests::{
         ALICE_ROOM_ID, ALICE_USER_ID, BOB_ROOM_ID, BOB_USER_ID, create_event,
@@ -436,6 +462,81 @@ mod tests {
         s.persist_event(&leave, &[]).await.unwrap();
 
         assert!(s.joined_rooms(*ALICE_USER_ID).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn joined_servers_lists_distinct_join_servers() {
+        let s = store().await;
+        s.create_room(
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
+            &[member_join(*ALICE_ROOM_ID, *ALICE_USER_ID)],
+        )
+        .await
+        .unwrap();
+
+        let servers = s.joined_servers(*ALICE_ROOM_ID).await.unwrap();
+        assert!(
+            servers
+                .iter()
+                .any(|sv| sv.as_str() == ALICE_USER_ID.server_name().as_str())
+        );
+    }
+
+    // Distinct server names: two joined members on the same homeserver collapse
+    // to one entry, a third on a different homeserver adds a second entry.
+    #[tokio::test]
+    async fn joined_servers_dedups_by_server_name() {
+        let s = store().await;
+        s.create_room(
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
+            &[member_join(*ALICE_ROOM_ID, *ALICE_USER_ID)],
+        )
+        .await
+        .unwrap();
+        // Second join on the same homeserver as ALICE (example.com).
+        let local_peer = user_id!("@carol:example.com");
+        s.persist_event(&member_join(*ALICE_ROOM_ID, local_peer), &[])
+            .await
+            .unwrap();
+        // Join on a different homeserver.
+        let remote = user_id!("@dave:other.example.org");
+        s.persist_event(&member_join(*ALICE_ROOM_ID, remote), &[])
+            .await
+            .unwrap();
+
+        let servers = s.joined_servers(*ALICE_ROOM_ID).await.unwrap();
+        let names: BTreeSet<&str> = servers.iter().map(|sv| sv.as_str()).collect();
+        assert_eq!(names, BTreeSet::from(["example.com", "other.example.org"]));
+    }
+
+    #[tokio::test]
+    async fn joined_servers_empty_for_unknown_room() {
+        let s = store().await;
+        assert!(s.joined_servers(*ALICE_ROOM_ID).await.unwrap().is_empty());
+    }
+
+    // A member who left is excluded from joined_servers.
+    #[tokio::test]
+    async fn joined_servers_excludes_left_members() {
+        let s = store().await;
+        s.create_room(
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
+            &[member_join(*ALICE_ROOM_ID, *ALICE_USER_ID)],
+        )
+        .await
+        .unwrap();
+        let remote = user_id!("@dave:other.example.org");
+        s.persist_event(&member_join(*ALICE_ROOM_ID, remote), &[])
+            .await
+            .unwrap();
+        // The remote member leaves; only ALICE's server should remain.
+        s.persist_event(&member_leave(*ALICE_ROOM_ID, remote), &[])
+            .await
+            .unwrap();
+
+        let servers = s.joined_servers(*ALICE_ROOM_ID).await.unwrap();
+        let names: BTreeSet<&str> = servers.iter().map(|sv| sv.as_str()).collect();
+        assert_eq!(names, BTreeSet::from(["example.com"]));
     }
 
     // S9
