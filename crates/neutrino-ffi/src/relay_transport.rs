@@ -27,7 +27,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use iroh::endpoint::presets::Minimal;
-use iroh::endpoint::{Connection, VarInt};
+use iroh::endpoint::{Connection, IdleTimeout, QuicTransportConfig, VarInt};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use neutrino_main::DatagramLink;
 use tokio::sync::Mutex as AsyncMutex;
@@ -54,6 +54,18 @@ const RELAY_ALPN: &[u8] = b"neutrino/iroh-relay/0";
 /// for a real BLE discovery + QUIC handshake, short enough to surface a dead peer
 /// well before the coap request timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Connection-level QUIC idle timeout. iroh's default is 30s (noq-proto,
+/// RFC 9308 §3.2); iroh overrides the *path* idle (15s) and keepalive (5s) but
+/// leaves this connection-level one at the default. On a BLE peer restart the
+/// old connection otherwise lingers the full 30s: iroh won't migrate to the
+/// freshly-reconnected pipe because the peer's custom address is prefix-keyed
+/// off its (unchanged) node id, so it looks like the same, still-live path —
+/// iroh only re-resolves and re-handshakes once *this* timer closes the dead
+/// connection. 10s is >2x the 5s keepalive (a healthy link survives a single
+/// lost keepalive) yet well under the 30s default, collapsing peer-restart
+/// recovery from ~30s+ to ~10s.
+const CONN_MAX_IDLE: Duration = Duration::from_secs(10);
 
 /// Bound on buffered inbound datagrams before the per-connection readers block
 /// (back-pressure onto the wire, which is acceptable for a best-effort link).
@@ -100,10 +112,21 @@ impl IrohTransport {
         // crypto provider; we disable the relay explicitly and resolve peers
         // solely via the BLE `address_lookup` wired below (LAN peers are seeded
         // via `add_peer`), so nothing ever touches the network for discovery.
+        // Shorten the connection-level idle timeout so a dead BLE connection is
+        // abandoned (and re-established over a fresh pipe) in seconds rather than
+        // the 30s default. Built from `QuicTransportConfig::builder()`, which
+        // seeds iroh's own defaults (5s keepalive, 15s path idle) — we override
+        // only the connection idle. See `CONN_MAX_IDLE`.
+        let transport_config = QuicTransportConfig::builder()
+            .max_idle_timeout(Some(IdleTimeout::try_from(CONN_MAX_IDLE).map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) },
+            )?))
+            .build();
         let builder = Endpoint::builder(Minimal)
             .relay_mode(RelayMode::Disabled)
             .secret_key(secret_key)
-            .alpns(vec![RELAY_ALPN.to_vec()]);
+            .alpns(vec![RELAY_ALPN.to_vec()])
+            .transport_config(transport_config);
 
         // On the embedded (Android) target, add the BLE custom transport
         // *alongside* IP, so federation reaches peers over both LAN and BLE
