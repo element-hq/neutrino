@@ -24,14 +24,33 @@ const RESTORING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12
 const DEAD_GC_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 pub(crate) const L2CAP_SELECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 /// Max time a `Connected` pipe may go without producing an inbound datagram
-/// before the registry treats it as wedged and synthesizes `Stalled`. The
-/// wire-level QUIC keepalive runs at 5 s so a healthy link should bump its
-/// `LivenessClock` at roughly that cadence (packets flow both ways); 45 s
-/// is ~9× that and tolerates substantial jitter / transient scan stalls
-/// without false-positiving. Covers the wedged-pipe case where the peer's
-/// BLE stack freezes without emitting a disconnect callback (observed on
-/// Android LE in low-power mode and during iOS background suspension).
-pub(crate) const CONNECTED_IDLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
+/// before the registry treats it as wedged and synthesizes `Stalled`.
+///
+/// This is the transport's real inbound-liveness detector: it fires off the
+/// pipe's `LivenessClock` (bumped by any inbound datagram), so it catches a
+/// silent-but-still-`Connected` link — a nuked/frozen peer — that the reliable
+/// layer's `LINK_DEAD_DEADLINE` misses (that one only runs while there is
+/// outstanding unacked data; an idle send queue is invisible to it).
+///
+/// The wire-level QUIC keepalive runs at 5 s (both directions), so a healthy
+/// link bumps its `LivenessClock` at roughly that cadence. 20 s is 4× that —
+/// enough to ride out ordinary jitter / transient scan stalls, and it bounds
+/// worst-case dead-peer recovery to ~20 s rather than 45 s. Trade-off: a peer
+/// whose BLE stack freezes *transiently* without a disconnect callback (Android
+/// LE low-power, iOS background suspension) longer than 20 s is torn down and
+/// must reconnect; the cost of that false teardown is a reconnect, versus the
+/// old 45 s of a genuinely-dead link looking alive.
+pub(crate) const CONNECTED_IDLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Max time an entry may sit in `Connecting` or `Handshaking` before the tick
+/// forces a reconnect. The driver bounds its own connect attempt, but nothing
+/// otherwise bounds `Handshaking` (a QUIC handshake that stalls on a freshly
+/// (re)established link). Without this an entry can wedge there forever:
+/// `handle_send_datagram` only *buffers* for `Handshaking`/`Connecting`,
+/// `handle_advertised` ignores those phases, and GC never reaps them — so the
+/// peer becomes permanently unreachable even while it's advertising in range.
+/// 10 s comfortably covers a real BLE connect + QUIC handshake.
+const DIAL_STAGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug)]
 pub struct Registry {
@@ -490,6 +509,32 @@ impl Registry {
                     device_id: device_id.clone(),
                     attempt,
                 });
+            }
+            // A peer we'd given up on (`Dead`) is advertising again → it's back.
+            // Recover it immediately like a fresh discovery instead of waiting
+            // out `DEAD_GC_TTL` + a subsequent send. Reset the failure budget so
+            // it isn't re-`Dead`ed on the first hiccup. Mirrors the `Unknown` arm.
+            PeerPhase::Dead { .. } => {
+                entry.consecutive_failures = 0;
+                if entry.pending_sends.is_empty() {
+                    entry.phase = PeerPhase::Discovered { since: now };
+                } else if should_defer {
+                    entry.phase = PeerPhase::PendingDial {
+                        since: now,
+                        deadline: pending_dial_deadline(now, prefix),
+                        prefix,
+                    };
+                } else {
+                    entry.phase = PeerPhase::Connecting {
+                        attempt: 0,
+                        started: now,
+                        path: crate::transport::peer::ConnectPath::Gatt,
+                    };
+                    actions.push(PeerAction::StartConnect {
+                        device_id: device_id.clone(),
+                        attempt: 0,
+                    });
+                }
             }
             _ => {}
         }
@@ -1051,6 +1096,7 @@ impl Registry {
             DrainingToDead,
             RestoringToDead,
             ConnectedWedged,
+            DialStageTimedOut,
         }
 
         let mut decisions: Vec<(DeviceId, TickAction)> = Vec::new();
@@ -1101,6 +1147,19 @@ impl Registry {
                             > CONNECTED_IDLE_DEADLINE)
                             .then_some(TickAction::ConnectedWedged),
                     }
+                }
+                // A dial that never progressed past connect/handshake. Nothing
+                // else bounds `Handshaking`, so this is what stops it wedging
+                // forever (see `DIAL_STAGE_DEADLINE`).
+                PeerPhase::Connecting { started, .. }
+                    if tick_now.saturating_duration_since(*started) > DIAL_STAGE_DEADLINE =>
+                {
+                    Some(TickAction::DialStageTimedOut)
+                }
+                PeerPhase::Handshaking { since, .. }
+                    if tick_now.saturating_duration_since(*since) > DIAL_STAGE_DEADLINE =>
+                {
+                    Some(TickAction::DialStageTimedOut)
                 }
                 _ => None,
             };
@@ -1172,6 +1231,41 @@ impl Registry {
                         });
                     }
                     actions.push(PeerAction::EmitMetric("connected_pipe_wedged".into()));
+                }
+                TickAction::DialStageTimedOut => {
+                    // Treat a stalled connect/handshake like a failed connect:
+                    // close any half-open channel and fall back to
+                    // `Reconnecting` (or `Dead` past the retry ceiling) so the
+                    // peer is re-dialed rather than left buffering sends into a
+                    // handshake that will never complete.
+                    let channel = match &entry.phase {
+                        PeerPhase::Handshaking { channel, .. } => Some(channel.clone()),
+                        _ => None,
+                    };
+                    entry.consecutive_failures += 1;
+                    actions.push(PeerAction::EmitMetric("dial_stage_timeout".into()));
+                    if entry.consecutive_failures >= MAX_CONNECT_ATTEMPTS {
+                        entry.phase = PeerPhase::Dead {
+                            reason: crate::transport::peer::DeadReason::MaxRetries,
+                            at: tick_now,
+                        };
+                        if let Some(prefix) = entry.prefix {
+                            actions.push(PeerAction::ForgetPeerStore { prefix });
+                        }
+                    } else {
+                        entry.phase = PeerPhase::Reconnecting {
+                            attempt: entry.consecutive_failures,
+                            next_at: tick_now + reconnect_backoff(entry.consecutive_failures),
+                            reason: crate::transport::peer::DisconnectReason::Timeout,
+                        };
+                    }
+                    if let Some(ch) = channel {
+                        actions.push(PeerAction::CloseChannel {
+                            device_id: device_id.clone(),
+                            channel: ch,
+                            reason: crate::transport::peer::DisconnectReason::Timeout,
+                        });
+                    }
                 }
             }
         }
@@ -2667,6 +2761,185 @@ mod tests {
     #[test]
     fn tick_wedged_l2cap_pipe_drains_and_closes_channel_after_idle_deadline() {
         tick_wedged_pipe_test_body(crate::transport::peer::ConnectPath::L2cap);
+    }
+
+    /// A `Connecting` entry that never progressed past `DIAL_STAGE_DEADLINE` must
+    /// be forced to `Reconnecting` so it re-dials rather than buffering forever.
+    #[test]
+    fn tick_times_out_stuck_connecting_into_reconnecting() {
+        use crate::transport::peer::{ConnectPath, DisconnectReason};
+
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-stuck-connecting");
+        let started = std::time::Instant::now();
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.phase = PeerPhase::Connecting {
+                attempt: 0,
+                started,
+                path: ConnectPath::Gatt,
+            };
+            e
+        });
+
+        let tick_now = started + DIAL_STAGE_DEADLINE + std::time::Duration::from_millis(10);
+        let actions = reg.handle(PeerCommand::Tick(tick_now));
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::EmitMetric(s) if s == "dial_stage_timeout")),
+            "expected dial_stage_timeout metric; got {actions:?}",
+        );
+        assert!(
+            matches!(
+                reg.peer(&device_id).unwrap().phase,
+                PeerPhase::Reconnecting {
+                    reason: DisconnectReason::Timeout,
+                    ..
+                }
+            ),
+            "stuck Connecting must fall back to Reconnecting; got {:?}",
+            reg.peer(&device_id).unwrap().phase,
+        );
+    }
+
+    /// A `Handshaking` entry (which has no other timeout) that stalls past
+    /// `DIAL_STAGE_DEADLINE` must be timed out, its half-open channel closed, and
+    /// dropped to `Reconnecting` — otherwise it wedges the peer permanently.
+    #[test]
+    fn tick_times_out_stuck_handshaking_and_closes_channel() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, DisconnectReason};
+
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-stuck-handshaking");
+        let since = std::time::Instant::now();
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.phase = PeerPhase::Handshaking {
+                since,
+                channel: ChannelHandle {
+                    id: 9,
+                    path: ConnectPath::Gatt,
+                },
+            };
+            e
+        });
+
+        let tick_now = since + DIAL_STAGE_DEADLINE + std::time::Duration::from_millis(10);
+        let actions = reg.handle(PeerCommand::Tick(tick_now));
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::CloseChannel { .. })),
+            "expected the half-open channel to be closed; got {actions:?}",
+        );
+        assert!(
+            matches!(
+                reg.peer(&device_id).unwrap().phase,
+                PeerPhase::Reconnecting {
+                    reason: DisconnectReason::Timeout,
+                    ..
+                }
+            ),
+            "stuck Handshaking must fall back to Reconnecting; got {:?}",
+            reg.peer(&device_id).unwrap().phase,
+        );
+    }
+
+    /// Counterpart: a fresh `Connecting` entry within the deadline must not be
+    /// timed out (the connect/handshake is still legitimately in progress).
+    #[test]
+    fn tick_does_not_time_out_dial_within_deadline() {
+        use crate::transport::peer::ConnectPath;
+
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-connecting-fresh");
+        let started = std::time::Instant::now();
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.phase = PeerPhase::Connecting {
+                attempt: 0,
+                started,
+                path: ConnectPath::Gatt,
+            };
+            e
+        });
+
+        let tick_now = started + std::time::Duration::from_millis(10);
+        let actions = reg.handle(PeerCommand::Tick(tick_now));
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::EmitMetric(s) if s == "dial_stage_timeout")),
+            "a fresh Connecting entry must not be timed out; got {actions:?}",
+        );
+        assert!(
+            matches!(
+                reg.peer(&device_id).unwrap().phase,
+                PeerPhase::Connecting { .. }
+            ),
+            "entry should remain Connecting within the deadline",
+        );
+    }
+
+    /// A `Dead` peer that starts advertising again must be revived into a dial
+    /// (not left waiting for GC + a fresh send) — this is what unwedges a peer
+    /// that was force-stopped and brought back. Failure budget resets so the
+    /// revived entry isn't immediately re-`Dead`ed.
+    #[test]
+    fn advertised_revives_dead_peer_with_pending_sends() {
+        use crate::transport::peer::{DeadReason, PendingSend};
+        use crate::transport::routing::prefix_from_endpoint;
+
+        let mut reg = Registry::new_for_test();
+        // Any peer prefix works; we accept either dialing outcome (Connecting or
+        // PendingDial) since which one is chosen depends on prefix ordering.
+        let peer_ep = iroh_base::SecretKey::from_bytes(&[0x01u8; 32]).public();
+        let peer_prefix = prefix_from_endpoint(&peer_ep);
+        let device_id = blew::DeviceId::from("dev-dead-revive");
+
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.consecutive_failures = MAX_CONNECT_ATTEMPTS;
+            e.phase = PeerPhase::Dead {
+                reason: DeadReason::MaxRetries,
+                at: std::time::Instant::now(),
+            };
+            e.pending_sends.push_back(PendingSend {
+                tx_gen: 0,
+                datagram: bytes::Bytes::from_static(b"buffered"),
+                waker: noop_waker(),
+            });
+            e
+        });
+
+        let _ = reg.handle(PeerCommand::Advertised {
+            prefix: peer_prefix,
+            device: blew::BleDevice {
+                id: device_id.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+
+        let entry = reg.peer(&device_id).unwrap();
+        assert!(
+            matches!(
+                entry.phase,
+                PeerPhase::Connecting { .. } | PeerPhase::PendingDial { .. }
+            ),
+            "a re-advertised Dead peer with buffered sends must be re-dialed; got {:?}",
+            entry.phase,
+        );
+        assert_eq!(
+            entry.consecutive_failures, 0,
+            "reviving a Dead peer must reset its failure budget",
+        );
     }
 
     /// A `Connected` entry whose data-pipe was torn down (the send path sets

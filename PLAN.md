@@ -178,6 +178,33 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### BLE permanent-wedge on peer restart: registry dial-stage timeout + Dead revive (2026-07-01)
+- **Symptom:** force-stop a BLE peer then bring it back → permanently unreachable,
+  symmetric on both devices ("as if BLE is off"), never recovers.
+- **Root cause (registry state machine, `iroh-ble-transport`):** an entry that
+  reaches `Handshaking` (QUIC handshake stalled on a re-established link) is stuck
+  forever — `Handshaking` has no tick timeout, `handle_advertised` is a no-op
+  (`_ => {}`) for `Handshaking`/`Connecting`/`Connected`/`Draining`/`Dead`, and
+  `handle_send_datagram` only *buffers* (Handshaking/Connecting) or *rejects*
+  (Connected-no-pipe/Draining/Dead) — none re-dial. So sends buffer into a
+  never-completing handshake, adverts are ignored, and GC never reaps it.
+- **Why only now:** disabling relay/DNS (correct for the offline BLE-mesh target)
+  forces all traffic onto the BLE custom transport. WiFi+iroh-DNS testing resolved
+  peers' IPs and connected over the IP transport, so the BLE registry was never
+  exercised — the wedge was always latent. NOT caused by the discovery-disable;
+  revealed by it. Discovery itself is healthy (confirmed: scanner sees the peer
+  strongly, `discovered[prefix]` is current). iroh's `resolve_remote`
+  (path_state.rs) also short-circuits on a cached path, but the BLE token resolves
+  live to `discovered[prefix]`, so that isn't the blocker.
+- **Fix 1:** `DIAL_STAGE_DEADLINE` (10s) — `handle_tick` now times out a
+  `Connecting`/`Handshaking` entry, closes any half-open channel, and drops it to
+  `Reconnecting` (or `Dead` past `MAX_CONNECT_ATTEMPTS`) so it re-dials.
+- **Fix 2:** `handle_advertised` revives a `Dead` peer that starts advertising
+  again into a fresh dial (mirrors the `Unknown` arm; resets `consecutive_failures`)
+  instead of waiting out `DEAD_GC_TTL` + a subsequent send.
+- 4 unit tests added. Vendored crate ⇒ not compilable in-sandbox (no dbus);
+  rustfmt-checked, CI verifies. Keep the discovery-disable (BLE-only is correct).
+
 ### Offline sync hang: disable iroh DNS discovery + executor-stall watchdog (2026-07-01)
 - **Symptom:** creating a room with **no network** hung — the client's `/sync`
   long-polls never returned (nor hit their 30s timeout). Reproduces only offline
