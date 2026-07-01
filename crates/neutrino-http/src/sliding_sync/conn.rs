@@ -67,6 +67,14 @@ pub struct SubCfg {
 #[derive(Debug, Default, Clone)]
 pub struct RoomSent {
     pub required_state_keys: HashMap<(String, String), OwnedEventId>,
+    /// Whether the most recent emission for this room was an `invite_state`
+    /// (as opposed to a joined-room timeline). An invite emission still
+    /// populates `Conn::sent` (so the invite isn't re-sent every sync), which
+    /// on its own would make the *subsequent join* look like a delta and skip
+    /// the full snapshot. `build_response` reads this flag to force
+    /// initial-snapshot treatment on the invite→join transition, restoring the
+    /// `prev_batch` the client needs to backpaginate pre-invite history.
+    pub emitted_as_invite: bool,
 }
 
 /// One sliding-sync connection's state.

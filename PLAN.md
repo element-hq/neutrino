@@ -291,6 +291,26 @@ never use .unwrap() in handler code.
   bounded by the 45s deadline; faster dead-link detection at send time is a
   possible follow-up (riskier — `pipe: None` is also a tolerated transient).
 
+### sliding-sync invite→join re-snapshot (2026-07-01)
+- **Bug:** a room joined *after* an invite was emitted only a `prev_batch`-less
+  delta on the joining sync, so clients could never backpaginate the history
+  that predates the invite and the `/messages` federation-backfill trigger never
+  fired — pre-invite message history was permanently unreachable.
+- **Cause:** `build_invite_room` populates `conn.sent` for the room (so the
+  invite isn't re-sent every sync). That entry made the subsequent join look
+  non-initial (`is_initial_for_room == false`), routing it through the delta
+  path, which caps at `timeline_limit` and hardcodes `prev_batch = None`.
+- **Fix:** `RoomSent` now carries `emitted_as_invite` (set from
+  `room.invite_state.is_some()` after each emission). On the sync where an
+  invite-emitted room is found joined, `build_room` forces the initial-snapshot
+  path (`room_messages` Backward + `prev_batch`), restoring backpagination →
+  federation backfill. Recorded here because the invite→join transition was an
+  untested gap; a regression test now pins `initial == Some(true)` +
+  `prev_batch.is_some()` on the transition.
+- **Known adjacent smell (not fixed here):** the joined delta path emits
+  `prev_batch = None` even when `limited == true`; benign now that the
+  transition takes the snapshot path, but arguably wrong on its own.
+
 ### room runtime moved into `neutrino-engine` (2026-06-30)
 - Phase 2 of the extraction: `room_actor` (RoomActor/RoomRegistry), `sender`,
   `worker`, `reconcile`, `gapfill` physically moved from `neutrino-http` into

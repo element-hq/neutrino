@@ -89,12 +89,19 @@ pub(super) async fn build_response<S: StorageBackend>(
 
     let mut rooms_response = BTreeMap::new();
     for (room_id, combined_cfg) in &combined {
-        let is_initial_for_room = !conn.sent.contains_key(room_id);
+        let sent_snapshot = conn.sent.get(room_id).cloned();
+        let is_initial_for_room = sent_snapshot.is_none();
+        // A room previously emitted as an invite has a `conn.sent` entry, so it
+        // no longer looks initial — but a join after an invite needs the full
+        // snapshot path (timeline + `prev_batch`), not the delta path.
+        let was_invite = sent_snapshot
+            .as_ref()
+            .map(|s| s.emitted_as_invite)
+            .unwrap_or(false);
         let room_delta: &[Event] = new_events_by_room
             .get(room_id)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let sent_snapshot = conn.sent.get(room_id).cloned();
 
         let built = build_room(
             state,
@@ -102,6 +109,7 @@ pub(super) async fn build_response<S: StorageBackend>(
             room_id,
             combined_cfg,
             is_initial_for_room,
+            was_invite,
             initial_sync,
             room_delta,
             sent_snapshot.as_ref(),
@@ -112,8 +120,13 @@ pub(super) async fn build_response<S: StorageBackend>(
             continue;
         };
 
+        // `invite_state` is set iff `build_room` took the invite path, so it's
+        // the authoritative record of which kind of emission this was — used
+        // next sync to detect the invite→join transition.
+        let emitted_as_invite = room_result.invite_state.is_some();
         let sent = conn.sent.entry(room_id.clone()).or_default();
         update_sent(sent, &state_events, &deleted_state_keys);
+        sent.emitted_as_invite = emitted_as_invite;
         rooms_response.insert(room_id.clone(), room_result);
     }
 
@@ -561,6 +574,7 @@ async fn build_room<S: StorageBackend>(
     room_id: &OwnedRoomId,
     cfg: &CombinedCfg,
     is_initial_for_room: bool,
+    was_invite: bool,
     is_initial_sync: bool,
     room_delta: &[Event],
     sent_snapshot: Option<&RoomSent>,
@@ -570,6 +584,12 @@ async fn build_room<S: StorageBackend>(
     if invited {
         return build_invite_room(state, user_id, room_id, cfg, is_initial_for_room).await;
     }
+
+    // Invite→join transition: the room's only prior emission was `invite_state`,
+    // so from the client's perspective it has never seen the timeline. Treat
+    // this first joined emission as initial — a full `room_messages` snapshot
+    // with a `prev_batch` token — rather than a `prev_batch`-less delta.
+    let is_initial_for_room = is_initial_for_room || was_invite;
 
     let mut room = response::Room::new();
     if is_initial_for_room {
