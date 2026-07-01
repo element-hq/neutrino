@@ -472,3 +472,42 @@ never use .unwrap() in handler code.
     oversized / source-binding cases added (I9/I10/I12).
   - Deferred with rationale: e2e loss injection (I11), recovery-timer de-flake
     (I13), change-detector / helper-test cleanup (I16/I18).
+
+### outbound federation backfill (2026-06-26)
+- Wired the *outbound* side of `GET /_matrix/federation/v1/backfill/{roomId}` to
+  client back-pagination, so a freshly-joined server (state via `send_join`, no
+  history) can serve timeline history its client back-paginates into. Mirrors
+  Synapse's model on neutrino's single `stream_pos` axis. Design:
+  `docs/superpowers/specs/2026-06-26-outbound-federation-backfill-design.md`.
+- **Trigger:** a client backward `/messages?dir=b` page that underflows the
+  requested `limit` runs **one** best-effort backfill round synchronously, then
+  re-reads and returns. The client paginating again drives the next round
+  (naturally rate-limited; never loops within a single request).
+- **Seeds:** backward extremities (dangling `prev` edges whose parent isn't held)
+  are computed **on the fly** per pagination — no `event_backward_extremities`
+  table, consistent with the "derive, don't store redundant state" stance. Capped
+  (default 5, Synapse parity) to bound the `v` query URI.
+- **Destinations:** joined servers from current state, minus self, tried
+  sequentially with failover (no joined peer → no-op).
+- **Ordering:** backfilled (older) events are allocated **descending `stream_pos`
+  below the current minimum** (`COALESCE(MIN(stream_pos),1)-1`, decremented per
+  event in a batch) via an **explicit** value into the `INTEGER PRIMARY KEY
+  AUTOINCREMENT` column (AUTOINCREMENT only governs auto-assigned values; explicit
+  inserts below the minimum are legal). `/messages?dir=b` already orders
+  `stream_pos DESC`, so it walks straight into them with no query change, and they
+  sit below any positive sliding-sync cursor. `persist_historical_event` **no
+  longer advances the forward `subscribe()` watch** and does not touch
+  `current_state`. `PaginationToken(pub u64)` → `PaginationToken(pub i64)` (and
+  `messages.rs` `parse_token`) to address the negative region; `StreamPos(pub u64)`
+  is **unchanged** (forward-only watch/sliding-sync cursor).
+- **Auth:** well-formedness only on the existing historical write path (no
+  state-res re-auth), per the trusted-network / no-signatures posture; PDUs whose
+  `room_id` ≠ the requested room are rejected and already-held events deduped.
+- **Documented downsides (accepted):** `stream_pos` is no longer `≥ 0` /
+  monotonic-from-zero — it grows a signed backfilled region; backfilled events are
+  visible only via `/messages`, never through sliding sync; the temporal
+  state-DAG index is **not** maintained for backfilled state events (tolerable
+  only because they aren't re-authed); on-the-fly extremity recompute re-scans per
+  pagination (no indexed table); no failed-pull backoff (a dead seed is retried
+  every back-page); positions drift monotonically toward `i64::MIN` (practically
+  unbounded, never resets).
