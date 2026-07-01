@@ -12,6 +12,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
 import android.os.ParcelUuid
+import android.os.SystemClock
 import android.util.Log
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -48,21 +49,44 @@ object BlePeripheralManager {
     // Latch to serialize addService calls (Android requires waiting for onServiceAdded).
     @Volatile private var serviceAddedLatch: CountDownLatch? = null
 
-    // Per-device semaphore to serialize notifyCharacteristicChanged calls.
-    // Android's BluetoothGattServer only allows one in-flight notification per
-    // device — subsequent calls before onNotificationSent are silently dropped.
-    private val notifySemaphores = ConcurrentHashMap<String, java.util.concurrent.Semaphore>()
+    // Per-device notify gate. Android's BluetoothGattServer allows only one
+    // outstanding notifyCharacteristicChanged per device — the next is silently
+    // dropped until onNotificationSent. We serialize on that, storing the
+    // monotonic deadline (elapsedRealtime ms) until which a notification is
+    // considered in-flight.
+    //
+    // Self-healing: the gate reopens either when onNotificationSent clears the
+    // entry (the healthy path, typically sub-50ms) OR when the deadline lapses.
+    // The latter is essential — the stack can accept notifyCharacteristicChanged
+    // yet fail to actually transmit ("Unable to send GATT server response"), in
+    // which case onNotificationSent never fires. A plain held-until-callback
+    // semaphore would then wedge for the entire connection, blocking every
+    // subsequent notification and killing the peripheral->central link (the
+    // receiver can't send its QUIC handshake response → LINK_DEAD → 2-3 retries).
+    private val notifyInFlightUntil = ConcurrentHashMap<String, Long>()
 
-    private fun getNotifySemaphore(addr: String): java.util.concurrent.Semaphore =
-        notifySemaphores.getOrPut(addr) { java.util.concurrent.Semaphore(1) }
+    // Longest a healthy onNotificationSent should take; past this we presume the
+    // completion callback was lost and reopen the gate.
+    private const val NOTIFY_INFLIGHT_TIMEOUT_MS = 500L
 
-    private fun acquireNotify(
-        addr: String,
-        timeoutMs: Long = 5000,
-    ): Boolean = getNotifySemaphore(addr).tryAcquire(timeoutMs, TimeUnit.MILLISECONDS)
+    // Marks a notification in-flight (returns true) iff none is in-flight or the
+    // previous one's deadline has lapsed. Atomic via `compute`.
+    private fun acquireNotify(addr: String): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        var acquired = false
+        notifyInFlightUntil.compute(addr) { _, until ->
+            if (until == null || now >= until) {
+                acquired = true
+                now + NOTIFY_INFLIGHT_TIMEOUT_MS
+            } else {
+                until
+            }
+        }
+        return acquired
+    }
 
     private fun releaseNotify(addr: String) {
-        notifySemaphores[addr]?.release()
+        notifyInFlightUntil.remove(addr)
     }
 
     // ── L2CAP state ──
@@ -189,8 +213,8 @@ object BlePeripheralManager {
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     connectedDevices.remove(addr)
                     subscriptions.remove(addr)
-                    // Drain and remove the notify semaphore so a reconnect starts fresh.
-                    notifySemaphores.remove(addr)?.drainPermits()
+                    // Clear the notify gate so a reconnect starts fresh.
+                    notifyInFlightUntil.remove(addr)
                     nativeOnConnectionStateChanged(addr, false)
                 }
             }
@@ -449,7 +473,7 @@ object BlePeripheralManager {
         val device = connectedDevices[deviceAddr] ?: return 2
         val subs = subscriptions[deviceAddr] ?: return 2
         if (uuid !in subs) return 2
-        if (!acquireNotify(deviceAddr, timeoutMs = 50)) return 1
+        if (!acquireNotify(deviceAddr)) return 1
         val sent = sendNotification(device, char, value)
         if (!sent) {
             releaseNotify(deviceAddr)

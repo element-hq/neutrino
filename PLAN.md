@@ -216,6 +216,18 @@ never use .unwrap() in handler code.
   for the first 1-2 tries (peer ACKs nothing despite a healthy pipe + correct MTU)
   — is still open; needs trace-level (`iroh_ble_transport::transport::reliable=trace`)
   fragment RX/TX logs on both ends to pin.
+- **Root cause found (trace):** the failing leg is **peripheral→central GATT notify**,
+  and it's in the Kotlin glue (`bindings/.../BlePeripheralManager.kt`), not the Rust.
+  The per-device notify semaphore was released only by `onNotificationSent`; when the
+  Android stack accepts `notifyCharacteristicChanged` but can't transmit it
+  (`ais_request_cback: Unable to send GATT server response`), that callback never
+  fires → the permit wedges for the whole connection → the receiver can't notify its
+  QUIC handshake response → LINK_DEAD, 2-3 retries (~78s). Fixed by replacing the
+  held-until-callback semaphore with a self-healing in-flight **deadline** (reopens on
+  `onNotificationSent` OR after `NOTIFY_INFLIGHT_TIMEOUT_MS=500` if the callback is
+  lost). Kotlin not compilable in-sandbox; verified by inspection, Kegan builds.
+  Rust registry `handle_stalled` (Connected|Handshaking) + `Handshaking` tick timeout
+  + Dead-revive-on-advert speed each failed-attempt teardown as defence-in-depth.
 
 ### Offline sync hang: disable iroh DNS discovery + executor-stall watchdog (2026-07-01)
 - **Symptom:** creating a room with **no network** hung — the client's `/sync`

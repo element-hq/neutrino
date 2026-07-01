@@ -33,14 +33,18 @@ pub(crate) const L2CAP_SELECT_TIMEOUT: std::time::Duration = std::time::Duration
 /// outstanding unacked data; an idle send queue is invisible to it).
 ///
 /// The wire-level QUIC keepalive runs at 5 s (both directions), so a healthy
-/// link bumps its `LivenessClock` at roughly that cadence. 20 s is 4× that —
-/// enough to ride out ordinary jitter / transient scan stalls, and it bounds
-/// worst-case dead-peer recovery to ~20 s rather than 45 s. Trade-off: a peer
-/// whose BLE stack freezes *transiently* without a disconnect callback (Android
-/// LE low-power, iOS background suspension) longer than 20 s is torn down and
-/// must reconnect; the cost of that false teardown is a reconnect, versus the
-/// old 45 s of a genuinely-dead link looking alive.
-pub(crate) const CONNECTED_IDLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+/// link bumps its `LivenessClock` roughly every 5 s. 8 s sits just above one
+/// keepalive interval plus jitter — a live link is never idle that long — while
+/// bounding the cost of a *stalled* reconnect attempt (Connected but making no
+/// forward progress) to ~8 s instead of 20 s, which is the dominant term in
+/// peer-restart recovery. Going this tight is only safe because the peripheral
+/// notify path now works (see `BlePeripheralManager` self-heal): before that
+/// fix a "healthy" link could genuinely sit inbound-silent and get false-torn-
+/// down; now inbound keepalive is reliable, so 8 s won't false-fire. The
+/// residual risk is a transient BLE-stack freeze >8 s (Android LE low-power,
+/// iOS background suspension) costing a reconnect — an acceptable trade for the
+/// faster recovery.
+pub(crate) const CONNECTED_IDLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Max time an entry may sit in `Connecting` or `Handshaking` before the tick
 /// forces a reconnect. The driver bounds its own connect attempt, but nothing
