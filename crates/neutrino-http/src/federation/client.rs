@@ -245,11 +245,8 @@ impl FederationClient {
     /// [`get_missing_events`](Self::get_missing_events): X-Matrix auth, opaque
     /// `RawValue` PDUs, transaction-envelope response. Returns the envelope's
     /// `pdus` array (newest-first, as the resident walks `prev_events` back from
-    /// the `v` seeds).
-    // No production caller yet — the outbound backfill orchestration that drives
-    // this lands in a later task of the backfill feature. Exercised by the unit
-    // tests below in the meantime.
-    #[allow(dead_code)]
+    /// the `v` seeds). Driven by the outbound backfill orchestrator
+    /// ([`crate::federation::backfill_out`]).
     pub(crate) async fn backfill(
         &self,
         dest: &ServerName,
