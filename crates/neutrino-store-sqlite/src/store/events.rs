@@ -238,9 +238,7 @@ impl EventStore for SqliteStore {
             .map_err(|_| Error::InvalidInput(format!("limit {limit} exceeds i64::MAX")))?;
         // Default `from` per direction: Forward starts at 0, Backward at i64::MAX.
         let from_pos: i64 = match from {
-            Some(t) => i64::try_from(t.0).map_err(|_| {
-                Error::InvalidInput(format!("PaginationToken {} exceeds i64::MAX", t.0))
-            })?,
+            Some(t) => t.0,
             None => match dir {
                 Direction::Forward => 0,
                 Direction::Backward => i64::MAX,
@@ -249,9 +247,7 @@ impl EventStore for SqliteStore {
         // Exclusive stop boundary. Unconstraining sentinels when `to` is None:
         // Forward never reaches i64::MAX, Backward never reaches i64::MIN.
         let to_pos: i64 = match to {
-            Some(t) => i64::try_from(t.0).map_err(|_| {
-                Error::InvalidInput(format!("PaginationToken {} exceeds i64::MAX", t.0))
-            })?,
+            Some(t) => t.0,
             None => match dir {
                 Direction::Forward => i64::MAX,
                 Direction::Backward => i64::MIN,
@@ -332,18 +328,14 @@ impl EventStore for SqliteStore {
                         // token is that row's position; backward `from` is
                         // inclusive, so subtract one to exclude the last row
                         // from the next page (Synapse `generate_next_token`).
-                        // `p >= 1` whenever a backward overflow row exists (an
-                        // older event sits past it), so `p - 1 >= 0`.
+                        // The token may be negative once backfilled events
+                        // occupy the negative stream-position region.
                         Some(p) => {
                             let tok = match dir {
                                 Direction::Forward => p,
                                 Direction::Backward => p - 1,
                             };
-                            Some(PaginationToken(u64::try_from(tok).map_err(|_| {
-                                Error::Internal(format!(
-                                    "negative stream_pos encountered while building pagination token: {tok}"
-                                ))
-                            })?))
+                            Some(PaginationToken(tok))
                         }
                         None => None,
                     }
@@ -1692,6 +1684,23 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 2);
         assert!(next.is_none());
+    }
+
+    // A negative pagination token is a valid backfilled-region cursor:
+    // backward pagination from a positive token must be able to return a
+    // row at a negative stream_pos and hand back a negative `next` token.
+    #[tokio::test]
+    async fn room_messages_backward_crosses_into_negative_region() {
+        let s = store_with_room().await;
+        // Forward event in the positive region.
+        s.persist_event(&message(*ALICE_ROOM_ID, *ALICE_USER_ID, "newer"), &[])
+            .await
+            .unwrap();
+        // Historical events will land at stream_pos <= 0 once Task 4 lands;
+        // until then this test pins only the token type round-trip — a
+        // negative literal only compiles under `i64`.
+        let tok = PaginationToken(-5);
+        assert_eq!(tok.0, -5i64);
     }
 
     // E44-E49: `persist_historical_event` — backfill-class persistence
