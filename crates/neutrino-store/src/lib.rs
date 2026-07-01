@@ -22,7 +22,7 @@ pub enum StorageError {
 pub struct StreamPos(pub u64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PaginationToken(pub i64);
+pub struct PaginationToken(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -142,17 +142,16 @@ pub trait EventStore: Send + Sync {
     ) -> Result<(), StorageError>;
 
     /// Pre:  the room identified by `event.room_id` must already exist.
-    /// Post: the event is persisted with a new `StreamPos` *less* than all previous
-    ///       positions (backfilled events are older than the head, so they occupy
-    ///       the descending region below the minimum) and visible via `get_events`
-    ///       / DAG walks / backward `room_messages`; `current_state` is NOT updated
-    ///       even for state events — historical events feed history (`events`,
-    ///       `event_edges`, `room_messages`) but must not regress the resolved
-    ///       current state, which already reflects the room's head; no outbox rows
-    ///       are created (historical events are local-only history, not federation
-    ///       traffic — backfill is the read direction); the `subscribe()` watch is
-    ///       NOT advanced (backfilled events are older than the head and never
-    ///       surface in incremental sliding sync).
+    /// Post: the event is persisted with a new `StreamPos` greater than all previous
+    ///       positions and visible via `events_after` / `get_events` / DAG walks;
+    ///       `current_state` is NOT updated even for state events — historical
+    ///       events feed history (`events`, `event_edges`, `room_messages`) but
+    ///       must not regress the resolved current state, which already reflects
+    ///       the room's head; no outbox rows are created (historical events are
+    ///       local-only history, not federation traffic — backfill is the read
+    ///       direction); the `subscribe()` watch is updated with the new
+    ///       `StreamPos` after the transaction commits, so subscribers can wake
+    ///       and discover the new history.
     ///
     /// Use this for `/backfill`, `/get_missing_events`, and any other path that
     /// inserts events older than the current head. Use `persist_event` for
@@ -281,12 +280,6 @@ pub trait StateStore: Send + Sync {
     ) -> Result<HashMap<String, Event>, StorageError>;
 
     /// Pre:  none.
-    /// Post: distinct server names with at least one `join` membership in the
-    ///       room's current state. Does NOT exclude our own server (callers
-    ///       filter). Empty if the room is unknown or has no joined members.
-    async fn joined_servers(&self, room_id: &RoomId) -> Result<Vec<OwnedServerName>, StorageError>;
-
-    /// Pre:  none.
     /// Post: returns the `room_id` of every room in which `user_id` has a current
     ///       `m.room.member` event with `content.membership = "join"`; rooms where the
     ///       user has left, been banned, or is only invited are excluded.
@@ -374,16 +367,6 @@ pub trait DagStore: Send + Sync {
         limit: usize,
         state_dag: bool,
     ) -> Result<Vec<Event>, StorageError>;
-
-    /// Pre:  none.
-    /// Post: returns the distinct event ids referenced as a `prev` edge by an
-    ///       event in `room_id` whose target is *not* present in `events` —
-    ///       the backward extremities, i.e. the seeds for an outbound
-    ///       `/backfill`. Empty for a fully-grounded room. Order unspecified.
-    async fn backward_extremities(
-        &self,
-        room_id: &RoomId,
-    ) -> Result<Vec<OwnedEventId>, StorageError>;
 }
 
 /// The result of [`StagingStore::ancestry_gap`] — a snapshot of one PDU's

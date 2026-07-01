@@ -267,9 +267,7 @@ impl<'a> EventRow<'a> {
     /// remote members and the initial-event batch advances the watch
     /// once at the end).
     pub fn write_into_tx(&self, tx: &Transaction<'_>) -> Result<i64, Error> {
-        self.write_into_tx_inner(
-            tx, /* update_current_state */ true, /* explicit_pos */ None,
-        )
+        self.write_into_tx_inner(tx, /* update_current_state */ true)
     }
 
     /// Historical-backfill write: crack JSON, INSERT into `events`,
@@ -281,23 +279,8 @@ impl<'a> EventRow<'a> {
     /// the current-state view. JSON cracking, column ↔ JSON cross-
     /// checks, and member-event validation still fire — historical
     /// events have to be well-formed for the read paths to function.
-    ///
-    /// The position is assigned **explicitly** as
-    /// `COALESCE(MIN(stream_pos), 1) - 1`, read inside this same txn, so each
-    /// backfilled event lands *below* the existing minimum (negative-or-zero,
-    /// decremented per call). SQLite permits explicit values — including values below the
-    /// current max — into an `AUTOINCREMENT` column; the autoincrement
-    /// monotonicity constraint only applies to auto-*generated* positions.
-    /// This is what lets client back-pagination (`room_messages` /
-    /// `/messages?dir=b`, which orders `stream_pos DESC`) walk into the
-    /// backfilled tail in correct order. Returns the assigned position.
     pub fn write_into_tx_historical(&self, tx: &Transaction<'_>) -> Result<i64, Error> {
-        let next_pos: i64 = tx.query_row(
-            "SELECT COALESCE(MIN(stream_pos), 1) - 1 FROM events",
-            [],
-            |r| r.get(0),
-        )?;
-        self.write_into_tx_inner(tx, /* update_current_state */ false, Some(next_pos))
+        self.write_into_tx_inner(tx, /* update_current_state */ false)
     }
 
     /// Resolved-event write: crack JSON, INSERT into `events`, INSERT edges.
@@ -307,22 +290,13 @@ impl<'a> EventRow<'a> {
     /// change current state for keys other than (or instead of) this event's
     /// own, so a single implicit per-key upsert would be wrong.
     pub fn write_into_tx_no_current_state(&self, tx: &Transaction<'_>) -> Result<i64, Error> {
-        self.write_into_tx_inner(
-            tx, /* update_current_state */ false, /* explicit_pos */ None,
-        )
+        self.write_into_tx_inner(tx, /* update_current_state */ false)
     }
 
-    /// Crack + cross-check + INSERT into `events`/`event_edges`, optionally
-    /// upserting `current_state`. When `explicit_pos` is `Some`, the
-    /// `stream_pos` column is supplied explicitly (used by the historical
-    /// backfill path to place events below the minimum); when `None`, SQLite
-    /// auto-assigns an ascending position via `AUTOINCREMENT` (the forward
-    /// path). Returns the assigned `stream_pos`.
     fn write_into_tx_inner(
         &self,
         tx: &Transaction<'_>,
         update_current_state: bool,
-        explicit_pos: Option<i64>,
     ) -> Result<i64, Error> {
         // Inline cracker for the JSON fields we need *and* the ones we
         // cross-check against the `Event` columns. A caller that
@@ -444,49 +418,24 @@ impl<'a> EventRow<'a> {
                 self.origin_server_ts
             ))
         })?;
-        let stream_pos = match explicit_pos {
-            Some(pos) => {
-                tx.execute(
-                    "INSERT INTO events \
-                     (stream_pos, event_id, room_id, event_type, state_key, sender, origin_server_ts, json, auth_events_json, rejected, soft_failed) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    params![
-                        pos,
-                        self.event_id.as_str(),
-                        self.room_id.as_str(),
-                        self.event_type,
-                        self.state_key,
-                        self.sender.as_str(),
-                        origin_server_ts,
-                        self.raw.get(),
-                        auth_events_json,
-                        self.rejected,
-                        self.soft_failed,
-                    ],
-                )?;
-                pos
-            }
-            None => {
-                tx.execute(
-                    "INSERT INTO events \
-                     (event_id, room_id, event_type, state_key, sender, origin_server_ts, json, auth_events_json, rejected, soft_failed) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    params![
-                        self.event_id.as_str(),
-                        self.room_id.as_str(),
-                        self.event_type,
-                        self.state_key,
-                        self.sender.as_str(),
-                        origin_server_ts,
-                        self.raw.get(),
-                        auth_events_json,
-                        self.rejected,
-                        self.soft_failed,
-                    ],
-                )?;
-                tx.last_insert_rowid()
-            }
-        };
+        tx.execute(
+            "INSERT INTO events \
+             (event_id, room_id, event_type, state_key, sender, origin_server_ts, json, auth_events_json, rejected, soft_failed) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                self.event_id.as_str(),
+                self.room_id.as_str(),
+                self.event_type,
+                self.state_key,
+                self.sender.as_str(),
+                origin_server_ts,
+                self.raw.get(),
+                auth_events_json,
+                self.rejected,
+                self.soft_failed,
+            ],
+        )?;
+        let stream_pos = tx.last_insert_rowid();
 
         {
             let mut stmt = tx.prepare(

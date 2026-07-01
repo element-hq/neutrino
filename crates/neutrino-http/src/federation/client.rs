@@ -240,54 +240,6 @@ impl FederationClient {
         )
     }
 
-    /// `GET http://{dest}/_matrix/federation/v1/backfill/{room}?v=<seed>&…&limit=N`
-    /// — request older timeline PDUs from a resident peer. Mirrors
-    /// [`get_missing_events`](Self::get_missing_events): X-Matrix auth, opaque
-    /// `RawValue` PDUs, transaction-envelope response. Returns the envelope's
-    /// `pdus` array (newest-first, as the resident walks `prev_events` back from
-    /// the `v` seeds). Driven by the outbound backfill orchestrator
-    /// ([`crate::federation::backfill_out`]).
-    pub(crate) async fn backfill(
-        &self,
-        dest: &ServerName,
-        room_id: &RoomId,
-        seeds: &[OwnedEventId],
-        limit: u32,
-    ) -> Result<Vec<Box<RawJsonValue>>, FederationClientError> {
-        // `room_id` goes in a path segment via `Url` (percent-safe), exactly as
-        // `get_missing_events` does — ruma's `RoomId` localpart isn't
-        // URL-validated. No trailing slash on the base (`push` appends a
-        // segment).
-        info!(target: "neutrino_http", %dest, %room_id, limit, seeds = seeds.len(), "outbound GET /_matrix/federation/v1/backfill");
-        let mut url = reqwest::Url::parse(&format!("http://{dest}/_matrix/federation/v1/backfill"))
-            .map_err(|_| FederationClientError::InvalidUrl)?;
-        url.path_segments_mut()
-            .map_err(|()| FederationClientError::InvalidUrl)?
-            .push(room_id.as_str());
-        {
-            let mut qp = url.query_pairs_mut();
-            for s in seeds {
-                qp.append_pair("v", s.as_str());
-            }
-            qp.append_pair("limit", &limit.to_string());
-        }
-
-        let resp = self
-            .http
-            .get(url)
-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(non_2xx_error(resp, dest, "GET /backfill").await);
-        }
-        Ok(
-            parse_2xx::<crate::federation::backfill::ResponseBody>(resp, dest, "GET /backfill")
-                .await?
-                .pdus,
-        )
-    }
-
     /// `GET http://{dest}/_matrix/federation/v1/make_join/{room}/{user}?ver={ver}`
     /// — request a membership-event template from the resident server (the
     /// first half of the join handshake). Returns the template + the room's
@@ -791,79 +743,6 @@ mod tests {
             .get_missing_events(&dest, &room, &[], &[], 10, true, false)
             .await
             .unwrap_err();
-        assert!(
-            matches!(err, FederationClientError::Status(404)),
-            "got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn backfill_builds_url_and_parses_pdus() {
-        // Capture the (room path segment, raw query) the stub receives so we can
-        // assert the repeated `v` seeds + `limit` made it onto the wire.
-        let captured: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
-        let cap = captured.clone();
-        let app = Router::new().route(
-            "/_matrix/federation/v1/backfill/{room}",
-            axum::routing::get(
-                move |Path(room): Path<String>,
-                      axum::extract::RawQuery(q): axum::extract::RawQuery| {
-                    let cap = cap.clone();
-                    async move {
-                        *cap.lock().unwrap() = Some((room, q.unwrap_or_default()));
-                        Json(json!({
-                            "origin": "hs1",
-                            "origin_server_ts": 0,
-                            "pdus": [ {"type": "m.room.message", "content": {"body": "old"}} ]
-                        }))
-                    }
-                },
-            ),
-        );
-        let dest = spawn_stub(app).await;
-
-        let client = FederationClient::new("local.test".to_owned(), None);
-        let room: OwnedRoomId = room_id!("!room:example.org").to_owned();
-        let seeds = vec![
-            event_id!("$seed1:example.org").to_owned(),
-            event_id!("$seed2:example.org").to_owned(),
-        ];
-
-        let pdus = client.backfill(&dest, &room, &seeds, 10).await.unwrap();
-        // The envelope's `pdus` is returned, parsed and order-preserved.
-        assert_eq!(pdus.len(), 1);
-        let parsed: Value = serde_json::from_str(pdus[0].get()).unwrap();
-        assert_eq!(parsed["content"]["body"], "old");
-
-        let (room_in, query) = captured
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("stub got a request");
-        assert_eq!(room_in, room.as_str());
-        // Each seed appears as its own `v` pair, plus `limit`.
-        assert!(
-            query.contains("v=%24seed1%3Aexample.org"),
-            "missing first seed: {query}"
-        );
-        assert!(
-            query.contains("v=%24seed2%3Aexample.org"),
-            "missing second seed: {query}"
-        );
-        assert!(query.contains("limit=10"), "missing limit: {query}");
-    }
-
-    #[tokio::test]
-    async fn backfill_surfaces_non_2xx_as_status_error() {
-        let app = Router::new().route(
-            "/_matrix/federation/v1/backfill/{room}",
-            axum::routing::get(|| async { StatusCode::NOT_FOUND }),
-        );
-        let dest = spawn_stub(app).await;
-
-        let client = FederationClient::new("local.test".to_owned(), None);
-        let room: OwnedRoomId = room_id!("!room:example.org").to_owned();
-        let err = client.backfill(&dest, &room, &[], 10).await.unwrap_err();
         assert!(
             matches!(err, FederationClientError::Status(404)),
             "got {err:?}"
