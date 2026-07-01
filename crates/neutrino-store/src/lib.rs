@@ -142,16 +142,17 @@ pub trait EventStore: Send + Sync {
     ) -> Result<(), StorageError>;
 
     /// Pre:  the room identified by `event.room_id` must already exist.
-    /// Post: the event is persisted with a new `StreamPos` greater than all previous
-    ///       positions and visible via `events_after` / `get_events` / DAG walks;
-    ///       `current_state` is NOT updated even for state events — historical
-    ///       events feed history (`events`, `event_edges`, `room_messages`) but
-    ///       must not regress the resolved current state, which already reflects
-    ///       the room's head; no outbox rows are created (historical events are
-    ///       local-only history, not federation traffic — backfill is the read
-    ///       direction); the `subscribe()` watch is updated with the new
-    ///       `StreamPos` after the transaction commits, so subscribers can wake
-    ///       and discover the new history.
+    /// Post: the event is persisted with a new `StreamPos` *less* than all previous
+    ///       positions (backfilled events are older than the head, so they occupy
+    ///       the descending region below the minimum) and visible via `get_events`
+    ///       / DAG walks / backward `room_messages`; `current_state` is NOT updated
+    ///       even for state events — historical events feed history (`events`,
+    ///       `event_edges`, `room_messages`) but must not regress the resolved
+    ///       current state, which already reflects the room's head; no outbox rows
+    ///       are created (historical events are local-only history, not federation
+    ///       traffic — backfill is the read direction); the `subscribe()` watch is
+    ///       NOT advanced (backfilled events are older than the head and never
+    ///       surface in incremental sliding sync).
     ///
     /// Use this for `/backfill`, `/get_missing_events`, and any other path that
     /// inserts events older than the current head. Use `persist_event` for
