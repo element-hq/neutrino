@@ -66,6 +66,13 @@ struct App {
     /// link reconciles divergence from a transaction's forward-extremity
     /// exchange. Held behind a trait object so tests inject a deterministic stub.
     fetcher: Arc<dyn MissingEventsFetcher>,
+    /// Shared outbound federation client, built once at startup from
+    /// `config.server_name`/`config.federation_proxy`. Reused by the `/messages`
+    /// backward-underflow backfill path (`messages.rs`) so each back-page reuses
+    /// the same connection pool rather than rebuilding a reqwest client per
+    /// round. (`fetcher` also wraps a `FederationClient`, but only as a type-
+    /// erased `MissingEventsFetcher`, which exposes no `backfill` method.)
+    fed_client: Arc<FederationClient>,
     sync_state: Arc<SyncState<SqliteStore>>,
     keys: Option<Value>,
     config: Config,
@@ -231,11 +238,18 @@ impl AppState {
         // task); the initial receiver is dropped — `send_modify` notifies any
         // live receivers and is a no-op when there are none.
         let (kick_backoff, _) = watch::channel(());
+        // Outbound federation client, built once here and shared (rather than
+        // rebuilt per back-page in `messages.rs`'s backfill path).
+        let fed_client = Arc::new(FederationClient::new(
+            config.server_name.clone(),
+            config.federation_proxy.as_deref(),
+        ));
         let app = App {
             store,
             room_registry,
             worker_poke,
             fetcher,
+            fed_client,
             sync_state,
             keys: None,
             config,
