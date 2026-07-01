@@ -14,8 +14,10 @@
 //! (the stripped state the sync builder renders from). Every other field
 //! (event_id, type, sender, ts, content, prev_events) is derivable from
 //! `json`, so no denormalised columns are stored — the same posture as
-//! `staged_events`. Nothing here advances the persist watch — an OOB invite is
-//! not a room event and surfaces only via the sync invite path.
+//! `staged_events`. An OOB invite is not a room event, so it does not advance
+//! the stream cursor; but storing or removing one *does* wake the stream watch
+//! (via [`SqliteStore::notify_watch_changed`]) so an in-flight sliding-sync
+//! long-poll surfaces the invite immediately instead of after its full timeout.
 
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{OptionalExtension, params};
@@ -39,6 +41,7 @@ impl InviteStore for SqliteStore {
         let room_id = room_id.as_str().to_owned();
         let state_key = user_id.as_str().to_owned();
         let json = event.raw.get().to_owned();
+        let watch_tx = self.watch_tx.clone();
 
         self.run_write(move |conn| -> Result<(), Error> {
             // INSERT OR REPLACE on the (room_id, state_key) PK: a re-invite for
@@ -48,6 +51,10 @@ impl InviteStore for SqliteStore {
                  VALUES (?, ?, ?)",
                 params![room_id, state_key, json],
             )?;
+            // Wake any in-flight sliding-sync long-poll so the invite surfaces
+            // now, not at the poll's timeout. Inside the closure (like
+            // `notify_watch`) so a committed invite is never stranded.
+            SqliteStore::notify_watch_changed(&watch_tx);
             Ok(())
         })
         .await
@@ -91,11 +98,15 @@ impl InviteStore for SqliteStore {
     async fn remove_invite(&self, room_id: &RoomId, user_id: &UserId) -> Result<(), StorageError> {
         let room_id = room_id.as_str().to_owned();
         let state_key = user_id.as_str().to_owned();
+        let watch_tx = self.watch_tx.clone();
         self.run_write(move |conn| -> Result<(), Error> {
             conn.execute(
                 "DELETE FROM oob_invites WHERE room_id = ? AND state_key = ?",
                 params![room_id, state_key],
             )?;
+            // Wake an in-flight long-poll so the rejected/withdrawn invite
+            // leaves the client's room set promptly (symmetric with put_invite).
+            SqliteStore::notify_watch_changed(&watch_tx);
             Ok(())
         })
         .await

@@ -258,6 +258,19 @@ impl SqliteStore {
         });
     }
 
+    /// Wake stream-watch subscribers *without* advancing the cursor. An OOB
+    /// invite (or its removal) is not a room event — it carries no
+    /// `StreamPos` — but it IS new data the sliding-sync long-poll must
+    /// surface promptly rather than after its full timeout. `send_modify`
+    /// bumps the watch's internal version (so `changed()` fires) while
+    /// leaving the `StreamPos` value untouched, which preserves both the
+    /// head read in `build_response` and `notify_watch`'s monotonic
+    /// `new_pos > cur` guard for real events. Same `'static`-closure reason
+    /// for being an associated fn as [`Self::notify_watch`].
+    pub(crate) fn notify_watch_changed(watch_tx: &watch::Sender<StreamPos>) {
+        watch_tx.send_modify(|_| {});
+    }
+
     /// Run a read-only closure on a connection from the reader pool.
     /// Mis-routed writes (any `INSERT`/`UPDATE`/`DELETE`/`CREATE`/`DROP`)
     /// fail with `SQLITE_READONLY` because the reader pool sets

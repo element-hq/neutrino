@@ -31,7 +31,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # is `bluer`, which needs system D-Bus/BlueZ. Gate it behind `ble` so the default
 # build (desktop LAN, CI) is iroh-only and needs no system Bluetooth stack. The
 # Android .aar build enables `ble`.
-iroh-ble-transport = { version = "0.1.0-alpha.6", optional = true }
+iroh-ble-transport = { path = "../../vendor/iroh-ble-transport", optional = true }
 # `iroh::Connection::send_datagram` takes `bytes::Bytes`; used by the BLE
 # self-test (`ble` feature) and the loopback datagram test. Already in the tree
 # transitively via iroh, so no new compile cost.
