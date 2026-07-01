@@ -178,6 +178,39 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### Offline sync hang: disable iroh DNS discovery + executor-stall watchdog (2026-07-01)
+- **Symptom:** creating a room with **no network** hung — the client's `/sync`
+  long-polls never returned (nor hit their 30s timeout). Reproduces only offline
+  (works with network), and intermittently.
+- **iroh discovery disabled.** `Endpoint::builder(N0DisableRelay)` applies the
+  full `N0` preset, which *appends* a `PkarrPublisher` + `DnsAddressLookup` both
+  targeting `dns.iroh.link`; `.address_lookup()` appends, so those ran alongside
+  the BLE lookup. Offline they churn (constant failed DNS/pkarr). Switched to the
+  `Minimal` preset + explicit `RelayMode::Disabled` so BLE is the only address
+  lookup — an offline BLE-mesh homeserver must never touch `dns.iroh.link`.
+  Verified on the non-ble path (`cargo test -p neutrino-ffi relay_transport`).
+- **Mechanism honestly unconfirmed.** iroh's discovery is fully async
+  (`TokioResolver`/`TokioRuntimeProvider`; no `block_on`/`block_in_place` in iroh
+  source) and the failing log shows the executor *alive* (pkarr retries,
+  createRoom returns) — so it is **not** a hard thread-block. Leading theory:
+  offline netcheck/discovery churn *starves* the single-threaded (`current_thread`)
+  FFI runtime, so the long-poll's 30s timer isn't serviced. The long-poll loop
+  itself is sound (`remaining` shrinks monotonically → can't exceed 30s unless the
+  task is never polled). Disabling discovery removes the most likely churn source
+  but is not proven to be the sole cause.
+- **Executor-stall watchdog added** (`neutrino-ffi/src/watchdog.rs`) precisely
+  because the fix isn't provable and the hang is intermittent: an in-runtime task
+  bumps a monotonic heartbeat; an off-runtime OS thread (holds a `Weak`, exits with
+  the runtime) logs a loud `WARN` when the heartbeat lags >3s. Turns a future
+  recurrence into a timestamped, greppable event and distinguishes "executor
+  stalled" from "client stopped syncing". Pure `evaluate()` decision unit-tested.
+  Deeper root-cause tier (deferred, not implemented): `tokio_unstable` +
+  `Handle::dump()` on stall for per-task backtraces, gated behind a debug feature.
+- **Runtime stays `current_thread`** — defensible for an embedded single-user
+  server (footprint, `!Send` ergonomics, trivial load). Multi-thread would only
+  *mask* an executor-blocking bug, not fix it; revisit only as post-root-cause
+  hardening.
+
 ### BLE invite failures: sync wake on OOB invite + vendored iroh-ble-transport (2026-06-30)
 - Two independent bugs surfaced when `/invite` failed over BLE (sender pixel.log,
   receiver recv.log).

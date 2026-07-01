@@ -26,9 +26,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use iroh::endpoint::presets::N0DisableRelay;
+use iroh::endpoint::presets::Minimal;
 use iroh::endpoint::{Connection, VarInt};
-use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use neutrino_main::DatagramLink;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
@@ -91,7 +91,17 @@ impl IrohTransport {
         // moved into the builder.
         #[cfg(feature = "ble")]
         let public = secret_key.public();
-        let builder = Endpoint::builder(N0DisableRelay)
+        // Offline BLE-mesh homeserver: no relay AND no n0 DNS discovery. The
+        // `N0`/`N0DisableRelay` presets silently append a `PkarrPublisher` +
+        // `DnsAddressLookup`, both pointing at `dns.iroh.link`. With no network
+        // those repeatedly fail/block, and on our single-threaded (`current_thread`)
+        // runtime that stalls the executor — starving the C-S `/sync` long-poll
+        // timers so the client's room list never updates. `Minimal` sets only the
+        // crypto provider; we disable the relay explicitly and resolve peers
+        // solely via the BLE `address_lookup` wired below (LAN peers are seeded
+        // via `add_peer`), so nothing ever touches the network for discovery.
+        let builder = Endpoint::builder(Minimal)
+            .relay_mode(RelayMode::Disabled)
             .secret_key(secret_key)
             .alpns(vec![RELAY_ALPN.to_vec()]);
 

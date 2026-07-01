@@ -6,6 +6,7 @@ mod ble_android;
 // iroh QUIC endpoint (keyed by 32-byte node ids). Built in `start` and injected
 // into the entrypoint via a `FederationLinkFactory`.
 mod relay_transport;
+mod watchdog;
 
 use relay_transport::{IrohTransport, RELAY_BIND};
 
@@ -176,6 +177,10 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
             }
         };
         rt.block_on(async {
+            // Loudly surface any stall of this single-threaded executor (a task
+            // that never yields, or a blocking call on the runtime thread) — it
+            // would otherwise silently freeze every task, including /sync.
+            watchdog::spawn();
             // The command receiver is threaded into the server; a `Shutdown`
             // command (or every `NeutrinoHandle` being dropped, which closes the
             // channel) drives `serve`'s graceful shutdown and returns here.
