@@ -54,24 +54,25 @@ impl EventStore for SqliteStore {
     async fn persist_historical_event(&self, event: &Event) -> Result<(), StorageError> {
         // event_id <-> raw consistency asserted inside `EventRow::from`.
         let event = EventRow::from(event).to_owned();
+        let watch_tx = self.watch_tx.clone();
 
         self.run_write(move |conn| -> Result<(), Error> {
             let tx = conn.transaction()?;
 
-            // `write_into_tx_historical` assigns a `stream_pos` *below* the
-            // existing minimum and skips the `current_state` upsert — see
-            // `row::EventRow::write_into_tx_historical` for the rationale.
-            // No outbox writes either: backfill is strictly the read
-            // direction, no federation traffic originates from a historical
-            // insert.
-            event.write_into_tx_historical(&tx)?;
+            // `write_into_tx_historical` skips the `current_state`
+            // upsert — see `row::EventRow::write_into_tx_historical`
+            // for the rationale. No outbox writes either: backfill is
+            // strictly the read direction, no federation traffic
+            // originates from a historical insert.
+            let stream_pos = event.write_into_tx_historical(&tx)?;
 
             tx.commit()?;
 
-            // The `subscribe()` watch is deliberately NOT advanced: a
-            // backfilled event is older than the head (its `stream_pos` is
-            // below the minimum), so it must never wake sliding-sync
-            // long-polls — incremental sync only surfaces forward extension.
+            // Watch still advances so subscribers waiting on stream
+            // changes can discover the new history (e.g. a paginating
+            // client refetching `room_messages`).
+            SqliteStore::notify_watch(&watch_tx, stream_pos);
+
             Ok(())
         })
         .await
@@ -237,7 +238,9 @@ impl EventStore for SqliteStore {
             .map_err(|_| Error::InvalidInput(format!("limit {limit} exceeds i64::MAX")))?;
         // Default `from` per direction: Forward starts at 0, Backward at i64::MAX.
         let from_pos: i64 = match from {
-            Some(t) => t.0,
+            Some(t) => i64::try_from(t.0).map_err(|_| {
+                Error::InvalidInput(format!("PaginationToken {} exceeds i64::MAX", t.0))
+            })?,
             None => match dir {
                 Direction::Forward => 0,
                 Direction::Backward => i64::MAX,
@@ -246,7 +249,9 @@ impl EventStore for SqliteStore {
         // Exclusive stop boundary. Unconstraining sentinels when `to` is None:
         // Forward never reaches i64::MAX, Backward never reaches i64::MIN.
         let to_pos: i64 = match to {
-            Some(t) => t.0,
+            Some(t) => i64::try_from(t.0).map_err(|_| {
+                Error::InvalidInput(format!("PaginationToken {} exceeds i64::MAX", t.0))
+            })?,
             None => match dir {
                 Direction::Forward => i64::MAX,
                 Direction::Backward => i64::MIN,
@@ -327,14 +332,18 @@ impl EventStore for SqliteStore {
                         // token is that row's position; backward `from` is
                         // inclusive, so subtract one to exclude the last row
                         // from the next page (Synapse `generate_next_token`).
-                        // The token may be negative once backfilled events
-                        // occupy the negative stream-position region.
+                        // `p >= 1` whenever a backward overflow row exists (an
+                        // older event sits past it), so `p - 1 >= 0`.
                         Some(p) => {
                             let tok = match dir {
                                 Direction::Forward => p,
                                 Direction::Backward => p - 1,
                             };
-                            Some(PaginationToken(tok))
+                            Some(PaginationToken(u64::try_from(tok).map_err(|_| {
+                                Error::Internal(format!(
+                                    "negative stream_pos encountered while building pagination token: {tok}"
+                                ))
+                            })?))
                         }
                         None => None,
                     }
@@ -1685,75 +1694,6 @@ mod tests {
         assert!(next.is_none());
     }
 
-    // A negative pagination token is a valid backfilled-region cursor:
-    // backward pagination from a positive `from` must be able to address rows in
-    // the negative `stream_pos` region (where `persist_historical_event` places
-    // backfilled history) and hand back a negative `next` token — exercising the
-    // `p - 1` backward next-token path across the 0 boundary.
-    #[tokio::test]
-    async fn room_messages_backward_crosses_into_negative_region() {
-        let s = store_with_room().await;
-        // Forward event in the positive region (stream_pos > 0).
-        s.persist_event(
-            &message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "newer", 1),
-            &[],
-        )
-        .await
-        .unwrap();
-        // Two historical events in the negative region: each
-        // `persist_historical_event` allocates a stream_pos below the running
-        // minimum, so these land at stream_pos <= 0, below the create/setup rows.
-        let older = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "older", 2);
-        let oldest = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "oldest", 3);
-        s.persist_historical_event(&older).await.unwrap();
-        s.persist_historical_event(&oldest).await.unwrap();
-
-        // The room now holds, newest→oldest: "newer" (positive), the create row
-        // (positive), "older" (negative), "oldest" (negative). Page backward from
-        // the head with limit 3 so the page is [newer, create, older] and the
-        // oldest row overflows — forcing a continuation token whose value is
-        // `older`'s negative position minus one (the backward `p - 1` path).
-        let head = s.room_stream_head(*ALICE_ROOM_ID).await.unwrap();
-        let (events, next) = s
-            .room_messages(
-                *ALICE_ROOM_ID,
-                Some(PaginationToken(head.0 as i64)),
-                None,
-                Direction::Backward,
-                3,
-            )
-            .await
-            .unwrap();
-
-        // The page must reach into the negative region: the "older" historical
-        // event (a row at stream_pos <= 0) is addressable and returned.
-        assert!(
-            events.iter().any(|e| e.event_id == older.event_id),
-            "backward pagination must surface the negatively-positioned historical event"
-        );
-        // More history remains beyond this page → a continuation token, and it
-        // must be negative (the `p - 1` of a negative last-in-page position),
-        // proving the cursor can address the negative region. Without an `i64`
-        // token this could not be expressed.
-        let tok = next.expect("more history remains → a continuation token");
-        assert!(
-            tok.0 < 0,
-            "the backward continuation token crosses into the negative region: {}",
-            tok.0
-        );
-
-        // And following that negative token returns the still-older event,
-        // confirming the negative cursor actually addresses the right rows.
-        let (rest, _) = s
-            .room_messages(*ALICE_ROOM_ID, Some(tok), None, Direction::Backward, 4)
-            .await
-            .unwrap();
-        assert!(
-            rest.iter().any(|e| e.event_id == oldest.event_id),
-            "the negative continuation token addresses the oldest historical row"
-        );
-    }
-
     // E44-E49: `persist_historical_event` — backfill-class persistence
     // that writes events + edges but deliberately does *not* update
     // `current_state` or the outbox. Resolves the unconditional-UPSERT
@@ -1761,11 +1701,8 @@ mod tests {
     // backfill handler a separate code path; `persist_event` keeps its
     // forward-extension semantics.
 
-    // E44: a historical event is visible via `get_events` and backward
-    // `room_messages` (history reads), but — being assigned a `stream_pos`
-    // *below* the minimum — it does NOT surface in the forward stream
-    // (`events_after(StreamPos(0), ..)`, `stream_pos > 0`), which only
-    // carries forward extension towards incremental sync.
+    // E44: a historical event is visible via `get_events` and
+    // `events_after` — same observability as a forward-extension write.
     #[tokio::test]
     async fn persist_historical_event_visible_via_reads() {
         let s = store_with_room().await;
@@ -1775,20 +1712,12 @@ mod tests {
 
         let got = s.get_events(&[&id]).await.unwrap();
         assert_eq!(got.len(), 1);
-        let (back, _) = s
-            .room_messages(*ALICE_ROOM_ID, None, None, Direction::Backward, 100)
-            .await
-            .unwrap();
-        assert!(
-            back.iter().any(|e| e.event_id.as_str() == id.as_str()),
-            "historical event must appear in backward pagination"
-        );
         let stream = s.events_after(StreamPos(0), 100).await.unwrap();
         assert!(
-            !stream
+            stream
                 .iter()
                 .any(|(_, e)| e.event_id.as_str() == id.as_str()),
-            "historical event is below the head and must not appear in the forward stream"
+            "historical event must appear in the stream"
         );
     }
 
@@ -1840,59 +1769,22 @@ mod tests {
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
 
-    // E49: `persist_historical_event` does NOT advance the `subscribe()`
-    // watch. A backfilled event is older than the head (its `stream_pos`
-    // is below the minimum), so it must never wake sliding-sync long-polls
-    // — incremental sync only surfaces forward extension. Contrast with
-    // `persist_event`, which advances the watch.
+    // E49: `persist_historical_event` advances the `subscribe()` watch
+    // so subscribers wake and discover the new history. Same wake-up
+    // contract as `persist_event` — only the current_state and outbox
+    // sides differ.
     #[tokio::test]
-    async fn persist_historical_event_does_not_advance_watch() {
+    async fn persist_historical_event_advances_watch() {
         let s = store_with_room().await;
-        let rx = s.subscribe();
+        let mut rx = s.subscribe();
         let initial = *rx.borrow();
         let msg = message(*ALICE_ROOM_ID, *ALICE_USER_ID, "history");
         s.persist_historical_event(&msg).await.unwrap();
-        // The write has committed; the watch value must be unchanged and
-        // no change should be pending for a waiting subscriber.
+        rx.changed().await.unwrap();
+        let after = *rx.borrow();
         assert!(
-            !rx.has_changed().unwrap(),
-            "watch must not signal a change after persist_historical_event"
-        );
-        assert_eq!(
-            *rx.borrow(),
-            initial,
-            "watch value must be unchanged after persist_historical_event: {initial:?}"
-        );
-    }
-
-    // E50: `persist_historical_event` allocates a `stream_pos` *below* the
-    // existing minimum, decremented per call, so backward pagination
-    // (`stream_pos DESC`) walks into the backfilled tail in correct order.
-    #[tokio::test]
-    async fn persist_historical_event_allocates_below_minimum() {
-        let s = store_with_room().await; // create/setup events occupy stream_pos >= 1
-        // Distinct `origin_server_ts` so the two messages get distinct
-        // event_ids — `content.body` is stripped by redaction in the
-        // reference hash, so `message(.., "older-1"/"older-2")` would collide.
-        let h1 = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "older-1", 1);
-        let h2 = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "older-2", 2);
-        s.persist_historical_event(&h1).await.unwrap();
-        s.persist_historical_event(&h2).await.unwrap();
-
-        // Read both back via backward pagination from the top; the two historical
-        // events must sort *after* the forward events and strictly descending.
-        let (events, _) = s
-            .room_messages(*ALICE_ROOM_ID, None, None, Direction::Backward, 100)
-            .await
-            .unwrap();
-        let ids: Vec<&str> = events.iter().map(|e| e.event_id.as_str()).collect();
-        let p1 = ids.iter().position(|i| *i == h1.event_id.as_str()).unwrap();
-        let p2 = ids.iter().position(|i| *i == h2.event_id.as_str()).unwrap();
-        // h2 inserted last → lowest stream_pos → appears last in DESC order.
-        assert!(p2 > p1, "later historical insert sorts older: {ids:?}");
-        assert!(
-            p1 == ids.len() - 2 && p2 == ids.len() - 1,
-            "historical tail: {ids:?}"
+            after > initial,
+            "watch did not advance after persist_historical_event: {initial:?} -> {after:?}"
         );
     }
 

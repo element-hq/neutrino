@@ -17,7 +17,7 @@ use axum::{
 };
 use neutrino_store::{EventStore, RoomStore};
 use ruma::{EventId, OwnedEventId, OwnedRoomId};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::value::RawValue as RawJsonValue;
 
 use crate::federation::{FedError, auth};
@@ -41,15 +41,11 @@ const MAX_LIMIT: u32 = 100;
 /// `Serialize`, so — as with the `get_missing_events` sibling — we hand-roll
 /// the JSON body the federation spec wants: a transaction envelope of
 /// `origin`, `origin_server_ts`, and the opaque `pdus`.
-///
-/// `Deserialize` is derived (and the fields made `pub(crate)`) so the outbound
-/// [`crate::federation::client::FederationClient::backfill`] can parse this same
-/// envelope back, mirroring the dual-derive `get_missing_events::ResponseBody`.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 pub(crate) struct ResponseBody {
-    pub(crate) origin: String,
-    pub(crate) origin_server_ts: u64,
-    pub(crate) pdus: Vec<Box<RawJsonValue>>,
+    origin: String,
+    origin_server_ts: u64,
+    pdus: Vec<Box<RawJsonValue>>,
 }
 
 /// Federation `/backfill` handler.

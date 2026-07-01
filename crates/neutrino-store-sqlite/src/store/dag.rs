@@ -403,32 +403,6 @@ impl DagStore for SqliteStore {
         })
         .await
     }
-
-    async fn backward_extremities(
-        &self,
-        room_id: &RoomId,
-    ) -> Result<Vec<OwnedEventId>, StorageError> {
-        let room_id = room_id.to_owned();
-        self.run_read(move |conn| -> Result<Vec<OwnedEventId>, Error> {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT e.parent_event_id \
-                 FROM event_edges e \
-                 JOIN events c ON c.event_id = e.child_event_id \
-                 WHERE c.room_id = ? AND e.edge_type = 'prev' \
-                   AND e.parent_event_id NOT IN (SELECT event_id FROM events)",
-            )?;
-            let rows = stmt.query_map(params![room_id.as_str()], |row| row.get::<_, String>(0))?;
-            let mut out = Vec::new();
-            for row in rows {
-                let id = OwnedEventId::try_from(row?).map_err(|e| {
-                    Error::Internal(format!("malformed parent_event_id in DB: {e}"))
-                })?;
-                out.push(id);
-            }
-            Ok(out)
-        })
-        .await
-    }
 }
 
 #[cfg(test)]
@@ -1474,53 +1448,5 @@ mod tests {
         let s_ids: HashSet<&str> = state.iter().map(|p| p.event_id.as_str()).collect();
         assert!(s_ids.contains(id_b.as_str()), "state walk yields B");
         assert!(!s_ids.contains(id_a.as_str()), "state walk skips A");
-    }
-
-    // BE1: a `prev` edge whose target we don't hold is a backward
-    // extremity (a backfill seed); a `prev` edge we *do* hold is not.
-    #[tokio::test]
-    async fn backward_extremities_returns_dangling_prev_only() {
-        use crate::tests::{make_event, message};
-        use serde_json::json;
-
-        let s = store_with_room().await;
-        // Persist child C with prev_events = [grounded, missing_parent]; the
-        // missing parent is a backward extremity. A grounded prev (one we
-        // hold) is NOT returned.
-        let grounded = message(*ALICE_ROOM_ID, *ALICE_USER_ID, "grounded");
-        s.persist_historical_event(&grounded).await.unwrap();
-        let missing_parent = event_id!("$missing_parent:hs1");
-        let child = make_event(
-            *ALICE_ROOM_ID,
-            *ALICE_USER_ID,
-            "m.room.message",
-            None,
-            json!({"msgtype":"m.text","body":"c"}),
-            0,
-            &[grounded.event_id.as_ref(), missing_parent],
-            &[],
-        );
-        s.persist_historical_event(&child).await.unwrap();
-
-        let mut ex = s.backward_extremities(*ALICE_ROOM_ID).await.unwrap();
-        ex.sort();
-        assert_eq!(
-            ex,
-            vec![missing_parent.to_owned()],
-            "only the unheld prev target is an extremity"
-        );
-    }
-
-    // BE2: a fully-grounded room (only the create event, no dangling prev)
-    // has no backward extremities.
-    #[tokio::test]
-    async fn backward_extremities_empty_when_grounded() {
-        let s = store_with_room().await;
-        assert!(
-            s.backward_extremities(*ALICE_ROOM_ID)
-                .await
-                .unwrap()
-                .is_empty()
-        );
     }
 }
