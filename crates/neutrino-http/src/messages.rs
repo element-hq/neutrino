@@ -26,7 +26,7 @@ use ruma::events::AnyTimelineEvent;
 use ruma::serde::Raw;
 use serde_json::{Map, Value, json};
 
-use neutrino_store::{DagStore, Direction, EventStore, PaginationToken};
+use neutrino_store::{Direction, EventStore, PaginationToken};
 
 use crate::federation::client::FederationClient;
 use crate::membership::current_membership;
@@ -90,12 +90,12 @@ fn parse_limit(params: &HashMap<String, String>) -> Result<usize, axum::response
 }
 
 /// One bounded federation backfill round for a backward page that underflowed
-/// `limit`. Only invoked when the room has backward extremities. Runs a single
-/// [`backfill_once`](crate::federation::backfill_out::backfill_once) round; if it
-/// persisted any events, re-reads and returns the fresh page, otherwise returns
-/// the original `(events, next)` unchanged. The peer client is resolved exactly as
-/// the federation sender does (`federation/sender.rs`): `App` holds no client, so
-/// we build a per-round one — only on the underflow path, never on a full page.
+/// `limit`. Runs a single
+/// [`backfill_once`](crate::federation::backfill_out::backfill_once) round (which
+/// itself reads the room's backward extremities and early-returns 0 when there
+/// are none); if it persisted any events, re-reads and returns the fresh page,
+/// otherwise returns the original `(events, next)` unchanged. Uses the shared
+/// `App`-owned [`FederationClient`] so each back-page reuses its connection pool.
 ///
 /// `Err` carries a built error `Response` for a re-read storage fault, mirroring
 /// the first `room_messages` read's mapping.
@@ -103,7 +103,7 @@ fn parse_limit(params: &HashMap<String, String>) -> Result<usize, axum::response
 async fn backfill_and_reread(
     store: &neutrino_store_sqlite::SqliteStore,
     own_server: &str,
-    proxy: Option<&str>,
+    client: &FederationClient,
     rid: &ruma::RoomId,
     read: (
         Option<PaginationToken>,
@@ -114,33 +114,29 @@ async fn backfill_and_reread(
     original: (Vec<neutrino_event::Event>, Option<PaginationToken>),
 ) -> Result<(Vec<neutrino_event::Event>, Option<PaginationToken>), axum::response::Response> {
     let (from, to, dir, limit) = read;
-    match store.backward_extremities(rid).await {
-        Ok(ex) if !ex.is_empty() => {
-            let client = FederationClient::new(own_server.to_owned(), proxy);
-            let n = crate::federation::backfill_out::backfill_once(
-                store,
-                &client,
-                own_server,
-                rid,
-                limit as u32,
-            )
-            .await;
-            if n > 0 {
-                store
-                    .room_messages(rid, from, to, dir, limit)
-                    .await
-                    .map_err(|e| {
-                        error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "M_UNKNOWN",
-                            &e.to_string(),
-                        )
-                    })
-            } else {
-                Ok(original)
-            }
-        }
-        _ => Ok(original),
+    // No outer backward-extremities pre-check: `backfill_once` reads them itself
+    // and returns 0 when there are no seeds, so a redundant gate query is wasted.
+    let n = crate::federation::backfill_out::backfill_once(
+        store,
+        client,
+        own_server,
+        rid,
+        limit as u32,
+    )
+    .await;
+    if n > 0 {
+        store
+            .room_messages(rid, from, to, dir, limit)
+            .await
+            .map_err(|e| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "M_UNKNOWN",
+                    &e.to_string(),
+                )
+            })
+    } else {
+        Ok(original)
     }
 }
 
@@ -192,16 +188,16 @@ pub(crate) async fn get_messages(
         Err(resp) => return resp,
     }
 
-    // Clone the store plus the bits a federation backfill round needs (own server
-    // name + egress proxy). The sender resolves its client the same way
-    // (`federation/sender.rs`): `App` holds no `FederationClient`, so we build a
-    // per-round one downstream — only when a backward page actually underflows.
-    let (store, own_server, proxy) = {
+    // Clone the store, the own server name (for `backfill_once`'s self-skip), and
+    // the shared outbound `FederationClient` that `App` builds once at startup —
+    // so a backward-underflow backfill round reuses its connection pool rather
+    // than constructing a client per back-page.
+    let (store, own_server, fed_client) = {
         let app = lock_app(&state.0);
         (
             app.store.clone(),
             app.config.server_name.clone(),
-            app.config.federation_proxy.clone(),
+            app.fed_client.clone(),
         )
     };
 
@@ -256,7 +252,7 @@ pub(crate) async fn get_messages(
             match backfill_and_reread(
                 &store,
                 &own_server,
-                proxy.as_deref(),
+                &fed_client,
                 &rid,
                 (from_again, to_again, dir, limit),
                 (events, next),
@@ -291,7 +287,7 @@ mod tests {
 
     use neutrino_event::event_builder::EventBuilder;
     use neutrino_event::{Event, ROOM_VERSION_ID};
-    use neutrino_store::{EventStore, RoomStore};
+    use neutrino_store::{DagStore, EventStore, RoomStore};
     use neutrino_store_sqlite::SqliteStore;
     use ruma::{OwnedEventId, OwnedUserId, event_id};
     use serde_json::json;
@@ -378,10 +374,11 @@ mod tests {
              and `backfill_once` actually runs rather than being skipped"
         );
 
+        let client = FederationClient::new(OWN.to_owned(), None);
         let out = backfill_and_reread(
             &store,
             OWN,
-            None,
+            &client,
             &rid,
             (Some(head), None, Direction::Backward, 100),
             (orig_events, orig_next.clone()),

@@ -1686,20 +1686,72 @@ mod tests {
     }
 
     // A negative pagination token is a valid backfilled-region cursor:
-    // backward pagination from a positive token must be able to return a
-    // row at a negative stream_pos and hand back a negative `next` token.
+    // backward pagination from a positive `from` must be able to address rows in
+    // the negative `stream_pos` region (where `persist_historical_event` places
+    // backfilled history) and hand back a negative `next` token — exercising the
+    // `p - 1` backward next-token path across the 0 boundary.
     #[tokio::test]
     async fn room_messages_backward_crosses_into_negative_region() {
         let s = store_with_room().await;
-        // Forward event in the positive region.
-        s.persist_event(&message(*ALICE_ROOM_ID, *ALICE_USER_ID, "newer"), &[])
+        // Forward event in the positive region (stream_pos > 0).
+        s.persist_event(
+            &message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "newer", 1),
+            &[],
+        )
+        .await
+        .unwrap();
+        // Two historical events in the negative region: each
+        // `persist_historical_event` allocates a stream_pos below the running
+        // minimum, so these land at stream_pos <= 0, below the create/setup rows.
+        let older = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "older", 2);
+        let oldest = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "oldest", 3);
+        s.persist_historical_event(&older).await.unwrap();
+        s.persist_historical_event(&oldest).await.unwrap();
+
+        // The room now holds, newest→oldest: "newer" (positive), the create row
+        // (positive), "older" (negative), "oldest" (negative). Page backward from
+        // the head with limit 3 so the page is [newer, create, older] and the
+        // oldest row overflows — forcing a continuation token whose value is
+        // `older`'s negative position minus one (the backward `p - 1` path).
+        let head = s.room_stream_head(*ALICE_ROOM_ID).await.unwrap();
+        let (events, next) = s
+            .room_messages(
+                *ALICE_ROOM_ID,
+                Some(PaginationToken(head.0 as i64)),
+                None,
+                Direction::Backward,
+                3,
+            )
             .await
             .unwrap();
-        // Historical events will land at stream_pos <= 0 once Task 4 lands;
-        // until then this test pins only the token type round-trip — a
-        // negative literal only compiles under `i64`.
-        let tok = PaginationToken(-5);
-        assert_eq!(tok.0, -5i64);
+
+        // The page must reach into the negative region: the "older" historical
+        // event (a row at stream_pos <= 0) is addressable and returned.
+        assert!(
+            events.iter().any(|e| e.event_id == older.event_id),
+            "backward pagination must surface the negatively-positioned historical event"
+        );
+        // More history remains beyond this page → a continuation token, and it
+        // must be negative (the `p - 1` of a negative last-in-page position),
+        // proving the cursor can address the negative region. Without an `i64`
+        // token this could not be expressed.
+        let tok = next.expect("more history remains → a continuation token");
+        assert!(
+            tok.0 < 0,
+            "the backward continuation token crosses into the negative region: {}",
+            tok.0
+        );
+
+        // And following that negative token returns the still-older event,
+        // confirming the negative cursor actually addresses the right rows.
+        let (rest, _) = s
+            .room_messages(*ALICE_ROOM_ID, Some(tok), None, Direction::Backward, 4)
+            .await
+            .unwrap();
+        assert!(
+            rest.iter().any(|e| e.event_id == oldest.event_id),
+            "the negative continuation token addresses the oldest historical row"
+        );
     }
 
     // E44-E49: `persist_historical_event` — backfill-class persistence

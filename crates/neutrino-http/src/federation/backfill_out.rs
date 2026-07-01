@@ -57,7 +57,7 @@ pub(crate) async fn backfill_once(
     // move on to the next.
     for dest in dests {
         match client.backfill(&dest, room_id, &seeds, limit).await {
-            Ok(pdus) => return persist_pdus(store, room_id, pdus).await,
+            Ok(pdus) => return persist_pdus(store, room_id, pdus, limit).await,
             Err(e) => {
                 info!(target: "neutrino_http", %dest, %room_id, error = %e, "backfill: peer failed, trying next");
             }
@@ -72,13 +72,17 @@ pub(crate) async fn backfill_once(
 /// stream position one below the running minimum) lays the newest backfilled
 /// event closest to 0, preserving timeline order under a `room_messages` DESC
 /// read. Do NOT reverse the list.
+///
+/// Defensive cap: we sent `limit` on the wire, but a buggy/hostile peer could
+/// return more — `.take(limit)` bounds how many we persist regardless.
 async fn persist_pdus(
     store: &SqliteStore,
     room_id: &RoomId,
     pdus: Vec<Box<serde_json::value::RawValue>>,
+    limit: u32,
 ) -> usize {
     let mut persisted = 0usize;
-    for raw in pdus {
+    for raw in pdus.into_iter().take(limit as usize) {
         // `from_wire` derives the id from the reference hash; an unparseable PDU
         // is dropped, exactly as the inbound `/send` path does.
         let event = match from_wire(raw, Vec::new()) {
@@ -118,7 +122,7 @@ mod tests {
     use axum::{Json, Router, extract::Path, routing::get};
     use neutrino_event::event_builder::EventBuilder;
     use neutrino_event::{Event, ROOM_VERSION_ID};
-    use neutrino_store::{EventStore, RoomStore};
+    use neutrino_store::{Direction, EventStore, RoomStore};
     use neutrino_store_sqlite::SqliteStore;
     use ruma::{OwnedRoomId, OwnedUserId, event_id};
     use serde_json::{Value, json};
@@ -319,6 +323,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backfill_once_caps_persisted_at_limit() {
+        // The peer returns MORE fresh, correct-room PDUs than the requested
+        // `limit`. The defensive `.take(limit)` in `persist_pdus` must bound
+        // the count: a peer can't make us persist more than we asked for.
+        let (store, _dir) = fresh_store().await;
+        let (stub, dest) = PeerStub::spawn().await;
+        let (room_id, _create) = seed_room_with_extremity(&store, &[alice(), user_on(&dest)]).await;
+        // Five distinct fresh PDUs, but we ask for at most 3.
+        stub.set_pdus(
+            (0..5)
+                .map(|i| pdu_in(&room_id, &format!("hist-{i}")))
+                .collect(),
+        );
+
+        let client = FederationClient::new(OWN.to_owned(), None);
+        let n = backfill_once(&store, &client, OWN, &room_id, 3).await;
+        assert_eq!(n, 3, "persisted count is capped at the requested limit");
+    }
+
+    #[tokio::test]
     async fn backfill_once_rejects_wrong_room() {
         let (store, _dir) = fresh_store().await;
         let (stub, dest) = PeerStub::spawn().await;
@@ -343,15 +367,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backfill_once_dedups_held() {
+    async fn backfill_once_continues_past_held_to_persist_fresh() {
+        // No-early-abort: the peer returns an already-held PDU (newest-first)
+        // followed by a *fresh* sibling. The held one is skipped via `continue`,
+        // so the loop must still reach and persist the sibling after it. n == 1
+        // (not 0 — proving the batch doesn't abort on the held PDU; not 2 —
+        // proving the held one isn't counted).
         let (store, _dir) = fresh_store().await;
         let (stub, dest) = PeerStub::spawn().await;
         let (room_id, _create) = seed_room_with_extremity(&store, &[alice(), user_on(&dest)]).await;
-        // Pre-persist one PDU so it's already held. The peer returns it again
-        // (newest-first) followed by a *fresh* sibling. Only the fresh one must be
-        // counted: a held PDU is skipped via `continue`, so the loop still
-        // persists the sibling after it (n == 1, not 0 — proving dedup doesn't
-        // abort the whole batch — and not 2 — proving the held one isn't counted).
         let held_raw = pdu_in(&room_id, "already here");
         let held: Event = from_wire(
             serde_json::value::RawValue::from_string(held_raw.clone()).unwrap(),
@@ -370,6 +394,63 @@ mod tests {
         assert_eq!(
             n, 1,
             "the held PDU is deduped (not counted); the fresh sibling is still persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_once_held_pdu_yields_no_duplicate_row() {
+        // The dedup *contract*: a PDU we already hold is not re-persisted — the
+        // peer returns ONLY the held event and the round persists nothing new,
+        // leaving exactly one row for that id and the timeline unchanged.
+        //
+        // HONESTY NOTE: the `UNIQUE(event_id)` constraint is the *hard* backstop —
+        // even if the `get_events` pre-check were deleted, the doomed re-INSERT
+        // rolls back atomically (no row, no `stream_pos` consumed), so this test
+        // would still pass. The pre-check is therefore an *optimisation* (skip a
+        // guaranteed-failing write), and isolating "pre-check ran" from "UNIQUE
+        // caught it" is not observable through the public store API without a
+        // persistence spy — deliberately out of scope here. What this test (with
+        // `…continues_past_held…` above) pins is the observable contract: held
+        // PDUs never duplicate a row and never abort the batch.
+        let (store, _dir) = fresh_store().await;
+        let (stub, dest) = PeerStub::spawn().await;
+        let (room_id, _create) = seed_room_with_extremity(&store, &[alice(), user_on(&dest)]).await;
+        let held_raw = pdu_in(&room_id, "already here");
+        let held: Event = from_wire(
+            serde_json::value::RawValue::from_string(held_raw.clone()).unwrap(),
+            Vec::new(),
+        )
+        .expect("parse held");
+        store
+            .persist_historical_event(&held)
+            .await
+            .expect("seed held");
+        let backward_ids = |s: Arc<SqliteStore>, rid: OwnedRoomId| async move {
+            let (events, _) = s
+                .room_messages(&rid, None, None, Direction::Backward, 100)
+                .await
+                .expect("backward read");
+            events
+                .iter()
+                .map(|e| e.event_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let before = backward_ids(store.clone(), room_id.clone()).await;
+
+        stub.set_pdus(vec![held_raw]);
+        let client = FederationClient::new(OWN.to_owned(), None);
+        let n = backfill_once(&store, &client, OWN, &room_id, 10).await;
+        assert_eq!(n, 0, "the sole, already-held PDU is deduped → nothing new");
+
+        let after = backward_ids(store.clone(), room_id.clone()).await;
+        assert_eq!(
+            after.iter().filter(|id| **id == held.event_id).count(),
+            1,
+            "the held event appears exactly once — never duplicated"
+        );
+        assert_eq!(
+            after, before,
+            "the timeline is unchanged: no new or re-positioned rows"
         );
     }
 
