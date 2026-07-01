@@ -204,6 +204,18 @@ never use .unwrap() in handler code.
   instead of waiting out `DEAD_GC_TTL` + a subsequent send.
 - 4 unit tests added. Vendored crate ⇒ not compilable in-sandbox (no dbus);
   rustfmt-checked, CI verifies. Keep the discovery-disable (BLE-only is correct).
+- **Follow-up (same day):** recovery was still ~78s (3 retries) because a dead
+  pipe wasn't torn down until the 20s wedged-pipe watchdog. `handle_stalled` (the
+  reliable-LINK_DEAD `Stalled` handler) only drained `Connected` and dropped the
+  `Stalled` for any other phase — including `Handshaking`, the common case (pipe
+  dies mid-handshake, peer never ACKs). Fixed: `handle_stalled` now drains
+  `Connected` **or** `Handshaking` → teardown at ~6s not ~20s. Also added always-on
+  registry phase-transition logging at `info` (snapshot `PhaseKind` per peer in
+  `handle()` before dispatch, log change/create/remove after) so future wedges are
+  debuggable from logs. The deeper root — a *fresh* BLE connection passing no data
+  for the first 1-2 tries (peer ACKs nothing despite a healthy pipe + correct MTU)
+  — is still open; needs trace-level (`iroh_ble_transport::transport::reliable=trace`)
+  fragment RX/TX logs on both ends to pin.
 
 ### Offline sync hang: disable iroh DNS discovery + executor-stall watchdog (2026-07-01)
 - **Symptom:** creating a room with **no network** hung — the client's `/sync`

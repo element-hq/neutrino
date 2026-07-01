@@ -102,6 +102,14 @@ impl Registry {
     pub fn handle(&mut self, cmd: PeerCommand) -> Vec<PeerAction> {
         let now = std::time::Instant::now();
         let mut actions = Vec::new();
+        // Snapshot phases so transitions can be logged at one choke point (after
+        // dispatch) rather than at every `entry.phase = …` site. Peer count is
+        // tiny (a handful), so the per-command clone is negligible.
+        let phases_before: Vec<(DeviceId, PhaseKind)> = self
+            .peers
+            .iter()
+            .map(|(d, e)| (d.clone(), PhaseKind::from(&e.phase)))
+            .collect();
         match cmd {
             PeerCommand::Advertised {
                 prefix,
@@ -205,7 +213,34 @@ impl Registry {
                 self.handle_l2cap_handover_timeout(&mut actions, device_id);
             }
         }
+        self.log_phase_transitions(&phases_before);
         actions
+    }
+
+    /// Log peer phase transitions caused by the just-handled command. Info
+    /// level: phase changes are infrequent and load-bearing for debugging BLE
+    /// connection wedges, so always-on is worth it — they don't spam.
+    fn log_phase_transitions(&self, before: &[(DeviceId, PhaseKind)]) {
+        for (device_id, before_kind) in before {
+            match self.peers.get(device_id) {
+                Some(entry) => {
+                    let after = PhaseKind::from(&entry.phase);
+                    if after != *before_kind {
+                        tracing::info!(device = %device_id, ?before_kind, ?after, "peer phase changed");
+                    }
+                }
+                None => {
+                    tracing::info!(device = %device_id, ?before_kind, "peer entry removed");
+                }
+            }
+        }
+        // Entries created during this command are absent from `before`.
+        for (device_id, entry) in &self.peers {
+            if !before.iter().any(|(d, _)| d == device_id) {
+                let phase = PhaseKind::from(&entry.phase);
+                tracing::info!(device = %device_id, ?phase, "peer entry created");
+            }
+        }
     }
 
     fn handle_verified_endpoint(
@@ -1349,12 +1384,18 @@ impl Registry {
         let Some(entry) = self.peers.get_mut(&device_id) else {
             return;
         };
-        let Some(channel) = (if let PeerPhase::Connected { channel, .. } = &entry.phase {
-            Some(channel.clone())
-        } else {
-            None
-        }) else {
-            return;
+        // A `Stalled` means this device's data pipe is dead (the reliable layer
+        // hit `LINK_DEAD_DEADLINE`). Tear the connection down promptly for *any*
+        // phase that owns a channel — not just `Connected`. The pipe commonly
+        // dies mid-QUIC-handshake (the peer never ACKs), leaving the entry in
+        // `Handshaking`; previously that dropped the `Stalled` and left teardown
+        // to the 20s wedged-pipe watchdog. Both `Connected` and `Handshaking`
+        // carry a channel.
+        let channel = match &entry.phase {
+            PeerPhase::Connected { channel, .. } | PeerPhase::Handshaking { channel, .. } => {
+                channel.clone()
+            }
+            _ => return,
         };
         let reason = crate::transport::peer::DisconnectReason::LinkDead;
         let broken_pipe_acks = Self::drain_to_draining(entry, now, reason.clone());
@@ -2939,6 +2980,51 @@ mod tests {
         assert_eq!(
             entry.consecutive_failures, 0,
             "reviving a Dead peer must reset its failure budget",
+        );
+    }
+
+    /// A `Stalled` (reliable LINK_DEAD) arriving while the entry is still
+    /// `Handshaking` — the pipe died mid-QUIC-handshake — must tear the
+    /// connection down immediately (close channel + drain), not get dropped and
+    /// left to the 20s wedged-pipe watchdog.
+    #[test]
+    fn stalled_during_handshaking_tears_down_immediately() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, DisconnectReason};
+
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-stalled-handshaking");
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.phase = PeerPhase::Handshaking {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 11,
+                    path: ConnectPath::Gatt,
+                },
+            };
+            e
+        });
+
+        let actions = reg.handle(PeerCommand::Stalled {
+            device_id: device_id.clone(),
+        });
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::CloseChannel { .. })),
+            "Stalled during Handshaking must close the channel; got {actions:?}",
+        );
+        assert!(
+            matches!(
+                reg.peer(&device_id).unwrap().phase,
+                PeerPhase::Draining {
+                    reason: DisconnectReason::LinkDead,
+                    ..
+                }
+            ),
+            "Stalled during Handshaking must drain to Draining; got {:?}",
+            reg.peer(&device_id).unwrap().phase,
         );
     }
 
