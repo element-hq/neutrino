@@ -498,6 +498,20 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
 
+    /// `bind`'s two BLE-only args as test doubles: an empty display-name watch
+    /// (its sender is dropped immediately — the channel is unused off the `ble`
+    /// feature, and a closed channel just makes the re-advertise task exit
+    /// cleanly under it) and a fresh, empty discovery registry.
+    fn ble_args() -> (
+        tokio::sync::watch::Receiver<String>,
+        Arc<neutrino_main::DiscoveryRegistry>,
+    ) {
+        (
+            tokio::sync::watch::channel(String::new()).1,
+            Arc::new(neutrino_main::DiscoveryRegistry::new()),
+        )
+    }
+
     /// Pick a node's loopback dialing address from its bound sockets.
     fn loopback_addr(tp: &IrohTransport) -> EndpointAddr {
         let sock = tp
@@ -516,10 +530,12 @@ mod tests {
     #[tokio::test]
     async fn datagram_relays_a_to_b_to_a_over_iroh() {
         let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
-        let a_tp = IrohTransport::bind(&[1u8; 32], loopback)
+        let (a_name, a_disc) = ble_args();
+        let a_tp = IrohTransport::bind(&[1u8; 32], loopback, a_name, a_disc)
             .await
             .expect("bind A");
-        let b_tp = IrohTransport::bind(&[2u8; 32], loopback)
+        let (b_name, b_disc) = ble_args();
+        let b_tp = IrohTransport::bind(&[2u8; 32], loopback, b_name, b_disc)
             .await
             .expect("bind B");
 
@@ -556,7 +572,8 @@ mod tests {
     #[tokio::test]
     async fn send_to_unknown_peer_is_an_error() {
         let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
-        let tp = IrohTransport::bind(&[3u8; 32], loopback)
+        let (name, disc) = ble_args();
+        let tp = IrohTransport::bind(&[3u8; 32], loopback, name, disc)
             .await
             .expect("bind");
         assert!(tp.send([9u8; 32], b"x").await.is_err());
@@ -572,7 +589,10 @@ mod tests {
     async fn node_key_matches_ed25519_public_key() {
         let secret = [7u8; 32];
         let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
-        let tp = IrohTransport::bind(&secret, loopback).await.expect("bind");
+        let (name, disc) = ble_args();
+        let tp = IrohTransport::bind(&secret, loopback, name, disc)
+            .await
+            .expect("bind");
         let expected = ed25519_dalek::SigningKey::from_bytes(&secret)
             .verifying_key()
             .to_bytes();

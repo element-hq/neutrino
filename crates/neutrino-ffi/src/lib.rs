@@ -78,6 +78,7 @@ impl From<Command> for neutrino_main::Command {
 /// `@n:{node_id}`. The discovery registry is localpart-agnostic — this is the
 /// embedded host's convention, applied by the BLE transport's discovery drain
 /// (see `relay_transport`) where the node id is known.
+#[cfg(feature = "ble")]
 const DISCOVERY_LOCALPART: &str = "n";
 
 #[derive(uniffi::Object)]
