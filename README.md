@@ -104,3 +104,34 @@ For example, to iterate from the `v0.2.0` release towards `0.2.1`:
    `0.2.1` build exists in `~/.m2`, the fork now resolves it from GitHub Packages.
 
 The mechanics of both paths are documented in [`tools/xtask/README.md`](tools/xtask/README.md).
+
+## Releasing
+
+This section outlines the release process for Neutrino and its Kotlin bindings. It does **not** cover how to prepare APKs of Element X Android with an embedded Neutrino homserver - see the [`element-x-android-neutrino`](https://github.com/element-hq/element-x-android-neutrino) repository for that information.
+
+### 1. Compile Neutrino
+
+This builds the current implementation and re-generates the Kotlin bindings if the FFI surface has changed.
+
+```sh
+cargo xtask compile
+```
+
+### 2. Commit Bindings
+
+If the bindings were updated in the last step, these should be committed to ensure the bindings line up with the tag itself.
+
+```sh
+git add bindings
+git commit -m "chore: Update bindings"
+```
+
+### 3. Tag and Push
+
+Once the working tree is clean, you can tag with the latest version and push:
+```sh
+git tag v1.2.3
+git push --tags
+```
+
+This will trigger the CI to perform an automatic release of the Neutrino bindings.
