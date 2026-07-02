@@ -124,6 +124,7 @@ Intentional gaps in the sliding-sync implementation — see `MSC4186-gaps.md`:
 
 - `initial_state`, `power_level_content_override`, and `creation_content` are not honoured
 - `trusted_private_chat`'s invitee power-level bump is not modelled (createRoom does not process the `invite` list for power levels)
+- DM `is_direct` is carried onto *local* baked invites only, not federated remote invites; `m.direct` account-data write 405s — remote DMs are not tagged direct
 
 ### Client-Server follow-ons
 
@@ -178,6 +179,134 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### createRoom federates remote invitees (2026-07-02)
+- **Bug:** starting a DM (element-x `create_dm` → one `createRoom` with
+  `is_direct:true` + `invite:[remote_user]`) never delivered the invite. The
+  createRoom path baked an invite `m.room.member` straight into the initial batch
+  via `store.create_room`, bypassing the room actor entirely — so neither the
+  actor's transaction fan-out (`outbound_destinations`) nor the dedicated
+  `/invite` handshake ever ran. A remote invitee's server isn't in the room's
+  joined-set anyway, so fan-out could never reach it; invites *require*
+  `PUT /federation/v2/invite`. The standalone `POST /invite` handler already did
+  this, which is why explicit invites worked but DM-creation invites did not.
+- **Fix (option a):** `build_initial_events` now bakes only *local* invitees;
+  `create_room`, after persisting the room, federates each *remote* invitee via
+  `federation::invite::federated_invite` (same path as the standalone handler).
+  Best-effort — the room is already persisted, so a failed invite is logged and
+  left for the client to retry rather than unwinding the room. Local/remote split
+  shares one helper (`invite_targets`) so both sides apply identical rules.
+- **Still outstanding (DM polish, not fixed here):** `is_direct` is not carried
+  onto the federated/remote invite member event (only local baked invites get
+  it), and `PUT …/account_data/m.direct` returns 405 — so remote DMs won't be
+  tagged as direct on either side yet.
+
+### sliding-sync wedge: HTTP backstop timeout + task-dump-on-fire (2026-07-02)
+- **Revises the 2026-07-01 "offline sync hang → executor starvation" theory.** A
+  fresh repro (create-room-hang.log) shows a single sliding-sync long-poll
+  (`pos=29`) that starts and never returns — its own 30s deadline never fires —
+  while, *during the hang*, store reads (`/members`, 1.77ms) and a store write
+  (`createRoom`, 4.4ms, which fires `notify_watch`) both complete, and the
+  executor-stall watchdog never logs. So the executor is live and the pools are
+  healthy; only that one task's wakers are lost (it's wedged before/at its
+  long-poll `select!`, since createRoom's watch edge — confirmed fired at
+  store/rooms.rs:162 — didn't wake it either). Root cause of the lost waker is
+  not yet pinned from logs alone.
+- **Backstop (symptom fix, always on):** the http `sync()` wrapper now runs
+  `sliding_sync::handle` inside `tokio::time::timeout(BACKSTOP_TIMEOUT)`
+  (`BACKSTOP_TIMEOUT = 40s = MAX_LONG_POLL_TIMEOUT + 10s slack`). The outer
+  timer registers its own waker with the time driver — which is provably live
+  (the watchdog heartbeat, itself a `tokio::time::interval`, keeps firing) — so
+  it fires regardless of which inner await is stuck. On fire the wrapper drops
+  `handle` (dropping its held `conn` guard → frees the per-conn lock) and
+  returns 504 `M_UNKNOWN`, which the client's serial sync loop retries, instead
+  of hanging forever. Invariant test guards `BACKSTOP_TIMEOUT > MAX_LONG_POLL_TIMEOUT`.
+- **Diagnostic (root-cause pin, opt-in):** on backstop fire, `dump_wedged_tasks()`
+  logs every task's await backtrace via `Handle::dump()`, gated on
+  `all(tokio_unstable, feature = "task-dump")`. The `task-dump` cargo feature
+  (chained neutrino-ffi → -main → -http → `tokio/taskdump`) is OFF by default;
+  tokio's `taskdump` hard-requires `--cfg tokio_unstable`, so a diagnostic build
+  is `RUSTFLAGS="--cfg tokio_unstable" cargo build -p neutrino-ffi --features
+  task-dump` (Android = linux/aarch64 satisfies tokio's platform gate; usable
+  traces also want `-C force-frame-pointers=yes`). Without the feature the
+  backstop still fires and logs context (user/conn_id/pos/elapsed) — just no
+  per-task backtraces. The real dump path is API-verified against tokio 1.52 but
+  not compiled in-sandbox (`backtrace`/`addr2line` uncached, network blocked).
+
+### user discovery over BLE — registry + directory search (2026-06-30)
+- The embedded server has no Matrix user directory; peers are learned out of
+  band over the BLE mesh. Each device advertises its display name + node id
+  (manufacturer data, company id `0xDFFF`); a search of the invite box answers
+  from the discovered set.
+- `DiscoveryRegistry` lives in `neutrino-ctl` (server-wide host-pushed state, the
+  read-queried sibling of `Command` — `Command` flows through the mpsc and is
+  *consumed*, this is *queried*, so it's a shared `Arc<DiscoveryRegistry>` read
+  directly by the handler, not the command channel). Keyed by `server_name`
+  (== node id; stored as a plain `String`, NOT iroh's `NodeId`, so ctl gains no
+  iroh coupling — it's the same identifier federation already keys on).
+- Registry stays **localpart-agnostic**: `DiscoveredPeer` carries `localpart`
+  verbatim and the registry never builds a user id. The embedded host (ffi,
+  iroh-aware) supplies the fixed constant `n`, but that's the host's choice — a
+  future multi-user host needs no registry change.
+- Write model is **snapshot replacement** (`replace`, one call per scan): a peer
+  out of range simply stops appearing, no removal bookkeeping. `upsert` kept for
+  incremental callers. `search` is case-insensitive substring on display name,
+  sorted `(display_name, server_name)` for determinism; the handler applies the
+  `limit` cap + `limited` flag.
+- `POST /_matrix/client/v3/user_directory/search` rebuilds `@{localpart}:{server_name}`
+  per hit and skips any peer whose advertised fields don't parse to a valid id
+  (defensive, not fatal). Hand-rolled request/response JSON (matching the spec
+  wire shape) + ruma `OwnedUserId` for id validation — avoids enabling a new ruma
+  feature, consistent with the `members`/`profile` handlers.
+- **FFI handoff (done):** the `Arc<DiscoveryRegistry>` is dependency-injected —
+  ffi `start` creates it, keeps a clone on `NeutrinoHandle`, and passes a clone
+  through `entrypoint` (new trailing `Option<Arc<DiscoveryRegistry>>` param,
+  defaulted; non-embedded callers pass `None`) → `serve` (required `Arc` param)
+  → `AppState::from_store_with_discovery`. `NeutrinoHandle::set_discovered_peers(
+  Vec<DiscoveredPeer{node_id, display_name}>)` replaces the snapshot, stamping
+  the fixed localpart `n` and a `last_seen_ms` clock read. ctl/http/main/dev
+  binary compile + clippy-clean + tests green; **ffi itself is unbuildable in
+  the sandbox** (bluer/iroh uncached) — verified by review + the buildable stack.
+- **Local display name is persisted in the store, not config (2026-06-30).**
+  The client sets it via `PUT /_matrix/client/v3/profile/{user}/displayname`
+  (+ `GET .../displayname`), so it MUST persist — it lives in the `IdentityStore`,
+  not a startup `Config` field (an earlier `Config.display_name` was removed as a
+  redundant second source of truth). The `node_identity` table was replaced by a
+  key/value `server_identity` table (`key='secret'` → 32 B, `key='displayname'`
+  → text; room for more k/v facts without a schema change — no migration, fresh
+  DB only). `IdentityStore` gained `get_display_name`/`set_display_name`.
+  `/profile` resolves: self → stored name (default **"Neutrino"**, not "Alice"),
+  discovered peer → registry by `server_name`, unknown remote → `{}`.
+- **BLE discovery landed end-to-end (2026-07-01).** Manufacturer id **`0x0E1E`**,
+  payload `node_id:32 ‖ display_name` in a BLE-5 **extended** advert (full 32 B
+  node id + name overflows the 31 B legacy cap; carrying only a 12 B prefix was
+  rejected — the directory must return a real `@n:{node_id}` and federation dials
+  the full id, and a prefix only resolves post-handshake). Layers:
+  - **`vendor/blew`** (forked crates.io `blew` 0.2.3, `[patch.crates-io]`):
+    `manufacturer_data` on `AdvertisingConfig`/`BleDevice`; Android peripheral →
+    `startAdvertisingSet`(non-legacy)+`addManufacturerData`, Android central →
+    `setLegacy(false)` scan surfacing the first mfr entry; Linux/bluer + JNI both
+    wired; Apple advertise left `None` (CoreBluetooth peripherals can't carry mfr
+    data — not a target).
+  - **`vendor/iroh-ble-transport::discovery`**: payload codec + `DiscoverySink`;
+    `BleTransportConfig.display_name` → advert; central loop decodes on
+    `DeviceDiscovered` → `BleTransport::discovered_peers()` snapshot stream;
+    `BleTransport::set_display_name` re-advertises (mutable driver config).
+  - **main**: reads `get_display_name()` (default "Neutrino") into a
+    `watch<String>` — tx→http (PUT handler pulses on `set_display_name`),
+    rx→`link_factory` (initial advert + re-advertise).
+  - **ffi**: `link_factory` builds the transport with the name, drains
+    `discovered_peers()` → the `DiscoveryRegistry` (hex node id = `server_name`,
+    fixed localpart `n`), and re-advertises on the name watch.
+  - **`set_discovered_peers` removed**: the transport is now the single registry
+    writer (it scans+decodes), so the earlier host-push FFI method + its
+    `DiscoveredPeer` uniffi record were redundant and dropped.
+  - Verified: ctl/http/main/dev-binary build + clippy-clean + tests green
+    (http 257, main 14+4, ctl 10, transport codec tests CI-runnable). blew +
+    iroh-ble-transport + ffi are review/parse-verified locally (no libdbus);
+    Kegan confirmed `neutrino-ffi --release --features ble` builds.
+  - **Remaining (host-side, not Rust):** none in-tree; the Kotlin `blew`
+    peripheral/central changes live in `vendor/blew/android/` — confirm the
+    EX-Android build consumes those (vs the `bindings/...` copy).
 ### BLE permanent-wedge on peer restart: registry dial-stage timeout + Dead revive (2026-07-01)
 - **Symptom:** force-stop a BLE peer then bring it back → permanently unreachable,
   symmetric on both devices ("as if BLE is off"), never recovers.

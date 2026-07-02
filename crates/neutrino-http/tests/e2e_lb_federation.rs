@@ -17,7 +17,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use neutrino_ctl::{Command, Config};
+use neutrino_ctl::{Command, Config, DiscoveryRegistry};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -78,7 +78,15 @@ async fn start_node(localpart: &str) -> Node {
                 .unwrap(),
         );
 
-        let _ = neutrino_http::serve(http_listener, config, store, cmd_rx).await;
+        let _ = neutrino_http::serve(
+            http_listener,
+            config,
+            store,
+            cmd_rx,
+            std::sync::Arc::new(DiscoveryRegistry::new()),
+            None,
+        )
+        .await;
     });
 
     // Sidecar: ingress on the public port, egress on loopback, upstream = the

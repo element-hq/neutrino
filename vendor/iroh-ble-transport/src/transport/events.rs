@@ -36,12 +36,26 @@ pub async fn run_central_events(
     central: Arc<Central>,
     routing: Arc<TransportRouting>,
     inbox: mpsc::Sender<PeerCommand>,
+    discovery: crate::discovery::DiscoverySink,
 ) {
     use tokio_stream::StreamExt as _;
     let mut events = central.events();
     while let Some(ev) = events.next().await {
         let cmd = match ev {
             CentralEvent::DeviceDiscovered(device) => {
+                // Record the peer for user discovery (id + display name) from the
+                // advert's manufacturer data — independent of the service-UUID
+                // dial-hint prefix below, so it happens even for adverts we don't
+                // otherwise route on.
+                if let Some((company, data)) = &device.manufacturer_data {
+                    if *company == crate::discovery::NEUTRINO_MANUFACTURER_ID {
+                        if let Some((node_id, name)) =
+                            crate::discovery::decode_discovery_payload(data)
+                        {
+                            discovery.observe(node_id, name);
+                        }
+                    }
+                }
                 let Some(prefix) = extract_prefix_from_services(&device.services) else {
                     continue;
                 };

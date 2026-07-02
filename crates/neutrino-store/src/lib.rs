@@ -630,10 +630,10 @@ pub trait InviteStore: Send + Sync {
     async fn invited_oob_rooms(&self, user_id: &UserId) -> Result<Vec<OwnedRoomId>, StorageError>;
 }
 
-/// The server's persistent node identity: a single opaque 32-byte secret. The
-/// server derives its stable identity from this secret (and, when unconfigured,
-/// its federation `server_name`), so it must survive restarts — see the
-/// `node_identity` table in the SQLite schema.
+/// The server's persistent identity facts: the opaque 32-byte node secret and
+/// the local user's display name. The server derives its stable identity from
+/// the secret (and, when unconfigured, its federation `server_name`), so these
+/// must survive restarts — see the `server_identity` table in the SQLite schema.
 #[async_trait]
 pub trait IdentityStore: Send + Sync {
     /// Pre:  `fresh_seed` is 32 cryptographically-random bytes from the caller.
@@ -646,6 +646,14 @@ pub trait IdentityStore: Send + Sync {
         &self,
         fresh_seed: [u8; 32],
     ) -> Result<[u8; 32], StorageError>;
+
+    /// The local user's persisted display name, or `None` if never set (the
+    /// caller applies the product default). Set via [`set_display_name`].
+    async fn get_display_name(&self) -> Result<Option<String>, StorageError>;
+
+    /// Persist the local user's display name, replacing any previous value
+    /// (`PUT /profile/{user}/displayname`).
+    async fn set_display_name(&self, name: &str) -> Result<(), StorageError>;
 }
 
 /// Combined storage interface. Use as a generic bound: `S: StorageBackend`.

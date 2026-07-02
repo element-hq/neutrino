@@ -12,13 +12,13 @@ use axum::{
     response::IntoResponse,
     routing::{get, post, put},
 };
-use neutrino_ctl::{Command, Config};
+use neutrino_ctl::{Command, Config, DEFAULT_DISPLAY_NAME, DiscoveryRegistry};
 use neutrino_event::event_builder::EventBuilder;
 use neutrino_event::{Event, FormatError, ROOM_VERSION_ID};
 use neutrino_room::CoreError;
 use neutrino_room::provider::InMemoryStateProvider;
 use neutrino_room::room_core::{Effect, RoomCore};
-use neutrino_store::{RoomStore, StateStore, StorageError};
+use neutrino_store::{IdentityStore, RoomStore, StateStore, StorageError};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5;
 use ruma::events::AnyTimelineEvent;
@@ -31,7 +31,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::trace::TraceLayer;
-use tracing::{Span, error, info, info_span};
+use tracing::{Span, error, info, info_span, warn};
 
 mod federation;
 mod legacy_sync;
@@ -75,6 +75,15 @@ struct App {
     fed_client: Arc<FederationClient>,
     sync_state: Arc<SyncState<SqliteStore>>,
     keys: Option<Value>,
+    /// Out-of-band peer discovery (BLE mesh): the host pushes the set of
+    /// currently-visible peers here and the user-directory search handler reads
+    /// it. Shared (`Arc`) so the host can hold a write handle while the router
+    /// reads — see [`AppState::discovery`].
+    discovery: Arc<DiscoveryRegistry>,
+    /// Publishes the local user's display name whenever it changes (via `PUT
+    /// /profile/.../displayname`), so the BLE transport can re-advertise it.
+    /// `None` off the embedded path (dev binary / tests): nothing re-advertises.
+    display_name_tx: Option<watch::Sender<String>>,
     config: Config,
     /// Latching cancellation signal shared with long-polls and the outbound
     /// federation sender. Fired once by [`AppState::begin_shutdown`]; after
@@ -209,21 +218,35 @@ impl AppState {
     /// simplest to construct directly through the trait rather than via the
     /// CSAPI write path.
     pub(crate) fn from_store(config: Config, store: Arc<SqliteStore>) -> Self {
+        Self::from_store_with_discovery(config, store, Arc::new(DiscoveryRegistry::new()))
+    }
+
+    /// Like [`AppState::from_store`] but with a caller-owned discovery registry.
+    /// The production path ([`serve`]) injects the registry the host holds a
+    /// write handle to (so its BLE-discovery callback and the router read the
+    /// same set); [`from_store`] passes a fresh empty one for tests/the dev binary.
+    pub(crate) fn from_store_with_discovery(
+        config: Config,
+        store: Arc<SqliteStore>,
+        discovery: Arc<DiscoveryRegistry>,
+    ) -> Self {
         let client = Arc::new(FederationClient::new(
             config.server_name.clone(),
             config.federation_proxy.as_deref(),
         ));
         let fetcher: Arc<dyn MissingEventsFetcher> = Arc::new(ReqwestFetcher::new(client));
-        Self::from_store_with_fetcher(config, store, fetcher)
+        Self::from_store_with_fetcher(config, store, fetcher, discovery)
     }
 
-    /// Like [`AppState::from_store`] but with an explicit gap-fill `fetcher`.
-    /// The federation gap-fill tests inject a deterministic stub here instead
-    /// of the reqwest client (which would otherwise reach the network).
+    /// Like [`AppState::from_store`] but with an explicit gap-fill `fetcher`
+    /// (and discovery registry). The federation gap-fill tests inject a
+    /// deterministic stub fetcher here instead of the reqwest client (which
+    /// would otherwise reach the network).
     fn from_store_with_fetcher(
         config: Config,
         store: Arc<SqliteStore>,
         fetcher: Arc<dyn MissingEventsFetcher>,
+        discovery: Arc<DiscoveryRegistry>,
     ) -> Self {
         let shutdown = CancellationToken::new();
         let sync_state = Arc::new(SyncState::new(store.clone(), shutdown.clone()));
@@ -252,6 +275,8 @@ impl AppState {
             fed_client,
             sync_state,
             keys: None,
+            discovery,
+            display_name_tx: None,
             config,
             shutdown,
             kick_backoff,
@@ -270,6 +295,13 @@ impl AppState {
     /// This homeserver's name, sent as the `origin` on outbound transactions.
     fn server_name(&self) -> String {
         lock_app(self).config.server_name.clone()
+    }
+
+    /// The shared out-of-band discovery registry. The host writes the visible
+    /// peer set through this handle (via the FFI); the user-directory search
+    /// handler reads it.
+    pub fn discovery(&self) -> Arc<DiscoveryRegistry> {
+        lock_app(self).discovery.clone()
     }
 
     /// The shared `get_missing_events` fetcher, for the outbound sender pool's
@@ -341,12 +373,21 @@ pub async fn serve(
     config: Config,
     store: Arc<SqliteStore>,
     commands: mpsc::UnboundedReceiver<Command>,
+    // Out-of-band peer discovery registry. The embedding host holds a clone and
+    // pushes the visible peer set into it; the user-directory search handler
+    // reads it. Non-embedded callers (the dev binary / e2e tests) pass a fresh
+    // empty one — discovery is a no-op without the BLE side channel.
+    discovery: Arc<DiscoveryRegistry>,
+    // Publishes the local display name on change so the BLE transport can
+    // re-advertise. `None` off the embedded path (no BLE advert to update).
+    display_name_tx: Option<watch::Sender<String>>,
 ) -> Result<(), StartupError> {
     // The caller (the entrypoint) opens the store, resolves the server identity
     // from it, and hands the live handle in — so we build state around it rather
     // than re-opening the same DB.
     AppState::validate_config(&config)?;
-    let state = AppState::from_store(config, store);
+    let state = AppState::from_store_with_discovery(config, store, discovery);
+    lock_app(&state).display_name_tx = display_name_tx;
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
     // enumeration resumes delivery of anything left undelivered.
@@ -445,7 +486,12 @@ pub(crate) fn router_with_store_and_fetcher(
     store: Arc<SqliteStore>,
     fetcher: Arc<dyn MissingEventsFetcher>,
 ) -> Router {
-    let state = AppState::from_store_with_fetcher(config, store, fetcher);
+    let state = AppState::from_store_with_fetcher(
+        config,
+        store,
+        fetcher,
+        Arc::new(DiscoveryRegistry::new()),
+    );
     build_router(&state)
 }
 
@@ -474,6 +520,14 @@ fn build_router(state: &AppState) -> Router {
             post(signatures_upload),
         )
         .route("/_matrix/client/v3/profile/{user_id}", get(profile))
+        .route(
+            "/_matrix/client/v3/profile/{user_id}/displayname",
+            get(get_display_name).put(put_display_name),
+        )
+        .route(
+            "/_matrix/client/v3/user_directory/search",
+            post(user_directory_search),
+        )
         .route(
             "/_matrix/client/v3/user/{user_id}/account_data/{account_data_type}",
             get(get_account_data),
@@ -800,25 +854,99 @@ async fn sync(
         Err(e) => return error_response(StatusCode::BAD_REQUEST, "M_BAD_JSON", &e.to_string()),
     };
 
-    match sliding_sync::handle(&sync_state, &user_id, req).await {
-        Ok(resp) => (StatusCode::OK, Json(SyncResponseWire::from(resp))).into_response(),
-        Err(SyncError::UnknownPos) => {
+    // Identifying fields for the backstop diagnostic, captured before `req`
+    // is moved into `handle`.
+    let pos = query.0.get("pos").cloned();
+    let conn_id = req.conn_id.clone().unwrap_or_default();
+
+    // Wrap the handler in an absolute backstop deadline. A healthy long-poll
+    // returns well within `BACKSTOP_TIMEOUT`; if it doesn't, the handler is
+    // wedged (see the const's doc + the decisions log). The outer timer's
+    // waker is registered with the time driver independently of any inner
+    // await, so it fires even when the inner wakers are lost; on fire we drop
+    // `handle` (which frees the conn lock) and return a retryable error rather
+    // than hang the client's serial sync loop forever.
+    let handled = tokio::time::timeout(
+        sliding_sync::BACKSTOP_TIMEOUT,
+        sliding_sync::handle(&sync_state, &user_id, req),
+    )
+    .await;
+
+    match handled {
+        Ok(Ok(resp)) => (StatusCode::OK, Json(SyncResponseWire::from(resp))).into_response(),
+        Ok(Err(SyncError::UnknownPos)) => {
             error_response(StatusCode::BAD_REQUEST, "M_UNKNOWN_POS", "Unknown position")
         }
-        Err(SyncError::BadRequest(msg)) => {
+        Ok(Err(SyncError::BadRequest(msg))) => {
             error_response(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", msg)
         }
-        Err(SyncError::Storage(e)) => error_response(
+        Ok(Err(SyncError::Storage(e))) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "M_UNKNOWN",
             &e.to_string(),
         ),
-        Err(SyncError::EventConversion(e)) => error_response(
+        Ok(Err(SyncError::EventConversion(e))) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "M_UNKNOWN",
             &e.to_string(),
         ),
+        Err(_elapsed) => {
+            error!(
+                %user_id,
+                conn_id,
+                pos = pos.as_deref().unwrap_or("<initial>"),
+                backstop_secs = sliding_sync::BACKSTOP_TIMEOUT.as_secs(),
+                "sliding-sync handler exceeded backstop deadline: the long-poll is \
+                 wedged (not an executor stall — other requests are being served). \
+                 Dropping the handler to free the conn lock; returning 504 so the \
+                 client's sync loop recovers."
+            );
+            dump_wedged_tasks().await;
+            error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "M_UNKNOWN",
+                "sync handler backstop deadline exceeded",
+            )
+        }
     }
+}
+
+/// Log a full task dump when the sliding-sync backstop fires, to pin the exact
+/// await the wedged handler is parked on.
+///
+/// Real dumps need `--cfg tokio_unstable` **and** `--features task-dump` (which
+/// enables tokio's `taskdump`, pulling in `backtrace`) — off by default so
+/// normal builds stay lean. To capture backtraces on the next repro, build the
+/// FFI lib with e.g.
+/// `RUSTFLAGS="--cfg tokio_unstable" cargo build -p neutrino-ffi --features task-dump`.
+/// Backtraces are only usable with frame pointers (`-C force-frame-pointers=yes`).
+#[cfg(all(tokio_unstable, feature = "task-dump"))]
+async fn dump_wedged_tasks() {
+    // `Handle::dump` re-polls every task in a tracing mode and can fail to
+    // terminate if a worker is blocked, so the tokio docs recommend pairing it
+    // with an explicit timeout.
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::runtime::Handle::current().dump(),
+    )
+    .await
+    {
+        Ok(dump) => {
+            for task in dump.tasks().iter() {
+                error!(task_id = %task.id(), trace = %task.trace(), "wedged-sync taskdump");
+            }
+        }
+        Err(_) => error!("wedged-sync taskdump timed out (a runtime worker is blocked)"),
+    }
+}
+
+/// Fallback when task dumps aren't compiled in — see the `cfg`-enabled variant.
+#[cfg(not(all(tokio_unstable, feature = "task-dump")))]
+async fn dump_wedged_tasks() {
+    error!(
+        "task dump unavailable: rebuild with RUSTFLAGS=\"--cfg tokio_unstable\" and \
+         --features task-dump to capture task backtraces when the sync backstop fires"
+    );
 }
 
 /// Build a `v5::Request` from the JSON body plus the `pos` and `timeout`
@@ -1023,10 +1151,132 @@ async fn signatures_upload(state: State<AppState>, body: Json<Value>) -> Json<Va
     Json(json!({}))
 }
 
-async fn profile(axum::extract::Path(_user_id): axum::extract::Path<String>) -> Json<Value> {
-    Json(json!({
-        "displayname": "Alice",
-    }))
+/// Resolve a user's display name: the local user's from the persistent
+/// [`IdentityStore`] (falling back to [`DEFAULT_DISPLAY_NAME`]), a discovered
+/// peer's from the [`DiscoveryRegistry`] (matched on the user id's
+/// `server_name`). `None` only for an unknown remote user.
+async fn resolve_display_name(state: &AppState, user_id: &str) -> Option<String> {
+    let (is_self, store, discovery) = {
+        let app = lock_app(state);
+        (
+            user_id == app.config.user_id(),
+            app.store.clone(),
+            app.discovery.clone(),
+        )
+    };
+    if is_self {
+        return Some(
+            store
+                .get_display_name()
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| DEFAULT_DISPLAY_NAME.to_string()),
+        );
+    }
+    user_id
+        .rsplit_once(':')
+        .and_then(|(_, server_name)| discovery.get(server_name))
+        .map(|peer| peer.display_name)
+}
+
+/// `GET /_matrix/client/v3/profile/{user_id}` and the `/displayname` keyed
+/// variant. An unknown remote user yields an empty profile (`{}`) — the spec
+/// permits an absent `displayname`, and there is no profile store to 404 a
+/// never-seen peer against.
+async fn profile(
+    state: State<AppState>,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+) -> Json<Value> {
+    match resolve_display_name(&state.0, &user_id).await {
+        Some(dn) => Json(json!({ "displayname": dn })),
+        None => Json(json!({})),
+    }
+}
+
+/// `GET /_matrix/client/v3/profile/{user_id}/displayname` — the keyed variant
+/// of [`profile`], returning only the `displayname` field.
+async fn get_display_name(
+    state: State<AppState>,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+) -> Json<Value> {
+    match resolve_display_name(&state.0, &user_id).await {
+        Some(dn) => Json(json!({ "displayname": dn })),
+        None => Json(json!({})),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SetDisplayNameRequest {
+    #[serde(default)]
+    displayname: String,
+}
+
+/// `PUT /_matrix/client/v3/profile/{user_id}/displayname`
+/// (https://spec.matrix.org/v1.18/client-server-api/#put_matrixclientv3profileuseriddisplayname).
+/// Persists the local user's display name in the [`IdentityStore`]. The embedded
+/// server is single-user, so the path `user_id` is the local user by
+/// construction; the name is stored verbatim.
+async fn put_display_name(
+    state: State<AppState>,
+    axum::extract::Path(_user_id): axum::extract::Path<String>,
+    Json(req): Json<SetDisplayNameRequest>,
+) -> axum::response::Response {
+    let store = lock_app(&state.0).store.clone();
+    match store.set_display_name(&req.displayname).await {
+        Ok(()) => {
+            // Signal the BLE transport (if any) to re-advertise the new name.
+            if let Some(tx) = &lock_app(&state.0).display_name_tx {
+                let _ = tx.send(req.displayname);
+            }
+            Json(json!({})).into_response()
+        }
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &e.to_string(),
+        ),
+    }
+}
+
+/// Default result cap when the client omits `limit`
+/// (https://spec.matrix.org/v1.18/client-server-api/#post_matrixclientv3user_directorysearch).
+fn default_search_limit() -> usize {
+    10
+}
+
+#[derive(serde::Deserialize)]
+struct SearchRequest {
+    search_term: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+/// `POST /_matrix/client/v3/user_directory/search`.
+///
+/// The embedded server has no Matrix-level user directory: it answers from the
+/// out-of-band [`DiscoveryRegistry`] (peers seen over the BLE mesh). Each peer's
+/// user id is rebuilt as `@{localpart}:{server_name}` from its stored fields; a
+/// peer whose advertised data doesn't form a syntactically valid id is skipped
+/// rather than failing the whole search.
+async fn user_directory_search(
+    state: State<AppState>,
+    Json(req): Json<SearchRequest>,
+) -> Json<Value> {
+    let mut matches = state.discovery().search(&req.search_term);
+    // The spec caps the list at `limit` and flags whether that truncated it.
+    let limited = matches.len() > req.limit;
+    matches.truncate(req.limit);
+    let results: Vec<Value> = matches
+        .into_iter()
+        .filter_map(|(server_name, peer)| {
+            let user_id: OwnedUserId = format!("@{}:{}", peer.localpart, server_name)
+                .parse()
+                .ok()?;
+            Some(json!({ "user_id": user_id, "display_name": peer.display_name }))
+        })
+        .collect();
+    Json(json!({ "results": results, "limited": limited }))
 }
 
 async fn get_account_data(
@@ -1056,15 +1306,19 @@ async fn create_room(
     AuthUser(sender): AuthUser,
     body: Json<Value>,
 ) -> axum::response::Response {
-    let store = lock_app(&state.0).store.clone();
+    let (store, own_server) = {
+        let app = lock_app(&state.0);
+        (app.store.clone(), app.config.server_name.clone())
+    };
 
     // Build the spec-mandated initial-state batch (create → join →
     // power_levels → join_rules, plus name/topic when requested). Each event
     // is built on the running heads, server-side `auth_events` selected, and
     // verified through `RoomCore::apply` before it's persisted — see
     // `build_initial_events`. Any failure here is a server bug (the events are
-    // server-authored), so it maps to 500.
-    let (create, initial) = match build_initial_events(&sender, &body.0) {
+    // server-authored), so it maps to 500. Only *local* invitees are baked into
+    // the batch; remote invitees are federated separately below.
+    let (create, initial) = match build_initial_events(&sender, &body.0, &own_server) {
         Ok(batch) => batch,
         Err(e) => {
             return error_response(
@@ -1089,7 +1343,47 @@ async fn create_room(
         );
     }
 
+    // Federate each *remote* invitee via the dedicated `/invite` handshake — a
+    // remote user's server isn't in the room yet, so it's not in the joined-set
+    // that transaction fan-out reaches; only `federated_invite` (PUT
+    // /federation/v2/invite) can deliver the invite. Local invitees already rode
+    // the initial batch. Best-effort: the room is persisted, so a failed invite
+    // is logged and left for the client to retry rather than unwinding the room.
+    for target in invite_targets(&sender, &body.0) {
+        if target.server_name().as_str() == own_server {
+            continue;
+        }
+        let resp = crate::federation::invite::federated_invite(
+            &state.0,
+            sender.clone(),
+            &room_id,
+            &target,
+            None,
+        )
+        .await;
+        if !resp.status().is_success() {
+            warn!(%room_id, invitee = %target, status = %resp.status(), "createRoom: failed to federate invite to remote invitee");
+        }
+    }
+
     (StatusCode::OK, Json(json!({"room_id": room_id}))).into_response()
+}
+
+/// The validated `invite` targets from a createRoom body, minus the creator and
+/// malformed entries (best-effort — a bad entry is skipped, not a room-creation
+/// failure). Shared by [`build_initial_events`] (bakes *local* invitees into the
+/// initial batch) and [`create_room`] (federates *remote* invitees as a
+/// follow-up), so the two split the same list on the same rules.
+fn invite_targets(sender: &OwnedUserId, body: &Value) -> Vec<OwnedUserId> {
+    let Some(invitees) = body.pointer("/invite").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    invitees
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|t| *t != sender.as_str())
+        .filter_map(|t| OwnedUserId::try_from(t).ok())
+        .collect()
 }
 
 /// Error building the createRoom initial-state batch. Every event is
@@ -1136,6 +1430,7 @@ fn persisted_event(effects: Vec<Effect>) -> Result<Arc<Event>, CreateRoomError> 
 fn build_initial_events(
     sender: &OwnedUserId,
     body: &Value,
+    own_server: &str,
 ) -> Result<(Event, Vec<Event>), CreateRoomError> {
     // create is special: no parents, room_id derived from its own event_id.
     let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
@@ -1189,27 +1484,23 @@ fn build_initial_events(
         add("m.room.topic", "", json!({ "topic": t }))?;
     }
 
-    // Honour the request's `invite` list (the membership follow-up to the
-    // multi-user shim): emit one invite member event per well-formed, non-self
-    // target, authored by the creator — who is joined with implicit MAX power,
-    // so rule 5.4 accepts it. Malformed entries are skipped rather than failing
-    // room creation (test server, best-effort). `is_direct` is propagated onto
-    // the invite content when the request sets it.
-    if let Some(invitees) = body.pointer("/invite").and_then(Value::as_array) {
-        let is_direct = body.pointer("/is_direct").and_then(Value::as_bool) == Some(true);
-        for entry in invitees {
-            let Some(target) = entry.as_str() else {
-                continue;
-            };
-            if target == sender.as_str() || OwnedUserId::try_from(target).is_err() {
-                continue;
-            }
-            let mut content = json!({ "membership": "invite" });
-            if is_direct {
-                content["is_direct"] = json!(true);
-            }
-            add("m.room.member", target, content)?;
+    // Honour the request's `invite` list, but only for *local* invitees: emit one
+    // invite member event per local target, authored by the creator — who is
+    // joined with implicit MAX power, so rule 5.4 accepts it. Remote invitees
+    // cannot ride the initial batch (their server isn't in the room yet, so
+    // nothing federates the event to them); `create_room` delivers those via the
+    // dedicated `/invite` handshake instead. `is_direct` is propagated onto the
+    // invite content when the request sets it.
+    let is_direct = body.pointer("/is_direct").and_then(Value::as_bool) == Some(true);
+    for target in invite_targets(sender, body) {
+        if target.server_name().as_str() != own_server {
+            continue;
         }
+        let mut content = json!({ "membership": "invite" });
+        if is_direct {
+            content["is_direct"] = json!(true);
+        }
+        add("m.room.member", target.as_str(), content)?;
     }
 
     Ok((create, initial))
@@ -1523,8 +1814,8 @@ async fn default_fallback() -> (StatusCode, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Command, Config, ControlFlow, SqliteStore, TcpListener, dispatch, handle,
-        join_rule_for, mpsc,
+        AppState, Command, Config, ControlFlow, Event, OwnedUserId, SqliteStore, TcpListener,
+        build_initial_events, dispatch, handle, invite_targets, join_rule_for, mpsc,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -1569,6 +1860,159 @@ mod tests {
             matches!(err, super::StartupError::InvalidFederationProxy(_)),
             "got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn user_directory_search_matches_discovered_peers() {
+        use neutrino_ctl::DiscoveredPeer;
+
+        let (state, _tmp) = test_state().await;
+        let reg = state.discovery();
+        let mk = |dn: &str| DiscoveredPeer {
+            localpart: "n".to_string(),
+            display_name: dn.to_string(),
+            last_seen_ms: 0,
+        };
+        reg.upsert("nodealice".to_string(), mk("Alice"));
+        reg.upsert("nodebob".to_string(), mk("Bob"));
+
+        let body = super::user_directory_search(
+            axum::extract::State(state.clone()),
+            axum::Json(super::SearchRequest {
+                search_term: "ali".to_string(),
+                limit: 10,
+            }),
+        )
+        .await
+        .0;
+
+        assert_eq!(body["limited"], serde_json::json!(false));
+        let results = body["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 1);
+        // user_id is rebuilt from the peer's localpart + server_name (the key).
+        assert_eq!(results[0]["user_id"], serde_json::json!("@n:nodealice"));
+        assert_eq!(results[0]["display_name"], serde_json::json!("Alice"));
+    }
+
+    #[tokio::test]
+    async fn user_directory_search_honours_limit_and_flags_truncation() {
+        use neutrino_ctl::DiscoveredPeer;
+
+        let (state, _tmp) = test_state().await;
+        let reg = state.discovery();
+        for i in 0..3 {
+            reg.upsert(
+                format!("node{i}"),
+                DiscoveredPeer {
+                    localpart: "n".to_string(),
+                    display_name: format!("Peer {i}"),
+                    last_seen_ms: 0,
+                },
+            );
+        }
+
+        let body = super::user_directory_search(
+            axum::extract::State(state.clone()),
+            axum::Json(super::SearchRequest {
+                search_term: "peer".to_string(),
+                limit: 2,
+            }),
+        )
+        .await
+        .0;
+
+        assert_eq!(body["limited"], serde_json::json!(true));
+        assert_eq!(body["results"].as_array().expect("results").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn profile_default_then_persisted_display_name() {
+        let (state, _tmp) = test_state().await;
+        // test_config: localpart "alice", server_name "127.0.0.1".
+        let self_id = "@alice:127.0.0.1".to_string();
+
+        // Unset → product default "Neutrino".
+        let body = super::profile(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(self_id.clone()),
+        )
+        .await
+        .0;
+        assert_eq!(body["displayname"], json!("Neutrino"));
+
+        // Persist via PUT, then GET reflects it (and survives in the store).
+        super::put_display_name(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(self_id.clone()),
+            axum::Json(super::SetDisplayNameRequest {
+                displayname: "Zaphod".to_string(),
+            }),
+        )
+        .await;
+        let body = super::profile(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(self_id),
+        )
+        .await
+        .0;
+        assert_eq!(body["displayname"], json!("Zaphod"));
+    }
+
+    #[tokio::test]
+    async fn put_display_name_persists_and_pulses_readvertise() {
+        use neutrino_store::IdentityStore;
+        let (state, _tmp) = test_state().await;
+        // Wire a display-name watch as the embedded path (serve) would.
+        let (tx, mut rx) = super::watch::channel(String::new());
+        super::lock_app(&state).display_name_tx = Some(tx);
+
+        super::put_display_name(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("@alice:127.0.0.1".to_string()),
+            axum::Json(super::SetDisplayNameRequest {
+                displayname: "Ford".to_string(),
+            }),
+        )
+        .await;
+
+        // Persisted in the store …
+        let store = super::lock_app(&state).store.clone();
+        let stored = store.get_display_name().await.expect("get");
+        assert_eq!(stored, Some("Ford".to_string()));
+        // … and pulsed to the re-advertise watch.
+        assert!(rx.has_changed().expect("sender alive"));
+        assert_eq!(*rx.borrow_and_update(), "Ford");
+    }
+
+    #[tokio::test]
+    async fn profile_resolves_peer_from_registry_and_unknown_is_empty() {
+        use neutrino_ctl::DiscoveredPeer;
+        let (state, _tmp) = test_state().await;
+        state.discovery().upsert(
+            "peernode".to_string(),
+            DiscoveredPeer {
+                localpart: "n".to_string(),
+                display_name: "Trillian".to_string(),
+                last_seen_ms: 0,
+            },
+        );
+
+        let body = super::profile(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("@n:peernode".to_string()),
+        )
+        .await
+        .0;
+        assert_eq!(body["displayname"], json!("Trillian"));
+
+        // An unknown remote user → empty profile.
+        let body = super::profile(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("@x:unknownserver".to_string()),
+        )
+        .await
+        .0;
+        assert_eq!(body, json!({}));
     }
 
     #[tokio::test]
@@ -1673,7 +2117,14 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let (tx, rx) = mpsc::unbounded_channel();
-        let server = tokio::spawn(super::serve(listener, config, store, rx));
+        let server = tokio::spawn(super::serve(
+            listener,
+            config,
+            store,
+            rx,
+            Arc::new(super::DiscoveryRegistry::new()),
+            None,
+        ));
 
         // Give the sender supervisor a moment to discover the dead peer and
         // spawn its per-destination task (which will be retrying the dead peer).
@@ -1719,6 +2170,59 @@ mod tests {
         assert_eq!(
             join_rule_for(&json!({ "preset": "weird_preset" })),
             "invite"
+        );
+    }
+
+    #[test]
+    fn invite_targets_skips_self_and_malformed() {
+        let sender: OwnedUserId = "@alice:127.0.0.1".parse().expect("user id");
+        let body = json!({
+            "invite": [
+                "@bob:127.0.0.1",
+                "@alice:127.0.0.1", // self — skipped
+                "not-a-user-id",    // malformed — skipped
+                "@carol:remote.example",
+                42,                 // wrong type — skipped
+            ]
+        });
+        let targets: Vec<String> = invite_targets(&sender, &body)
+            .into_iter()
+            .map(|u| u.to_string())
+            .collect();
+        assert_eq!(targets, ["@bob:127.0.0.1", "@carol:remote.example"]);
+    }
+
+    #[test]
+    fn build_initial_events_bakes_local_invite_only_remote_deferred() {
+        // A DM-style createRoom with one local and one remote invitee: the local
+        // invite member event rides the initial batch (with `is_direct`), the
+        // remote one does not — `create_room` federates it via `/invite` instead.
+        let sender: OwnedUserId = "@alice:127.0.0.1".parse().expect("user id");
+        let body = json!({
+            "is_direct": true,
+            "invite": ["@bob:127.0.0.1", "@carol:remote.example"],
+        });
+        let (_create, initial) =
+            build_initial_events(&sender, &body, "127.0.0.1").expect("build initial events");
+
+        let invites: Vec<&Event> = initial
+            .iter()
+            .filter(|e| {
+                e.event_type == "m.room.member"
+                    && e.content_str("membership").as_deref() == Some("invite")
+            })
+            .collect();
+        assert_eq!(invites.len(), 1, "only the local invitee is baked in");
+        let bob = invites[0];
+        assert_eq!(bob.state_key.as_deref(), Some("@bob:127.0.0.1"));
+        let content: serde_json::Value =
+            serde_json::from_str(bob.content.get()).expect("content json");
+        assert_eq!(content.pointer("/is_direct"), Some(&json!(true)));
+        assert!(
+            !initial
+                .iter()
+                .any(|e| e.state_key.as_deref() == Some("@carol:remote.example")),
+            "the remote invitee must not appear in the initial batch"
         );
     }
 }

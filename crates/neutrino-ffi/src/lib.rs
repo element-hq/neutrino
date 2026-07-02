@@ -74,6 +74,13 @@ impl From<Command> for neutrino_main::Command {
     }
 }
 
+/// Fixed localpart for every embedded peer's user: user ids are
+/// `@n:{node_id}`. The discovery registry is localpart-agnostic — this is the
+/// embedded host's convention, applied by the BLE transport's discovery drain
+/// (see `relay_transport`) where the node id is known.
+#[cfg(feature = "ble")]
+const DISCOVERY_LOCALPART: &str = "n";
+
 #[derive(uniffi::Object)]
 pub struct NeutrinoHandle {
     tx: tokio::sync::mpsc::UnboundedSender<neutrino_main::Command>,
@@ -148,15 +155,22 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
     // The entrypoint publishes the resolved server name here once identity
     // resolution completes; `server_name()` reads it back.
     let (handoff_tx, handoff_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+    // Shared out-of-band discovery registry: the BLE transport writes the peers
+    // it scans into it, and the homeserver reads it for user-directory search.
+    // One handle for the homeserver (read by user-directory search), one for the
+    // BLE transport (which writes scanned peers into it — see the drain task).
+    let discovery_for_server = std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new());
+    let discovery_for_link = discovery_for_server.clone();
     // Build the federation datagram link from the resolved node secret: an iroh
     // QUIC endpoint, addressed by 32-byte node id, carrying the sidecar's
     // CoAP/CBOR wire over BLE (no OS socket / TUN / virtual IPs). The entrypoint
     // calls this once it has resolved the secret, then injects the link into the
     // lb sidecar. A bind failure is widened to `entrypoint`'s boxed error and
     // fails startup loudly (logged on the runtime thread below).
-    let link_factory: neutrino_main::FederationLinkFactory = Box::new(move |secret| {
+    let link_factory: neutrino_main::FederationLinkFactory = Box::new(move |secret, name_rx| {
         Box::pin(async move {
-            let transport = IrohTransport::bind(&secret, RELAY_BIND).await?;
+            let transport =
+                IrohTransport::bind(&secret, RELAY_BIND, name_rx, discovery_for_link).await?;
             Ok(transport as std::sync::Arc<dyn neutrino_main::DatagramLink>)
         })
     });
@@ -184,8 +198,14 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
             // The command receiver is threaded into the server; a `Shutdown`
             // command (or every `NeutrinoHandle` being dropped, which closes the
             // channel) drives `serve`'s graceful shutdown and returns here.
-            if let Err(e) =
-                neutrino_main::entrypoint(config, rx, Some(handoff_tx), Some(link_factory)).await
+            if let Err(e) = neutrino_main::entrypoint(
+                config,
+                rx,
+                Some(handoff_tx),
+                Some(link_factory),
+                Some(discovery_for_server),
+            )
+            .await
             {
                 tracing::error!(error = %e, "neutrino: server entrypoint exited with an error");
             }

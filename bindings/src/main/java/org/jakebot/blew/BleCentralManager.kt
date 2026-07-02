@@ -87,6 +87,10 @@ object BleCentralManager {
         deviceName: String?,
         rssi: Int,
         serviceUuids: String,
+        // First manufacturer-specific-data entry from the advertisement, or
+        // (-1, null) when the advert carried none.
+        manufacturerId: Int,
+        manufacturerData: ByteArray?,
     )
 
     @JvmStatic
@@ -225,6 +229,11 @@ object BleCentralManager {
             ScanSettings
                 .Builder()
                 .setScanMode(scanMode)
+                // Observe BLE-5 extended advertisements too (peers carry the
+                // node id + display name there); a legacy-only scan wouldn't see
+                // them. Harmless on legacy adverts.
+                .setLegacy(false)
+                .setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED)
                 .build()
 
         scanCallback =
@@ -244,7 +253,16 @@ object BleCentralManager {
                             ?.joinToString(",") { it.uuid.toString() }
                             ?: ""
 
-                    nativeOnDeviceDiscovered(addr, name, rssi, uuids)
+                    // Surface the first manufacturer-specific-data entry, if any.
+                    val msd = result.scanRecord?.manufacturerSpecificData
+                    var mfrId = -1
+                    var mfrData: ByteArray? = null
+                    if (msd != null && msd.size() > 0) {
+                        mfrId = msd.keyAt(0)
+                        mfrData = msd.valueAt(0)
+                    }
+
+                    nativeOnDeviceDiscovered(addr, name, rssi, uuids, mfrId, mfrData)
                 }
 
                 override fun onScanFailed(errorCode: Int) {

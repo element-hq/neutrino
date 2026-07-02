@@ -71,6 +71,12 @@ pub struct BleTransportConfig {
     /// handshake-time dedup is effectively disabled — useful for tests that
     /// don't run a real iroh `Endpoint`.
     pub verified_rx: Option<tokio::sync::mpsc::UnboundedReceiver<VerifiedEndpointEvent>>,
+    /// Local display name to advertise for peer discovery. When `Some`, the
+    /// advertisement carries `node_id ‖ display_name` as manufacturer data (see
+    /// [`crate::discovery`]) via extended advertising, so scanning peers learn
+    /// this node's id + name without connecting. `None` (the default) advertises
+    /// no discovery payload (legacy advertising, prior behaviour).
+    pub display_name: Option<String>,
 }
 
 impl Default for BleTransportConfig {
@@ -79,6 +85,7 @@ impl Default for BleTransportConfig {
             l2cap_policy: L2capPolicy::default(),
             store: Arc::new(InMemoryPeerStore::new()),
             verified_rx: None,
+            display_name: None,
         }
     }
 }
@@ -89,6 +96,7 @@ impl std::fmt::Debug for BleTransportConfig {
             .field("l2cap_policy", &self.l2cap_policy)
             .field("store", &"<PeerStore>")
             .field("verified_rx", &self.verified_rx.is_some())
+            .field("display_name", &self.display_name)
             .finish()
     }
 }
@@ -188,6 +196,13 @@ pub struct BleTransport {
     /// `AtomicWaker` (which would clobber prior registrations and leak wakeups).
     inbox_capacity_wakers: Arc<Mutex<Vec<Waker>>>,
     store: Arc<dyn PeerStore>,
+    /// Snapshot receiver for BLE-discovered peers (id + advertised name),
+    /// published by the central event loop. See [`Self::discovered_peers`].
+    discovered_rx: tokio::sync::watch::Receiver<Vec<crate::discovery::DiscoveredPeer>>,
+    /// Driver handle + local id, so [`Self::set_display_name`] can re-encode the
+    /// discovery payload and re-advertise when the name changes at runtime.
+    driver: Arc<BlewDriver>,
+    local_id: EndpointId,
 }
 
 impl std::fmt::Debug for BleTransport {
@@ -227,9 +242,19 @@ impl BleTransport {
         let key_uuid = iroh_key_uuid(&local_id);
         let services = build_gatt_services(key_uuid);
         register_gatt_services(&peripheral, &services).await?;
+        // When a display name is configured, advertise `node_id ‖ name` as
+        // manufacturer data so peers can discover this node (id + name) without
+        // connecting. This forces extended advertising on the peripheral side.
+        let manufacturer_data = config.display_name.as_ref().map(|name| {
+            (
+                crate::discovery::NEUTRINO_MANUFACTURER_ID,
+                crate::discovery::encode_discovery_payload(local_id.as_bytes(), name),
+            )
+        });
         let advertising_config = AdvertisingConfig {
             local_name: "iroh".to_string(),
             service_uuids: vec![key_uuid],
+            manufacturer_data,
         };
         peripheral.start_advertising(&advertising_config).await?;
         info!(key_uuid = %key_uuid, "advertising started");
@@ -263,6 +288,9 @@ impl BleTransport {
             services,
             advertising_config,
         ));
+        // Keep a handle to the driver so `set_display_name` can update the
+        // advertised manufacturer data and re-advertise at runtime.
+        let driver_iface = Arc::clone(&iface);
         let driver = Driver::new(
             iface,
             inbox_tx.clone(),
@@ -321,10 +349,15 @@ impl BleTransport {
             });
         }
 
+        // Peer-discovery sink: the central event loop records discovered peers
+        // (id + name from manufacturer data) here; consumers read snapshots via
+        // `discovered_peers()`.
+        let (discovery_sink, discovered_rx) = crate::discovery::DiscoverySink::new();
         tokio::spawn(run_central_events(
             Arc::clone(&central),
             Arc::clone(&routing),
             inbox_tx.clone(),
+            discovery_sink,
         ));
         tokio::spawn(run_peripheral_state_events(
             Arc::clone(&peripheral),
@@ -352,7 +385,34 @@ impl BleTransport {
             empty_frames,
             inbox_capacity_wakers,
             store: config.store,
+            discovered_rx,
+            driver: driver_iface,
+            local_id,
         })
+    }
+
+    /// Snapshot receiver for peers discovered over BLE — the full current set of
+    /// `(node_id, display_name)` pairs, republished on every change. The ffi
+    /// layer forwards each snapshot to the homeserver's discovery registry.
+    #[must_use]
+    pub fn discovered_peers(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Vec<crate::discovery::DiscoveredPeer>> {
+        self.discovered_rx.clone()
+    }
+
+    /// Update the advertised display name at runtime and re-advertise, so peers
+    /// see the new `node_id ‖ name` payload. `None` clears the discovery payload
+    /// (reverts to a non-discovery advert). Called when the local profile name
+    /// changes (`PUT /profile/.../displayname`).
+    pub async fn set_display_name(&self, name: Option<String>) -> BleResult<()> {
+        let data = name.map(|n| {
+            (
+                crate::discovery::NEUTRINO_MANUFACTURER_ID,
+                crate::discovery::encode_discovery_payload(self.local_id.as_bytes(), &n),
+            )
+        });
+        self.driver.set_manufacturer_data(data).await
     }
 
     #[must_use]

@@ -49,6 +49,10 @@ ndk-context = { version = "0.1", optional = true }
 
 [features]
 ble = ["dep:iroh-ble-transport", "dep:blew", "dep:jni", "dep:ndk-context"]
+# Diagnostic-only passthrough — see neutrino-http's `task-dump`. Build the FFI
+# lib with `RUSTFLAGS="--cfg tokio_unstable" cargo build -p neutrino-ffi
+# --features task-dump` to capture task backtraces when the sync backstop fires.
+task-dump = ["neutrino-main/task-dump"]
 
 [dev-dependencies]
 # The datagram-link test derives the expected node id from a secret to pin the
