@@ -632,8 +632,12 @@ async fn build_room<S: StorageBackend>(
 
     // ---- Required state diff ----
     let current_state = state.store.current_room_state(room_id).await?;
-    let (state_events, mut deleted_state_keys) =
-        diff_required_state(&current_state, &cfg.required_state, sent_snapshot);
+    let (state_events, mut deleted_state_keys) = diff_required_state(
+        &current_state,
+        &cfg.required_state,
+        user_id.as_str(),
+        sent_snapshot,
+    );
     if !EMIT_STATE_STUBS {
         // Drop the list so the rest of the pipeline behaves as if no
         // deletions occurred: no stubs in `required_state`, no "deletion-only"
@@ -873,11 +877,12 @@ fn extract_invite_room_state(
 fn diff_required_state(
     current_state: &HashMap<(String, String), Event>,
     required_state: &[(StateEventType, String)],
+    user_id: &str,
     sent_snapshot: Option<&RoomSent>,
 ) -> (Vec<Event>, Vec<(String, String)>) {
     let filtered: Vec<(&(String, String), &Event)> = current_state
         .iter()
-        .filter(|((t, k), _)| required_state_matches(required_state, t, k))
+        .filter(|((t, k), _)| required_state_matches(required_state, user_id, t, k))
         .collect();
 
     let mut state_events: Vec<Event> = Vec::new();
@@ -902,7 +907,7 @@ fn diff_required_state(
             // effect — otherwise we'd emit stubs for state the client no
             // longer cares about because required_state shrank.
             let (t, k) = key;
-            if required_state_matches(required_state, t, k) && !live.contains(key) {
+            if required_state_matches(required_state, user_id, t, k) && !live.contains(key) {
                 deleted.push(key.clone());
             }
         }
@@ -990,18 +995,26 @@ async fn populate_room_metadata<S: StorageBackend>(
 /// MSC3575 §"Required State" matching: each `(event_type, state_key)` rule is
 /// OR'd against the current state; `"*"` is a wildcard for either field.
 ///
-/// TODO: implement the special tokens `$LAZY` / `$ME` — needed only
-/// if a client we care about starts sending them. `$LAZY` is paired with
-/// lazy_members which is explicitly out of scope.
+/// The special state-key tokens are also honoured:
+/// - `$ME` matches the state key equal to the syncing user's ID (their own
+///   `m.room.member` event).
+/// - `$LAZY` requests lazy-loaded members. Since this homeserver is embedded
+///   and never needs to lazy-load, we treat it as `"*"` — send every matching
+///   event (i.e. all members).
 fn required_state_matches(
     rules: &[(StateEventType, String)],
+    user_id: &str,
     evt_type: &str,
     state_key: &str,
 ) -> bool {
     for (rule_type, rule_key) in rules {
         let rule_type = rule_type.to_string();
         let type_match = rule_type == "*" || rule_type == evt_type;
-        let key_match = rule_key == "*" || rule_key == state_key;
+        let key_match = match rule_key.as_str() {
+            "*" | "$LAZY" => true,
+            "$ME" => state_key == user_id,
+            other => other == state_key,
+        };
         if type_match && key_match {
             return true;
         }
@@ -1038,7 +1051,46 @@ mod unit_tests {
     use ruma::{event_id, room_id, user_id};
 
     use super::super::conn::RoomSent;
-    use super::{diff_required_state, effective_range};
+    use super::{diff_required_state, effective_range, required_state_matches};
+
+    #[test]
+    fn required_state_me_matches_only_callers_own_member() {
+        let rules = vec![(StateEventType::RoomMember, "$ME".to_string())];
+        let me = "@me:example.org";
+        assert!(required_state_matches(
+            &rules,
+            me,
+            "m.room.member",
+            "@me:example.org"
+        ));
+        assert!(!required_state_matches(
+            &rules,
+            me,
+            "m.room.member",
+            "@other:example.org"
+        ));
+    }
+
+    #[test]
+    fn required_state_lazy_matches_every_member() {
+        // `$LAZY` is treated as `*` for the state key: every member matches.
+        let rules = vec![(StateEventType::RoomMember, "$LAZY".to_string())];
+        let me = "@me:example.org";
+        assert!(required_state_matches(
+            &rules,
+            me,
+            "m.room.member",
+            "@me:example.org"
+        ));
+        assert!(required_state_matches(
+            &rules,
+            me,
+            "m.room.member",
+            "@other:example.org"
+        ));
+        // Type still has to match: `$LAZY` doesn't leak past m.room.member.
+        assert!(!required_state_matches(&rules, me, "m.room.name", ""));
+    }
 
     #[test]
     fn effective_range_none_input_full_window() {
@@ -1107,14 +1159,16 @@ mod unit_tests {
             m
         };
         let rules = vec![(StateEventType::RoomName, String::new())];
-        let (changed, deleted) = diff_required_state(&current_state, &rules, Some(&sent));
+        let (changed, deleted) =
+            diff_required_state(&current_state, &rules, "@test:example.org", Some(&sent));
         assert!(changed.is_empty());
         assert!(deleted.is_empty());
 
         // Second call: current state no longer has the name → deletion
         // surfaced regardless of EMIT_STATE_STUBS.
         let empty_state: HashMap<(String, String), Event> = HashMap::new();
-        let (changed, deleted) = diff_required_state(&empty_state, &rules, Some(&sent));
+        let (changed, deleted) =
+            diff_required_state(&empty_state, &rules, "@test:example.org", Some(&sent));
         assert!(changed.is_empty());
         assert_eq!(deleted, vec![("m.room.name".to_string(), String::new())]);
     }
