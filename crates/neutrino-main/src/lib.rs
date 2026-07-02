@@ -123,7 +123,12 @@ pub async fn entrypoint(
         None => None,
     };
 
-    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
+    // Bind through `canonical_loopback` so a `localhost` bind lands on IPv4
+    // deterministically — the same family the ingress upstream targets. Binding
+    // the raw `localhost` lets the resolver pick `::1` while the upstream dials
+    // `127.0.0.1` (or vice versa), which is a connect-refused 502 on the loopback
+    // hop. `config.bind_addr` is left raw for `neutrino_http::serve`.
+    let listener = tokio::net::TcpListener::bind(&canonical_loopback(&config.bind_addr)).await?;
     tracing::info!("listening on {}", listener.local_addr()?);
 
     match lb_config {
@@ -290,6 +295,23 @@ fn ingress_bind_for(bind_addr: &str, fed_port: u16) -> SocketAddr {
 /// construction, so its unauthenticated open forward proxy stays off the network
 /// without an explicit guard. (The brief probe→re-bind window is the same
 /// free-port pattern the e2e tests use.)
+/// Pin the loopback hostname `localhost` to `127.0.0.1`. `localhost` resolves to
+/// BOTH `127.0.0.1` and `::1`, and the homeserver's listener bind and the ingress
+/// upstream resolve it independently — so they can land on different families,
+/// and a listener bound to one while the ingress dials the other is a
+/// connect-refused `502` (the "Empty Room" invite failure; see the
+/// `upstream_address_family_mismatch_yields_bad_gateway` test). Forcing IPv4 on
+/// both keeps them in lockstep. Numeric addresses and other hostnames pass
+/// through unchanged.
+fn canonical_loopback(authority: &str) -> String {
+    match authority.rsplit_once(':') {
+        Some((host, port)) if host.eq_ignore_ascii_case("localhost") => {
+            format!("127.0.0.1:{port}")
+        }
+        _ => authority.to_owned(),
+    }
+}
+
 fn alloc_loopback_egress() -> Result<SocketAddr, String> {
     let probe = std::net::TcpListener::bind("127.0.0.1:0")
         .map_err(|e| format!("allocating sidecar egress port: {e}"))?;
@@ -310,9 +332,12 @@ fn alloc_loopback_egress() -> Result<SocketAddr, String> {
 ///   it and a verbatim URL would send the ingress→upstream hop off the loopback
 ///   path — exposing the unauthenticated CSAPI on the network. Fail loudly
 ///   rather than silently going off-box.
-/// - a non-IP authority (`hostname:port`) can't be classified without
-///   resolution, so it is trusted verbatim.
+/// - the loopback hostname `localhost` is pinned to `127.0.0.1` (see
+///   [`canonical_loopback`]) so the hop lands on the same family the listener
+///   binds; any other non-IP authority (`hostname:port`) can't be classified
+///   without resolution, so it is trusted verbatim.
 fn upstream_url(bind_addr: &str) -> Result<String, String> {
+    let bind_addr = canonical_loopback(bind_addr);
     match bind_addr.parse::<SocketAddr>() {
         Ok(addr) if addr.ip().is_loopback() => Ok(format!("http://{bind_addr}")),
         Ok(addr) if addr.ip().is_unspecified() => {
@@ -370,15 +395,44 @@ mod tests {
         assert_eq!(lb.upstream, "http://127.0.0.1:8008");
     }
 
-    // A non-IP authority (`localhost:port`, the offline/dev fallback) can't be
-    // classified, so the ingress falls back to IPv6 unspecified (`[::]`; no peer
-    // can reach an offline device regardless) and the upstream is trusted verbatim.
+    // A `localhost:port` authority (the offline/dev fallback): the public ingress
+    // still can't be classified, so it falls back to IPv6 unspecified (`[::]`; no
+    // peer can reach an offline device regardless), but the loopback upstream is
+    // pinned to IPv4 `127.0.0.1` so the ingress→homeserver hop can't land on the
+    // wrong family (see `canonical_loopback`).
     #[test]
     fn build_lb_config_ingress_falls_back_to_unspecified_for_hostname() {
         let c = cfg("localhost:8008");
         let lb = build_lb_config(&c, 8448, egress(), None).expect("valid lb config");
         assert_eq!(lb.ingress_bind, "[::]:8448".parse().unwrap());
-        assert_eq!(lb.upstream, "http://localhost:8008");
+        assert_eq!(lb.upstream, "http://127.0.0.1:8008");
+    }
+
+    // `localhost` is pinned to IPv4 loopback for the upstream — it otherwise
+    // resolves to both `::1` and `127.0.0.1`, and dialing the family the
+    // homeserver did not bind is a connect-refused 502.
+    #[test]
+    fn upstream_url_pins_localhost_to_ipv4_loopback() {
+        assert_eq!(
+            upstream_url("localhost:8008").unwrap(),
+            "http://127.0.0.1:8008"
+        );
+        // Case-insensitive host, and the port is preserved.
+        assert_eq!(
+            upstream_url("LocalHost:443").unwrap(),
+            "http://127.0.0.1:443"
+        );
+    }
+
+    // Numeric addresses and non-`localhost` hostnames are untouched by the pin.
+    #[test]
+    fn canonical_loopback_only_rewrites_localhost() {
+        assert_eq!(canonical_loopback("localhost:8008"), "127.0.0.1:8008");
+        assert_eq!(canonical_loopback("127.0.0.1:8008"), "127.0.0.1:8008");
+        assert_eq!(canonical_loopback("0.0.0.0:8008"), "0.0.0.0:8008");
+        assert_eq!(canonical_loopback("[::1]:8008"), "[::1]:8008");
+        assert_eq!(canonical_loopback("[::]:8008"), "[::]:8008");
+        assert_eq!(canonical_loopback("example.com:8008"), "example.com:8008");
     }
 
     // An unspecified bind is loopback-rewritten for the upstream so the ingress

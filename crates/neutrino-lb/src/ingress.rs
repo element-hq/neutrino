@@ -23,6 +23,17 @@ use crate::transport::{WireHandler, WireRequest, WireResponse};
 /// this server has no signing keys and serves no key endpoints.
 const FEDERATION_PREFIX: &str = "/_matrix/federation/";
 
+/// Join an error's source chain into `": "`-separated causes. reqwest's `Display`
+/// stops at its own message and drops the underlying cause (connect / reset /
+/// timeout), which is exactly the datum needed to tell a loopback-family mismatch
+/// from a genuinely dead upstream.
+fn source_chain(err: &dyn std::error::Error) -> String {
+    std::iter::successors(err.source(), |c| c.source())
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
 /// Forwards transcoded requests to the local homeserver.
 pub struct IngressHandler {
     http: reqwest::Client,
@@ -105,7 +116,11 @@ impl WireHandler for IngressHandler {
         let resp = match rb.body(json_body).send().await {
             Ok(r) => r,
             Err(e) => {
-                warn!(%e, "ingress: upstream request failed");
+                // reqwest's `Display` stops at "error sending request for url";
+                // the load-bearing root cause (e.g. "connection refused (os error
+                // 111)" — the IPv4/IPv6 loopback mismatch) lives in the source
+                // chain, so log that too or the failure is undiagnosable.
+                warn!(%e, cause = %source_chain(&e), "ingress: upstream request failed");
                 return Self::bad_gateway();
             }
         };
@@ -358,5 +373,51 @@ mod tests {
 
         assert_eq!(resp.status, 404, "traversal escape must be rejected");
         assert!(!*hit.lock().unwrap(), "upstream must not be reached");
+    }
+
+    // Proves the localhost/127.0.0.1 address-family mismatch is what turns a
+    // federated invite into a 502 (the "Empty Room" failure in
+    // create-room-fail.log). Production binds the homeserver v4-only
+    // (`neutrino_main: listening on 127.0.0.1:8008`) but the ingress upstream is
+    // the *hostname* `http://localhost:8008` (upstream_url passes a non-numeric
+    // bind_addr through verbatim). On Android `localhost` also resolves to `::1`,
+    // where nothing listens. Against ONE v4-only upstream the only variable here
+    // is the address family of the upstream URL: same family forwards and returns
+    // the homeserver's 200; the other family ([::1], which `localhost` can pick)
+    // can't connect, so the ingress reports 502 — exactly the observed failure.
+    #[tokio::test]
+    async fn upstream_address_family_mismatch_yields_bad_gateway() {
+        // v4-only listener, mirroring production's `listening on 127.0.0.1:8008`.
+        let app = Router::new().fallback(|| async { Json(serde_json::json!({"event": {}})) });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let invite = || WireRequest {
+            dest: String::new(),
+            method: Method::PUT,
+            path: "/_matrix/federation/v2/invite/!r/$e".to_owned(),
+            headers: vec![],
+            body: json_to_cbor(br#"{"room_version":"org.matrix.msc4242.12"}"#).unwrap(),
+        };
+
+        // Matching family (v4) → reaches the v4-bound homeserver.
+        let matched = IngressHandler::new(format!("http://127.0.0.1:{port}"))
+            .handle(invite())
+            .await;
+        assert_eq!(
+            matched.status, 200,
+            "v4 upstream must reach the v4-bound homeserver"
+        );
+
+        // Other family (v6) — the address `localhost` can resolve to — has no
+        // listener, so the loopback connect fails and the ingress 502s.
+        let mismatched = IngressHandler::new(format!("http://[::1]:{port}"))
+            .handle(invite())
+            .await;
+        assert_eq!(
+            mismatched.status, 502,
+            "v6 upstream against a v4-only homeserver must 502 (the invite failure)"
+        );
     }
 }
