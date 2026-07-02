@@ -15,6 +15,9 @@ use std::time::Duration;
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8008";
 const DEFAULT_SERVER_NAME: &str = "localhost";
 const DEFAULT_LOCALPART: &str = "alice";
+/// Product default for the local user's display name, used by `/profile` and the
+/// BLE discovery advert until the client sets one via `PUT .../displayname`.
+pub const DEFAULT_DISPLAY_NAME: &str = "Neutrino";
 /// Default cap on concurrent in-flight outbound federation transactions.
 const DEFAULT_OUTBOUND_CONCURRENCY: usize = 2;
 /// Default upper bound on the random startup delay before a freshly-started

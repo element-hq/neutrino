@@ -2018,6 +2018,8 @@ mod tests {
             name: None,
             rssi: Some(-60),
             services: vec![],
+
+            manufacturer_data: None,
         };
         let actions = reg.handle(PeerCommand::Advertised {
             prefix: [1u8; 12],
@@ -2038,6 +2040,8 @@ mod tests {
             name: None,
             rssi: None,
             services: vec![],
+
+            manufacturer_data: None,
         };
         reg.handle(PeerCommand::Advertised {
             prefix: [2u8; 12],
@@ -2515,6 +2519,8 @@ mod tests {
                 name: None,
                 rssi: None,
                 services: vec![],
+
+                manufacturer_data: None,
             },
             rssi: None,
         });
@@ -2968,6 +2974,8 @@ mod tests {
                 name: None,
                 rssi: None,
                 services: vec![],
+
+                manufacturer_data: None,
             },
             rssi: None,
         });
@@ -3325,6 +3333,8 @@ mod tests {
                 name: None,
                 rssi: None,
                 services: vec![],
+
+                manufacturer_data: None,
             },
             rssi: None,
         });
@@ -5202,6 +5212,8 @@ mod tests {
             name: None,
             rssi: None,
             services: vec![],
+
+            manufacturer_data: None,
         };
         let prefix: crate::transport::peer::KeyPrefix = [0xAB; 12];
         reg.handle(PeerCommand::Advertised {
@@ -5455,6 +5467,8 @@ mod tests {
                 name: None,
                 rssi: None,
                 services: vec![],
+
+                manufacturer_data: None,
             },
             rssi: None,
         });
@@ -5509,6 +5523,8 @@ mod tests {
                 name: None,
                 rssi: None,
                 services: vec![],
+
+                manufacturer_data: None,
             },
             rssi: None,
         });
@@ -5545,6 +5561,8 @@ mod tests {
                 name: None,
                 rssi: None,
                 services: vec![],
+
+                manufacturer_data: None,
             },
             rssi: None,
         });
@@ -5571,6 +5589,8 @@ mod tests {
                 name: None,
                 rssi: None,
                 services: vec![],
+
+                manufacturer_data: None,
             },
             rssi: None,
         });
@@ -5622,6 +5642,8 @@ mod tests {
                 name: None,
                 rssi: None,
                 services: vec![],
+
+                manufacturer_data: None,
             },
             rssi: None,
         });
@@ -5678,6 +5700,8 @@ mod tests {
                 name: None,
                 rssi: None,
                 services: vec![],
+
+                manufacturer_data: None,
             },
             rssi: None,
         });
@@ -5735,6 +5759,8 @@ mod tests {
                 name: None,
                 rssi: None,
                 services: vec![],
+
+                manufacturer_data: None,
             },
             rssi: None,
         });
@@ -5791,6 +5817,8 @@ mod tests {
                 name: None,
                 rssi: None,
                 services: vec![],
+
+                manufacturer_data: None,
             },
             rssi: None,
         });

@@ -5,6 +5,8 @@ edition = "2024"
 
 [features]
 multi-user-shim = ["neutrino-http/multi-user-shim"]
+# Diagnostic-only passthrough — see neutrino-http's `task-dump`.
+task-dump = ["neutrino-http/task-dump"]
 
 [dependencies]
 tokio.workspace = true

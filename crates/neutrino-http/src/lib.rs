@@ -12,7 +12,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post, put},
 };
-use neutrino_ctl::{Command, Config, DiscoveryRegistry};
+use neutrino_ctl::{Command, Config, DEFAULT_DISPLAY_NAME, DiscoveryRegistry};
 use neutrino_event::event_builder::EventBuilder;
 use neutrino_event::{Event, FormatError, ROOM_VERSION_ID};
 use neutrino_room::CoreError;
@@ -80,6 +80,10 @@ struct App {
     /// it. Shared (`Arc`) so the host can hold a write handle while the router
     /// reads — see [`AppState::discovery`].
     discovery: Arc<DiscoveryRegistry>,
+    /// Publishes the local user's display name whenever it changes (via `PUT
+    /// /profile/.../displayname`), so the BLE transport can re-advertise it.
+    /// `None` off the embedded path (dev binary / tests): nothing re-advertises.
+    display_name_tx: Option<watch::Sender<String>>,
     config: Config,
     /// Latching cancellation signal shared with long-polls and the outbound
     /// federation sender. Fired once by [`AppState::begin_shutdown`]; after
@@ -272,6 +276,7 @@ impl AppState {
             sync_state,
             keys: None,
             discovery,
+            display_name_tx: None,
             config,
             shutdown,
             kick_backoff,
@@ -373,12 +378,16 @@ pub async fn serve(
     // reads it. Non-embedded callers (the dev binary / e2e tests) pass a fresh
     // empty one — discovery is a no-op without the BLE side channel.
     discovery: Arc<DiscoveryRegistry>,
+    // Publishes the local display name on change so the BLE transport can
+    // re-advertise. `None` off the embedded path (no BLE advert to update).
+    display_name_tx: Option<watch::Sender<String>>,
 ) -> Result<(), StartupError> {
     // The caller (the entrypoint) opens the store, resolves the server identity
     // from it, and hands the live handle in — so we build state around it rather
     // than re-opening the same DB.
     AppState::validate_config(&config)?;
     let state = AppState::from_store_with_discovery(config, store, discovery);
+    lock_app(&state).display_name_tx = display_name_tx;
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
     // enumeration resumes delivery of anything left undelivered.
@@ -845,25 +854,99 @@ async fn sync(
         Err(e) => return error_response(StatusCode::BAD_REQUEST, "M_BAD_JSON", &e.to_string()),
     };
 
-    match sliding_sync::handle(&sync_state, &user_id, req).await {
-        Ok(resp) => (StatusCode::OK, Json(SyncResponseWire::from(resp))).into_response(),
-        Err(SyncError::UnknownPos) => {
+    // Identifying fields for the backstop diagnostic, captured before `req`
+    // is moved into `handle`.
+    let pos = query.0.get("pos").cloned();
+    let conn_id = req.conn_id.clone().unwrap_or_default();
+
+    // Wrap the handler in an absolute backstop deadline. A healthy long-poll
+    // returns well within `BACKSTOP_TIMEOUT`; if it doesn't, the handler is
+    // wedged (see the const's doc + the decisions log). The outer timer's
+    // waker is registered with the time driver independently of any inner
+    // await, so it fires even when the inner wakers are lost; on fire we drop
+    // `handle` (which frees the conn lock) and return a retryable error rather
+    // than hang the client's serial sync loop forever.
+    let handled = tokio::time::timeout(
+        sliding_sync::BACKSTOP_TIMEOUT,
+        sliding_sync::handle(&sync_state, &user_id, req),
+    )
+    .await;
+
+    match handled {
+        Ok(Ok(resp)) => (StatusCode::OK, Json(SyncResponseWire::from(resp))).into_response(),
+        Ok(Err(SyncError::UnknownPos)) => {
             error_response(StatusCode::BAD_REQUEST, "M_UNKNOWN_POS", "Unknown position")
         }
-        Err(SyncError::BadRequest(msg)) => {
+        Ok(Err(SyncError::BadRequest(msg))) => {
             error_response(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", msg)
         }
-        Err(SyncError::Storage(e)) => error_response(
+        Ok(Err(SyncError::Storage(e))) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "M_UNKNOWN",
             &e.to_string(),
         ),
-        Err(SyncError::EventConversion(e)) => error_response(
+        Ok(Err(SyncError::EventConversion(e))) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "M_UNKNOWN",
             &e.to_string(),
         ),
+        Err(_elapsed) => {
+            error!(
+                %user_id,
+                conn_id,
+                pos = pos.as_deref().unwrap_or("<initial>"),
+                backstop_secs = sliding_sync::BACKSTOP_TIMEOUT.as_secs(),
+                "sliding-sync handler exceeded backstop deadline: the long-poll is \
+                 wedged (not an executor stall — other requests are being served). \
+                 Dropping the handler to free the conn lock; returning 504 so the \
+                 client's sync loop recovers."
+            );
+            dump_wedged_tasks().await;
+            error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "M_UNKNOWN",
+                "sync handler backstop deadline exceeded",
+            )
+        }
     }
+}
+
+/// Log a full task dump when the sliding-sync backstop fires, to pin the exact
+/// await the wedged handler is parked on.
+///
+/// Real dumps need `--cfg tokio_unstable` **and** `--features task-dump` (which
+/// enables tokio's `taskdump`, pulling in `backtrace`) — off by default so
+/// normal builds stay lean. To capture backtraces on the next repro, build the
+/// FFI lib with e.g.
+/// `RUSTFLAGS="--cfg tokio_unstable" cargo build -p neutrino-ffi --features task-dump`.
+/// Backtraces are only usable with frame pointers (`-C force-frame-pointers=yes`).
+#[cfg(all(tokio_unstable, feature = "task-dump"))]
+async fn dump_wedged_tasks() {
+    // `Handle::dump` re-polls every task in a tracing mode and can fail to
+    // terminate if a worker is blocked, so the tokio docs recommend pairing it
+    // with an explicit timeout.
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::runtime::Handle::current().dump(),
+    )
+    .await
+    {
+        Ok(dump) => {
+            for task in dump.tasks().iter() {
+                error!(task_id = %task.id(), trace = %task.trace(), "wedged-sync taskdump");
+            }
+        }
+        Err(_) => error!("wedged-sync taskdump timed out (a runtime worker is blocked)"),
+    }
+}
+
+/// Fallback when task dumps aren't compiled in — see the `cfg`-enabled variant.
+#[cfg(not(all(tokio_unstable, feature = "task-dump")))]
+async fn dump_wedged_tasks() {
+    error!(
+        "task dump unavailable: rebuild with RUSTFLAGS=\"--cfg tokio_unstable\" and \
+         --features task-dump to capture task backtraces when the sync backstop fires"
+    );
 }
 
 /// Build a `v5::Request` from the JSON body plus the `pos` and `timeout`
@@ -1068,10 +1151,6 @@ async fn signatures_upload(state: State<AppState>, body: Json<Value>) -> Json<Va
     Json(json!({}))
 }
 
-/// Product default for the local user's display name, returned by `/profile`
-/// until the client sets one via `PUT .../displayname`.
-const DEFAULT_DISPLAY_NAME: &str = "Neutrino";
-
 /// Resolve a user's display name: the local user's from the persistent
 /// [`IdentityStore`] (falling back to [`DEFAULT_DISPLAY_NAME`]), a discovered
 /// peer's from the [`DiscoveryRegistry`] (matched on the user id's
@@ -1145,7 +1224,13 @@ async fn put_display_name(
 ) -> axum::response::Response {
     let store = lock_app(&state.0).store.clone();
     match store.set_display_name(&req.displayname).await {
-        Ok(()) => Json(json!({})).into_response(),
+        Ok(()) => {
+            // Signal the BLE transport (if any) to re-advertise the new name.
+            if let Some(tx) = &lock_app(&state.0).display_name_tx {
+                let _ = tx.send(req.displayname);
+            }
+            Json(json!({})).into_response()
+        }
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "M_UNKNOWN",
@@ -1833,6 +1918,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_display_name_persists_and_pulses_readvertise() {
+        use neutrino_store::IdentityStore;
+        let (state, _tmp) = test_state().await;
+        // Wire a display-name watch as the embedded path (serve) would.
+        let (tx, mut rx) = super::watch::channel(String::new());
+        super::lock_app(&state).display_name_tx = Some(tx);
+
+        super::put_display_name(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("@alice:127.0.0.1".to_string()),
+            axum::Json(super::SetDisplayNameRequest {
+                displayname: "Ford".to_string(),
+            }),
+        )
+        .await;
+
+        // Persisted in the store …
+        let store = super::lock_app(&state).store.clone();
+        let stored = store.get_display_name().await.expect("get");
+        assert_eq!(stored, Some("Ford".to_string()));
+        // … and pulsed to the re-advertise watch.
+        assert!(rx.has_changed().expect("sender alive"));
+        assert_eq!(*rx.borrow_and_update(), "Ford");
+    }
+
+    #[tokio::test]
     async fn profile_resolves_peer_from_registry_and_unknown_is_empty() {
         use neutrino_ctl::DiscoveredPeer;
         let (state, _tmp) = test_state().await;
@@ -1971,6 +2082,7 @@ mod tests {
             store,
             rx,
             Arc::new(super::DiscoveryRegistry::new()),
+            None,
         ));
 
         // Give the sender supervisor a moment to discover the dead peer and

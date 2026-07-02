@@ -82,6 +82,7 @@ async fn start_node(localpart: &str) -> Node {
             store,
             cmd_rx,
             std::sync::Arc::new(DiscoveryRegistry::new()),
+            None,
         )
         .await;
     });

@@ -51,6 +51,21 @@ const MAX_ROOM_SUBSCRIPTIONS: usize = 100;
 /// keep TCP idle long.
 const MAX_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Absolute wall-clock deadline the *HTTP wrapper* enforces around the whole
+/// [`handle`] call, as a last-resort backstop against a wedged long-poll.
+///
+/// A healthy request returns within [`MAX_LONG_POLL_TIMEOUT`] plus the tiny
+/// cost of building the response, so this ceiling (that timeout + 10s slack)
+/// is never hit in normal operation. It exists because a sliding-sync handler
+/// was once observed to hang indefinitely — holding the conn lock and the
+/// client's (serial) sync loop hostage — *without* tripping the executor-stall
+/// watchdog (the executor stayed live; only that one task's wakers were lost).
+/// The wrapper's outer timer registers its own waker with the time driver, so
+/// it fires independently of whatever inner await is stuck; on fire the wrapper
+/// drops `handle` (freeing the conn lock) and returns an error the client
+/// retries. See the decisions log.
+pub const BACKSTOP_TIMEOUT: Duration = Duration::from_secs(40);
+
 #[derive(Debug, Error)]
 pub enum SyncError {
     /// Returned as HTTP 400 with errcode `M_UNKNOWN_POS`. Client is expected to

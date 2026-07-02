@@ -446,7 +446,9 @@ pub struct BlewDriver {
     /// re-register the same service table and advertise with the same config
     /// after an adapter-off/on cycle wipes platform state.
     services: Vec<GattService>,
-    advertising_config: AdvertisingConfig,
+    // Mutable so the advertised manufacturer data (the local display name) can be
+    // updated at runtime and re-advertised — see `set_manufacturer_data`.
+    advertising_config: Mutex<AdvertisingConfig>,
 }
 
 impl BlewDriver {
@@ -462,8 +464,22 @@ impl BlewDriver {
             next_channel_id: AtomicU64::new(1),
             channels_by_device: Mutex::new(HashMap::new()),
             services,
-            advertising_config,
+            advertising_config: Mutex::new(advertising_config),
         }
+    }
+
+    /// Replace the advertised manufacturer data and re-advertise, so scanning
+    /// peers observe the new payload. Used when the local display name changes
+    /// at runtime (e.g. via `PUT /profile/.../displayname`).
+    pub async fn set_manufacturer_data(
+        &self,
+        data: Option<(u16, Vec<u8>)>,
+    ) -> crate::error::BleResult<()> {
+        self.advertising_config
+            .lock()
+            .expect("advertising_config mutex poisoned")
+            .manufacturer_data = data;
+        self.restart_advertising().await
     }
 }
 
@@ -611,9 +627,12 @@ impl BleInterface for BlewDriver {
         if let Err(e) = self.peripheral.stop_advertising().await {
             tracing::debug!(?e, "restart_advertising: stop_advertising ignored");
         }
-        self.peripheral
-            .start_advertising(&self.advertising_config)
-            .await?;
+        let config = self
+            .advertising_config
+            .lock()
+            .expect("advertising_config mutex poisoned")
+            .clone();
+        self.peripheral.start_advertising(&config).await?;
         Ok(())
     }
 

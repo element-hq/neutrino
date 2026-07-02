@@ -9,6 +9,21 @@ edition = "2024"
 # build; ON for the local dev binary and the Complement image.
 multi-user-shim = []
 
+# Diagnostic-only: enable tokio task dumps so the sliding-sync backstop can log
+# every task's await backtrace when it fires. Pulls in `backtrace` (via tokio's
+# `taskdump`), so it's opt-in and OFF by default (the default build never sees
+# it). NOTE: tokio's `taskdump` itself hard-requires `--cfg tokio_unstable`, so
+# this feature MUST be built with `RUSTFLAGS="--cfg tokio_unstable"` or tokio
+# fails to compile. Without the feature, the backstop still fires and logs
+# context — it just can't capture per-task backtraces.
+task-dump = ["tokio/taskdump"]
+
+[lints.rust]
+# `tokio_unstable` is a rustc cfg set via RUSTFLAGS (see the `task-dump`
+# feature), not a Cargo feature, so declare it to check-cfg to keep
+# `clippy -D warnings` clean whether or not the flag is present.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+
 [dependencies]
 axum = "0.8.7"
 tower-http = { version = "0.6.6", features = ["trace"] }

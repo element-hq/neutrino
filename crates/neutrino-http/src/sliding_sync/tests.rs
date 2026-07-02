@@ -19,6 +19,15 @@ fn no_shutdown() -> tokio_util::sync::CancellationToken {
     tokio_util::sync::CancellationToken::new()
 }
 
+/// The HTTP-wrapper backstop must sit strictly above the long-poll cap: a
+/// healthy sync waits up to `MAX_LONG_POLL_TIMEOUT` plus a little build time,
+/// so a backstop at or below that would kill healthy 30s long-polls as if they
+/// were wedged. Guards against someone lowering `BACKSTOP_TIMEOUT` too far.
+#[test]
+fn backstop_sits_above_long_poll_cap() {
+    assert!(super::BACKSTOP_TIMEOUT > super::MAX_LONG_POLL_TIMEOUT);
+}
+
 /// Wait until a spawned long-poll on `(user_id, conn_id)` has subscribed to
 /// its cancel signal and is in (or about to enter) its idle wait.
 ///

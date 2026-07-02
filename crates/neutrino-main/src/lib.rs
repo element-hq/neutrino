@@ -23,8 +23,13 @@ pub type DatagramLinkResult =
 /// Builds the federation datagram link once the node secret is resolved. ffi
 /// supplies one that binds an iroh transport; the dev binary passes `None`
 /// (plain UDP federation). Async because binding the transport is async.
-pub type FederationLinkFactory =
-    Box<dyn FnOnce([u8; 32]) -> Pin<Box<dyn Future<Output = DatagramLinkResult> + Send>> + Send>;
+pub type FederationLinkFactory = Box<
+    dyn FnOnce(
+            [u8; 32],
+            watch::Receiver<String>,
+        ) -> Pin<Box<dyn Future<Output = DatagramLinkResult> + Send>>
+        + Send,
+>;
 
 /// Install the tracing subscriber that routes our logs to the platform sink
 /// (logcat on Android). Idempotent. [`entrypoint`] calls this itself, but an
@@ -60,6 +65,17 @@ pub async fn entrypoint(
     let store = Arc::new(SqliteStore::open_in_dir(&config.storage_dir).await?);
     let secret = resolve_server_identity(&mut config, &store).await?;
 
+    // The local display name, sourced from the store (the client sets it via
+    // `PUT /profile/.../displayname`). A `watch` carries it to two consumers: the
+    // http PUT handler updates it (below, injected into `serve`), and the BLE
+    // transport advertises + re-advertises it (via `link_factory`). Seeded with
+    // the persisted value, or the product default when never set.
+    let display_name = store
+        .get_display_name()
+        .await?
+        .unwrap_or_else(|| neutrino_ctl::DEFAULT_DISPLAY_NAME.to_string());
+    let (display_name_tx, display_name_rx) = watch::channel(display_name);
+
     // Build the federation datagram link from the resolved secret (the embedded
     // iroh build injects a factory; the dev binary passes `None` for plain UDP
     // federation). A failed transport bind must fail startup loudly — propagate
@@ -67,9 +83,11 @@ pub async fn entrypoint(
     // The factory's error is `Send + Sync` (so it can cross the ffi task
     // boundary); widen it to this function's plain `Box<dyn Error>` on the way
     // out, since the two boxed-trait-object types don't auto-convert via `?`.
+    // The transport reads the current display name from `display_name_rx` (for
+    // the initial advert) and watches it for re-advertise.
     let link = match link_factory {
         Some(factory) => Some(
-            factory(secret)
+            factory(secret, display_name_rx)
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error> { e })?,
         ),
@@ -118,7 +136,14 @@ pub async fn entrypoint(
             );
             let shutdown = CancellationToken::new();
             let lb = neutrino_lb::serve(lb_config, shutdown.clone());
-            let hs = neutrino_http::serve(listener, config, store, commands, discovery);
+            let hs = neutrino_http::serve(
+                listener,
+                config,
+                store,
+                commands,
+                discovery,
+                Some(display_name_tx),
+            );
             tokio::pin!(lb, hs);
             tokio::select! {
                 // The homeserver owns the command channel, so it drives the
@@ -151,7 +176,17 @@ pub async fn entrypoint(
                 }
             }
         }
-        None => neutrino_http::serve(listener, config, store, commands, discovery).await?,
+        None => {
+            neutrino_http::serve(
+                listener,
+                config,
+                store,
+                commands,
+                discovery,
+                Some(display_name_tx),
+            )
+            .await?
+        }
     }
     Ok(())
 }

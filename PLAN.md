@@ -178,6 +178,38 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### sliding-sync wedge: HTTP backstop timeout + task-dump-on-fire (2026-07-02)
+- **Revises the 2026-07-01 "offline sync hang → executor starvation" theory.** A
+  fresh repro (create-room-hang.log) shows a single sliding-sync long-poll
+  (`pos=29`) that starts and never returns — its own 30s deadline never fires —
+  while, *during the hang*, store reads (`/members`, 1.77ms) and a store write
+  (`createRoom`, 4.4ms, which fires `notify_watch`) both complete, and the
+  executor-stall watchdog never logs. So the executor is live and the pools are
+  healthy; only that one task's wakers are lost (it's wedged before/at its
+  long-poll `select!`, since createRoom's watch edge — confirmed fired at
+  store/rooms.rs:162 — didn't wake it either). Root cause of the lost waker is
+  not yet pinned from logs alone.
+- **Backstop (symptom fix, always on):** the http `sync()` wrapper now runs
+  `sliding_sync::handle` inside `tokio::time::timeout(BACKSTOP_TIMEOUT)`
+  (`BACKSTOP_TIMEOUT = 40s = MAX_LONG_POLL_TIMEOUT + 10s slack`). The outer
+  timer registers its own waker with the time driver — which is provably live
+  (the watchdog heartbeat, itself a `tokio::time::interval`, keeps firing) — so
+  it fires regardless of which inner await is stuck. On fire the wrapper drops
+  `handle` (dropping its held `conn` guard → frees the per-conn lock) and
+  returns 504 `M_UNKNOWN`, which the client's serial sync loop retries, instead
+  of hanging forever. Invariant test guards `BACKSTOP_TIMEOUT > MAX_LONG_POLL_TIMEOUT`.
+- **Diagnostic (root-cause pin, opt-in):** on backstop fire, `dump_wedged_tasks()`
+  logs every task's await backtrace via `Handle::dump()`, gated on
+  `all(tokio_unstable, feature = "task-dump")`. The `task-dump` cargo feature
+  (chained neutrino-ffi → -main → -http → `tokio/taskdump`) is OFF by default;
+  tokio's `taskdump` hard-requires `--cfg tokio_unstable`, so a diagnostic build
+  is `RUSTFLAGS="--cfg tokio_unstable" cargo build -p neutrino-ffi --features
+  task-dump` (Android = linux/aarch64 satisfies tokio's platform gate; usable
+  traces also want `-C force-frame-pointers=yes`). Without the feature the
+  backstop still fires and logs context (user/conn_id/pos/elapsed) — just no
+  per-task backtraces. The real dump path is API-verified against tokio 1.52 but
+  not compiled in-sandbox (`backtrace`/`addr2line` uncached, network blocked).
+
 ### user discovery over BLE — registry + directory search (2026-06-30)
 - The embedded server has no Matrix user directory; peers are learned out of
   band over the BLE mesh. Each device advertises its display name + node id
@@ -222,12 +254,37 @@ never use .unwrap() in handler code.
   DB only). `IdentityStore` gained `get_display_name`/`set_display_name`.
   `/profile` resolves: self → stored name (default **"Neutrino"**, not "Alice"),
   discovered peer → registry by `server_name`, unknown remote → `{}`.
-- **Outstanding:** Android — fork `blew` to extended advertising
-  (`startAdvertisingSet`, `setLegacyMode(false)`; the 32 B node id + ≤20 B name
-  overflow the 31 B legacy cap) + manufacturer data `0xDFFF` =
-  `[version][node_id:32][display_name]`, and switch the scanner to
-  `setLegacy(false)` + surface `getManufacturerSpecificData(0xDFFF)` up to a new
-  discovery callback that calls `set_discovered_peers`.
+- **BLE discovery landed end-to-end (2026-07-01).** Manufacturer id **`0x0E1E`**,
+  payload `node_id:32 ‖ display_name` in a BLE-5 **extended** advert (full 32 B
+  node id + name overflows the 31 B legacy cap; carrying only a 12 B prefix was
+  rejected — the directory must return a real `@n:{node_id}` and federation dials
+  the full id, and a prefix only resolves post-handshake). Layers:
+  - **`vendor/blew`** (forked crates.io `blew` 0.2.3, `[patch.crates-io]`):
+    `manufacturer_data` on `AdvertisingConfig`/`BleDevice`; Android peripheral →
+    `startAdvertisingSet`(non-legacy)+`addManufacturerData`, Android central →
+    `setLegacy(false)` scan surfacing the first mfr entry; Linux/bluer + JNI both
+    wired; Apple advertise left `None` (CoreBluetooth peripherals can't carry mfr
+    data — not a target).
+  - **`vendor/iroh-ble-transport::discovery`**: payload codec + `DiscoverySink`;
+    `BleTransportConfig.display_name` → advert; central loop decodes on
+    `DeviceDiscovered` → `BleTransport::discovered_peers()` snapshot stream;
+    `BleTransport::set_display_name` re-advertises (mutable driver config).
+  - **main**: reads `get_display_name()` (default "Neutrino") into a
+    `watch<String>` — tx→http (PUT handler pulses on `set_display_name`),
+    rx→`link_factory` (initial advert + re-advertise).
+  - **ffi**: `link_factory` builds the transport with the name, drains
+    `discovered_peers()` → the `DiscoveryRegistry` (hex node id = `server_name`,
+    fixed localpart `n`), and re-advertises on the name watch.
+  - **`set_discovered_peers` removed**: the transport is now the single registry
+    writer (it scans+decodes), so the earlier host-push FFI method + its
+    `DiscoveredPeer` uniffi record were redundant and dropped.
+  - Verified: ctl/http/main/dev-binary build + clippy-clean + tests green
+    (http 257, main 14+4, ctl 10, transport codec tests CI-runnable). blew +
+    iroh-ble-transport + ffi are review/parse-verified locally (no libdbus);
+    Kegan confirmed `neutrino-ffi --release --features ble` builds.
+  - **Remaining (host-side, not Rust):** none in-tree; the Kotlin `blew`
+    peripheral/central changes live in `vendor/blew/android/` — confirm the
+    EX-Android build consumes those (vs the `bindings/...` copy).
 ### BLE permanent-wedge on peer restart: registry dial-stage timeout + Dead revive (2026-07-01)
 - **Symptom:** force-stop a BLE peer then bring it back → permanently unreachable,
   symmetric on both devices ("as if BLE is off"), never recovers.

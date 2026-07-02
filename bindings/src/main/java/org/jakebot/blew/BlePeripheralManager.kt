@@ -5,6 +5,9 @@ import android.bluetooth.*
 import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
+import android.bluetooth.le.AdvertisingSet
+import android.bluetooth.le.AdvertisingSetCallback
+import android.bluetooth.le.AdvertisingSetParameters
 import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -33,6 +36,10 @@ object BlePeripheralManager {
     private var bluetoothManager: BluetoothManager? = null
     private var gattServer: BluetoothGattServer? = null
     private var advertiser: BluetoothLeAdvertiser? = null
+    // Extended-advertising set + callback, used when manufacturer data is
+    // present (a full node id + name overflows the 31-byte legacy budget).
+    private var advertisingSet: AdvertisingSet? = null
+    private var advertisingSetCallback: AdvertisingSetCallback? = null
 
     // Track connected devices for notification delivery.
     private val connectedDevices = ConcurrentHashMap<String, BluetoothDevice>()
@@ -397,6 +404,13 @@ object BlePeripheralManager {
     fun startAdvertising(
         name: String,
         serviceUuids: Array<String>,
+        // Manufacturer-specific data. `manufacturerId < 0` (with `null` bytes)
+        // means "no manufacturer data" → legacy advertising, preserving the
+        // prior behaviour. When present, we must use BLE-5 extended advertising:
+        // a full 32-byte node id + display name overflows the 31-byte legacy
+        // advertisement budget.
+        manufacturerId: Int,
+        manufacturerData: ByteArray?,
     ) {
         val adv =
             advertiser ?: run {
@@ -405,6 +419,11 @@ object BlePeripheralManager {
             }
 
         bluetoothManager?.adapter?.name = name
+
+        if (manufacturerData != null && manufacturerId >= 0) {
+            startExtendedAdvertising(adv, serviceUuids, manufacturerId, manufacturerData)
+            return
+        }
 
         val settings =
             AdvertiseSettings
@@ -444,11 +463,69 @@ object BlePeripheralManager {
         adv.startAdvertising(settings, data, scanResponse, advertiseCallback)
     }
 
+    // BLE-5 extended advertising carrying manufacturer data (node id + display
+    // name). Connectable extended sets cannot also be scannable, so the payload
+    // rides entirely in the primary advertising data.
+    private fun startExtendedAdvertising(
+        adv: BluetoothLeAdvertiser,
+        serviceUuids: Array<String>,
+        manufacturerId: Int,
+        manufacturerData: ByteArray,
+    ) {
+        val params =
+            AdvertisingSetParameters
+                .Builder()
+                .setLegacyMode(false)
+                .setConnectable(true)
+                .setScannable(false)
+                .setInterval(AdvertisingSetParameters.INTERVAL_LOW)
+                .setTxPowerLevel(AdvertisingSetParameters.TX_POWER_HIGH)
+                .build()
+
+        val dataBuilder =
+            AdvertiseData
+                .Builder()
+                .setIncludeDeviceName(false)
+        for (uuid in serviceUuids) {
+            dataBuilder.addServiceUuid(ParcelUuid(UUID.fromString(uuid)))
+        }
+        dataBuilder.addManufacturerData(manufacturerId, manufacturerData)
+        val data = dataBuilder.build()
+
+        val cb =
+            object : AdvertisingSetCallback() {
+                override fun onAdvertisingSetStarted(
+                    set: AdvertisingSet?,
+                    txPower: Int,
+                    status: Int,
+                ) {
+                    if (status == AdvertisingSetCallback.ADVERTISE_SUCCESS) {
+                        advertisingSet = set
+                        Log.d(TAG, "extended advertising started (txPower=$txPower)")
+                    } else {
+                        Log.e(TAG, "extended advertising failed: status=$status")
+                    }
+                }
+            }
+        advertisingSetCallback = cb
+        try {
+            adv.startAdvertisingSet(params, data, null, null, null, cb)
+        } catch (e: Exception) {
+            Log.e(TAG, "startAdvertisingSet threw (extended advertising unsupported?): $e")
+            advertisingSetCallback = null
+        }
+    }
+
     @JvmStatic
     fun stopAdvertising() {
         advertiseCallback?.let { cb ->
             advertiser?.stopAdvertising(cb)
             advertiseCallback = null
+        }
+        advertisingSetCallback?.let { cb ->
+            advertiser?.stopAdvertisingSet(cb)
+            advertisingSetCallback = null
+            advertisingSet = null
         }
         Log.d(TAG, "advertising stopped")
     }

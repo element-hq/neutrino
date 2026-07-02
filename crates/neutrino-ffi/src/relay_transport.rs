@@ -47,6 +47,74 @@ pub(crate) const RELAY_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::U
 /// ALPN for the federation datagram link.
 const RELAY_ALPN: &[u8] = b"neutrino/iroh-relay/0";
 
+/// Forward BLE-discovered peers into the homeserver's discovery registry. Each
+/// transport snapshot replaces the registry set: peers are keyed by
+/// `server_name` (= lowercase hex of the node id, matching how the resolver
+/// derives it) and stamped with the fixed [`crate::DISCOVERY_LOCALPART`].
+#[cfg(feature = "ble")]
+fn spawn_discovery_drain(
+    mut rx: tokio::sync::watch::Receiver<Vec<iroh_ble_transport::discovery::DiscoveredPeer>>,
+    registry: Arc<neutrino_main::DiscoveryRegistry>,
+) {
+    tokio::spawn(async move {
+        while rx.changed().await.is_ok() {
+            let snapshot = rx.borrow_and_update().clone();
+            let last_seen_ms = now_ms();
+            let map = snapshot
+                .into_iter()
+                .map(|p| {
+                    (
+                        hex32(&p.node_id),
+                        neutrino_main::DiscoveredPeer {
+                            localpart: crate::DISCOVERY_LOCALPART.to_string(),
+                            display_name: p.display_name,
+                            last_seen_ms,
+                        },
+                    )
+                })
+                .collect();
+            registry.replace(map);
+        }
+    });
+}
+
+/// Re-advertise the local display name whenever it changes (`PUT
+/// /profile/.../displayname` pulses the watch).
+#[cfg(feature = "ble")]
+fn spawn_readvertise(
+    ble: Arc<iroh_ble_transport::transport::BleTransport>,
+    mut name_rx: tokio::sync::watch::Receiver<String>,
+) {
+    tokio::spawn(async move {
+        while name_rx.changed().await.is_ok() {
+            let name = name_rx.borrow_and_update().clone();
+            if let Err(e) = ble.set_display_name(Some(name)).await {
+                warn!(error = %e, "re-advertise after display-name change failed");
+            }
+        }
+    });
+}
+
+/// Lowercase-hex a 32-byte node id → its `server_name` string.
+#[cfg(feature = "ble")]
+fn hex32(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Wall-clock milliseconds since the Unix epoch (0 if the clock is before it).
+#[cfg(feature = "ble")]
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Upper bound on a single dial (id-only `connect`, resolved via BLE discovery).
 /// Without it `endpoint.connect` waits forever when discovery never finds the peer
 /// (peer not advertising / out of range / BLE unpaired), so a federation request
@@ -97,7 +165,16 @@ impl IrohTransport {
     pub(crate) async fn bind(
         secret: &[u8; 32],
         bind_addr: SocketAddr,
+        // Current + future local display name (seeded by the entrypoint from the
+        // store). The BLE transport advertises the current value and re-advertises
+        // on change. Unused off the `ble` feature.
+        name_rx: tokio::sync::watch::Receiver<String>,
+        // The homeserver's discovery registry; the BLE transport publishes peers
+        // it scans into it. Unused off the `ble` feature.
+        discovery: Arc<neutrino_main::DiscoveryRegistry>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
+        #[cfg(not(feature = "ble"))]
+        let _ = (name_rx, discovery);
         let secret_key = SecretKey::from_bytes(secret);
         // The BLE transport needs our public key; capture it before the key is
         // moved into the builder.
@@ -140,10 +217,24 @@ impl IrohTransport {
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             let central = Arc::new(iroh_ble_transport::Central::new().await?);
             let peripheral = Arc::new(iroh_ble_transport::Peripheral::new().await?);
-            let ble = iroh_ble_transport::transport::BleTransport::new(public, central, peripheral)
-                .await?;
+            // Advertise `node_id ‖ display_name` for peer discovery (current name
+            // from the watch; re-advertised on change below).
+            let config = iroh_ble_transport::transport::BleTransportConfig {
+                display_name: Some(name_rx.borrow().clone()),
+                ..Default::default()
+            };
+            let ble = Arc::new(
+                iroh_ble_transport::transport::BleTransport::with_config(
+                    public, central, peripheral, config,
+                )
+                .await?,
+            );
             let lookup = ble.address_lookup();
-            let ble: Arc<dyn iroh::endpoint::transports::CustomTransport> = Arc::new(ble);
+            // Publish peers the transport scans into the homeserver's registry,
+            // and re-advertise our name when it changes.
+            spawn_discovery_drain(ble.discovered_peers(), discovery);
+            spawn_readvertise(Arc::clone(&ble), name_rx);
+            let ble: Arc<dyn iroh::endpoint::transports::CustomTransport> = ble;
             builder
                 .add_custom_transport(ble)
                 .address_lookup(lookup)
