@@ -2,13 +2,13 @@ use std::{
     collections::{BTreeMap, HashMap},
     ops::ControlFlow,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
     Json, Router,
     extract::{Query, State},
-    http::StatusCode,
+    http::{Method, StatusCode, Uri},
     response::IntoResponse,
     routing::{get, post, put},
 };
@@ -666,9 +666,56 @@ fn build_router(state: &AppState) -> Router {
                     },
                 ),
         )
+        // Outermost: log requests whose handler future is dropped before a
+        // response is written (client hung up — routine for /sync long-polls
+        // aborted when the client stops its sync loop). `TraceLayer` above
+        // only logs written responses, so without this an aborted long-poll
+        // leaves a dangling "started processing request" line that is
+        // indistinguishable from a hung handler.
+        .layer(axum::middleware::from_fn(log_aborted_requests))
         // `AppState` is `Arc`-backed; this clone is the router's instance, the
         // caller keeps the other (e.g. `serve` hands its instance to `dispatch`).
         .with_state(state.clone())
+}
+
+async fn log_aborted_requests(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut guard = AbortLogGuard {
+        method: request.method().clone(),
+        uri: request.uri().clone(),
+        start: Instant::now(),
+        completed: false,
+    };
+    let response = next.run(request).await;
+    guard.completed = true;
+    response
+}
+
+/// Armed for the lifetime of a request; fires from `Drop` iff the response
+/// never completed, which only happens when the request future is dropped
+/// (client disconnected). Captures method/uri itself because the drop runs
+/// outside the `TraceLayer` request span.
+struct AbortLogGuard {
+    method: Method,
+    uri: Uri,
+    start: Instant,
+    completed: bool,
+}
+
+impl Drop for AbortLogGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            info!(
+                target: "neutrino_http",
+                method = %self.method,
+                uri = %self.uri,
+                latency = ?self.start.elapsed(),
+                "request aborted by client before a response was written",
+            );
+        }
+    }
 }
 
 async fn root() -> &'static str {
@@ -1165,19 +1212,35 @@ async fn resolve_display_name(state: &AppState, user_id: &str) -> Option<String>
         )
     };
     if is_self {
-        return Some(
-            store
-                .get_display_name()
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| DEFAULT_DISPLAY_NAME.to_string()),
-        );
+        return Some(local_display_name(&store).await);
     }
     user_id
         .rsplit_once(':')
         .and_then(|(_, server_name)| discovery.get(server_name))
         .map(|peer| peer.display_name)
+}
+
+/// The local user's stored display name, falling back to
+/// [`DEFAULT_DISPLAY_NAME`] when never set. This is the server-wide display
+/// name both reported for the local user's profile and embedded into the
+/// `m.room.member` events the server authors for the local user.
+pub(crate) async fn local_display_name(store: &SqliteStore) -> String {
+    store
+        .get_display_name()
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| DEFAULT_DISPLAY_NAME.to_string())
+}
+
+/// Set `content.displayname` on an `m.room.member` content object. The server
+/// is authoritative for its local users' profile, so the member events it
+/// authors for a local user carry the server-wide display name (a no-op if
+/// `content` is not a JSON object).
+pub(crate) fn set_member_displayname(content: &mut Value, name: &str) {
+    if let Some(obj) = content.as_object_mut() {
+        obj.insert("displayname".to_owned(), Value::String(name.to_owned()));
+    }
 }
 
 /// `GET /_matrix/client/v3/profile/{user_id}` and the `/displayname` keyed
@@ -1318,7 +1381,9 @@ async fn create_room(
     // `build_initial_events`. Any failure here is a server bug (the events are
     // server-authored), so it maps to 500. Only *local* invitees are baked into
     // the batch; remote invitees are federated separately below.
-    let (create, initial) = match build_initial_events(&sender, &body.0, &own_server) {
+    let display_name = local_display_name(&store).await;
+    let (create, initial) = match build_initial_events(&sender, &body.0, &own_server, &display_name)
+    {
         Ok(batch) => batch,
         Err(e) => {
             return error_response(
@@ -1431,6 +1496,7 @@ fn build_initial_events(
     sender: &OwnedUserId,
     body: &Value,
     own_server: &str,
+    display_name: &str,
 ) -> Result<(Event, Vec<Event>), CreateRoomError> {
     // create is special: no parents, room_id derived from its own event_id.
     let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
@@ -1461,11 +1527,9 @@ fn build_initial_events(
             Ok(())
         };
 
-    add(
-        "m.room.member",
-        sender.as_str(),
-        json!({ "membership": "join" }),
-    )?;
+    let mut join_content = json!({ "membership": "join" });
+    set_member_displayname(&mut join_content, display_name);
+    add("m.room.member", sender.as_str(), join_content)?;
     add("m.room.power_levels", "", default_power_levels())?;
     add(
         "m.room.join_rules",
@@ -1500,6 +1564,9 @@ fn build_initial_events(
         if is_direct {
             content["is_direct"] = json!(true);
         }
+        // Local invitees only reach this branch (remote ones are skipped
+        // above), so their displayname is our server-wide name.
+        set_member_displayname(&mut content, display_name);
         add("m.room.member", target.as_str(), content)?;
     }
 
@@ -1862,6 +1929,89 @@ mod tests {
         );
     }
 
+    /// Captures event messages so the abort-guard tests can assert on what was
+    /// (and wasn't) logged without pulling in `tracing-subscriber`.
+    struct CapturingSubscriber(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for CapturingSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct MessageVisitor(String);
+            impl tracing::field::Visit for MessageVisitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.0.lock().expect("capture lock").push(visitor.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn dropped_request_logs_abort_and_completed_request_does_not() {
+        use tower::ServiceExt;
+
+        let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(CapturingSubscriber(messages.clone()));
+
+        let router = axum::Router::new()
+            .route(
+                "/hang",
+                axum::routing::get(std::future::pending::<&'static str>),
+            )
+            .route("/ok", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(super::log_aborted_requests));
+        let req = |path: &str| {
+            axum::extract::Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .expect("request")
+        };
+
+        // A request that completes must not fire the guard.
+        let response = router.clone().oneshot(req("/ok")).await.expect("response");
+        assert_eq!(response.status(), super::StatusCode::OK);
+        assert!(
+            messages
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .all(|m| !m.contains("aborted")),
+            "completed request must not log an abort"
+        );
+
+        // Dropping an in-flight request (client hung up mid long-poll) must.
+        let mut in_flight = Box::pin(router.oneshot(req("/hang")));
+        tokio::time::timeout(Duration::from_millis(50), &mut in_flight)
+            .await
+            .expect_err("/hang must still be in flight");
+        drop(in_flight);
+        assert!(
+            messages
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .any(|m| m.contains("request aborted by client before a response was written")),
+            "dropped request must log an abort"
+        );
+    }
+
     #[tokio::test]
     async fn user_directory_search_matches_discovered_peers() {
         use neutrino_ctl::DiscoveredPeer;
@@ -2202,8 +2352,23 @@ mod tests {
             "is_direct": true,
             "invite": ["@bob:127.0.0.1", "@carol:remote.example"],
         });
-        let (_create, initial) =
-            build_initial_events(&sender, &body, "127.0.0.1").expect("build initial events");
+        let (_create, initial) = build_initial_events(&sender, &body, "127.0.0.1", "Alice")
+            .expect("build initial events");
+
+        // The creator's own join carries the server-wide display name.
+        let join = initial
+            .iter()
+            .find(|e| {
+                e.event_type == "m.room.member"
+                    && e.content_str("membership").as_deref() == Some("join")
+            })
+            .expect("creator join present");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(join.content.get())
+                .expect("join content")
+                .pointer("/displayname"),
+            Some(&json!("Alice")),
+        );
 
         let invites: Vec<&Event> = initial
             .iter()
@@ -2218,6 +2383,11 @@ mod tests {
         let content: serde_json::Value =
             serde_json::from_str(bob.content.get()).expect("content json");
         assert_eq!(content.pointer("/is_direct"), Some(&json!(true)));
+        assert_eq!(
+            content.pointer("/displayname"),
+            Some(&json!("Alice")),
+            "the local invitee carries the server-wide display name"
+        );
         assert!(
             !initial
                 .iter()

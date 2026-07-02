@@ -93,6 +93,46 @@ fn chunk_len(body: &Value) -> usize {
     body["chunk"].as_array().expect("chunk array").len()
 }
 
+/// The server embeds its server-wide display name into the local user's own
+/// member events. Exercises the `change_membership` path (leave) end-to-end:
+/// set a display name, create + leave a room, and confirm the resulting leave
+/// member event carries `displayname`.
+#[tokio::test]
+async fn local_member_event_carries_server_display_name() {
+    let (app, _tmp) = test_router().await;
+    let (status, _) = put(
+        &app,
+        "/_matrix/client/v3/profile/@alice:example.org/displayname",
+        &json!({ "displayname": "Alice" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "set display name");
+
+    let (status, body) = post(&app, "/_matrix/client/v3/createRoom", &json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let room_id = body["room_id"].as_str().expect("room_id").to_string();
+
+    let (status, _) = post(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "leave");
+
+    let (status, member) = get(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.member/@alice:example.org"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(member["membership"], "leave");
+    assert_eq!(
+        member["displayname"], "Alice",
+        "the leave member event carries the server-wide display name"
+    );
+}
+
 #[tokio::test]
 async fn backward_no_from_returns_recent_newest_first() {
     let (app, _tmp) = test_router().await;

@@ -131,7 +131,10 @@ Intentional gaps in the sliding-sync implementation — see `MSC4186-gaps.md`:
 - client-timeline filtering on `soft_failed`: the column + field exist, but relayed timelines do not yet drop soft-failed events
 - room-alias resolution: `#alias` → room id is unresolvable (no alias directory); the global `/join/{roomIdOrAlias}` reports `M_INVALID_PARAM` on any alias
 - `/forget`
-- displayname / avatar carry-over onto membership events
+- avatar carry-over onto membership events (displayname is done: the server-wide
+  name from the `IdentityStore` is embedded into every local-user member event —
+  createRoom join + local invites, `change_membership` join/leave/invite/kick/ban,
+  and completed federated join/leave templates)
 
 ### Server-Server follow-ons
 
