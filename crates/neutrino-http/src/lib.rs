@@ -31,7 +31,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::trace::TraceLayer;
-use tracing::{Span, error, info, info_span};
+use tracing::{Span, error, info, info_span, warn};
 
 mod federation;
 mod legacy_sync;
@@ -1306,15 +1306,19 @@ async fn create_room(
     AuthUser(sender): AuthUser,
     body: Json<Value>,
 ) -> axum::response::Response {
-    let store = lock_app(&state.0).store.clone();
+    let (store, own_server) = {
+        let app = lock_app(&state.0);
+        (app.store.clone(), app.config.server_name.clone())
+    };
 
     // Build the spec-mandated initial-state batch (create → join →
     // power_levels → join_rules, plus name/topic when requested). Each event
     // is built on the running heads, server-side `auth_events` selected, and
     // verified through `RoomCore::apply` before it's persisted — see
     // `build_initial_events`. Any failure here is a server bug (the events are
-    // server-authored), so it maps to 500.
-    let (create, initial) = match build_initial_events(&sender, &body.0) {
+    // server-authored), so it maps to 500. Only *local* invitees are baked into
+    // the batch; remote invitees are federated separately below.
+    let (create, initial) = match build_initial_events(&sender, &body.0, &own_server) {
         Ok(batch) => batch,
         Err(e) => {
             return error_response(
@@ -1339,7 +1343,47 @@ async fn create_room(
         );
     }
 
+    // Federate each *remote* invitee via the dedicated `/invite` handshake — a
+    // remote user's server isn't in the room yet, so it's not in the joined-set
+    // that transaction fan-out reaches; only `federated_invite` (PUT
+    // /federation/v2/invite) can deliver the invite. Local invitees already rode
+    // the initial batch. Best-effort: the room is persisted, so a failed invite
+    // is logged and left for the client to retry rather than unwinding the room.
+    for target in invite_targets(&sender, &body.0) {
+        if target.server_name().as_str() == own_server {
+            continue;
+        }
+        let resp = crate::federation::invite::federated_invite(
+            &state.0,
+            sender.clone(),
+            &room_id,
+            &target,
+            None,
+        )
+        .await;
+        if !resp.status().is_success() {
+            warn!(%room_id, invitee = %target, status = %resp.status(), "createRoom: failed to federate invite to remote invitee");
+        }
+    }
+
     (StatusCode::OK, Json(json!({"room_id": room_id}))).into_response()
+}
+
+/// The validated `invite` targets from a createRoom body, minus the creator and
+/// malformed entries (best-effort — a bad entry is skipped, not a room-creation
+/// failure). Shared by [`build_initial_events`] (bakes *local* invitees into the
+/// initial batch) and [`create_room`] (federates *remote* invitees as a
+/// follow-up), so the two split the same list on the same rules.
+fn invite_targets(sender: &OwnedUserId, body: &Value) -> Vec<OwnedUserId> {
+    let Some(invitees) = body.pointer("/invite").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    invitees
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|t| *t != sender.as_str())
+        .filter_map(|t| OwnedUserId::try_from(t).ok())
+        .collect()
 }
 
 /// Error building the createRoom initial-state batch. Every event is
@@ -1386,6 +1430,7 @@ fn persisted_event(effects: Vec<Effect>) -> Result<Arc<Event>, CreateRoomError> 
 fn build_initial_events(
     sender: &OwnedUserId,
     body: &Value,
+    own_server: &str,
 ) -> Result<(Event, Vec<Event>), CreateRoomError> {
     // create is special: no parents, room_id derived from its own event_id.
     let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
@@ -1439,27 +1484,23 @@ fn build_initial_events(
         add("m.room.topic", "", json!({ "topic": t }))?;
     }
 
-    // Honour the request's `invite` list (the membership follow-up to the
-    // multi-user shim): emit one invite member event per well-formed, non-self
-    // target, authored by the creator — who is joined with implicit MAX power,
-    // so rule 5.4 accepts it. Malformed entries are skipped rather than failing
-    // room creation (test server, best-effort). `is_direct` is propagated onto
-    // the invite content when the request sets it.
-    if let Some(invitees) = body.pointer("/invite").and_then(Value::as_array) {
-        let is_direct = body.pointer("/is_direct").and_then(Value::as_bool) == Some(true);
-        for entry in invitees {
-            let Some(target) = entry.as_str() else {
-                continue;
-            };
-            if target == sender.as_str() || OwnedUserId::try_from(target).is_err() {
-                continue;
-            }
-            let mut content = json!({ "membership": "invite" });
-            if is_direct {
-                content["is_direct"] = json!(true);
-            }
-            add("m.room.member", target, content)?;
+    // Honour the request's `invite` list, but only for *local* invitees: emit one
+    // invite member event per local target, authored by the creator — who is
+    // joined with implicit MAX power, so rule 5.4 accepts it. Remote invitees
+    // cannot ride the initial batch (their server isn't in the room yet, so
+    // nothing federates the event to them); `create_room` delivers those via the
+    // dedicated `/invite` handshake instead. `is_direct` is propagated onto the
+    // invite content when the request sets it.
+    let is_direct = body.pointer("/is_direct").and_then(Value::as_bool) == Some(true);
+    for target in invite_targets(sender, body) {
+        if target.server_name().as_str() != own_server {
+            continue;
         }
+        let mut content = json!({ "membership": "invite" });
+        if is_direct {
+            content["is_direct"] = json!(true);
+        }
+        add("m.room.member", target.as_str(), content)?;
     }
 
     Ok((create, initial))
@@ -1773,8 +1814,8 @@ async fn default_fallback() -> (StatusCode, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Command, Config, ControlFlow, SqliteStore, TcpListener, dispatch, handle,
-        join_rule_for, mpsc,
+        AppState, Command, Config, ControlFlow, Event, OwnedUserId, SqliteStore, TcpListener,
+        build_initial_events, dispatch, handle, invite_targets, join_rule_for, mpsc,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -2129,6 +2170,59 @@ mod tests {
         assert_eq!(
             join_rule_for(&json!({ "preset": "weird_preset" })),
             "invite"
+        );
+    }
+
+    #[test]
+    fn invite_targets_skips_self_and_malformed() {
+        let sender: OwnedUserId = "@alice:127.0.0.1".parse().expect("user id");
+        let body = json!({
+            "invite": [
+                "@bob:127.0.0.1",
+                "@alice:127.0.0.1", // self — skipped
+                "not-a-user-id",    // malformed — skipped
+                "@carol:remote.example",
+                42,                 // wrong type — skipped
+            ]
+        });
+        let targets: Vec<String> = invite_targets(&sender, &body)
+            .into_iter()
+            .map(|u| u.to_string())
+            .collect();
+        assert_eq!(targets, ["@bob:127.0.0.1", "@carol:remote.example"]);
+    }
+
+    #[test]
+    fn build_initial_events_bakes_local_invite_only_remote_deferred() {
+        // A DM-style createRoom with one local and one remote invitee: the local
+        // invite member event rides the initial batch (with `is_direct`), the
+        // remote one does not — `create_room` federates it via `/invite` instead.
+        let sender: OwnedUserId = "@alice:127.0.0.1".parse().expect("user id");
+        let body = json!({
+            "is_direct": true,
+            "invite": ["@bob:127.0.0.1", "@carol:remote.example"],
+        });
+        let (_create, initial) =
+            build_initial_events(&sender, &body, "127.0.0.1").expect("build initial events");
+
+        let invites: Vec<&Event> = initial
+            .iter()
+            .filter(|e| {
+                e.event_type == "m.room.member"
+                    && e.content_str("membership").as_deref() == Some("invite")
+            })
+            .collect();
+        assert_eq!(invites.len(), 1, "only the local invitee is baked in");
+        let bob = invites[0];
+        assert_eq!(bob.state_key.as_deref(), Some("@bob:127.0.0.1"));
+        let content: serde_json::Value =
+            serde_json::from_str(bob.content.get()).expect("content json");
+        assert_eq!(content.pointer("/is_direct"), Some(&json!(true)));
+        assert!(
+            !initial
+                .iter()
+                .any(|e| e.state_key.as_deref() == Some("@carol:remote.example")),
+            "the remote invitee must not appear in the initial batch"
         );
     }
 }

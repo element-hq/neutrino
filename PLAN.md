@@ -124,6 +124,7 @@ Intentional gaps in the sliding-sync implementation — see `MSC4186-gaps.md`:
 
 - `initial_state`, `power_level_content_override`, and `creation_content` are not honoured
 - `trusted_private_chat`'s invitee power-level bump is not modelled (createRoom does not process the `invite` list for power levels)
+- DM `is_direct` is carried onto *local* baked invites only, not federated remote invites; `m.direct` account-data write 405s — remote DMs are not tagged direct
 
 ### Client-Server follow-ons
 
@@ -177,6 +178,27 @@ never use .unwrap() in handler code.
 - Restricted rooms (`join_authorised_via_users_server`) — documented, not implemented
 
 ## decisions log
+
+### createRoom federates remote invitees (2026-07-02)
+- **Bug:** starting a DM (element-x `create_dm` → one `createRoom` with
+  `is_direct:true` + `invite:[remote_user]`) never delivered the invite. The
+  createRoom path baked an invite `m.room.member` straight into the initial batch
+  via `store.create_room`, bypassing the room actor entirely — so neither the
+  actor's transaction fan-out (`outbound_destinations`) nor the dedicated
+  `/invite` handshake ever ran. A remote invitee's server isn't in the room's
+  joined-set anyway, so fan-out could never reach it; invites *require*
+  `PUT /federation/v2/invite`. The standalone `POST /invite` handler already did
+  this, which is why explicit invites worked but DM-creation invites did not.
+- **Fix (option a):** `build_initial_events` now bakes only *local* invitees;
+  `create_room`, after persisting the room, federates each *remote* invitee via
+  `federation::invite::federated_invite` (same path as the standalone handler).
+  Best-effort — the room is already persisted, so a failed invite is logged and
+  left for the client to retry rather than unwinding the room. Local/remote split
+  shares one helper (`invite_targets`) so both sides apply identical rules.
+- **Still outstanding (DM polish, not fixed here):** `is_direct` is not carried
+  onto the federated/remote invite member event (only local baked invites get
+  it), and `PUT …/account_data/m.direct` returns 405 — so remote DMs won't be
+  tagged as direct on either side yet.
 
 ### sliding-sync wedge: HTTP backstop timeout + task-dump-on-fire (2026-07-02)
 - **Revises the 2026-07-01 "offline sync hang → executor starvation" theory.** A
