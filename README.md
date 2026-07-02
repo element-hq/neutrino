@@ -117,7 +117,6 @@ This builds the current implementation and re-generates the Kotlin bindings if t
 cargo xtask compile
 ```
 
-
 ### 2. Commit Bindings
 
 If the bindings were updated in the last step, these should be committed to ensure the bindings line up with the tag itself.
