@@ -896,6 +896,13 @@ async fn sync(
     let body_value = body.0;
     let sync_state = lock_app(&state.0).sync_state.clone();
 
+    info!(
+        %user_id,
+        query = %serde_json::to_string(&query.0).unwrap_or_default(),
+        body = %body_value,
+        "sync request"
+    );
+
     let req = match build_sync_request(&query.0, body_value) {
         Ok(r) => r,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, "M_BAD_JSON", &e.to_string()),
@@ -920,7 +927,15 @@ async fn sync(
     .await;
 
     match handled {
-        Ok(Ok(resp)) => (StatusCode::OK, Json(SyncResponseWire::from(resp))).into_response(),
+        Ok(Ok(resp)) => {
+            let wire = SyncResponseWire::from(resp);
+            info!(
+                %user_id,
+                body = %serde_json::to_string(&wire).unwrap_or_default(),
+                "sync response"
+            );
+            (StatusCode::OK, Json(wire)).into_response()
+        }
         Ok(Err(SyncError::UnknownPos)) => {
             error_response(StatusCode::BAD_REQUEST, "M_UNKNOWN_POS", "Unknown position")
         }
