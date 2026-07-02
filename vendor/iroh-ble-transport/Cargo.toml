@@ -81,15 +81,8 @@ version = "0.1"
 [dependencies.atomic-waker]
 version = "1"
 
-# `blew` is always redirected to the local fork via the workspace
-# `[patch.crates-io]`, so the version requirement only needs to be satisfiable —
-# NOT to pin 0.2.3. cargo-chef (docker/complement) normalises local crate
-# versions to 0.0.1 in its recipe skeleton; a strict `0.2.3` here would then fail
-# to match the patched-in 0.0.1, so cargo would resolve a *second* `blew` from
-# crates.io and the two `links = "blew"` crates collide. A wildcard is satisfied
-# by both the real 0.2.3 and the normalised 0.0.1, so exactly one `blew` resolves.
 [dependencies.blew]
-version = "*"
+version = "0.2.3"
 
 [dependencies.bytes]
 version = "1"
@@ -142,7 +135,7 @@ features = ["v4"]
 version = "1"
 
 [dev-dependencies.blew]
-version = "*"
+version = "0.2.3"
 features = ["testing"]
 
 [dev-dependencies.rand]

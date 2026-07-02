@@ -7,13 +7,15 @@ FROM lukemathwalker/cargo-chef:latest-rust-1-slim-bookworm AS chef
 WORKDIR /src
 
 FROM chef AS planner
-COPY Cargo.toml Cargo.lock ./
+# Use the pruned Complement workspace manifest (excludes neutrino-ffi + the
+# vendored BLE crates). `neutrino` — the only bin built here — doesn't use them,
+# and excluding them keeps `blew`/`iroh-ble-transport` out of the cargo-chef
+# recipe entirely, so cargo-chef's local-version normalisation can't trigger the
+# `links = "blew"` collision. Consequently `vendor/` is not copied.
+COPY docker/complement/Cargo.toml ./Cargo.toml
+COPY Cargo.lock ./Cargo.lock
 COPY crates ./crates
 COPY tools ./tools
-# neutrino-ffi has a path dependency on the vendored iroh-ble-transport crate, so
-# the workspace manifest can't be loaded without it — even though `neutrino` (the
-# only bin built here) doesn't enable the `ble` feature that pulls it in.
-COPY vendor ./vendor
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
@@ -26,10 +28,10 @@ COPY --from=planner /src/recipe.json recipe.json
 # uniffi[cli] dep transitively compiles uniffi_bindgen
 RUN cargo chef cook --release --recipe-path recipe.json --bin neutrino
 
-COPY Cargo.toml Cargo.lock ./
+COPY docker/complement/Cargo.toml ./Cargo.toml
+COPY Cargo.lock ./Cargo.lock
 COPY crates ./crates
 COPY tools ./tools
-COPY vendor ./vendor
 RUN cargo build --release --bin neutrino --features multi-user-shim
 
 # Runtime: nginx sidecar terminates TLS on 8448 and proxies plain HTTP on 8008.
