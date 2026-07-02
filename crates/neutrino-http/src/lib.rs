@@ -2,13 +2,13 @@ use std::{
     collections::{BTreeMap, HashMap},
     ops::ControlFlow,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
     Json, Router,
     extract::{Query, State},
-    http::StatusCode,
+    http::{Method, StatusCode, Uri},
     response::IntoResponse,
     routing::{get, post, put},
 };
@@ -666,9 +666,56 @@ fn build_router(state: &AppState) -> Router {
                     },
                 ),
         )
+        // Outermost: log requests whose handler future is dropped before a
+        // response is written (client hung up — routine for /sync long-polls
+        // aborted when the client stops its sync loop). `TraceLayer` above
+        // only logs written responses, so without this an aborted long-poll
+        // leaves a dangling "started processing request" line that is
+        // indistinguishable from a hung handler.
+        .layer(axum::middleware::from_fn(log_aborted_requests))
         // `AppState` is `Arc`-backed; this clone is the router's instance, the
         // caller keeps the other (e.g. `serve` hands its instance to `dispatch`).
         .with_state(state.clone())
+}
+
+async fn log_aborted_requests(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut guard = AbortLogGuard {
+        method: request.method().clone(),
+        uri: request.uri().clone(),
+        start: Instant::now(),
+        completed: false,
+    };
+    let response = next.run(request).await;
+    guard.completed = true;
+    response
+}
+
+/// Armed for the lifetime of a request; fires from `Drop` iff the response
+/// never completed, which only happens when the request future is dropped
+/// (client disconnected). Captures method/uri itself because the drop runs
+/// outside the `TraceLayer` request span.
+struct AbortLogGuard {
+    method: Method,
+    uri: Uri,
+    start: Instant,
+    completed: bool,
+}
+
+impl Drop for AbortLogGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            info!(
+                target: "neutrino_http",
+                method = %self.method,
+                uri = %self.uri,
+                latency = ?self.start.elapsed(),
+                "request aborted by client before a response was written",
+            );
+        }
+    }
 }
 
 async fn root() -> &'static str {
@@ -1879,6 +1926,89 @@ mod tests {
         assert!(
             matches!(err, super::StartupError::InvalidFederationProxy(_)),
             "got {err:?}"
+        );
+    }
+
+    /// Captures event messages so the abort-guard tests can assert on what was
+    /// (and wasn't) logged without pulling in `tracing-subscriber`.
+    struct CapturingSubscriber(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for CapturingSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct MessageVisitor(String);
+            impl tracing::field::Visit for MessageVisitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.0.lock().expect("capture lock").push(visitor.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn dropped_request_logs_abort_and_completed_request_does_not() {
+        use tower::ServiceExt;
+
+        let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(CapturingSubscriber(messages.clone()));
+
+        let router = axum::Router::new()
+            .route(
+                "/hang",
+                axum::routing::get(std::future::pending::<&'static str>),
+            )
+            .route("/ok", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(super::log_aborted_requests));
+        let req = |path: &str| {
+            axum::extract::Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .expect("request")
+        };
+
+        // A request that completes must not fire the guard.
+        let response = router.clone().oneshot(req("/ok")).await.expect("response");
+        assert_eq!(response.status(), super::StatusCode::OK);
+        assert!(
+            messages
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .all(|m| !m.contains("aborted")),
+            "completed request must not log an abort"
+        );
+
+        // Dropping an in-flight request (client hung up mid long-poll) must.
+        let mut in_flight = Box::pin(router.oneshot(req("/hang")));
+        tokio::time::timeout(Duration::from_millis(50), &mut in_flight)
+            .await
+            .expect_err("/hang must still be in flight");
+        drop(in_flight);
+        assert!(
+            messages
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .any(|m| m.contains("request aborted by client before a response was written")),
+            "dropped request must log an abort"
         );
     }
 
