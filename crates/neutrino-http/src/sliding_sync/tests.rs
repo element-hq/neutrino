@@ -2213,6 +2213,82 @@ async fn newly_joined_room_emits_initial_snapshot_on_incremental_sync() {
     );
 }
 
+/// A room the client was **invited** to and then **joined** must be re-emitted
+/// as a fresh initial snapshot on the sync where membership flips — not as a
+/// capped delta. During the invite phase `build_invite_room` records the room
+/// in `conn.sent`, which would otherwise make the subsequent join look like a
+/// delta (`is_initial_for_room == false`). The delta path caps the timeline at
+/// `timeline_limit` and — critically — issues no `prev_batch`, so the client
+/// can never backpaginate into the history that predates the invite, and the
+/// `/messages` federation-backfill trigger never fires. The transition must
+/// therefore yield `initial = Some(true)` with a `prev_batch` token.
+#[tokio::test]
+async fn invite_then_join_re_emits_initial_snapshot_with_prev_batch() {
+    let (store, _tmp) = fresh_store().await;
+    let user = user_id!("@alice:example.org");
+    let inviter = user_id!("@bob:example.org");
+    let room = room_id!("!room:example.org");
+    // Room + inviter join, then history that predates Alice's involvement.
+    setup_room(&store, room, inviter).await;
+    for i in 0..5 {
+        seed(
+            &store,
+            &make_event(
+                room,
+                "m.room.message",
+                None,
+                inviter,
+                (i + 1) * 100,
+                serde_json::json!({"body": "history", "msgtype": "m.text"}),
+            ),
+        )
+        .await;
+    }
+    // Alice is invited.
+    seed_member(&store, room, user, inviter, "invite", 600).await;
+    let state = SyncState::new(store.clone(), no_shutdown());
+
+    // Sync 1 (initial): the room appears as an invite, which populates
+    // `conn.sent` for the room.
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(2, vec![]));
+    let mut req1 = Request::new();
+    req1.lists = lists.clone();
+    let resp1 = handle(&state, user, req1).await.unwrap();
+    assert!(
+        resp1
+            .rooms
+            .get(room)
+            .and_then(|r| r.invite_state.as_ref())
+            .is_some(),
+        "precondition: the room first appears as an invite"
+    );
+
+    // Alice accepts: her membership flips invite -> join.
+    seed_member(&store, room, user, user, "join", 700).await;
+
+    // Sync 2 (incremental): the join must be a fresh snapshot, not a delta.
+    let mut req2 = Request::new();
+    req2.pos = Some(resp1.pos);
+    req2.lists = lists;
+    let resp2 = handle(&state, user, req2).await.unwrap();
+
+    let room_res = resp2
+        .rooms
+        .get(room)
+        .expect("the joined room is emitted on the invite->join transition");
+    assert_eq!(
+        room_res.initial,
+        Some(true),
+        "invite->join is re-initialised as a full snapshot, not a capped delta"
+    );
+    assert!(
+        room_res.prev_batch.is_some(),
+        "prev_batch issued so the client can backpaginate the pre-invite \
+         history (which is what triggers federation backfill via /messages)"
+    );
+}
+
 #[tokio::test]
 async fn empty_room_still_emitted_on_initial_sync() {
     let (store, _tmp) = fresh_store().await;
