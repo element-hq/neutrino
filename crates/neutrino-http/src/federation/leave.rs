@@ -60,12 +60,14 @@ pub(crate) async fn reject_invite(
     // *with its underlying cause* and swallowed — the unconditional local
     // removal below is what the client relies on.
     let dest = invite.sender.server_name().to_owned();
+    let display_name = crate::local_display_name(&store).await;
     if let Err(e) = try_federated_leave(
         &own_server,
         federation_proxy.as_deref(),
         &dest,
         room_id,
         &user,
+        &display_name,
     )
     .await
     {
@@ -93,6 +95,7 @@ async fn try_federated_leave(
     dest: &ServerName,
     room_id: &RoomId,
     user: &UserId,
+    display_name: &str,
 ) -> Result<(), String> {
     let client = FederationClient::new(own_server.to_owned(), proxy);
     let template = client
@@ -105,7 +108,7 @@ async fn try_federated_leave(
             template.room_version
         ));
     }
-    let leave = complete_membership_template(&template.event, room_id, user, "leave")
+    let leave = complete_membership_template(&template.event, room_id, user, "leave", display_name)
         .ok_or_else(|| "could not complete the leave template".to_string())?;
     client
         .send_leave(dest, room_id, &leave.event_id, &leave.raw)
@@ -155,11 +158,15 @@ mod tests {
 
         // The leave we build must target our own room + our own user.
         let room_id = ruma::RoomId::parse("!room:resident.example").unwrap();
-        let event = complete_membership_template(&hostile, &room_id, &our_user, "leave")
+        let event = complete_membership_template(&hostile, &room_id, &our_user, "leave", "Neo")
             .expect("template completes");
         let v: Value = serde_json::from_str(event.raw.get()).unwrap();
         assert_eq!(v["type"], "m.room.member", "type must be ours");
         assert_eq!(v["sender"], our_user.as_str(), "sender must be our user");
+        assert_eq!(
+            v["content"]["displayname"], "Neo",
+            "our user's server-wide display name must be embedded"
+        );
         assert_eq!(
             v["state_key"],
             our_user.as_str(),

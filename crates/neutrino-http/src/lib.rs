@@ -1165,19 +1165,35 @@ async fn resolve_display_name(state: &AppState, user_id: &str) -> Option<String>
         )
     };
     if is_self {
-        return Some(
-            store
-                .get_display_name()
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| DEFAULT_DISPLAY_NAME.to_string()),
-        );
+        return Some(local_display_name(&store).await);
     }
     user_id
         .rsplit_once(':')
         .and_then(|(_, server_name)| discovery.get(server_name))
         .map(|peer| peer.display_name)
+}
+
+/// The local user's stored display name, falling back to
+/// [`DEFAULT_DISPLAY_NAME`] when never set. This is the server-wide display
+/// name both reported for the local user's profile and embedded into the
+/// `m.room.member` events the server authors for the local user.
+pub(crate) async fn local_display_name(store: &SqliteStore) -> String {
+    store
+        .get_display_name()
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| DEFAULT_DISPLAY_NAME.to_string())
+}
+
+/// Set `content.displayname` on an `m.room.member` content object. The server
+/// is authoritative for its local users' profile, so the member events it
+/// authors for a local user carry the server-wide display name (a no-op if
+/// `content` is not a JSON object).
+pub(crate) fn set_member_displayname(content: &mut Value, name: &str) {
+    if let Some(obj) = content.as_object_mut() {
+        obj.insert("displayname".to_owned(), Value::String(name.to_owned()));
+    }
 }
 
 /// `GET /_matrix/client/v3/profile/{user_id}` and the `/displayname` keyed
@@ -1318,7 +1334,9 @@ async fn create_room(
     // `build_initial_events`. Any failure here is a server bug (the events are
     // server-authored), so it maps to 500. Only *local* invitees are baked into
     // the batch; remote invitees are federated separately below.
-    let (create, initial) = match build_initial_events(&sender, &body.0, &own_server) {
+    let display_name = local_display_name(&store).await;
+    let (create, initial) = match build_initial_events(&sender, &body.0, &own_server, &display_name)
+    {
         Ok(batch) => batch,
         Err(e) => {
             return error_response(
@@ -1431,6 +1449,7 @@ fn build_initial_events(
     sender: &OwnedUserId,
     body: &Value,
     own_server: &str,
+    display_name: &str,
 ) -> Result<(Event, Vec<Event>), CreateRoomError> {
     // create is special: no parents, room_id derived from its own event_id.
     let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
@@ -1461,11 +1480,9 @@ fn build_initial_events(
             Ok(())
         };
 
-    add(
-        "m.room.member",
-        sender.as_str(),
-        json!({ "membership": "join" }),
-    )?;
+    let mut join_content = json!({ "membership": "join" });
+    set_member_displayname(&mut join_content, display_name);
+    add("m.room.member", sender.as_str(), join_content)?;
     add("m.room.power_levels", "", default_power_levels())?;
     add(
         "m.room.join_rules",
@@ -1500,6 +1517,9 @@ fn build_initial_events(
         if is_direct {
             content["is_direct"] = json!(true);
         }
+        // Local invitees only reach this branch (remote ones are skipped
+        // above), so their displayname is our server-wide name.
+        set_member_displayname(&mut content, display_name);
         add("m.room.member", target.as_str(), content)?;
     }
 
@@ -2202,8 +2222,23 @@ mod tests {
             "is_direct": true,
             "invite": ["@bob:127.0.0.1", "@carol:remote.example"],
         });
-        let (_create, initial) =
-            build_initial_events(&sender, &body, "127.0.0.1").expect("build initial events");
+        let (_create, initial) = build_initial_events(&sender, &body, "127.0.0.1", "Alice")
+            .expect("build initial events");
+
+        // The creator's own join carries the server-wide display name.
+        let join = initial
+            .iter()
+            .find(|e| {
+                e.event_type == "m.room.member"
+                    && e.content_str("membership").as_deref() == Some("join")
+            })
+            .expect("creator join present");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(join.content.get())
+                .expect("join content")
+                .pointer("/displayname"),
+            Some(&json!("Alice")),
+        );
 
         let invites: Vec<&Event> = initial
             .iter()
@@ -2218,6 +2253,11 @@ mod tests {
         let content: serde_json::Value =
             serde_json::from_str(bob.content.get()).expect("content json");
         assert_eq!(content.pointer("/is_direct"), Some(&json!(true)));
+        assert_eq!(
+            content.pointer("/displayname"),
+            Some(&json!("Alice")),
+            "the local invitee carries the server-wide display name"
+        );
         assert!(
             !initial
                 .iter()

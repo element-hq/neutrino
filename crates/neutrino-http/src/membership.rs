@@ -138,10 +138,23 @@ async fn change_membership(
     membership: &str,
     reason: Option<&str>,
 ) -> Result<(), axum::response::Response> {
-    let registry = lock_app(state).room_registry.clone();
+    let (registry, store, own_server) = {
+        let app = lock_app(state);
+        (
+            app.room_registry.clone(),
+            app.store.clone(),
+            app.config.server_name.clone(),
+        )
+    };
     let mut content = json!({ "membership": membership });
     if let Some(r) = reason {
         content["reason"] = json!(r);
+    }
+    // The `displayname` describes the state_key user; set the server-wide name
+    // only when that target is one of our local users.
+    if target.server_name().as_str() == own_server {
+        let name = crate::local_display_name(&store).await;
+        crate::set_member_displayname(&mut content, &name);
     }
     registry
         .send_event(

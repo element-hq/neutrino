@@ -218,6 +218,7 @@ pub(crate) fn complete_membership_template(
     room_id: &ruma::RoomId,
     user: &ruma::UserId,
     membership: &str,
+    display_name: &str,
 ) -> Option<neutrino_event::Event> {
     use neutrino_event::event_builder::{EventBuilder, from_wire};
     let raw = serde_json::value::RawValue::from_string(template.get().to_owned()).ok()?;
@@ -228,10 +229,14 @@ pub(crate) fn complete_membership_template(
             return None;
         }
     };
+    // `user` is always our own local user here (we are completing our own
+    // join/leave), so it carries the server-wide display name.
+    let mut content = json!({ "membership": membership });
+    crate::set_member_displayname(&mut content, display_name);
     match EventBuilder::new(user.to_owned(), "m.room.member".to_owned())
         .room_id(room_id.to_owned())
         .state_key(user.to_string())
-        .content(json!({ "membership": membership }))
+        .content(content)
         .prev_events(parsed.prev_events)
         .prev_state_events(parsed.prev_state_events)
         .build()

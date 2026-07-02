@@ -69,6 +69,7 @@ pub(crate) async fn federated_join_with(
         )
     };
     let client = FederationClient::new(own_server, federation_proxy.as_deref());
+    let display_name = crate::local_display_name(&store).await;
 
     // Subscribe to the persist watch *before* staging anything (subscribe-
     // before-query: a persist between staging and subscribing can't be missed),
@@ -77,7 +78,17 @@ pub(crate) async fn federated_join_with(
 
     let mut terminal: Option<JoinFailure> = None;
     for dest in candidates {
-        match try_join_via(&client, &*store, &worker_poke, dest, room_id, &user).await {
+        match try_join_via(
+            &client,
+            &*store,
+            &worker_poke,
+            dest,
+            room_id,
+            &user,
+            &display_name,
+        )
+        .await
+        {
             Ok(()) => {
                 // Staged + worker poked; block until our join lands (or time out).
                 return match wait_for_join(&*store, &mut persists, room_id, &user, timeout).await {
@@ -265,6 +276,7 @@ async fn try_join_via(
     dest: &ServerName,
     room_id: &RoomId,
     user: &UserId,
+    display_name: &str,
 ) -> Result<(), JoinFailure> {
     let template = client
         .make_join(dest, room_id, user, ROOM_VERSION_ID)
@@ -274,9 +286,14 @@ async fn try_join_via(
         return Err(gateway("resident room version is unsupported"));
     }
 
-    let join =
-        crate::federation::complete_membership_template(&template.event, room_id, user, "join")
-            .ok_or_else(|| gateway("could not complete the join template"))?;
+    let join = crate::federation::complete_membership_template(
+        &template.event,
+        room_id,
+        user,
+        "join",
+        display_name,
+    )
+    .ok_or_else(|| gateway("could not complete the join template"))?;
     let join_id = join.event_id.clone();
 
     let resp = client
