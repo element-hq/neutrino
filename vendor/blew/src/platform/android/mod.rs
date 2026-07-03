@@ -47,7 +47,18 @@ pub fn are_ble_permissions_granted() -> bool {
             )?;
             Ok(result.z()?)
         });
-    result.unwrap_or(false)
+    match result {
+        Ok(granted) => granted,
+        Err(e) => {
+            // A failed lookup (e.g. the Kotlin method stripped by a minifier)
+            // is not the same as "denied" — say so instead of silently
+            // reporting the permissions as missing.
+            tracing::error!(
+                "areBlePermissionsGranted JNI call failed (reporting not-granted): {e}"
+            );
+            false
+        }
+    }
 }
 
 /// Trigger the Android BLE runtime permissions dialog.
