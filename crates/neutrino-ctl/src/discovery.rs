@@ -65,24 +65,34 @@ impl DiscoveryRegistry {
         self.read().get(server_name).cloned()
     }
 
+    /// Every known peer as `(server_name, peer)` pairs sorted by
+    /// `(display_name, server_name)` so results are deterministic. The read-side
+    /// snapshot behind [`search`](Self::search) and the host's directory
+    /// listing (over the FFI).
+    pub fn all(&self) -> Vec<(String, DiscoveredPeer)> {
+        let mut peers: Vec<(String, DiscoveredPeer)> = self
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        peers.sort_by(|(a_name, a), (b_name, b)| {
+            a.display_name
+                .cmp(&b.display_name)
+                .then_with(|| a_name.cmp(b_name))
+        });
+        peers
+    }
+
     /// Peers whose display name contains `term` (case-insensitive), returned as
     /// `(server_name, peer)` pairs sorted by `(display_name, server_name)` so
     /// results are deterministic. An empty `term` matches every peer. The
     /// caller applies any result cap (and decides whether the cap was hit).
     pub fn search(&self, term: &str) -> Vec<(String, DiscoveredPeer)> {
         let needle = term.to_lowercase();
-        let mut hits: Vec<(String, DiscoveredPeer)> = self
-            .read()
-            .iter()
+        self.all()
+            .into_iter()
             .filter(|(_, p)| p.display_name.to_lowercase().contains(&needle))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        hits.sort_by(|(a_name, a), (b_name, b)| {
-            a.display_name
-                .cmp(&b.display_name)
-                .then_with(|| a_name.cmp(b_name))
-        });
-        hits
+            .collect()
     }
 
     fn read(&self) -> RwLockReadGuard<'_, HashMap<String, DiscoveredPeer>> {
@@ -142,6 +152,18 @@ mod tests {
     fn no_match_returns_empty() {
         let reg = seeded();
         assert!(reg.search("zzz").is_empty());
+    }
+
+    #[test]
+    fn all_returns_every_peer_sorted() {
+        let reg = seeded();
+        let all = reg.all();
+        // Every peer, sorted by (display_name, server_name).
+        let names: Vec<&str> = all.iter().map(|(_, p)| p.display_name.as_str()).collect();
+        assert_eq!(names, vec!["Alexandra", "Alice", "Bob"]);
+        // Keyed by server_name, carrying the peer verbatim.
+        assert_eq!(all[0].0, "node_alex");
+        assert_eq!(all[2].0, "node_bob");
     }
 
     #[test]

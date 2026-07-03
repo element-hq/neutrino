@@ -81,12 +81,31 @@ impl From<Command> for neutrino_main::Command {
 #[cfg(feature = "ble")]
 const DISCOVERY_LOCALPART: &str = "n";
 
+/// A peer the embedded server has discovered out of band (over the BLE mesh),
+/// for the host to render in a Settings directory. Host-facing projection of
+/// `neutrino_ctl::DiscoveredPeer` plus its `server_name` key; the localpart is
+/// omitted (the host builds user ids itself from `server_name`).
+#[derive(uniffi::Record)]
+pub struct DiscoveredPeer {
+    /// The peer's `server_name` (its 64-char hex node id).
+    pub server_name: String,
+    /// The display name the peer advertised.
+    pub display_name: String,
+    /// Wall-clock milliseconds of the scan snapshot that last saw this peer.
+    /// Uniform across all peers in a snapshot (see `discovered_peers`).
+    pub last_seen_ms: u64,
+}
+
 #[derive(uniffi::Object)]
 pub struct NeutrinoHandle {
     tx: tokio::sync::mpsc::UnboundedSender<neutrino_main::Command>,
     /// The server identity (its resolved `server_name`/node id), published by the
     /// entrypoint once resolved. Read by `server_name()`; `None` until booted.
     identity: tokio::sync::watch::Receiver<Option<String>>,
+    /// Out-of-band discovery registry, written by the BLE transport's scan drain
+    /// and read back by `discovered_peers()`. Shared (same `Arc`) with the
+    /// homeserver's user-directory search.
+    discovery: std::sync::Arc<neutrino_main::DiscoveryRegistry>,
 }
 
 #[uniffi::export]
@@ -125,6 +144,23 @@ impl NeutrinoHandle {
     pub fn server_name(&self) -> Option<String> {
         self.identity.borrow().clone()
     }
+
+    /// A single-shot snapshot of every peer discovered over the BLE mesh, sorted
+    /// by `(display_name, server_name)`. Not live — the host re-calls to refresh.
+    /// A non-blocking in-memory read (like `server_name`), so it is safe to call
+    /// from the FFI/JNI thread. Empty on a build without BLE discovery, or before
+    /// the first scan has landed any peers.
+    pub fn discovered_peers(&self) -> Vec<DiscoveredPeer> {
+        self.discovery
+            .all()
+            .into_iter()
+            .map(|(server_name, peer)| DiscoveredPeer {
+                server_name,
+                display_name: peer.display_name,
+                last_seen_ms: peer.last_seen_ms,
+            })
+            .collect()
+    }
 }
 
 /// Spawn an owned Tokio runtime and begin polling the server entrypoint with
@@ -161,6 +197,8 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
     // BLE transport (which writes scanned peers into it — see the drain task).
     let discovery_for_server = std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new());
     let discovery_for_link = discovery_for_server.clone();
+    // A third reader-side handle for the FFI directory listing (`discovered_peers`).
+    let discovery_for_handle = discovery_for_server.clone();
     // Build the federation datagram link from the resolved node secret: an iroh
     // QUIC endpoint, addressed by 32-byte node id, carrying the sidecar's
     // CoAP/CBOR wire over BLE (no OS socket / TUN / virtual IPs). The entrypoint
@@ -221,6 +259,7 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
     NeutrinoHandle {
         tx,
         identity: handoff_rx,
+        discovery: discovery_for_handle,
     }
 }
 
@@ -259,6 +298,7 @@ mod tests {
         let handle = NeutrinoHandle {
             tx,
             identity: tokio::sync::watch::channel::<Option<String>>(None).1,
+            discovery: std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new()),
         };
         handle.shutdown();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::Shutdown);
@@ -273,9 +313,55 @@ mod tests {
         let handle = NeutrinoHandle {
             tx,
             identity: tokio::sync::watch::channel::<Option<String>>(None).1,
+            discovery: std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new()),
         };
         handle.kick_backoff();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::KickBackoff);
+    }
+
+    #[test]
+    fn discovered_peers_maps_registry_snapshot() {
+        let discovery = std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new());
+        discovery.upsert(
+            "node_bob".to_string(),
+            neutrino_main::DiscoveredPeer {
+                localpart: "n".to_string(),
+                display_name: "Bob".to_string(),
+                last_seen_ms: 42,
+            },
+        );
+        discovery.upsert(
+            "node_alice".to_string(),
+            neutrino_main::DiscoveredPeer {
+                localpart: "n".to_string(),
+                display_name: "Alice".to_string(),
+                last_seen_ms: 7,
+            },
+        );
+        let handle = NeutrinoHandle {
+            tx: tokio::sync::mpsc::unbounded_channel().0,
+            identity: tokio::sync::watch::channel::<Option<String>>(None).1,
+            discovery,
+        };
+        let peers = handle.discovered_peers();
+        // Sorted by (display_name, server_name); localpart is dropped, other
+        // fields carried through verbatim.
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].server_name, "node_alice");
+        assert_eq!(peers[0].display_name, "Alice");
+        assert_eq!(peers[0].last_seen_ms, 7);
+        assert_eq!(peers[1].server_name, "node_bob");
+        assert_eq!(peers[1].last_seen_ms, 42);
+    }
+
+    #[test]
+    fn discovered_peers_empty_registry() {
+        let handle = NeutrinoHandle {
+            tx: tokio::sync::mpsc::unbounded_channel().0,
+            identity: tokio::sync::watch::channel::<Option<String>>(None).1,
+            discovery: std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new()),
+        };
+        assert!(handle.discovered_peers().is_empty());
     }
 
     #[test]
