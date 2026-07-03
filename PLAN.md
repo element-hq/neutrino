@@ -182,6 +182,30 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### FFI exposes discovered peers to the host (2026-07-03)
+- EX-Android Settings needs to list peers discovered over the BLE mesh.
+  Added `NeutrinoHandle::discovered_peers() -> Vec<DiscoveredPeer>` (uniffi
+  `Record`: `server_name`/`display_name`/`last_seen_ms`) — single-shot, no
+  watchers (host re-calls to refresh).
+- Reads the **existing** shared `Arc<DiscoveryRegistry>` (the BLE transport is
+  still the sole writer): the handle gains a `discovery` field, cloned from the
+  `discovery_for_server` Arc already built in `start`. No new wiring. Sync +
+  non-blocking (an in-memory RwLock read, like `server_name()`), so it's safe
+  from the JNI thread. Unconditional — a non-`ble` build just returns `[]`.
+- New `DiscoveryRegistry::all()` returns the full set sorted by
+  `(display_name, server_name)`; `search` now delegates to it (`all().filter`)
+  so the ordering lives in one place.
+- `user_id` deliberately **not** exposed — the host builds `@{localpart}:
+  {server_name}` itself; the record carries only what Settings renders.
+- `last_seen_ms` is per-**scan-snapshot**, not per-peer: `spawn_discovery_drain`
+  stamps one `now_ms()` per transport snapshot and `replace`s the whole set, so
+  all peers present in a scan share its timestamp (a peer out of range just
+  disappears). Adequate for "last seen"; won't show per-peer divergence.
+- Verified: neutrino-ctl fmt+clippy+tests green; ffi `cargo check` +
+  `clippy --tests -D warnings` clean. ffi *tests* can't link in-sandbox (cdylib
+  link OOMs, `ld` killed) — logic covered by ctl tests + the compiled-but-
+  unrun ffi mapping tests; Kegan runs the on-device `--features ble` build.
+
 ### createRoom federates remote invitees (2026-07-02)
 - **Bug:** starting a DM (element-x `create_dm` → one `createRoom` with
   `is_direct:true` + `invite:[remote_user]`) never delivered the invite. The

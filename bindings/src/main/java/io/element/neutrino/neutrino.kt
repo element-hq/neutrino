@@ -641,6 +641,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_command(
     ): Short
+    external fun uniffi_neutrino_checksum_method_neutrinohandle_discovered_peers(
+    ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_kick_backoff(
     ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_server_name(
@@ -671,6 +673,8 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_neutrino_fn_method_neutrinohandle_command(`ptr`: Long,`command`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_neutrino_fn_method_neutrinohandle_discovered_peers(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_neutrino_fn_method_neutrinohandle_kick_backoff(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_neutrino_fn_method_neutrinohandle_server_name(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1001,6 +1005,29 @@ public object FfiConverterUInt: FfiConverter<UInt, Int> {
 /**
  * @suppress
  */
+public object FfiConverterULong: FfiConverter<ULong, Long> {
+    override fun lift(value: Long): ULong {
+        return value.toULong()
+    }
+
+    override fun read(buf: ByteBuffer): ULong {
+        return lift(buf.getLong())
+    }
+
+    override fun lower(value: ULong): Long {
+        return value.toLong()
+    }
+
+    override fun allocationSize(value: ULong) = 8UL
+
+    override fun write(value: ULong, buf: ByteBuffer) {
+        buf.putLong(value.toLong())
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
     // Note: we don't inherit from FfiConverterRustBuffer, because we use a
     // special encoding when lowering/lifting.  We can use `RustBuffer.len` to
@@ -1165,6 +1192,15 @@ public interface NeutrinoHandleInterface {
     fun `command`(`command`: Command)
     
     /**
+     * A single-shot snapshot of every peer discovered over the BLE mesh, sorted
+     * by `(display_name, server_name)`. Not live — the host re-calls to refresh.
+     * A non-blocking in-memory read (like `server_name`), so it is safe to call
+     * from the FFI/JNI thread. Empty on a build without BLE discovery, or before
+     * the first scan has landed any peers.
+     */
+    fun `discoveredPeers`(): List<DiscoveredPeer>
+    
+    /**
      * Reset outbound retry backoff and retry now. Convenience for
      * `command(Command::KickBackoff)`; the host calls this when device
      * connectivity is restored so backed-off destinations reconnect promptly.
@@ -1310,6 +1346,26 @@ open class NeutrinoHandle: Disposable, AutoCloseable, NeutrinoHandleInterface
 
     
     /**
+     * A single-shot snapshot of every peer discovered over the BLE mesh, sorted
+     * by `(display_name, server_name)`. Not live — the host re-calls to refresh.
+     * A non-blocking in-memory read (like `server_name`), so it is safe to call
+     * from the FFI/JNI thread. Empty on a build without BLE discovery, or before
+     * the first scan has landed any peers.
+     */override fun `discoveredPeers`(): List<DiscoveredPeer> {
+            return FfiConverterSequenceTypeDiscoveredPeer.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_neutrino_fn_method_neutrinohandle_discovered_peers(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Reset outbound retry backoff and retry now. Convenience for
      * `command(Command::KickBackoff)`; the host calls this when device
      * connectivity is restored so backed-off destinations reconnect promptly.
@@ -1398,6 +1454,65 @@ public object FfiConverterTypeNeutrinoHandle: FfiConverter<NeutrinoHandle, Long>
 
     override fun write(value: NeutrinoHandle, buf: ByteBuffer) {
         buf.putLong(lower(value))
+    }
+}
+
+
+
+/**
+ * A peer the embedded server has discovered out of band (over the BLE mesh),
+ * for the host to render in a Settings directory. Host-facing projection of
+ * `neutrino_ctl::DiscoveredPeer` plus its `server_name` key; the localpart is
+ * omitted (the host builds user ids itself from `server_name`).
+ */
+data class DiscoveredPeer (
+    /**
+     * The peer's `server_name` (its 64-char hex node id).
+     */
+    var `serverName`: kotlin.String
+    , 
+    /**
+     * The display name the peer advertised.
+     */
+    var `displayName`: kotlin.String
+    , 
+    /**
+     * Wall-clock milliseconds of the scan snapshot that last saw this peer.
+     * Uniform across all peers in a snapshot (see `discovered_peers`).
+     */
+    var `lastSeenMs`: kotlin.ULong
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeDiscoveredPeer: FfiConverterRustBuffer<DiscoveredPeer> {
+    override fun read(buf: ByteBuffer): DiscoveredPeer {
+        return DiscoveredPeer(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: DiscoveredPeer) = (
+            FfiConverterString.allocationSize(value.`serverName`) +
+            FfiConverterString.allocationSize(value.`displayName`) +
+            FfiConverterULong.allocationSize(value.`lastSeenMs`)
+    )
+
+    override fun write(value: DiscoveredPeer, buf: ByteBuffer) {
+            FfiConverterString.write(value.`serverName`, buf)
+            FfiConverterString.write(value.`displayName`, buf)
+            FfiConverterULong.write(value.`lastSeenMs`, buf)
     }
 }
 
@@ -1572,6 +1687,34 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         } else {
             buf.put(1)
             FfiConverterString.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeDiscoveredPeer: FfiConverterRustBuffer<List<DiscoveredPeer>> {
+    override fun read(buf: ByteBuffer): List<DiscoveredPeer> {
+        val len = buf.getInt()
+        return List<DiscoveredPeer>(len) {
+            FfiConverterTypeDiscoveredPeer.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<DiscoveredPeer>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeDiscoveredPeer.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<DiscoveredPeer>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeDiscoveredPeer.write(it, buf)
         }
     }
 }
