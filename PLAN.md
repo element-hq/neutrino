@@ -182,6 +182,21 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### Bindings AAR ships consumer ProGuard rules (2026-07-03)
+- The blew Kotlin managers (`org.jakebot.blew.*`) are invoked from Rust purely
+  by JNI name lookup — nothing on the Kotlin side references those methods, so
+  R8 in a minified consuming app strips/renames them. blew maps any JNI failure
+  in `areBlePermissionsGranted` to "not granted", killing the server before the
+  CS listener binds (release-only infinite "Starting Neutrino").
+- Decision: keep rules belong in the AAR (`consumer-rules.pro`, broad
+  `-keep class org.jakebot.blew.** / io.element.neutrino.** { *; }`), not in
+  each consuming app — the AAR knows its own JNI surface. Blanket keep over
+  per-method keeps: the JNI surface is ~20 methods and churns; the size cost is
+  negligible.
+- Also made the two silent fail-as-false paths loud (JNI error in
+  vendor/blew `mod.rs`; missing-`init()` warning in `BlePeripheralManager`) —
+  a lookup failure is not "denied" and must not be reported as such.
+
 ### FFI exposes discovered peers to the host (2026-07-03)
 - EX-Android Settings needs to list peers discovered over the BLE mesh.
   Added `NeutrinoHandle::discovered_peers() -> Vec<DiscoveredPeer>` (uniffi

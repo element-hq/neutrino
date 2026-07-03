@@ -29,6 +29,9 @@ android {
 
     defaultConfig {
         minSdk = 21
+        // Keep the JNI-only entry points (org.jakebot.blew.*, io.element.neutrino.*)
+        // in minified consuming apps — see consumer-rules.pro.
+        consumerProguardFiles("consumer-rules.pro")
     }
 
     compileOptions {

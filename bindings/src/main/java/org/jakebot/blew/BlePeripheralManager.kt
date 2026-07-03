@@ -621,7 +621,10 @@ object BlePeripheralManager {
 
     @JvmStatic
     fun areBlePermissionsGranted(): Boolean {
-        val ctx = context ?: return false
+        val ctx = context ?: run {
+            Log.w(TAG, "areBlePermissionsGranted: init() never called, reporting not-granted")
+            return false
+        }
 
         fun granted(p: String) =
             androidx.core.content.ContextCompat
