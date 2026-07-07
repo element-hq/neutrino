@@ -74,6 +74,25 @@ impl From<Command> for neutrino_main::Command {
     }
 }
 
+/// Failure arming a pcap capture (see `NeutrinoHandle::start_capture`).
+#[derive(Debug, uniffi::Error)]
+pub enum CaptureError {
+    /// The capture file could not be opened/created at the given path. Field is
+    /// named `reason` (not `message`) to avoid colliding with `Throwable.message`
+    /// in the generated Kotlin exception.
+    Io { reason: String },
+}
+
+impl std::fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CaptureError::Io { reason } => write!(f, "pcap capture I/O error: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for CaptureError {}
+
 /// Fixed localpart for every embedded peer's user: user ids are
 /// `@n:{node_id}`. The discovery registry is localpart-agnostic — this is the
 /// embedded host's convention, applied by the BLE transport's discovery drain
@@ -106,6 +125,10 @@ pub struct NeutrinoHandle {
     /// and read back by `discovered_peers()`. Shared (same `Arc`) with the
     /// homeserver's user-directory search.
     discovery: std::sync::Arc<neutrino_main::DiscoveryRegistry>,
+    /// Runtime-toggleable pcap capture of federation datagrams (a debug tap).
+    /// Same `Arc` as the one wrapping the transport link; the Settings toggle
+    /// drives it via `start_capture`/`stop_capture`.
+    capture: std::sync::Arc<neutrino_main::CaptureControl>,
 }
 
 #[uniffi::export]
@@ -161,6 +184,29 @@ impl NeutrinoHandle {
             })
             .collect()
     }
+
+    /// Start mirroring every federation datagram into a Wireshark-readable pcap
+    /// at `path` (an absolute path in host-owned storage, e.g. app-specific
+    /// external storage so it is `adb pull`-able). Errors if the file can't be
+    /// opened. Calling it while already capturing rotates to the new file. A
+    /// non-blocking control call, safe from the FFI/JNI thread.
+    pub fn start_capture(&self, path: String) -> Result<(), CaptureError> {
+        self.capture.start(&path).map_err(|e| CaptureError::Io {
+            reason: e.to_string(),
+        })
+    }
+
+    /// Stop capturing and flush + close the file before returning, so it is
+    /// immediately ready to `adb pull`. Returns whether a capture was running.
+    /// Idempotent.
+    pub fn stop_capture(&self) -> bool {
+        self.capture.stop()
+    }
+
+    /// Whether a capture is currently running — drives the Settings toggle state.
+    pub fn is_capturing(&self) -> bool {
+        self.capture.is_active()
+    }
 }
 
 /// Spawn an owned Tokio runtime and begin polling the server entrypoint with
@@ -188,6 +234,12 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let config: neutrino_main::Config = config.into();
+    // Runtime-toggleable pcap capture of federation datagrams (a debug tap; see
+    // `neutrino_lb::CaptureControl`). One handle wraps the link on the transport
+    // hot path, an identical clone lives on `NeutrinoHandle` for the Settings
+    // toggle (`start_capture`/`stop_capture`). Off until the host arms it.
+    let capture = neutrino_main::CaptureControl::new();
+    let capture_for_link = capture.clone();
     // The entrypoint publishes the resolved server name here once identity
     // resolution completes; `server_name()` reads it back.
     let (handoff_tx, handoff_rx) = tokio::sync::watch::channel::<Option<String>>(None);
@@ -209,7 +261,10 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
         Box::pin(async move {
             let transport =
                 IrohTransport::bind(&secret, RELAY_BIND, name_rx, discovery_for_link).await?;
-            Ok(transport as std::sync::Arc<dyn neutrino_main::DatagramLink>)
+            let link = transport as std::sync::Arc<dyn neutrino_main::DatagramLink>;
+            // Always install the (inert) capture tap so the host can toggle it at
+            // runtime without rebuilding the link.
+            Ok(neutrino_main::PcapCaptureLink::wrap(link, capture_for_link))
         })
     });
     std::thread::spawn(move || {
@@ -260,6 +315,7 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
         tx,
         identity: handoff_rx,
         discovery: discovery_for_handle,
+        capture,
     }
 }
 
@@ -299,6 +355,7 @@ mod tests {
             tx,
             identity: tokio::sync::watch::channel::<Option<String>>(None).1,
             discovery: std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new()),
+            capture: neutrino_main::CaptureControl::new(),
         };
         handle.shutdown();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::Shutdown);
@@ -314,6 +371,7 @@ mod tests {
             tx,
             identity: tokio::sync::watch::channel::<Option<String>>(None).1,
             discovery: std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new()),
+            capture: neutrino_main::CaptureControl::new(),
         };
         handle.kick_backoff();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::KickBackoff);
@@ -342,6 +400,7 @@ mod tests {
             tx: tokio::sync::mpsc::unbounded_channel().0,
             identity: tokio::sync::watch::channel::<Option<String>>(None).1,
             discovery,
+            capture: neutrino_main::CaptureControl::new(),
         };
         let peers = handle.discovered_peers();
         // Sorted by (display_name, server_name); localpart is dropped, other
@@ -360,6 +419,7 @@ mod tests {
             tx: tokio::sync::mpsc::unbounded_channel().0,
             identity: tokio::sync::watch::channel::<Option<String>>(None).1,
             discovery: std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new()),
+            capture: neutrino_main::CaptureControl::new(),
         };
         assert!(handle.discovered_peers().is_empty());
     }

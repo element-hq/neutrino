@@ -18,6 +18,7 @@
 //! reassembly-time cap is a follow-up (see `PLAN.md`); it needs coap-lite to bound
 //! the block accumulator, which the current API does not allow from the outside.
 
+pub mod capture;
 pub mod datagram;
 mod message;
 mod paths;

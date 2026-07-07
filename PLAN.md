@@ -89,6 +89,17 @@ Done:
   + 6 MSC4242 state-DAG keys) plus event-ID
   →raw-32 B packing with a re-encode/fall-back-to-text guard. CoAP path enums were
   already done (`transport::coap::paths`). (MSC3079.)
+- Wireshark pcap tap (`transport::coap::capture::PcapCaptureLink`): a
+  `DatagramLink` decorator that mirrors every datagram both directions into a
+  classic pcap (`LINKTYPE_RAW`, synthetic IPv4/UDP :5683, us=10.0.0.1 /
+  peer=10.0.0.N) and delegates untouched. Each block is a full CoAP message, so
+  Wireshark dissects CoAP + reassembles blockwise + decodes CBOR natively (MTU
+  chunking *and* payload, no custom decode). Best-effort background writer; never
+  breaks transport. Runtime-toggleable from the host (`CaptureControl`): the tap
+  always wraps the link but stays inert until armed, so the FFI handle exposes
+  `start_capture(path)` / `stop_capture()` / `is_capturing()` (a Settings toggle).
+  `stop` joins the std-thread writer, so the file is flushed + `adb pull`-ready
+  the moment it returns. ffi-only; not on the shared `Config`.
 
 Deferred follow-ups (write-ups, not done):
 - Wire-size reduction for small MTUs: carry v12 **room** IDs as **raw 32 B**

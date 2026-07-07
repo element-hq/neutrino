@@ -10,6 +10,7 @@ pub mod ingress;
 pub mod transport;
 
 pub use error::LbError;
+pub use transport::coap::capture::{CaptureControl, PcapCaptureLink};
 pub use transport::coap::datagram::DatagramLink;
 pub use transport::{DestinationResolver, DirectResolver};
 
