@@ -23,13 +23,25 @@
 //! header — no synthetic Ethernet MACs). "Us" is always `10.0.0.1`; each distinct
 //! peer node id is minted a stable `10.0.0.N` for the session. Ports are assigned
 //! by CoAP *role*, not fixed: the server endpoint of each datagram uses 5683 and
-//! the client uses a synthetic per-node ephemeral port, so a request and its
-//! response form one client↔server:5683 conversation. This matters — Wireshark's
-//! block-wise reassembly keys off request/response direction, so forcing both
-//! ports to 5683 collapses direction and leaves fragmented CBOR undecodable;
-//! role-based ports let it pair the exchange and reassemble. Timestamps are
-//! wall-clock ([`SystemTime`]); a merged two-device timeline (`mergecap`) is only
-//! as good as the two device clocks.
+//! the client uses a synthetic ephemeral port, so a request and its response form
+//! one client↔server:5683 conversation. This matters — Wireshark's block-wise
+//! reassembly keys off request/response direction, so forcing both ports to 5683
+//! collapses direction and leaves fragmented CBOR undecodable; role-based ports
+//! let it pair the exchange and reassemble.
+//!
+//! The client port is scoped per *token*, not per node: Wireshark keys its block
+//! reassembly by the 5-tuple alone (not token/Request-Tag), so putting all of a
+//! node's transfers on one conversation lets an abandoned or interleaved
+//! Q-Block1 transfer splice into the next one's reassembly ("Illegal block
+//! fragments", subtly corrupt CBOR). Every message of one exchange — request
+//! blocks, the response (and its Q-Block2 blocks), 4.08 recovery — echoes the
+//! request token, so a per-(client, token) port puts each exchange in its own
+//! conversation with pairing intact. Token-less datagrams (empty/signalling,
+//! non-CoAP) fall back to a per-node port. NOTE: if per-block tokens land
+//! (RFC 9177 §6, plan item 1b), this key must become the token's per-body part
+//! (its low 32 bits) or the Request-Tag, or blocks of one body will scatter
+//! across conversations. Timestamps are wall-clock ([`SystemTime`]); a merged
+//! two-device timeline (`mergecap`) is only as good as the two device clocks.
 //!
 //! ## Threading
 //!
@@ -64,7 +76,9 @@ const LINKTYPE_RAW: u32 = 101;
 /// into one conversation, which its block-wise reassembly relies on — using 5683
 /// for both ports collapses direction and defeats reassembly of fragmented CBOR.
 const SERVER_PORT: u16 = 5683;
-/// The synthetic ephemeral port for the local node when it acts as CoAP *client*.
+/// The synthetic *fallback* client port for the local node, used only for
+/// token-less datagrams; tokened exchanges get a per-(client, token) port (see
+/// [`NodeRegistry::port_for`]).
 const US_CLIENT_PORT: u16 = 49152;
 /// The synthetic address of the local node in the capture.
 const US_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
@@ -170,28 +184,37 @@ impl CaptureControl {
             );
             return;
         }
-        let (peer_ip, peer_client_port) = session.ips.addr_for(node);
-        // sender/receiver as (ip, client-role port). The client keeps its ephemeral
-        // port and the server uses SERVER_PORT, so a request and its response form
-        // one client↔server:5683 conversation Wireshark can pair and reassemble.
-        let local = (US_IP, US_CLIENT_PORT);
-        let peer = (peer_ip, peer_client_port);
-        let (sender, receiver) = if local_is_src {
-            (local, peer)
-        } else {
-            (peer, local)
-        };
+        let (peer_ip, peer_fallback_port) = session.ips.addr_for(node);
         // A request's sender is the client; a response's sender is the server. When
         // the code doesn't classify (empty/signalling), treat the sender as client —
         // such datagrams carry no CBOR, so reassembly is unaffected either way.
         let sender_is_client = coap_is_request(payload).unwrap_or(true);
-        let (src_port, dst_port) = if sender_is_client {
-            (sender.1, SERVER_PORT)
+        // The client endpoint's port is scoped to the exchange token (every
+        // message of an exchange echoes it), so each exchange is its own
+        // client↔server:5683 conversation in Wireshark — no cross-transfer
+        // block-reassembly contamination. Token-less → the per-node fallback.
+        let client_is_local = sender_is_client == local_is_src;
+        let (client_key, fallback_port) = if client_is_local {
+            (None, US_CLIENT_PORT)
         } else {
-            (SERVER_PORT, receiver.1)
+            (Some(node), peer_fallback_port)
+        };
+        let client_port = match coap_token(payload) {
+            Some(token) => session.ips.port_for(client_key, token),
+            None => fallback_port,
+        };
+        let (src_ip, dst_ip) = if local_is_src {
+            (US_IP, peer_ip)
+        } else {
+            (peer_ip, US_IP)
+        };
+        let (src_port, dst_port) = if sender_is_client {
+            (client_port, SERVER_PORT)
+        } else {
+            (SERVER_PORT, client_port)
         };
         let (sec, usec) = now_parts();
-        let frame = ipv4_udp_frame(sender.0, src_port, receiver.0, dst_port, payload);
+        let frame = ipv4_udp_frame(src_ip, src_port, dst_ip, dst_port, payload);
         let _ = session.frames.send(pcap_record(sec, usec, &frame));
     }
 }
@@ -238,14 +261,20 @@ impl DatagramLink for PcapCaptureLink {
     }
 }
 
-/// Node id → synthetic peer address: an IP and the ephemeral port that node uses
-/// when it acts as CoAP *client*. Peers are minted from `10.0.0.2` / port `49153`
-/// upward (`10.0.0.1` / `49152` is the local node), stable per node for the life
-/// of a session.
+/// Synthetic endpoint registry: node id → IP (plus a token-less fallback port),
+/// and (client, token) → per-exchange client port. Peers are minted from
+/// `10.0.0.2` / fallback port `49153` upward (`10.0.0.1` / `49152` is the local
+/// node), stable per node for the life of a session. Per-token ports are minted
+/// *downward* from `65535` so the two spaces cannot collide in any realistic
+/// debug capture.
 #[derive(Default)]
 struct NodeRegistry {
     next: u32,
     map: HashMap<[u8; 32], (Ipv4Addr, u16)>,
+    /// Count of per-token ports minted; port = `65535 - token_minted`.
+    token_minted: u16,
+    /// (client node — `None` is the local node — and exchange token) → port.
+    token_ports: HashMap<(Option<[u8; 32]>, Vec<u8>), u16>,
 }
 
 impl NodeRegistry {
@@ -260,6 +289,21 @@ impl NodeRegistry {
         let addr = (ip, client_port);
         self.map.insert(node, addr);
         addr
+    }
+
+    /// The stable synthetic client port for one exchange: keyed by the client
+    /// endpoint (so two clients reusing the same token bytes stay distinct) and
+    /// the CoAP token. Wraps after 16k exchanges — acceptable for a debug
+    /// capture window.
+    fn port_for(&mut self, client: Option<[u8; 32]>, token: &[u8]) -> u16 {
+        let key = (client, token.to_vec());
+        if let Some(&port) = self.token_ports.get(&key) {
+            return port;
+        }
+        let port = u16::MAX - self.token_minted;
+        self.token_minted = self.token_minted.wrapping_add(1);
+        self.token_ports.insert(key, port);
+        port
     }
 }
 
@@ -314,6 +358,20 @@ fn coap_is_request(datagram: &[u8]) -> Option<bool> {
         (2 | 4 | 5, _) => Some(false),
         _ => None,
     }
+}
+
+/// The CoAP token of a datagram, or `None` for token-less (TKL 0), reserved TKL
+/// (> 8), truncated, or non-CoAP data. Used only to scope synthetic ports.
+fn coap_token(datagram: &[u8]) -> Option<&[u8]> {
+    let b0 = *datagram.first()?;
+    if b0 >> 6 != 1 {
+        return None; // not CoAP version 1
+    }
+    let tkl = (b0 & 0x0f) as usize;
+    if tkl == 0 || tkl > 8 {
+        return None;
+    }
+    datagram.get(4..4 + tkl)
 }
 
 /// Wrap `payload` in a synthetic IPv4 + UDP frame with the given ports. Caller
@@ -469,6 +527,63 @@ mod tests {
         assert_eq!(&frame[16..20], &[10, 0, 0, 2]);
         assert_eq!(udp_ports(&frame), (49152, SERVER_PORT));
         assert_eq!(udp_payload(&frame), payload);
+    }
+
+    #[test]
+    fn coap_token_extraction() {
+        assert_eq!(
+            coap_token(b"\x44\x01\x00\x01\x0A\x0B\x0C\x0D"),
+            Some(&[0x0A, 0x0B, 0x0C, 0x0D][..])
+        );
+        assert_eq!(coap_token(b"\x40\x01\x00\x01"), None); // TKL 0
+        assert_eq!(coap_token(b"\x49\x01\x00\x01ttttttttt"), None); // TKL 9 reserved
+        assert_eq!(coap_token(b"\x44\x01\x00\x01\x0A"), None); // truncated token
+        assert_eq!(coap_token(b"\x04\x01\x00\x01\x0A\x0B\x0C\x0D"), None); // not v1
+    }
+
+    /// Each exchange (token) gets its own client port, shared by its request and
+    /// response and distinct per client endpoint; token-less datagrams fall back
+    /// to the per-node port. This is what keeps an abandoned or interleaved
+    /// Q-Block transfer out of the next transfer's Wireshark reassembly stream.
+    #[tokio::test]
+    async fn token_scoped_client_ports_separate_exchanges() {
+        let node = [9u8; 32];
+        // Inbound: a response to our token-A request, then a request from the
+        // peer with its own token C.
+        let resp_a = b"\x64\x45\x00\x01\x0A\x0B\x0C\x0D".to_vec(); // ACK 2.05, tok A
+        let req_c = b"\x44\x02\x00\x03\xC0\xC1\xC2\xC3".to_vec(); // CON POST, tok C
+        let mock = MockLink::new(vec![(node, resp_a), (node, req_c)]);
+        let control = CaptureControl::new();
+        let link = PcapCaptureLink::wrap(mock, control.clone());
+        let path = temp_pcap();
+
+        control.start(path.to_str().unwrap()).unwrap();
+        link.send(node, b"\x44\x01\x00\x01\x0A\x0B\x0C\x0D")
+            .await
+            .unwrap(); // req, tok A
+        link.send(node, b"\x44\x01\x00\x02\x0E\x0F\x10\x11")
+            .await
+            .unwrap(); // req, tok B
+        link.recv().await.unwrap(); // response, tok A
+        link.recv().await.unwrap(); // peer request, tok C
+        link.send(node, b"\x64\x45\x00\x03\xC0\xC1\xC2\xC3")
+            .await
+            .unwrap(); // our response, tok C
+        link.send(node, b"\x40\x01\x00\x09").await.unwrap(); // token-less req
+        control.stop();
+
+        let frames = frames_of(&path);
+        // Two exchanges from us: distinct ports minted downward from 65535.
+        assert_eq!(udp_ports(&frames[0]), (65535, SERVER_PORT));
+        assert_eq!(udp_ports(&frames[1]), (65534, SERVER_PORT));
+        // The response reuses token A's port — one conversation with frames[0].
+        assert_eq!(udp_ports(&frames[2]), (SERVER_PORT, 65535));
+        // The peer's own exchange gets the next port, on the peer (client) side.
+        assert_eq!(udp_ports(&frames[3]), (65533, SERVER_PORT));
+        assert_eq!(udp_ports(&frames[4]), (SERVER_PORT, 65533));
+        // Token-less falls back to the local node's fixed client port.
+        assert_eq!(udp_ports(&frames[5]), (US_CLIENT_PORT, SERVER_PORT));
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

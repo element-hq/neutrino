@@ -222,6 +222,14 @@ never use .unwrap() in handler code.
 - Remaining RFC 9177 deviations (deliberately NOT in this change, see plan
   items 1b/1c): per-block MID+token for Q-Block1 blocks, NON (not CON) block
   bursts. Wireshark-side single-slot bug worth filing upstream regardless.
+- Follow-up (same day): pcap capture now scopes the synthetic client port per
+  (client, token) instead of per node — Wireshark keys block reassembly by
+  5-tuple only, so an abandoned/interleaved transfer on a shared conversation
+  spliced into the next one's reassembly ("Illegal block fragments", subtly
+  corrupt CBOR; seen live when a stalled invite send orphaned block 0).
+  Token-less datagrams keep the per-node fallback port. CAVEAT recorded in
+  capture.rs: plan item 1b (per-block tokens) must switch this key to the
+  token's per-body low 32 bits or the Request-Tag.
 
 ### Bindings AAR ships consumer ProGuard rules (2026-07-03)
 - The blew Kotlin managers (`org.jakebot.blew.*`) are invoked from Rust purely
