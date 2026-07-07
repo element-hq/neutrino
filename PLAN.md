@@ -195,6 +195,34 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### Q-Block requests carry no blanket Q-Block2 opt-in; coap-rs vendored (2026-07-07)
+- Wireshark could not reassemble multi-block CBOR *request* bodies in Q-Block
+  captures ("Malformed packet: CBOR" on block 0, stray CBOR on later blocks)
+  while responses decoded fine. Root cause: coap-rs stamped a Q-Block2
+  (opt 31) early-negotiation option on EVERY request; Wireshark keeps one
+  block-state slot per message and parses options in ascending number order,
+  so the request's Q-Block2 (31 > Q-Block1's 19) clobbered the real Q-Block1
+  block number/M-flag and every block was CBOR-dissected standalone. libcoap
+  (which the q-block support was modelled on) never combines the two on a
+  data-bearing request — it probes once per session (RFC 9177 §4.1).
+- Decision: requests carry Q-Block1 + Request-Tag only. Since both ends of the
+  LB hop run this stack, peer support is declared out of band via a new
+  `QBlockConfig.assume_peer_block_size: Option<usize>` (None = RFC-negotiated
+  only; a request that does carry Q-Block2 still wins). `QBlockTuning::
+  to_qblock_config(block1_size)` sets it to the wire's block size. Server-side,
+  `maybe_serve` now runs before the RFC 7959 `intercept_response` so the
+  BlockHandler never double-fragments a Q-Block2-streamed response.
+- The coap-rs fork is now vendored at `vendor/coap-rs` (base kaylendog/coap-rs
+  rev 9d9b49b) via `[patch.crates-io]` path — the sandbox can't push to the
+  fork; upstream the vendored diff and re-pin a git rev when convenient.
+  Excluded from workspace members so its dev-deps stay out of the shared
+  lockfile; test with `cargo test --features q-block --lib` inside it.
+- Side effect fixed: the client's 4.08 recovery template no longer inherits a
+  stale `Q-Block2 num=0` option (it used to re-request block 0 every round).
+- Remaining RFC 9177 deviations (deliberately NOT in this change, see plan
+  items 1b/1c): per-block MID+token for Q-Block1 blocks, NON (not CON) block
+  bursts. Wireshark-side single-slot bug worth filing upstream regardless.
+
 ### Bindings AAR ships consumer ProGuard rules (2026-07-03)
 - The blew Kotlin managers (`org.jakebot.blew.*`) are invoked from Rust purely
   by JNI name lookup — nothing on the Kotlin side references those methods, so

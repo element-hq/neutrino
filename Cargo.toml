@@ -17,6 +17,11 @@ members = [
 # `vendor/blew` is a fork of the crates.io `blew` crate (see `[patch.crates-io]`
 # below): it adds extended-advertising + manufacturer-data support for BLE peer
 # discovery (advertise `node_id ‖ display_name`, surface it on scan).
+# `vendor/coap-rs` is NOT a member: its dev-dependencies (quickcheck,
+# tokio-test) would enter the shared lockfile for nothing. It is wired in via
+# `[patch.crates-io]` below and keeps its own lockfile; run its tests with
+# `cargo test --features q-block --lib` from inside `vendor/coap-rs`.
+exclude = ["./vendor/coap-rs"]
 default-members = [
     "./crates/*",
     "./tools/uniffi-bindgen",
@@ -59,7 +64,14 @@ async-compat = { git = "https://github.com/element-hq/async-compat", rev = "5a27
 # This rev also rejects an advertised Q-Block Size exceeding max_body_len in
 # QBlockReceiver::accept, closing a one-datagram OOM (a spoofed Size1/Size2 fed
 # RangeSet::missing() an unbounded allocation on the first recovery tick).
-coap = { git = "https://github.com/kaylendog/coap-rs", rev = "9d9b49b4e26b08aa927282f0f9ae3cbbb67dd059" }
+# Vendored at `vendor/coap-rs` (base: kaylendog/coap-rs rev 9d9b49b) to carry the
+# RFC 9177 conformance fix the fork doesn't have yet: requests no longer carry a
+# blanket Q-Block2 opt-in (it also clobbered Wireshark's Q-Block reassembly state,
+# leaving fragmented CBOR request bodies undecodable); servers instead stream
+# large responses when `QBlockConfig.assume_peer_block_size` says the peer is
+# known to support Q-Block (both ends of the LB hop are this stack). Upstream the
+# `vendor/coap-rs` diff to the fork and re-pin a git rev when convenient.
+coap = { path = "./vendor/coap-rs" }
 # coap-rs's q-block feature needs coap-lite's qblock primitives (RangeSet,
 # missing_blocks). coap-rs's own [patch] for coap-lite is ignored when coap-rs is
 # consumed as a dependency, and crates.io coap-lite lacks them, so pin the fork
