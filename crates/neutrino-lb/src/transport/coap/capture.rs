@@ -21,11 +21,15 @@
 //!
 //! Framing choices: link type is `LINKTYPE_RAW` (the frame begins at the IPv4
 //! header — no synthetic Ethernet MACs). "Us" is always `10.0.0.1`; each distinct
-//! peer node id is minted a stable `10.0.0.N` for the session, so tx/rx render as
-//! clean Wireshark conversations with direction. UDP ports are both 5683 so the
-//! CoAP dissector attaches regardless of direction; request/response matching is
-//! by CoAP token, not port. Timestamps are wall-clock ([`SystemTime`]); a merged
-//! two-device timeline (`mergecap`) is only as good as the two device clocks.
+//! peer node id is minted a stable `10.0.0.N` for the session. Ports are assigned
+//! by CoAP *role*, not fixed: the server endpoint of each datagram uses 5683 and
+//! the client uses a synthetic per-node ephemeral port, so a request and its
+//! response form one client↔server:5683 conversation. This matters — Wireshark's
+//! block-wise reassembly keys off request/response direction, so forcing both
+//! ports to 5683 collapses direction and leaves fragmented CBOR undecodable;
+//! role-based ports let it pair the exchange and reassemble. Timestamps are
+//! wall-clock ([`SystemTime`]); a merged two-device timeline (`mergecap`) is only
+//! as good as the two device clocks.
 //!
 //! ## Threading
 //!
@@ -54,8 +58,14 @@ use super::datagram::DatagramLink;
 const PCAP_MAGIC: u32 = 0xa1b2_c3d4;
 /// `LINKTYPE_RAW`: each frame starts at the IP header, no link-layer wrapper.
 const LINKTYPE_RAW: u32 = 101;
-/// Well-known CoAP/UDP port; used as both ports so the CoAP dissector attaches.
-const COAP_PORT: u16 = 5683;
+/// Well-known CoAP server port. A datagram's *server* endpoint uses this; the
+/// *client* endpoint uses a synthetic ephemeral port (see [`Session::ips`]). This
+/// asymmetry is what lets Wireshark tell request from response and pair the two
+/// into one conversation, which its block-wise reassembly relies on — using 5683
+/// for both ports collapses direction and defeats reassembly of fragmented CBOR.
+const SERVER_PORT: u16 = 5683;
+/// The synthetic ephemeral port for the local node when it acts as CoAP *client*.
+const US_CLIENT_PORT: u16 = 49152;
 /// The synthetic address of the local node in the capture.
 const US_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 /// IPv4 header (no options) + UDP header, in bytes.
@@ -79,9 +89,9 @@ struct Session {
     /// Serialized pcap records, drained by the writer thread. Unbounded so the
     /// transport is never back-pressured; a dead writer just drops frames.
     frames: mpsc::Sender<Vec<u8>>,
-    /// Per-session node → synthetic IP map, minted fresh each `start` so every
-    /// capture's addresses begin at `10.0.0.2`.
-    ips: IpRegistry,
+    /// Per-session node → synthetic address map, minted fresh each `start` so
+    /// every capture's addresses begin at `10.0.0.2`.
+    ips: NodeRegistry,
     /// The writer thread, joined on `stop` for a deterministic final flush.
     writer: Option<JoinHandle<()>>,
 }
@@ -106,7 +116,7 @@ impl CaptureControl {
             .spawn(move || writer_loop(rx, file))?;
         let session = Session {
             frames: tx,
-            ips: IpRegistry::default(),
+            ips: NodeRegistry::default(),
             writer: Some(writer),
         };
         // Install, capturing any prior session to stop it *after* releasing the
@@ -160,14 +170,28 @@ impl CaptureControl {
             );
             return;
         }
-        let peer = session.ips.ip_for(node);
-        let (src, dst) = if local_is_src {
-            (US_IP, peer)
+        let (peer_ip, peer_client_port) = session.ips.addr_for(node);
+        // sender/receiver as (ip, client-role port). The client keeps its ephemeral
+        // port and the server uses SERVER_PORT, so a request and its response form
+        // one client↔server:5683 conversation Wireshark can pair and reassemble.
+        let local = (US_IP, US_CLIENT_PORT);
+        let peer = (peer_ip, peer_client_port);
+        let (sender, receiver) = if local_is_src {
+            (local, peer)
         } else {
-            (peer, US_IP)
+            (peer, local)
+        };
+        // A request's sender is the client; a response's sender is the server. When
+        // the code doesn't classify (empty/signalling), treat the sender as client —
+        // such datagrams carry no CBOR, so reassembly is unaffected either way.
+        let sender_is_client = coap_is_request(payload).unwrap_or(true);
+        let (src_port, dst_port) = if sender_is_client {
+            (sender.1, SERVER_PORT)
+        } else {
+            (SERVER_PORT, receiver.1)
         };
         let (sec, usec) = now_parts();
-        let frame = ipv4_udp_frame(src, dst, payload);
+        let frame = ipv4_udp_frame(sender.0, src_port, receiver.0, dst_port, payload);
         let _ = session.frames.send(pcap_record(sec, usec, &frame));
     }
 }
@@ -214,25 +238,28 @@ impl DatagramLink for PcapCaptureLink {
     }
 }
 
-/// Node id → synthetic peer IP. Peers are minted from `10.0.0.2` upward (`.1` is
-/// the local node), stable per node for the life of a session.
+/// Node id → synthetic peer address: an IP and the ephemeral port that node uses
+/// when it acts as CoAP *client*. Peers are minted from `10.0.0.2` / port `49153`
+/// upward (`10.0.0.1` / `49152` is the local node), stable per node for the life
+/// of a session.
 #[derive(Default)]
-struct IpRegistry {
+struct NodeRegistry {
     next: u32,
-    map: HashMap<[u8; 32], Ipv4Addr>,
+    map: HashMap<[u8; 32], (Ipv4Addr, u16)>,
 }
 
-impl IpRegistry {
-    fn ip_for(&mut self, node: [u8; 32]) -> Ipv4Addr {
-        if let Some(ip) = self.map.get(&node) {
-            return *ip;
+impl NodeRegistry {
+    fn addr_for(&mut self, node: [u8; 32]) -> (Ipv4Addr, u16) {
+        if let Some(addr) = self.map.get(&node) {
+            return *addr;
         }
-        // 10.0.0.0 + (2 + next): first peer is 10.0.0.2, rolling into 10.0.1.x etc.
-        // past .255 — fine for a debug capture.
+        // First peer is 10.0.0.2 / 49153, rolling upward; fine for a debug capture.
         let ip = Ipv4Addr::from(u32::from(US_IP).wrapping_add(1) + self.next);
+        let client_port = US_CLIENT_PORT + 1 + self.next as u16;
         self.next += 1;
-        self.map.insert(node, ip);
-        ip
+        let addr = (ip, client_port);
+        self.map.insert(node, addr);
+        addr
     }
 }
 
@@ -272,9 +299,32 @@ fn pcap_record(sec: u32, usec: u32, frame: &[u8]) -> Vec<u8> {
     rec
 }
 
-/// Wrap `payload` in a synthetic IPv4 + UDP frame (both ports 5683). Caller
+/// Classify a CoAP datagram by its code byte: `Some(true)` = a request method
+/// (code class 0, detail 1–31), `Some(false)` = a response (class 2/4/5), `None`
+/// for empty/signalling/non-CoAP where the role can't be told. Used only to pick
+/// synthetic ports; it never inspects the payload.
+fn coap_is_request(datagram: &[u8]) -> Option<bool> {
+    // byte0: version(2)|type(2)|token-length(4); byte1: code = class(3)|detail(5).
+    if datagram.first()? >> 6 != 1 {
+        return None; // not CoAP version 1
+    }
+    let code = *datagram.get(1)?;
+    match (code >> 5, code & 0x1f) {
+        (0, detail) if detail != 0 => Some(true),
+        (2 | 4 | 5, _) => Some(false),
+        _ => None,
+    }
+}
+
+/// Wrap `payload` in a synthetic IPv4 + UDP frame with the given ports. Caller
 /// guarantees `IP_UDP_OVERHEAD + payload.len() <= u16::MAX`.
-fn ipv4_udp_frame(src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
+fn ipv4_udp_frame(
+    src: Ipv4Addr,
+    src_port: u16,
+    dst: Ipv4Addr,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
     let total = (IP_UDP_OVERHEAD + payload.len()) as u16;
     let mut buf = Vec::with_capacity(total as usize);
     // IPv4 header.
@@ -292,8 +342,8 @@ fn ipv4_udp_frame(src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
     buf[10..12].copy_from_slice(&checksum.to_be_bytes());
     // UDP header. Checksum 0 = "not computed", legal for IPv4/UDP.
     let udp_len = (8 + payload.len()) as u16;
-    buf.extend_from_slice(&COAP_PORT.to_be_bytes()); // source port
-    buf.extend_from_slice(&COAP_PORT.to_be_bytes()); // destination port
+    buf.extend_from_slice(&src_port.to_be_bytes());
+    buf.extend_from_slice(&dst_port.to_be_bytes());
     buf.extend_from_slice(&udp_len.to_be_bytes());
     buf.extend_from_slice(&0u16.to_be_bytes()); // checksum
     buf.extend_from_slice(payload);
@@ -387,12 +437,21 @@ mod tests {
         &frame[IP_UDP_OVERHEAD..]
     }
 
+    fn udp_ports(frame: &[u8]) -> (u16, u16) {
+        (
+            u16::from_be_bytes([frame[20], frame[21]]),
+            u16::from_be_bytes([frame[22], frame[23]]),
+        )
+    }
+
     #[test]
     fn frame_has_valid_ip_udp_headers() {
         let payload = b"\x40\x01\x30\x39hello";
         let frame = ipv4_udp_frame(
             Ipv4Addr::new(10, 0, 0, 1),
+            49152,
             Ipv4Addr::new(10, 0, 0, 2),
+            SERVER_PORT,
             payload,
         );
         assert_eq!(frame[0], 0x45);
@@ -408,9 +467,18 @@ mod tests {
         );
         assert_eq!(&frame[12..16], &[10, 0, 0, 1]);
         assert_eq!(&frame[16..20], &[10, 0, 0, 2]);
-        assert_eq!(u16::from_be_bytes([frame[20], frame[21]]), COAP_PORT);
-        assert_eq!(u16::from_be_bytes([frame[22], frame[23]]), COAP_PORT);
+        assert_eq!(udp_ports(&frame), (49152, SERVER_PORT));
         assert_eq!(udp_payload(&frame), payload);
+    }
+
+    #[test]
+    fn coap_request_response_classification() {
+        assert_eq!(coap_is_request(b"\x40\x01\x00\x00"), Some(true)); // 0.01 GET
+        assert_eq!(coap_is_request(b"\x40\x02\x00\x00"), Some(true)); // 0.02 POST
+        assert_eq!(coap_is_request(b"\x60\x45\x00\x00"), Some(false)); // 2.05 Content
+        assert_eq!(coap_is_request(b"\x60\x84\x00\x00"), Some(false)); // 4.04 Not Found
+        assert_eq!(coap_is_request(b"\x40\x00\x00\x00"), None); // 0.00 empty
+        assert_eq!(coap_is_request(b"\x00"), None); // not version 1
     }
 
     #[tokio::test]
@@ -428,7 +496,8 @@ mod tests {
     #[tokio::test]
     async fn start_capture_stop_writes_both_directions() {
         let node = [7u8; 32];
-        let inbound = b"coap-response".to_vec();
+        // A real 2.05 Content response inbound; a 0.01 GET request outbound.
+        let inbound = b"\x60\x45\x00\x00coap-response".to_vec();
         let mock = MockLink::new(vec![(node, inbound.clone())]);
         let control = CaptureControl::new();
         let link = PcapCaptureLink::wrap(mock.clone(), control.clone());
@@ -446,14 +515,44 @@ mod tests {
         // stop() joined the writer: the file is complete and parseable now.
         let frames = frames_of(&path);
         assert_eq!(frames.len(), 2);
-        // tx: us -> peer, payload preserved.
+        // tx request: we're the client → us:49152 -> peer:5683.
         assert_eq!(&frames[0][12..16], &[10, 0, 0, 1]);
         assert_eq!(&frames[0][16..20], &[10, 0, 0, 2]);
+        assert_eq!(udp_ports(&frames[0]), (US_CLIENT_PORT, SERVER_PORT));
         assert_eq!(udp_payload(&frames[0]), outbound);
-        // rx: peer -> us.
+        // rx response: peer is the server → peer:5683 -> us:49152. Same
+        // conversation (us:49152 ↔ peer:5683), so Wireshark pairs + reassembles.
         assert_eq!(&frames[1][12..16], &[10, 0, 0, 2]);
         assert_eq!(&frames[1][16..20], &[10, 0, 0, 1]);
+        assert_eq!(udp_ports(&frames[1]), (SERVER_PORT, US_CLIENT_PORT));
         assert_eq!(udp_payload(&frames[1]), inbound.as_slice());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn ports_reflect_server_role_for_inbound_request() {
+        let node = [3u8; 32];
+        let request = b"\x40\x02\x00\x00hello".to_vec(); // 0.02 POST from the peer
+        let mock = MockLink::new(vec![(node, request.clone())]);
+        let control = CaptureControl::new();
+        let link = PcapCaptureLink::wrap(mock, control.clone());
+        let path = temp_pcap();
+
+        control.start(path.to_str().unwrap()).unwrap();
+        link.recv().await.unwrap(); // inbound request: peer is the client
+        link.send(node, b"\x60\x45\x00\x00world").await.unwrap(); // our 2.05 response
+        control.stop();
+
+        let frames = frames_of(&path);
+        // rx request: peer client (49153) -> us server (5683).
+        assert_eq!(&frames[0][12..16], &[10, 0, 0, 2]);
+        assert_eq!(&frames[0][16..20], &[10, 0, 0, 1]);
+        assert_eq!(udp_ports(&frames[0]), (US_CLIENT_PORT + 1, SERVER_PORT));
+        // tx response: us server (5683) -> same peer client port (49153), so the
+        // pair is one conversation peer:49153 ↔ us:5683.
+        assert_eq!(&frames[1][12..16], &[10, 0, 0, 1]);
+        assert_eq!(&frames[1][16..20], &[10, 0, 0, 2]);
+        assert_eq!(udp_ports(&frames[1]), (SERVER_PORT, US_CLIENT_PORT + 1));
         std::fs::remove_file(&path).ok();
     }
 

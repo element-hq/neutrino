@@ -91,10 +91,12 @@ Done:
   already done (`transport::coap::paths`). (MSC3079.)
 - Wireshark pcap tap (`transport::coap::capture::PcapCaptureLink`): a
   `DatagramLink` decorator that mirrors every datagram both directions into a
-  classic pcap (`LINKTYPE_RAW`, synthetic IPv4/UDP :5683, us=10.0.0.1 /
-  peer=10.0.0.N) and delegates untouched. Each block is a full CoAP message, so
-  Wireshark dissects CoAP + reassembles blockwise + decodes CBOR natively (MTU
-  chunking *and* payload, no custom decode). Best-effort background writer; never
+  classic pcap (`LINKTYPE_RAW`, synthetic IPv4/UDP; us=10.0.0.1 / peer=10.0.0.N;
+  ports by CoAP role — server=5683, client=per-node ephemeral, so each exchange is
+  one client↔server conversation Wireshark can reassemble) and delegates untouched.
+  Each block is a full CoAP message, so Wireshark dissects CoAP + reassembles
+  blockwise + decodes CBOR natively (MTU chunking *and* payload, no custom decode).
+  Best-effort background writer; never
   breaks transport. Runtime-toggleable from the host (`CaptureControl`): the tap
   always wraps the link but stays inert until armed, so the FFI handle exposes
   `start_capture(path)` / `stop_capture()` / `is_capturing()` (a Settings toggle).
