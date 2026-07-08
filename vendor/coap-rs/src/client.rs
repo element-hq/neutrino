@@ -888,8 +888,7 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
         };
         self.transport.synchronizer.remove_sender(&token).await;
 
-        let timed_out =
-            || Error::new(ErrorKind::TimedOut, "q-block transfer did not complete");
+        let timed_out = || Error::new(ErrorKind::TimedOut, "q-block transfer did not complete");
         match outcome {
             Outcome::Plain(Some(message)) => Ok(CoapResponse { message }),
             Outcome::Plain(None) => Err(timed_out()),
@@ -2709,21 +2708,41 @@ mod test {
         req
     }
 
-    /// `send_qblock` round-trips a large response through the real `Server`
-    /// dispatch + `UdpCoAPClient` transport over loopback: the client opts into
-    /// Q-Block2, the server streams the body as a NON burst, and the client
-    /// reassembles it back into a single `CoapResponse`.
+    /// `send_qblock` reassembles a large *response* streamed as Q-Block2 by a
+    /// real `Server` over loopback. The GET request carries no body and no
+    /// Q-Block opt-in, so the server's `assume_peer_block_size` (the closed-
+    /// deployment agreement) is what turns the 960-byte reply into a multi-block
+    /// Q-Block2 NON burst; the client reassembles it into a single
+    /// `CoapResponse`. This is the response-only counterpart to
+    /// `send_qblock_bidirectional_large_request_and_response`: without
+    /// `assume_peer_block_size` the body would come back as one plain PDU and
+    /// the Q-Block2 receive path would never run.
     #[cfg(feature = "q-block")]
     #[tokio::test]
     async fn send_qblock_reassembles_large_response_against_real_server() {
-        let port = spawn_server("127.0.0.1:0", qblock_big_handler)
-            .recv()
-            .await
-            .unwrap();
+        use crate::qblock::QBlockConfig;
+        use crate::server::{Server, UdpCoapListener};
+        use tokio::net::UdpSocket;
 
-        let mut client = UdpCoAPClient::new(format!("127.0.0.1:{port}"))
-            .await
-            .unwrap();
+        let cfg = || QBlockConfig {
+            non_timeout: Duration::from_millis(5),
+            non_receive_timeout: Duration::from_millis(20),
+            ..Default::default()
+        };
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let mut server = Server::from_listeners(vec![Box::new(UdpCoapListener::from_socket(sock))]);
+        server.set_qblock_config(QBlockConfig {
+            assume_peer_block_size: Some(64),
+            ..cfg()
+        });
+        tokio::spawn(async move {
+            let _ = server.run(qblock_big_handler).await;
+        });
+
+        let mut client = UdpCoAPClient::new(addr).await.unwrap();
+        client.set_qblock_config(cfg());
         client.set_block1_size(64); // Q-Block2 block size for the request opt-in
 
         let request = RequestBuilder::new("/big", Method::Get).build();

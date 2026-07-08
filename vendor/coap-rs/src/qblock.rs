@@ -13,7 +13,7 @@
 //! (NSTART/ACK) can be added without reworking this code. See
 //! `neutrino/docs/superpowers/specs/2026-06-23-qblock-rfc9177-rust-design.md`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -325,8 +325,18 @@ pub struct QBlockReceiver {
     /// receives a large request).
     option: CoapOption,
     rec_blocks: RangeSet,
-    /// Reassembly buffer, grown as blocks land at their offsets.
-    body: Vec<u8>,
+    /// Received block payloads keyed by block number, kept sparse until the
+    /// transfer completes. Storing blocks individually (rather than writing them
+    /// into a dense offset-indexed buffer as they arrive) bounds memory to the
+    /// bytes actually delivered: a block claiming a wild offset costs only its
+    /// own payload, not a zero-filled buffer stretching to that offset. The
+    /// dense body is materialised once, on completion, when every block — and so
+    /// every byte — has genuinely been received.
+    blocks: BTreeMap<u32, Vec<u8>>,
+    /// Running total of stored payload bytes, checked against `max_body_len` on
+    /// every block so a transfer can never buffer more than the cap regardless
+    /// of the offsets its blocks claim.
+    received_bytes: usize,
     /// The first accepted block's PDU with its payload and block/size options
     /// stripped — the "carrier" of the transfer's metadata (code, token, and any
     /// application options such as content-format or forwarded HTTP status/
@@ -380,7 +390,8 @@ impl QBlockReceiver {
         Self {
             option,
             rec_blocks: RangeSet::new(),
-            body: Vec::new(),
+            blocks: BTreeMap::new(),
+            received_bytes: 0,
             carrier: None,
             final_len: None,
             total_len: None,
@@ -409,6 +420,13 @@ impl QBlockReceiver {
     /// Whether the whole body has been received.
     pub fn is_complete(&self) -> bool {
         self.rec_blocks.is_complete()
+    }
+
+    /// Bytes currently buffered for this transfer. Proportional to the payload
+    /// actually delivered, never to the offsets blocks claim.
+    #[cfg(test)]
+    fn buffered_bytes(&self) -> usize {
+        self.received_bytes
     }
 
     /// Feeds one received PDU. Extracts the Q-Block option, writes the payload
@@ -466,9 +484,19 @@ impl QBlockReceiver {
             ));
         }
 
-        // Track first; on overflow/out-of-range drop without touching the buffer.
+        // Track first; on overflow/out-of-range drop without buffering anything.
         if !self.rec_blocks.insert(num, block.more) {
             return Ok(BlockOutcome::Dropped);
+        }
+        // The block is new: buffering its payload can only push the total up, so
+        // enforce the cap on the running total. A dense offset-indexed buffer
+        // would have to allocate up to `end` here (a one-datagram OOM from a
+        // high block number); storing sparsely means we hold only real bytes.
+        if self.received_bytes + pdu.payload.len() > self.max_body_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Q-Block body exceeds maximum length",
+            ));
         }
         // Activity resets the recovery backoff (mirrors libcoap blocks_add_entry).
         self.retry = 0;
@@ -482,18 +510,35 @@ impl QBlockReceiver {
             self.carrier = Some(carrier);
         }
 
-        if self.body.len() < end {
-            self.body.resize(end, 0);
-        }
-        self.body[offset..end].copy_from_slice(&pdu.payload);
+        self.received_bytes += pdu.payload.len();
+        self.blocks.insert(num, pdu.payload.clone());
         if !block.more {
             self.final_len = Some(end);
         }
 
         if self.rec_blocks.is_complete() {
-            let mut body = core::mem::take(&mut self.body);
-            if let Some(len) = self.final_len {
-                body.truncate(len);
+            // Completion means every block 0..N is present (RangeSet::is_complete
+            // guarantees no gaps). Place each payload at its offset, exactly as
+            // the old dense buffer did, but allocate the buffer only now — the
+            // one place a max_body_len-sized allocation happens, and only once
+            // the peer has actually delivered that many bytes.
+            let block_size = 1usize << (self.szx.unwrap_or(0) + 4);
+            let blocks = core::mem::take(&mut self.blocks);
+            let len = self.final_len.unwrap_or_else(|| {
+                blocks
+                    .iter()
+                    .map(|(num, payload)| *num as usize * block_size + payload.len())
+                    .max()
+                    .unwrap_or(0)
+            });
+            let mut body = vec![0u8; len];
+            for (num, payload) in &blocks {
+                let offset = *num as usize * block_size;
+                if offset >= len {
+                    continue;
+                }
+                let end = (offset + payload.len()).min(len);
+                body[offset..end].copy_from_slice(&payload[..end - offset]);
             }
             return Ok(BlockOutcome::Complete(body));
         }
@@ -1132,6 +1177,26 @@ mod tests {
     }
 
     #[test]
+    fn receiver_buffers_only_received_bytes_not_block_offset() {
+        // A block claiming a high offset (num 60000 * 16 B ≈ 960 KB, under the
+        // 64 MiB cap) must cost only its own payload, not a dense buffer
+        // stretching to that offset. Before the sparse-storage fix this resized
+        // the reassembly buffer to ~960 KB from a single 16-byte datagram — the
+        // sparse-block one-datagram OOM (16 such transfers ≈ the full cap each).
+        let mut rx = QBlockReceiver::new(
+            CoapOption::QBlock2,
+            request_template(),
+            64 * 1024 * 1024,
+            QBlockConfig::default(),
+        );
+        let outcome = rx
+            .accept(&block_pkt(60000, true, 0, vec![7u8; 16]))
+            .unwrap();
+        assert_eq!(outcome, BlockOutcome::Accepted);
+        assert_eq!(rx.buffered_bytes(), 16);
+    }
+
+    #[test]
     fn receiver_rejects_changed_block_size() {
         let mut rx = receiver();
         rx.accept(&block_pkt(0, true, 0, vec![0u8; 16])).unwrap();
@@ -1455,8 +1520,7 @@ mod tests {
         tx.send(blk.to_bytes().unwrap()).await.unwrap();
 
         let req_sink = RecordingSink::default();
-        let receiver =
-            QBlockReceiver::new(CoapOption::QBlock2, request_template(), 1 << 20, cfg);
+        let receiver = QBlockReceiver::new(CoapOption::QBlock2, request_template(), 1 << 20, cfg);
         // `tx` stays alive across the await, so the channel never closes — the
         // *only* way out is the partial-timeout (proves it, not a closed channel).
         let got = drive_receive(receiver, rx, &req_sink).await.unwrap();
