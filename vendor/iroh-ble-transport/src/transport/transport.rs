@@ -251,18 +251,19 @@ impl BleTransport {
                 crate::discovery::encode_discovery_payload(local_id.as_bytes(), name),
             )
         });
+        // Two UUIDs: the per-peer key-prefix UUID (the dial hint scanners route
+        // on) and the fixed marker every peer shares (what the filtered scan
+        // matches — the key-prefix UUID differs per peer so it can't be
+        // exact-match filtered).
         let advertising_config = AdvertisingConfig {
             local_name: "iroh".to_string(),
-            service_uuids: vec![key_uuid],
+            service_uuids: vec![key_uuid, crate::discovery::DISCOVERY_SERVICE_UUID],
             manufacturer_data,
         };
         peripheral.start_advertising(&advertising_config).await?;
         info!(key_uuid = %key_uuid, "advertising started");
 
-        match central
-            .start_scan(blew::central::ScanFilter::default())
-            .await
-        {
+        match central.start_scan(crate::discovery::scan_filter()).await {
             Ok(()) => info!("scanning for iroh-ble peers"),
             Err(BlewError::NotSupported) => {
                 warn!("central start_scan not supported; discovery disabled");

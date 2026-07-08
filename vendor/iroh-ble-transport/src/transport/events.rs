@@ -49,14 +49,27 @@ pub async fn run_central_events(
                 // otherwise route on.
                 if let Some((company, data)) = &device.manufacturer_data {
                     if *company == crate::discovery::NEUTRINO_MANUFACTURER_ID {
-                        if let Some((node_id, name)) =
-                            crate::discovery::decode_discovery_payload(data)
-                        {
-                            discovery.observe(node_id, name);
+                        match crate::discovery::decode_discovery_payload(data) {
+                            Some((node_id, name)) => discovery.observe(node_id, name),
+                            None => tracing::debug!(
+                                device = %device.id,
+                                payload_len = data.len(),
+                                "discovery: neutrino manufacturer data rejected \
+                                 (too short or name not UTF-8)"
+                            ),
                         }
                     }
                 }
                 let Some(prefix) = extract_prefix_from_services(&device.services) else {
+                    // The scan is filtered on the shared marker UUID, so a
+                    // result without the per-peer key-prefix UUID is anomalous
+                    // (truncated advert, or a foreign device advertising our
+                    // marker) — worth surfacing, and post-filter it can't flood.
+                    tracing::debug!(
+                        device = %device.id,
+                        services = ?device.services,
+                        "discovery: scan result without iroh key-prefix UUID; ignoring"
+                    );
                     continue;
                 };
                 let rssi = device.rssi;

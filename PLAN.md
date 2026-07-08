@@ -208,9 +208,23 @@ client, and blew's Kotlin `startScan` registers a new `ScanCallback`). Chosen
 over (a) periodic automatic rescan (radio churn with no user intent) and
 (b) rescanning inside `discovered_peers()` (side-effecting read, fires per
 keystroke while the search polls). The EX-side call (search screen → rescan())
-lives in the app repo. Not addressed here: masked-UUID filtered scanning
-(unfiltered scans get zero results when the screen is off) and discovery-path
-debug logging — both noted as follow-ons.
+lives in the app repo.
+
+Follow-up (same day): filtered scanning + discovery-path logging landed too.
+Every peer now advertises a fixed marker service UUID
+`c0ba1760-be7a-deca-1956-fade00000000` (`DISCOVERY_SERVICE_UUID`) alongside its
+per-peer `69726f00-…` key-prefix UUID — the key-prefix UUID differs per peer so
+it can't be exact-match filtered; the shared marker is what all scans
+(boot/rescan/adapter-recovery, via `discovery::scan_filter()`) now filter on.
+Filtered scans keep delivering with the screen off, use the controller hardware
+filter, and avoid the long-lived-unfiltered-client pathology entirely. Caveats
+accepted: version skew splits discovery (old peers lack the marker → invisible
+to new scanners) — fine for a debug fleet; the legacy (no-mfr-data) advertising
+branch can't fit two 128-bit UUIDs in 31 bytes, but neutrino always sets mfr
+data → always extended. Logging: `DiscoverySink::observe` now debug-logs
+new/renamed peers, and events.rs debug-logs rejected scan results (bad mfr
+payload; marker present but key-prefix UUID missing — post-filter these can't
+flood). Wire constant pinned by a unit test.
 
 ### Q-Block requests carry no blanket Q-Block2 opt-in; coap-rs vendored (2026-07-07)
 - Wireshark could not reassemble multi-block CBOR *request* bodies in Q-Block

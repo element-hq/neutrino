@@ -423,7 +423,6 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
-use blew::central::ScanFilter;
 use blew::gatt::service::GattService;
 use blew::l2cap::types::Psm;
 use blew::peripheral::AdvertisingConfig;
@@ -489,7 +488,9 @@ impl BlewDriver {
     /// best-effort (the scan may not be running).
     pub async fn rescan(&self) -> crate::error::BleResult<()> {
         let _ = self.central.stop_scan().await;
-        self.central.start_scan(ScanFilter::default()).await?;
+        self.central
+            .start_scan(crate::discovery::scan_filter())
+            .await?;
         Ok(())
     }
 }
@@ -610,7 +611,9 @@ impl BleInterface for BlewDriver {
     }
 
     async fn start_scan(&self) -> crate::error::BleResult<()> {
-        self.central.start_scan(ScanFilter::default()).await?;
+        self.central
+            .start_scan(crate::discovery::scan_filter())
+            .await?;
         Ok(())
     }
 
