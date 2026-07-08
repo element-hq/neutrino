@@ -195,6 +195,26 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### Scan duty follows the connected-peer count (2026-07-08)
+
+The alice/bob 2-minute "Hi" delay: the pipe never died, it crawled — ACK p50
+~5s (bimodal, min 52ms), ~30 datagrams queued ≈ 2.5min of queue latency, while
+the phone ran a 100%-duty `LOW_LATENCY` scan alongside two GATT pipes on one
+radio. Fix: the registry emits `PeerAction::SetScanLowPower` when the
+Connected-peer count crosses 0↔1 (single choke point in `handle()`, next to
+phase-transition logging); the driver executes it by cycling the scan at
+`ScanMode::LowPower` (Android `SCAN_MODE_LOW_POWER`, ~10% duty) while any peer
+is connected, back to `LOW_LATENCY` when the last leaves. The duty flag lives
+on `BlewDriver` and is read by every scan (re)start, so it survives `rescan()`
+and adapter-cycle recovery. Chosen over "pause scan entirely while connected"
+(kills Dead-peer revival-by-advert and new-peer discovery) and over
+traffic-based signals (flappy; connection count is stable). Trade-off accepted:
+new-peer discovery while chatting slows from ~instant to ≤~10s (0.5s scan
+window per 5s). No blew/Kotlin changes — `ScanMode::LowPower` already plumbs
+through. Not addressed (still open from the same incident): timeline-prev
+gapfill from the referencing event's sender; CoAP-timeout-vs-queue-latency
+mismatch (timed-out bytes stay queued and retries double-buffer).
+
 ### BLE discovery rescan is host-pulsed, not polled (2026-07-08)
 
 New-peer investigation (charlie): a peer that starts advertising after an

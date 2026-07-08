@@ -22,6 +22,12 @@ pub trait BleInterface: Send + Sync + 'static {
     async fn open_l2cap(&self, device_id: &DeviceId, psm: u16) -> BleResult<L2capChannel>;
     async fn start_scan(&self) -> BleResult<()>;
     async fn stop_scan(&self) -> BleResult<()>;
+    /// Retune the discovery scan duty cycle: `low_power` while any peer is
+    /// connected (the scan shares the radio with pipe traffic), full duty when
+    /// idle. Default no-op — only platform-backed drivers own a scanner.
+    async fn set_scan_low_power(&self, _low_power: bool) -> BleResult<()> {
+        Ok(())
+    }
     async fn rebuild_server(&self) -> BleResult<()>;
     async fn restart_advertising(&self) -> BleResult<()>;
     async fn restart_l2cap_listener(&self) -> BleResult<Option<u16>>;

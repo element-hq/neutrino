@@ -367,6 +367,13 @@ pub enum PeerAction {
     RebuildGattServer,
     RestartAdvertising,
     RestartL2capListener,
+    /// The connected-peer count crossed 0↔1: retune the discovery scan duty.
+    /// `low_power` while any peer is connected — the radio is shared, and a
+    /// 100%-duty scan starves pipe traffic (ACK RTTs balloon from ~100ms to
+    /// seconds) — full duty again once the last peer disconnects.
+    SetScanLowPower {
+        low_power: bool,
+    },
     StartDataPipe {
         device_id: DeviceId,
         tx_gen: u64,

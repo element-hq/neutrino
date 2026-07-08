@@ -219,6 +219,15 @@ impl<I: BleInterface> Driver<I> {
                 });
             }
 
+            PeerAction::SetScanLowPower { low_power } => {
+                let iface = Arc::clone(&self.iface);
+                tokio::spawn(async move {
+                    if let Err(e) = iface.set_scan_low_power(low_power).await {
+                        tracing::debug!(?e, low_power, "set_scan_low_power failed");
+                    }
+                });
+            }
+
             PeerAction::RestartL2capListener => {
                 let iface = Arc::clone(&self.iface);
                 tokio::spawn(async move {
@@ -448,6 +457,11 @@ pub struct BlewDriver {
     // Mutable so the advertised manufacturer data (the local display name) can be
     // updated at runtime and re-advertised — see `set_manufacturer_data`.
     advertising_config: Mutex<AdvertisingConfig>,
+    /// Current scan duty: low power while any peer is connected (set via
+    /// [`BleInterface::set_scan_low_power`]), full duty (`LOW_LATENCY`) when
+    /// idle. Every scan (re)start reads this so the duty survives rescans and
+    /// adapter-cycle recovery.
+    scan_low_power: std::sync::atomic::AtomicBool,
 }
 
 impl BlewDriver {
@@ -464,6 +478,19 @@ impl BlewDriver {
             channels_by_device: Mutex::new(HashMap::new()),
             services,
             advertising_config: Mutex::new(advertising_config),
+            scan_low_power: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The discovery scan filter at the currently-selected duty cycle.
+    fn current_scan_filter(&self) -> blew::central::ScanFilter {
+        blew::central::ScanFilter {
+            mode: if self.scan_low_power.load(Ordering::Relaxed) {
+                blew::central::ScanMode::LowPower
+            } else {
+                blew::central::ScanMode::LowLatency
+            },
+            ..crate::discovery::scan_filter()
         }
     }
 
@@ -488,9 +515,7 @@ impl BlewDriver {
     /// best-effort (the scan may not be running).
     pub async fn rescan(&self) -> crate::error::BleResult<()> {
         let _ = self.central.stop_scan().await;
-        self.central
-            .start_scan(crate::discovery::scan_filter())
-            .await?;
+        self.central.start_scan(self.current_scan_filter()).await?;
         Ok(())
     }
 }
@@ -611,14 +636,25 @@ impl BleInterface for BlewDriver {
     }
 
     async fn start_scan(&self) -> crate::error::BleResult<()> {
-        self.central
-            .start_scan(crate::discovery::scan_filter())
-            .await?;
+        self.central.start_scan(self.current_scan_filter()).await?;
         Ok(())
     }
 
     async fn stop_scan(&self) -> crate::error::BleResult<()> {
         self.central.stop_scan().await?;
+        Ok(())
+    }
+
+    async fn set_scan_low_power(&self, low_power: bool) -> crate::error::BleResult<()> {
+        if self.scan_low_power.swap(low_power, Ordering::Relaxed) == low_power {
+            return Ok(());
+        }
+        tracing::info!(
+            low_power,
+            "retuning discovery scan duty (connected-peer count crossed 0↔1)"
+        );
+        let _ = self.central.stop_scan().await;
+        self.central.start_scan(self.current_scan_filter()).await?;
         Ok(())
     }
 

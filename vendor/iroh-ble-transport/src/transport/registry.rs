@@ -218,7 +218,27 @@ impl Registry {
             }
         }
         self.log_phase_transitions(&phases_before);
+        self.retune_scan_duty(&phases_before, &mut actions);
         actions
+    }
+
+    /// Emit [`PeerAction::SetScanLowPower`] when this command changed whether
+    /// ANY peer is connected. Scanning at 100% duty (`LOW_LATENCY`) while a
+    /// data pipe carries traffic starves the shared radio — observed as ACK
+    /// RTTs ballooning from ~100ms to ~5s with the send queue backing up for
+    /// minutes — so the scan drops to low duty while any peer is connected and
+    /// returns to full duty when the last one goes.
+    fn retune_scan_duty(&self, before: &[(DeviceId, PhaseKind)], actions: &mut Vec<PeerAction>) {
+        let was_connected = before.iter().any(|(_, k)| *k == PhaseKind::Connected);
+        let is_connected = self
+            .peers
+            .values()
+            .any(|e| PhaseKind::from(&e.phase) == PhaseKind::Connected);
+        if was_connected != is_connected {
+            actions.push(PeerAction::SetScanLowPower {
+                low_power: is_connected,
+            });
+        }
     }
 
     /// Log peer phase transitions caused by the just-handled command. Info
@@ -2410,6 +2430,108 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // Scan duty follows the connected-peer count crossing 0↔1: the first peer
+    // reaching Connected drops the scan to low power (a 100%-duty scan starves
+    // pipe traffic on the shared radio), the last one leaving restores full
+    // duty, and transitions that don't cross the boundary emit nothing.
+    #[test]
+    fn scan_duty_follows_connected_count_crossing() {
+        fn connected_entry(device_id: &blew::DeviceId) -> PeerEntry {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.tx_gen = 1;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: crate::transport::peer::ChannelHandle {
+                    id: 1,
+                    path: crate::transport::peer::ConnectPath::Gatt,
+                },
+                tx_gen: 1,
+                upgrading: false,
+            };
+            e
+        }
+
+        // 0 -> 1 (via Handshaking -> Connected): drop to low power.
+        let mut reg = Registry::new_for_test();
+        let dev_a = blew::DeviceId::from("dev-scan-a");
+        reg.peers.insert(dev_a.clone(), {
+            let mut e = PeerEntry::new(dev_a.clone());
+            e.tx_gen = 0;
+            e.phase = PeerPhase::Handshaking {
+                since: std::time::Instant::now(),
+                channel: crate::transport::peer::ChannelHandle {
+                    id: 1,
+                    path: crate::transport::peer::ConnectPath::Gatt,
+                },
+            };
+            e
+        });
+        let actions = reg.handle(PeerCommand::InboundGattFragment {
+            device_id: dev_a.clone(),
+            source: crate::transport::peer::FragmentSource::CentralReceivedP2c,
+            bytes: bytes::Bytes::from_static(b"frag"),
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::SetScanLowPower { low_power: true })),
+            "first Connected peer must drop scan duty; got {actions:?}"
+        );
+
+        // 1 -> 2: a second peer connecting must NOT retune (no crossing).
+        let dev_b = blew::DeviceId::from("dev-scan-b");
+        reg.peers.insert(dev_b.clone(), {
+            let mut e = PeerEntry::new(dev_b.clone());
+            e.tx_gen = 0;
+            e.phase = PeerPhase::Handshaking {
+                since: std::time::Instant::now(),
+                channel: crate::transport::peer::ChannelHandle {
+                    id: 2,
+                    path: crate::transport::peer::ConnectPath::Gatt,
+                },
+            };
+            e
+        });
+        let actions = reg.handle(PeerCommand::InboundGattFragment {
+            device_id: dev_b.clone(),
+            source: crate::transport::peer::FragmentSource::CentralReceivedP2c,
+            bytes: bytes::Bytes::from_static(b"frag"),
+        });
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::SetScanLowPower { .. })),
+            "1->2 connected peers must not retune; got {actions:?}"
+        );
+
+        // 2 -> 1: one peer disconnecting must NOT retune either.
+        let actions = reg.handle(PeerCommand::CentralDisconnected {
+            device_id: dev_b.clone(),
+            cause: blew::DisconnectCause::LinkLoss,
+        });
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::SetScanLowPower { .. })),
+            "2->1 connected peers must not retune; got {actions:?}"
+        );
+
+        // 1 -> 0: the last Connected peer leaving restores full duty.
+        let mut reg = Registry::new_for_test();
+        let dev_c = blew::DeviceId::from("dev-scan-c");
+        reg.peers.insert(dev_c.clone(), connected_entry(&dev_c));
+        let actions = reg.handle(PeerCommand::CentralDisconnected {
+            device_id: dev_c.clone(),
+            cause: blew::DisconnectCause::LinkLoss,
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::SetScanLowPower { low_power: false })),
+            "last Connected peer leaving must restore full duty; got {actions:?}"
+        );
     }
 
     #[test]
