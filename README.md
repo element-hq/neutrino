@@ -7,13 +7,13 @@ caveats:
 
  1. Neutrino has been written specifically to experiment with P2P Matrix dialects.
  2. It is **not** intended to run as a standalone homeserver.
-   * Instead, it's runnable from the P2P branch of Element X Android, embedded within the Android app.
+     * Instead, it's runnable from the P2P branch of Element X Android, embedded within the Android app.
  3. It is very deliberately **NOT SECURE** for use on the public internet.
-   * Again, please DO NOT USE NEUTRINO ON UNTRUSTED NETWORKS (e.g. the internet) yet.
-   * It does not yet put signatures on events, nor does it check them.
+     * Again, please DO NOT USE NEUTRINO ON UNTRUSTED NETWORKS (e.g. the internet) yet.
+     * It does not yet put signatures on events, nor does it check them.
  4. It does not speak or interoperate with normal Matrix yet.
  5. It is deliberately very feature poor; it only supports joining/leaving rooms and sending messages.
-   * It has no E2EE, or file transfer, or typing notifications, or read receipts, etc. etc.
+     * It has no E2EE, or file transfer, or typing notifications, or read receipts, etc. etc.
  6. It is deliberately not at all optimised yet - e.g. it has no caching.
  7. It only implements the very latest room versions (Hydra Phase 2 and (in future) 3 - e.g. State DAGs: MSC4242)
  8. Gives us somewhere to evaluate Hydra and state resets in the harshest conditions (i.e. P2P)
