@@ -481,6 +481,17 @@ impl BlewDriver {
             .manufacturer_data = data;
         self.restart_advertising().await
     }
+
+    /// Stop and re-start the discovery scan so the platform registers a fresh
+    /// scanner client. Some Android stacks stop delivering new advertisers to a
+    /// long-lived scan client even while the controller-level scan stays
+    /// enabled; cycling the client restores a current view. The stop is
+    /// best-effort (the scan may not be running).
+    pub async fn rescan(&self) -> crate::error::BleResult<()> {
+        let _ = self.central.stop_scan().await;
+        self.central.start_scan(ScanFilter::default()).await?;
+        Ok(())
+    }
 }
 
 #[async_trait]

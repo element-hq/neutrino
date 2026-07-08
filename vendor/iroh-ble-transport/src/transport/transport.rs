@@ -415,6 +415,15 @@ impl BleTransport {
         self.driver.set_manufacturer_data(data).await
     }
 
+    /// Restart the discovery scan (fresh platform scanner client). Called by
+    /// the host when its peer-search UI opens: some Android stacks stop
+    /// reporting new advertisers to a long-lived scan client, which leaves a
+    /// peer that started advertising after scan start invisible until the scan
+    /// is cycled. See [`BlewDriver::rescan`].
+    pub async fn rescan(&self) -> BleResult<()> {
+        self.driver.rescan().await
+    }
+
     #[must_use]
     pub fn metrics(&self) -> BleMetricsSnapshot {
         BleMetricsSnapshot {

@@ -95,6 +95,26 @@ fn spawn_readvertise(
     });
 }
 
+/// Restart the discovery scan whenever the handle pulses the watch
+/// (`NeutrinoHandle::rescan`, called by the host when its peer-search UI
+/// opens). A fresh scanner client makes peers that started advertising after
+/// the original scan visible on stacks that stop reporting new advertisers to
+/// a long-lived scan client.
+#[cfg(feature = "ble")]
+fn spawn_rescan(
+    ble: Arc<iroh_ble_transport::transport::BleTransport>,
+    mut rescan_rx: tokio::sync::watch::Receiver<u64>,
+) {
+    tokio::spawn(async move {
+        while rescan_rx.changed().await.is_ok() {
+            rescan_rx.borrow_and_update();
+            if let Err(e) = ble.rescan().await {
+                warn!(error = %e, "BLE discovery rescan failed");
+            }
+        }
+    });
+}
+
 /// Lowercase-hex a 32-byte node id → its `server_name` string.
 #[cfg(feature = "ble")]
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -169,12 +189,15 @@ impl IrohTransport {
         // store). The BLE transport advertises the current value and re-advertises
         // on change. Unused off the `ble` feature.
         name_rx: tokio::sync::watch::Receiver<String>,
+        // Pulsed by `NeutrinoHandle::rescan` (host's peer-search UI opening);
+        // each pulse cycles the BLE discovery scan. Unused off the `ble` feature.
+        rescan_rx: tokio::sync::watch::Receiver<u64>,
         // The homeserver's discovery registry; the BLE transport publishes peers
         // it scans into it. Unused off the `ble` feature.
         discovery: Arc<neutrino_main::DiscoveryRegistry>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
         #[cfg(not(feature = "ble"))]
-        let _ = (name_rx, discovery);
+        let _ = (name_rx, rescan_rx, discovery);
         let secret_key = SecretKey::from_bytes(secret);
         // The BLE transport needs our public key; capture it before the key is
         // moved into the builder.
@@ -234,6 +257,7 @@ impl IrohTransport {
             // and re-advertise our name when it changes.
             spawn_discovery_drain(ble.discovered_peers(), discovery);
             spawn_readvertise(Arc::clone(&ble), name_rx);
+            spawn_rescan(Arc::clone(&ble), rescan_rx);
             let ble: Arc<dyn iroh::endpoint::transports::CustomTransport> = ble;
             builder
                 .add_custom_transport(ble)
@@ -498,16 +522,19 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
 
-    /// `bind`'s two BLE-only args as test doubles: an empty display-name watch
-    /// (its sender is dropped immediately — the channel is unused off the `ble`
-    /// feature, and a closed channel just makes the re-advertise task exit
-    /// cleanly under it) and a fresh, empty discovery registry.
+    /// `bind`'s three BLE-only args as test doubles: an empty display-name watch
+    /// and a rescan watch (their senders are dropped immediately — the channels
+    /// are unused off the `ble` feature, and a closed channel just makes the
+    /// re-advertise/rescan task exit cleanly under it) and a fresh, empty
+    /// discovery registry.
     fn ble_args() -> (
         tokio::sync::watch::Receiver<String>,
+        tokio::sync::watch::Receiver<u64>,
         Arc<neutrino_main::DiscoveryRegistry>,
     ) {
         (
             tokio::sync::watch::channel(String::new()).1,
+            tokio::sync::watch::channel(0u64).1,
             Arc::new(neutrino_main::DiscoveryRegistry::new()),
         )
     }
@@ -530,12 +557,12 @@ mod tests {
     #[tokio::test]
     async fn datagram_relays_a_to_b_to_a_over_iroh() {
         let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
-        let (a_name, a_disc) = ble_args();
-        let a_tp = IrohTransport::bind(&[1u8; 32], loopback, a_name, a_disc)
+        let (a_name, a_rescan, a_disc) = ble_args();
+        let a_tp = IrohTransport::bind(&[1u8; 32], loopback, a_name, a_rescan, a_disc)
             .await
             .expect("bind A");
-        let (b_name, b_disc) = ble_args();
-        let b_tp = IrohTransport::bind(&[2u8; 32], loopback, b_name, b_disc)
+        let (b_name, b_rescan, b_disc) = ble_args();
+        let b_tp = IrohTransport::bind(&[2u8; 32], loopback, b_name, b_rescan, b_disc)
             .await
             .expect("bind B");
 
@@ -572,8 +599,8 @@ mod tests {
     #[tokio::test]
     async fn send_to_unknown_peer_is_an_error() {
         let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
-        let (name, disc) = ble_args();
-        let tp = IrohTransport::bind(&[3u8; 32], loopback, name, disc)
+        let (name, rescan, disc) = ble_args();
+        let tp = IrohTransport::bind(&[3u8; 32], loopback, name, rescan, disc)
             .await
             .expect("bind");
         assert!(tp.send([9u8; 32], b"x").await.is_err());
@@ -589,8 +616,8 @@ mod tests {
     async fn node_key_matches_ed25519_public_key() {
         let secret = [7u8; 32];
         let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback");
-        let (name, disc) = ble_args();
-        let tp = IrohTransport::bind(&secret, loopback, name, disc)
+        let (name, rescan, disc) = ble_args();
+        let tp = IrohTransport::bind(&secret, loopback, name, rescan, disc)
             .await
             .expect("bind");
         let expected = ed25519_dalek::SigningKey::from_bytes(&secret)

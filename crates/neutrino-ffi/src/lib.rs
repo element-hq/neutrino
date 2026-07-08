@@ -129,6 +129,9 @@ pub struct NeutrinoHandle {
     /// Same `Arc` as the one wrapping the transport link; the Settings toggle
     /// drives it via `start_capture`/`stop_capture`.
     capture: std::sync::Arc<neutrino_main::CaptureControl>,
+    /// Pulse counter watched by the BLE transport; each bump cycles the
+    /// discovery scan. Driven by `rescan()`.
+    rescan: tokio::sync::watch::Sender<u64>,
 }
 
 #[uniffi::export]
@@ -156,6 +159,16 @@ impl NeutrinoHandle {
     /// connectivity is restored so backed-off destinations reconnect promptly.
     pub fn kick_backoff(&self) {
         self.command(Command::KickBackoff);
+    }
+
+    /// Restart the BLE discovery scan (fresh platform scanner client). The host
+    /// calls this when its peer-search UI opens: some Android stacks stop
+    /// reporting new advertisers to a long-lived scan client, so a peer that
+    /// began advertising after scan start stays invisible until the scan is
+    /// cycled. Fire-and-forget and safe from the FFI/JNI thread; a no-op on a
+    /// build without BLE or before the transport is up.
+    pub fn rescan(&self) {
+        self.rescan.send_modify(|n| *n = n.wrapping_add(1));
     }
 
     /// The server's resolved federation name — its derived node id, or `None`
@@ -257,10 +270,15 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
     // calls this once it has resolved the secret, then injects the link into the
     // lb sidecar. A bind failure is widened to `entrypoint`'s boxed error and
     // fails startup loudly (logged on the runtime thread below).
+    // Rescan pulses flow handle → transport: `rescan()` bumps the counter, the
+    // transport's watcher task cycles the BLE discovery scan. A plain counter
+    // (not the count's value) — only the change edge matters.
+    let (rescan_tx, rescan_rx) = tokio::sync::watch::channel(0u64);
     let link_factory: neutrino_main::FederationLinkFactory = Box::new(move |secret, name_rx| {
         Box::pin(async move {
             let transport =
-                IrohTransport::bind(&secret, RELAY_BIND, name_rx, discovery_for_link).await?;
+                IrohTransport::bind(&secret, RELAY_BIND, name_rx, rescan_rx, discovery_for_link)
+                    .await?;
             let link = transport as std::sync::Arc<dyn neutrino_main::DatagramLink>;
             // Always install the (inert) capture tap so the host can toggle it at
             // runtime without rebuilding the link.
@@ -316,6 +334,7 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
         identity: handoff_rx,
         discovery: discovery_for_handle,
         capture,
+        rescan: rescan_tx,
     }
 }
 
@@ -356,6 +375,7 @@ mod tests {
             identity: tokio::sync::watch::channel::<Option<String>>(None).1,
             discovery: std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new()),
             capture: neutrino_main::CaptureControl::new(),
+            rescan: tokio::sync::watch::channel(0u64).0,
         };
         handle.shutdown();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::Shutdown);
@@ -372,6 +392,7 @@ mod tests {
             identity: tokio::sync::watch::channel::<Option<String>>(None).1,
             discovery: std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new()),
             capture: neutrino_main::CaptureControl::new(),
+            rescan: tokio::sync::watch::channel(0u64).0,
         };
         handle.kick_backoff();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::KickBackoff);
@@ -401,6 +422,7 @@ mod tests {
             identity: tokio::sync::watch::channel::<Option<String>>(None).1,
             discovery,
             capture: neutrino_main::CaptureControl::new(),
+            rescan: tokio::sync::watch::channel(0u64).0,
         };
         let peers = handle.discovered_peers();
         // Sorted by (display_name, server_name); localpart is dropped, other
@@ -420,6 +442,7 @@ mod tests {
             identity: tokio::sync::watch::channel::<Option<String>>(None).1,
             discovery: std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new()),
             capture: neutrino_main::CaptureControl::new(),
+            rescan: tokio::sync::watch::channel(0u64).0,
         };
         assert!(handle.discovered_peers().is_empty());
     }

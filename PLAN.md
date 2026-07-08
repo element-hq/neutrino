@@ -195,6 +195,23 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### BLE discovery rescan is host-pulsed, not polled (2026-07-08)
+
+New-peer investigation (charlie): a peer that starts advertising after an
+existing phone's scan begins can stay invisible to that phone's long-lived
+scanner client — the controller-level scan stays enabled, but new advertisers
+stop being reported to the app callback (nRF Connect confirmed the advert is on
+the air, so it's receiver-side). Fix: `NeutrinoHandle::rescan()` — a watch-pulse
+from the host when its peer-search UI opens, drained by a transport task that
+cycles the scan (`BleTransport::rescan` → stop + start = fresh platform scanner
+client, and blew's Kotlin `startScan` registers a new `ScanCallback`). Chosen
+over (a) periodic automatic rescan (radio churn with no user intent) and
+(b) rescanning inside `discovered_peers()` (side-effecting read, fires per
+keystroke while the search polls). The EX-side call (search screen → rescan())
+lives in the app repo. Not addressed here: masked-UUID filtered scanning
+(unfiltered scans get zero results when the screen is off) and discovery-path
+debug logging — both noted as follow-ons.
+
 ### Q-Block requests carry no blanket Q-Block2 opt-in; coap-rs vendored (2026-07-07)
 - Wireshark could not reassemble multi-block CBOR *request* bodies in Q-Block
   captures ("Malformed packet: CBOR" on block 0, stray CBOR on later blocks)
