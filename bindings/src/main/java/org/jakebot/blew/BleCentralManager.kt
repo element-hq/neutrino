@@ -418,6 +418,34 @@ object BleCentralManager {
                     value,
                 )
             }
+
+            // Pre-API-33 devices invoke only the legacy callback overloads;
+            // API 33+ invokes both, so gate on SDK_INT to avoid double
+            // delivery. Copy `value` immediately — the legacy getter exposes
+            // the framework's mutable buffer.
+
+            @Deprecated("Deprecated in Java")
+            override fun onCharacteristicRead(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                status: Int,
+            ) {
+                if (android.os.Build.VERSION.SDK_INT >= 33) return
+                @Suppress("DEPRECATION")
+                val value = characteristic.value?.copyOf() ?: ByteArray(0)
+                onCharacteristicRead(gatt, characteristic, value, status)
+            }
+
+            @Deprecated("Deprecated in Java")
+            override fun onCharacteristicChanged(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+            ) {
+                if (android.os.Build.VERSION.SDK_INT >= 33) return
+                @Suppress("DEPRECATION")
+                val value = characteristic.value?.copyOf() ?: ByteArray(0)
+                onCharacteristicChanged(gatt, characteristic, value)
+            }
         }
 
     // ── Connection management ──
@@ -566,7 +594,7 @@ object BleCentralManager {
                         } else {
                             pendingNonces[nonceKey] = nonce
                         }
-                        val ret = gatt.writeCharacteristic(char, value, writeType)
+                        val ret = writeCharacteristicCompat(gatt, char, value, writeType)
                         if (ret != BluetoothStatusCodes.SUCCESS) {
                             noResponseHandled.remove(deviceAddr)
                             pendingNonces.remove(nonceKey)
@@ -616,7 +644,8 @@ object BleCentralManager {
                         val key = "$deviceAddr:cccd:$charUuid"
                         pendingNonces[key] = nonce
                         val ret =
-                            gatt.writeDescriptor(
+                            writeDescriptorCompat(
+                                gatt,
                                 descriptor,
                                 BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE,
                             )
@@ -659,7 +688,8 @@ object BleCentralManager {
                             val key = "$deviceAddr:cccd:$charUuid"
                             pendingNonces[key] = nonce
                             val ret =
-                                gatt.writeDescriptor(
+                                writeDescriptorCompat(
+                                    gatt,
                                     descriptor,
                                     BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE,
                                 )
@@ -725,6 +755,56 @@ object BleCentralManager {
     fun closeL2cap(socketId: Int) = l2cap.close(socketId)
 
     // ── Helpers ──
+
+    /**
+     * Write a characteristic, handling the API 33+ / legacy split: the
+     * Int-returning [BluetoothGatt.writeCharacteristic] overload only exists
+     * on API 33+, and calling it on older devices throws [NoSuchMethodError].
+     * Returns a [BluetoothStatusCodes] value on both paths.
+     */
+    private fun writeCharacteristicCompat(
+        gatt: BluetoothGatt,
+        char: BluetoothGattCharacteristic,
+        value: ByteArray,
+        writeType: Int,
+    ): Int =
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            gatt.writeCharacteristic(char, value, writeType)
+        } else {
+            @Suppress("DEPRECATION")
+            synchronized(char) {
+                char.writeType = writeType
+                char.value = value
+                if (gatt.writeCharacteristic(char)) {
+                    BluetoothStatusCodes.SUCCESS
+                } else {
+                    BluetoothStatusCodes.ERROR_UNKNOWN
+                }
+            }
+        }
+
+    /**
+     * Write a descriptor, handling the API 33+ / legacy split — see
+     * [writeCharacteristicCompat].
+     */
+    private fun writeDescriptorCompat(
+        gatt: BluetoothGatt,
+        descriptor: BluetoothGattDescriptor,
+        value: ByteArray,
+    ): Int =
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            gatt.writeDescriptor(descriptor, value)
+        } else {
+            @Suppress("DEPRECATION")
+            synchronized(descriptor) {
+                descriptor.value = value
+                if (gatt.writeDescriptor(descriptor)) {
+                    BluetoothStatusCodes.SUCCESS
+                } else {
+                    BluetoothStatusCodes.ERROR_UNKNOWN
+                }
+            }
+        }
 
     private fun findCharacteristic(
         gatt: BluetoothGatt,
