@@ -9,7 +9,7 @@ caveats:
  2. It is **not** intended to run as a standalone homeserver.
    * Instead, it's runnable from the P2P branch of Element X Android, embedded within the Android app.
  3. It is very deliberately **NOT SECURE** for use on the public internet.
-   * Again, please do not use Neutrino on untrusted networks yet.
+   * Again, please DO NOT USE NEUTRINO ON UNTRUSTED NETWORKS (e.g. the internet) yet.
    * It does not yet put signatures on events, nor does it check them.
  4. It does not speak or interoperate with normal Matrix yet.
  5. It is deliberately very feature poor; it only supports joining/leaving rooms and sending messages.
