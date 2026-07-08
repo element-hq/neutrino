@@ -647,6 +647,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_kick_backoff(
     ): Short
+    external fun uniffi_neutrino_checksum_method_neutrinohandle_rescan(
+    ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_server_name(
     ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_shutdown(
@@ -684,6 +686,8 @@ internal object UniffiLib {
     external fun uniffi_neutrino_fn_method_neutrinohandle_is_capturing(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_neutrino_fn_method_neutrinohandle_kick_backoff(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_neutrino_fn_method_neutrinohandle_rescan(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_neutrino_fn_method_neutrinohandle_server_name(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1248,6 +1252,16 @@ public interface NeutrinoHandleInterface {
     fun `kickBackoff`()
     
     /**
+     * Restart the BLE discovery scan (fresh platform scanner client). The host
+     * calls this when its peer-search UI opens: some Android stacks stop
+     * reporting new advertisers to a long-lived scan client, so a peer that
+     * began advertising after scan start stays invisible until the scan is
+     * cycled. Fire-and-forget and safe from the FFI/JNI thread; a no-op on a
+     * build without BLE or before the transport is up.
+     */
+    fun `rescan`()
+    
+    /**
      * The server's resolved federation name — its derived node id, or `None`
      * until the server has booted and resolved its identity (so the host can
      * distinguish "not ready yet" from a value rather than racing on an empty
@@ -1446,6 +1460,26 @@ open class NeutrinoHandle: Disposable, AutoCloseable, NeutrinoHandleInterface
     callWithHandle {
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_neutrino_fn_method_neutrinohandle_kick_backoff(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Restart the BLE discovery scan (fresh platform scanner client). The host
+     * calls this when its peer-search UI opens: some Android stacks stop
+     * reporting new advertisers to a long-lived scan client, so a peer that
+     * began advertising after scan start stays invisible until the scan is
+     * cycled. Fire-and-forget and safe from the FFI/JNI thread; a no-op on a
+     * build without BLE or before the transport is up.
+     */override fun `rescan`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_neutrino_fn_method_neutrinohandle_rescan(
         it,
         _status)
 }
