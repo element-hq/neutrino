@@ -171,6 +171,14 @@ pub(crate) async fn handle(
     let mut pdus = BTreeMap::new();
     let mut seen: HashSet<OwnedEventId> = HashSet::new();
     let mut touched: BTreeSet<OwnedRoomId> = BTreeSet::new();
+    // The `prev_events` of every staged PDU, per room — candidate timeline
+    // gaps. Two subtractions keep this from double-fetching: a prev that is
+    // also in the same PDU's `prev_state_events` is excluded here (the worker's
+    // state-DAG gap-fill already fetches it, and blocks integration on it),
+    // and ids delivered by this same transaction are subtracted below. Whatever
+    // remains is checked against the store (and fetched from the origin if
+    // missing) by `fill_timeline_prev_gap`.
+    let mut txn_prevs: BTreeMap<OwnedRoomId, BTreeSet<OwnedEventId>> = BTreeMap::new();
     // Stays true only if every keyable PDU was durably staged. A storage fault
     // on any one keeps the txn *unrecorded* so the peer's resend re-stages it
     // (never-lose). An unkeyable/malformed PDU is an intentional drop, not a
@@ -193,6 +201,13 @@ pub(crate) async fn handle(
             // both cases it is pending in the room, so poke the worker.
             Ok(_) => {
                 touched.insert(event.room_id.clone());
+                txn_prevs.entry(event.room_id.clone()).or_default().extend(
+                    event
+                        .prev_events
+                        .iter()
+                        .filter(|p| !event.prev_state_events.contains(p))
+                        .cloned(),
+                );
                 PduResult::default()
             }
             // A storage write fault is a server-side problem; surface it on this
@@ -249,6 +264,35 @@ pub(crate) async fn handle(
         tokio::spawn(async move {
             reconcile::reconcile_room(&*store, &*fetcher, &worker_poke, &origin, &room, &heads)
                 .await;
+        });
+    }
+
+    // Timeline-prev gap-fill: if this transaction's PDUs reference prev_events
+    // we don't hold, fetch them from the sender now — it referenced them, so it
+    // holds them — instead of waiting for their author's own (possibly wedged)
+    // push or a later anti-entropy round. Prevs delivered inside this same
+    // transaction are subtracted here; the store-existence check happens in the
+    // task. Fire-and-forget for the same reason as reconciliation, and bounded
+    // (small pages, few rounds) so a deep gap is left to backfill.
+    for (room, mut prevs) in txn_prevs {
+        prevs.retain(|p| !seen.contains(p));
+        if prevs.is_empty() {
+            continue;
+        }
+        let store = store.clone();
+        let fetcher = fetcher.clone();
+        let worker_poke = worker_poke.clone();
+        let origin = body.origin.clone();
+        tokio::spawn(async move {
+            reconcile::fill_timeline_prev_gap(
+                &*store,
+                &*fetcher,
+                &worker_poke,
+                &origin,
+                &room,
+                prevs.into_iter().collect(),
+            )
+            .await;
         });
     }
 

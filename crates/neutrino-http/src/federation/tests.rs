@@ -42,7 +42,7 @@ use neutrino_engine::{MissingEventsFetcher, MissingEventsQuery, TransportError};
 
 /// The arguments one `fetch` call was made with, recorded so a test can assert
 /// the gap-fill loop targets the right frontier / boundary / limit.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct FetchCall {
     latest: Vec<OwnedEventId>,
     earliest: Vec<OwnedEventId>,
@@ -2456,6 +2456,213 @@ async fn reconcile_ignores_advertisement_from_non_member_peer() {
         fetcher.call_count(),
         0,
         "an advertisement from a non-member peer must trigger no fetch",
+    );
+}
+
+#[tokio::test]
+async fn send_pulls_missing_prev_events_from_transaction_origin() {
+    // The "Hi took two minutes" regression: the peer pushes us `yo` whose
+    // `prev_events` references `hi`, which we never received (its author's pipe
+    // to us was wedged). The origin referenced `hi`, so it holds it — `/send`
+    // must pull it from the origin right away rather than integrate `yo` around
+    // a permanent-until-anti-entropy timeline gap.
+    let fetcher = StubFetcher::no_progress();
+    // Room shared with the peer (membership gate) — same seeding as the
+    // reconcile pull test: create ← alice-join ← peer-join.
+    let (store, _tempfile) = fresh_store().await;
+    let alice = alice();
+    let peer = peer_user();
+    let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    let alice_join = EventBuilder::new(alice.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(alice.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create.event_id.clone()])
+        .prev_state_events(vec![create.event_id.clone()])
+        .build()
+        .expect("build alice join");
+    let peer_join = EventBuilder::new(peer.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(peer.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![alice_join.event_id.clone()])
+        .prev_state_events(vec![alice_join.event_id.clone()])
+        .build()
+        .expect("build peer join");
+    let head = peer_join.event_id.clone();
+    store
+        .create_room(&create, &[alice_join, peer_join])
+        .await
+        .expect("create_room");
+    let app = router_with_store_and_fetcher(config(), store.clone(), fetcher.clone());
+
+    // `hi`: on the shared head (grounded once fetched); we don't hold it.
+    let hi = message_on(&peer, &room_id, &head, "hi", 1_700_000_002_000);
+    // `yo`: timeline-prev is `hi` (missing), state-prev is the held head — so
+    // it integrates immediately, leaving a pure timeline gap.
+    let yo = EventBuilder::new(peer.clone(), "m.room.message".to_owned())
+        .room_id(room_id.clone())
+        .content(json!({ "msgtype": "m.text", "body": "yo" }))
+        .prev_events(vec![hi.event_id.clone()])
+        .prev_state_events(vec![head.clone()])
+        .origin_server_ts(1_700_000_003_000)
+        .build()
+        .expect("build yo");
+    fetcher.set_events(&[&hi]);
+
+    let (status, body) = put_json(&app, &send_path("prev-gap-txn"), &txn(&[&yo])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    // `yo` integrates on its own (state ancestry held); `hi` arrives via the
+    // prev-gap pull from the origin and commits too.
+    let yo_row = wait_committed(&store, yo.event_id.as_ref()).await;
+    assert!(!yo_row.rejected);
+    let hi_row = wait_committed(&store, hi.event_id.as_ref()).await;
+    assert!(!hi_row.rejected, "pulled prev must auth-pass and commit");
+
+    // Exactly one fetch: the missing prev, walking the timeline DAG in the
+    // small prev-gap page size — and no second round, because the staged
+    // event's own ancestry is grounded.
+    let calls = fetcher.calls();
+    assert_eq!(calls.len(), 1, "one prev-gap pull; calls = {calls:?}");
+    assert_eq!(calls[0].latest, vec![hi.event_id.clone()]);
+    assert_eq!(
+        calls[0].limit, 10,
+        "prev-gap fetches use the small page size"
+    );
+}
+
+#[tokio::test]
+async fn prev_gap_fill_stops_at_round_budget() {
+    // A gap deeper than the round budget (3 rounds × its page size) is left
+    // unfilled: each round the peer serves one ancestor whose own prev is the
+    // next unknown, and after three rounds the walk must stop — the deepest
+    // ancestor is never requested. Drives `fill_timeline_prev_gap` directly so
+    // the round count is deterministic.
+    let (store, _tempfile) = fresh_store().await;
+    let alice = alice();
+    let peer = peer_user();
+    let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    let alice_join = EventBuilder::new(alice.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(alice.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create.event_id.clone()])
+        .prev_state_events(vec![create.event_id.clone()])
+        .build()
+        .expect("build alice join");
+    let peer_join = EventBuilder::new(peer.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(peer.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![alice_join.event_id.clone()])
+        .prev_state_events(vec![alice_join.event_id.clone()])
+        .build()
+        .expect("build peer join");
+    let head = peer_join.event_id.clone();
+    store
+        .create_room(&create, &[alice_join, peer_join])
+        .await
+        .expect("create_room");
+
+    // A chain of four missing ancestors: c1 ← c2 ← c3 ← c4 (state-prevs all on
+    // the held head, so only the timeline DAG is gapped).
+    let chain_msg = |prev: &OwnedEventId, body: &str, ts: u64| {
+        EventBuilder::new(peer.clone(), "m.room.message".to_owned())
+            .room_id(room_id.clone())
+            .content(json!({ "msgtype": "m.text", "body": body }))
+            .prev_events(vec![prev.clone()])
+            .prev_state_events(vec![head.clone()])
+            .origin_server_ts(ts)
+            .build()
+            .expect("build chain message")
+    };
+    let c1 = message_on(&peer, &room_id, &head, "c1", 1_700_000_002_000);
+    let c2 = chain_msg(&c1.event_id, "c2", 1_700_000_003_000);
+    let c3 = chain_msg(&c2.event_id, "c3", 1_700_000_004_000);
+    let c4 = chain_msg(&c3.event_id, "c4", 1_700_000_005_000);
+
+    // The peer dribbles one ancestor per round; the fourth batch must never be
+    // requested.
+    let fetcher = StubFetcher::no_progress();
+    fetcher.set_sequence(vec![vec![&c4], vec![&c3], vec![&c2], vec![&c1]]);
+    let (poke_tx, _poke_rx) = tokio::sync::mpsc::channel(8);
+    let peer_name: &ServerName = TEST_PEER.try_into().unwrap();
+
+    // As if a txn PDU referenced c4 as its prev.
+    neutrino_engine::reconcile::fill_timeline_prev_gap(
+        &*store,
+        &*fetcher,
+        &poke_tx,
+        peer_name,
+        &room_id,
+        vec![c4.event_id.clone()],
+    )
+    .await;
+
+    let calls = fetcher.calls();
+    assert_eq!(
+        calls.len(),
+        3,
+        "the walk stops at the round budget; calls = {calls:?}"
+    );
+    assert_eq!(calls[0].latest, vec![c4.event_id.clone()]);
+    assert_eq!(calls[1].latest, vec![c3.event_id.clone()]);
+    assert_eq!(calls[2].latest, vec![c2.event_id.clone()]);
+    // The deepest ancestor was deliberately left unfetched.
+    let staged: Vec<_> = store
+        .staged_for_room(&room_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.event_id)
+        .collect();
+    assert!(staged.contains(&c4.event_id));
+    assert!(staged.contains(&c2.event_id));
+    assert!(
+        !staged.contains(&c1.event_id),
+        "gap deeper than the budget stays unfilled"
+    );
+}
+
+#[tokio::test]
+async fn prev_gap_fill_ignores_non_member_peer() {
+    // Same fetch-amplification gate as reconciliation: prev ids arrive inside
+    // attacker-controllable PDU bytes, so a peer that doesn't share the room
+    // must not be able to make us fetch for it.
+    let fetcher = StubFetcher::no_progress();
+    let (_app, store, room_id, _alice, _join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let (poke_tx, _poke_rx) = tokio::sync::mpsc::channel(8);
+    let peer: &ServerName = TEST_PEER.try_into().unwrap();
+    let ghost: OwnedEventId = "$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        .try_into()
+        .unwrap();
+
+    neutrino_engine::reconcile::fill_timeline_prev_gap(
+        &*store,
+        &*fetcher,
+        &poke_tx,
+        peer,
+        &room_id,
+        vec![ghost],
+    )
+    .await;
+
+    assert_eq!(
+        fetcher.call_count(),
+        0,
+        "a non-member peer's prev references must trigger no fetch",
     );
 }
 

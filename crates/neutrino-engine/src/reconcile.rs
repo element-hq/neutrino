@@ -125,7 +125,7 @@ pub async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
 
     // State heads first (the auth-relevant DAG), then timeline heads. Each walks
     // the matching DAG so the fetched ancestry is the kind `apply_pdu` needs.
-    let mut staged = fetch_unknown(
+    let (mut staged, _) = fetch_unknown(
         store,
         fetcher,
         peer,
@@ -134,21 +134,22 @@ pub async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
         &our_state,
         &staged_ids,
         true,
+        RECONCILE_LIMIT,
     )
     .await;
-    staged.extend(
-        fetch_unknown(
-            store,
-            fetcher,
-            peer,
-            room_id,
-            &advertised.timeline,
-            &our_timeline,
-            &staged_ids,
-            false,
-        )
-        .await,
-    );
+    let (staged_timeline, _) = fetch_unknown(
+        store,
+        fetcher,
+        peer,
+        room_id,
+        &advertised.timeline,
+        &our_timeline,
+        &staged_ids,
+        false,
+        RECONCILE_LIMIT,
+    )
+    .await;
+    staged.extend(staged_timeline);
 
     // Hand the staged events to the inbound worker (toposort + auth + apply).
     // Best-effort poke: a full channel means the worker already has the room
@@ -166,10 +167,110 @@ pub async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
     }
 }
 
+/// Batch size per `get_missing_events` round of a timeline-prev gap-fill. Small
+/// on purpose: the fetch often rides the same congested pipe the gap came from,
+/// and each round's response must fit comfortably in one Q-Block transfer.
+const PREV_GAP_LIMIT: u32 = 10;
+
+/// Rounds per trigger. A gap deeper than `PREV_GAP_MAX_ROUNDS × PREV_GAP_LIMIT`
+/// events is deliberately left unfilled — that's history, and paging history is
+/// `/messages` backfill's job (or a later anti-entropy round); an inbound
+/// transaction must not turn into an unbounded walk of a peer's DAG.
+const PREV_GAP_MAX_ROUNDS: u32 = 3;
+
+/// Fetch the missing `prev_events` of a just-received transaction's PDUs from
+/// the transaction's origin. The origin referenced these ids (they are its own
+/// events' parents), so it provably holds them — asking it directly closes a
+/// timeline gap in seconds instead of waiting for the events' author to push
+/// them through a possibly-wedged pipe of its own, which is how a one-line
+/// message once took two minutes to arrive.
+///
+/// Bounded on both axes ([`PREV_GAP_LIMIT`], [`PREV_GAP_MAX_ROUNDS`]): each
+/// round fetches one small page walking the timeline DAG down from the current
+/// frontier, the next round's frontier is the prevs of what was just staged,
+/// and after the round budget whatever is still missing stays a gap. Prevs we
+/// already hold (or have staged) cost only the membership checks — the common
+/// linear-chat case where a PDU's prev is simply our current head is a cheap
+/// no-op. Same trust model as [`reconcile_room`]: fetched events are staged
+/// pre-auth and the worker auth-checks them like any PDU.
+pub async fn fill_timeline_prev_gap<F: MissingEventsFetcher + ?Sized>(
+    store: &impl StorageBackend,
+    fetcher: &F,
+    worker_poke: &mpsc::Sender<OwnedRoomId>,
+    peer: &ServerName,
+    room_id: &RoomId,
+    prevs: Vec<OwnedEventId>,
+) {
+    if prevs.is_empty() {
+        return;
+    }
+    // Same fetch-amplification scope guard as `reconcile_room`: PDU contents
+    // (and so their prev ids) are attacker-controllable.
+    match server_in_room(store, room_id, peer).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            warn!(%peer, %room_id, error = %e, "prev-gap: peer-membership check failed");
+            return;
+        }
+    }
+    let Ok(Some((our_timeline, _))) = store.forward_extremities(room_id).await else {
+        return;
+    };
+    let earliest: Vec<OwnedEventId> = our_timeline.into_iter().collect();
+
+    let mut heads = prevs;
+    for round in 0..PREV_GAP_MAX_ROUNDS {
+        let staged_ids: BTreeSet<OwnedEventId> = match store.staged_for_room(room_id).await {
+            Ok(rows) => rows.into_iter().map(|p| p.event_id).collect(),
+            Err(e) => {
+                warn!(%peer, %room_id, error = %e, "prev-gap: listing staged events failed");
+                return;
+            }
+        };
+        let (staged, staged_prevs) = fetch_unknown(
+            store,
+            fetcher,
+            peer,
+            room_id,
+            &heads,
+            &earliest,
+            &staged_ids,
+            false,
+            PREV_GAP_LIMIT,
+        )
+        .await;
+        if staged.is_empty() {
+            // Grounded (every head held/staged), or the peer had nothing new,
+            // or the fetch failed — in all cases there is no next frontier.
+            return;
+        }
+        info!(
+            target: "neutrino_http",
+            %peer,
+            %room_id,
+            round,
+            count = staged.len(),
+            events = ?sample_ids(&staged),
+            "prev-gap: staged missing prev_events from the transaction's origin, poking worker",
+        );
+        let _ = worker_poke.try_send(room_id.to_owned());
+        heads = staged_prevs;
+    }
+    // Round budget exhausted with a live frontier: leave the rest unfilled.
+    info!(
+        %peer, %room_id,
+        frontier = heads.len(),
+        "prev-gap: round budget exhausted; leaving deeper history to backfill",
+    );
+}
+
 /// Fetch the advertised `heads` we don't already hold — with their ancestry down
 /// to `earliest` — in a single `get_missing_events` (`include_latest_events` so
 /// the heads themselves come back, not just their ancestors), and stage them.
-/// Returns the ids of the events it newly staged.
+/// Returns `(staged, staged_prevs)`: the ids of the events it newly staged, and
+/// those events' `prev_events` — the next-deeper timeline frontier, which
+/// [`fill_timeline_prev_gap`] feeds back in as the next round's heads.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
     store: &impl StorageBackend,
@@ -180,9 +281,10 @@ async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
     earliest: &[OwnedEventId],
     staged_ids: &BTreeSet<OwnedEventId>,
     state_dag: bool,
-) -> Vec<OwnedEventId> {
+    limit: u32,
+) -> (Vec<OwnedEventId>, Vec<OwnedEventId>) {
     if heads.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     // `get_events` returns only the events we hold, so it doubles as an existence
     // filter: an advertised head it omits is one we are missing. A head already
@@ -192,7 +294,7 @@ async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
         Ok(events) => events.into_iter().map(|e| e.event_id).collect(),
         Err(e) => {
             warn!(%peer, %room_id, error = %e, "reconcile: looking up advertised heads failed");
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
     };
     let unknown: Vec<OwnedEventId> = heads
@@ -201,7 +303,7 @@ async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
         .cloned()
         .collect();
     if unknown.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     info!(
         target: "neutrino_http",
@@ -219,7 +321,7 @@ async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
             room_id,
             latest: &unknown,
             earliest,
-            limit: RECONCILE_LIMIT,
+            limit,
             state_dag,
             include_latest_events: true,
         })
@@ -228,11 +330,12 @@ async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
         Ok(fetched) => fetched,
         Err(e) => {
             warn!(%peer, %room_id, error = %e, "reconcile: fetching advertised heads failed");
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
     };
 
     let mut staged_new: Vec<OwnedEventId> = Vec::new();
+    let mut staged_prevs: Vec<OwnedEventId> = Vec::new();
     for raw in fetched {
         // Derive each event's id from its bytes (`from_wire`); an unkeyable PDU is
         // dropped. Only stage events for *this* room — a foreign-room event is
@@ -244,12 +347,15 @@ async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
             continue;
         }
         match store.stage_pdu(peer, room_id, &ev.event_id, &ev.raw).await {
-            Ok(true) => staged_new.push(ev.event_id),
+            Ok(true) => {
+                staged_prevs.extend(ev.prev_events.iter().cloned());
+                staged_new.push(ev.event_id);
+            }
             Ok(false) => {}
             Err(e) => {
                 warn!(%peer, %room_id, error = %e, "reconcile: staging a fetched event failed")
             }
         }
     }
-    staged_new
+    (staged_new, staged_prevs)
 }

@@ -195,6 +195,26 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### Timeline-prev gap-fill pulls from the transaction origin (2026-07-08)
+
+Second fix from the alice/bob delay: bob integrated charlie's "Yo" with
+`prev_events` pointing at alice's undelivered "Hi" and nothing fetched it —
+gap-fill only fired for `prev_state_events` (an integration blocker). Now the
+inbound `/send` handler collects each staged PDU's `prev_events` (minus ids in
+the same txn, minus ids also in that PDU's `prev_state_events` — those the
+state-DAG gap-fill already fetches and blocks on) and fire-and-forgets
+`reconcile::fill_timeline_prev_gap` per room: same membership gate, staging,
+and worker-poke as anti-entropy, but seeded from PDU prevs and bounded per
+Kegan — `limit=10` per `get_missing_events` round (PREV_GAP_LIMIT; small so a
+round fits one Q-Block transfer on a congested pipe), max 3 rounds
+(PREV_GAP_MAX_ROUNDS), next round's frontier = prevs of what the last round
+staged, deeper gaps deliberately left to `/messages` backfill / anti-entropy.
+Detection is a DB existence filter (`get_events` + staged rows) inside
+`fetch_unknown`, which now also returns the staged events' prevs; both callers
+share it. No new endpoint: `state_dag=false` on the existing
+`/get_missing_events`. Tests: e2e /send pull ("Hi" regression), round-budget
+bound, non-member gate.
+
 ### Scan duty follows the connected-peer count (2026-07-08)
 
 The alice/bob 2-minute "Hi" delay: the pipe never died, it crawled — ACK p50
