@@ -42,5 +42,13 @@ sha2 = "=0.11.0-rc.5"
 # pruned workspace depends on `blew`, and `vendor/blew` is not copied into the
 # image, so a path patch here would fail to load.
 async-compat = { git = "https://github.com/element-hq/async-compat", rev = "5a27c8b290f1f1dcfc0c4ec22c464e38528aa591" }
-coap = { git = "https://github.com/kaylendog/coap-rs", rev = "9d9b49b4e26b08aa927282f0f9ae3cbbb67dd059" }
+# Mirror the root manifest's in-tree fork (see ./Cargo.toml): the crates.io-
+# published `coap` 0.27.0 and the kaylendog git rev both predate the fields
+# neutrino-lb needs (`QBlockConfig::assume_peer_block_size`, `pub
+# UdpCoAPClient::MAX_PAYLOAD_BLOCK`). `vendor/coap-rs` carries them, so it is
+# copied into the image (docker/complement/Dockerfile) and patched by path here.
+# Unlike `blew`, `coap` is a patch-only, non-member crate with no `links` key, so
+# it does not trigger the cargo-chef member-normalisation collision that forced
+# the BLE crates to be pruned.
+coap = { path = "./vendor/coap-rs" }
 coap-lite = { git = "https://github.com/kaylendog/coap-lite", rev = "d45e95244bde0a65a36bf754eac7908beab7fafe" }

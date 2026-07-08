@@ -11,11 +11,14 @@ FROM chef AS planner
 # vendored BLE crates). `neutrino` — the only bin built here — doesn't use them,
 # and excluding them keeps `blew`/`iroh-ble-transport` out of the cargo-chef
 # recipe entirely, so cargo-chef's local-version normalisation can't trigger the
-# `links = "blew"` collision. Consequently `vendor/` is not copied.
+# `links = "blew"` collision. `vendor/coap-rs` is the one vendored crate that IS
+# copied: neutrino-lb depends on it and the pruned manifest patches `coap` to
+# this path (it has no `links` key, so it can't collide like `blew`).
 COPY docker/complement/Cargo.toml ./Cargo.toml
 COPY Cargo.lock ./Cargo.lock
 COPY crates ./crates
 COPY tools ./tools
+COPY vendor/coap-rs ./vendor/coap-rs
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
@@ -32,6 +35,7 @@ COPY docker/complement/Cargo.toml ./Cargo.toml
 COPY Cargo.lock ./Cargo.lock
 COPY crates ./crates
 COPY tools ./tools
+COPY vendor/coap-rs ./vendor/coap-rs
 RUN cargo build --release --bin neutrino --features multi-user-shim
 
 # Runtime: nginx sidecar terminates TLS on 8448 and proxies plain HTTP on 8008.
