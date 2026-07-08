@@ -643,11 +643,17 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_discovered_peers(
     ): Short
+    external fun uniffi_neutrino_checksum_method_neutrinohandle_is_capturing(
+    ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_kick_backoff(
     ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_server_name(
     ): Short
     external fun uniffi_neutrino_checksum_method_neutrinohandle_shutdown(
+    ): Short
+    external fun uniffi_neutrino_checksum_method_neutrinohandle_start_capture(
+    ): Short
+    external fun uniffi_neutrino_checksum_method_neutrinohandle_stop_capture(
     ): Short
     external fun ffi_neutrino_uniffi_contract_version(
     ): Int
@@ -675,12 +681,18 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_neutrino_fn_method_neutrinohandle_discovered_peers(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_neutrino_fn_method_neutrinohandle_is_capturing(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
     external fun uniffi_neutrino_fn_method_neutrinohandle_kick_backoff(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_neutrino_fn_method_neutrinohandle_server_name(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_neutrino_fn_method_neutrinohandle_shutdown(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_neutrino_fn_method_neutrinohandle_start_capture(`ptr`: Long,`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_neutrino_fn_method_neutrinohandle_stop_capture(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
     external fun uniffi_neutrino_fn_func_start(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     external fun ffi_neutrino_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1028,6 +1040,29 @@ public object FfiConverterULong: FfiConverter<ULong, Long> {
 /**
  * @suppress
  */
+public object FfiConverterBoolean: FfiConverter<Boolean, Byte> {
+    override fun lift(value: Byte): Boolean {
+        return value.toInt() != 0
+    }
+
+    override fun read(buf: ByteBuffer): Boolean {
+        return lift(buf.get())
+    }
+
+    override fun lower(value: Boolean): Byte {
+        return if (value) 1.toByte() else 0.toByte()
+    }
+
+    override fun allocationSize(value: Boolean) = 1UL
+
+    override fun write(value: Boolean, buf: ByteBuffer) {
+        buf.put(lower(value))
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
     // Note: we don't inherit from FfiConverterRustBuffer, because we use a
     // special encoding when lowering/lifting.  We can use `RustBuffer.len` to
@@ -1201,6 +1236,11 @@ public interface NeutrinoHandleInterface {
     fun `discoveredPeers`(): List<DiscoveredPeer>
     
     /**
+     * Whether a capture is currently running — drives the Settings toggle state.
+     */
+    fun `isCapturing`(): kotlin.Boolean
+    
+    /**
      * Reset outbound retry backoff and retry now. Convenience for
      * `command(Command::KickBackoff)`; the host calls this when device
      * connectivity is restored so backed-off destinations reconnect promptly.
@@ -1223,6 +1263,22 @@ public interface NeutrinoHandleInterface {
      * working unchanged.
      */
     fun `shutdown`()
+    
+    /**
+     * Start mirroring every federation datagram into a Wireshark-readable pcap
+     * at `path` (an absolute path in host-owned storage, e.g. app-specific
+     * external storage so it is `adb pull`-able). Errors if the file can't be
+     * opened. Calling it while already capturing rotates to the new file. A
+     * non-blocking control call, safe from the FFI/JNI thread.
+     */
+    fun `startCapture`(`path`: kotlin.String)
+    
+    /**
+     * Stop capturing and flush + close the file before returning, so it is
+     * immediately ready to `adb pull`. Returns whether a capture was running.
+     * Idempotent.
+     */
+    fun `stopCapture`(): kotlin.Boolean
     
     companion object
 }
@@ -1366,6 +1422,22 @@ open class NeutrinoHandle: Disposable, AutoCloseable, NeutrinoHandleInterface
 
     
     /**
+     * Whether a capture is currently running — drives the Settings toggle state.
+     */override fun `isCapturing`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_neutrino_fn_method_neutrinohandle_is_capturing(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Reset outbound retry backoff and retry now. Convenience for
      * `command(Command::KickBackoff)`; the host calls this when device
      * connectivity is restored so backed-off destinations reconnect promptly.
@@ -1417,6 +1489,44 @@ open class NeutrinoHandle: Disposable, AutoCloseable, NeutrinoHandleInterface
 }
     }
     
+    
+
+    
+    /**
+     * Start mirroring every federation datagram into a Wireshark-readable pcap
+     * at `path` (an absolute path in host-owned storage, e.g. app-specific
+     * external storage so it is `adb pull`-able). Errors if the file can't be
+     * opened. Calling it while already capturing rotates to the new file. A
+     * non-blocking control call, safe from the FFI/JNI thread.
+     */
+    @Throws(CaptureException::class)override fun `startCapture`(`path`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCallWithError(CaptureException) { _status ->
+    UniffiLib.uniffi_neutrino_fn_method_neutrinohandle_start_capture(
+        it,
+        FfiConverterString.lower(`path`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Stop capturing and flush + close the file before returning, so it is
+     * immediately ready to `adb pull`. Returns whether a capture was running.
+     * Idempotent.
+     */override fun `stopCapture`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_neutrino_fn_method_neutrinohandle_stop_capture(
+        it,
+        _status)
+}
+    }
+    )
+    }
     
 
     
@@ -1585,6 +1695,76 @@ public object FfiConverterTypeNeutrinoConfig: FfiConverterRustBuffer<NeutrinoCon
             FfiConverterUInt.write(value.`outboundConcurrency`, buf)
             FfiConverterOptionalUShort.write(value.`lbFederationPort`, buf)
     }
+}
+
+
+
+
+
+/**
+ * Failure arming a pcap capture (see `NeutrinoHandle::start_capture`).
+ */
+sealed class CaptureException: kotlin.Exception() {
+    
+    /**
+     * The capture file could not be opened/created at the given path. Field is
+     * named `reason` (not `message`) to avoid colliding with `Throwable.message`
+     * in the generated Kotlin exception.
+     */
+    class Io(
+        
+        val `reason`: kotlin.String
+        ) : CaptureException() {
+        override val message
+            get() = "reason=${ `reason` }"
+    }
+    
+
+    
+
+
+    companion object ErrorHandler : UniffiRustCallStatusErrorHandler<CaptureException> {
+        override fun lift(error_buf: RustBuffer.ByValue): CaptureException = FfiConverterTypeCaptureError.lift(error_buf)
+    }
+
+    
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeCaptureError : FfiConverterRustBuffer<CaptureException> {
+    override fun read(buf: ByteBuffer): CaptureException {
+        
+
+        return when(buf.getInt()) {
+            1 -> CaptureException.Io(
+                FfiConverterString.read(buf),
+                )
+            else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: CaptureException): ULong {
+        return when(value) {
+            is CaptureException.Io -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.`reason`)
+            )
+        }
+    }
+
+    override fun write(value: CaptureException, buf: ByteBuffer) {
+        when(value) {
+            is CaptureException.Io -> {
+                buf.putInt(1)
+                FfiConverterString.write(value.`reason`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+
 }
 
 

@@ -10,6 +10,7 @@ pub mod ingress;
 pub mod transport;
 
 pub use error::LbError;
+pub use transport::coap::capture::{CaptureControl, PcapCaptureLink};
 pub use transport::coap::datagram::DatagramLink;
 pub use transport::{DestinationResolver, DirectResolver};
 
@@ -90,12 +91,22 @@ impl QBlockTuning {
     /// (`probing_rate`, `nstart`, `non_probing_wait`) and the NON field
     /// `non_partial_timeout` (a partial-body hold time, not yet wired in coap-rs
     /// v1) at their defaults — none are read on the NON send/serve path today.
-    pub(crate) fn to_qblock_config(self) -> coap::qblock::QBlockConfig {
+    ///
+    /// `block1_size` is the wire's per-block payload cap (`None` = coap-rs's
+    /// 1024 B default). Both ends of the LB hop run this stack, so the config
+    /// declares Q-Block support out of band (`assume_peer_block_size`) at that
+    /// size: servers stream large responses as Q-Block2 without a per-request
+    /// opt-in — requests carrying a blanket Q-Block2 diverged from RFC 9177 /
+    /// libcoap practice and broke Wireshark's Q-Block reassembly.
+    pub(crate) fn to_qblock_config(self, block1_size: Option<usize>) -> coap::qblock::QBlockConfig {
         coap::qblock::QBlockConfig {
             max_payloads: self.max_payloads,
             non_timeout: self.non_timeout,
             non_receive_timeout: self.non_receive_timeout,
             non_max_retransmit: self.non_max_retransmit,
+            assume_peer_block_size: Some(
+                block1_size.unwrap_or(coap::client::UdpCoAPClient::MAX_PAYLOAD_BLOCK),
+            ),
             ..Default::default()
         }
     }
@@ -247,7 +258,7 @@ pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), 
             block1_size,
             qblock,
         } => {
-            let cfg = qblock.to_qblock_config();
+            let cfg = qblock.to_qblock_config(block1_size);
             let wire_client: Arc<dyn WireClient> =
                 Arc::new(CoapWireClient::with_qblock(block1_size, cfg.clone()));
             let wire_server = CoapWireServer::with_qblock(config.ingress_bind, cfg);
@@ -284,7 +295,7 @@ async fn serve_over_link(
             block1_size,
             qblock,
         } => {
-            let cfg = qblock.to_qblock_config();
+            let cfg = qblock.to_qblock_config(block1_size);
             let wire_client: Arc<dyn WireClient> = Arc::new(IrohCoapWireClient::with_qblock(
                 hub.clone(),
                 block1_size,
@@ -488,10 +499,14 @@ mod qblock_tuning_tests {
             non_receive_timeout: Duration::from_millis(900),
             non_max_retransmit: 2,
         };
-        let c = t.to_qblock_config();
+        let c = t.to_qblock_config(Some(512));
         assert_eq!(c.max_payloads, 7);
         assert_eq!(c.non_timeout, Duration::from_millis(500));
         assert_eq!(c.non_receive_timeout, Duration::from_millis(900));
         assert_eq!(c.non_max_retransmit, 2);
+        // Closed deployment: peer Q-Block support is declared out of band, at
+        // the wire's block size (falling back to coap-rs's 1024 B default).
+        assert_eq!(c.assume_peer_block_size, Some(512));
+        assert_eq!(t.to_qblock_config(None).assume_peer_block_size, Some(1024));
     }
 }

@@ -18,6 +18,7 @@
 //! reassembly-time cap is a follow-up (see `PLAN.md`); it needs coap-lite to bound
 //! the block accumulator, which the current API does not allow from the outside.
 
+pub mod capture;
 pub mod datagram;
 mod message;
 mod paths;
@@ -1492,9 +1493,12 @@ mod loss_tests {
         // Fast recovery timing so the test doesn't wait the 4 s default. The same
         // config drives both ends so the server's 4.08 fires while the client is
         // still lingering to service it (see `spawn_qblock_server_and_relay`).
+        // Peer support is assumed (as production does): requests carry no
+        // Q-Block2 opt-in, so the flag is what streams the echoed body back.
         let qcfg = coap::qblock::QBlockConfig {
             non_timeout: Duration::from_millis(50),
             non_receive_timeout: Duration::from_millis(100),
+            assume_peer_block_size: Some(64),
             ..Default::default()
         };
         let (relay_addr, token, dropped) =
@@ -1600,7 +1604,12 @@ mod qblock_client_tests {
         let addr: SocketAddr = probe.local_addr().unwrap();
         drop(probe);
         let mut server = Server::new_udp(addr).expect("server");
-        server.set_qblock_config(coap::qblock::QBlockConfig::default());
+        // Requests carry no Q-Block2 opt-in; the assumed peer support (64 B
+        // blocks, matching the client) is what streams the 2 KiB echo back.
+        server.set_qblock_config(coap::qblock::QBlockConfig {
+            assume_peer_block_size: Some(64),
+            ..Default::default()
+        });
 
         tokio::spawn(async move {
             server
@@ -1793,9 +1802,17 @@ mod qblock_server_tests {
         let token = CancellationToken::new();
         let server_token = token.clone();
         let handle = tokio::spawn(async move {
-            CoapWireServer::with_qblock(addr, coap::qblock::QBlockConfig::default())
-                .serve(Arc::new(PlainEcho), server_token)
-                .await
+            // Peer support assumed at the client's 128 B block size (requests
+            // carry no Q-Block2 opt-in), as production configures it.
+            CoapWireServer::with_qblock(
+                addr,
+                coap::qblock::QBlockConfig {
+                    assume_peer_block_size: Some(128),
+                    ..Default::default()
+                },
+            )
+            .serve(Arc::new(PlainEcho), server_token)
+            .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 

@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 pub use neutrino_ctl::{Command, Config, DiscoveredPeer, DiscoveryRegistry};
-pub use neutrino_lb::DatagramLink;
+pub use neutrino_lb::{CaptureControl, DatagramLink, PcapCaptureLink};
 
 use std::future::Future;
 use std::pin::Pin;

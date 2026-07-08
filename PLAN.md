@@ -89,6 +89,19 @@ Done:
   + 6 MSC4242 state-DAG keys) plus event-ID
   →raw-32 B packing with a re-encode/fall-back-to-text guard. CoAP path enums were
   already done (`transport::coap::paths`). (MSC3079.)
+- Wireshark pcap tap (`transport::coap::capture::PcapCaptureLink`): a
+  `DatagramLink` decorator that mirrors every datagram both directions into a
+  classic pcap (`LINKTYPE_RAW`, synthetic IPv4/UDP; us=10.0.0.1 / peer=10.0.0.N;
+  ports by CoAP role — server=5683, client=per-node ephemeral, so each exchange is
+  one client↔server conversation Wireshark can reassemble) and delegates untouched.
+  Each block is a full CoAP message, so Wireshark dissects CoAP + reassembles
+  blockwise + decodes CBOR natively (MTU chunking *and* payload, no custom decode).
+  Best-effort background writer; never
+  breaks transport. Runtime-toggleable from the host (`CaptureControl`): the tap
+  always wraps the link but stays inert until armed, so the FFI handle exposes
+  `start_capture(path)` / `stop_capture()` / `is_capturing()` (a Settings toggle).
+  `stop` joins the std-thread writer, so the file is flushed + `adb pull`-ready
+  the moment it returns. ffi-only; not on the shared `Config`.
 
 Deferred follow-ups (write-ups, not done):
 - Wire-size reduction for small MTUs: carry v12 **room** IDs as **raw 32 B**
@@ -181,6 +194,42 @@ never use .unwrap() in handler code.
 - Restricted rooms (`join_authorised_via_users_server`) — documented, not implemented
 
 ## decisions log
+
+### Q-Block requests carry no blanket Q-Block2 opt-in; coap-rs vendored (2026-07-07)
+- Wireshark could not reassemble multi-block CBOR *request* bodies in Q-Block
+  captures ("Malformed packet: CBOR" on block 0, stray CBOR on later blocks)
+  while responses decoded fine. Root cause: coap-rs stamped a Q-Block2
+  (opt 31) early-negotiation option on EVERY request; Wireshark keeps one
+  block-state slot per message and parses options in ascending number order,
+  so the request's Q-Block2 (31 > Q-Block1's 19) clobbered the real Q-Block1
+  block number/M-flag and every block was CBOR-dissected standalone. libcoap
+  (which the q-block support was modelled on) never combines the two on a
+  data-bearing request — it probes once per session (RFC 9177 §4.1).
+- Decision: requests carry Q-Block1 + Request-Tag only. Since both ends of the
+  LB hop run this stack, peer support is declared out of band via a new
+  `QBlockConfig.assume_peer_block_size: Option<usize>` (None = RFC-negotiated
+  only; a request that does carry Q-Block2 still wins). `QBlockTuning::
+  to_qblock_config(block1_size)` sets it to the wire's block size. Server-side,
+  `maybe_serve` now runs before the RFC 7959 `intercept_response` so the
+  BlockHandler never double-fragments a Q-Block2-streamed response.
+- The coap-rs fork is now vendored at `vendor/coap-rs` (base kaylendog/coap-rs
+  rev 9d9b49b) via `[patch.crates-io]` path — the sandbox can't push to the
+  fork; upstream the vendored diff and re-pin a git rev when convenient.
+  Excluded from workspace members so its dev-deps stay out of the shared
+  lockfile; test with `cargo test --features q-block --lib` inside it.
+- Side effect fixed: the client's 4.08 recovery template no longer inherits a
+  stale `Q-Block2 num=0` option (it used to re-request block 0 every round).
+- Remaining RFC 9177 deviations (deliberately NOT in this change, see plan
+  items 1b/1c): per-block MID+token for Q-Block1 blocks, NON (not CON) block
+  bursts. Wireshark-side single-slot bug worth filing upstream regardless.
+- Follow-up (same day): pcap capture now scopes the synthetic client port per
+  (client, token) instead of per node — Wireshark keys block reassembly by
+  5-tuple only, so an abandoned/interleaved transfer on a shared conversation
+  spliced into the next one's reassembly ("Illegal block fragments", subtly
+  corrupt CBOR; seen live when a stalled invite send orphaned block 0).
+  Token-less datagrams keep the per-node fallback port. CAVEAT recorded in
+  capture.rs: plan item 1b (per-block tokens) must switch this key to the
+  token's per-body low 32 bits or the Request-Tag.
 
 ### Bindings AAR ships consumer ProGuard rules (2026-07-03)
 - The blew Kotlin managers (`org.jakebot.blew.*`) are invoked from Rust purely

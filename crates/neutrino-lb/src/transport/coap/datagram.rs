@@ -771,6 +771,27 @@ mod tests {
         max_message_size: Option<usize>,
     ) -> (IrohCoapWireClient, CancellationToken, ServeHandle) {
         let (a_link, b_link) = MockLink::pair(NODE_A, NODE_B);
+        rig_with_links(
+            a_link,
+            b_link,
+            client_qblock,
+            server_qblock,
+            block1_size,
+            max_message_size,
+        )
+        .await
+    }
+
+    /// [`rig`] over caller-supplied links, so a test can interpose a tap (e.g.
+    /// [`PcapCaptureLink`](super::capture::PcapCaptureLink)) on A's side.
+    async fn rig_with_links(
+        a_link: Arc<dyn DatagramLink>,
+        b_link: Arc<dyn DatagramLink>,
+        client_qblock: Option<coap::qblock::QBlockConfig>,
+        server_qblock: Option<coap::qblock::QBlockConfig>,
+        block1_size: Option<usize>,
+        max_message_size: Option<usize>,
+    ) -> (IrohCoapWireClient, CancellationToken, ServeHandle) {
         let hub_a = Hub::new(a_link);
         let hub_b = Hub::new(b_link);
 
@@ -789,6 +810,17 @@ mod tests {
             None => IrohCoapWireClient::new(hub_a, block1_size),
         };
         (client, token, handle)
+    }
+
+    /// A Q-Block config shaped the way production
+    /// (`QBlockTuning::to_qblock_config`) builds it: peer support is assumed at
+    /// the wire's block size (both ends run this stack; requests carry no
+    /// per-request Q-Block2 opt-in), `None` = coap-rs's 1024 B default.
+    fn qblock_cfg(block1_size: Option<usize>) -> coap::qblock::QBlockConfig {
+        coap::qblock::QBlockConfig {
+            assume_peer_block_size: Some(block1_size.unwrap_or(1024)),
+            ..Default::default()
+        }
     }
 
     async fn shutdown(token: CancellationToken, handle: ServeHandle) {
@@ -880,7 +912,7 @@ mod tests {
     // A Q-Block NON-mode request must round-trip over the mock link.
     #[tokio::test]
     async fn qblock_round_trips() {
-        let qcfg = coap::qblock::QBlockConfig::default();
+        let qcfg = qblock_cfg(Some(128));
         let (client, token, handle) = rig(Some(qcfg.clone()), Some(qcfg), Some(128), None).await;
         let req_body: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
         let resp = client
@@ -935,7 +967,7 @@ mod tests {
 
     #[tokio::test]
     async fn qblock_long_federation_request_overflows_default_1024_block() {
-        let qcfg = coap::qblock::QBlockConfig::default();
+        let qcfg = qblock_cfg(None);
         let (mut client, token, handle) = rig(Some(qcfg.clone()), Some(qcfg), None, None).await;
         client.request_timeout = std::time::Duration::from_secs(3);
         let body: Vec<u8> = (0..1141).map(|i| (i % 251) as u8).collect();
@@ -959,7 +991,7 @@ mod tests {
     // request round-trips — 512 payload + options stays under 1280.
     #[tokio::test]
     async fn qblock_long_federation_request_round_trips_with_512_block() {
-        let qcfg = coap::qblock::QBlockConfig::default();
+        let qcfg = qblock_cfg(Some(512));
         let (client, token, handle) = rig(Some(qcfg.clone()), Some(qcfg), Some(512), None).await;
         let body: Vec<u8> = (0..1141).map(|i| (i % 251) as u8).collect();
         let resp = client
@@ -975,6 +1007,128 @@ mod tests {
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, body, "body corrupted");
         shutdown(token, handle).await;
+    }
+
+    /// UDP payloads of a classic `LINKTYPE_RAW` pcap as written by the capture
+    /// tap (24 B global header, 16 B record headers, 20 B IPv4 + 8 B UDP).
+    fn pcap_udp_payloads(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut payloads = Vec::new();
+        let mut off = 24;
+        while off + 16 <= bytes.len() {
+            let incl = u32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap()) as usize;
+            off += 16;
+            assert!(incl >= 28, "frame shorter than IPv4+UDP headers");
+            payloads.push(bytes[off + 28..off + incl].to_vec());
+            off += incl;
+        }
+        payloads
+    }
+
+    /// (code byte, option numbers) of a CoAP message.
+    fn coap_code_and_options(payload: &[u8]) -> (u8, Vec<u16>) {
+        let tkl = (payload[0] & 0x0f) as usize;
+        let code = payload[1];
+        let mut i = 4 + tkl;
+        let mut num = 0u16;
+        let mut opts = Vec::new();
+        while i < payload.len() && payload[i] != 0xFF {
+            let mut delta = (payload[i] >> 4) as u16;
+            let mut len = (payload[i] & 0x0f) as usize;
+            i += 1;
+            if delta == 13 {
+                delta = payload[i] as u16 + 13;
+                i += 1;
+            } else if delta == 14 {
+                delta = u16::from_be_bytes([payload[i], payload[i + 1]]) + 269;
+                i += 2;
+            }
+            if len == 13 {
+                len = payload[i] as usize + 13;
+                i += 1;
+            } else if len == 14 {
+                len = u16::from_be_bytes([payload[i], payload[i + 1]]) as usize + 269;
+                i += 2;
+            }
+            num += delta;
+            opts.push(num);
+            i += len;
+        }
+        (code, opts)
+    }
+
+    // The 1a wire pin (Wireshark CBOR reassembly): request PDUs must NOT carry
+    // Q-Block2 (option 31). Wireshark keeps one block-state slot per message
+    // and dissects options in ascending number order, so a request-side
+    // Q-Block2 (31 > Q-Block1's 19) clobbered the real Q-Block1 state and left
+    // multi-block CBOR request bodies undecodable ("Malformed packet: CBOR").
+    // Asserted on the actual datagrams via the pcap tap, over a full Q-Block
+    // round-trip; the response leg must still stream Q-Block2 (via
+    // `assume_peer_block_size`, not a per-request opt-in).
+    #[tokio::test]
+    async fn qblock_requests_carry_no_qblock2_on_the_wire() {
+        use super::super::capture::{CaptureControl, PcapCaptureLink};
+        const Q_BLOCK1: u16 = 19;
+        const Q_BLOCK2: u16 = 31;
+
+        let (a_link, b_link) = MockLink::pair(NODE_A, NODE_B);
+        let control = CaptureControl::new();
+        let a_link = PcapCaptureLink::wrap(a_link, control.clone());
+        let path = std::env::temp_dir().join(format!(
+            "neutrino-qblock2-wire-pin-{}.pcap",
+            std::process::id()
+        ));
+        control.start(path.to_str().unwrap()).unwrap();
+
+        let qcfg = qblock_cfg(Some(128));
+        let (client, token, handle) = rig_with_links(
+            a_link,
+            b_link,
+            Some(qcfg.clone()),
+            Some(qcfg),
+            Some(128),
+            None,
+        )
+        .await;
+        let req_body: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let resp = client
+            .send(WireRequest {
+                dest: hex_node(NODE_B),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txnw".to_owned(),
+                headers: vec![],
+                body: req_body.clone(),
+            })
+            .await
+            .expect("qblock send");
+        assert_eq!(resp.body, req_body);
+        shutdown(token, handle).await;
+        control.stop();
+
+        let (mut q1_requests, mut q2_requests, mut q2_responses) = (0, 0, 0);
+        for payload in pcap_udp_payloads(&std::fs::read(&path).unwrap()) {
+            let (code, opts) = coap_code_and_options(&payload);
+            match code >> 5 {
+                0 if code != 0 => {
+                    q1_requests += usize::from(opts.contains(&Q_BLOCK1));
+                    q2_requests += usize::from(opts.contains(&Q_BLOCK2));
+                }
+                2..=5 => q2_responses += usize::from(opts.contains(&Q_BLOCK2)),
+                _ => {}
+            }
+        }
+        std::fs::remove_file(&path).ok();
+        assert!(
+            q1_requests > 1,
+            "multi-block Q-Block1 request not exercised"
+        );
+        assert_eq!(
+            q2_requests, 0,
+            "a request carried Q-Block2 — this breaks Wireshark's Q-Block reassembly of CBOR request bodies"
+        );
+        assert!(
+            q2_responses > 1,
+            "response was not streamed as multi-block Q-Block2"
+        );
     }
 
     // The classifier must route a response back to the originating client inbox

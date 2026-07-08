@@ -1,0 +1,2855 @@
+#[cfg(feature = "dtls")]
+use crate::dtls::{DtlsConnection, UdpDtlsConfig};
+use crate::request::RequestBuilder;
+use coap_lite::{
+    block_handler::{extending_splice, BlockValue},
+    error::HandlingError,
+    CoapOption, CoapRequest, CoapResponse, MessageClass, MessageType, ObserveOption,
+    Packet as Message, RequestType as Method, ResponseType,
+};
+use core::mem;
+
+use futures::Future;
+use log::*;
+
+use regex::Regex;
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{atomic::AtomicU16, Weak},
+};
+use std::{
+    io::{Error, ErrorKind, Result as IoResult},
+    pin::Pin,
+};
+use std::{sync::Arc, time::Duration};
+use tokio::sync::{
+    mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    oneshot, Mutex,
+};
+use tokio::time::timeout;
+use tokio::{
+    net::{lookup_host, ToSocketAddrs, UdpSocket},
+    sync::RwLock,
+};
+use url::Url;
+const DEFAULT_RECEIVE_TIMEOUT_SECONDS: u64 = 2; // 2s
+
+#[derive(Debug, Clone)]
+pub struct Packet {
+    pub address: Option<SocketAddr>,
+    pub message: Message,
+}
+
+#[derive(Debug)]
+/// Represents control messages for an observation relationship.
+///
+/// Note: Cancellation via `Terminate` is inherently best-effort over UDP.
+/// If the deregistration message is lost, the server may continue sending notifications.
+/// Client code should be prepared to ignore unexpected messages after calling `send(Terminate)`.
+pub enum ObserveMessage {
+    Terminate,
+}
+use async_trait::async_trait;
+
+#[async_trait]
+/// A basic interface for a transport on the client
+/// representing a one-to-one connection between a client and server
+/// timeouts and retries do not need to be implemented by the transport
+/// if confirmable messages are sent
+pub trait ClientTransport: Send + Sync {
+    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, Option<SocketAddr>)>;
+    async fn send(&self, buf: &[u8]) -> std::io::Result<usize>;
+}
+
+trait TransportExt {
+    async fn receive_packet(&self) -> IoResult<Option<Packet>>;
+}
+
+impl<T: ClientTransport> TransportExt for T {
+    async fn receive_packet(&self) -> IoResult<Option<Packet>> {
+        let mut buf = [0; 1500];
+        let (nread, address) = self.recv(&mut buf).await?;
+        match Message::from_bytes(&buf[..nread]).ok() {
+            Some(message) => Ok(Some(Packet { address, message })),
+            None => Ok(None),
+        }
+    }
+}
+
+/// we only use the token as the identifier, and an empty token to represent empty requests
+type Token = Vec<u8>;
+type PacketRegistry = BTreeMap<Token, UnboundedSender<IoResult<Packet>>>;
+
+#[derive(Clone)]
+pub struct TransportSynchronizer {
+    pub(crate) outgoing: Arc<Mutex<PacketRegistry>>,
+    fail_error: Arc<RwLock<Option<std::io::Error>>>,
+}
+
+impl Default for TransportSynchronizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TransportSynchronizer {
+    pub fn new() -> Self {
+        Self {
+            outgoing: Arc::new(Mutex::new(PacketRegistry::new())),
+            fail_error: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    async fn check_for_error(&self, sender: &UnboundedSender<IoResult<Packet>>) -> Option<()> {
+        self.fail_error.read().await.as_ref();
+        if let Some(err) = self.fail_error.read().await.as_ref() {
+            let _ = sender.send(Err(Self::clone_err(err)));
+            return None;
+        }
+        Some(())
+    }
+
+    fn clone_err(error: &std::io::Error) -> std::io::Error {
+        let s = error.to_string();
+        let k = error.kind();
+        std::io::Error::new(k, s)
+    }
+
+    pub async fn fail(self, error: std::io::Error) {
+        let error_clone = Self::clone_err(&error);
+        let _ = self.fail_error.write().await.insert(error_clone);
+        let mut mutex = self.outgoing.lock().await;
+
+        let keys: Vec<Vec<u8>> = mutex.keys().cloned().collect();
+        for k in keys {
+            let error_clone = Self::clone_err(&error);
+            let _ = mutex.remove(&k).map(|resp| resp.send(Err(error_clone)));
+        }
+    }
+
+    pub async fn get_sender(&self, key: &[u8]) -> Option<UnboundedSender<IoResult<Packet>>> {
+        self.outgoing.lock().await.get(key).cloned()
+    }
+    /// Sets the sender of a given key,
+    /// returns the previous key if it was set
+    pub async fn set_sender(
+        &self,
+        key: Vec<u8>,
+        sender: UnboundedSender<IoResult<Packet>>,
+    ) -> Option<UnboundedSender<IoResult<Packet>>> {
+        self.check_for_error(&sender).await?;
+        self.outgoing.lock().await.insert(key, sender)
+    }
+    pub async fn remove_sender(&self, key: &[u8]) -> Option<UnboundedSender<IoResult<Packet>>> {
+        self.outgoing.lock().await.remove(key)
+    }
+}
+
+async fn receive_loop<T: ClientTransport + 'static>(
+    transport: Weak<T>,
+    transport_sync: TransportSynchronizer,
+) -> std::io::Result<()> {
+    let err = loop {
+        let Some(transport_instance) = transport.upgrade() else {
+            // nobody else is listening so we can drop our reference
+            return Ok(());
+        };
+        // we do a timeout here to ensure that we do not block forever
+        let Ok(recv_res) = timeout(
+            Duration::from_millis(300),
+            transport_instance.receive_packet(),
+        )
+        .await
+        else {
+            continue;
+        };
+        let option_packet = match recv_res {
+            Err(e) => break e,
+            Ok(o) => o,
+        };
+        let Some(packet) = option_packet else {
+            trace!("unexpected malformed packet received");
+            continue;
+        };
+        if let Some(ack) = parse_for_ack(&packet) {
+            transport_instance.send(&ack).await?;
+        }
+
+        match packet.message.header.code {
+            MessageClass::Response(_) => {}
+            m => {
+                debug!("unknown message type {}", m);
+                continue;
+            }
+        };
+
+        let token = packet.message.get_token();
+        let Some(sender) = transport_sync.get_sender(token).await else {
+            info!("received unexpected response for token {:?}", token);
+            continue;
+        };
+        let Ok(_) = sender.send(Ok(packet)) else {
+            debug!("unexpected drop of sender");
+            continue;
+        };
+    };
+
+    let e = Err(Error::new(err.kind(), err.to_string()));
+    transport_sync.fail(err).await;
+    e
+}
+
+pub fn parse_for_ack(packet: &Packet) -> Option<Vec<u8>> {
+    match (packet.message.header.get_type(), packet.message.header.code) {
+        (MessageType::Confirmable, MessageClass::Response(_)) => Some(make_ack(packet)),
+        _ => None,
+    }
+}
+
+pub fn make_ack(packet: &Packet) -> Vec<u8> {
+    let mut ack = Message::new();
+    ack.header.set_type(MessageType::Acknowledgement);
+    ack.header.message_id = packet.message.header.message_id;
+    ack.header.code = MessageClass::Empty;
+    ack.to_bytes().unwrap()
+}
+
+/// a wrapper for transports responsible for retries and timeouts
+struct CoapClientTransport<T: ClientTransport> {
+    pub(crate) transport: Arc<T>,
+    pub(crate) synchronizer: TransportSynchronizer,
+    pub(crate) retries: usize,
+    pub(crate) timeout: Duration,
+}
+
+impl<T: ClientTransport> Clone for CoapClientTransport<T> {
+    fn clone(&self) -> Self {
+        Self {
+            transport: self.transport.clone(),
+            synchronizer: self.synchronizer.clone(),
+            retries: self.retries,
+            timeout: self.timeout,
+        }
+    }
+}
+
+impl<T: ClientTransport> CoapClientTransport<T> {
+    pub const DEFAULT_NUM_RETRIES: usize = 5;
+    async fn establish_receiver_for(&self, packet: &Packet) -> UnboundedReceiver<IoResult<Packet>> {
+        let (tx, rx) = unbounded_channel();
+        let token = packet.message.get_token().to_owned();
+        self.synchronizer.set_sender(token, tx).await;
+        rx
+    }
+
+    /// tries to send a confirmable message with retries and timeouts
+    async fn try_send_confirmable_message(
+        &self,
+        msg: &Packet,
+        receiver: &mut UnboundedReceiver<IoResult<Packet>>,
+    ) -> IoResult<Packet> {
+        let mut res = Err(Error::new(ErrorKind::InvalidData, "not enough retries"));
+        for _ in 0..self.retries {
+            res = self.try_send_non_confirmable_message(msg, receiver).await;
+            if res.is_ok() {
+                return res;
+            }
+        }
+        res
+    }
+
+    fn encode_message(message: &Message) -> IoResult<Vec<u8>> {
+        message
+            .to_bytes()
+            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e.to_string()))
+    }
+
+    async fn try_send_non_confirmable_message(
+        &self,
+        msg: &Packet,
+        receiver: &mut UnboundedReceiver<IoResult<Packet>>,
+    ) -> IoResult<Packet> {
+        let bytes = Self::encode_message(&msg.message)?;
+        self.transport.send(&bytes).await?;
+        let try_receive: Result<Option<Result<Packet, Error>>, tokio::time::error::Elapsed> =
+            timeout(self.timeout, receiver.recv()).await;
+        if let Ok(Some(res)) = try_receive {
+            return res;
+        }
+        Err(Error::new(ErrorKind::TimedOut, "send timeout"))
+    }
+
+    async fn do_request_response_for_packet_inner(
+        &self,
+        packet: &Packet,
+        receiver: &mut UnboundedReceiver<IoResult<Packet>>,
+    ) -> IoResult<Packet> {
+        if packet.message.header.get_type() == MessageType::Confirmable {
+            return self.try_send_confirmable_message(packet, receiver).await;
+        } else {
+            return self
+                .try_send_non_confirmable_message(packet, receiver)
+                .await;
+        }
+    }
+
+    pub async fn do_request_response_for_packet(&self, packet: &Packet) -> IoResult<Packet> {
+        let mut receiver = self.establish_receiver_for(packet).await;
+        let result = self
+            .do_request_response_for_packet_inner(packet, &mut receiver)
+            .await;
+        self.synchronizer
+            .remove_sender(packet.message.get_token())
+            .await;
+        result
+    }
+
+    pub fn from_transport(transport: Arc<T>, synchronizer: TransportSynchronizer) -> Self {
+        Self {
+            transport,
+            synchronizer,
+            retries: Self::DEFAULT_NUM_RETRIES,
+            timeout: Duration::from_secs(DEFAULT_RECEIVE_TIMEOUT_SECONDS),
+        }
+    }
+}
+
+pub struct UdpTransport {
+    pub socket: UdpSocket,
+    pub peer_addr: SocketAddr,
+}
+#[async_trait]
+impl ClientTransport for UdpTransport {
+    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, Option<SocketAddr>)> {
+        let (read, addr) = self.socket.recv_from(buf).await?;
+        return Ok((read, Some(addr)));
+    }
+    async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
+        self.socket.send_to(buf, self.peer_addr).await
+    }
+}
+
+/// A CoAP client over UDP. This client can send multicast and broadcasts
+pub type UdpCoAPClient = CoAPClient<UdpTransport>;
+
+pub struct CoAPClient<T: ClientTransport> {
+    transport: CoapClientTransport<T>,
+    block1_size: usize,
+    /// When set, request blocks are sized per-request from this MTU minus the
+    /// message's actual non-payload overhead (see `block1_size_for_mtu`), the
+    /// request-side mirror of the server `BlockHandler`'s `max_total_message_size`.
+    /// `None` falls back to the static `block1_size`.
+    max_total_message_size: Option<usize>,
+    message_id: Arc<AtomicU16>,
+    /// Config for [`send_qblock`](CoAPClient::send_qblock) (RFC 9177) transfers.
+    #[cfg(feature = "q-block")]
+    qblock_config: crate::qblock::QBlockConfig,
+}
+
+impl<T: ClientTransport> Clone for CoAPClient<T> {
+    fn clone(&self) -> Self {
+        Self {
+            transport: self.transport.clone(),
+            block1_size: self.block1_size,
+            max_total_message_size: self.max_total_message_size,
+            message_id: self.message_id.clone(),
+            #[cfg(feature = "q-block")]
+            qblock_config: self.qblock_config.clone(),
+        }
+    }
+}
+
+/// Headroom for the Block1/Block2 option blockwise transfer adds to each
+/// datagram. Mirrors coap-lite's private `BLOCK_OPTIONS_MAX_LENGTH`.
+const BLOCK_OPTIONS_MAX_LENGTH: usize = 12;
+
+/// Largest valid CoAP block size — a power of two in `16..=1024` (RFC 7959 §2.2
+/// SZX encoding) — whose payload fits `mtu` once the request's `non_payload_len`
+/// (header + token + options) and the Block1 option are accounted for. This is
+/// the request-side analogue of coap-lite's `negotiate_block_size_if_necessary`,
+/// so a request self-sizes its blocks from the real per-message overhead rather
+/// than a static, overhead-blind `block1_size`. Errors if the MTU cannot fit
+/// even a 16-byte payload block alongside the request's options.
+fn block1_size_for_mtu(mtu: usize, non_payload_len: usize) -> IoResult<usize> {
+    let budget = mtu
+        .checked_sub(non_payload_len + BLOCK_OPTIONS_MAX_LENGTH)
+        .filter(|&b| b >= 16)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "CoAP MTU {mtu} too small to frame a request with {non_payload_len} bytes of \
+                     options (needs room for the Block1 option + a 16-byte payload block)"
+                ),
+            )
+        })?;
+    // Largest power of two in 16..=1024 not exceeding the payload budget.
+    Ok((4..=10)
+        .rev()
+        .map(|exp| 1usize << exp)
+        .find(|&block| block <= budget)
+        .unwrap_or(16))
+}
+
+/// a receiver used whenever you have a use case involving multiple responses to a single request
+pub struct MessageReceiver {
+    synchronizer: TransportSynchronizer,
+    receiver: UnboundedReceiver<IoResult<Packet>>,
+    token: Vec<u8>,
+}
+
+impl MessageReceiver {
+    pub async fn receive(&mut self) -> IoResult<Packet> {
+        match self.receiver.recv().await {
+            Some(Ok(packet)) => Ok(packet),
+            Some(Err(e)) => Err(e),
+            None => Err(Error::other("sender dropped by synchronizer")),
+        }
+    }
+    pub fn new(
+        synchronizer: TransportSynchronizer,
+        receiver: UnboundedReceiver<IoResult<Packet>>,
+        token: &[u8],
+    ) -> Self {
+        Self {
+            synchronizer,
+            receiver,
+            token: token.to_vec(),
+        }
+    }
+}
+
+impl Drop for MessageReceiver {
+    fn drop(&mut self) {
+        let sync = self.synchronizer.clone();
+        let tok = std::mem::take(&mut self.token);
+        tokio::spawn(async move { sync.remove_sender(&tok).await });
+    }
+}
+
+impl UdpCoAPClient {
+    pub async fn new_with_specific_source<A: ToSocketAddrs, B: ToSocketAddrs>(
+        bind_addr: A,
+        peer_addr: B,
+    ) -> IoResult<Self> {
+        let socket = UdpSocket::bind(bind_addr).await?;
+        Self::new_with_tokio_socket(socket, peer_addr).await
+    }
+
+    pub async fn new<A: ToSocketAddrs>(addr: A) -> IoResult<Self> {
+        let sock_addr = lookup_host(addr).await?.next().ok_or(Error::new(
+            ErrorKind::InvalidInput,
+            "could not get socket address",
+        ))?;
+        Ok(match &sock_addr {
+            SocketAddr::V4(_) => Self::new_with_specific_source("0.0.0.0:0", sock_addr).await?,
+            SocketAddr::V6(_) => Self::new_with_specific_source(":::0", sock_addr).await?,
+        })
+    }
+
+    /// Create a client with a `std::net` socket
+    ///
+    /// Using a standard socket is useful to get advanced features from socket2 crate
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// # tokio_test::block_on(async {
+    ///   use socket2::{Socket, Domain, Type};
+    ///   use coap::UdpCoAPClient;
+    ///
+    ///   let socket = Socket::new(Domain::IPV6, Type::DGRAM, None).expect("Standard socket creation failed");
+    ///   socket.set_multicast_hops_v6(16).expect("Setting multicast hops failed");
+    ///   let client = UdpCoAPClient::new_with_std_socket(socket.into(), "[::1]:5683").await.expect("Client creation failed");
+    /// # })
+    /// ```
+    pub async fn new_with_std_socket<A: ToSocketAddrs>(
+        socket: std::net::UdpSocket,
+        peer_addr: A,
+    ) -> IoResult<Self> {
+        socket.set_nonblocking(true)?;
+        let socket = UdpSocket::from_std(socket)?;
+        Self::new_with_tokio_socket(socket, peer_addr).await
+    }
+
+    async fn new_with_tokio_socket<A: ToSocketAddrs>(
+        socket: UdpSocket,
+        peer_addr: A,
+    ) -> IoResult<Self> {
+        let peer_addr = lookup_host(peer_addr).await?.next().ok_or(Error::new(
+            ErrorKind::InvalidInput,
+            "could not get socket address",
+        ))?;
+
+        let transport = UdpTransport { socket, peer_addr };
+        Ok(UdpCoAPClient::from_transport(transport))
+    }
+
+    /// Send a request to all CoAP devices.
+    /// - IPv4 AllCoAP multicast address is '224.0.1.187'
+    /// - IPv6 AllCoAp multicast addresses are 'ff0?::fd'
+    ///   Parameter segment is used with IPv6 to determine the first octet.
+    ///   It's value can be between 0x0 and 0xf. To address multiple segments,
+    ///   you have to call send_all_coap for each of the segments.
+    pub async fn send_all_coap(
+        &self,
+        request: &mut CoapRequest<SocketAddr>,
+        segment: u8,
+    ) -> IoResult<()> {
+        assert!(segment <= 0xf);
+        let addr = match self.transport.transport.peer_addr {
+            SocketAddr::V4(val) => {
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 1, 187)), val.port())
+            }
+            SocketAddr::V6(val) => SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(
+                    0xff00 + segment as u16,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0xfd,
+                )),
+                val.port(),
+            ),
+        };
+
+        self.send_multicast(request, &addr).await
+    }
+
+    /// Send a multicast request to multiple devices.
+    pub async fn send_multicast(
+        &self,
+        request: &mut CoapRequest<SocketAddr>,
+        addr: &SocketAddr,
+    ) -> IoResult<()> {
+        if 0 == request.message.header.message_id {
+            request.message.header.message_id = self.gen_message_id();
+        }
+        match request.message.to_bytes() {
+            Ok(bytes) => {
+                let size = self
+                    .transport
+                    .transport
+                    .socket
+                    .send_to(&bytes[..], addr)
+                    .await?;
+                if size == bytes.len() {
+                    Ok(())
+                } else {
+                    Err(Error::other("send length error"))
+                }
+            }
+            Err(_) => Err(Error::new(ErrorKind::InvalidInput, "packet error")),
+        }
+    }
+
+    pub fn set_broadcast(&self, value: bool) -> IoResult<()> {
+        self.transport.transport.socket.set_broadcast(value)
+    }
+
+    /// creates a receiver based on a specific request
+    /// this method can be used if you send a multicast request and
+    /// expect multiple responses.
+    /// only use this method if you know what you are doing
+    /// ```
+    ///
+    /// use coap_lite::{
+    ///     RequestType
+    /// };
+    /// use coap::request::RequestBuilder;
+    /// use coap::client::UdpCoAPClient;
+    ///
+    /// async fn foo() {
+    ///   let segment = 0x0;
+    ///   let client = UdpCoAPClient::new("127.0.0.1:5683")
+    ///          .await
+    ///          .unwrap();
+    ///   let mut request = RequestBuilder::new("test-echo", RequestType::Get)
+    ///       .data(Some(vec![0x51, 0x55, 0x77, 0xE8]))
+    ///       .confirmable(true)
+    ///       .build();
+    ///
+    ///   let mut receiver = client.create_receiver_for(&request).await;
+    ///   client.send_all_coap(&mut request, segment).await.unwrap();
+    ///   loop {
+    ///      let recv_packet = receiver.receive().await.unwrap();
+    ///      assert_eq!(recv_packet.message.payload, b"test-echo".to_vec());
+    ///   }
+    /// }
+    /// ```
+    pub async fn create_receiver_for(&self, request: &CoapRequest<SocketAddr>) -> MessageReceiver {
+        let (tx, rx) = unbounded_channel();
+        let key = request.message.get_token().to_vec();
+        self.transport.synchronizer.set_sender(key, tx).await;
+        MessageReceiver::new(
+            self.transport.synchronizer.clone(),
+            rx,
+            request.message.get_token(),
+        )
+    }
+}
+
+#[cfg(feature = "dtls")]
+impl CoAPClient<DtlsConnection> {
+    pub async fn from_udp_dtls_config(config: UdpDtlsConfig) -> IoResult<Self> {
+        Ok(CoAPClient::from_transport(
+            DtlsConnection::try_new(config).await?,
+        ))
+    }
+}
+
+impl<T: ClientTransport + 'static> CoAPClient<T> {
+    /// Default per-block payload cap (`set_block1_size` overrides it).
+    pub const MAX_PAYLOAD_BLOCK: usize = 1024;
+
+    /// Create a CoAP client with a chosen transport type
+    pub fn from_transport(transport: T) -> Self {
+        let synchronizer = TransportSynchronizer::new();
+        let transport_arc = Arc::new(transport);
+        let message_id: u16 = rand::random();
+        // spawn receive loop to handle responses
+        tokio::spawn(receive_loop(
+            Arc::downgrade(&transport_arc),
+            synchronizer.clone(),
+        ));
+        CoAPClient {
+            transport: CoapClientTransport::from_transport(transport_arc.clone(), synchronizer),
+            block1_size: Self::MAX_PAYLOAD_BLOCK,
+            max_total_message_size: None,
+            message_id: Arc::new(AtomicU16::new(message_id)),
+            #[cfg(feature = "q-block")]
+            qblock_config: crate::qblock::QBlockConfig::default(),
+        }
+    }
+    /// Execute a single get request with a coap url
+    pub async fn get(url: &str) -> IoResult<CoapResponse> {
+        Self::request(url, Method::Get, None).await
+    }
+
+    /// Execute a single get request with a coap url and a specific timeout.
+    pub async fn get_with_timeout(url: &str, timeout: Duration) -> IoResult<CoapResponse> {
+        Self::request_with_timeout(url, Method::Get, None, timeout).await
+    }
+
+    /// Execute a single post request with a coap url using udp
+    pub async fn post(url: &str, data: Vec<u8>) -> IoResult<CoapResponse> {
+        Self::request(url, Method::Post, Some(data)).await
+    }
+
+    /// Execute a single post request with a coap url using udp
+    pub async fn post_with_timeout(
+        url: &str,
+        data: Vec<u8>,
+        timeout: Duration,
+    ) -> IoResult<CoapResponse> {
+        Self::request_with_timeout(url, Method::Post, Some(data), timeout).await
+    }
+
+    /// Execute a put request with a coap url using udp
+    pub async fn put(url: &str, data: Vec<u8>) -> IoResult<CoapResponse> {
+        Self::request(url, Method::Put, Some(data)).await
+    }
+
+    /// Execute a single put request with a coap url using udp
+    pub async fn put_with_timeout(
+        url: &str,
+        data: Vec<u8>,
+        timeout: Duration,
+    ) -> IoResult<CoapResponse> {
+        Self::request_with_timeout(url, Method::Put, Some(data), timeout).await
+    }
+
+    /// Execute a single delete request with a coap url using udp
+    pub async fn delete(url: &str) -> IoResult<CoapResponse> {
+        Self::request(url, Method::Delete, None).await
+    }
+
+    /// Execute a single delete request with a coap url using udp
+    pub async fn delete_with_timeout(url: &str, timeout: Duration) -> IoResult<CoapResponse> {
+        Self::request_with_timeout(url, Method::Delete, None, timeout).await
+    }
+
+    /// Execute a single request (GET, POST, PUT, DELETE) with a coap url using udp
+    pub async fn request(
+        url: &str,
+        method: Method,
+        data: Option<Vec<u8>>,
+    ) -> IoResult<CoapResponse> {
+        let (domain, port, path, queries) = Self::parse_coap_url(url)?;
+        let client = UdpCoAPClient::new((domain.as_str(), port)).await?;
+        let request = RequestBuilder::new(&path, method)
+            .queries(queries)
+            .domain(domain)
+            .data(data)
+            .build();
+        client.send(request).await
+    }
+
+    /// Execute a single request (GET, POST, PUT, DELETE) with a coap url and a specfic timeout
+    /// using udp
+    pub async fn request_with_timeout(
+        url: &str,
+        method: Method,
+        data: Option<Vec<u8>>,
+        timeout: Duration,
+    ) -> IoResult<CoapResponse> {
+        let (domain, port, path, queries) = Self::parse_coap_url(url)?;
+        let mut client = UdpCoAPClient::new((domain.as_str(), port)).await?;
+        client.set_receive_timeout(timeout);
+        let request = RequestBuilder::new(&path, method)
+            .queries(queries)
+            .domain(domain)
+            .data(data)
+            .build();
+
+        client.send(request).await
+    }
+
+    /// Send a Request via the given transport, and receive a response.
+    /// users are responsible for filling meaningful fields in the request
+    /// this method supports blockwise requests
+    pub async fn send(&self, mut request: CoapRequest<SocketAddr>) -> IoResult<CoapResponse> {
+        let first_response = self.send_request(&mut request).await?;
+        request.response = Some(first_response);
+        self.receive(&mut request).await
+    }
+
+    /// Sets the Q-Block (RFC 9177) configuration used by
+    /// [`send_qblock`](CoAPClient::send_qblock).
+    #[cfg(feature = "q-block")]
+    pub fn set_qblock_config(&mut self, config: crate::qblock::QBlockConfig) {
+        self.qblock_config = config;
+    }
+
+    /// Sends `request` opting into a Q-Block2 (RFC 9177) response and returns the
+    /// reassembled response — a near drop-in for [`send`](CoAPClient::send), but
+    /// the (potentially large) reply arrives as a NON burst with built-in
+    /// loss recovery rather than RFC 7959 stop-and-wait. The returned
+    /// [`CoapResponse`] carries the assembled body plus the response's options
+    /// (code, content-format, any forwarded headers) from its carrier block.
+    ///
+    /// A large request body is itself sent as a Q-Block1 burst (correlated by a
+    /// Request-Tag, with the server recovering losses via 4.08); a small body
+    /// goes as a single PDU.
+    #[cfg(feature = "q-block")]
+    pub async fn send_qblock(&self, mut request: CoapRequest<SocketAddr>) -> IoResult<CoapResponse>
+    where
+        T: 'static,
+    {
+        use crate::qblock::{
+            drive_receive, drive_send, parse_missing_request, ClientTransportSink, QBlockReceiver,
+            QBlockSender, TransferKind,
+        };
+
+        if request.message.get_token().is_empty() {
+            request.message.set_token(self.gen_token());
+        }
+        if request.message.header.message_id == 0 {
+            request.message.header.message_id = self.gen_message_id();
+        }
+        let token = request.message.get_token().to_vec();
+        let block_size = self.block1_size;
+        let szx = BlockValue::new(0, false, block_size)
+            .map_err(|e| Error::new(ErrorKind::InvalidInput, e.to_string()))?
+            .size_exponent;
+
+        // Tag the request so a Q-Block1 send (large body) can be correlated by
+        // the server. No Q-Block2 opt-in is added: RFC 9177 §4.4 early
+        // negotiation belongs on requests that actually want a specific
+        // response block size, and stamping it on every request both diverges
+        // from libcoap (which only probes once per session) and breaks
+        // Wireshark's Q-Block reassembly (its single block-state slot lets a
+        // request's Q-Block2 clobber the Q-Block1 state, as options parse in
+        // ascending number order and 31 > 19). Servers that know the peer runs
+        // this stack stream large responses via
+        // `QBlockConfig::assume_peer_block_size` instead.
+        request
+            .message
+            .add_option(CoapOption::Unknown(292), token.clone()); // Request-Tag
+
+        // Receive every packet for this token via the synchronizer, demuxing the
+        // three reply shapes: Q-Block2 response blocks (-> pdu_rx, reassembled
+        // below); Q-Block1 4.08 missing-block requests (-> miss_rx, feeding our
+        // request-body send); and a plain single-PDU response (-> plain_tx). The
+        // server replies in one plain PDU whenever the response body fits one
+        // block (`maybe_serve` returns false): that PDU carries no Q-Block2
+        // option and is not a 4.08, so without this third arm a small response
+        // would be dropped and the call would hang to the receive timeout.
+        let (raw_tx, mut raw_rx) = unbounded_channel::<IoResult<Packet>>();
+        self.transport
+            .synchronizer
+            .set_sender(token.clone(), raw_tx)
+            .await;
+        let (pdu_tx, pdu_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+        let (miss_tx, miss_rx) = tokio::sync::mpsc::channel::<Vec<u32>>(16);
+        let (plain_tx, plain_rx) = oneshot::channel::<Message>();
+        tokio::spawn(async move {
+            let mut plain_tx = Some(plain_tx);
+            while let Some(Ok(pkt)) = raw_rx.recv().await {
+                if pkt.message.get_option(CoapOption::QBlock2).is_some() {
+                    if let Ok(bytes) = pkt.message.to_bytes() {
+                        if pdu_tx.send(bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                } else if pkt.message.header.code
+                    == MessageClass::Response(ResponseType::RequestEntityIncomplete)
+                {
+                    // A 4.08 asking for missing Q-Block1 request blocks.
+                    let _ = miss_tx
+                        .send(parse_missing_request(&pkt.message, CoapOption::QBlock1))
+                        .await;
+                } else {
+                    // A plain single-PDU response (small body): deliver it as the
+                    // completed response and stop — the full reply is in hand.
+                    if let Some(tx) = plain_tx.take() {
+                        let _ = tx.send(pkt.message);
+                    }
+                    break;
+                }
+            }
+        });
+
+        let sink = ClientTransportSink(self.transport.transport.clone());
+
+        // Aborts the background request-send task when `send_qblock` returns, so
+        // its post-burst `linger` (which can be tens of seconds) cannot outlive
+        // the exchange and pin the socket/buffers. Aborting on return is safe: a
+        // reassembled response means the server already has the full request, so
+        // no further request-block recovery is needed; on timeout/error we are
+        // giving up anyway.
+        struct AbortOnDrop(tokio::task::JoinHandle<()>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+
+        // Send the request: Q-Block1 burst if the body needs more than one block,
+        // else a single PDU.
+        let body = std::mem::take(&mut request.message.payload);
+        let _drive_guard = if body.len() > block_size {
+            let mut template = request.message.clone();
+            template.payload.clear();
+            let seed = token
+                .iter()
+                .fold(0u64, |a, &b| a.wrapping_mul(31).wrapping_add(u64::from(b)));
+            let sender = QBlockSender::new(
+                template,
+                CoapOption::QBlock1,
+                body.into(),
+                szx,
+                TransferKind::Non,
+                self.qblock_config.clone(),
+                seed,
+            );
+            let linger = self.qblock_config.non_receive_timeout
+                * (self.qblock_config.non_max_retransmit + 2);
+            // Drive the request send (incl. 4.08 recovery) in the background;
+            // we return once the response is reassembled below.
+            let send_sink = ClientTransportSink(self.transport.transport.clone());
+            Some(AbortOnDrop(tokio::spawn(async move {
+                let _ = drive_send(sender, &send_sink, miss_rx, linger).await;
+            })))
+        } else {
+            request.message.payload = body;
+            let req_bytes = request
+                .message
+                .to_bytes()
+                .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+            self.transport.transport.send(&req_bytes).await?;
+            drop(miss_rx);
+            None
+        };
+
+        let receiver = QBlockReceiver::new(
+            CoapOption::QBlock2,
+            request.message.clone(),
+            self.max_total_message_size.unwrap_or(usize::MAX),
+            self.qblock_config.clone(),
+        );
+        // Race the Q-Block2 reassembly against a plain single-PDU response: a
+        // large reply completes via `drive_receive`, a small one via `plain_rx`.
+        // `biased` takes a ready plain response before polling the reassembler;
+        // the two are mutually exclusive per transfer, and the loser's future is
+        // dropped.
+        enum Outcome {
+            Plain(Option<Message>),
+            Qblock(IoResult<Option<(Vec<u8>, Message)>>),
+        }
+        let outcome = tokio::select! {
+            biased;
+            plain = plain_rx => Outcome::Plain(plain.ok()),
+            result = drive_receive(receiver, pdu_rx, &sink) => Outcome::Qblock(result),
+        };
+        self.transport.synchronizer.remove_sender(&token).await;
+
+        let timed_out = || Error::new(ErrorKind::TimedOut, "q-block transfer did not complete");
+        match outcome {
+            Outcome::Plain(Some(message)) => Ok(CoapResponse { message }),
+            Outcome::Plain(None) => Err(timed_out()),
+            Outcome::Qblock(result) => match result? {
+                Some((body, mut carrier)) => {
+                    carrier.payload = body;
+                    Ok(CoapResponse { message: carrier })
+                }
+                None => Err(timed_out()),
+            },
+        }
+    }
+
+    pub async fn observe<H: FnMut(IoResult<Message>) + Send + 'static>(
+        &self,
+        resource_path: &str,
+        handler: H,
+    ) -> IoResult<oneshot::Sender<ObserveMessage>>
+    where
+        T: 'static + Send + Sync,
+    {
+        let register_packet = RequestBuilder::new(resource_path, Method::Get).build();
+        self.observe_with(register_packet, handler).await
+    }
+
+    /// Observe a resource with the handler and specified timeout using the given transport.
+    /// Use the oneshot sender to cancel observation. If this sender is dropped without explicitly
+    /// cancelling it, the observation will continue forever.
+    pub async fn observe_with_timeout<H: FnMut(IoResult<Message>) + Send + 'static>(
+        &mut self,
+        resource_path: &str,
+        handler: H,
+        timeout: Duration,
+    ) -> IoResult<oneshot::Sender<ObserveMessage>>
+    where
+        T: 'static + Send + Sync,
+    {
+        self.set_receive_timeout(timeout);
+        self.observe(resource_path, handler).await
+    }
+
+    /// observe a resource with a given transport using your own request
+    /// Use this method if you need to set some specific options in your
+    /// requests. This method will add observe flags and a message id as a fallback
+    /// Use this method if you plan on re-using the same client for requests
+    pub async fn observe_with<H: FnMut(IoResult<Message>) + Send + 'static>(
+        &self,
+        request: CoapRequest<SocketAddr>,
+        mut handler: H,
+    ) -> IoResult<oneshot::Sender<ObserveMessage>> {
+        let this = self.clone();
+        let mut register_packet = request.clone();
+        if 0 == register_packet.message.header.message_id {
+            register_packet.message.header.message_id = self.gen_message_id();
+        }
+        if register_packet.message.get_token().is_empty() {
+            register_packet.message.set_token(self.gen_token());
+        }
+        register_packet.set_observe_flag(ObserveOption::Register);
+
+        let req_token = register_packet.message.get_token().to_vec();
+        let resource_path = register_packet.get_path();
+
+        let (tx_observe, mut rx_observe) = unbounded_channel();
+        self.transport
+            .synchronizer
+            .set_sender(req_token.clone(), tx_observe)
+            .await;
+
+        // Ensure we clean up the long-lived observe mapping if registration fails
+        if let Err(e) = self
+            .send_observe_registration(&mut register_packet, &mut rx_observe, &mut handler)
+            .await
+        {
+            self.transport.synchronizer.remove_sender(&req_token).await;
+            return Err(e);
+        }
+
+        let (tx, rx) = oneshot::channel();
+        let observe_path = resource_path;
+
+        tokio::spawn(async move {
+            // Template used to create a fresh continuation request per notification
+            // to avoid cross-notification state leakage.
+            let continuation_template = register_packet.clone();
+            let mut rx_pinned: Pin<
+                Box<
+                    dyn Future<
+                            Output = std::result::Result<ObserveMessage, oneshot::error::RecvError>,
+                        > + Send,
+                >,
+            > = Box::pin(rx);
+            loop {
+                tokio::select! {
+                    sock_rx = rx_observe.recv() => {
+                        let mut blockwise_request = continuation_template.clone();
+                        this.receive_and_handle_message_observe(&mut blockwise_request, sock_rx?, &mut handler).await;
+                    }
+                    observe = &mut rx_pinned => {
+                        match observe {
+                            Ok(ObserveMessage::Terminate) => {
+                                this.terminate_observe(&observe_path, req_token, continuation_template.message.clone()).await;
+                                break;
+                            }
+                            // if the receiver is dropped, we change the future to wait forever
+                            Err(_) => {
+                                debug!("observe continuing forever");
+                                rx_pinned  = Box::pin(futures::future::pending())
+                            },
+                        }
+                    }
+
+                }
+            }
+            Some(())
+        });
+        Ok(tx)
+    }
+
+    async fn send_observe_registration<H: FnMut(IoResult<Message>) + Send + 'static>(
+        &self,
+        register_packet: &mut CoapRequest<SocketAddr>,
+        receiver: &mut UnboundedReceiver<IoResult<Packet>>,
+        handler: &mut H,
+    ) -> Result<(), std::io::Error> {
+        // Avoid sending packets with missing/invalid observe.
+        match register_packet.get_observe_flag() {
+            Some(Ok(ObserveOption::Register)) => {}
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "observe registration packet must have observe flag set to register",
+                ))
+            }
+        }
+        // Bypass the first layer of "do_request_response_for_packet" to prevent the
+        // long-lasting observe-receiver from being removed
+        let response = self
+            .transport
+            .do_request_response_for_packet_inner(
+                &Packet {
+                    address: None,
+                    message: register_packet.message.to_owned(),
+                },
+                receiver,
+            )
+            .await?;
+        // Check if the server accepted the observe request
+        let coap_response = CoapResponse {
+            message: response.message.clone(),
+        };
+        if coap_response.get_status().is_error() {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                "the resource was not found",
+            ));
+        }
+        // Finalize a potential block-wise transfer and pass result to handler
+        self.receive_and_handle_message_observe(register_packet, Ok(response), handler)
+            .await;
+        Ok(())
+    }
+
+    async fn terminate_observe(&self, observe_path: &str, req_token: Vec<u8>, template: Message) {
+        let mut deregister_packet = CoapRequest::<SocketAddr>::new();
+        deregister_packet.message = template;
+        deregister_packet.message.header.message_id = self.gen_message_id();
+        deregister_packet.set_observe_flag(ObserveOption::Deregister);
+        deregister_packet.set_path(observe_path);
+        deregister_packet.message.set_token(req_token);
+        // clear any Block2 options left from blockwise bookkeeping
+        deregister_packet.message.clear_option(CoapOption::Block2);
+
+        let _ = self
+            .transport
+            .do_request_response_for_packet(&Packet {
+                address: None,
+                message: deregister_packet.message,
+            })
+            .await;
+    }
+
+    async fn receive_and_handle_message_observe<H: FnMut(IoResult<Message>) + Send + 'static>(
+        &self,
+        request: &mut CoapRequest<SocketAddr>,
+        socket_result: IoResult<Packet>,
+        handler: &mut H,
+    ) {
+        match socket_result {
+            Ok(response) => {
+                if let Some(block2) = CoAPClient::<T>::get_block2_option(&response.message) {
+                    if CoAPClient::<T>::contains_more_blocks(&response.message) {
+                        let expected_etag: Option<Vec<u8>> = response
+                            .message
+                            .get_option(CoapOption::ETag)
+                            .and_then(|iter| iter.front().cloned());
+
+                        request.response = Some(CoapResponse {
+                            message: response.message.clone(),
+                        });
+                        // Use a different token for the short-lived blockwise continuation to avoid
+                        // interfering with the long-lived observe mapping keyed by the original token.
+                        request.message.set_token(self.gen_token());
+                        request.message.header.message_id = self.gen_message_id();
+                        request.message.clear_option(CoapOption::Observe);
+                        request.message.clear_option(CoapOption::Block2);
+
+                        let mut next_block2 = block2.clone();
+                        next_block2.num += 1;
+                        next_block2.more = false;
+                        request
+                            .message
+                            .add_option_as::<BlockValue>(CoapOption::Block2, next_block2);
+
+                        let full_datagram = self
+                            .receive_with_etag_validation(request, expected_etag.as_deref())
+                            .await;
+
+                        match full_datagram {
+                            Ok(full_datagram) => {
+                                handler(Ok(full_datagram.message.clone()));
+                            }
+                            Err(e) => {
+                                handler(Err(e));
+                            }
+                        }
+                    } else {
+                        handler(Ok(response.message));
+                    }
+                } else {
+                    handler(Ok(response.message));
+                }
+            }
+            Err(e) => match e.kind() {
+                ErrorKind::WouldBlock => {
+                    info!("Observe timeout");
+                }
+                _ => handler(Err(e)),
+            },
+        }
+    }
+
+    /// sends a request through the transport. If a request is confirmable, it will attempt
+    /// retries until receiving a response. requests sent using a multicast-address should be non-confirmable
+    /// the user is responsible for setting meaningful fields in the request
+    /// Do not use this method unless you need low-level control over the protocol (e.g.,
+    /// multicast), instead use send for client applications.
+    pub async fn send_single_request(
+        &self,
+        request: &CoapRequest<SocketAddr>,
+    ) -> IoResult<CoapResponse> {
+        let response = self
+            .transport
+            .do_request_response_for_packet(&Packet {
+                address: None,
+                message: request.message.to_owned(),
+            })
+            .await?;
+        Ok(CoapResponse {
+            message: response.message,
+        })
+    }
+
+    /// The Block1 size to use for `message`: when an MTU
+    /// (`max_total_message_size`) is configured, derive it per-request from the
+    /// message's actual non-payload overhead (`block1_size_for_mtu`); otherwise
+    /// use the static `block1_size`.
+    fn effective_block1_size(&self, message: &Message) -> IoResult<usize> {
+        match self.max_total_message_size {
+            None => Ok(self.block1_size),
+            Some(mtu) => {
+                let payload_len = message.payload.len();
+                let message_len = message.to_bytes().map(|b| b.len()).map_err(|e| {
+                    Error::new(ErrorKind::InvalidData, format!("sizing request: {e}"))
+                })?;
+                block1_size_for_mtu(mtu, message_len.saturating_sub(payload_len))
+            }
+        }
+    }
+
+    /// low-level method to send a a request supporting block1 option based on
+    /// the block size set in the client
+    async fn send_request(&self, request: &mut CoapRequest<SocketAddr>) -> IoResult<CoapResponse> {
+        let block1_size = self.effective_block1_size(&request.message)?;
+        let request_length = request.message.payload.len();
+        if request_length <= block1_size {
+            if 0 == request.message.header.message_id {
+                request.message.header.message_id = self.gen_message_id();
+            }
+            return self.send_single_request(request).await;
+        }
+        let payload = std::mem::take(&mut request.message.payload);
+        let mut it = payload.chunks(block1_size).enumerate().peekable();
+        let mut result = Err(Error::other("unknown error occurred"));
+
+        while let Some((idx, elem)) = it.next() {
+            let more_blocks = it.peek().is_some();
+            let block = BlockValue::new(idx, more_blocks, block1_size)
+                .map_err(|_| Error::other("could not set block size"))?;
+
+            request.message.clear_option(CoapOption::Block1);
+            request
+                .message
+                .add_option_as::<BlockValue>(CoapOption::Block1, block.clone());
+            request.message.payload = elem.to_vec();
+
+            request.message.header.message_id = self.gen_message_id();
+            let resp = self.send_single_request(request).await?;
+            // continue receiving responses until last element
+            if it.peek().is_some() {
+                let maybe_block1 = resp
+                    .message
+                    .get_first_option_as::<BlockValue>(CoapOption::Block1)
+                    .ok_or(Error::new(
+                        ErrorKind::Unsupported,
+                        "endpoint does not support blockwise transfers. Try setting block1_size to a larger value",
+                    ))?;
+                let block1_resp = maybe_block1.map_err(|_| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        "endpoint responded with invalid block",
+                    )
+                })?;
+                //TODO: negotiate smaller block size
+                if block1_resp.size_exponent != block.size_exponent {
+                    return Err(Error::new(
+                        ErrorKind::Unsupported,
+                        "negotiating block size is currently unsupported",
+                    ));
+                }
+            }
+            result = Ok(resp);
+        }
+        result
+    }
+
+    /// Receive a response support block-wise.
+    async fn receive(&self, request: &mut CoapRequest<SocketAddr>) -> IoResult<CoapResponse> {
+        let mut block2_state = BlockState::default();
+        loop {
+            match Self::intercept_response(request, &mut block2_state) {
+                Ok(true) => {
+                    request.message.header.message_id = self.gen_message_id();
+                    let resp = self.send_single_request(request).await?;
+                    request.response = Some(resp);
+                }
+                Err(err) => {
+                    error!("intercept response error: {:?}", err);
+                    return Err(Error::new(ErrorKind::Interrupted, "packet error"));
+                }
+                Ok(false) => {
+                    break;
+                }
+            }
+        }
+        Ok(CoapResponse {
+            message: request.response.as_ref().unwrap().message.clone(),
+        })
+    }
+
+    /// Receive a response supporting block-wise with ETag validation.
+    ///
+    /// Returns `std::io::Error` with `ErrorKind::InvalidData` if the message contains
+    /// an ETag mismatch. This indicates the resource changed during the block transfer,
+    /// and the client MUST abort the current transfer and wait for the next notification.
+    /// Callers should branch on `e.kind() == ErrorKind::InvalidData` to handle this gracefully.
+    async fn receive_with_etag_validation(
+        &self,
+        request: &mut CoapRequest<SocketAddr>,
+        expected_etag: Option<&[u8]>,
+    ) -> IoResult<CoapResponse> {
+        let mut block2_state = BlockState::default();
+        loop {
+            if let Some(ref response) = request.response {
+                if let Some(expected) = expected_etag {
+                    let etag_matches = response
+                        .message
+                        .get_option(CoapOption::ETag)
+                        .and_then(|iter| iter.front())
+                        .map(|etag: &Vec<u8>| etag.as_slice() == expected)
+                        .unwrap_or(false);
+
+                    if !etag_matches {
+                        debug!(
+                            "ETag mismatch detected: expected {:?}, got {:?}. Aborting block transfer.",
+                            expected,
+                            response.message.get_option(CoapOption::ETag)
+                        );
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "ETag mismatch: resource changed during block transfer",
+                        ));
+                    }
+                }
+            }
+
+            match Self::intercept_response(request, &mut block2_state) {
+                Ok(true) => {
+                    request.message.header.message_id = self.gen_message_id();
+                    let resp = self.send_single_request(request).await?;
+                    request.response = Some(resp);
+                }
+                Err(err) => {
+                    error!("intercept response error: {:?}", err);
+                    return Err(Error::new(ErrorKind::Interrupted, "packet error"));
+                }
+                Ok(false) => {
+                    break;
+                }
+            }
+        }
+        Ok(CoapResponse {
+            message: request.response.as_ref().unwrap().message.clone(),
+        })
+    }
+
+    /// Set the receive timeout.
+    pub fn set_receive_timeout(&mut self, dur: Duration) {
+        self.transport.timeout = dur;
+    }
+
+    pub fn set_transport_retries(&mut self, num_retries: usize) {
+        self.transport.retries = num_retries;
+    }
+
+    /// Set the maximum size for a block1 request. Default is 1024 bytes
+    pub fn set_block1_size(&mut self, block1_max_bytes: usize) {
+        self.block1_size = block1_max_bytes;
+    }
+
+    /// Set the total framed-message budget (the link MTU) for outbound requests.
+    /// When set, each request's Block1 size is derived from this minus the
+    /// message's actual non-payload overhead (`block1_size_for_mtu`) instead of
+    /// the static `block1_size`, so short requests use larger payload blocks than
+    /// option-heavy ones on the same link. `None` restores the static behaviour.
+    pub fn set_max_total_message_size(&mut self, max_total_message_size: Option<usize>) {
+        self.max_total_message_size = max_total_message_size;
+    }
+
+    fn parse_coap_url(url: &str) -> IoResult<(String, u16, String, Vec<Vec<u8>>)> {
+        let url_params = match Url::parse(url) {
+            Ok(url_params) => url_params,
+            Err(_) => return Err(Error::new(ErrorKind::InvalidInput, "url error")),
+        };
+
+        let host = match url_params.host_str() {
+            Some("") => return Err(Error::new(ErrorKind::InvalidInput, "host error")),
+            Some(h) => h,
+            None => return Err(Error::new(ErrorKind::InvalidInput, "host error")),
+        };
+        let host = Regex::new(r"^\[(.*?)]$")
+            .unwrap()
+            .replace(host, "$1")
+            .to_string();
+
+        let port = url_params.port().unwrap_or(5683);
+
+        let path = url_params.path().to_string();
+
+        let queries = url_params
+            .query()
+            .map(|q| q.split("&").map(|qi| qi.as_bytes().to_vec()).collect())
+            .unwrap_or(vec![]);
+
+        Ok((host.to_string(), port, path, queries))
+    }
+
+    fn gen_message_id(&self) -> u16 {
+        self.message_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn gen_token(&self) -> Vec<u8> {
+        rand::random::<u16>().to_be_bytes().to_vec()
+    }
+
+    fn intercept_response(
+        request: &mut CoapRequest<SocketAddr>,
+        state: &mut BlockState,
+    ) -> std::result::Result<bool, HandlingError> {
+        let contains_more = Self::handle_blockwise(request, state)?;
+        if contains_more {
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    // Handle blockwise transfers.
+    // Returns Ok(true) if the datagram contains more blocks.
+    // Returns Ok(false) if it is the last block or if the datagram is not part of a blockwise transfer.
+    // Returns Err if the response block number does not match the expected sequence.
+    fn handle_blockwise(
+        request: &mut CoapRequest<SocketAddr>,
+        state: &mut BlockState,
+    ) -> std::result::Result<bool, HandlingError> {
+        let packet = request.response.as_ref().unwrap().message.clone();
+
+        if let Some(block2) = Self::get_block2_option(&packet) {
+            // Validate that the response block number matches what we expected
+            if let Some(expected) = state.expected_block_num {
+                if block2.num != expected {
+                    debug!(
+                        "Block number mismatch: expected {}, got {}. Aborting transfer.",
+                        expected, block2.num
+                    );
+                    return Err(HandlingError::internal(format!(
+                        "Block number mismatch: expected {}, got {}",
+                        expected, block2.num
+                    )));
+                }
+            }
+
+            if state.cached_payload.is_none() {
+                state.cached_payload = Some(Vec::new());
+            }
+            let cached_payload = state.cached_payload.as_mut().unwrap();
+            let payload_offset = usize::from(block2.num) * block2.size();
+            extending_splice(
+                cached_payload,
+                payload_offset..payload_offset + block2.size(),
+                packet.payload.iter().copied(),
+                16 * 1024,
+            )
+            .map_err(HandlingError::internal)?;
+
+            if Self::contains_more_blocks(&packet) {
+                // Prepare request for requesting next block
+                let next_num = block2.num + 1;
+                state.expected_block_num = Some(next_num);
+                request.message.clear_option(CoapOption::Block1);
+                request.message.clear_option(CoapOption::Block2);
+                let mut next_block2 = block2.clone();
+                next_block2.num = next_num;
+                next_block2.more = false;
+                request
+                    .message
+                    .add_option_as::<BlockValue>(CoapOption::Block2, next_block2);
+                return Ok(true);
+            } else {
+                let cached_payload = mem::take(&mut state.cached_payload).unwrap();
+                request.response.as_mut().unwrap().message.payload = cached_payload;
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn get_block2_option(packet: &Message) -> Option<BlockValue> {
+        packet
+            .get_first_option_as::<BlockValue>(CoapOption::Block2)
+            .and_then(|x| x.ok())
+    }
+
+    // Check the Block2 option in the packet and determine if the datagram contains more blocks or
+    // if it is the last block.
+    // All packets that are part of a blockwise transfer will be assembled in the BlockState.cached_payload.
+    fn contains_more_blocks(packet: &Message) -> bool {
+        if let Some(block2) = Self::get_block2_option(packet) {
+            if block2.more {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BlockState {
+    cached_payload: Option<Vec<u8>>,
+    expected_block_num: Option<u16>,
+}
+
+#[cfg(test)]
+mod test {
+
+    use tokio::time;
+
+    use crate::server::test::spawn_server;
+
+    use super::super::*;
+    use super::*;
+    use coap_lite::ResponseType as Status;
+    use std::ops::DerefMut;
+    use std::str;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // MTU-aware request block sizing: pick the largest valid CoAP block
+    // (power of two, 16..=1024) whose payload fits the MTU once the request's
+    // non-payload overhead + the Block1 option are accounted for. This is the
+    // request-side mirror of coap-lite's server-side block negotiation.
+    #[test]
+    fn block1_size_for_mtu_picks_largest_fitting_power_of_two() {
+        // 200 B MTU, 50 B overhead → 200-50-12 = 138 budget → 128-byte block.
+        assert_eq!(block1_size_for_mtu(200, 50).unwrap(), 128);
+        // Same MTU, heavier options (120 B) → 200-120-12 = 68 → only 64 fits.
+        // (The 128-vs-64 boundary that matters for small-MTU bandwidth.)
+        assert_eq!(block1_size_for_mtu(200, 120).unwrap(), 64);
+        // Exactly on a boundary: budget 128 → 128.
+        assert_eq!(block1_size_for_mtu(140, 0).unwrap(), 128);
+        // A generous MTU is capped at the 1024-byte CoAP maximum.
+        assert_eq!(block1_size_for_mtu(100_000, 50).unwrap(), 1024);
+    }
+
+    #[test]
+    fn block1_size_for_mtu_errors_when_too_small_to_frame() {
+        // 60 B MTU but 60 B of options + 12 B block option leaves < 16 → error,
+        // not a silently-too-large block.
+        let err = block1_size_for_mtu(60, 60).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_parse_coap_url_good_url() {
+        assert!(UdpCoAPClient::parse_coap_url("coap://127.0.0.1").is_ok());
+        assert!(UdpCoAPClient::parse_coap_url("coap://127.0.0.1:5683").is_ok());
+        assert!(UdpCoAPClient::parse_coap_url("coap://[::1]").is_ok());
+        assert!(UdpCoAPClient::parse_coap_url("coap://[::1]:5683").is_ok());
+        assert!(UdpCoAPClient::parse_coap_url("coap://[bbbb::9329:f033:f558:7418]").is_ok());
+        assert!(UdpCoAPClient::parse_coap_url("coap://[bbbb::9329:f033:f558:7418]:5683").is_ok());
+        assert!(UdpCoAPClient::parse_coap_url("coap://127.0.0.1/?hello=world").is_ok());
+    }
+
+    #[test]
+    fn test_parse_coap_url_bad_url() {
+        assert!(UdpCoAPClient::parse_coap_url("coap://127.0.0.1:65536").is_err());
+        assert!(UdpCoAPClient::parse_coap_url("coap://").is_err());
+        assert!(UdpCoAPClient::parse_coap_url("coap://:5683").is_err());
+        assert!(UdpCoAPClient::parse_coap_url("127.0.0.1").is_err());
+    }
+
+    async fn request_handler(req: Box<CoapRequest<SocketAddr>>) -> Box<CoapRequest<SocketAddr>> {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        req
+    }
+
+    #[test]
+    fn test_parse_queries() {
+        if let Ok((_, _, _, queries)) =
+            UdpCoAPClient::parse_coap_url("coap://127.0.0.1/?hello=world&test1=test2")
+        {
+            assert_eq!(
+                vec![
+                    "hello=world".as_bytes().to_vec(),
+                    "test1=test2".as_bytes().to_vec()
+                ],
+                queries
+            );
+        } else {
+            error!("Parse Queries failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_url() {
+        let resp = UdpCoAPClient::get("coap://coap.me:5683/hello")
+            .await
+            .unwrap();
+        assert_eq!(resp.message.payload, b"world".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_get_url_timeout() {
+        let server_port = server::test::spawn_server("127.0.0.1:0", request_handler)
+            .recv()
+            .await
+            .unwrap();
+
+        let error = UdpCoAPClient::get_with_timeout(
+            &format!("coap://127.0.0.1:{}/Rust", server_port),
+            Duration::new(0, 0),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn test_get() {
+        let domain = "coap.me";
+        let client = UdpCoAPClient::new((domain, 5683)).await.unwrap();
+        let resp = client
+            .send(
+                RequestBuilder::request_path(
+                    "/hello",
+                    Method::Get,
+                    None,
+                    vec![],
+                    Some(domain.to_string()),
+                )
+                .build(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.message.payload, b"world".to_vec());
+    }
+    #[tokio::test]
+    async fn test_post_url() {
+        let resp = UdpCoAPClient::post("coap://coap.me:5683/validate", b"world".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(resp.message.payload, b"POST OK".to_vec());
+        let resp = UdpCoAPClient::post("coap://coap.me:5683/validate", b"test".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(resp.message.payload, b"POST OK".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_post() {
+        let domain = "coap.me";
+        let client = UdpCoAPClient::new((domain, 5683)).await.unwrap();
+        let resp = client
+            .send(
+                RequestBuilder::request_path(
+                    "/validate",
+                    Method::Post,
+                    Some(b"world".to_vec()),
+                    vec![],
+                    Some(domain.to_string()),
+                )
+                .build(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.message.payload, b"POST OK".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_put_url() {
+        let resp = UdpCoAPClient::put("coap://coap.me:5683/create1", b"world".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(resp.message.payload, b"Created".to_vec());
+        let resp = UdpCoAPClient::put("coap://coap.me:5683/create1", b"test".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(resp.message.payload, b"Created".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_put() {
+        let domain = "coap.me";
+        let client = UdpCoAPClient::new((domain, 5683)).await.unwrap();
+        let resp = client
+            .send(
+                RequestBuilder::new("/create1", Method::Put)
+                    .data(Some(b"world".to_vec()))
+                    .domain(domain.to_string())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.message.payload, b"Created".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_delete_url() {
+        let resp = UdpCoAPClient::delete("coap://coap.me:5683/validate")
+            .await
+            .unwrap();
+        assert_eq!(resp.message.payload, b"DELETE OK".to_vec());
+        let resp = UdpCoAPClient::delete("coap://coap.me:5683/validate")
+            .await
+            .unwrap();
+        assert_eq!(resp.message.payload, b"DELETE OK".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_delete() {
+        let domain = "coap.me";
+        let client = UdpCoAPClient::new((domain, 5683)).await.unwrap();
+        let resp = client
+            .send(
+                RequestBuilder::new("/validate", Method::Delete)
+                    .domain(domain.to_string())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.message.payload, b"DELETE OK".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_set_broadcast() {
+        let client = UdpCoAPClient::new(("127.0.0.1", 5683)).await.unwrap();
+        assert!(client.set_broadcast(true).is_ok());
+        assert!(client.set_broadcast(false).is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_set_broadcast_v6() {
+        let client = UdpCoAPClient::new(("::1", 5683)).await.unwrap();
+        assert!(client.set_broadcast(true).is_ok());
+        assert!(client.set_broadcast(false).is_ok());
+    }
+
+    type FakeObserveHandlerFn = Box<
+        dyn Fn(
+                Box<CoapRequest<SocketAddr>>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Box<CoapRequest<SocketAddr>>> + Send>,
+            > + Send
+            + Sync
+            + 'static,
+    >;
+
+    // Build a server that fakes observe behavior for a single response (it doesn't send regular notifications).
+    // Upon "/observe_me" registration, it returns a single notification split into two blocks.
+    // First block Block2 option: num=0 more=true, payload: "a" 1024 times, second block: num=1 more=false, payload: "b" 1024 times.
+    fn make_fake_blockwise_observe_server_handler() -> FakeObserveHandlerFn {
+        let prev_block_num = Arc::new(std::sync::Mutex::new(0u8));
+        Box::new(move |mut req: Box<CoapRequest<SocketAddr>>| {
+            let prev_block_num = prev_block_num.clone();
+            Box::pin(async move {
+                let path = req.get_path().to_string();
+                let method = *req.get_method();
+
+                let mut send_block = |num: u16, more: bool, data: &[u8]| {
+                    if let Some(resp) = req.response.as_mut() {
+                        resp.message.header.code = MessageClass::Response(Status::Content);
+                        let block =
+                            BlockValue::new(num as usize, more, data.len()).expect("valid block");
+                        resp.message
+                            .add_option_as::<BlockValue>(CoapOption::Block2, block);
+                        resp.message.payload = data.to_vec();
+                    }
+                };
+
+                match (path.as_str(), method) {
+                    ("ok", Method::Get) => {
+                        if let Some(resp) = req.response.as_mut() {
+                            resp.message.header.code = MessageClass::Response(Status::Content);
+                            resp.message.payload = b"ok".to_vec();
+                        }
+                    }
+                    ("observe_me", _) => {
+                        let has_observe = req.message.get_option(CoapOption::Observe).is_some();
+                        let maybe_block2_req = req
+                            .message
+                            .get_first_option_as::<BlockValue>(CoapOption::Block2)
+                            .and_then(|x| x.ok());
+
+                        match (has_observe, maybe_block2_req) {
+                            (true, None) => {
+                                *prev_block_num.lock().unwrap() = 0;
+                                let payload_first_block = vec![b'a'; 1024];
+                                send_block(0, true, &payload_first_block);
+                            }
+                            (_, Some(block2)) if block2.num == 1 => {
+                                *prev_block_num.lock().unwrap() = 1;
+                                let payload_second_block = vec![b'b'; 1024];
+                                send_block(1, false, &payload_second_block);
+                            }
+                            _ => {
+                                if let Some(resp) = req.response.as_mut() {
+                                    resp.message.header.code =
+                                        MessageClass::Response(Status::NotFound);
+                                    resp.message.payload = b"not found".to_vec();
+                                }
+                            }
+                        }
+                    }
+                    ("delayed_observe", _) => {
+                        // Simulate a slow connection to enforce a timeout
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        if let Some(resp) = req.response.as_mut() {
+                            resp.message.header.code = MessageClass::Response(Status::Content);
+                            resp.message.payload = b"delayed_observe".to_vec();
+                        }
+                    }
+                    _ => {
+                        if let Some(resp) = req.response.as_mut() {
+                            resp.message.header.code = MessageClass::Response(Status::NotFound);
+                            resp.message.payload = b"not found".to_vec();
+                        }
+                    }
+                }
+
+                req
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn test_observe_registration_failure_cleans_up_and_returns_error() {
+        // Spawn server with automatic observe handling disabled so that the observe-messages are passed to this handler.
+        // The server returns NotFound for observe registration
+        let server_port = server::test::spawn_server_disable_observe(
+            "127.0.0.1:0",
+            make_fake_blockwise_observe_server_handler(),
+        )
+        .recv()
+        .await
+        .unwrap();
+
+        let mut client = UdpCoAPClient::new(("127.0.0.1", server_port))
+            .await
+            .unwrap();
+        client.set_receive_timeout(Duration::from_secs(1));
+
+        // Attempt to observe non-existing resource should fail with NotFound
+        let failed_observe_result = client.observe("/dont_observe_me", |_| {}).await;
+        assert!(failed_observe_result.is_err());
+
+        // The client should remain usable after the failed registration
+        let working_observe_result = client.observe("/observe_me", |_| {}).await;
+        assert!(working_observe_result.is_ok());
+
+        // Clean up the observe registration
+        let _ = working_observe_result
+            .unwrap()
+            .send(ObserveMessage::Terminate);
+    }
+
+    #[tokio::test]
+    async fn test_observe_with_timeout() {
+        // Spawn server with automatic observe handling disabled so that we can write a specific test in the handler.
+        // Note: Port 0 is used to prevent port conflicts during concurrent test execution.
+        // Real servers should use port 5683.
+        let server_port = server::test::spawn_server_disable_observe(
+            "127.0.0.1:0",
+            make_fake_blockwise_observe_server_handler(),
+        )
+        .recv()
+        .await
+        .unwrap();
+
+        let mut client = UdpCoAPClient::new(("127.0.0.1", server_port))
+            .await
+            .unwrap();
+        client.set_transport_retries(1);
+
+        let expect_no_timely_response_handler = move |_: IoResult<Message>| {
+            // This handler should never be called because we have
+            // a short timeout and the server is slow.
+            unreachable!("handler should not be called: timeout shorter than server delay");
+        };
+
+        // Set up arc to know when the handler is called
+        let client_handler_called = Arc::new(std::sync::Mutex::new(false));
+        let client_handler_called_clone = client_handler_called.clone();
+
+        let expect_timely_response_handler = move |_: IoResult<Message>| {
+            let mut client_handler_called = client_handler_called_clone.lock().unwrap();
+            *client_handler_called = true;
+        };
+
+        // Execute the observe with a short timeout
+        let short_timeout = Duration::from_millis(1);
+        let unsubscriber = client
+            .observe_with_timeout(
+                "/delayed_observe",
+                expect_no_timely_response_handler,
+                short_timeout,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await; // Sleep longer than the server delay
+        assert!(unsubscriber.is_err());
+
+        // Execute the observe with a sufficient timeout
+        let sufficient_timeout = Duration::from_millis(200);
+        let unsubscriber = client
+            .observe_with_timeout(
+                "/delayed_observe",
+                expect_timely_response_handler,
+                sufficient_timeout,
+            )
+            .await;
+
+        // Wait for the handler to be called
+        let test_deadline = tokio::time::Instant::now() + sufficient_timeout * 2;
+        while tokio::time::Instant::now() < test_deadline {
+            if *client_handler_called.lock().unwrap() {
+                // The handler was called, we can terminate the observation
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(*client_handler_called.lock().unwrap());
+
+        // Terminate observation
+        let _ = unsubscriber.unwrap().send(ObserveMessage::Terminate);
+    }
+
+    #[tokio::test]
+    async fn test_observe_blockwise_notification_is_assembled() {
+        // Spawn server with automatic observe handling disabled so that we can write a specific test in the handler.
+        // Note: Port 0 is used to prevent port conflicts during concurrent test execution.
+        // Real servers should use port 5683.
+        let server_port = server::test::spawn_server_disable_observe(
+            "127.0.0.1:0",
+            make_fake_blockwise_observe_server_handler(),
+        )
+        .recv()
+        .await
+        .unwrap();
+
+        let client = UdpCoAPClient::new(("127.0.0.1", server_port))
+            .await
+            .unwrap();
+
+        // Set up arc to know when the handler is called
+        let client_handler_called = Arc::new(std::sync::Mutex::new(false));
+        let client_handler_called_clone = client_handler_called.clone();
+
+        let handler = move |result: IoResult<Message>| {
+            let m = result.unwrap();
+            let mut client_handler_called = client_handler_called_clone.lock().unwrap();
+            *client_handler_called = true;
+            assert!(m.payload.len() == 2048);
+        };
+
+        let terminator = client.observe("/observe_me", handler).await.unwrap();
+
+        // Wait for the handler to be called (limit execution time to 1 sec)
+        let test_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while tokio::time::Instant::now() < test_deadline {
+            if *client_handler_called.lock().unwrap() {
+                // The handler was called, we can terminate the observation
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(*client_handler_called.lock().unwrap());
+
+        // Terminate observation
+        let _ = terminator.send(ObserveMessage::Terminate);
+    }
+
+    #[tokio::test]
+    async fn test_observe_deregister_includes_uri_query() {
+        // Arrange: Create a channel to receive the deregister result from the server handler task
+        let (deregister_tx, deregister_rx) = tokio::sync::oneshot::channel::<bool>();
+        let deregister_tx = Arc::new(std::sync::Mutex::new(Some(deregister_tx)));
+
+        // Spawn server with automatic observe handling disabled so that we can write a specific test in the handler.
+        // Note: Port 0 is used to prevent port conflicts during concurrent test execution.
+        // Real servers should use port 5683.
+        let server_port = {
+            let deregister_tx = deregister_tx.clone();
+            server::test::spawn_server_disable_observe(
+                "127.0.0.1:0",
+                move |mut req: Box<CoapRequest<SocketAddr>>| {
+                    let deregister_tx = deregister_tx.clone();
+                    Box::pin(async move {
+                        if req.get_observe_flag() == Some(Ok(ObserveOption::Deregister)) {
+                            let uri_query_present = req
+                                .message
+                                .get_option(CoapOption::UriQuery)
+                                .is_some_and(|opts| opts.contains(&b"q=uery".to_vec()));
+                            if let Some(tx) = deregister_tx.lock().unwrap().take() {
+                                let _ = tx.send(uri_query_present);
+                            }
+                        }
+                        if let Some(resp) = req.response.as_mut() {
+                            resp.message.header.code = MessageClass::Response(Status::Content);
+                        }
+                        req
+                    })
+                },
+            )
+        }
+        .recv()
+        .await
+        .unwrap();
+
+        let client = UdpCoAPClient::new(("127.0.0.1", server_port))
+            .await
+            .unwrap();
+
+        let mut request = CoapRequest::new();
+        request.set_path("/observe_me");
+        request.message.set_option(
+            CoapOption::UriQuery,
+            std::iter::once("q=uery".as_bytes().to_vec()).collect(),
+        );
+        request.set_method(Method::Get);
+
+        // Act
+        let terminator = client
+            .observe_with(request, |_: IoResult<Message>| {})
+            .await
+            .unwrap();
+        let _ = terminator.send(ObserveMessage::Terminate);
+
+        // Assert: wait for the server to receive the deregister and report the result
+        let uri_query_in_deregister = tokio::time::timeout(Duration::from_secs(1), deregister_rx)
+            .await
+            .expect("deregister request not received within 1 second")
+            .expect("deregister sender was dropped");
+        assert!(
+            uri_query_in_deregister,
+            "deregister request did not include URI query 'q=uery'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_all_coap() {
+        // prepare the Non-confirmable request with the broadcast message
+        let mut request: CoapRequest<SocketAddr> = CoapRequest::new();
+        request.set_method(Method::Get);
+        request.set_path("/");
+        request
+            .message
+            .header
+            .set_type(coap_lite::MessageType::NonConfirmable);
+        request.message.payload = b"Discovery".to_vec();
+
+        let client = UdpCoAPClient::new(("127.0.0.1", 5683)).await.unwrap();
+        client.send_all_coap(&mut request, 0).await.unwrap();
+    }
+    #[tokio::test]
+    async fn test_change_block_option() {
+        // this test is a little finnicky because it relies on the configuration
+        // of the reception endpoint. It tries to send a payload larger than the
+        // default using a block option, this request is expected to fail because
+        // the endpoint does not support block requests. Afterwards, we change the
+        // maximum block size and thus expect the request to work.
+        const PAYLOAD_STR: &str = "this is a payload";
+        let mut large_payload = vec![];
+        while large_payload.len() < 1024 {
+            large_payload.extend_from_slice(PAYLOAD_STR.as_bytes());
+        }
+        let domain = "coap.me";
+        let mut client = UdpCoAPClient::new((domain, 5683)).await.unwrap();
+        let resp = client
+            .send(
+                RequestBuilder::new("/large-create", Method::Put)
+                    .domain(domain.to_string())
+                    .data(Some(large_payload.clone()))
+                    .build(),
+            )
+            .await;
+        let err = resp.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
+        //we now set the block size to make sure it is sent in a single request
+        client.set_block1_size(10_000_000);
+
+        let resp = client
+            .send(
+                RequestBuilder::new("/large-create", Method::Post)
+                    .data(Some(large_payload.clone()))
+                    .domain(domain.to_string())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(*resp.get_status(), Status::Created);
+    }
+    #[tokio::test]
+    #[ignore]
+    async fn test_send_all_coap_v6() {
+        // prepare the Non-confirmable request with the broadcast message
+        let mut request: CoapRequest<SocketAddr> = CoapRequest::new();
+        request.set_method(Method::Get);
+        request.set_path("/");
+        request
+            .message
+            .header
+            .set_type(coap_lite::MessageType::NonConfirmable);
+        request.message.payload = b"Discovery".to_vec();
+
+        let client = UdpCoAPClient::new(("::1", 5683)).await.unwrap();
+        client.send_all_coap(&mut request, 0x4).await.unwrap();
+    }
+
+    struct FaultyUdp {
+        pub udp: UdpTransport,
+        pub num_fails: u32,
+        pub current_fails: AtomicU32,
+    }
+
+    #[async_trait]
+    impl ClientTransport for FaultyUdp {
+        async fn recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, Option<SocketAddr>)> {
+            self.udp.recv(buf).await
+        }
+
+        async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
+            self.current_fails.fetch_add(1, Ordering::Relaxed);
+            self.current_fails
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n % self.num_fails)
+                })
+                .unwrap();
+            if self.current_fails.load(Ordering::Relaxed) == 0 {
+                return self.udp.send(buf).await;
+            }
+            Err(Error::other("fails this time"))
+        }
+    }
+
+    async fn get_faulty_client(server_addr: &str, num_fails: u32) -> CoAPClient<FaultyUdp> {
+        let peer_addr = lookup_host(server_addr)
+            .await
+            .unwrap()
+            .next()
+            .ok_or(Error::new(
+                ErrorKind::InvalidInput,
+                "could not get socket address",
+            ))
+            .unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let transport = UdpTransport { socket, peer_addr };
+        let transport = FaultyUdp {
+            udp: transport,
+            num_fails,
+            current_fails: 0.into(),
+        };
+
+        CoAPClient::from_transport(transport)
+    }
+    #[tokio::test]
+    async fn test_retries() {
+        let server_port = server::test::spawn_server("127.0.0.1:0", |mut req| async {
+            req.response.as_mut().unwrap().message.payload = b"Rust".to_vec();
+            req
+        })
+        .recv()
+        .await
+        .unwrap();
+
+        let server_addr = format!("127.0.0.1:{}", server_port);
+        let mut client = get_faulty_client(
+            &server_addr,
+            CoapClientTransport::<FaultyUdp>::DEFAULT_NUM_RETRIES as u32 + 1,
+        )
+        .await;
+        let request_gen = || {
+            RequestBuilder::new("/Rust", Method::Get)
+                .domain(server_addr.clone())
+                .build()
+        };
+        let error = client.send(request_gen()).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Other);
+        //this request will work, we do this to reset the state of the faulty udp
+        client.send(request_gen()).await.unwrap();
+
+        client.set_transport_retries(CoapClientTransport::<UdpTransport>::DEFAULT_NUM_RETRIES + 2);
+        let resp = client.send(request_gen()).await.unwrap();
+
+        assert_eq!(resp.message.payload, b"Rust".to_vec());
+    }
+    #[tokio::test]
+    async fn test_non_confirmable_no_retries() {
+        let server_port = server::test::spawn_server("127.0.0.1:0", |mut req| async {
+            req.response.as_mut().unwrap().message.payload = b"Rust".to_vec();
+            req
+        })
+        .recv()
+        .await
+        .unwrap();
+
+        let server_addr = format!("127.0.0.1:{}", server_port);
+        let client = get_faulty_client(&server_addr, 2).await;
+        let mut request = CoapRequest::new();
+        request.set_method(Method::Get);
+        request.set_path("/Rust");
+        request.message.header.message_id = 123;
+        request.message.header.set_type(MessageType::NonConfirmable);
+
+        let req = client.send(request).await;
+        assert!(req.is_err());
+    }
+
+    async fn do_wait_request<T: ClientTransport + 'static>(
+        client: Arc<CoAPClient<T>>,
+        path: &str,
+        token: Vec<u8>,
+        wait_ms: u64,
+    ) -> IoResult<CoapResponse> {
+        let mut request = CoapRequest::new();
+        request.message.header.set_version(1);
+        request
+            .message
+            .header
+            .set_type(coap_lite::MessageType::Confirmable);
+        request.message.header.set_code("0.01");
+        request.message.header.message_id = 1;
+        request.message.set_token(token);
+        request
+            .message
+            .add_option(CoapOption::UriPath, path.as_bytes().to_vec());
+        request.message.payload = wait_ms.to_string().into();
+
+        return client.send(request).await;
+    }
+
+    async fn wait_handler(mut req: Box<CoapRequest<SocketAddr>>) -> Box<CoapRequest<SocketAddr>> {
+        let uri_path_list = req.message.get_option(CoapOption::UriPath).unwrap().clone();
+        let payload = str::from_utf8(&req.message.payload).unwrap();
+        let to_wait_ms: u64 = payload.parse().unwrap();
+        time::sleep(Duration::from_millis(to_wait_ms)).await;
+
+        if let Some(ref mut response) = req.response {
+            response.message.payload = uri_path_list.front().unwrap().clone();
+        }
+        req
+    }
+    /// run 2 clients using the same transport and receive an answer
+    /// in the expected order without interference
+    #[tokio::test]
+    async fn test_multiple_clients_same_socket() {
+        let server_port = spawn_server("127.0.0.1:0", wait_handler)
+            .recv()
+            .await
+            .unwrap();
+
+        let client = Arc::new(
+            UdpCoAPClient::new(format!("127.0.0.1:{}", server_port))
+                .await
+                .unwrap(),
+        );
+        let mut b = tokio::spawn(do_wait_request(client.clone(), "/bar", vec![1], 500));
+        let a = tokio::spawn(do_wait_request(client.clone(), "/foo", vec![2], 50));
+
+        tokio::select! {
+            a_first = a => {
+            let a_first = a_first.unwrap().unwrap();
+            assert_eq!(a_first.message.payload, b"/foo".to_vec());
+            assert_eq!(a_first.message.get_token(), vec![2]);
+            },
+            _b_first = &mut b => {
+                panic!("should not happen");
+
+            }
+        }
+        let b_end = b.await.unwrap().expect("should receive a response");
+        assert_eq!(b_end.message.payload, b"/bar".to_vec());
+        assert_eq!(b_end.message.get_token(), vec![1]);
+    }
+
+    struct FaultyReceiver {
+        pub udp: UdpTransport,
+        pub should_fail: Mutex<oneshot::Receiver<std::io::Error>>,
+    }
+    #[async_trait]
+    impl ClientTransport for FaultyReceiver {
+        async fn recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, Option<SocketAddr>)> {
+            let mut mutex = self.should_fail.lock().await;
+            tokio::select! {
+                e = mutex.deref_mut() => {
+                    return Err(e.unwrap());
+                }
+                result = self.udp.recv(buf) => {
+                    return result;
+                }
+            }
+        }
+
+        async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
+            self.udp.send(buf).await
+        }
+    }
+
+    async fn get_faulty_receiver_client(
+        server_addr: &str,
+    ) -> (oneshot::Sender<std::io::Error>, CoAPClient<FaultyReceiver>) {
+        let (tx, rx) = oneshot::channel();
+        let peer_addr = lookup_host(server_addr)
+            .await
+            .unwrap()
+            .next()
+            .ok_or(Error::new(
+                ErrorKind::InvalidInput,
+                "could not get socket address",
+            ))
+            .unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let transport = UdpTransport { socket, peer_addr };
+        let transport = FaultyReceiver {
+            udp: transport,
+            should_fail: Mutex::new(rx),
+        };
+
+        (tx, CoAPClient::from_transport(transport))
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_synchronizer_receive_error() {
+        let server_port = server::test::spawn_server("127.0.0.1:0", wait_handler)
+            .recv()
+            .await
+            .unwrap();
+
+        let server_addr = format!("127.0.0.1:{}", server_port);
+        let (flag, client) = get_faulty_receiver_client(&server_addr).await;
+        let mut handles = vec![];
+        let arc_client = Arc::new(client);
+        for i in 0..10 {
+            let c_clone = arc_client.clone();
+            handles.push(tokio::spawn(async move {
+                do_wait_request(c_clone, &format!("/{}", i), vec![i], 2000).await
+            }));
+        }
+        //wait for all futures to advance
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        flag.send(Error::other("fail")).unwrap();
+
+        //all handles should fail now because of the error
+        for h in handles {
+            assert!(h.await.unwrap().is_err());
+        }
+
+        assert!(
+            do_wait_request(arc_client.clone(), "/foo", vec![254], 1)
+                .await
+                .is_err(),
+            "failed transport should make all other requests fail"
+        )
+    }
+
+    fn generate_large_payload(byte: u8) -> Vec<u8> {
+        let payload = vec![byte; 2048];
+        assert!(
+            payload.len() > 1024,
+            "Test payload must be larger than default block size"
+        );
+        payload
+    }
+
+    async fn large_resource_handler(
+        mut req: Box<CoapRequest<SocketAddr>>,
+    ) -> Box<CoapRequest<SocketAddr>> {
+        if req.response.is_none() {
+            req.response = Some(CoapResponse {
+                message: Message::new(),
+            });
+        }
+
+        if let Some(ref mut response) = req.response {
+            response.message.payload = b"OK".to_vec();
+        }
+        req
+    }
+
+    #[tokio::test]
+    async fn test_observe_large_resource_continuous_update() {
+        let server_port = server::test::spawn_server("127.0.0.1:0", large_resource_handler)
+            .recv()
+            .await
+            .unwrap();
+        let addr = format!("127.0.0.1:{}", server_port);
+        let client = UdpCoAPClient::new(&addr).await.unwrap();
+
+        let payload_a = generate_large_payload(b'a');
+        let put_req = RequestBuilder::new("/large", Method::Put)
+            .data(Some(payload_a.clone()))
+            .build();
+        client.send(put_req).await.unwrap();
+
+        let received_payloads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_payloads_clone = received_payloads.clone();
+
+        let mut observe_req = CoapRequest::new();
+        observe_req.set_method(Method::Get);
+        observe_req.set_path("/large");
+        observe_req.message.add_option_as::<BlockValue>(
+            CoapOption::Block2,
+            BlockValue::new(0, false, 1024).unwrap(),
+        );
+
+        let unsubscriber = client
+            .observe_with(observe_req, move |result| {
+                let msg = result.unwrap();
+                let mut lock = received_payloads_clone.lock().unwrap();
+                lock.push(msg.payload.clone());
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let first_payloads = received_payloads.lock().unwrap().clone();
+        assert_eq!(
+            first_payloads.len(),
+            1,
+            "Should receive initial notification"
+        );
+        assert_eq!(first_payloads[0], payload_a, "Initial payload mismatch");
+
+        let payload_b = generate_large_payload(b'b');
+        let put_req2 = RequestBuilder::new("/large", Method::Put)
+            .data(Some(payload_b.clone()))
+            .build();
+        client.send(put_req2).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let second_payloads = received_payloads.lock().unwrap().clone();
+        assert_eq!(
+            second_payloads.len(),
+            2,
+            "Should receive update notification"
+        );
+        assert_eq!(second_payloads[1], payload_b, "Updated payload mismatch");
+
+        let _ = unsubscriber.send(ObserveMessage::Terminate);
+    }
+
+    #[tokio::test]
+    async fn test_observe_cancel_stops_future_notifications() {
+        let server_port = server::test::spawn_server("127.0.0.1:0", large_resource_handler)
+            .recv()
+            .await
+            .unwrap();
+        let addr = format!("127.0.0.1:{}", server_port);
+        let client = UdpCoAPClient::new(&addr).await.unwrap();
+
+        // Use small payload to avoid exceeding client's 1500 byte UDP receive buffer
+        let payload_a = vec![b'a'; 100];
+        client
+            .send(
+                RequestBuilder::new("/large", Method::Put)
+                    .data(Some(payload_a.clone()))
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let handler_counter = Arc::new(AtomicU16::new(0));
+        let handler_counter_clone = handler_counter.clone();
+
+        let unsubscriber = client
+            .observe("/large", move |_: IoResult<Message>| {
+                handler_counter_clone.fetch_add(1, Ordering::Relaxed);
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            handler_counter.load(Ordering::Relaxed),
+            1,
+            "Initial observe failed"
+        );
+
+        let _ = unsubscriber.send(ObserveMessage::Terminate);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let payload_b = vec![b'b'; 100];
+        client
+            .send(
+                RequestBuilder::new("/large", Method::Put)
+                    .data(Some(payload_b))
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(
+            handler_counter.load(Ordering::Relaxed),
+            1,
+            "Should not receive notification after cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_observe_large_resource_no_block2_fallback() {
+        let server_port = server::test::spawn_server("127.0.0.1:0", large_resource_handler)
+            .recv()
+            .await
+            .unwrap();
+        let addr = format!("127.0.0.1:{}", server_port);
+        let client = UdpCoAPClient::new(&addr).await.unwrap();
+
+        // Use 1200 bytes: larger than 1024 block size, but smaller than 1500 UDP buffer limit
+        let payload = vec![b'x'; 1200];
+        client
+            .send(
+                RequestBuilder::new("/large", Method::Put)
+                    .data(Some(payload.clone()))
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let handler_received_full = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler_received_full_clone = handler_received_full.clone();
+
+        // Construct registration request without Block2 option
+        let mut req = CoapRequest::new();
+        req.set_method(Method::Get);
+        req.set_path("/large");
+
+        let unsubscriber = client
+            .observe_with(req, move |result| {
+                let msg = result.unwrap();
+                // Verify that even without Block2 and larger than default block size, full data is received at once
+                assert_eq!(msg.payload.len(), 1200);
+                assert_eq!(msg.payload, payload);
+                handler_received_full_clone.store(true, Ordering::Relaxed);
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            handler_received_full.load(Ordering::Relaxed),
+            "Fallback to full payload failed"
+        );
+
+        let _ = unsubscriber.send(ObserveMessage::Terminate);
+    }
+
+    #[tokio::test]
+    async fn test_send_invalid_observe_registration() {
+        let server_port = server::test::spawn_server("127.0.0.1:0", large_resource_handler)
+            .recv()
+            .await
+            .unwrap();
+        let addr = format!("127.0.0.1:{}", server_port);
+        let client = UdpCoAPClient::new(&addr).await.unwrap();
+
+        let mut req = CoapRequest::new();
+        req.set_method(Method::Get);
+
+        // Not setting the observe flag.
+        let res = client
+            .observe_with(req.clone(), |_msg| {
+                unreachable!("Handler should not be called for invalid observe registration");
+            })
+            .await;
+
+        assert!(
+            res.is_err(),
+            "Expected error for invalid observe registration"
+        );
+
+        // A deregister flag cannot be used to register.
+        req.set_observe_flag(ObserveOption::Deregister);
+        let res = client
+            .observe_with(req, |_msg| {
+                unreachable!("Handler should not be called for invalid observe registration");
+            })
+            .await;
+
+        assert!(
+            res.is_err(),
+            "Expected error for invalid observe registration"
+        );
+    }
+
+    #[test]
+    fn test_handle_blockwise_rejects_mismatched_block_number() {
+        // Arrange: build a request whose response carries Block2 num=5
+        let mut request: CoapRequest<SocketAddr> = CoapRequest::new();
+        let mut response_msg = Message::new();
+        let wrong_block = BlockValue::new(5, true, 1024).unwrap();
+        response_msg.add_option_as::<BlockValue>(CoapOption::Block2, wrong_block);
+        response_msg.payload = vec![0xAA; 1024];
+        request.response = Some(CoapResponse {
+            message: response_msg,
+        });
+
+        let mut state = BlockState {
+            cached_payload: Some(vec![0u8; 1024]),
+            expected_block_num: Some(1),
+        };
+
+        // Act
+        let result = CoAPClient::<UdpTransport>::handle_blockwise(&mut request, &mut state);
+
+        // Assert
+        assert!(result.is_err(), "Expected block number mismatch error");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Block number mismatch"),
+            "Error should mention block number mismatch, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_handle_blockwise_accepts_matching_block_number() {
+        // Arrange: response carries Block2 num=1, state expects 1
+        let mut request: CoapRequest<SocketAddr> = CoapRequest::new();
+        let mut response_msg = Message::new();
+        let block = BlockValue::new(1, true, 1024).unwrap();
+        response_msg.add_option_as::<BlockValue>(CoapOption::Block2, block);
+        response_msg.payload = vec![0xBB; 1024];
+        request.response = Some(CoapResponse {
+            message: response_msg,
+        });
+
+        let mut state = BlockState {
+            cached_payload: Some(vec![0u8; 1024]),
+            expected_block_num: Some(1),
+        };
+
+        // Act
+        let result = CoAPClient::<UdpTransport>::handle_blockwise(&mut request, &mut state);
+
+        // Assert: should succeed and indicate more blocks
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Expected more blocks");
+        assert_eq!(state.expected_block_num, Some(2));
+    }
+
+    #[test]
+    fn test_handle_blockwise_skips_guard_when_no_expected_block() {
+        // Arrange: first block (expected_block_num is None)
+        let mut request: CoapRequest<SocketAddr> = CoapRequest::new();
+        let mut response_msg = Message::new();
+        let block = BlockValue::new(0, true, 1024).unwrap();
+        response_msg.add_option_as::<BlockValue>(CoapOption::Block2, block);
+        response_msg.payload = vec![0xCC; 1024];
+        request.response = Some(CoapResponse {
+            message: response_msg,
+        });
+
+        let mut state = BlockState::default();
+
+        // Act
+        let result = CoAPClient::<UdpTransport>::handle_blockwise(&mut request, &mut state);
+
+        // Assert: no mismatch error; state should now expect block 1
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Expected more blocks");
+        assert_eq!(state.expected_block_num, Some(1));
+    }
+
+    fn make_blockwise_observe_server_with_wrong_block_num() -> FakeObserveHandlerFn {
+        Box::new(move |mut req: Box<CoapRequest<SocketAddr>>| {
+            Box::pin(async move {
+                let path = req.get_path().to_string();
+                let has_observe = req.message.get_option(CoapOption::Observe).is_some();
+                let maybe_block2 = req
+                    .message
+                    .get_first_option_as::<BlockValue>(CoapOption::Block2)
+                    .and_then(|x| x.ok());
+
+                if let Some(resp) = req.response.as_mut() {
+                    match (path.as_str(), has_observe, maybe_block2) {
+                        ("bad_block", true, None) => {
+                            // First observe notification: block 0 with more=true
+                            resp.message.header.code = MessageClass::Response(Status::Content);
+                            let block = BlockValue::new(0, true, 1024).unwrap();
+                            resp.message
+                                .add_option_as::<BlockValue>(CoapOption::Block2, block);
+                            resp.message.payload = vec![b'a'; 1024];
+                        }
+                        ("bad_block", _, Some(_block2)) => {
+                            // Client requests block 1, but we reply with block 99
+                            resp.message.header.code = MessageClass::Response(Status::Content);
+                            let wrong_block = BlockValue::new(99, false, 1024).unwrap();
+                            resp.message
+                                .add_option_as::<BlockValue>(CoapOption::Block2, wrong_block);
+                            resp.message.payload = vec![b'z'; 1024];
+                        }
+                        _ => {
+                            resp.message.header.code = MessageClass::Response(Status::NotFound);
+                        }
+                    }
+                }
+                req
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn test_observe_handler_receives_error_on_block_mismatch() {
+        let server_port = server::test::spawn_server_disable_observe(
+            "127.0.0.1:0",
+            make_blockwise_observe_server_with_wrong_block_num(),
+        )
+        .recv()
+        .await
+        .unwrap();
+
+        let client = UdpCoAPClient::new(("127.0.0.1", server_port))
+            .await
+            .unwrap();
+
+        let handler_got_error = Arc::new(std::sync::Mutex::new(false));
+        let handler_got_error_clone = handler_got_error.clone();
+
+        let handler = move |result: IoResult<Message>| {
+            if result.is_err() {
+                *handler_got_error_clone.lock().unwrap() = true;
+            }
+        };
+
+        let terminator = client.observe("/bad_block", handler).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if *handler_got_error.lock().unwrap() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            *handler_got_error.lock().unwrap(),
+            "Observe handler should have received an Err due to block number mismatch"
+        );
+
+        let _ = terminator.send(ObserveMessage::Terminate);
+    }
+
+    #[cfg(feature = "q-block")]
+    fn qblock_test_body() -> Vec<u8> {
+        (0..960u32).map(|i| i as u8).collect()
+    }
+
+    #[cfg(feature = "q-block")]
+    async fn qblock_big_handler(
+        mut req: Box<CoapRequest<SocketAddr>>,
+    ) -> Box<CoapRequest<SocketAddr>> {
+        if let Some(resp) = req.response.as_mut() {
+            resp.message.payload = qblock_test_body();
+            resp.message.header.code = coap_lite::MessageClass::Response(Status::Content);
+        }
+        req
+    }
+
+    /// `send_qblock` reassembles a large *response* streamed as Q-Block2 by a
+    /// real `Server` over loopback. The GET request carries no body and no
+    /// Q-Block opt-in, so the server's `assume_peer_block_size` (the closed-
+    /// deployment agreement) is what turns the 960-byte reply into a multi-block
+    /// Q-Block2 NON burst; the client reassembles it into a single
+    /// `CoapResponse`. This is the response-only counterpart to
+    /// `send_qblock_bidirectional_large_request_and_response`: without
+    /// `assume_peer_block_size` the body would come back as one plain PDU and
+    /// the Q-Block2 receive path would never run.
+    #[cfg(feature = "q-block")]
+    #[tokio::test]
+    async fn send_qblock_reassembles_large_response_against_real_server() {
+        use crate::qblock::QBlockConfig;
+        use crate::server::{Server, UdpCoapListener};
+        use tokio::net::UdpSocket;
+
+        let cfg = || QBlockConfig {
+            non_timeout: Duration::from_millis(5),
+            non_receive_timeout: Duration::from_millis(20),
+            ..Default::default()
+        };
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let mut server = Server::from_listeners(vec![Box::new(UdpCoapListener::from_socket(sock))]);
+        server.set_qblock_config(QBlockConfig {
+            assume_peer_block_size: Some(64),
+            ..cfg()
+        });
+        tokio::spawn(async move {
+            let _ = server.run(qblock_big_handler).await;
+        });
+
+        let mut client = UdpCoAPClient::new(addr).await.unwrap();
+        client.set_qblock_config(cfg());
+        client.set_block1_size(64); // Q-Block2 block size for the request opt-in
+
+        let request = RequestBuilder::new("/big", Method::Get).build();
+        let resp = time::timeout(Duration::from_secs(5), client.send_qblock(request))
+            .await
+            .expect("q-block transfer timed out")
+            .unwrap();
+
+        assert_eq!(resp.message.payload, qblock_test_body());
+    }
+
+    /// A *small* response that fits one block: the server replies with a single
+    /// plain PDU (`maybe_serve` declines Q-Block2), carrying no Q-Block2 option.
+    #[cfg(feature = "q-block")]
+    async fn qblock_small_handler(
+        mut req: Box<CoapRequest<SocketAddr>>,
+    ) -> Box<CoapRequest<SocketAddr>> {
+        if let Some(resp) = req.response.as_mut() {
+            resp.message.payload = vec![1, 2, 3, 4];
+            resp.message.header.code = coap_lite::MessageClass::Response(Status::Content);
+        }
+        req
+    }
+
+    /// `send_qblock` must round-trip a *small* response — one that fits a single
+    /// block, so the server answers with a plain PDU and never engages Q-Block2.
+    /// Regression for the small-reply hang: the client opts into Q-Block2, and
+    /// without the plain-response completion arm this single PDU is dropped and
+    /// the call times out. Federation is full of such small replies (e.g. an
+    /// empty `{}` body), so this is the common case, not an edge case.
+    #[cfg(feature = "q-block")]
+    #[tokio::test]
+    async fn send_qblock_small_response_round_trips() {
+        let port = spawn_server("127.0.0.1:0", qblock_small_handler)
+            .recv()
+            .await
+            .unwrap();
+
+        let mut client = UdpCoAPClient::new(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        client.set_block1_size(64);
+
+        let request = RequestBuilder::new("/small", Method::Get).build();
+        let resp = time::timeout(Duration::from_secs(5), client.send_qblock(request))
+            .await
+            .expect("small q-block response timed out (plain-response arm regressed)")
+            .unwrap();
+
+        assert_eq!(resp.message.payload, vec![1, 2, 3, 4]);
+    }
+
+    /// Echoes the request body back as the response — drives a *large request*
+    /// (reassembled server-side via Q-Block1) and a *large response* (Q-Block2).
+    #[cfg(feature = "q-block")]
+    async fn qblock_echo_handler(
+        mut req: Box<CoapRequest<SocketAddr>>,
+    ) -> Box<CoapRequest<SocketAddr>> {
+        let body = req.message.payload.clone();
+        if let Some(resp) = req.response.as_mut() {
+            resp.message.payload = body;
+            resp.message.header.code = coap_lite::MessageClass::Response(Status::Content);
+        }
+        req
+    }
+
+    /// Full bidirectional Q-Block over loopback: the client sends a large
+    /// request as Q-Block1 (server reassembles it), and the echoed large
+    /// response comes back as Q-Block2 (client reassembles it).
+    #[cfg(feature = "q-block")]
+    #[tokio::test]
+    async fn send_qblock_bidirectional_large_request_and_response() {
+        use crate::qblock::QBlockConfig;
+        use crate::server::{Server, UdpCoapListener};
+        use tokio::net::UdpSocket;
+
+        let cfg = || QBlockConfig {
+            non_timeout: Duration::from_millis(5),
+            non_receive_timeout: Duration::from_millis(20),
+            ..Default::default()
+        };
+        let body: Vec<u8> = (0..2000u32).map(|i| i as u8).collect();
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let mut server = Server::from_listeners(vec![Box::new(UdpCoapListener::from_socket(sock))]);
+        // Requests carry no Q-Block2 opt-in, so the closed-deployment flag is
+        // what turns the large echoed response into a Q-Block2 transfer.
+        server.set_qblock_config(QBlockConfig {
+            assume_peer_block_size: Some(64),
+            ..cfg()
+        });
+        tokio::spawn(async move {
+            let _ = server.run(qblock_echo_handler).await;
+        });
+
+        let mut client = UdpCoAPClient::new(addr).await.unwrap();
+        client.set_qblock_config(cfg());
+        client.set_block1_size(64);
+
+        let mut request = RequestBuilder::new("/echo", Method::Put).build();
+        request.message.payload = body.clone();
+        let resp = time::timeout(Duration::from_secs(10), client.send_qblock(request))
+            .await
+            .expect("q-block transfer timed out")
+            .unwrap();
+
+        assert_eq!(resp.message.payload, body);
+    }
+}

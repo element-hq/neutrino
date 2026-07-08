@@ -1,0 +1,15 @@
+install:
+  - appveyor DownloadFile https://win.rustup.rs/ -FileName rustup-init.exe
+  - rustup-init -yv --default-toolchain nightly --default-host x86_64-pc-windows-msvc
+  - set PATH=%PATH%;%USERPROFILE%\.cargo\bin
+  - rustc -vV
+  - cargo -vV
+
+build: false
+
+environment:
+  RUST_TEST_THREADS: 1
+
+test_script:
+  - cargo test --verbose
+  - cargo clippy --all-targets -- -D warnings

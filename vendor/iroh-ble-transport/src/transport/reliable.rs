@@ -55,7 +55,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify, mpsc};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::mtu::MAX_DATAGRAM_SIZE;
 
@@ -98,7 +98,14 @@ const WINDOW_SIZE: u8 = 6;
 /// write-without-response buffer.
 const INTER_FRAME_GAP: Duration = Duration::from_millis(3);
 
-/// BLE round-trips are typically 120-200ms; 300ms gives margin for jitter.
+/// Floor (and pre-first-sample default) for the adaptive retransmission
+/// timeout. Idle-link round-trips are ~85-100ms, so 300ms is a comfortable
+/// floor — but the true RTT is bimodal: a fragment of a QUIC-padded ≥1200 B
+/// datagram (3 fragments at chunk 509) is only ACKed once its train has
+/// serialized (~800 ms observed), so the *operating* timeout comes from
+/// [`RtoEstimator`], seeded by live Karn-filtered samples. A fixed 300 ms
+/// timer spuriously retransmitted frag0 of every such train — each waste of
+/// airtime delaying the ACKs behind it, a self-amplifying retransmit storm.
 const ACK_TIMEOUT: Duration = Duration::from_millis(300);
 
 const ACK_TIMEOUT_MAX: Duration = Duration::from_secs(5);
@@ -114,9 +121,31 @@ const ACK_DELAY: Duration = Duration::from_millis(15);
 const LINK_DEAD_DEADLINE: Duration = Duration::from_secs(6);
 
 const SEND_QUEUE_CAPACITY: usize = 32;
+
+/// How often the aggregated ACK-RTT / retransmit telemetry is emitted (at most
+/// one log line per window, and only when the window saw traffic).
+const RTT_STATS_WINDOW: Duration = Duration::from_secs(30);
+
+/// Cap on stored RTT samples per window — bounds memory and percentile-sort
+/// cost; at BLE rates a window rarely exceeds a few hundred ACKed fragments.
+const RTT_SAMPLES_CAP: usize = 512;
+
 struct InFlightFragment {
     seq: u8,
     wire_msg: Vec<u8>,
+    /// When this fragment was FIRST put on the wire (retransmits don't reset
+    /// it) — the anchor for both RTT samples and the head-age retransmit logs.
+    first_sent_at: tokio::time::Instant,
+    /// When this fragment was LAST put on the wire (updated on retransmit) —
+    /// the anchor for the retransmission timer. The deadline must be
+    /// `last_sent_at + timeout`, NOT "now + timeout" recomputed per loop
+    /// iteration: every inbound fragment wakes the send loop, so a
+    /// now-anchored deadline slides forward forever under steady inbound
+    /// traffic and the head is never retransmitted (observed on-device as
+    /// head_age_ms > 10s with head_retransmits=0 → spurious LINK_DEAD loops).
+    last_sent_at: tokio::time::Instant,
+    /// How many times this fragment has been retransmitted.
+    retransmits: u32,
 }
 
 struct FragmentEntry {
@@ -135,6 +164,102 @@ struct BufferedFragment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkDead;
 
+/// One emit-window of ACK round-trip / retransmit telemetry, for tuning
+/// [`ACK_TIMEOUT`] against the link's real RTT. Samples follow Karn's
+/// algorithm: only fragments ACKed without ever being retransmitted contribute
+/// an RTT sample — a retransmitted fragment's ACK cannot be attributed to a
+/// specific transmission, so it is counted (`acked_after_retransmit`) but not
+/// sampled.
+struct RttStats {
+    /// Clean first-transmission→ACK durations (capped at [`RTT_SAMPLES_CAP`]).
+    samples: Vec<Duration>,
+    /// Fragments ACKed in this window.
+    acked: u32,
+    /// Of `acked`, how many needed ≥1 retransmit before their ACK arrived.
+    acked_after_retransmit: u32,
+    /// Retransmissions performed in this window.
+    retransmits: u32,
+    /// Worst per-fragment retransmit count seen in this window.
+    max_retransmits: u32,
+    window_started_at: tokio::time::Instant,
+}
+
+/// RFC 6298 retransmission-timeout estimator — the same scheme TCP's RTO and
+/// QUIC's PTO use. Fed exclusively with Karn-filtered samples (fragments ACKed
+/// without ever being retransmitted), so a retransmission-ambiguous ACK can
+/// never poison the estimate.
+struct RtoEstimator {
+    /// Smoothed RTT (⅞ EWMA); `None` until the first sample.
+    srtt: Option<Duration>,
+    /// Smoothed mean deviation (¾ EWMA).
+    rttvar: Duration,
+}
+
+impl RtoEstimator {
+    fn new() -> Self {
+        Self {
+            srtt: None,
+            rttvar: Duration::ZERO,
+        }
+    }
+
+    fn sample(&mut self, r: Duration) {
+        match self.srtt {
+            None => {
+                self.srtt = Some(r);
+                self.rttvar = r / 2;
+            }
+            Some(srtt) => {
+                let dev = srtt.abs_diff(r);
+                self.rttvar = (self.rttvar * 3 + dev) / 4;
+                self.srtt = Some((srtt * 7 + r) / 8);
+            }
+        }
+    }
+
+    /// The retransmission timeout: `srtt + 4·rttvar`, clamped to
+    /// [[`ACK_TIMEOUT`], [`ACK_TIMEOUT_MAX`]]. Before any sample has landed
+    /// this is the [`ACK_TIMEOUT`] floor, i.e. exactly the old fixed
+    /// behaviour. The cap stays below [`LINK_DEAD_DEADLINE`] so at least one
+    /// retransmit always precedes a link-death verdict.
+    fn rto(&self) -> Duration {
+        match self.srtt {
+            None => ACK_TIMEOUT,
+            Some(srtt) => (srtt + self.rttvar * 4).clamp(ACK_TIMEOUT, ACK_TIMEOUT_MAX),
+        }
+    }
+}
+
+impl RttStats {
+    fn new() -> Self {
+        Self {
+            samples: Vec::new(),
+            acked: 0,
+            acked_after_retransmit: 0,
+            retransmits: 0,
+            max_retransmits: 0,
+            window_started_at: tokio::time::Instant::now(),
+        }
+    }
+
+    /// Record one ACKed fragment: a clean RTT sample if it was never
+    /// retransmitted, a tainted count otherwise.
+    fn record_ack(&mut self, rtt: Duration, fragment_retransmits: u32) {
+        self.acked += 1;
+        if fragment_retransmits == 0 {
+            if self.samples.len() < RTT_SAMPLES_CAP {
+                self.samples.push(rtt);
+            }
+        } else {
+            self.acked_after_retransmit += 1;
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
 struct ChannelState {
     send_queue: VecDeque<Vec<u8>>,
     frag_queue: VecDeque<FragmentEntry>,
@@ -149,6 +274,11 @@ struct ChannelState {
     ack_pending: Option<u8>,
     /// Delayed-ACK deadline; allows outgoing data to piggyback the ACK first.
     ack_deadline: Option<tokio::time::Instant>,
+    /// ACK-RTT / retransmit telemetry for the current emit window.
+    rtt: RttStats,
+    /// Adaptive retransmission-timeout estimator, fed by the same clean
+    /// samples as the telemetry.
+    rto: RtoEstimator,
     /// Monotonic timestamp of the last forward-progress event — i.e. the last
     /// cumulative ACK that advanced `send_base`. The send loop uses this as
     /// the anchor for `LINK_DEAD_DEADLINE`; a stuck peer is detected purely
@@ -185,6 +315,64 @@ impl ChannelState {
     fn take_ack(&mut self) -> Option<u8> {
         self.ack_deadline = None;
         self.ack_pending.take()
+    }
+
+    /// Emit the window's ACK-RTT / retransmit telemetry (one `info` line) and
+    /// start a fresh window, once [`RTT_STATS_WINDOW`] has elapsed and there
+    /// was any traffic. Called on the ACK path, so a fully stalled link emits
+    /// nothing here — the per-retransmit `head_age_ms` debug line covers that
+    /// case instead.
+    fn maybe_emit_rtt_stats(&mut self) {
+        let now = tokio::time::Instant::now();
+        let window = now.saturating_duration_since(self.rtt.window_started_at);
+        if window < RTT_STATS_WINDOW {
+            return;
+        }
+        if self.rtt.acked == 0 && self.rtt.retransmits == 0 {
+            self.rtt.window_started_at = now;
+            return;
+        }
+        let mut samples = std::mem::take(&mut self.rtt.samples);
+        samples.sort_unstable();
+        let pct = |p: usize| samples[(samples.len() - 1) * p / 100].as_millis();
+        if samples.is_empty() {
+            info!(
+                window_s = window.as_secs(),
+                acked = self.rtt.acked,
+                acked_after_retransmit = self.rtt.acked_after_retransmit,
+                retransmits = self.rtt.retransmits,
+                max_retransmits = self.rtt.max_retransmits,
+                in_flight = self.in_flight.len(),
+                queued_frags = self.frag_queue.len(),
+                queued_datagrams = self.send_queue.len(),
+                ack_timeout_ms = ACK_TIMEOUT.as_millis(),
+                rto_ms = self.rto.rto().as_millis(),
+                "BLE ACK RTT: no clean samples — every ACKed fragment needed a retransmit"
+            );
+        } else {
+            let mean_ms =
+                samples.iter().map(Duration::as_millis).sum::<u128>() / samples.len() as u128;
+            info!(
+                window_s = window.as_secs(),
+                samples = samples.len(),
+                min_ms = samples[0].as_millis(),
+                p50_ms = pct(50),
+                p95_ms = pct(95),
+                max_ms = samples[samples.len() - 1].as_millis(),
+                mean_ms,
+                acked = self.rtt.acked,
+                acked_after_retransmit = self.rtt.acked_after_retransmit,
+                retransmits = self.rtt.retransmits,
+                max_retransmits = self.rtt.max_retransmits,
+                in_flight = self.in_flight.len(),
+                queued_frags = self.frag_queue.len(),
+                queued_datagrams = self.send_queue.len(),
+                ack_timeout_ms = ACK_TIMEOUT.as_millis(),
+                rto_ms = self.rto.rto().as_millis(),
+                "BLE ACK RTT"
+            );
+        }
+        self.rtt.reset();
     }
 }
 
@@ -226,6 +414,8 @@ impl ReliableChannel {
                 recv_buf: Vec::new(),
                 ack_pending: None,
                 ack_deadline: None,
+                rtt: RttStats::new(),
+                rto: RtoEstimator::new(),
                 last_progress_at: tokio::time::Instant::now(),
                 link_dead: false,
             })),
@@ -327,19 +517,27 @@ impl ReliableChannel {
                 && acked_count <= WINDOW_SIZE
                 && acked_count <= state.in_flight_count()
             {
+                let now = tokio::time::Instant::now();
                 let to_remove = acked_count as usize;
                 let actually_remove = to_remove.min(state.in_flight.len());
                 for _ in 0..actually_remove {
-                    state.in_flight.pop_front();
+                    if let Some(frag) = state.in_flight.pop_front() {
+                        let rtt = now.saturating_duration_since(frag.first_sent_at);
+                        state.rtt.record_ack(rtt, frag.retransmits);
+                        if frag.retransmits == 0 {
+                            state.rto.sample(rtt);
+                        }
+                    }
                 }
                 state.send_base = (ack_seq + 1) % SEQ_MODULUS;
-                state.last_progress_at = tokio::time::Instant::now();
+                state.last_progress_at = now;
                 trace!(
                     ack_seq,
                     new_base = state.send_base,
                     in_flight = state.in_flight.len(),
                     "cumulative ACK received"
                 );
+                state.maybe_emit_rtt_stats();
                 self.send_waker.wake();
                 self.wake.notify_one();
             }
@@ -472,20 +670,26 @@ impl ReliableChannel {
             match action {
                 SendAction::Dead => return Err(LinkDead),
                 SendAction::Wait => {
-                    let (head_seq, ack_deadline, last_progress_at) = {
+                    let (head, ack_deadline, last_progress_at, rto) = {
                         let state = self.state.lock().await;
                         (
-                            state.in_flight.front().map(|f| f.seq),
+                            state
+                                .in_flight
+                                .front()
+                                .map(|f| (f.retransmits, f.first_sent_at, f.last_sent_at)),
                             state.ack_deadline,
                             state.last_progress_at,
+                            state.rto.rto(),
                         )
                     };
 
-                    if head_seq.is_some() {
-                        // Real forward progress since we last observed resets
-                        // the retransmit backoff back to the aggressive base.
-                        if tracked_progress_at.is_some_and(|prev| prev != last_progress_at) {
-                            timeout = ACK_TIMEOUT;
+                    if let Some((head_retransmits, head_first_sent_at, head_last_sent_at)) = head {
+                        // Refresh the retransmit timer from the estimator on
+                        // the first observation of a head (loop start / after
+                        // idle) and on real forward progress. A stuck head
+                        // between those keeps its backed-off value.
+                        if tracked_progress_at.is_none_or(|prev| prev != last_progress_at) {
+                            timeout = rto;
                         }
                         tracked_progress_at = Some(last_progress_at);
 
@@ -494,13 +698,20 @@ impl ReliableChannel {
                         if now >= dead_at {
                             warn!(
                                 elapsed_ms = (now - last_progress_at).as_millis(),
+                                head_age_ms = now
+                                    .saturating_duration_since(head_first_sent_at)
+                                    .as_millis(),
+                                head_retransmits,
                                 "no forward progress within LINK_DEAD_DEADLINE, declaring link dead"
                             );
                             self.state.lock().await.link_dead = true;
                             return Err(LinkDead);
                         }
 
-                        let retransmit_at = now + timeout;
+                        // Anchored to the head's last transmission, so the
+                        // constant wakeups of a busy link (every inbound
+                        // fragment notifies) cannot slide the deadline.
+                        let retransmit_at = head_last_sent_at + timeout;
                         let sleep_until = match ack_deadline {
                             Some(dl) => dl.min(retransmit_at).min(dead_at),
                             None => retransmit_at.min(dead_at),
@@ -517,21 +728,37 @@ impl ReliableChannel {
 
                                 let resend = {
                                     let mut state = self.state.lock().await;
-                                    let mut msg =
-                                        state.in_flight.front().map(|f| f.wire_msg.clone());
-                                    if let Some(ref mut m) = msg
-                                        && let Some(ack_seq) = state.take_ack()
-                                        && m.len() >= HEADER_SIZE
-                                    {
-                                        set_ack(m, ack_seq);
+                                    let now = tokio::time::Instant::now();
+                                    let mut head = state.in_flight.front_mut().map(|f| {
+                                        f.retransmits += 1;
+                                        f.last_sent_at = now;
+                                        (
+                                            f.wire_msg.clone(),
+                                            f.seq,
+                                            f.retransmits,
+                                            now.saturating_duration_since(f.first_sent_at),
+                                        )
+                                    });
+                                    if let Some((ref mut m, _, retransmits, _)) = head {
+                                        state.rtt.retransmits += 1;
+                                        state.rtt.max_retransmits =
+                                            state.rtt.max_retransmits.max(retransmits);
+                                        if let Some(ack_seq) = state.take_ack()
+                                            && m.len() >= HEADER_SIZE
+                                        {
+                                            set_ack(m, ack_seq);
+                                        }
                                     }
-                                    msg
+                                    head
                                 };
 
-                                if let Some(msg) = resend {
+                                if let Some((msg, head_seq, head_retransmits, head_age)) = resend {
                                     self.retransmit_counter.fetch_add(1, Ordering::Relaxed);
                                     debug!(
                                         timeout_ms = timeout.as_millis(),
+                                        head_seq,
+                                        head_age_ms = head_age.as_millis(),
+                                        head_retransmits,
                                         "ACK timeout, retransmitting oldest fragment"
                                     );
                                     if let Err(e) = send_fn(msg).await {
@@ -558,7 +785,8 @@ impl ReliableChannel {
                         } else {
                             self.wake.notified().await;
                         }
-                        timeout = ACK_TIMEOUT;
+                        // `timeout` is refreshed by the head branch above once
+                        // a fragment is in flight again (tracked = None).
                         tracked_progress_at = None;
                         continue;
                     }
@@ -618,9 +846,13 @@ impl ReliableChannel {
                 if state.in_flight.is_empty() {
                     state.last_progress_at = tokio::time::Instant::now();
                 }
+                let sent_at = tokio::time::Instant::now();
                 state.in_flight.push_back(InFlightFragment {
                     seq,
                     wire_msg: msg.clone(),
+                    first_sent_at: sent_at,
+                    last_sent_at: sent_at,
+                    retransmits: 0,
                 });
                 state.send_next = (state.send_next + 1) % SEQ_MODULUS;
 
@@ -884,6 +1116,163 @@ mod tests {
                 "send_base should advance past ACK'd seq"
             );
         }
+    }
+
+    #[test]
+    fn test_rto_estimator_floor_before_first_sample() {
+        let est = RtoEstimator::new();
+        assert_eq!(est.rto(), ACK_TIMEOUT, "cold estimator = old fixed timeout");
+    }
+
+    #[test]
+    fn test_rto_estimator_clamps_fast_link_to_floor() {
+        let mut est = RtoEstimator::new();
+        // Idle-link samples (~85ms): srtt + 4·rttvar ≈ 250ms < floor.
+        for _ in 0..10 {
+            est.sample(Duration::from_millis(85));
+        }
+        assert_eq!(est.rto(), ACK_TIMEOUT);
+    }
+
+    #[test]
+    fn test_rto_estimator_tracks_slow_trains_and_caps() {
+        let mut est = RtoEstimator::new();
+        // QUIC-padded-train samples (~800ms): RTO must clear the sample RTT
+        // so those fragments stop being spuriously retransmitted.
+        for _ in 0..5 {
+            est.sample(Duration::from_millis(800));
+        }
+        assert!(
+            est.rto() > Duration::from_millis(800),
+            "adapted RTO must exceed the observed RTT, got {:?}",
+            est.rto()
+        );
+        // Pathological samples clamp at the cap (which stays below
+        // LINK_DEAD_DEADLINE so a retransmit always precedes link death).
+        est.sample(Duration::from_secs(30));
+        assert_eq!(est.rto(), ACK_TIMEOUT_MAX);
+        assert!(ACK_TIMEOUT_MAX < LINK_DEAD_DEADLINE);
+    }
+
+    #[test]
+    fn test_rto_estimator_decays_back_after_trains_stop() {
+        let mut est = RtoEstimator::new();
+        for _ in 0..5 {
+            est.sample(Duration::from_millis(800));
+        }
+        // The distribution shift first spikes rttvar (correct RFC 6298
+        // behaviour), so convergence back to the floor takes ~40 samples.
+        for _ in 0..40 {
+            est.sample(Duration::from_millis(85));
+        }
+        assert_eq!(est.rto(), ACK_TIMEOUT, "⅛-gain EWMA converges to the floor");
+    }
+
+    // The behavioural point of the adaptive RTO: once the estimator has seen
+    // train-shaped RTTs (~800ms), a fragment un-ACKed at 500ms — which the old
+    // fixed 300ms timer spuriously retransmitted — is left alone, and a
+    // genuinely lost fragment still retransmits once the adapted RTO elapses.
+    #[tokio::test(start_paused = true)]
+    async fn test_adapted_rto_suppresses_spurious_train_retransmit() {
+        let (ch, _rx) = make_channel();
+        let ch = Arc::new(ch);
+        let retransmit_counter = ch.retransmit_counter.clone();
+
+        let ch2 = ch.clone();
+        let handle =
+            tokio::spawn(
+                async move { ch2.run_send_loop(|_data| async { Ok(()) }, || false).await },
+            );
+
+        async fn tick(ms: u64) {
+            for _ in 0..(ms / 10).max(1) {
+                tokio::time::advance(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
+            }
+        }
+
+        // Warm the estimator with train-shaped samples (values from the
+        // observed on-device distribution). Injected directly: a wire-path
+        // warmup under the still-cold 300ms timer gets retransmitted, and
+        // Karn then rightly discards those samples — the wire feeding path is
+        // covered by test_ack_records_clean_rtt_sample.
+        {
+            let mut state = ch.state.lock().await;
+            for _ in 0..5 {
+                state.rto.sample(Duration::from_millis(800));
+            }
+        }
+        let rto = state_rto(&ch).await;
+        assert!(rto > Duration::from_millis(800), "warmup: rto = {rto:?}");
+
+        // A fragment un-ACKed for 500ms: the old fixed timer would have fired
+        // at 300ms; the adapted RTO must not.
+        ch.enqueue_datagram(b"next".to_vec()).await;
+        tick(500).await;
+        assert_eq!(
+            retransmit_counter.load(Ordering::Relaxed),
+            0,
+            "no spurious retransmit within the adapted RTO"
+        );
+
+        // But a genuine loss still recovers: keep withholding the ACK and the
+        // adapted RTO (< LINK_DEAD_DEADLINE) fires a retransmit.
+        tick(2500).await;
+        assert!(
+            retransmit_counter.load(Ordering::Relaxed) > 0,
+            "a genuinely lost fragment must still be retransmitted"
+        );
+
+        ch.state.lock().await.link_dead = true;
+        ch.wake.notify_one();
+        let _ = handle.await;
+    }
+
+    async fn state_rto(ch: &ReliableChannel) -> Duration {
+        ch.state.lock().await.rto.rto()
+    }
+
+    // A fragment ACKed without any retransmit contributes a clean RTT sample.
+    #[tokio::test]
+    async fn test_ack_records_clean_rtt_sample() {
+        let (ch, _rx) = make_channel();
+        ch.enqueue_datagram(b"test".to_vec()).await;
+        assert!(matches!(ch.next_send_action().await, SendAction::Send(_)));
+
+        ch.receive_fragment(&pure_ack(0)).await;
+
+        let state = ch.state.lock().await;
+        assert_eq!(state.rtt.acked, 1);
+        assert_eq!(state.rtt.acked_after_retransmit, 0);
+        assert_eq!(
+            state.rtt.samples.len(),
+            1,
+            "never-retransmitted fragment must be RTT-sampled"
+        );
+    }
+
+    // Karn's algorithm: a fragment that was retransmitted before its ACK is
+    // counted but NOT RTT-sampled (its ACK can't be attributed to a specific
+    // transmission).
+    #[tokio::test]
+    async fn test_retransmitted_fragment_ack_is_not_sampled() {
+        let (ch, _rx) = make_channel();
+        ch.enqueue_datagram(b"test".to_vec()).await;
+        assert!(matches!(ch.next_send_action().await, SendAction::Send(_)));
+
+        {
+            let mut state = ch.state.lock().await;
+            state.in_flight.front_mut().unwrap().retransmits = 1;
+        }
+        ch.receive_fragment(&pure_ack(0)).await;
+
+        let state = ch.state.lock().await;
+        assert_eq!(state.rtt.acked, 1);
+        assert_eq!(state.rtt.acked_after_retransmit, 1);
+        assert!(
+            state.rtt.samples.is_empty(),
+            "retransmitted fragment must not contribute an RTT sample"
+        );
     }
 
     #[tokio::test]
@@ -1298,6 +1687,46 @@ mod tests {
         );
 
         // Clean shutdown.
+        ch.state.lock().await.link_dead = true;
+        ch.wake.notify_one();
+        let _ = handle.await;
+    }
+
+    /// Regression for the starved-retransmit bug: the retransmit deadline is
+    /// anchored to the head's last transmission, so the constant wakeups of a
+    /// busy link (every inbound fragment notifies the send loop) cannot
+    /// postpone it. In the buggy code the deadline was recomputed as
+    /// `now + timeout` on every loop iteration, so wake churn faster than the
+    /// timeout starved the head of retransmits until LINK_DEAD — seen
+    /// on-device as head_age_ms > 10s with head_retransmits=0 once the
+    /// adaptive RTO lengthened the timeout past the wake cadence, producing an
+    /// endless dead/reconnect loop.
+    #[tokio::test(start_paused = true)]
+    async fn test_wake_churn_does_not_starve_retransmit() {
+        let (ch, _rx) = make_channel();
+        let ch = Arc::new(ch);
+        let retransmit_counter = ch.retransmit_counter.clone();
+
+        ch.enqueue_datagram(b"stuck".to_vec()).await;
+        let ch2 = ch.clone();
+        let handle =
+            tokio::spawn(
+                async move { ch2.run_send_loop(|_data| async { Ok(()) }, || false).await },
+            );
+
+        // Churn wakeups every 100ms — well under the 300ms cold RTO — while
+        // withholding the ACK. The anchored deadline must still fire.
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+            ch.wake.notify_one();
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            retransmit_counter.load(Ordering::Relaxed) >= 1,
+            "wake churn must not postpone the anchored retransmit deadline"
+        );
+
         ch.state.lock().await.link_dead = true;
         ch.wake.notify_one();
         let _ = handle.await;
