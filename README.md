@@ -1,6 +1,29 @@
 # Neutrino
 
-A lightweight, embedded homeserver written in Rust.
+Neutrino is an experimental lightweight embedded Matrix homeserver written in Rust.
+
+We're releasing the code at a **very early stage** for transparency, and it comes with some serious
+caveats:
+
+ 1. Neutrino has been written specifically to experiment with P2P Matrix dialects.
+ 2. It is **not** intended to run as a standalone homeserver.
+   * Instead, it's runnable from the P2P branch of Element X Android, embedded within the Android app.
+ 3. It is very deliberately **NOT SECURE** for use on the public internet.
+   * Again, please do not use Neutrino on untrusted networks yet.
+   * It does not yet put signatures on events, nor does it check them.
+ 4. It does not speak or interoperate with normal Matrix yet.
+ 5. It is deliberately very feature poor; it only supports joining/leaving rooms and sending messages.
+   * It has no E2EE, or file transfer, or typing notifications, or read receipts, etc. etc.
+ 6. It is deliberately not at all optimised yet - e.g. it has no caching.
+ 7. It only implements the very latest room versions (Hydra Phase 2 and (in future) 3 - e.g. State DAGs: MSC4242)
+ 8. Gives us somewhere to evaluate Hydra and state resets in the harshest conditions (i.e. P2P)
+
+ Separately, it's worth noting that:
+  * Neutrino is not the future of Synapse or Synapse Pro, although we expect Neutrino and Synapse to share Rust code in future
+  * This not a re-run of Dendrite (which was built as a horizontally scalable successor to Synapse, but in the end its learnings got subsumed into Synapse and Synapse Pro)
+  * Instead, we want a dedicated embeddable minimal homeserver for P2P, rather than forcing a serverside homeserver to run clientside
+  * We also want somewhere to experiment freely with new ideas (e.g. temporal state storage) which can get backported and/or shared with Synapse & Synapse Pro.
+  * Neutrino development has been accelerated significantly via use of Claude Opus and Fable. We are very mindful of the ethical and environmental aspects of using LLMs, but have concluded that using big tech to accelerate decentralisation of communication is net positive in this instance.
 
 ## Overview
 
