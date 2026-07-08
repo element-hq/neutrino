@@ -30,6 +30,11 @@ default-members = [
 ]
 resolver = "3"
 
+[workspace.package]
+# See LICENSE-AGPL-3.0 at the repo root. Applies to first-party crates only;
+# the forks under `vendor/` keep their upstream licenses.
+license = "AGPL-3.0-only"
+
 [workspace.dependencies]
 async-trait = "0.1.89"
 clap = { version = "4.6.1", features = ["derive"] }

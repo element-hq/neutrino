@@ -2,6 +2,7 @@
 name = "neutrino-http"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [features]
 # Testing-only multi-user identity shim. Enables per-request Bearer-token →
