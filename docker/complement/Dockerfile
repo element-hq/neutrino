@@ -27,6 +27,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=planner /src/recipe.json recipe.json
+# The recipe records `coap` as a path dependency (patched to ./vendor/coap-rs in
+# the manifest), and `cargo chef cook` reads that path's Cargo.toml while
+# reconstructing the skeleton — so it must be on disk before cook, not just
+# before the final build. cook busts (and rebuilds coap) only when the vendored
+# source changes, which is correct for a dependency.
+COPY vendor/coap-rs ./vendor/coap-rs
 # Scope to the neutrino binary so we don't pull in tools/uniffi-bindgen, whose
 # uniffi[cli] dep transitively compiles uniffi_bindgen
 RUN cargo chef cook --release --recipe-path recipe.json --bin neutrino
@@ -35,6 +41,8 @@ COPY docker/complement/Cargo.toml ./Cargo.toml
 COPY Cargo.lock ./Cargo.lock
 COPY crates ./crates
 COPY tools ./tools
+# Re-copy after cook alongside the real crate source: if cargo-chef stubbed the
+# vendored source during cook, this restores it for the actual build.
 COPY vendor/coap-rs ./vendor/coap-rs
 RUN cargo build --release --bin neutrino --features multi-user-shim
 
