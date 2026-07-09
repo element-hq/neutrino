@@ -351,9 +351,18 @@ async fn ingest_state_dag(
 
     // Stage every event + poke the worker (cross-room events are skipped inside;
     // the poke is awaited so a fresh-room ingest can't be silently dropped).
-    neutrino_engine::stage_and_poke(store, worker_poke, origin, room_id, &events)
-        .await
-        .map_err(|_| "could not stage room state")
+    // `Fetched`: a bulk pull — the ingested DAG's dangling timeline edges must
+    // not fan out into a `get_missing_events` per staged event.
+    neutrino_engine::stage_and_poke(
+        store,
+        worker_poke,
+        origin,
+        room_id,
+        neutrino_store::StagedKind::Fetched,
+        &events,
+    )
+    .await
+    .map_err(|_| "could not stage room state")
 }
 
 /// Block until our `join` lands in current state, or time out. Driven by the

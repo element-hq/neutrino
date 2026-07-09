@@ -195,6 +195,45 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### best-effort timeline gap-fill — transitive message delivery (2026-07-09)
+- Previously only *state* events were delivered transitively (the mandatory
+  state-DAG gap-fill); messages missed during a partition arrived only via
+  anti-entropy or client-driven `/messages` backfill. Now a live inbound PDU
+  whose direct `prev_events` we neither hold nor have staged triggers **one**
+  `get_missing_events` (`state_dag=false`, `limit=10`, `latest=[event]`,
+  `earliest=` our timeline FEs) before it applies. Fetched events stage into
+  the same pre-auth pipeline; the drain's toposort applies them (oldest) first.
+  Since state events sit in the timeline DAG too, the common few-missed-events
+  case (… ← E_state ← E_msg1 ← E_msg2, receive E_msg2) lands everything off a
+  single request — the state fill only makes its own (mandatory) request when
+  the timeline round under-returns.
+- **Single-round, never blocking**: no growing rounds, no recursion. On
+  no-progress or peer failure the event applies as-is — a dangling
+  `prev_events` edge is valid federation state, and the tail beyond `limit`
+  stays reachable via `/messages` backfill. State grounding is unchanged
+  (`fill_state_ancestry` still walks to create and blocks until grounded).
+- **`StagedKind` (`staged_events.live` column) gates the trigger**: `Live` =
+  pushed to us (`/send` PDU, federated invite); `Fetched` = pulled in bulk
+  (gap-fill ancestry, reconcile, join ingest). Only `Live` rows may trigger,
+  and rows staged *by* any fetch are `Fetched` — this bounds transitive
+  fetching to one request per live trigger AND stops a join's ingested state
+  DAG (whose old events all have dangling timeline parents) from fanning out
+  into a fetch per event. Persisted (not in-memory) so a restart can't turn
+  drain recovery into a fetch storm; the *once-only* mark for live rows is
+  in-memory (`worker` `timeline_filled`), so a still-staged live row may retry
+  its one fetch after a restart — that just resumes catch-up.
+- Consolidation: the triplicated fetch-response staging loop (state fill,
+  reconcile, + the new fill) is now one `gapfill::stage_fetched` helper;
+  `reconcile::fetch_unknown` delegates to it (behaviour delta: a mid-batch
+  storage fault now warns and drops the rest of that batch instead of
+  continuing row-by-row — storage faults are systemic, and reconcile is
+  best-effort re-triggered by the next advertisement).
+- Tests: 5 new e2e (single-fetch headline incl. missed-state-rides-along,
+  fetched-events-never-refetch, peer-failure-still-applies,
+  timeline-shortfall-still-grounds-state, in-order-costs-zero-fetches); the two
+  state-fill arg-pinning tests re-point their trigger's `prev_events` at a held
+  event so they stay pure state-DAG scenarios; `FetchCall` now records
+  `state_dag`. Store: `stage_pdu` kind round-trip + first-wins.
 ### Filtered BLE scans via masked service-UUID prefix (2026-07-09)
 - Unfiltered Android scans are aggressively batched/throttled (and return
   nothing screen-off), delaying discovery. Requirement: backwards compatible

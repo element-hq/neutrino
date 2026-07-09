@@ -29,7 +29,20 @@
 //! ## Drain pass
 //!
 //! Read the room's staged rows, toposort by `prev_events ∪ prev_state_events`,
-//! and apply each oldest-first through [`RoomRegistry::apply_pdu`]:
+//! and apply each oldest-first through [`RoomRegistry::apply_pdu`].
+//!
+//! First, a pre-apply check: a [`StagedKind::Live`] row (pushed to us, not
+//! pulled) whose direct `prev_events` we neither hold nor have staged gets
+//! **one** best-effort timeline gap-fill (`fill_timeline_gap`) — transitive
+//! delivery of recently-missed messages. If that stages anything, the row is
+//! deferred one pass so the fetched (older) events apply first; on no-progress
+//! or peer failure it is applied as-is (a dangling `prev_events` edge is valid
+//! federation state). Events staged *by* the fetch are `Fetched` and never
+//! re-trigger — the fill is bounded to a single request per live trigger. The
+//! once-only mark is in-memory (`timeline_filled`); after a restart a
+//! still-staged live row may retry its one fetch, which just resumes catch-up.
+//!
+//! Then the apply dispositions:
 //!
 //! - **Ok** (accepted / soft-failed / rejected — federation persists rejects):
 //!   unstage it.
@@ -57,13 +70,13 @@ use std::time::{Duration, Instant};
 
 use neutrino_event::Event;
 use neutrino_event::event_builder::from_wire;
-use neutrino_store::{StagedPdu, StorageBackend, WithStateProvider};
-use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, RoomId};
+use neutrino_store::{StagedKind, StagedPdu, StorageBackend, WithStateProvider};
+use ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomId};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::gapfill::fill_state_ancestry;
+use crate::gapfill::{fill_state_ancestry, fill_timeline_gap};
 use crate::ports::MissingEventsFetcher;
 use crate::room_actor::{RoomActorError, RoomRegistry};
 use crate::util::{BACKOFF_BASE, jitter, next_backoff};
@@ -204,6 +217,9 @@ async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
     notify: Arc<Notify>,
 ) {
     let mut backoff: HashMap<OwnedEventId, Backoff> = HashMap::new();
+    // Live rows whose one-shot timeline gap-fill already ran (successfully or
+    // not) — each live trigger gets at most one fetch while it stays staged.
+    let mut timeline_filled: HashSet<OwnedEventId> = HashSet::new();
     loop {
         let rows = match ctx.store.staged_for_room(&room).await {
             Ok(r) => r,
@@ -218,14 +234,17 @@ async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
         if rows.is_empty() {
             // Fully drained: forget any backoff state and park until poked.
             backoff.clear();
+            timeline_filled.clear();
             notify.notified().await;
             continue;
         }
 
-        // Drop backoff entries for events that are no longer staged (applied or
-        // dropped), so the map stays bounded by the live backlog.
-        let present: HashSet<&OwnedEventId> = rows.iter().map(|p| &p.event_id).collect();
-        backoff.retain(|id, _| present.contains(id));
+        // Drop bookkeeping for events that are no longer staged (applied or
+        // dropped), so the maps stay bounded by the live backlog. The owned set
+        // doubles as the "already staged" half of the timeline-gap prev-check.
+        let staged_ids: HashSet<OwnedEventId> = rows.iter().map(|p| p.event_id.clone()).collect();
+        backoff.retain(|id, _| staged_ids.contains(id));
+        timeline_filled.retain(|id| staged_ids.contains(id));
 
         // Eligible = not currently in a backoff window. A backing-off PDU is
         // skipped (left staged), never dequeued, so it can't block its siblings.
@@ -250,7 +269,15 @@ async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
         // bytes no longer parse are junk (they passed `from_wire` when staged,
         // so this is defensive) — unstage them rather than spin forever.
         for staged in toposort(parse_or_drop(&ctx, &eligible).await) {
-            process_one(&ctx, &room, staged, &mut backoff).await;
+            process_one(
+                &ctx,
+                &room,
+                staged,
+                &mut backoff,
+                &mut timeline_filled,
+                &staged_ids,
+            )
+            .await;
         }
     }
 }
@@ -267,6 +294,7 @@ async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
             Ok(event) => out.push(Staged {
                 event,
                 origin: p.origin.clone(),
+                kind: p.kind,
             }),
             Err(e) => {
                 warn!(event_id = %p.event_id, error = %e, "dropping unparseable staged PDU");
@@ -278,10 +306,12 @@ async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
 }
 
 /// One staged event paired with the server it arrived from (the gap-fill fetch
-/// target). The `Event` carries the DAG pointers `toposort` orders by.
+/// target) and how it got here (live push vs bulk pull — the timeline gap-fill
+/// gate). The `Event` carries the DAG pointers `toposort` orders by.
 struct Staged {
     event: Event,
     origin: OwnedServerName,
+    kind: StagedKind,
 }
 
 /// Integrate one staged PDU through the actor, updating `backoff` per the
@@ -291,8 +321,33 @@ async fn process_one<S: StorageBackend + WithStateProvider + 'static>(
     room: &RoomId,
     staged: Staged,
     backoff: &mut HashMap<OwnedEventId, Backoff>,
+    timeline_filled: &mut HashSet<OwnedEventId>,
+    staged_ids: &HashSet<OwnedEventId>,
 ) {
     let id = staged.event.event_id.clone();
+
+    // Best-effort transitive delivery of missed messages (see the module docs):
+    // a live-pushed PDU whose direct timeline parents we neither hold nor have
+    // staged gets one shot at pulling the recent gap before it applies. Success
+    // defers it a pass so the fetched (older) events apply first; anything else
+    // falls through — unlike the state fill below, a timeline gap never blocks.
+    if staged.kind == StagedKind::Live
+        && !timeline_filled.contains(&id)
+        && has_unknown_prevs(&*ctx.store, &staged.event, staged_ids).await
+    {
+        timeline_filled.insert(id.clone());
+        match fill_timeline_gap(&*ctx.store, &staged.origin, &staged.event, &*ctx.fetcher).await {
+            Ok(n) if n > 0 => {
+                info!(%id, fetched = n, "timeline gap-fill staged missed events; deferring one pass");
+                return;
+            }
+            Ok(_) => debug!(%id, "timeline gap-fill found nothing new; applying as-is"),
+            Err(reason) => {
+                warn!(%id, reason, "timeline gap-fill failed; applying with dangling prev_events");
+            }
+        }
+    }
+
     match ctx.registry.apply_pdu(room, staged.event.clone()).await {
         // Terminal: accepted, soft-failed, or rejected (federation persists
         // rejects). Either way it's integrated — drop it from staging.
@@ -347,6 +402,34 @@ async fn process_one<S: StorageBackend + WithStateProvider + 'static>(
         Err(other) => {
             warn!(%id, error = %other, "applying staged PDU failed; backing off");
             bump_backoff(backoff, id, ctx.backoff_base);
+        }
+    }
+}
+
+/// Whether any of `event`'s direct `prev_events` is neither committed nor
+/// currently staged — the trigger for the one-shot timeline gap-fill. Depth-1
+/// only: a *staged* parent's own gap is (or was) its own trigger's business. A
+/// storage fault answers `false` — don't fetch on bad information; the apply
+/// path will surface the fault and back off.
+async fn has_unknown_prevs<S: StorageBackend + WithStateProvider + 'static>(
+    store: &S,
+    event: &Event,
+    staged_ids: &HashSet<OwnedEventId>,
+) -> bool {
+    let candidates: Vec<&EventId> = event
+        .prev_events
+        .iter()
+        .filter(|p| !staged_ids.contains(*p))
+        .map(|p| p.as_ref())
+        .collect();
+    if candidates.is_empty() {
+        return false;
+    }
+    match store.get_events(&candidates).await {
+        Ok(held) => held.len() < candidates.len(),
+        Err(e) => {
+            warn!(event_id = %event.event_id, error = %e, "prev_events lookup failed; skipping timeline gap-fill");
+            false
         }
     }
 }
@@ -445,6 +528,7 @@ mod tests {
         Staged {
             event,
             origin: server_name!("example.org").to_owned(),
+            kind: StagedKind::Live,
         }
     }
 

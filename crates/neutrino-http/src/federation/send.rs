@@ -39,7 +39,7 @@ use axum::{
     http::HeaderMap,
 };
 use neutrino_event::event_builder::from_wire;
-use neutrino_store::{FederationInbox, StagingStore};
+use neutrino_store::{FederationInbox, StagedKind, StagingStore};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
@@ -185,8 +185,16 @@ pub(crate) async fn handle(
             continue;
         }
         let id = event.event_id.to_string();
+        // `Live`: pushed to us by a peer, so the worker may run its one-shot
+        // timeline gap-fill if the PDU's `prev_events` point into a gap.
         let result = match store
-            .stage_pdu(&body.origin, &event.room_id, &event.event_id, &event.raw)
+            .stage_pdu(
+                &body.origin,
+                &event.room_id,
+                &event.event_id,
+                StagedKind::Live,
+                &event.raw,
+            )
             .await
         {
             // Staged (newly, or already present from an earlier delivery) — in

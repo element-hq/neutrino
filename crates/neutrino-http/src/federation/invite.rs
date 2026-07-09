@@ -160,11 +160,13 @@ pub(crate) async fn handle(
         // ancestry if needed), so it lands in `current_state`. Origin = the
         // invite's sender domain (the worker's gap-fill fetch target).
         let origin = event.sender.server_name().to_owned();
+        // `Live`: pushed to us by the inviting server, like a `/send` PDU.
         stage_and_poke(
             &*store,
             &worker_poke,
             &origin,
             &room_id,
+            neutrino_store::StagedKind::Live,
             std::slice::from_ref(&event),
         )
         .await?;
