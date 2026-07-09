@@ -301,6 +301,23 @@ impl BleTransport {
             Arc::clone(&config.store),
         );
 
+        info!(
+            policy = ?config.l2cap_policy,
+            verified_rx_wired = config.verified_rx.is_some(),
+            "BLE transport starting"
+        );
+        if config.l2cap_policy == L2capPolicy::PreferL2cap && config.verified_rx.is_none() {
+            // Not just "dedup disabled": both UpgradeToL2cap emit sites in the
+            // registry key off VerifiedEndpoint (directly, or via the
+            // verified_prefixes it populates), so this combination silently
+            // pins every connection to GATT.
+            warn!(
+                "PreferL2cap policy but no verified_rx wired — the registry never sees \
+                 VerifiedEndpoint, so the GATT→L2CAP upgrade will never be attempted; \
+                 install BleDedupHook on the iroh Endpoint and pass its receiver in \
+                 BleTransportConfig.verified_rx"
+            );
+        }
         let mut psm = None;
         if config.l2cap_policy == L2capPolicy::PreferL2cap {
             match peripheral.l2cap_listener().await {

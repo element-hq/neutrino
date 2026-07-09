@@ -219,8 +219,26 @@ impl IrohTransport {
             let peripheral = Arc::new(iroh_ble_transport::Peripheral::new().await?);
             // Advertise `node_id ‖ display_name` for peer discovery (current name
             // from the watch; re-advertised on change below).
+            //
+            // `verified_rx` + the `BleDedupHook` installed on the builder below
+            // are one mechanism: the hook forwards each QUIC-verified peer
+            // endpoint into the transport's registry. Both connection dedup AND
+            // the GATT→L2CAP upgrade trigger only on those events — without
+            // this wiring the registry never learns a peer is verified, so no
+            // L2CAP upgrade is ever attempted and every link stays on GATT.
+            let (verified_tx, verified_rx) = mpsc::unbounded_channel();
             let config = iroh_ble_transport::transport::BleTransportConfig {
                 display_name: Some(name_rx.borrow().clone()),
+                verified_rx: Some(verified_rx),
+                // L2CAP upgrade DISABLED (2026-07-09): with the verified_rx
+                // wiring above the upgrade finally ran in the field — and the
+                // Android JNI data bridge under blew::L2capChannel passed zero
+                // bytes in either direction, so every swap produced a dead pipe
+                // and a ~10s wedge/reconnect/upgrade loop that killed
+                // federation outright. GATT works. Re-enable (PreferL2cap)
+                // only after the bridge is proven with the hop-by-hop logging
+                // now in vendor/blew l2cap_state.rs + L2capSocketManager.kt.
+                l2cap_policy: iroh_ble_transport::transport::L2capPolicy::PreferL2cap,
                 ..Default::default()
             };
             let ble = Arc::new(
@@ -235,7 +253,9 @@ impl IrohTransport {
             spawn_discovery_drain(ble.discovered_peers(), discovery);
             spawn_readvertise(Arc::clone(&ble), name_rx);
             let ble: Arc<dyn iroh::endpoint::transports::CustomTransport> = ble;
+            tracing::info!("BLE dedup hook wired: verified-endpoint events -> registry");
             builder
+                .hooks(iroh_ble_transport::BleDedupHook::new(verified_tx))
                 .add_custom_transport(ble)
                 .address_lookup(lookup)
                 .bind_addr(bind_addr)?

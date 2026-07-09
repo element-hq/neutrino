@@ -263,6 +263,16 @@ impl RttStats {
 struct ChannelState {
     send_queue: VecDeque<Vec<u8>>,
     frag_queue: VecDeque<FragmentEntry>,
+    /// Whole-datagram copies of everything fragmented but not yet fully ACKed,
+    /// as `(fragments_awaiting_ack, datagram)` in fragmentation order. ACKs are
+    /// cumulative and datagrams fragment FIFO, so every ACKed fragment belongs
+    /// to the queue head; a datagram is dropped when its count hits zero. Kept
+    /// so an L2CAP handover can re-send undelivered datagrams whole over the
+    /// new pipe ([`ReliableChannel::take_undelivered`]) — unACKed *fragments*
+    /// can't be re-sent there (the peer's reliable reassembly state dies with
+    /// its own swap), only whole datagrams are useful. Bounded by
+    /// `SEND_QUEUE_CAPACITY` datagrams.
+    unacked_datagrams: VecDeque<(u32, Vec<u8>)>,
     send_next: u8,
     send_base: u8,
     in_flight: VecDeque<InFlightFragment>,
@@ -405,6 +415,7 @@ impl ReliableChannel {
             state: Arc::new(Mutex::new(ChannelState {
                 send_queue: VecDeque::new(),
                 frag_queue: VecDeque::new(),
+                unacked_datagrams: VecDeque::new(),
                 send_next: 0,
                 send_base: 0,
                 in_flight: VecDeque::new(),
@@ -477,6 +488,23 @@ impl ReliableChannel {
         self.send_waker.register(waker);
     }
 
+    /// Drain every datagram the peer has not yet fully ACKed, whole and in
+    /// send order: copies of fragmented-but-unACKed datagrams first, then the
+    /// not-yet-fragmented tail of the send queue. Called by the pipe
+    /// supervisor at L2CAP handover so in-flight data survives the swap
+    /// instead of dying with the retired GATT worker (field 2026-07-09: a
+    /// client QUIC handshake Finished dropped here cost an ~8s PTO stall per
+    /// swap and wedged the link outright twice). Clears the send side so the
+    /// retiring send loop transmits nothing new; a datagram whose ACK is
+    /// already in flight gets re-sent as a duplicate, which QUIC dedups.
+    pub async fn take_undelivered(&self) -> Vec<Vec<u8>> {
+        let mut state = self.state.lock().await;
+        let mut out: Vec<Vec<u8>> = state.unacked_datagrams.drain(..).map(|(_, d)| d).collect();
+        out.extend(state.send_queue.drain(..));
+        state.frag_queue.clear();
+        out
+    }
+
     /// Process an incoming GATT value.
     pub async fn receive_fragment(&self, value: &[u8]) {
         if value.len() < HEADER_SIZE {
@@ -526,6 +554,12 @@ impl ReliableChannel {
                         state.rtt.record_ack(rtt, frag.retransmits);
                         if frag.retransmits == 0 {
                             state.rto.sample(rtt);
+                        }
+                        if let Some(head) = state.unacked_datagrams.front_mut() {
+                            head.0 = head.0.saturating_sub(1);
+                            if head.0 == 0 {
+                                state.unacked_datagrams.pop_front();
+                            }
                         }
                     }
                 }
@@ -880,6 +914,7 @@ impl ReliableChannel {
         let max_payload = self.chunk_size.load(Ordering::Relaxed) - HEADER_SIZE - 1;
 
         if datagram.len() <= max_payload {
+            state.unacked_datagrams.push_back((1, datagram.clone()));
             state.frag_queue.push_back(FragmentEntry {
                 payload: datagram,
                 first: true,
@@ -890,6 +925,9 @@ impl ReliableChannel {
 
         let chunks: Vec<&[u8]> = datagram.chunks(max_payload).collect();
         let last_idx = chunks.len() - 1;
+        state
+            .unacked_datagrams
+            .push_back((chunks.len() as u32, datagram.clone()));
 
         for (i, chunk) in chunks.into_iter().enumerate() {
             state.frag_queue.push_back(FragmentEntry {
@@ -1083,6 +1121,70 @@ mod tests {
         let mut h = [0u8; HEADER_SIZE];
         set_ack(&mut h, ack_seq);
         h.to_vec()
+    }
+
+    #[tokio::test]
+    async fn take_undelivered_returns_unacked_and_queued_whole_datagrams() {
+        let (ch, _rx) = make_channel();
+        ch.enqueue_datagram(b"one".to_vec()).await;
+        ch.enqueue_datagram(b"two".to_vec()).await;
+        ch.enqueue_datagram(b"three".to_vec()).await;
+        // Put all three on the wire (single-fragment each at chunk 512),
+        // none ACKed.
+        for _ in 0..3 {
+            let action = ch.next_send_action().await;
+            assert!(matches!(action, SendAction::Send(_)));
+        }
+
+        let undelivered = ch.take_undelivered().await;
+        assert_eq!(
+            undelivered,
+            vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()],
+            "every unACKed datagram must come back whole, in send order"
+        );
+
+        let state = ch.state.lock().await;
+        assert!(state.send_queue.is_empty(), "send queue must be drained");
+        assert!(state.frag_queue.is_empty(), "frag queue must be cleared");
+        assert!(state.unacked_datagrams.is_empty(), "copies must be drained");
+    }
+
+    #[tokio::test]
+    async fn take_undelivered_excludes_fully_acked_datagrams() {
+        let (ch, _rx) = make_channel();
+        ch.enqueue_datagram(b"acked".to_vec()).await;
+        ch.enqueue_datagram(b"lost".to_vec()).await;
+        assert!(matches!(ch.next_send_action().await, SendAction::Send(_))); // seq 0
+        assert!(matches!(ch.next_send_action().await, SendAction::Send(_))); // seq 1
+
+        ch.receive_fragment(&pure_ack(0)).await; // ACKs "acked" only
+
+        let undelivered = ch.take_undelivered().await;
+        assert_eq!(
+            undelivered,
+            vec![b"lost".to_vec()],
+            "a fully ACKed datagram must not be re-sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn take_undelivered_returns_partially_acked_datagram_whole() {
+        let (ch, _rx) = make_channel();
+        // max_payload = 4 → an 8-byte datagram fragments into two.
+        ch.set_chunk_size(HEADER_SIZE + 1 + 4);
+        ch.enqueue_datagram(b"12345678".to_vec()).await;
+        assert!(matches!(ch.next_send_action().await, SendAction::Send(_))); // frag seq 0
+        assert!(matches!(ch.next_send_action().await, SendAction::Send(_))); // frag seq 1
+
+        ch.receive_fragment(&pure_ack(0)).await; // first fragment ACKed, second not
+
+        let undelivered = ch.take_undelivered().await;
+        assert_eq!(
+            undelivered,
+            vec![b"12345678".to_vec()],
+            "a partially ACKed datagram must be returned whole — its ACKed \
+             fragments died with the peer's reassembly state"
+        );
     }
 
     #[tokio::test]

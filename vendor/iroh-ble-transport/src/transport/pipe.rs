@@ -55,6 +55,9 @@ enum ActiveWorker {
         inbound_fwd_tx: mpsc::Sender<Bytes>,
         shutdown_tx: oneshot::Sender<()>,
         teardown_flag: Arc<AtomicBool>,
+        /// The worker's reliable layer, shared so the supervisor can rescue
+        /// undelivered datagrams (`take_undelivered`) at L2CAP handover.
+        reliable: Arc<ReliableChannel>,
         handle: JoinHandle<()>,
     },
     L2cap {
@@ -208,6 +211,42 @@ async fn run_pipe_supervisor(
                     new_path = "L2cap",
                     "retiring old pipe after L2CAP handover"
                 );
+                // Rescue datagrams the peer never fully ACKed over GATT and
+                // re-send them whole on the new pipe. Without this the swap
+                // silently drops them and QUIC eats a multi-second PTO stall
+                // recovering (or, mid-handshake, the connection wedges — the
+                // lost client Finished of 2026-07-09). Also clears the old
+                // send queues so the retiring worker transmits nothing new.
+                // Duplicates on the wire are fine: QUIC dedups by packet
+                // number.
+                if let ActiveWorker::Gatt { reliable, .. } = &old {
+                    let undelivered = reliable.take_undelivered().await;
+                    if !undelivered.is_empty() {
+                        tracing::info!(
+                            device = %device_id,
+                            count = undelivered.len(),
+                            "L2CAP handover: requeuing undelivered GATT datagrams"
+                        );
+                        for datagram in undelivered {
+                            let send = PendingSend {
+                                // tx_gen is display-only inside the pipe; the
+                                // original send was already acked to iroh, so
+                                // no waker is waiting on this re-send.
+                                tx_gen: 0,
+                                datagram: Bytes::from(datagram),
+                                waker: std::task::Waker::noop().clone(),
+                            };
+                            match forward_outbound(&active, send, &device_id, &registry_tx, &mut l2cap_timeout_reported).await {
+                                ForwardResult::Ok => {}
+                                // Forwarding failure here is the pre-rescue
+                                // status quo (datagrams lost, QUIC recovers);
+                                // let the next regular outbound drive the
+                                // supervisor's own teardown handling.
+                                ForwardResult::WorkerGone | ForwardResult::L2capTimeout => break,
+                            }
+                        }
+                    }
+                }
                 spawn_drain_old_worker(old, device_id.clone(), L2CAP_HANDOVER_TIMEOUT);
             }
         }
@@ -317,18 +356,23 @@ fn spawn_gatt_worker(
     let (inbound_fwd_tx, inbound_fwd_rx) = mpsc::channel::<Bytes>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let teardown_flag = Arc::new(AtomicBool::new(false));
+    // Construct the reliable layer here (not inside the task) so the
+    // supervisor keeps a handle for the handover-time datagram rescue.
+    let (channel, datagram_rx) =
+        ReliableChannel::new(INITIAL_CHUNK_SIZE, retransmit_counter, truncation_counter);
+    let channel = Arc::new(channel);
     let handle = tokio::spawn(run_gatt_pipe(
         iface,
         device_id,
         role,
+        Arc::clone(&channel),
+        datagram_rx,
         outbound_fwd_rx,
         inbound_fwd_rx,
         shutdown_rx,
         Arc::clone(&teardown_flag),
         incoming_tx,
         registry_tx,
-        retransmit_counter,
-        truncation_counter,
         last_rx_at,
     ));
     ActiveWorker::Gatt {
@@ -336,6 +380,7 @@ fn spawn_gatt_worker(
         inbound_fwd_tx,
         shutdown_tx,
         teardown_flag,
+        reliable: channel,
         handle,
     }
 }
@@ -428,24 +473,20 @@ async fn run_gatt_pipe(
     iface: Arc<dyn BleInterface>,
     device_id: blew::DeviceId,
     role: ConnectRole,
+    // Constructed by `spawn_gatt_worker` (with the conservative
+    // `INITIAL_CHUNK_SIZE`, so the select loop can process inbound fragments
+    // immediately while the async MTU resolver runs) — the supervisor keeps a
+    // clone for the L2CAP-handover datagram rescue.
+    channel: Arc<ReliableChannel>,
+    mut datagram_rx: mpsc::Receiver<Vec<u8>>,
     mut outbound_rx: mpsc::Receiver<PendingSend>,
     mut inbound_rx: mpsc::Receiver<Bytes>,
     mut shutdown_rx: oneshot::Receiver<()>,
     teardown_flag: Arc<AtomicBool>,
     incoming_tx: mpsc::Sender<IncomingPacket>,
     registry_tx: mpsc::Sender<PeerCommand>,
-    retransmit_counter: Arc<AtomicU64>,
-    truncation_counter: Arc<AtomicU64>,
     last_rx_at: LivenessClock,
 ) {
-    // Start with a conservative chunk size so the select loop can begin
-    // processing inbound fragments immediately. Blocking on the MTU resolver
-    // here would starve inbound reassembly for up to `MTU_READY_DEADLINE`
-    // (≈3s) — enough to collide with an L2CAP accept landing mid-handshake.
-    let (channel, mut datagram_rx) =
-        ReliableChannel::new(INITIAL_CHUNK_SIZE, retransmit_counter, truncation_counter);
-    let channel = Arc::new(channel);
-
     let resolver_handle = {
         let channel = Arc::clone(&channel);
         let iface = Arc::clone(&iface);
@@ -887,5 +928,186 @@ mod tests {
             1,
             "outbound empty must be counted exactly once"
         );
+    }
+
+    /// End-to-end swap coverage: a supervisor running on GATT that receives an
+    /// L2CAP channel via `swap_tx` must keep passing datagrams BOTH ways over
+    /// the new channel. Field regression 2026-07-09: both phones swapped and
+    /// then passed zero bytes until the wedge watchdog tore the link down.
+    #[tokio::test]
+    async fn swap_to_l2cap_passes_data_both_ways() {
+        let iface = Arc::new(MockBleInterface::new());
+        let (outbound_tx, outbound_rx) = mpsc::channel::<PendingSend>(4);
+        let (_inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(4);
+        let (incoming_tx, mut incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let (registry_tx, _registry_rx) = mpsc::channel::<PeerCommand>(4);
+        let (swap_tx, swap_rx) = mpsc::channel::<blew::L2capChannel>(1);
+
+        let device_id = blew::DeviceId::from("pipe-swap");
+        tokio::spawn(run_data_pipe(
+            iface.clone() as Arc<dyn BleInterface>,
+            device_id.clone(),
+            ConnectRole::Central,
+            ConnectPath::Gatt,
+            None,
+            outbound_rx,
+            inbound_rx,
+            incoming_tx,
+            registry_tx,
+            swap_rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            LivenessClock::new(),
+        ));
+
+        // Pre-swap sanity: outbound flows to the GATT write path.
+        outbound_tx
+            .send(PendingSend {
+                tx_gen: 1,
+                datagram: Bytes::from_static(b"pre-swap"),
+                waker: noop_waker(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if iface
+                    .calls()
+                    .iter()
+                    .any(|c| matches!(c, CallKind::WriteC2p { .. }))
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pre-swap GATT write");
+
+        // Hand the supervisor the L2CAP channel, as SwapPipeToL2cap does.
+        let (ours, theirs) = blew::l2cap::L2capChannel::pair(8192);
+        swap_tx.send(ours).await.unwrap();
+        // Give the select loop a beat to process the swap arm so the next
+        // outbound deterministically rides L2CAP, not the retiring GATT worker.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let (mut peer_rd, mut peer_wr) = tokio::io::split(theirs);
+
+        // The pre-swap datagram was never ACKed (mock iface produces no
+        // inbound), so the handover rescue re-sends it first.
+        let rescued = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::transport::l2cap::read_framed_datagram(&mut peer_rd),
+        )
+        .await
+        .expect("rescued pre-swap datagram should arrive over L2CAP")
+        .expect("read_framed_datagram must succeed")
+        .expect("frame present");
+        assert_eq!(rescued, b"pre-swap");
+
+        // Outbound post-swap: must arrive framed on the peer half.
+        outbound_tx
+            .send(PendingSend {
+                tx_gen: 1,
+                datagram: Bytes::from_static(b"post-swap-out"),
+                waker: noop_waker(),
+            })
+            .await
+            .unwrap();
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::transport::l2cap::read_framed_datagram(&mut peer_rd),
+        )
+        .await
+        .expect("peer should see the post-swap datagram")
+        .expect("read_framed_datagram must succeed")
+        .expect("frame present");
+        assert_eq!(got, b"post-swap-out");
+
+        // Inbound post-swap: a framed datagram from the peer must surface on
+        // incoming_tx (the direct-to-iroh path; GATT's inbound_rx is bypassed).
+        crate::transport::l2cap::write_framed_datagram(&mut peer_wr, b"post-swap-in")
+            .await
+            .unwrap();
+        let pkt = tokio::time::timeout(std::time::Duration::from_secs(1), incoming_rx.recv())
+            .await
+            .expect("inbound datagram should surface post-swap")
+            .expect("incoming channel open");
+        assert_eq!(pkt.data.as_ref(), b"post-swap-in");
+        assert_eq!(pkt.device_id, device_id);
+    }
+
+    /// Field regression 2026-07-09: a datagram on the GATT wire but not yet
+    /// ACKed at swap time (the client's QUIC handshake Finished) died with the
+    /// retired GATT worker, stalling the handshake for ~8s per swap and
+    /// wedging the link outright twice. The supervisor must rescue it and
+    /// re-send it whole over the new L2CAP pipe.
+    #[tokio::test]
+    async fn swap_requeues_unacked_gatt_datagrams_onto_l2cap() {
+        let iface = Arc::new(MockBleInterface::new());
+        let (outbound_tx, outbound_rx) = mpsc::channel::<PendingSend>(4);
+        let (_inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(4);
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let (registry_tx, _registry_rx) = mpsc::channel::<PeerCommand>(4);
+        let (swap_tx, swap_rx) = mpsc::channel::<blew::L2capChannel>(1);
+
+        let device_id = blew::DeviceId::from("pipe-rescue");
+        tokio::spawn(run_data_pipe(
+            iface.clone() as Arc<dyn BleInterface>,
+            device_id.clone(),
+            ConnectRole::Central,
+            ConnectPath::Gatt,
+            None,
+            outbound_rx,
+            inbound_rx,
+            incoming_tx,
+            registry_tx,
+            swap_rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            LivenessClock::new(),
+        ));
+
+        // A datagram that reaches the GATT wire but is never ACKed — the mock
+        // iface produces no inbound, so no ACK ever arrives.
+        outbound_tx
+            .send(PendingSend {
+                tx_gen: 1,
+                datagram: Bytes::from_static(b"finished"),
+                waker: noop_waker(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if iface
+                    .calls()
+                    .iter()
+                    .any(|c| matches!(c, CallKind::WriteC2p { .. }))
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("datagram must reach the GATT wire before the swap");
+
+        // Swap to L2CAP; the rescue must re-send the unACKed datagram whole.
+        let (ours, theirs) = blew::l2cap::L2capChannel::pair(8192);
+        swap_tx.send(ours).await.unwrap();
+
+        let (mut peer_rd, _peer_wr) = tokio::io::split(theirs);
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::transport::l2cap::read_framed_datagram(&mut peer_rd),
+        )
+        .await
+        .expect("rescued datagram should arrive over L2CAP")
+        .expect("read_framed_datagram must succeed")
+        .expect("frame present");
+        assert_eq!(got, b"finished");
     }
 }
