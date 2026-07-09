@@ -195,6 +195,28 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### State res v2.1: conflicted subgraph = paths between conflicted events (2026-07-09)
+- A synapse/state comparison found the rust impl's major deviation:
+  `conflicted_subgraph()` returned the full backwards auth-chain closure of
+  the conflicted events. Spec v12 defines the conflicted state subgraph as
+  the union of `auth_events` paths **between pairs** of conflicted events,
+  endpoints included; synapse computes it as backwards ∩ forwards
+  reachability (`state/v2.py` unpersisted part; DB layer in
+  `event_federation.py`). The superset dragged the room's whole auth DAG
+  into the full conflicted set: stale unconflicted ancestors re-judged from
+  the empty base state could flip verdicts on genuinely conflicted keys,
+  every conflicted resolve cost O(room DAG), and the strict-closure
+  invariant turned any locally-missing ancestor into a hard MissingEvent.
+- Fix keeps `provider.auth_chain` for the backwards closure, then walks
+  forwards from the seeds over reversed auth edges *within the closure* —
+  sound because every seed⇒seed path lies wholly inside the closure. Seeds
+  are always included (synapse unions the conflicted events in
+  unconditionally).
+- Also adopted synapse's no-conflict short-circuit: `resolve_state` returns
+  the unconflicted map before any auth-chain walk when `separate()` finds
+  zero conflicted keys — previously the converged path (identical multi-head
+  inputs) walked the full chains of every state set for nothing.
+
 ### Filtered BLE scans via masked service-UUID prefix (2026-07-09)
 - Unfiltered Android scans are aggressively batched/throttled (and return
   nothing screen-off), delaying discovery. Requirement: backwards compatible
