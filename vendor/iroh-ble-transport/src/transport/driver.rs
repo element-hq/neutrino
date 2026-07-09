@@ -372,6 +372,7 @@ impl<I: BleInterface> Driver<I> {
         let inbox = self.inbox.clone();
         let dev_for_msg = device_id.clone();
         tokio::spawn(async move {
+            tracing::info!(device = %device_id, "L2CAP upgrade: reading peer PSM");
             let result = tokio::time::timeout(super::registry::L2CAP_SELECT_TIMEOUT, async {
                 let psm = read_psm_with_retry(&READ_PSM_BACKOFFS_MS, &device_id, || {
                     let iface = Arc::clone(&iface);
@@ -379,6 +380,7 @@ impl<I: BleInterface> Driver<I> {
                     async move { iface.read_psm(&dev).await }
                 })
                 .await?;
+                tracing::info!(device = %device_id, psm, "L2CAP upgrade: PSM read; opening channel");
                 iface
                     .open_l2cap(&device_id, psm)
                     .await
@@ -423,7 +425,6 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
-use blew::central::ScanFilter;
 use blew::gatt::service::GattService;
 use blew::l2cap::types::Psm;
 use blew::peripheral::AdvertisingConfig;
@@ -599,7 +600,9 @@ impl BleInterface for BlewDriver {
     }
 
     async fn start_scan(&self) -> crate::error::BleResult<()> {
-        self.central.start_scan(ScanFilter::default()).await?;
+        self.central
+            .start_scan(crate::transport::transport::iroh_scan_filter())
+            .await?;
         Ok(())
     }
 

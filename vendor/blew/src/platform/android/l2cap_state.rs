@@ -93,6 +93,16 @@ fn close_socket(socket_id: i32, is_server: bool) {
 }
 
 pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: bool) {
+    // Hop-by-hop logging (2026-07-09): the first field run of this bridge
+    // passed zero bytes in either direction with no diagnostic trail — every
+    // failure path here was silent. Each pump now logs start / stop / error
+    // so a dead hop is attributable from logcat.
+    tracing::info!(
+        device = device_addr,
+        socket_id,
+        from_server,
+        "l2cap bridge: channel opened; starting pumps"
+    );
     let (app_half, bridge_half) = tokio::io::duplex(DUPLEX_BUF_SIZE);
     let (mut bridge_reader, mut bridge_writer) = tokio::io::split(bridge_half);
 
@@ -104,19 +114,43 @@ pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: 
     let handle = TOKIO_HANDLE.get().expect("tokio handle not initialized");
 
     handle.spawn(async move {
+        tracing::debug!(socket_id, "l2cap bridge: kotlin->rust pump running");
+        let mut total: u64 = 0;
         while let Some(data) = data_rx.recv().await {
+            total += data.len() as u64;
             if bridge_writer.write_all(&data).await.is_err() {
+                tracing::warn!(
+                    socket_id,
+                    "l2cap bridge: duplex write failed; kotlin->rust pump stopping"
+                );
                 break;
             }
         }
+        tracing::debug!(socket_id, total, "l2cap bridge: kotlin->rust pump exiting");
     });
 
     let is_server = from_server;
     handle.spawn(async move {
+        tracing::debug!(socket_id, "l2cap bridge: rust->kotlin pump running");
         let mut buf = vec![0u8; L2CAP_READ_BUF_SIZE];
+        let mut total: u64 = 0;
         loop {
             match bridge_reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) => {
+                    tracing::debug!(
+                        socket_id,
+                        "l2cap bridge: duplex EOF; rust->kotlin pump stopping"
+                    );
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        socket_id,
+                        ?e,
+                        "l2cap bridge: duplex read failed; rust->kotlin pump stopping"
+                    );
+                    break;
+                }
                 Ok(n) => {
                     let data = buf[..n].to_vec();
                     let result = jvm().attach_current_thread(|env| {
@@ -134,12 +168,20 @@ pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: 
                         )?;
                         Ok::<_, jni::errors::Error>(())
                     });
-                    if result.is_err() {
+                    if let Err(e) = result {
+                        tracing::warn!(
+                            socket_id,
+                            ?e,
+                            "l2cap bridge: JNI writeL2cap failed; rust->kotlin pump stopping"
+                        );
                         break;
                     }
+                    total += n as u64;
+                    tracing::trace!(socket_id, n, "l2cap bridge: forwarded to kotlin");
                 }
             }
         }
+        tracing::debug!(socket_id, total, "l2cap bridge: rust->kotlin pump exiting");
         close_socket(socket_id, is_server);
     });
 
@@ -169,7 +211,19 @@ pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: 
 pub(crate) fn on_channel_data(socket_id: i32, data: &[u8]) {
     if let Some(s) = STATE.get() {
         if let Some(tx) = s.data_tx.lock().get(&socket_id) {
-            let _ = tx.send(data.to_vec());
+            if tx.send(data.to_vec()).is_err() {
+                tracing::warn!(
+                    socket_id,
+                    len = data.len(),
+                    "l2cap bridge: kotlin->rust pump gone; inbound dropped"
+                );
+            }
+        } else {
+            tracing::warn!(
+                socket_id,
+                len = data.len(),
+                "l2cap bridge: inbound data for unknown socket id; dropped"
+            );
         }
     }
 }

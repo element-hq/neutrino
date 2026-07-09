@@ -237,9 +237,16 @@ pub async fn run_peripheral_requests(
                 ..
             } => {
                 if char_uuid == crate::transport::transport::IROH_PSM_CHAR_UUID {
+                    // A PSM read is the peer-side signature of an L2CAP upgrade
+                    // attempt — log it so captures show both ends of the dance.
                     if let Some(psm_val) = psm {
+                        tracing::info!(psm = psm_val, "serving PSM read to central");
                         responder.respond(psm_val.to_le_bytes().to_vec());
                     } else {
+                        tracing::info!(
+                            "serving empty PSM read (no local L2CAP listener); \
+                             central will stay on GATT"
+                        );
                         responder.respond(Vec::new());
                     }
                 } else if char_uuid == crate::transport::transport::IROH_VERSION_CHAR_UUID {

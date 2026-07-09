@@ -248,16 +248,23 @@ impl CentralBackend for AndroidCentral {
     fn start_scan(&self, filter: ScanFilter) -> impl Future<Output = BlewResult<()>> + Send {
         async move {
             let low_power = filter.mode == crate::central::types::ScanMode::LowPower;
+            // Exact filters ride as plain UUID strings, masked filters as
+            // "uuid;mask" — one array keeps the JNI signature stable;
+            // `BleCentralManager.startScan` splits on ';'.
+            let mut specs: Vec<String> = filter.services.iter().map(|u| u.to_string()).collect();
+            specs.extend(
+                filter
+                    .service_masks
+                    .iter()
+                    .map(|(uuid, mask)| format!("{uuid};{mask}")),
+            );
             jvm()
                 .attach_current_thread(|env| {
                     let string_class = env.find_class(jni_str!("java/lang/String"))?;
-                    let uuids: JObjectArray = env.new_object_array(
-                        filter.services.len() as i32,
-                        &string_class,
-                        &JObject::null(),
-                    )?;
-                    for (i, uuid) in filter.services.iter().enumerate() {
-                        let s = env.new_string(uuid.to_string())?;
+                    let uuids: JObjectArray =
+                        env.new_object_array(specs.len() as i32, &string_class, &JObject::null())?;
+                    for (i, spec) in specs.iter().enumerate() {
+                        let s = env.new_string(spec)?;
                         uuids.set_element(env, i, &s)?;
                     }
 

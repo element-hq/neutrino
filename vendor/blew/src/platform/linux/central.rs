@@ -227,6 +227,9 @@ impl CentralBackend for LinuxCentral {
                 }
             }
 
+            if !filter.service_masks.is_empty() {
+                debug!("masked service-UUID filters are not supported by BlueZ; ignoring");
+            }
             if !filter.services.is_empty() {
                 let df = bluer::DiscoveryFilter {
                     uuids: filter.services.into_iter().collect(),
