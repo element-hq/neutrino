@@ -20,6 +20,11 @@ members = [
 exclude = ["./crates/neutrino-ffi"]
 resolver = "3"
 
+# Mirrors the root manifest: member crates inherit this via
+# `license.workspace = true`, so it must exist here too.
+[workspace.package]
+license = "AGPL-3.0-only"
+
 [workspace.dependencies]
 async-trait = "0.1.89"
 clap = { version = "4.6.1", features = ["derive"] }
