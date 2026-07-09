@@ -2,6 +2,7 @@
 name = "neutrino-testkit"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 # In-process multi-server federation test harness: spawns real `neutrino`
 # binaries on loopback and drives real federation HTTP between them, with

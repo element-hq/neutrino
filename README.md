@@ -158,3 +158,9 @@ git push --tags
 ```
 
 This will trigger the CI to perform an automatic release of the Neutrino bindings.
+
+## License
+
+Neutrino is licensed under the
+[GNU Affero General Public License v3.0](./LICENSE-AGPL-3.0) (`AGPL-3.0-only`).
+For discussion around alternative licensing please contact licensing@element.io

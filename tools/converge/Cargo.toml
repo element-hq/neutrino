@@ -2,6 +2,7 @@
 name = "converge"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 publish = false
 
 # Convergence fuzzer over an in-process 3-server federation rig. Model, oracle
