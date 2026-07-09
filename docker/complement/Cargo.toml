@@ -42,6 +42,11 @@ proptest = "1"
 # required by iroh
 sha2 = "=0.11.0-rc.5"
 
+[workspace.package]
+# See LICENSE-AGPL-3.0 at the repo root. Applies to first-party crates only;
+# the forks under `vendor/` keep their upstream licenses.
+license = "AGPL-3.0-only"
+
 [patch.crates-io]
 # NB: the root manifest's `blew` patch is intentionally absent — no crate in this
 # pruned workspace depends on `blew`, and `vendor/blew` is not copied into the
