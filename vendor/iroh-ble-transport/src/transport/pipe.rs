@@ -622,7 +622,7 @@ async fn run_l2cap_pipe(
 ) {
     let (reader, writer) = tokio::io::split(channel);
 
-    let (l2cap_tx, _send_task, _recv_task, done) = crate::transport::l2cap::spawn_l2cap_io_tasks(
+    let (l2cap_tx, send_task, recv_task, done) = crate::transport::l2cap::spawn_l2cap_io_tasks(
         reader,
         writer,
         device_id.clone(),
@@ -631,6 +631,15 @@ async fn run_l2cap_pipe(
         Arc::clone(&teardown_flag),
         Arc::clone(&empty_frames_counter),
     );
+    // The io tasks own the channel halves; the recv task in particular sits
+    // blocked in `read_framed_datagram` and never observes teardown on its
+    // own. Guard both so ANY exit from this worker — clean break or the
+    // supervisor's abort — kills them, dropping both halves so the channel's
+    // close hook fires (on Android: JNI closeL2cap → BluetoothSocket.close()
+    // → the Kotlin read-loop thread exits). Without this, every retired
+    // L2CAP pipe leaked an open CoC socket, an fd, and a blocked thread.
+    let _send_guard = AbortOnDrop(send_task);
+    let _recv_guard = AbortOnDrop(recv_task);
 
     let mut io_died = false;
     loop {
@@ -1109,5 +1118,75 @@ mod tests {
         .expect("read_framed_datagram must succeed")
         .expect("frame present");
         assert_eq!(got, b"finished");
+    }
+
+    /// Retiring an L2CAP pipe must drop both channel halves so the channel's
+    /// close hook fires (on Android: BluetoothSocket.close(), ending the
+    /// Kotlin read-loop thread). Field leak 2026-07-09: the recv io task
+    /// stayed blocked in `read_framed_datagram` holding the ReadHalf, so
+    /// every retired pipe leaked the open CoC socket, an fd, and a thread —
+    /// observable as "L2CAP read ended" never appearing in logcat.
+    #[tokio::test]
+    async fn l2cap_pipe_teardown_drops_channel() {
+        let iface = Arc::new(MockBleInterface::new());
+        let (outbound_tx, outbound_rx) = mpsc::channel::<PendingSend>(4);
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(4);
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let (registry_tx, _registry_rx) = mpsc::channel::<PeerCommand>(4);
+        let (_swap_tx, swap_rx) = mpsc::channel::<blew::L2capChannel>(1);
+
+        let (ours, theirs) = blew::l2cap::L2capChannel::pair(8192);
+        tokio::spawn(run_data_pipe(
+            iface.clone() as Arc<dyn BleInterface>,
+            blew::DeviceId::from("pipe-close"),
+            ConnectRole::Central,
+            ConnectPath::L2cap,
+            Some(ours),
+            outbound_rx,
+            inbound_rx,
+            incoming_tx,
+            registry_tx,
+            swap_rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            LivenessClock::new(),
+        ));
+
+        // Sanity: the pipe is live before teardown.
+        outbound_tx
+            .send(PendingSend {
+                tx_gen: 1,
+                datagram: Bytes::from_static(b"ping"),
+                waker: noop_waker(),
+            })
+            .await
+            .unwrap();
+        let (mut peer_rd, _peer_wr) = tokio::io::split(theirs);
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::transport::l2cap::read_framed_datagram(&mut peer_rd),
+        )
+        .await
+        .expect("live pipe should deliver")
+        .expect("read must succeed")
+        .expect("frame present");
+        assert_eq!(got, b"ping");
+
+        // Registry-style teardown: drop the pipe senders. The supervisor
+        // exits, and the io-task guards must drop both channel halves.
+        drop(outbound_tx);
+        drop(inbound_tx);
+
+        let end = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            crate::transport::l2cap::read_framed_datagram(&mut peer_rd),
+        )
+        .await
+        .expect("peer must observe the channel closing after teardown");
+        assert!(
+            matches!(end, Ok(None) | Err(_)),
+            "expected EOF or reset, got a frame: {end:?}"
+        );
     }
 }

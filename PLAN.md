@@ -223,8 +223,18 @@ never use .unwrap() in handler code.
   fully-ACKed excluded; partially-ACKed returned whole) + an e2e supervisor
   swap-rescue test pinning the lost-Finished regression; the swap both-ways
   test now asserts the rescued frame arrives first. 275 lib tests green;
-  ffi(ble) cargo check clean. Still open from the incident: io-task/socket
-  teardown leak; optional wedge-after-swap damping.
+  ffi(ble) cargo check clean.
+- **Field-confirmed + cleaned up (same day):** Kegan verified the rescue works
+  on-device. Per-op Kotlin logs ("L2CAP wrote/read NB") removed (loop
+  start/end + error logs stay). **Teardown leak FIXED:** `run_l2cap_pipe`
+  wraps its io tasks in `AbortOnDrop`, so any exit — clean break or the
+  supervisor's 1s abort — kills them, dropping both channel halves → close
+  hook → JNI `closeL2cap` → `BluetoothSocket.close()` → Kotlin read-loop
+  thread exits. Test `l2cap_pipe_teardown_drops_channel` pins peer-observed
+  close after registry-style teardown; 276 lib tests green. Still open
+  (optional, insurance only): wedge-after-swap damping — set the
+  `l2cap_upgrade_failed` sticky when the wedge fires on an L2CAP-path entry,
+  so an unknown future dead-swap mode degrades to GATT instead of looping.
 
 ### CORRECTION (2026-07-09, later): cycle 3 of the same capture WORKED over L2CAP
 - Kegan reported the app eventually worked on retry. The recv capture tail

@@ -42,7 +42,6 @@ class L2capSocketManager(
         try {
             socket.outputStream.write(data)
             socket.outputStream.flush()
-            Log.d(tag, "L2CAP wrote ${data.size}B (socket $socketId)")
         } catch (e: Exception) {
             Log.e(tag, "L2CAP write failed (socket $socketId): ${e.message}")
             close(socketId)
@@ -70,7 +69,6 @@ class L2capSocketManager(
             while (true) {
                 val n = input.read(buf)
                 if (n < 0) break
-                Log.d(tag, "L2CAP read ${n}B (socket $socketId)")
                 onData(socketId, buf.copyOf(n))
             }
         } catch (e: Exception) {
