@@ -34,7 +34,11 @@ class L2capSocketManager(
         socketId: Int,
         data: ByteArray,
     ) {
-        val socket = sockets[socketId] ?: return
+        val socket =
+            sockets[socketId] ?: run {
+                Log.w(tag, "L2CAP write for unknown socket $socketId (${data.size}B dropped)")
+                return
+            }
         try {
             socket.outputStream.write(data)
             socket.outputStream.flush()
@@ -58,6 +62,7 @@ class L2capSocketManager(
         deviceAddr: String,
         socket: BluetoothSocket,
     ) {
+        Log.d(tag, "L2CAP read loop started (socket $socketId, device $deviceAddr)")
         val buf = ByteArray(4096)
         try {
             val input = socket.inputStream

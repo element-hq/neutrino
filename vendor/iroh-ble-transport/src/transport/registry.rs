@@ -255,6 +255,11 @@ impl Registry {
         exact_device_id: Option<DeviceId>,
     ) {
         let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
+        tracing::info!(
+            endpoint = %endpoint_id,
+            exact_device = ?exact_device_id,
+            "endpoint verified"
+        );
         self.verified_prefixes.insert(prefix, endpoint_id);
         if let Some(device_id) = exact_device_id.as_ref()
             && let Some(entry) = self.peers.get_mut(device_id)
@@ -348,32 +353,55 @@ impl Registry {
                     e.prefix == Some(prefix) && matches!(e.phase, PeerPhase::Connected { .. })
                 })
                 .count();
-            let to_upgrade: Vec<DeviceId> = self
-                .peers
-                .iter()
-                .filter(|(_, e)| {
-                    e.prefix == Some(prefix)
-                        && !e.l2cap_upgrade_failed
-                        && Self::should_emit_l2cap_upgrade(
-                            connected_for_prefix,
-                            e.role,
-                            &my_endpoint,
-                            &endpoint_id,
-                        )
-                        && matches!(
-                            e.phase,
-                            PeerPhase::Connected {
-                                upgrading: false,
-                                channel: crate::transport::peer::ChannelHandle {
-                                    path: crate::transport::peer::ConnectPath::Gatt,
-                                    ..
-                                },
-                                ..
-                            }
-                        )
-                })
-                .map(|(did, _)| did.clone())
-                .collect();
+            // Field debugging showed upgrades silently never happening, so
+            // every gate's outcome is logged per entry rather than folded into
+            // one opaque filter.
+            let mut to_upgrade: Vec<DeviceId> = Vec::new();
+            let mut entries_for_prefix = 0usize;
+            for (did, e) in &self.peers {
+                if e.prefix != Some(prefix) {
+                    continue;
+                }
+                entries_for_prefix += 1;
+                let dedup_says_dial = Self::should_emit_l2cap_upgrade(
+                    connected_for_prefix,
+                    e.role,
+                    &my_endpoint,
+                    &endpoint_id,
+                );
+                let phase_is_idle_gatt = matches!(
+                    e.phase,
+                    PeerPhase::Connected {
+                        upgrading: false,
+                        channel: crate::transport::peer::ChannelHandle {
+                            path: crate::transport::peer::ConnectPath::Gatt,
+                            ..
+                        },
+                        ..
+                    }
+                );
+                let emit = !e.l2cap_upgrade_failed && dedup_says_dial && phase_is_idle_gatt;
+                tracing::info!(
+                    device = %did,
+                    phase = ?PhaseKind::from(&e.phase),
+                    role = ?e.role,
+                    connected_for_prefix,
+                    dedup_says_dial,
+                    phase_is_idle_gatt,
+                    upgrade_failed_sticky = e.l2cap_upgrade_failed,
+                    emit,
+                    "L2CAP upgrade check (verified endpoint)"
+                );
+                if emit {
+                    to_upgrade.push(did.clone());
+                }
+            }
+            if entries_for_prefix == 0 {
+                tracing::info!(
+                    endpoint = %endpoint_id,
+                    "L2CAP upgrade check: verified endpoint matched no peer entry by prefix"
+                );
+            }
             for did in to_upgrade {
                 if let Some(entry) = self.peers.get_mut(&did) {
                     if let PeerPhase::Connected { upgrading, .. } = &mut entry.phase {
@@ -799,20 +827,45 @@ impl Registry {
             path: crate::transport::peer::ConnectPath::Gatt,
             l2cap_channel: None,
         });
-        if matches!(self.l2cap_policy, L2capPolicy::PreferL2cap)
-            && let Some(endpoint_id) = verified_endpoint
-            && !entry.l2cap_upgrade_failed
-            && Self::should_emit_l2cap_upgrade(
-                connected_for_prefix,
-                entry.role,
-                &self.my_endpoint,
-                &endpoint_id,
-            )
-        {
-            if let PeerPhase::Connected { upgrading, .. } = &mut entry.phase {
-                *upgrading = true;
+        if matches!(self.l2cap_policy, L2capPolicy::PreferL2cap) {
+            match verified_endpoint {
+                Some(endpoint_id) => {
+                    let dedup_says_dial = Self::should_emit_l2cap_upgrade(
+                        connected_for_prefix,
+                        entry.role,
+                        &self.my_endpoint,
+                        &endpoint_id,
+                    );
+                    let emit = !entry.l2cap_upgrade_failed && dedup_says_dial;
+                    tracing::info!(
+                        device = %device_id,
+                        role = ?entry.role,
+                        connected_for_prefix,
+                        dedup_says_dial,
+                        upgrade_failed_sticky = entry.l2cap_upgrade_failed,
+                        emit,
+                        "L2CAP upgrade check (connect succeeded, peer already verified)"
+                    );
+                    if emit {
+                        if let PeerPhase::Connected { upgrading, .. } = &mut entry.phase {
+                            *upgrading = true;
+                        }
+                        actions.push(PeerAction::UpgradeToL2cap { device_id });
+                    }
+                }
+                None => {
+                    // Expected on a first-ever connect: verification happens
+                    // during the QUIC handshake that runs over this fresh GATT
+                    // pipe, so the upgrade decision is deferred to
+                    // `handle_verified_endpoint`.
+                    tracing::info!(
+                        device = %device_id,
+                        prefix_known = known_prefix.is_some(),
+                        "L2CAP upgrade deferred: peer not verified yet \
+                         (decision re-runs on VerifiedEndpoint)"
+                    );
+                }
             }
-            actions.push(PeerAction::UpgradeToL2cap { device_id });
         }
     }
 
@@ -1513,6 +1566,10 @@ impl Registry {
                         channel.path = crate::transport::peer::ConnectPath::L2cap;
                         *upgrading = false;
                     }
+                    tracing::info!(
+                        device = %device_id,
+                        "L2CAP upgrade succeeded; swapping active pipe GATT -> L2CAP"
+                    );
                     actions.push(PeerAction::SwapPipeToL2cap {
                         device_id,
                         channel: l2cap_chan,

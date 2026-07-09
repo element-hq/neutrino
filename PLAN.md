@@ -195,6 +195,158 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### Filtered BLE scans via masked service-UUID prefix (2026-07-09)
+- Unfiltered Android scans are aggressively batched/throttled (and return
+  nothing screen-off), delaying discovery. Requirement: backwards compatible
+  with builds already in the field — so the filter must match what those
+  builds advertise, and the advertise side must not change.
+- The advertised `key_uuid` is `69726f00-<12-byte node prefix>` — per-device,
+  so an exact `setServiceUuid` filter can't work. Android supports masked
+  matching (`ScanFilter.setServiceUuid(uuid, mask)`), so the filter is the
+  fixed 4-byte iroh magic prefix with mask `ffffffff-0000-…` —
+  `iroh_scan_filter()` in `transport.rs`, used by both scan sites (initial +
+  `BleInterface::start_scan` for restarts). Interop both directions: new
+  scanner matches old adverts; old unfiltered scanners see new adverts.
+- blew: `ScanFilter.service_masks: Vec<(Uuid, Uuid)>`; Android encodes masked
+  entries as `"uuid;mask"` strings in the EXISTING JNI array so the JNI
+  signature stays `([Ljava/lang/String;Z)V` (no NoSuchMethodError class of
+  bug); Kotlin splits on `;`. BlueZ has no masked filter → Linux logs and
+  ignores masked entries (scan behaves as before; Linux isn't throttled and
+  decode-side filtering already applies).
+- Test pins the filter shape (matches any `69726f00-*` key UUID, rejects
+  wrong-prefix/foreign UUIDs, asserts no exact-service entries). blew 54 +
+  transport 277 tests green; ffi(ble) check clean; Android path is
+  build-verified on device as usual.
+
+### L2CAP handover rescue: undelivered GATT datagrams re-sent on the new pipe (2026-07-09)
+- The `l2cap-again` captures confirmed the bridge healthy end-to-end AND
+  measured the swap-drop cost: fragments mid-retransmit at swap died with the
+  retired GATT worker and QUIC ate an ~8s PTO stall recovering (fatal twice in
+  the earlier run when it was the client handshake Finished). Kegan's theory
+  and the log evidence agreed; he green-lit the fix after log verification.
+- **Mechanism:** `ReliableChannel` now keeps a whole-datagram copy from
+  fragmentation until the datagram is fully ACKed
+  (`ChannelState.unacked_datagrams: VecDeque<(frags_remaining, copy)>` —
+  cumulative ACKs + FIFO fragmentation mean every ACKed fragment belongs to
+  the queue head, so it's a count-down, no seq bookkeeping). New
+  `take_undelivered()` drains those copies + the unfragmented `send_queue`
+  tail (in send order) and clears the send side so the retiring loop
+  transmits nothing new. Whole datagrams, not fragments: the peer's reliable
+  reassembly state dies at its own swap, so partially-delivered datagrams
+  can only complete via a whole re-send; duplicates are fine (QUIC dedups by
+  packet number).
+- **Wiring:** `ReliableChannel` construction hoisted from `run_gatt_pipe`
+  into `spawn_gatt_worker`; `ActiveWorker::Gatt` carries the `Arc` so the
+  supervisor's swap arm rescues (`take_undelivered`) after installing the
+  L2CAP worker and re-forwards each datagram (`Waker::noop()`, tx_gen 0 —
+  display-only inside the pipe) before `spawn_drain_old_worker`. Forward
+  failure mid-rescue degrades to the pre-rescue status quo. Logs
+  `count` at info ("L2CAP handover: requeuing undelivered GATT datagrams").
+- Tests: 3 `take_undelivered` unit tests (unACKed+queued whole & ordered;
+  fully-ACKed excluded; partially-ACKed returned whole) + an e2e supervisor
+  swap-rescue test pinning the lost-Finished regression; the swap both-ways
+  test now asserts the rescued frame arrives first. 275 lib tests green;
+  ffi(ble) cargo check clean.
+- **Field-confirmed + cleaned up (same day):** Kegan verified the rescue works
+  on-device. Per-op Kotlin logs ("L2CAP wrote/read NB") removed (loop
+  start/end + error logs stay). **Teardown leak FIXED:** `run_l2cap_pipe`
+  wraps its io tasks in `AbortOnDrop`, so any exit — clean break or the
+  supervisor's 1s abort — kills them, dropping both channel halves → close
+  hook → JNI `closeL2cap` → `BluetoothSocket.close()` → Kotlin read-loop
+  thread exits. Test `l2cap_pipe_teardown_drops_channel` pins peer-observed
+  close after registry-style teardown; 276 lib tests green. Still open
+  (optional, insurance only): wedge-after-swap damping — set the
+  `l2cap_upgrade_failed` sticky when the wedge fires on an L2CAP-path entry,
+  so an unknown future dead-swap mode degrades to GATT instead of looping.
+
+### CORRECTION (2026-07-09, later): cycle 3 of the same capture WORKED over L2CAP
+- Kegan reported the app eventually worked on retry. The recv capture tail
+  proves it was L2CAP, not GATT: the third upgrade cycle (recv 08:53:48.9)
+  completed the QUIC handshake THROUGH both swapped pipes (`endpoint verified`
+  at :50.6, 1.7s after the recv's swap — post-swap inbound GATT is dropped, so
+  the client Finished can only have arrived via the L2CAP recv task) and the
+  link then stayed silent-stable to capture end (+16.5s): no wedge, no
+  teardown, no re-dial — which also proves recv→sender flowed (the sender's
+  10s CONN_MAX_IDLE would otherwise have killed the conn and re-dialed).
+- So "bridge passes zero bytes" was overfit to cycles 1–2: the bridge WORKS;
+  the first two swap cycles black-holed. Distinguishing fact: cycle 3's
+  upgrade fired ~4.4s after GATT connect (vs ~2–2.5s in cycles 1–2), i.e. the
+  handshake was fully settled before any swap. In cycles 1–2 both sides
+  swapped mid-handshake-completion, both sides' in-flight reliable fragments
+  (client Finished / server flight) died with the retired GATT workers, and
+  the QUIC PTO retransmits into the fresh pipes never landed — should-recover-
+  but-didn't, so the bridge's first post-swap seconds remain suspect; the
+  hop-by-hop instrumentation (in Kegan's PreferL2cap rebuild) will show
+  whether the first writes reach Kotlin/the wire.
+- Policy: Kegan re-enabled PreferL2cap in the ffi (instrumented diagnostic
+  run). Mitigation candidates if dead-first-swap recurs, in preference order:
+  (1) requeue in-flight unACKed reliable fragments into the new pipe at swap
+  instead of dropping; (2) delay `UpgradeToL2cap` until the handshake settles
+  (emit N seconds after verify); (3) wedge-after-swap ⇒ revert-to-GATT +
+  sticky instead of full teardown (kills the loop); (4) io-task/socket
+  teardown leak fix (below) regardless.
+
+### L2CAP upgrade re-disabled: Android JNI data bridge passes no bytes (2026-07-09, follow-up)
+- With the hook wired (entry below), the upgrade ran in the field for the first
+  time — and broke federation outright. Captures (l2cap-sender/recv.log) show
+  the dance working (PSM read, CoC open at OS level both ends, both pipes
+  swapped within ~40ms — the apparent 27s gap is phone clock skew) and then
+  **zero bytes crossing the L2CAP channel in either direction**: the receiver
+  never completed the QUIC handshake (client Finished died with the retired
+  GATT worker; PTO retransmits vanished into the new pipe), its
+  kotlin→rust pump provably starved (no EOF, no data), both wedge watchdogs
+  fired ~9–14s post-swap, and the loop GATT-reconnect → verify → upgrade →
+  dead swap repeated forever (`open_l2cap` succeeds, so the
+  `l2cap_upgrade_failed` sticky never engages — nothing damps the loop).
+- Rust layers exonerated in-sandbox: new `swap_to_l2cap_passes_data_both_ways`
+  pipe test drives a real supervisor swap over an in-memory channel pair and
+  passes both directions. The dead layer is the android-only JNI bridge
+  (`vendor/blew` `l2cap_state.rs` duplex pumps ↔ `L2capSocketManager.kt`) —
+  first-ever field execution, and every failure path in it was silent.
+- **Decision:** ffi pins `l2cap_policy: Disabled` (federation back on the
+  known-good GATT path). `BleDedupHook`/`verified_rx` stay wired — dedup is
+  correct, newly live, and unimplicated in the captures. The bridge is now
+  instrumented hop-by-hop (pump start/stop/error warns in `l2cap_state.rs`;
+  per-read/write `Log.d` + unknown-socket warn in `L2capSocketManager.kt`), so
+  the next PreferL2cap run pinpoints the dead hop from logcat.
+- Before re-enabling, also fix: L2CAP io-task teardown leak (recv task blocked
+  in `read_framed_datagram` holds the socket ReadHalf forever → supervisor
+  needs its abort path, close hook never fires, Kotlin read loop/socket leak
+  per cycle — the field logs' "worker did not exit within handover timeout;
+  aborted" + absent "L2CAP read ended"), and consider a sticky/backoff guard
+  for wedge-after-swap so a dead bridge can't loop the link.
+
+### L2CAP upgrade never attempted: BleDedupHook was never installed (2026-07-09)
+- **Root cause** of "devices never upgrade to L2CAP" (zero `read_psm` /
+  `OpenL2cap*` lines across all field captures): `BleTransportConfig.verified_rx`
+  defaults to `None` and ffi's `relay_transport.rs` built the config with
+  `..Default::default()`, and never called `.hooks(BleDedupHook::new(tx))` on the
+  iroh endpoint builder. `VerifiedEndpoint` is the sole trigger for BOTH
+  `UpgradeToL2cap` emit sites (`handle_verified_endpoint` directly;
+  `handle_connect_succeeded` via the `verified_prefixes` map only
+  `handle_verified_endpoint` populates) — so the upgrade state machine was
+  unreachable, not flaky. Supersedes the earlier timing-window theory.
+  Handshake-time connection dedup was equally dead (the `verified_rx` doc
+  comment says so verbatim); expect first-ever `DedupLoser` drains in the field
+  after this fix.
+- **Fix (ffi):** create the unbounded channel, pass `verified_rx: Some(rx)`,
+  install `BleDedupHook` on the builder inside the `ble` block.
+- **Diagnostics added** (all info-level, rare events): transport-startup
+  `policy`/`verified_rx_wired` line + a warn tripwire when PreferL2cap has no
+  `verified_rx`; `endpoint verified`; per-entry per-gate `L2CAP upgrade check`
+  decision traces at both emit sites (fields: `dedup_says_dial`,
+  `phase_is_idle_gatt`, `upgrade_failed_sticky`, `emit`); "upgrade deferred:
+  peer not verified yet" on connect; driver `reading peer PSM` → `PSM read;
+  opening channel`; peripheral `serving PSM read to central` (the peer-side
+  signature of an attempt); `swapping active pipe GATT -> L2CAP`.
+- **Sandbox verification unblocked:** a stub `dbus-1.pc` (PKG_CONFIG_PATH) plus
+  a stub `libdbus-1.so` of empty `dbus_*` symbols (in an exec-mappable dir, not
+  /tmp; `CARGO_PROFILE_DEV_DEBUG=0 -j2` to dodge the OOM) lets `cargo
+  check`/`clippy`/`test --lib` run for `vendor/blew`, `vendor/iroh-ble-transport`
+  AND `neutrino-ffi --features ble`. 240 transport lib tests green; on-device
+  build remains the final gate. (`examples/peripheral.rs` has a pre-existing
+  `manufacturer_data` compile break — use `--lib`.)
+
 ### Q-Block requests carry no blanket Q-Block2 opt-in; coap-rs vendored (2026-07-07)
 - Wireshark could not reassemble multi-block CBOR *request* bodies in Q-Block
   captures ("Malformed packet: CBOR" on block 0, stray CBOR on later blocks)

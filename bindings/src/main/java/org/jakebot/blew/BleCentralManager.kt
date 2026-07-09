@@ -209,11 +209,21 @@ object BleCentralManager {
 
         val filters =
             if (serviceUuids.isNotEmpty()) {
-                serviceUuids.map { uuid ->
-                    ScanFilter
-                        .Builder()
-                        .setServiceUuid(ParcelUuid(UUID.fromString(uuid)))
-                        .build()
+                serviceUuids.map { spec ->
+                    // "uuid" = exact match; "uuid;mask" = match only the bits
+                    // set in mask (e.g. a fixed prefix shared by all peers
+                    // whose remaining UUID bytes differ per device).
+                    val parts = spec.split(";")
+                    val builder = ScanFilter.Builder()
+                    if (parts.size == 2) {
+                        builder.setServiceUuid(
+                            ParcelUuid(UUID.fromString(parts[0])),
+                            ParcelUuid(UUID.fromString(parts[1])),
+                        )
+                    } else {
+                        builder.setServiceUuid(ParcelUuid(UUID.fromString(spec)))
+                    }
+                    builder.build()
                 }
             } else {
                 null
