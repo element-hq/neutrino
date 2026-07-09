@@ -29,18 +29,25 @@ caveats:
 
 Neutrino is split into a number of different modules:
 
-- `neutrino-common` contains the common type definitions and utilities used throughout the project.
-- `neutrino-state` contains the room-state model, event authorisation rules, and state resolution.
+Server operations:
+- `neutrino-ctl` contains control plane operations e.g. configuration, shutdown commands.
+- `neutrino-http` contains the HTTP router for both the C2S and S2S Matrix APIs.
+- `neutrino-lb` contains the low bandwidth modifications which map HTTP to CoaP.
+- `neutrino-testkit` contains a multi-federation test harness.
+
+Matrix logic:
+- `neutrino-engine` contains operations which work on a collection of rooms e.g. event ingestion pipeline, actor models
+- `neutrino-room` contains operations which work in a single room e.g. state resolution.
+- `neutrino-event` contains operations which work on a single event e.g. redaction/hashing algorithms, canonical JSON.
+
+FFI/bindings/stand-alone:
+- `neutrino-ffi` defines the FFI functions exposed to Android generated using UniFFI.
+- `neutrino` defines the development binary.
+- `neutrino-main` defines shared entrypoint code between binary/FFI.
+
+Storage:
 - `neutrino-store` defines the `StorageBackend` storage trait that handlers go through.
 - `neutrino-store-sqlite` is the SQLite implementation of that storage trait.
-- `neutrino-http` contains the HTTP router for both the C2S and S2S Matrix APIs.
-- `neutrino-main` contains a common entrypoint between the host development and Android-embedded
-  servers.
-
-Two further crates are involved in building binary versions of the server:
-
-- `neutrino` contains the host development binary definition.
-- `neutrino-ffi` contains bindings for Neutrino for use in Android, generated using UniFFI.
 
 Neutrino makes use of the [`xtask` pattern](https://github.com/matklad/cargo-xtask) for compiling
 and publishing the project's FFI bindings; see [`tools/xtask/README.md`](tools/xtask/README.md) for
