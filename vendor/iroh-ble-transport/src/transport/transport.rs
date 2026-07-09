@@ -51,6 +51,25 @@ pub const PROTOCOL_VERSION: u8 = 1;
 
 const KEY_UUID_PREFIX: [u8; 4] = [0x69, 0x72, 0x6f, 0x00];
 
+/// Scan filter matching any iroh-ble peer: a masked service-UUID filter on
+/// [`KEY_UUID_PREFIX`] alone, because the advertised `key_uuid`'s remaining
+/// 12 bytes are the peer's key prefix — different per device, so exact
+/// matching is impossible. Backwards compatible by construction: it matches
+/// the same `key_uuid` service every existing build already advertises.
+/// Filtered scans matter on Android, where unfiltered scans are aggressively
+/// batched/throttled (delayed discovery, empty results with the screen off).
+pub(crate) fn iroh_scan_filter() -> blew::central::ScanFilter {
+    let mut uuid = [0u8; 16];
+    uuid[..4].copy_from_slice(&KEY_UUID_PREFIX);
+    let mut mask = [0u8; 16];
+    mask[..4].copy_from_slice(&[0xff; 4]);
+    blew::central::ScanFilter {
+        services: Vec::new(),
+        service_masks: vec![(uuid::Uuid::from_bytes(uuid), uuid::Uuid::from_bytes(mask))],
+        mode: Default::default(),
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum L2capPolicy {
     Disabled,
@@ -259,10 +278,7 @@ impl BleTransport {
         peripheral.start_advertising(&advertising_config).await?;
         info!(key_uuid = %key_uuid, "advertising started");
 
-        match central
-            .start_scan(blew::central::ScanFilter::default())
-            .await
-        {
+        match central.start_scan(iroh_scan_filter()).await {
             Ok(()) => info!("scanning for iroh-ble peers"),
             Err(BlewError::NotSupported) => {
                 warn!("central start_scan not supported; discovery disabled");
@@ -815,6 +831,44 @@ impl AddressLookup for BleAddressLookup {
 mod tests {
     use super::*;
     use crate::transport::routing::TransportRouting;
+
+    /// Android mask semantics: candidate matches iff
+    /// `candidate & mask == uuid & mask` bytewise.
+    fn masked_match(candidate: &uuid::Uuid, uuid: &uuid::Uuid, mask: &uuid::Uuid) -> bool {
+        candidate
+            .as_bytes()
+            .iter()
+            .zip(uuid.as_bytes())
+            .zip(mask.as_bytes())
+            .all(|((c, u), m)| c & m == u & m)
+    }
+
+    #[test]
+    fn iroh_scan_filter_matches_every_key_uuid_but_nothing_else() {
+        let f = iroh_scan_filter();
+        assert!(
+            f.services.is_empty(),
+            "an exact service filter can never match per-device key UUIDs"
+        );
+        assert_eq!(f.service_masks.len(), 1);
+        let (uuid, mask) = f.service_masks[0];
+
+        // Any advertised key UUID — magic prefix + arbitrary key bytes —
+        // must match, exactly like `extract_prefix_from_services` accepts it.
+        let key_uuid = uuid::Uuid::from_bytes([
+            0x69, 0x72, 0x6f, 0x00, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+        ]);
+        assert!(masked_match(&key_uuid, &uuid, &mask));
+
+        // Foreign services must not match.
+        let other = uuid::Uuid::from_bytes([0x12; 16]);
+        assert!(!masked_match(&other, &uuid, &mask));
+        // Same tail, wrong prefix must not match either.
+        let wrong_prefix = uuid::Uuid::from_bytes([
+            0x69, 0x72, 0x6f, 0x01, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+        ]);
+        assert!(!masked_match(&wrong_prefix, &uuid, &mask));
+    }
     use n0_future::Stream;
     use std::pin::Pin;
     use std::sync::Arc;

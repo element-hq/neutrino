@@ -81,6 +81,15 @@ pub struct ScanFilter {
     /// Only report peripherals advertising at least one of these service UUIDs.
     /// Empty means report all.
     pub services: Vec<Uuid>,
+    /// Masked service-UUID filters: report a peripheral whose advertised
+    /// service UUID equals `uuid` on the bits set in `mask` — e.g. a fixed
+    /// prefix shared by a fleet whose remaining UUID bytes differ per device.
+    /// Android maps these to hardware-assisted
+    /// `ScanFilter.setServiceUuid(uuid, mask)` (a filtered scan also escapes
+    /// the aggressive batching Android applies to unfiltered scans); BlueZ
+    /// has no masked filter, so Linux ignores these entries and the scan
+    /// stays only as filtered as [`services`](Self::services) makes it.
+    pub service_masks: Vec<(Uuid, Uuid)>,
     pub mode: ScanMode,
 }
 

@@ -195,6 +195,29 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### Filtered BLE scans via masked service-UUID prefix (2026-07-09)
+- Unfiltered Android scans are aggressively batched/throttled (and return
+  nothing screen-off), delaying discovery. Requirement: backwards compatible
+  with builds already in the field — so the filter must match what those
+  builds advertise, and the advertise side must not change.
+- The advertised `key_uuid` is `69726f00-<12-byte node prefix>` — per-device,
+  so an exact `setServiceUuid` filter can't work. Android supports masked
+  matching (`ScanFilter.setServiceUuid(uuid, mask)`), so the filter is the
+  fixed 4-byte iroh magic prefix with mask `ffffffff-0000-…` —
+  `iroh_scan_filter()` in `transport.rs`, used by both scan sites (initial +
+  `BleInterface::start_scan` for restarts). Interop both directions: new
+  scanner matches old adverts; old unfiltered scanners see new adverts.
+- blew: `ScanFilter.service_masks: Vec<(Uuid, Uuid)>`; Android encodes masked
+  entries as `"uuid;mask"` strings in the EXISTING JNI array so the JNI
+  signature stays `([Ljava/lang/String;Z)V` (no NoSuchMethodError class of
+  bug); Kotlin splits on `;`. BlueZ has no masked filter → Linux logs and
+  ignores masked entries (scan behaves as before; Linux isn't throttled and
+  decode-side filtering already applies).
+- Test pins the filter shape (matches any `69726f00-*` key UUID, rejects
+  wrong-prefix/foreign UUIDs, asserts no exact-service entries). blew 54 +
+  transport 277 tests green; ffi(ble) check clean; Android path is
+  build-verified on device as usual.
+
 ### L2CAP handover rescue: undelivered GATT datagrams re-sent on the new pipe (2026-07-09)
 - The `l2cap-again` captures confirmed the bridge healthy end-to-end AND
   measured the swap-drop cost: fragments mid-retransmit at swap died with the
