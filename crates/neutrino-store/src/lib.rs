@@ -404,6 +404,22 @@ pub struct AncestryGap {
     pub staged: Vec<OwnedEventId>,
 }
 
+/// How a staged PDU entered the staging area — the worker's cue for whether
+/// the row may trigger a best-effort *timeline* gap-fill for its missing
+/// `prev_events` (transitive message delivery).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedKind {
+    /// Pushed to us directly by a peer (a `/send` transaction PDU, a federated
+    /// invite): the leading edge of live traffic, so missing `prev_events` are
+    /// evidence of recently-missed history worth one fetch.
+    Live,
+    /// Pulled in bulk by this server (gap-fill ancestry, anti-entropy
+    /// reconciliation, join ingest). Never triggers a further timeline fetch —
+    /// transitive fetching is bounded to one round per live trigger, and a
+    /// join's ingested state DAG must not fan out into a fetch per event.
+    Fetched,
+}
+
 /// One staged PDU as returned by [`StagingStore::staged_for_room`]: the raw
 /// bytes plus the metadata the background worker needs to process it (the
 /// originating server, for gap-fill fetches). The `event_id` is the staging key.
@@ -411,6 +427,7 @@ pub struct AncestryGap {
 pub struct StagedPdu {
     pub event_id: OwnedEventId,
     pub origin: OwnedServerName,
+    pub kind: StagedKind,
     pub raw: Box<RawJsonValue>,
 }
 
@@ -426,11 +443,13 @@ pub struct StagedPdu {
 #[async_trait]
 pub trait StagingStore: Send + Sync {
     /// Pre:  `raw` is the canonical post-`from_wire` bytes whose reference hash
-    ///       is `event_id` (so id ↔ bytes round-trip), `room_id` matches, and
-    ///       `origin` is the server it arrived from (or was fetched from).
-    /// Post: `(event_id, room_id, origin, raw)` is recorded in the staging
-    ///       area; idempotent — re-staging the same id is a no-op (a peer may
-    ///       resend, and gap-fill may re-fetch, the same event). Does NOT
+    ///       is `event_id` (so id ↔ bytes round-trip), `room_id` matches,
+    ///       `origin` is the server it arrived from (or was fetched from), and
+    ///       `kind` says which of those two it was (see [`StagedKind`]).
+    /// Post: `(event_id, room_id, origin, kind, raw)` is recorded in the
+    ///       staging area; idempotent — re-staging the same id is a no-op (a
+    ///       peer may resend, and gap-fill may re-fetch, the same event; the
+    ///       first row's `origin`/`kind` win). Does NOT
     ///       advance the `subscribe` watch (staged events are invisible).
     ///       Returns `true` if a new row was inserted, `false` if the id was
     ///       already staged (an ignored duplicate) — the gap-fill loop uses
@@ -444,6 +463,7 @@ pub trait StagingStore: Send + Sync {
         origin: &ServerName,
         room_id: &RoomId,
         event_id: &EventId,
+        kind: StagedKind,
         raw: &RawJsonValue,
     ) -> Result<bool, StorageError>;
 

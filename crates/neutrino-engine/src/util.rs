@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use neutrino_event::Event;
-use neutrino_store::{StagingStore, StorageError};
+use neutrino_store::{StagedKind, StagingStore, StorageError};
 use rand::Rng;
 use ruma::{OwnedRoomId, RoomId, ServerName};
 use tokio::sync::mpsc;
@@ -63,12 +63,15 @@ impl TxnIdGen {
 /// Durably stage `events` for `room_id` (skipping any cross-room event a peer
 /// slipped in), then poke the inbound worker to drain them. The poke is awaited
 /// (not `try_send`) so a single fresh-room ingest can't be silently dropped and
-/// left to stall.
+/// left to stall. `kind` says how the events got here ([`StagedKind::Live`] =
+/// pushed to us, [`StagedKind::Fetched`] = pulled in bulk) — it gates the
+/// worker's best-effort timeline gap-fill.
 pub async fn stage_and_poke(
     store: &impl StagingStore,
     worker_poke: &mpsc::Sender<OwnedRoomId>,
     origin: &ServerName,
     room_id: &RoomId,
+    kind: StagedKind,
     events: &[Event],
 ) -> Result<(), StorageError> {
     for ev in events {
@@ -76,7 +79,7 @@ pub async fn stage_and_poke(
             continue; // never stage a cross-room event a peer slipped in
         }
         store
-            .stage_pdu(origin, &ev.room_id, &ev.event_id, &ev.raw)
+            .stage_pdu(origin, &ev.room_id, &ev.event_id, kind, &ev.raw)
             .await?;
     }
     if worker_poke.send(room_id.to_owned()).await.is_err() {

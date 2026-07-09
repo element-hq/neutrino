@@ -312,6 +312,13 @@ CREATE INDEX ix_outbox_dest_order ON outbox(destination, outbox_id);
 -- re-asks when it needs to fill a deeper gap. Per-row, not per-room, since
 -- different peers can send events into the same room.
 --
+-- `live` (StagedKind) records *how* the row got here: 1 = pushed to us
+-- directly (a `/send` PDU, a federated invite), 0 = pulled in bulk by this
+-- server (gap-fill ancestry, reconciliation, join ingest). Only a live row
+-- may trigger the worker's one-shot best-effort *timeline* gap-fill for
+-- missing `prev_events`; without the distinction a join's ingested state DAG
+-- would fan out into a fetch per staged event.
+--
 -- No FK on `room_id` (a holding pen, not history — same posture as the
 -- FK-free `event_edges.parent_event_id`). No `user_version` bump: additive,
 -- no live data, no migration framework yet (same policy as the `events`
@@ -323,6 +330,7 @@ CREATE TABLE staged_events (
     event_id  TEXT NOT NULL PRIMARY KEY,
     room_id   TEXT NOT NULL,
     origin    TEXT NOT NULL,
+    live      INTEGER NOT NULL CHECK (live IN (0, 1)),
     json      TEXT NOT NULL
 ) STRICT, WITHOUT ROWID;
 

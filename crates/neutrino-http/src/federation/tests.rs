@@ -41,12 +41,13 @@ use crate::{router, router_with_store, router_with_store_and_fetcher};
 use neutrino_engine::{MissingEventsFetcher, MissingEventsQuery, TransportError};
 
 /// The arguments one `fetch` call was made with, recorded so a test can assert
-/// the gap-fill loop targets the right frontier / boundary / limit.
+/// the gap-fill loop targets the right frontier / boundary / limit / DAG.
 #[derive(Clone)]
 struct FetchCall {
     latest: Vec<OwnedEventId>,
     earliest: Vec<OwnedEventId>,
     limit: u32,
+    state_dag: bool,
 }
 
 /// Deterministic gap-fill [`MissingEventsFetcher`] for the inbound `/send`
@@ -123,6 +124,7 @@ impl MissingEventsFetcher for StubFetcher {
             latest: q.latest.to_vec(),
             earliest: q.earliest.to_vec(),
             limit: q.limit,
+            state_dag: q.state_dag,
         });
         let rebuild = |jsons: &[String]| {
             jsons
@@ -1527,11 +1529,26 @@ fn message_on(
     body: &str,
     ts: u64,
 ) -> neutrino_event::Event {
+    message_between(sender, room_id, head, head, body, ts)
+}
+
+/// Build a message PDU whose timeline parent and state parent differ —
+/// messages don't advance the state DAG, so a message following another
+/// message chains `prev_events` off it while `prev_state_events` stays at
+/// whatever state event last applied.
+fn message_between(
+    sender: &OwnedUserId,
+    room_id: &OwnedRoomId,
+    timeline_head: &OwnedEventId,
+    state_head: &OwnedEventId,
+    body: &str,
+    ts: u64,
+) -> neutrino_event::Event {
     EventBuilder::new(sender.clone(), "m.room.message".to_owned())
         .room_id(room_id.clone())
         .content(json!({ "msgtype": "m.text", "body": body }))
-        .prev_events(vec![head.clone()])
-        .prev_state_events(vec![head.clone()])
+        .prev_events(vec![timeline_head.clone()])
+        .prev_state_events(vec![state_head.clone()])
         .origin_server_ts(ts)
         .build()
         .expect("build message")
@@ -1826,9 +1843,12 @@ async fn send_gapfill_fetch_targets_frontier_and_state_boundary() {
     let (app, _store, room_id, alice, join_id, _tempfile) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
     let orphan = topic_on(&alice, &room_id, &join_id, "x", 1_700_000_002_000);
-    let child = message_on(
+    // The child's timeline parent is the (held) join, so the best-effort
+    // timeline gap-fill stays quiet and the recorded call is the state fill's.
+    let child = message_between(
         &alice,
         &room_id,
+        &join_id,
         &orphan.event_id,
         "child",
         1_700_000_003_000,
@@ -1840,6 +1860,7 @@ async fn send_gapfill_fetch_targets_frontier_and_state_boundary() {
     // retries — pin the *first* round's arguments rather than the call count.
     wait_fetch_attempted(&fetcher).await;
     let calls = fetcher.calls();
+    assert!(calls[0].state_dag, "the state fill walks the state DAG");
     assert_eq!(
         calls[0].latest,
         vec![child.event_id.clone()],
@@ -1866,7 +1887,16 @@ async fn send_gapfills_over_multiple_rounds() {
         seed_joined_room_with_fetcher(fetcher.clone()).await;
     let b = topic_on(&alice, &room_id, &join_id, "b", 1_700_000_002_000);
     let a = topic_on(&alice, &room_id, &b.event_id, "a", 1_700_000_003_000);
-    let child = message_on(&alice, &room_id, &a.event_id, "child", 1_700_000_004_000);
+    // The child's timeline parent is the (held) join, so the best-effort
+    // timeline gap-fill stays quiet and every recorded call is a state round.
+    let child = message_between(
+        &alice,
+        &room_id,
+        &join_id,
+        &a.event_id,
+        "child",
+        1_700_000_004_000,
+    );
     let child_id = child.event_id.clone();
     // Newest-first dribble: A (child's parent) then B (A's parent).
     fetcher.set_sequence(vec![vec![&a], vec![&b]]);
@@ -1886,6 +1916,10 @@ async fn send_gapfills_over_multiple_rounds() {
     wait_committed(&store, child_id.as_ref()).await;
     let calls = fetcher.calls();
     assert_eq!(calls.len(), 2, "two gap-fill rounds");
+    assert!(
+        calls.iter().all(|c| c.state_dag),
+        "both rounds walk the state DAG"
+    );
     assert_eq!(calls[0].limit, 10);
     assert_eq!(calls[1].limit, 20, "limit doubles each round");
     assert!(
@@ -1900,6 +1934,236 @@ async fn send_gapfills_over_multiple_rounds() {
         .unwrap();
     assert_eq!(committed.len(), 3, "B + A + child all committed");
     assert!(committed.iter().all(|e| !e.rejected));
+}
+
+// ── best-effort timeline gap-fill (transitive message delivery) ──────────────
+
+#[tokio::test]
+async fn send_timeline_gapfill_pulls_missed_messages_and_state_in_one_fetch() {
+    // The headline scenario: while we were apart the peer's room advanced
+    // join ← state1 ← msg1 ← msg2 and we receive only msg2. Its missing
+    // `prev_events` trigger ONE `get_missing_events` walking the *timeline*
+    // DAG — which carries the missed state event along — so everything lands
+    // without the state gap-fill ever making a request of its own.
+    let fetcher = StubFetcher::no_progress();
+    let (app, store, room_id, alice, join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let state1 = topic_on(
+        &alice,
+        &room_id,
+        &join_id,
+        "set while apart",
+        1_700_000_002_000,
+    );
+    let msg1 = message_on(
+        &alice,
+        &room_id,
+        &state1.event_id,
+        "missed",
+        1_700_000_003_000,
+    );
+    let msg2 = message_between(
+        &alice,
+        &room_id,
+        &msg1.event_id,
+        &state1.event_id,
+        "received",
+        1_700_000_004_000,
+    );
+    fetcher.set_events(&[&state1, &msg1]);
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&msg2])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    // All three commit (oldest applied first ⇒ msg2 ends up the sole head).
+    for ev in [&state1, &msg1, &msg2] {
+        assert!(!wait_committed(&store, ev.event_id.as_ref()).await.rejected);
+    }
+    wait_timeline_head(&store, &room_id, msg2.event_id.as_ref()).await;
+    wait_staging_empty(&store, &room_id).await;
+
+    let calls = fetcher.calls();
+    assert_eq!(calls.len(), 1, "exactly one get_missing_events round-trip");
+    assert!(
+        !calls[0].state_dag,
+        "the one fetch walks the timeline DAG (the missed state rides along)"
+    );
+    assert_eq!(calls[0].limit, 10);
+    assert_eq!(
+        calls[0].latest,
+        vec![msg2.event_id.clone()],
+        "latest is the triggering event"
+    );
+    assert_eq!(
+        calls[0].earliest,
+        vec![join_id.clone()],
+        "earliest is our timeline forward extremity"
+    );
+}
+
+#[tokio::test]
+async fn send_timeline_gapfill_fetched_events_never_refetch() {
+    // A gap deeper than the peer returns: join ← lost ← fetched ← trigger, and
+    // the one timeline round returns only `fetched`. A pulled event must not
+    // trigger a round of its own (single-request bound), so `lost` stays
+    // unknown and both `fetched` and `trigger` apply with a dangling prev —
+    // valid federation state, reachable later via /messages backfill.
+    let fetcher = StubFetcher::no_progress();
+    let (app, store, room_id, alice, join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let lost = message_on(&alice, &room_id, &join_id, "lost", 1_700_000_002_000);
+    let fetched = message_between(
+        &alice,
+        &room_id,
+        &lost.event_id,
+        &join_id,
+        "fetched",
+        1_700_000_003_000,
+    );
+    let trigger = message_between(
+        &alice,
+        &room_id,
+        &fetched.event_id,
+        &join_id,
+        "received",
+        1_700_000_004_000,
+    );
+    fetcher.set_events(&[&fetched]);
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&trigger])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    assert!(
+        !wait_committed(&store, fetched.event_id.as_ref())
+            .await
+            .rejected
+    );
+    assert!(
+        !wait_committed(&store, trigger.event_id.as_ref())
+            .await
+            .rejected
+    );
+    wait_staging_empty(&store, &room_id).await;
+    assert!(
+        store
+            .get_events(&[lost.event_id.as_ref()])
+            .await
+            .unwrap()
+            .is_empty(),
+        "the tail beyond the fetched batch stays missing (best-effort)"
+    );
+    assert_eq!(
+        fetcher.call_count(),
+        1,
+        "the fetched event's own dangling prev must not trigger a second round"
+    );
+}
+
+#[tokio::test]
+async fn send_timeline_gapfill_failure_still_applies_pdu() {
+    // The peer errors on the timeline fetch. Best-effort means the PDU still
+    // applies (with a dangling prev) — unlike a state gap, which blocks until
+    // grounded (`send_fetcher_failure_leaves_pdu_unapplied`).
+    let fetcher = StubFetcher::erroring(502);
+    let (app, store, room_id, alice, join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let ghost = message_on(
+        &alice,
+        &room_id,
+        &join_id,
+        "never delivered",
+        1_700_000_002_000,
+    );
+    let trigger = message_between(
+        &alice,
+        &room_id,
+        &ghost.event_id,
+        &join_id,
+        "received",
+        1_700_000_003_000,
+    );
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&trigger])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    assert!(
+        !wait_committed(&store, trigger.event_id.as_ref())
+            .await
+            .rejected
+    );
+    let calls = fetcher.calls();
+    assert_eq!(calls.len(), 1, "one attempt, no retry loop");
+    assert!(!calls[0].state_dag);
+}
+
+#[tokio::test]
+async fn send_timeline_gapfill_shortfall_still_grounds_state() {
+    // The timeline round under-returns: msg2's gap is state1 ← msg1 but the
+    // peer's timeline response carries only msg1. msg1's own apply then hits
+    // the missing state ancestry, and the *mandatory* state gap-fill fetches
+    // state1 — best-effort timeline never weakens state grounding.
+    let fetcher = StubFetcher::no_progress();
+    let (app, store, room_id, alice, join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let state1 = topic_on(
+        &alice,
+        &room_id,
+        &join_id,
+        "missed state",
+        1_700_000_002_000,
+    );
+    let msg1 = message_on(
+        &alice,
+        &room_id,
+        &state1.event_id,
+        "missed",
+        1_700_000_003_000,
+    );
+    let msg2 = message_between(
+        &alice,
+        &room_id,
+        &msg1.event_id,
+        &state1.event_id,
+        "received",
+        1_700_000_004_000,
+    );
+    // Round 1 (timeline): only msg1. Round 2 (state): state1.
+    fetcher.set_sequence(vec![vec![&msg1], vec![&state1]]);
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&msg2])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    for ev in [&state1, &msg1, &msg2] {
+        assert!(!wait_committed(&store, ev.event_id.as_ref()).await.rejected);
+    }
+    wait_staging_empty(&store, &room_id).await;
+    let calls = fetcher.calls();
+    assert_eq!(calls.len(), 2, "one timeline round + one state round");
+    assert!(
+        !calls[0].state_dag,
+        "round 1 is the best-effort timeline walk"
+    );
+    assert!(
+        calls[1].state_dag,
+        "round 2 is the mandatory state walk grounding what the timeline round missed"
+    );
+}
+
+#[tokio::test]
+async fn send_in_order_pdu_never_fetches() {
+    // The common live case: a PDU whose parents we already hold must not cost
+    // a `get_missing_events` — the timeline gap-fill triggers only on a gap.
+    let fetcher = StubFetcher::no_progress();
+    let (app, store, room_id, alice, join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let msg = message_on(&alice, &room_id, &join_id, "in order", 1_700_000_002_000);
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&msg])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    wait_committed(&store, msg.event_id.as_ref()).await;
+    wait_staging_empty(&store, &room_id).await;
+    assert_eq!(fetcher.call_count(), 0, "no gap, no fetch");
 }
 
 #[tokio::test]
@@ -2222,7 +2486,13 @@ async fn worker_drains_rows_staged_before_startup() {
     let origin: &ServerName = "remote.example.org".try_into().unwrap();
     assert!(
         store
-            .stage_pdu(origin, &room_id, &msg.event_id, &msg.raw)
+            .stage_pdu(
+                origin,
+                &room_id,
+                &msg.event_id,
+                neutrino_store::StagedKind::Live,
+                &msg.raw
+            )
             .await
             .unwrap()
     );

@@ -18,7 +18,6 @@
 
 use std::collections::BTreeSet;
 
-use neutrino_event::event_builder::from_wire;
 use neutrino_store::{StateStore, StorageBackend};
 use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId, ServerName};
 use tokio::sync::mpsc;
@@ -232,24 +231,11 @@ async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
         }
     };
 
-    let mut staged_new: Vec<OwnedEventId> = Vec::new();
-    for raw in fetched {
-        // Derive each event's id from its bytes (`from_wire`); an unkeyable PDU is
-        // dropped. Only stage events for *this* room — a foreign-room event is
-        // never reachable by this room's drain, so it would be junk.
-        let Ok(ev) = from_wire(raw, Vec::new()) else {
-            continue;
-        };
-        if ev.room_id != *room_id {
-            continue;
-        }
-        match store.stage_pdu(peer, room_id, &ev.event_id, &ev.raw).await {
-            Ok(true) => staged_new.push(ev.event_id),
-            Ok(false) => {}
-            Err(e) => {
-                warn!(%peer, %room_id, error = %e, "reconcile: staging a fetched event failed")
-            }
+    match crate::gapfill::stage_fetched(store, peer, room_id, fetched).await {
+        Ok(staged_new) => staged_new,
+        Err(e) => {
+            warn!(%peer, %room_id, error = %e, "reconcile: staging fetched events failed");
+            Vec::new()
         }
     }
-    staged_new
 }
