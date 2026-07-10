@@ -6,9 +6,9 @@
 //! input shape is smaller and well-defined; the algorithm itself is unchanged
 //! from synapse `state/v2.py`, modulo two v12 deltas:
 //!
-//! - The full conflicted set includes a **conflicted subgraph** — events
-//!   reachable backwards via `auth_events` from any conflicted state event.
-//!   v2 didn't have this.
+//! - The full conflicted set includes the **conflicted state subgraph** —
+//!   the events on `auth_events` paths between any pair of conflicted state
+//!   events, endpoints included. v2 didn't have this.
 //! - Iterative auth checks pass 1 starts from the **empty state**, not from
 //!   the unconflicted state. v2 started from unconflicted.
 //!
@@ -86,20 +86,65 @@ pub fn separate(state_sets: &[&StateMap<OwnedEventId>]) -> Separated {
 
 // ----------------- conflicted_subgraph -----------------
 
-/// v12 (state-res v2.1) addition: events reachable backwards from any seed
-/// event via the `auth_events` graph. The subgraph **includes the seeds
-/// themselves** (per our pick on the spec's "include or exclude endpoints"
-/// ambiguity — simpler, no special-casing).
+/// v12 (state-res v2.1) addition: the **conflicted state subgraph** — the
+/// union of all `auth_events` paths between any pair of events in `seeds`,
+/// endpoints included. Spec v12 §state resolution: "The union of all such
+/// paths between any pair of events in the conflicted state set (including
+/// endpoints) forms a subgraph of the original `auth_event` graph, called
+/// the _conflicted state subgraph_." The seeds themselves are always in the
+/// output, even when no path connects them — synapse parity (`state/v2.py`
+/// unions the conflicted events into the subgraph unconditionally).
 ///
-/// `seeds` is typically the union of all event IDs across the conflicted
-/// values produced by `separate`. The traversal is delegated to
-/// `provider.auth_chain` — in-memory does DFS, SQLite will do a recursive
-/// CTE.
+/// Computed as backwards ∩ forwards reachability, mirroring synapse
+/// (`state/v2.py::_get_auth_chain_difference`'s
+/// `backwards_conflicted_set.intersection(forwards_conflicted_set)`):
+/// `provider.auth_chain` gives the backwards closure of the seeds; a forward
+/// walk from the seeds along reversed auth edges *within that closure* then
+/// keeps exactly the events that both descend from a seed and are an
+/// ancestor of one. Restricting the forward walk to the closure loses
+/// nothing — every node on a seed⇒seed path is an ancestor of the
+/// descendant endpoint, so the whole path lies inside the closure.
+///
+/// `seeds` is the union of all event IDs across the conflicted values
+/// produced by `separate`.
 pub fn conflicted_subgraph(
     seeds: &HashSet<OwnedEventId>,
     provider: &dyn StateProvider,
 ) -> Result<HashSet<OwnedEventId>, StateResError> {
-    provider.auth_chain(seeds)
+    let backwards = provider.auth_chain(seeds)?;
+
+    // Reversed auth edges within the backwards closure: parent → children.
+    // The closure is transitively complete, so every auth parent of a member
+    // is itself a member — no membership filter needed on the edge target.
+    let mut children_of: HashMap<OwnedEventId, Vec<OwnedEventId>> = HashMap::new();
+    for id in &backwards {
+        let event = provider
+            .get_event(id)?
+            .ok_or_else(|| StateResError::MissingEvent(id.clone()))?;
+        for parent in &event.auth_events {
+            children_of
+                .entry(parent.clone())
+                .or_default()
+                .push(id.clone());
+        }
+    }
+
+    // Forward walk from the seeds: everything reached descends from a seed
+    // (by construction) and is an ancestor of one (it's in `backwards`) —
+    // i.e. it lies on a path between two conflicted events.
+    let mut subgraph: HashSet<OwnedEventId> = seeds.clone();
+    let mut stack: Vec<OwnedEventId> = seeds.iter().cloned().collect();
+    while let Some(id) = stack.pop() {
+        let Some(children) = children_of.get(&id) else {
+            continue;
+        };
+        for child in children {
+            if subgraph.insert(child.clone()) {
+                stack.push(child.clone());
+            }
+        }
+    }
+    Ok(subgraph)
 }
 
 // ----------------- auth_chain_difference -----------------
@@ -748,7 +793,9 @@ fn state_before_inner(
 /// the v12 / state-res v2.1 algorithm.
 ///
 /// Steps (spec v12 §state resolution):
-/// 1. `separate` the state sets into unconflicted + conflicted.
+/// 1. `separate` the state sets into unconflicted + conflicted. No
+///    conflicted keys → return the unconflicted map immediately (synapse
+///    parity; no auth-chain walks on the converged path).
 /// 2. Compute the **full conflicted set** = `auth_chain_difference ∪
 ///    conflicted_subgraph ∪ conflicted-state-values` (v2.1 adds the subgraph;
 ///    v2 used just the diff + conflicted values).
@@ -774,6 +821,13 @@ pub fn resolve_state(
         unconflicted,
         conflicted,
     } = separate(state_sets);
+
+    // No conflicts → the unconflicted map IS the resolution. Matches synapse
+    // `state/v2.py` ("if not conflicted_state: return unconflicted_state")
+    // and skips the auth-chain walks entirely on the common converged path.
+    if conflicted.is_empty() {
+        return Ok(unconflicted);
+    }
 
     // (2) Full conflicted set.
     let conflicted_values: HashSet<OwnedEventId> = conflicted.values().flatten().cloned().collect();
@@ -996,9 +1050,11 @@ mod tests {
     }
 
     #[test]
-    fn conflicted_subgraph_walks_auth_event_ids_transitively() {
-        // a → b → c (a's auth_events = [b], b's auth_events = [c]).
-        // Insert leaves first so each id is known before being referenced.
+    fn conflicted_subgraph_single_seed_is_just_the_seed() {
+        // a → b → c (a's auth_events = [b], b's auth_events = [c]) with only
+        // `a` conflicted: no path from `a` leads to another conflicted event,
+        // so its plain ancestors b and c stay out. (Full-closure inclusion
+        // here was the pre-fix bug.)
         let mut provider = InMemoryStateProvider::new();
         let mut bag = HashMap::new();
         insert(&mut provider, &mut bag, "c", &[]);
@@ -1007,6 +1063,20 @@ mod tests {
         let mut seeds = HashSet::new();
         seeds.insert(bag["a"].clone());
         let sg = conflicted_subgraph(&seeds, &provider).unwrap();
+        assert_eq!(sg, seeds);
+    }
+
+    #[test]
+    fn conflicted_subgraph_includes_events_on_path_between_seeds() {
+        // a → b → c with `a` and `c` conflicted: b lies on the a⇒c path →
+        // {a, b, c}.
+        let mut provider = InMemoryStateProvider::new();
+        let mut bag = HashMap::new();
+        insert(&mut provider, &mut bag, "c", &[]);
+        insert(&mut provider, &mut bag, "b", &["c"]);
+        insert(&mut provider, &mut bag, "a", &["b"]);
+        let seeds: HashSet<_> = [bag["a"].clone(), bag["c"].clone()].into_iter().collect();
+        let sg = conflicted_subgraph(&seeds, &provider).unwrap();
         let expected: HashSet<_> = [bag["a"].clone(), bag["b"].clone(), bag["c"].clone()]
             .into_iter()
             .collect();
@@ -1014,8 +1084,24 @@ mod tests {
     }
 
     #[test]
-    fn conflicted_subgraph_unions_multiple_seed_chains() {
-        // a → b; c → d. Seeds {a, c} → {a, b, c, d}.
+    fn conflicted_subgraph_excludes_shared_ancestor_of_seeds() {
+        // a → b → d; c → d. Seeds {a, c}: b and d are ancestors of a seed but
+        // lie on no path BETWEEN two seeds → {a, c} only. (The intersection-
+        // excluded shared history that v2's auth difference also drops.)
+        let mut provider = InMemoryStateProvider::new();
+        let mut bag = HashMap::new();
+        insert(&mut provider, &mut bag, "d", &[]);
+        insert(&mut provider, &mut bag, "b", &["d"]);
+        insert(&mut provider, &mut bag, "a", &["b"]);
+        insert(&mut provider, &mut bag, "c", &["d"]);
+        let seeds: HashSet<_> = [bag["a"].clone(), bag["c"].clone()].into_iter().collect();
+        let sg = conflicted_subgraph(&seeds, &provider).unwrap();
+        assert_eq!(sg, seeds);
+    }
+
+    #[test]
+    fn conflicted_subgraph_disconnected_seeds_include_only_themselves() {
+        // a → b; c → d (two disjoint chains). Seeds {a, c} → {a, c}.
         let mut provider = InMemoryStateProvider::new();
         let mut bag = HashMap::new();
         insert(&mut provider, &mut bag, "b", &[]);
@@ -1024,7 +1110,32 @@ mod tests {
         insert(&mut provider, &mut bag, "c", &["d"]);
         let seeds: HashSet<_> = [bag["a"].clone(), bag["c"].clone()].into_iter().collect();
         let sg = conflicted_subgraph(&seeds, &provider).unwrap();
-        assert_eq!(sg.len(), 4);
+        assert_eq!(sg, seeds);
+    }
+
+    #[test]
+    fn conflicted_subgraph_diamond_includes_both_branches() {
+        // top → l, top → r, l → bot, r → bot. Seeds {top, bot}: two distinct
+        // top⇒bot paths — both interior events included.
+        let mut provider = InMemoryStateProvider::new();
+        let mut bag = HashMap::new();
+        insert(&mut provider, &mut bag, "bot", &[]);
+        insert(&mut provider, &mut bag, "l", &["bot"]);
+        insert(&mut provider, &mut bag, "r", &["bot"]);
+        insert(&mut provider, &mut bag, "top", &["l", "r"]);
+        let seeds: HashSet<_> = [bag["top"].clone(), bag["bot"].clone()]
+            .into_iter()
+            .collect();
+        let sg = conflicted_subgraph(&seeds, &provider).unwrap();
+        let expected: HashSet<_> = [
+            bag["top"].clone(),
+            bag["l"].clone(),
+            bag["r"].clone(),
+            bag["bot"].clone(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(sg, expected);
     }
 
     // ----- auth_chain_difference -----
@@ -2009,6 +2120,20 @@ mod tests {
             ("m.room.create".to_string(), String::new()),
             create_id.clone(),
         );
+        let s2 = s1.clone();
+        let out = resolve_state(&[&s1, &s2], &provider).unwrap();
+        assert_eq!(out, s1);
+    }
+
+    #[test]
+    fn resolve_state_no_conflicts_short_circuits_before_chain_walks() {
+        // Identical state sets → zero conflicted keys → resolve_state must
+        // return without touching auth chains. The value is deliberately
+        // unknown to the provider: any chain walk would raise MissingEvent,
+        // so success pins the synapse-parity short-circuit (state/v2.py
+        // "if not conflicted_state: return unconflicted_state").
+        let provider = InMemoryStateProvider::new();
+        let s1 = state(&[("m.room.name", "", "$name:example.org")]);
         let s2 = s1.clone();
         let out = resolve_state(&[&s1, &s2], &provider).unwrap();
         assert_eq!(out, s1);

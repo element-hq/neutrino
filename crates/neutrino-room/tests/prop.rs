@@ -640,7 +640,8 @@ proptest! {
 
     // ----- conflicted_subgraph -----
 
-    /// Output contains every seed (we picked include-endpoints).
+    /// Output contains every seed (spec: endpoints included; synapse
+    /// unconditionally unions the conflicted events into the subgraph).
     #[test]
     fn subgraph_contains_seeds(
         (provider, ids) in arb_provider_with_ids(),
@@ -661,32 +662,29 @@ proptest! {
         prop_assert!(sg.is_empty());
     }
 
-    /// Output is closed under `Event.auth_events`: for every id in the
-    /// output, every event in its auth chain is also in the output.
+    /// Reference-model equality: the subgraph is exactly the events lying on
+    /// an `auth_events` path between two seeds (endpoints included) — i.e.
+    /// backwards-reachable from some seed AND with some seed in their own
+    /// auth chain. Computed naively here (per-node auth chains) so the
+    /// property genuinely cross-checks the impl's closure-restricted forward
+    /// walk.
     #[test]
-    fn subgraph_closed_under_auth_events(
+    fn subgraph_equals_between_seeds_reference(
         (provider, ids) in arb_provider_with_ids(),
         n_seeds in 1usize..6,
     ) {
         let seeds: HashSet<OwnedEventId> =
             ids.iter().take(n_seeds.min(ids.len())).cloned().collect();
         let sg = conflicted_subgraph(&seeds, &provider).unwrap();
-        for id in &sg {
-            let parents: Vec<OwnedEventId> = provider
-                .get_event(id)
-                .ok()
-                .flatten()
-                .map(|info| info.auth_events.clone())
-                .unwrap_or_default();
-            for parent in &parents {
-                prop_assert!(
-                    sg.contains(parent),
-                    "subgraph missing parent {} of {}",
-                    parent,
-                    id
-                );
-            }
+        let mut backwards: HashSet<OwnedEventId> = HashSet::new();
+        for s in &seeds {
+            backwards.extend(auth_chain_of(s, &provider));
         }
+        let expected: HashSet<OwnedEventId> = backwards
+            .into_iter()
+            .filter(|x| auth_chain_of(x, &provider).iter().any(|a| seeds.contains(a)))
+            .collect();
+        prop_assert_eq!(sg, expected);
     }
 
     /// No fabricated ids: every id in the output is either a seed or a
@@ -836,21 +834,38 @@ fn arb_diamond() -> impl Strategy<Value = (InMemoryStateProvider, [OwnedEventId;
 }
 
 proptest! {
-    /// Subgraph of the head of a linear chain equals the whole chain — no
-    /// premature termination, no off-by-one.
+    /// Subgraph seeded with the head AND tail of a linear chain equals the
+    /// whole chain (every link is on the head⇒tail path) — no premature
+    /// termination, no off-by-one.
     #[test]
-    fn subgraph_traverses_linear_chain_completely(
+    fn subgraph_covers_linear_chain_between_head_and_tail(
         (provider, ids) in arb_linear_chain(1, 30),
     ) {
         let mut seeds = HashSet::new();
         seeds.insert(ids[0].clone());
+        seeds.insert(ids[ids.len() - 1].clone());
         let sg = conflicted_subgraph(&seeds, &provider).unwrap();
         let expected: HashSet<OwnedEventId> = ids.into_iter().collect();
         prop_assert_eq!(sg, expected);
     }
 
-    /// Subgraph of the diamond root visits both branches and converges on
-    /// the shared bottom — catches "only walk first parent" bugs.
+    /// A single conflicted event contributes only itself: its plain
+    /// ancestors lie on no path between two conflicted events. Direct
+    /// negation of the pre-fix full-closure behaviour, on the same
+    /// generator.
+    #[test]
+    fn subgraph_single_seed_excludes_plain_ancestors(
+        (provider, ids) in arb_linear_chain(2, 30),
+    ) {
+        let mut seeds = HashSet::new();
+        seeds.insert(ids[0].clone());
+        let sg = conflicted_subgraph(&seeds, &provider).unwrap();
+        prop_assert_eq!(sg, seeds);
+    }
+
+    /// Subgraph seeded with the diamond's root and bottom visits both
+    /// branches (two distinct root⇒bottom paths) — catches "only walk first
+    /// parent" bugs.
     #[test]
     fn subgraph_visits_both_branches_of_diamond(
         (provider, corners) in arb_diamond(),
@@ -858,6 +873,7 @@ proptest! {
         let [root, left, right, bottom] = corners;
         let mut seeds = HashSet::new();
         seeds.insert(root.clone());
+        seeds.insert(bottom.clone());
         let sg = conflicted_subgraph(&seeds, &provider).unwrap();
         let expected: HashSet<OwnedEventId> =
             [root, left, right, bottom].into_iter().collect();
