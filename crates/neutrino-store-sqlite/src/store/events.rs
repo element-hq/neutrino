@@ -198,9 +198,14 @@ impl EventStore for SqliteStore {
             .map_err(|_| Error::InvalidInput(format!("limit {limit} exceeds i64::MAX")))?;
 
         self.run_read(move |conn| -> Result<Vec<(StreamPos, Event)>, Error> {
+            // Client-visible reader: rejected and soft-failed events are
+            // persisted (federation policy) but must never reach a client
+            // timeline. Federation reads go through `get_events` (by id,
+            // unfiltered) so peers can still ground rejected ancestry.
             let query = format!(
                 "SELECT stream_pos, {EVENT_COLUMNS} FROM events \
-                 WHERE stream_pos > ? ORDER BY stream_pos ASC LIMIT ?"
+                 WHERE stream_pos > ? AND rejected = 0 AND soft_failed = 0 \
+                 ORDER BY stream_pos ASC LIMIT ?"
             );
             let mut stmt = conn.prepare(&query)?;
             let rows = stmt.query_map(params![pos, limit_i64], |row| {
@@ -287,9 +292,14 @@ impl EventStore for SqliteStore {
                     Direction::Backward => ("<=", ">", "DESC"),
                 };
 
+                // Client-visible reader (see `events_after`): the filter is
+                // in SQL so `LIMIT` counts visible rows and the sentinel /
+                // continuation token track visible data only — a page that
+                // straddles invisible rows skips them without shorting.
                 let query = format!(
                     "SELECT stream_pos, {EVENT_COLUMNS} FROM events \
                      WHERE room_id = ? AND stream_pos {from_cmp} ? AND stream_pos {to_cmp} ? \
+                     AND rejected = 0 AND soft_failed = 0 \
                      ORDER BY stream_pos {order} LIMIT ?"
                 );
                 let mut stmt = conn.prepare(&query)?;
@@ -1093,6 +1103,93 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_empty());
+    }
+
+    // E34: client-visibility filter. Rejected and soft-failed events are
+    // persisted but must never surface via `events_after` (the sync feed) —
+    // while `get_events` (the federation read) still returns them, so peers
+    // can ground rejected ancestry (MSC4242).
+    #[tokio::test]
+    async fn events_after_excludes_rejected_and_soft_failed() {
+        let s = store_with_room().await;
+        let visible = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "seen", 1);
+        let mut rejected = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "rejected", 2);
+        rejected.rejected = true;
+        let mut soft = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "soft", 3);
+        soft.soft_failed = true;
+        for ev in [&visible, &rejected, &soft] {
+            s.persist_event(ev, &[]).await.unwrap();
+        }
+
+        let stream = s.events_after(StreamPos(0), 100).await.unwrap();
+        let ids: Vec<&str> = stream.iter().map(|(_, e)| e.event_id.as_str()).collect();
+        assert!(ids.contains(&visible.event_id.as_str()));
+        assert!(!ids.contains(&rejected.event_id.as_str()));
+        assert!(!ids.contains(&soft.event_id.as_str()));
+
+        // Federation parity pin: `get_events` is the unfiltered by-id read.
+        let fed = s
+            .get_events(&[&rejected.event_id, &soft.event_id])
+            .await
+            .unwrap();
+        assert_eq!(fed.len(), 2, "get_events must still serve invisible events");
+    }
+
+    // E35: invisible rows don't burn `limit` — the filter is in SQL, so a
+    // page fills with visible events even when invisible rows sit between
+    // them.
+    #[tokio::test]
+    async fn room_messages_invisible_rows_do_not_count_against_limit() {
+        let s = store_with_room().await;
+        let v1 = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "v1", 1);
+        let mut r = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "rejected", 2);
+        r.rejected = true;
+        let mut sf = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "soft", 3);
+        sf.soft_failed = true;
+        let v2 = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "v2", 4);
+        for ev in [&v1, &r, &sf, &v2] {
+            s.persist_event(ev, &[]).await.unwrap();
+        }
+
+        // Backward page of 2 from the head: both visible messages, straddling
+        // the two invisible rows between them.
+        let (events, _next) = s
+            .room_messages(*ALICE_ROOM_ID, None, None, Direction::Backward, 2)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = events.iter().map(|e| e.event_id.as_str()).collect();
+        assert_eq!(ids, vec![v2.event_id.as_str(), v1.event_id.as_str()]);
+    }
+
+    // E36: pagination tokens stay correct across invisible rows — a page
+    // ending just before an invisible run resumes at the next *visible*
+    // event, neither repeating nor leaking the invisible ones.
+    #[tokio::test]
+    async fn room_messages_pagination_skips_invisible_rows() {
+        let s = store_with_room().await;
+        let v1 = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "v1", 1);
+        let mut r = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "rejected", 2);
+        r.rejected = true;
+        let v2 = message_with_ts(*ALICE_ROOM_ID, *ALICE_USER_ID, "v2", 3);
+        for ev in [&v1, &r, &v2] {
+            s.persist_event(ev, &[]).await.unwrap();
+        }
+
+        let (page1, next) = s
+            .room_messages(*ALICE_ROOM_ID, None, None, Direction::Backward, 1)
+            .await
+            .unwrap();
+        assert_eq!(page1[0].event_id, v2.event_id);
+        let tok = next.expect("more visible events remain");
+
+        let (page2, _next) = s
+            .room_messages(*ALICE_ROOM_ID, Some(tok), None, Direction::Backward, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            page2[0].event_id, v1.event_id,
+            "the rejected row between the pages must be skipped, not returned"
+        );
     }
 
     // E23: Forward, from=None → ascending from earliest

@@ -815,6 +815,111 @@ async fn third_sync_with_no_new_events_omits_room() {
     );
 }
 
+/// Rejected and soft-failed events are persisted (federation policy) but must
+/// never surface to a client: not in an initial snapshot, and a delta window
+/// containing only invisible events reads as "no update" (room omitted) —
+/// exactly the ban-evasion traffic soft-fail exists to suppress.
+#[tokio::test]
+async fn rejected_and_soft_failed_events_hidden_from_sync() {
+    let (store, _tmp) = fresh_store().await;
+    let user = user_id!("@alice:example.org");
+    let room = room_id!("!room:example.org");
+    setup_joined_room(&store, room, user).await;
+    let mut rejected = make_event(
+        room,
+        "m.room.message",
+        None,
+        user,
+        1000,
+        serde_json::json!({"body": "rejected", "msgtype": "m.text"}),
+    );
+    rejected.rejected = true;
+    seed(&store, &rejected).await;
+    let mut soft = make_event(
+        room,
+        "m.room.message",
+        None,
+        user,
+        2000,
+        serde_json::json!({"body": "soft-failed", "msgtype": "m.text"}),
+    );
+    soft.soft_failed = true;
+    seed(&store, &soft).await;
+    let state = SyncState::new(store.clone(), no_shutdown());
+
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(10, vec![]));
+
+    // Initial snapshot: the room emits (the user is joined) but neither
+    // invisible event appears in the timeline.
+    let mut req = Request::new();
+    req.lists = lists.clone();
+    let resp1 = handle(&state, user, req).await.unwrap();
+    if let Some(r) = resp1.rooms.get(room) {
+        for ev in &r.timeline {
+            let body = ev
+                .get_field::<serde_json::Value>("content")
+                .unwrap()
+                .and_then(|c| c.get("body").and_then(|v| v.as_str()).map(str::to_owned));
+            assert!(
+                body.as_deref() != Some("rejected") && body.as_deref() != Some("soft-failed"),
+                "invisible event leaked into the initial snapshot: {body:?}"
+            );
+        }
+    }
+
+    // Delta window containing only invisible events → no update for the room.
+    let mut soft2 = make_event(
+        room,
+        "m.room.message",
+        None,
+        user,
+        3000,
+        serde_json::json!({"body": "soft-failed-2", "msgtype": "m.text"}),
+    );
+    soft2.soft_failed = true;
+    seed(&store, &soft2).await;
+    let mut req2 = Request::new();
+    req2.pos = Some(resp1.pos);
+    req2.lists = lists.clone();
+    let resp2 = handle(&state, user, req2).await.unwrap();
+    assert!(
+        !resp2.rooms.contains_key(room),
+        "a delta of purely invisible events must read as no-update"
+    );
+
+    // A later visible event still syncs normally (the cursor recovers past
+    // the invisible run).
+    seed(
+        &store,
+        &make_event(
+            room,
+            "m.room.message",
+            None,
+            user,
+            4000,
+            serde_json::json!({"body": "visible", "msgtype": "m.text"}),
+        ),
+    )
+    .await;
+    let mut req3 = Request::new();
+    req3.pos = Some(resp2.pos);
+    req3.lists = lists;
+    let resp3 = handle(&state, user, req3).await.unwrap();
+    let room3 = resp3.rooms.get(room).expect("visible event emits the room");
+    assert_eq!(
+        room3.timeline.len(),
+        1,
+        "only the visible event in the delta"
+    );
+    let body: String = room3.timeline[0]
+        .get_field::<serde_json::Value>("content")
+        .unwrap()
+        .and_then(|c| c.get("body").and_then(|v| v.as_str()).map(str::to_owned))
+        .expect("timeline event has content.body");
+    assert_eq!(body, "visible");
+}
+
 #[tokio::test]
 async fn limited_set_when_timeline_truncated() {
     let (store, _tmp) = fresh_store().await;

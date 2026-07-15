@@ -206,8 +206,14 @@ pub trait EventStore: Send + Sync {
     async fn get_events(&self, ids: &[&EventId]) -> Result<Vec<Event>, StorageError>;
 
     /// Pre:  none (`StreamPos(0)` is valid for an initial full query).
-    /// Post: returns all events with `stream_pos > pos` in ascending stream order;
-    ///       returns an empty vec if no new events exist since `pos`.
+    /// Post: returns all **client-visible** events with `stream_pos > pos` in
+    ///       ascending stream order; returns an empty vec if no new events exist
+    ///       since `pos`. Rejected and soft-failed events are excluded: they are
+    ///       persisted (federation persist policy) but must never reach a client
+    ///       timeline (spec: soft-failed events "should not be sent to clients";
+    ///       rejected events likewise — synapse `allow_rejected=False`).
+    ///       Federation reads use `get_events`, which returns them — peers need
+    ///       rejected ancestry to ground their state DAGs (MSC4242).
     async fn events_after(
         &self,
         pos: StreamPos,
@@ -216,7 +222,10 @@ pub trait EventStore: Send + Sync {
 
     /// Pre:  the room must exist; if `from`/`to` are `Some`, the token must have been
     ///       returned by a previous call (or built from a known `StreamPos`).
-    /// Post: returns up to `limit` events in the requested direction. Tokens follow
+    /// Post: returns up to `limit` **client-visible** events in the requested
+    ///       direction — rejected/soft-failed events are excluded and do not
+    ///       count against `limit` (see `events_after`; federation reads use
+    ///       `get_events` instead, which returns them). Tokens follow
     ///       Synapse's convention — a token points *after* the row it names — so the
     ///       bounds are asymmetric: `Forward` excludes `from` and includes `to`;
     ///       `Backward` includes `from` and excludes `to`. The continuation token is

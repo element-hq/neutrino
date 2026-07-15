@@ -1317,6 +1317,119 @@ async fn backfill_ships_wire_bytes_without_event_id() {
     }
 }
 
+/// Seed a router whose message chain has invisible-to-clients events in the
+/// middle: `create ← join ← a ← b(rejected) ← c(soft_failed) ← d`. Returns
+/// the ids of `[a, b, c, d]` oldest-first.
+///
+/// Federation must serve rejected and soft-failed events: rejection is local
+/// policy, and a peer whose PDU references `b` in its ancestry can only
+/// ground the reference (and cascade-reject, MSC4242) if we hand `b` over.
+/// The client-visibility filter lives in `events_after` / `room_messages`
+/// only — deliberately NOT in the DAG walks these endpoints use.
+async fn build_router_with_invisible_chain()
+-> (axum::Router, OwnedRoomId, Vec<OwnedEventId>, TempDir) {
+    let (store, tempfile) = fresh_store().await;
+    let sender = peer_user();
+
+    let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    let join = EventBuilder::new(sender.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(sender.as_str().to_owned())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create.event_id.clone()])
+        .prev_state_events(vec![create.event_id.clone()])
+        .build()
+        .expect("build join");
+    let mut prev = join.event_id.clone();
+    store
+        .create_room(&create, &[join])
+        .await
+        .expect("create_room");
+
+    let mut ids = Vec::with_capacity(4);
+    for (i, body) in ["a", "b-rejected", "c-soft", "d"].iter().enumerate() {
+        let mut ev = EventBuilder::new(sender.clone(), "m.room.message".to_owned())
+            .room_id(room_id.clone())
+            .content(json!({ "msgtype": "m.text", "body": body }))
+            .prev_events(vec![prev.clone()])
+            .origin_server_ts(1_700_000_000_000 + i as u64)
+            .build()
+            .expect("build msg");
+        ev.rejected = *body == "b-rejected";
+        ev.soft_failed = *body == "c-soft";
+        store
+            .persist_historical_event(&ev)
+            .await
+            .expect("persist_historical_event");
+        ids.push(ev.event_id.clone());
+        prev = ev.event_id;
+    }
+
+    (router_with_store(config(), store), room_id, ids, tempfile)
+}
+
+// Rejected and soft-failed events ARE served over federation backfill —
+// the client-visibility filter must not leak into the S-S read paths.
+#[tokio::test]
+async fn backfill_serves_rejected_and_soft_failed_events() {
+    let (app, room_id, ids, _tempfile) = build_router_with_invisible_chain().await;
+
+    let (status, body) = get(
+        &app,
+        &backfill_path(room_id.as_str(), &[ids[3].as_str()], Some(50)),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(
+        pdu_bodies(&body),
+        vec![
+            "d".to_owned(),
+            "c-soft".to_owned(),
+            "b-rejected".to_owned(),
+            "a".to_owned(),
+        ],
+        "backfill must serve the full chain, invisible events included"
+    );
+}
+
+// Same pin for /get_missing_events: walking latest=[d] back to earliest=[a]
+// must yield exactly the rejected and soft-failed events between them.
+#[tokio::test]
+async fn get_missing_events_serves_rejected_and_soft_failed_events() {
+    let (app, room_id, ids, _tempfile) = build_router_with_invisible_chain().await;
+
+    let (status, body) = post_json(
+        &app,
+        &fed_path(room_id.as_str()),
+        &json!({
+            "earliest_events": [ids[0].as_str()],
+            "latest_events": [ids[3].as_str()],
+            "limit": 10,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let bodies: Vec<&str> = body
+        .get("events")
+        .and_then(Value::as_array)
+        .expect("events array")
+        .iter()
+        .filter_map(|p| p.pointer("/content/body").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        bodies,
+        vec!["b-rejected", "c-soft"],
+        "get_missing_events must serve invisible events, oldest-first"
+    );
+}
+
 // Unknown room → 404 M_NOT_FOUND (spec-required), not a 500 or the
 // bare-text fallback.
 #[tokio::test]
