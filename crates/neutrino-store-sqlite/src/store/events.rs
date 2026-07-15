@@ -1530,6 +1530,41 @@ mod tests {
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
 
+    // E35b: the membership guard is scoped to non-rejected rows. A
+    // semantically-malformed member (rule 5.1) is persisted *as rejected*
+    // (the M5 REJECT disposition) so descendants cascade-reject — the
+    // write boundary must accept it; it never reaches the `current_state`
+    // upsert, so the membership invariant is untouched.
+    #[tokio::test]
+    async fn persist_event_accepts_rejected_member_without_membership() {
+        let s = store_with_room().await;
+        let mut bad = make_event(
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.member",
+            Some(ALICE_USER_ID.as_str()),
+            json!({}), // no `membership` key
+            0,
+            &[],
+            &[],
+        );
+        bad.rejected = true;
+        let bad_id = bad.event_id.clone();
+        s.persist_event(&bad, &[])
+            .await
+            .expect("rejected row persists");
+        let got = s.get_events(&[&bad_id]).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].rejected);
+        // The malformed member never lands in current_state.
+        assert!(
+            s.current_state_event(*ALICE_ROOM_ID, "m.room.member", ALICE_USER_ID.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     // E36: m.room.member event without state_key → InvalidInput. State
     // key carries the user_id for member rows; missing it would silently
     // skip the `current_state` upsert and leave the membership invisible.

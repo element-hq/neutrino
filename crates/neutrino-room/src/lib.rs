@@ -64,6 +64,18 @@ pub enum AuthError {
     #[error("m.room.create for the room could not be resolved")]
     CreateUnavailable,
 
+    /// A state event's content violates a shape that `validate_pdu`
+    /// guarantees for every accepted event (integer power levels, string
+    /// `additional_creators`, …). Unreachable through the live pipeline —
+    /// rejected events never enter a state map — so this indicates DB
+    /// corruption or a validation regression. Surfaced as an error rather
+    /// than a panic so one bad row can't crash the room actor.
+    #[error("state event `{event_type}` content is malformed: {detail}")]
+    MalformedStateContent {
+        event_type: &'static str,
+        detail: &'static str,
+    },
+
     /// `m.room.member` state_key did not parse as a Matrix user id (rule 9
     /// exempts `m.room.member` from the `@`-state_key format check, so rule 5
     /// is the first place this is detected). Raised by 5.4 / 5.5 / 5.6.

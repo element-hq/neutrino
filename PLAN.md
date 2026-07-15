@@ -195,6 +195,32 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### Synapse-audit fix M5: state-independent rule failures REJECT-persist instead of DROP (2026-07-15)
+- Rules 9, 5.1, 10.1–10.3 (`validate_pdu` failures on parseable federation
+  PDUs) now persist as `rejected = true` instead of erroring, so a
+  descendant's reference check cascade-rejects (MSC4242 2.3) and terminates —
+  previously the descendant retried forever (gapfill refetch → drop → loop).
+  The split lives in `room_core::is_semantic_rejection`, next to the existing
+  reference-rejection classifier.
+- Placement in `apply_pdu`: the verdict is parked across
+  `validate_references` (so UnknownRoom stays RETRY — persisting needs the
+  room row, `events.room_id` FK) and fires before the state-before walk (no
+  gapfill for a condemned event; synapse's state-independent checks reject
+  without fetching state; the auth machinery never sees malformed content).
+- `from_wire` no longer runs `validate_pdu` — a malformed-but-parseable PDU
+  must reach `apply_pdu` to get its verdict. `EventBuilder::build` still runs
+  it (local sends 400, never persisted). `apply_pdu`'s run is authoritative.
+- Stays DROP: parse failures (no derivable event_id), size limits + >20 caps
+  (synapse `unpersistable` parity), and create rules 1.3/1.4 (a rejected
+  create has no room row to persist under; hash-derived room ids mean the
+  room just never grounds — descendants stay UnknownRoom-retryable).
+- Riders: `PowerLevels::parse` / additional_creators `.expect()`s →
+  `AuthError::MalformedStateContent` (a persisted-rejected malformed PL row
+  must never be one code-path away from a panic); store write boundary now
+  exempts rejected member rows from the membership guard AND gates the
+  `current_state` upsert on `!rejected` (rejected events never enter
+  current_state on any path).
+
 ### Synapse-audit fix M1: client-visibility filter is read-side SQL, federation reads stay unfiltered (2026-07-15)
 - Rejected/soft-failed events were persisted with correct flags but served to
   clients (audit finding M1). Fix is **read-side only**: `events_after` and

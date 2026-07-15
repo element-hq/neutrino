@@ -412,7 +412,14 @@ impl<'a> EventRow<'a> {
         // (invisible to member filters) or skip the `current_state`
         // upsert entirely — both silently break the invariant. Reject
         // at the write boundary instead.
-        let membership = if self.event_type == "m.room.member" {
+        //
+        // Rejected rows are exempt: they never reach the `current_state`
+        // upsert (their verdict IS the `rejected` flag), and a
+        // semantically-malformed member — missing membership/state_key,
+        // persisted *as rejected* per rule 5.1's REJECT disposition — must
+        // be storable so a descendant's reference check cascade-rejects
+        // instead of gapfill-refetching the offender forever.
+        let membership = if self.event_type == "m.room.member" && !self.rejected {
             let m = cracked.content.membership.as_deref().ok_or_else(|| {
                 Error::InvalidInput("m.room.member event missing content.membership".into())
             })?;
@@ -504,7 +511,16 @@ impl<'a> EventRow<'a> {
             }
         }
 
-        if update_current_state && let Some(sk) = self.state_key.as_deref() {
+        // Rejected events never enter current_state (their verdict is the
+        // row flag; every resolved-state path already excludes them). The
+        // explicit gate keeps the simple `persist_event` path consistent
+        // with `persist_resolved_event`, and shields the CHECK constraint
+        // from the NULL-membership shape a rejected malformed member
+        // legitimately carries.
+        if update_current_state
+            && !self.rejected
+            && let Some(sk) = self.state_key.as_deref()
+        {
             tx.execute(
                 "INSERT INTO current_state \
                  (room_id, event_type, state_key, event_id, membership) \

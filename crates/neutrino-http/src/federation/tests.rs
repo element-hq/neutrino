@@ -1856,6 +1856,78 @@ async fn send_unfillable_ancestry_stays_unapplied() {
 }
 
 #[tokio::test]
+async fn send_semantically_malformed_ancestor_terminates_via_cascade_reject() {
+    // The M5 wedge regression. E_bad fails a state-independent rule (5.1:
+    // member without `membership`). Pre-fix, apply DROPped it, so E_child's
+    // PrevStateNotFound stayed retryable and the worker looped: gapfill →
+    // refetch E_bad → drop → back off → forever. Now E_bad persists as
+    // *rejected* and E_child cascade-rejects via PrevStateRejected: two
+    // committed rows, drained staging, and a bounded number of fetch rounds.
+    let fetcher = StubFetcher::no_progress();
+    let (app, store, room_id, alice, join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+
+    // E_bad can't come from EventBuilder (build refuses to produce it); hand
+    // it to from_wire, which deliberately skips semantic validation. The
+    // wrong content hash is fine: member redaction keeps `membership`
+    // (absent here), so the redacted event still carries the defect.
+    let bad_raw = json!({
+        "type": "m.room.member",
+        "state_key": "@mallory:remote.example.org",
+        "sender": alice.as_str(),
+        "room_id": room_id.as_str(),
+        "content": {},
+        "prev_events": [join_id.as_str()],
+        "prev_state_events": [join_id.as_str()],
+        "origin_server_ts": 1_700_000_002_000u64,
+        "hashes": { "sha256": "wrong" },
+    });
+    let bad = neutrino_event::event_builder::from_wire(
+        serde_json::value::RawValue::from_string(bad_raw.to_string()).expect("valid JSON"),
+        Vec::new(),
+    )
+    .expect("parseable PDU");
+    let bad_id = bad.event_id.clone();
+    let child = message_on(
+        &alice,
+        &room_id,
+        &bad_id,
+        "child of doom",
+        1_700_000_003_000,
+    );
+    let child_id = child.event_id.clone();
+
+    // The peer sends only the child; the fetcher serves E_bad on gap-fill.
+    fetcher.set_events(&[&bad]);
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    // Termination: both events commit as rejected and staging drains.
+    let bad_row = wait_committed(&store, bad_id.as_ref()).await;
+    assert!(
+        bad_row.rejected,
+        "state-independent rule → persisted rejected"
+    );
+    let child_row = wait_committed(&store, child_id.as_ref()).await;
+    assert!(child_row.rejected, "descendant cascade-rejects");
+    wait_staging_empty(&store, &room_id).await;
+    assert!(
+        fetcher.call_count() <= 2,
+        "gap-fill must terminate, not refetch-loop; got {} calls",
+        fetcher.call_count()
+    );
+    // Neither event contaminated the room: mallory absent from state, heads
+    // unchanged.
+    assert!(
+        store
+            .current_state_event(&room_id, "m.room.member", "@mallory:remote.example.org")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn send_gapfills_missing_ancestry_then_accepts() {
     // The success path that was inert under the old `NoFetcher`: a PDU arrives
     // referencing an `orphan` we don't hold; the fetcher supplies the orphan,

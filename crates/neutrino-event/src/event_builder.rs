@@ -12,7 +12,10 @@
 //!
 //! - [`from_wire`] is the inbound counterpart: it reads the canonical bytes
 //!   as the source of truth, computes the reference hash to derive the
-//!   event_id, then runs the same `parse_event` + `validate_pdu` pair.
+//!   event_id, then runs `parse_event` only. Semantic validation
+//!   (`validate_pdu`) is deliberately left to `RoomCore::apply_pdu`, which
+//!   persists state-independent rule failures as *rejected* rather than
+//!   dropping them at the wire edge (see `from_wire`'s docs).
 //!
 //! See `event-id-design.md` §"Updated `EventBuilder`".
 
@@ -257,6 +260,15 @@ impl EventBuilder {
 ///   shape (mapped via [`ref_hash_error_to_format_error`]).
 /// - Any downstream `parse_event` rejection.
 ///
+/// **Deliberately does NOT run [`validate_pdu`]** (unlike
+/// `EventBuilder::build`, where a semantic failure is a local caller bug
+/// surfaced as a 400). A federation PDU that parses but fails a semantic
+/// rule must still reach `RoomCore::apply_pdu`, whose authoritative
+/// `validate_pdu` run classifies it: state-independent auth-rule failures
+/// (rule 9 / 5.1 / 10.1–10.3) are persisted as rejected — so descendants
+/// cascade-reject and terminate instead of gapfill-refetching the offender
+/// forever — and everything else is dropped there.
+///
 /// Performance note: this parses `raw` twice — once here to a
 /// `CanonicalJsonValue` for hash computation, then again in `parse_event`.
 /// Acceptable for the federation receive path's current scale.
@@ -282,9 +294,7 @@ pub fn from_wire(raw: Box<RawValue>, auth_events: Vec<OwnedEventId>) -> Result<E
         let s = String::from_utf8(bytes).expect("canonical JSON is valid UTF-8");
         RawValue::from_string(s).expect("canonical JSON parses as a RawValue")
     };
-    let event = parse_event(raw_to_parse, event_id, auth_events)?;
-    validate_pdu(&event)?;
-    Ok(event)
+    parse_event(raw_to_parse, event_id, auth_events)
 }
 
 fn ref_hash_error_to_format_error(err: ruma::canonical_json::RedactionError) -> FormatError {
@@ -662,6 +672,38 @@ mod tests {
         // Round-tripped raw still lacks `room_id` (v12 create invariant).
         let raw: serde_json::Value = serde_json::from_str(parsed.raw.get()).unwrap();
         assert!(raw.get("room_id").is_none());
+    }
+
+    #[test]
+    fn from_wire_accepts_semantically_malformed_but_parseable_pdu() {
+        // Contract pin: `from_wire` runs `parse_event` only — a PDU that
+        // parses but fails a semantic rule (here rule 5.1, member without
+        // `membership`) must come through Ok so `RoomCore::apply_pdu` can
+        // persist it as *rejected* (cascade-terminating) instead of it
+        // dying at the wire edge (the M5 gapfill-refetch wedge).
+        // `EventBuilder::build`, by contrast, still refuses to produce it.
+        let raw = serde_json::json!({
+            "type": "m.room.member",
+            "state_key": "@mallory:remote.example",
+            "sender": "@alice:remote.example",
+            "room_id": "!Fw7pQdLu79h74bsZabn1UKXoXo7-q5M-cOwQxQxfh2c",
+            "content": {},
+            "prev_events": [],
+            "prev_state_events": [],
+            "origin_server_ts": 42,
+            "hashes": { "sha256": "wrong" },
+        });
+        let ev = from_wire(
+            RawValue::from_string(raw.to_string()).expect("valid JSON"),
+            Vec::new(),
+        )
+        .expect("parseable PDU must not be dropped at the wire edge");
+        // The semantic defect is still visible to the authoritative
+        // apply-time run.
+        assert!(matches!(
+            crate::validate::validate_pdu(&ev),
+            Err(FormatError::MemberMissingMembership)
+        ));
     }
 
     #[test]
