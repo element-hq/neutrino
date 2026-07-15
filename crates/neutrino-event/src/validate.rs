@@ -4,8 +4,8 @@
 //! `parse_event`: pure-JSON wire format (required fields, JSON
 //! types, ID parsing). No I/O, no semantic-rule decisions.
 //! `validate_pdu`: semantic rules that work off a parsed `Event`
-//! and need no provider (count limits, create structural rules, rule 9,
-//! per-type content shape).
+//! and need no provider (size limits, count limits, create structural rules,
+//! rule 9, per-type content shape).
 //!
 //! Reference validation (v12 rule 2 + the MSC4242 `prev_state_events` triad)
 //! requires provider lookups against a single room's DAG, so it is room-scoped
@@ -20,16 +20,27 @@
 //!
 //! Every check is annotated inline with its spec citation.
 
-use ruma::canonical_json::CanonicalJsonError;
+use ruma::canonical_json::{CanonicalJsonError, CanonicalJsonValue};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+use crate::event_id::canonical;
 use crate::{Event, ROOM_VERSION_ID};
 
 const MAX_PREV_EVENTS: usize = 20;
 const MAX_PREV_STATE_EVENTS: usize = 20;
+/// S-S API §"Size limits": the complete PDU must be ≤ 65536 bytes when
+/// encoded as canonical JSON. Cross-ref synapse `MAX_PDU_SIZE`.
+const MAX_PDU_BYTES: usize = 65536;
+/// S-S API §"Size limits": `type` and `state_key` are capped at 255.
+/// Synapse (`_check_size_limits`) measures both unicode codepoints and UTF-8
+/// bytes and rejects the event on either; codepoint count ≤ UTF-8 byte count,
+/// so the byte limit subsumes the codepoint one and bytes are what we
+/// measure. (`sender` / `room_id` / `event_id` get their 255-byte cap from
+/// ruma's ID parsers in `parse_event` — not duplicated here.)
+const MAX_FIELD_BYTES: usize = 255;
 
 /// Errors raised by format validation — wire-format violations that
 /// reject the event outright, before any state lookup happens.
@@ -58,6 +69,18 @@ pub enum FormatError {
     /// float, an out-of-range integer, or another value canonical JSON forbids.
     #[error("event JSON is not canonical-JSON encodable: {0}")]
     NonCanonical(CanonicalJsonError),
+
+    /// S-S API §"Size limits": the full PDU exceeds `MAX_PDU_BYTES` when
+    /// encoded as canonical JSON. Cross-ref synapse `_check_size_limits`
+    /// ("event too large").
+    #[error("event exceeds 65536 bytes as canonical JSON")]
+    EventTooLarge,
+
+    /// S-S API §"Size limits": a size-capped string field exceeds
+    /// `MAX_FIELD_BYTES` UTF-8 bytes. See `MAX_FIELD_BYTES` for the
+    /// bytes-vs-codepoints rationale.
+    #[error("field `{0}` exceeds 255 bytes")]
+    FieldTooLong(&'static str),
 
     /// MSC4242: `auth_events` is removed from the wire and must not be present.
     /// Cross-ref synapse `events/__init__.py`:
@@ -288,6 +311,8 @@ pub fn parse_event(
 /// these checks before `RoomCore::apply` will accept it.
 ///
 /// Checks:
+/// - **S-S API §"Size limits"**: the whole PDU ≤ `MAX_PDU_BYTES` bytes as
+///   canonical JSON; `type` / `state_key` ≤ `MAX_FIELD_BYTES` UTF-8 bytes.
 /// - **MSC4242**: `prev_events` ≤ `MAX_PREV_EVENTS`,
 ///   `prev_state_events` ≤ `MAX_PREV_STATE_EVENTS`.
 /// - **v12 rule 1.1**: `m.room.create` has no `prev_events`.
@@ -306,6 +331,34 @@ pub fn parse_event(
 /// re-parse means a caller that hand-constructed an `Event` with a
 /// non-object content still gets a typed error here rather than a panic.
 pub fn validate_pdu(event: &Event) -> Result<(), FormatError> {
+    // S-S API §"Size limits" — first, mirroring synapse's
+    // `check_state_independent_auth_rules` ordering. The whole-PDU limit is
+    // measured on the canonical JSON encoding of the wire bytes (`Event.raw`);
+    // this server has no signatures, so canonical `raw` is the full
+    // federation-format event.
+    let wire = match serde_json::from_str::<CanonicalJsonValue>(event.raw.get())? {
+        CanonicalJsonValue::Object(obj) => obj,
+        _ => {
+            return Err(FormatError::InvalidFieldType {
+                field: "<root>",
+                expected: "object",
+            });
+        }
+    };
+    if canonical(&wire).len() > MAX_PDU_BYTES {
+        return Err(FormatError::EventTooLarge);
+    }
+    // Field limits: UTF-8 bytes (see `MAX_FIELD_BYTES`). `state_key` is only
+    // checked when present, matching synapse's `event.is_state()` guard.
+    if event.event_type.len() > MAX_FIELD_BYTES {
+        return Err(FormatError::FieldTooLong("type"));
+    }
+    if let Some(sk) = &event.state_key
+        && sk.len() > MAX_FIELD_BYTES
+    {
+        return Err(FormatError::FieldTooLong("state_key"));
+    }
+
     // MSC4242 bounds on DAG fan-in. Cheap up-front guard.
     if event.prev_events.len() > MAX_PREV_EVENTS {
         return Err(FormatError::TooManyPrevEvents);
@@ -1048,6 +1101,102 @@ mod tests {
             parse_event(raw(v), eid("$e:example.org"), vec![]),
             Err(FormatError::MissingField("room_id"))
         ));
+    }
+
+    // ---------- size limits (validate_pdu) ----------
+
+    /// Canonical-JSON byte length of a fixture value — the measure the
+    /// whole-PDU limit is defined over.
+    fn canonical_len(v: &Value) -> usize {
+        let obj: ruma::canonical_json::CanonicalJsonObject =
+            serde_json::from_value(v.clone()).expect("test fixture is canonical-encodable");
+        canonical(&obj).len()
+    }
+
+    /// base_event with an ASCII `content.pad` sized so the whole event's
+    /// canonical encoding is exactly `target` bytes.
+    fn event_with_canonical_size(target: usize) -> Value {
+        let mut v = base_event();
+        v["content"]["pad"] = json!("");
+        let without_pad = canonical_len(&v);
+        v["content"]["pad"] = json!("a".repeat(target - without_pad));
+        assert_eq!(canonical_len(&v), target, "pad math");
+        v
+    }
+
+    #[test]
+    fn validate_pdu_accepts_event_at_exactly_max_pdu_bytes() {
+        let v = event_with_canonical_size(65536);
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
+        validate_pdu(&ev).expect("event at exactly 65536 canonical bytes is accepted");
+    }
+
+    #[test]
+    fn validate_pdu_rejects_event_one_byte_over_max_pdu_bytes() {
+        let v = event_with_canonical_size(65537);
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
+        assert!(matches!(validate_pdu(&ev), Err(FormatError::EventTooLarge)));
+    }
+
+    #[test]
+    fn validate_pdu_accepts_type_at_255_bytes() {
+        let mut v = base_event();
+        v["type"] = json!("a".repeat(255));
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
+        validate_pdu(&ev).expect("255-byte type is accepted");
+    }
+
+    #[test]
+    fn validate_pdu_rejects_type_over_255_bytes() {
+        let mut v = base_event();
+        v["type"] = json!("a".repeat(256));
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
+        assert!(matches!(
+            validate_pdu(&ev),
+            Err(FormatError::FieldTooLong("type"))
+        ));
+    }
+
+    #[test]
+    fn validate_pdu_accepts_state_key_at_255_bytes() {
+        let mut v = base_event();
+        v["type"] = json!("m.room.topic");
+        v["state_key"] = json!("s".repeat(255));
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
+        validate_pdu(&ev).expect("255-byte state_key is accepted");
+    }
+
+    #[test]
+    fn validate_pdu_rejects_state_key_over_255_bytes() {
+        let mut v = base_event();
+        v["type"] = json!("m.room.topic");
+        v["state_key"] = json!("s".repeat(256));
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
+        assert!(matches!(
+            validate_pdu(&ev),
+            Err(FormatError::FieldTooLong("state_key"))
+        ));
+    }
+
+    #[test]
+    fn validate_pdu_field_limits_measure_utf8_bytes_not_codepoints() {
+        // 'é' is 2 UTF-8 bytes. 128 of them = 128 codepoints but 256 bytes:
+        // synapse's codepoint check passes and its byte check rejects, and the
+        // event is rejected in every room version (the strict-bytes flag only
+        // affects persistence, not acceptance). Pin the same bytes semantics.
+        let mut v = base_event();
+        v["type"] = json!("é".repeat(128));
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
+        assert!(matches!(
+            validate_pdu(&ev),
+            Err(FormatError::FieldTooLong("type"))
+        ));
+
+        // 127 'é' + 1 ASCII char = 128 codepoints, 255 bytes — accepted.
+        let mut v = base_event();
+        v["type"] = json!(format!("{}a", "é".repeat(127)));
+        let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
+        validate_pdu(&ev).expect("255-byte multibyte type is accepted");
     }
 
     // ---------- signatures field is ignored ----------
