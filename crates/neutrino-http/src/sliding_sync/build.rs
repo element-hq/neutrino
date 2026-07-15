@@ -220,6 +220,14 @@ fn apply_sticky(conn: &mut Conn, req: &Request) {
 /// the embedded server has one user with no filters → every event maps
 /// to an emitted room. Surface this in MSC4186-gaps.md so it doesn't
 /// become a surprise if filters are ever wired up.
+///
+/// **Invisible-tail stall (benign):** `events_after` excludes rejected /
+/// soft-failed events, and `max_pos` advances only over returned rows. If the
+/// newest events in the store are all invisible, the high-water mark parks
+/// just before them and each poll re-runs an indexed query that returns zero
+/// rows, until the next visible event lands and jumps the mark past the run.
+/// Correct, and cheap at embedded scale — kept in preference to widening the
+/// `events_after` return shape with a "max scanned pos".
 async fn fetch_event_deltas<S: StorageBackend>(
     state: &SyncState<S>,
     from_pos: u64,

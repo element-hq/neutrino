@@ -195,6 +195,27 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### Synapse-audit fix M1: client-visibility filter is read-side SQL, federation reads stay unfiltered (2026-07-15)
+- Rejected/soft-failed events were persisted with correct flags but served to
+  clients (audit finding M1). Fix is **read-side only**: `events_after` and
+  `room_messages` gain `AND rejected = 0 AND soft_failed = 0` in SQL and are
+  re-documented as the client-visible readers. No `Visibility` parameter: a
+  caller scan showed every production caller of the two paginated readers is
+  client-facing (sync, /messages) — the federation serving handlers
+  (`/backfill`, `/get_missing_events`) read via `get_events` by id, which
+  stays unfiltered.
+- **Deliberate deviation from synapse**: synapse hides rejected events on
+  federation reads too (`get_events_as_list` default `allow_rejected=False`)
+  and tolerates the resulting holes via DAG-discontinuity acceptance
+  (accept-after-10-deep). Neutrino has no discontinuity acceptance — every
+  `prev_state_events` chain must ground (MSC4242) — so peers must be able to
+  fetch our rejected events or they wedge in gapfill retry.
+- Filter is in SQL (not post-filter) so `LIMIT` and pagination tokens count
+  visible rows only. Known benign nuance: the sliding-sync high-water mark
+  advances over returned rows, so an invisible-only tail parks the cursor and
+  re-runs a cheap indexed zero-row query per poll until a visible event lands
+  (documented on `fetch_event_deltas`).
+
 ### Synapse-audit fixes M3/M4: rule 10.6 raw-presence + PDU size limits (2026-07-15)
 - Out of a 4-way neutrino-room-vs-synapse audit, two findings fixed now (rest
   logged in the audit report, Matrix 2026-07-15):
