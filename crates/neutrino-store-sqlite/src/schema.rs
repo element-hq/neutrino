@@ -78,6 +78,22 @@ pub(crate) fn apply_connection_pragmas(conn: &Connection, query_only: bool) -> R
     if query_only {
         conn.execute_batch("PRAGMA query_only = ON;")?;
     }
+    // Skip the close-time checkpoint + WAL delete. SQLite 3.51.0–3.51.1
+    // (bundled by libsqlite3-sys 0.36.0) has a lock-order inversion between
+    // `sqlite3WalClose`'s last-closer probe (`unixLock(EXCLUSIVE)` holds
+    // pInode->pLockMutex, wants unixBigLock via unixIsSharingShmNode) and a
+    // concurrent `unixClose` (holds unixBigLock, wants pLockMutex). deadpool-
+    // sync closes each pooled connection on a detached blocking task at store
+    // drop, so the writer + reader closes race and can ABBA-deadlock, wedging
+    // the process (observed as CI test hangs). Fixed upstream in SQLite
+    // 3.51.2; this flag removes the only reachable inversion arm until a
+    // deadpool-sqlite release bundles a fixed SQLite. Auto-checkpoint during
+    // normal operation is unaffected; the WAL is simply recovered on next
+    // open instead of deleted at close.
+    conn.set_db_config(
+        deadpool_sqlite::rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+        true,
+    )?;
     Ok(())
 }
 

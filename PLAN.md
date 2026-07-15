@@ -195,6 +195,39 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### SQLite close-deadlock: NO_CKPT_ON_CLOSE on every pooled connection (2026-07-15)
+- **Root cause of the intermittent CI test hangs** (first seen as
+  `sliding_sync::tests::kicked_room_appears_in_candidates_even_on_fresh_connection`
+  running >20000s): SQLite **3.51.1** (bundled via deadpool-sqlite 0.13 →
+  rusqlite 0.38 → libsqlite3-sys 0.36.0) has a lock-order inversion in the
+  broken-POSIX-lock detection added in 3.51.0. `sqlite3WalClose`'s last-closer
+  probe (`unixLock(EXCLUSIVE)`) holds `pInode->pLockMutex` and takes
+  `unixBigLock` inside `unixIsSharingShmNode`, while a concurrent `unixClose`
+  takes them in the opposite order → ABBA deadlock when two connections to the
+  same DB file close concurrently. deadpool-sync's `SyncWrapper::Drop` fires
+  every close as a detached `spawn_blocking`, so a store drop closes the writer
+  + reader connections in parallel — at test teardown `Runtime::drop →
+  BlockingPool::shutdown` then waits on the deadlocked closes forever. Test
+  body itself passed. Diagnosed by stress-repro (~1/30–1/150) + ptrace attach +
+  aarch64 frame-pointer unwind of a live hung process (no gdb in sandbox;
+  scripts preserved in session scratchpad). Reported upstream via TSAN, fixed
+  in SQLite 3.51.2 (2026-01-09); no deadpool-sqlite release bundles it yet.
+- **Fix**: `apply_connection_pragmas` now sets
+  `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` on every pooled connection, which makes
+  `sqlite3WalClose` skip the exclusive-lock probe (the only reachable inversion
+  arm). Impact: WAL/-shm survive a clean close (recovered on next open,
+  auto-checkpoint still bounds them at runtime); durability unchanged. Remove
+  (or harmlessly keep) once deadpool-sqlite ships rusqlite ≥0.39 / SQLite ≥3.51.2.
+- Not test-specific: any file-backed-store teardown could hang; the kicked test
+  was just the one that lost the CI lottery. Verified: 6000 stress runs of the
+  previously-hanging test + 25 full sliding_sync module runs, zero hangs
+  (pre-fix ≥1/150).
+- **Plausible (unproven) production link**: a wedged close pair permanently
+  holds that inode's lock mutexes; any *later* connection open on the same file
+  (lazy reader-pool growth) then hangs inside `run_read` (no timeout) while
+  existing WAL readers/writers stay healthy — the same signature as the
+  2026-07-02 sliding-sync wedge the HTTP backstop was added for.
+
 ### State res v2.1: conflicted subgraph = paths between conflicted events (2026-07-09)
 - A synapse/state comparison found the rust impl's major deviation:
   `conflicted_subgraph()` returned the full backwards auth-chain closure of
