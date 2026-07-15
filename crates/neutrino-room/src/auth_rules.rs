@@ -760,34 +760,51 @@ fn check_rule_10_power_levels(
     // copying an existing power level forward unchanged is always allowed.
 
     // 10.6: scalar default-level alterations.
-    let scalars: &[(&str, i64, i64)] = &[
-        ("users_default", cur_pl.users_default, new_pl.users_default),
-        (
-            "events_default",
-            cur_pl.events_default,
-            new_pl.events_default,
-        ),
-        ("state_default", cur_pl.state_default, new_pl.state_default),
-        ("ban", cur_pl.ban, new_pl.ban),
-        ("redact", cur_pl.redact, new_pl.redact),
-        ("kick", cur_pl.kick, new_pl.kick),
-        ("invite", cur_pl.invite, new_pl.invite),
+    //
+    // Raw-presence comparison, like the 10.7/10.8 maps below: a key absent
+    // on one side and explicitly present on the other *is* an alteration,
+    // even when the explicit value equals the spec default (synapse
+    // `_check_power_levels` contributes `None` for an absent key, never the
+    // default). `PowerLevels::parse` substitutes defaults for absent keys,
+    // so compare the raw contents instead; an absent side contributes no
+    // value and cannot itself trigger a reject.
+    let cur_content = ctx
+        .state
+        .get(&("m.room.power_levels".to_string(), String::new()))
+        .map(|ev| parse_content(ev))
+        // Unreachable: the 10.5 gate above returned unless a previous
+        // power_levels event is in state.
+        .unwrap_or(Value::Null);
+    let scalars = [
+        "users_default",
+        "events_default",
+        "state_default",
+        "ban",
+        "redact",
+        "kick",
+        "invite",
     ];
-    for (field, cur, new) in scalars {
+    for field in scalars {
+        let cur = cur_content.get(field).and_then(Value::as_i64);
+        let new = content.get(field).and_then(Value::as_i64);
         if cur == new {
             continue;
         }
-        if *cur > sender_power {
+        if let Some(cv) = cur
+            && cv > sender_power
+        {
             return Err(AuthError::Rule10_6_1_CurrentDefaultAboveSender {
-                property: (*field).to_string(),
-                value: *cur,
+                property: field.to_string(),
+                value: cv,
                 sender: sender_power,
             });
         }
-        if *new > sender_power {
+        if let Some(nv) = new
+            && nv > sender_power
+        {
             return Err(AuthError::Rule10_6_2_NewDefaultAboveSender {
-                property: (*field).to_string(),
-                value: *new,
+                property: field.to_string(),
+                value: nv,
                 sender: sender_power,
             });
         }
@@ -2096,6 +2113,119 @@ mod tests {
             check_auth_rules(&pl2, &st, &InMemoryStateProvider::new()),
             Err(AuthError::Rule10_8_NewEventEntryAboveSender { .. })
         ));
+    }
+
+    /// Shared fixture for the 10.6 raw-presence tests: Alice (creator) sends
+    /// `pl1_content`, then Bob — at whatever power `pl1_content` grants him —
+    /// sends `pl2_content`.
+    fn run_rule_10_6_scalar_case(pl1_content: Value, pl2_content: Value) -> Result<(), AuthError> {
+        let create = create_event("@alice:example.org", &[]);
+        let alice_join = member_event(
+            &create.room_id,
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            json!({}),
+        );
+        let bob_join = member_event(
+            &create.room_id,
+            "@bob:example.org",
+            "@bob:example.org",
+            "join",
+            json!({}),
+        );
+        let pl1 = power_levels_event(&create.room_id, "@alice:example.org", pl1_content);
+        let st = state_map([create.clone(), alice_join, bob_join, pl1]);
+        let pl2 = power_levels_event(&create.room_id, "@bob:example.org", pl2_content);
+        check_auth_rules(&pl2, &st, &InMemoryStateProvider::new())
+    }
+
+    #[test]
+    fn rule_10_6_2_explicit_at_default_is_an_addition_synapse_parity() {
+        // Old PL omits `ban` (effective default 50). Bob (power 25) adds an
+        // explicit `ban: 50`. Raw-presence comparison: old=None, new=Some(50)
+        // is *not* unchanged, so 10.6.2 fires — new (50) > sender (25) —
+        // even though the explicit value equals the default. `state_default=0`
+        // so Bob clears rule 8 to even reach rule 10.
+        assert!(matches!(
+            run_rule_10_6_scalar_case(
+                json!({ "users": { "@bob:example.org": 25 }, "state_default": 0 }),
+                json!({
+                    "users": { "@bob:example.org": 25 },
+                    "state_default": 0,
+                    "ban": 50,
+                }),
+            ),
+            Err(AuthError::Rule10_6_2_NewDefaultAboveSender { .. })
+        ));
+    }
+
+    #[test]
+    fn rule_10_6_1_removing_explicit_default_above_sender_rejected() {
+        // Old PL has an explicit `ban: 50` (the spec default). Bob (power 25)
+        // removes the key. Raw-presence: old=Some(50), new=None is a change,
+        // so 10.6.1 fires — current (50) > sender (25).
+        assert!(matches!(
+            run_rule_10_6_scalar_case(
+                json!({
+                    "users": { "@bob:example.org": 25 },
+                    "state_default": 0,
+                    "ban": 50,
+                }),
+                json!({ "users": { "@bob:example.org": 25 }, "state_default": 0 }),
+            ),
+            Err(AuthError::Rule10_6_1_CurrentDefaultAboveSender { .. })
+        ));
+    }
+
+    #[test]
+    fn rule_10_6_explicit_unchanged_scalar_allowed() {
+        // `ban: 80` explicitly present and equal on both sides is unchanged —
+        // copying it forward is allowed even though 80 > Bob's power (25).
+        run_rule_10_6_scalar_case(
+            json!({
+                "users": { "@bob:example.org": 25 },
+                "state_default": 0,
+                "ban": 80,
+            }),
+            json!({
+                "users": { "@bob:example.org": 25 },
+                "state_default": 0,
+                "ban": 80,
+            }),
+        )
+        .expect("explicitly-present equal scalar is not an alteration");
+    }
+
+    #[test]
+    fn rule_10_6_scalar_absent_both_sides_allowed() {
+        // `ban` absent on both sides contributes nothing — no alteration,
+        // no reject, even though the effective default (50) > Bob (25).
+        run_rule_10_6_scalar_case(
+            json!({ "users": { "@bob:example.org": 25 }, "state_default": 0 }),
+            json!({ "users": { "@bob:example.org": 25 }, "state_default": 0 }),
+        )
+        .expect("absent-on-both-sides scalar is not an alteration");
+    }
+
+    #[test]
+    fn rule_10_6_powered_sender_may_add_and_remove_scalars() {
+        // Bob at 75 adds `ban: 50` (new 50 ≤ 75) and removes `kick: 60`
+        // (current 60 ≤ 75) in one event — both alterations are within his
+        // power, so the event is allowed.
+        run_rule_10_6_scalar_case(
+            json!({
+                "users": { "@bob:example.org": 75 },
+                "state_default": 0,
+                "kick": 60,
+            }),
+            json!({
+                "users": { "@bob:example.org": 75 },
+                "state_default": 0,
+                "ban": 50,
+            }),
+        )
+        .expect("sufficiently-powered sender may add/remove scalar levels");
     }
 
     // ---------- creator-vs-creator interactions ----------

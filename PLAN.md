@@ -195,6 +195,22 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### Synapse-audit fixes M3/M4: rule 10.6 raw-presence + PDU size limits (2026-07-15)
+- Out of a 4-way neutrino-room-vs-synapse audit, two findings fixed now (rest
+  logged in the audit report, Matrix 2026-07-15):
+- **M3 (rule 10.6)**: scalar PL fields are compared by **raw key presence** in
+  old/new content (synapse `_check_power_levels` parity), not via the
+  default-substituted `PowerLevels` struct — adding/removing an explicit key
+  whose value equals the spec default is an alteration and is power-checked.
+- **M4 (size limits)**: `validate_pdu` enforces whole-PDU ≤ 65536
+  canonical-JSON bytes and `type`/`state_key` ≤ 255 **UTF-8 bytes** (bytes
+  subsume synapse's codepoint check, so byte-only is exact interop parity;
+  `sender`/`room_id`/`event_id` already capped by ruma's ID parsers).
+  Disposition is `FormatError` → DROP for inbound / 400 for local sends:
+  synapse also effectively drops (`unpersistable`) oversized PDUs, so parity
+  holds. The size check runs first, mirroring synapse's
+  `check_state_independent_auth_rules` ordering.
+
 ### SQLite close-deadlock: NO_CKPT_ON_CLOSE on every pooled connection (2026-07-15)
 - **Root cause of the intermittent CI test hangs** (first seen as
   `sliding_sync::tests::kicked_room_appears_in_candidates_even_on_fresh_connection`

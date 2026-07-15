@@ -611,6 +611,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_rejects_event_over_max_pdu_size() {
+        // Local-send path of the S-S §"Size limits" whole-PDU check: an
+        // oversized event surfaces from `build()` (via validate_pdu) so the
+        // C-S handler can 400 it. Boundary precision lives in validate.rs.
+        let err = EventBuilder::new(user("@a:d"), "m.room.message".to_owned())
+            .room_id(room("!r:d"))
+            .content(json!({ "body": "a".repeat(70_000) }))
+            .origin_server_ts(1)
+            .build()
+            .expect_err("oversized event must not build");
+        assert!(matches!(err, FormatError::EventTooLarge));
+    }
+
     // ---------- from_wire ----------
 
     #[test]
