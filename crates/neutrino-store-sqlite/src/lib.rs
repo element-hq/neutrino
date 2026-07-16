@@ -71,6 +71,12 @@ pub struct SqliteStore {
     /// monotonically advanced by `persist_event` via `send_if_modified`
     /// from inside the `spawn_blocking` closure (05-14 §2).
     watch_tx: watch::Sender<StreamPos>,
+    /// Whether client-visible reads (`events_after` for `/sync`,
+    /// `room_messages` for `/messages`) exclude soft-failed rows. `true` in
+    /// production; the convergence harness sets it `false` (see
+    /// [`SqliteStore::client_hides_soft_failed`]). Copied on `clone`; set once
+    /// at startup, before the store is shared.
+    hide_soft_failed: bool,
 }
 
 /// Database filename within a storage directory. The on-disk layout — this
@@ -230,7 +236,32 @@ impl SqliteStore {
             reader_pool,
             writer_pool,
             watch_tx,
+            // Production default: soft-failed events are hidden from clients.
+            hide_soft_failed: true,
         })
+    }
+
+    /// Set whether client-visible reads hide soft-failed events (default
+    /// `true`). The convergence harness passes `false` so soft-failed events
+    /// stay visible in `/messages` / `/sync`: soft-fail is order-dependent and
+    /// server-local, so hiding it diverges client timelines even when the
+    /// state DAG converges. Consuming builder — call once at startup, before
+    /// the store is cloned/shared.
+    #[must_use]
+    pub fn client_hides_soft_failed(mut self, hide: bool) -> Self {
+        self.hide_soft_failed = hide;
+        self
+    }
+
+    /// SQL fragment excluding soft-failed rows from a client-visible read, or
+    /// empty when the client-side filter is off (see
+    /// [`client_hides_soft_failed`](Self::client_hides_soft_failed)).
+    fn soft_failed_filter(&self) -> &'static str {
+        if self.hide_soft_failed {
+            " AND soft_failed = 0"
+        } else {
+            ""
+        }
     }
 
     /// Public sibling of `EventStore::subscribe` — useful for callers that
