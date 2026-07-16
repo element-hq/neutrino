@@ -5,7 +5,7 @@
 //! `origin_server_ts`** (newest popped first), tie-broken on `event_id`
 //! for determinism — mirroring Synapse's depth-descending backfill walk,
 //! with `origin_server_ts` standing in for `depth` (this server stores no
-//! `depth`; see `neutrino-state`'s `validate.rs`). Popping highest-ts-first
+//! `depth`; see `neutrino-event`'s `validate.rs`). Popping highest-ts-first
 //! means a multi-seed or forked walk merges branches in true
 //! newest-first order rather than per-seed BFS-level order. A `visited`
 //! set defends against malformed cycles (MSC4242 says the DAG is acyclic,
@@ -74,7 +74,7 @@ fn hydrate_pdu(
 
 /// Fetch a child's parents of a given edge type from `event_edges`,
 /// sorted by `parent_event_id`. Used by `missing_events` to gather the
-/// initial frontier (parents of `latest`); the sort is no longer
+/// initial frontier (parents of `latest`); the sort is not
 /// load-bearing for the *walk* order — [`walk_prev_events`] re-orders the
 /// whole frontier by `origin_server_ts` in its priority queue — but the
 /// deterministic read keeps the seed-gathering reproducible. `event_edges`
@@ -109,7 +109,7 @@ fn fetch_edges(
 /// `origin_server_ts` wins, and equal timestamps (forks, clock ties) fall
 /// back to the **lowest** `event_id` for a deterministic, reproducible
 /// order. `origin_server_ts` is this server's stand-in for Synapse's
-/// `depth` (see `neutrino-state`'s `validate.rs`).
+/// `depth` (see `neutrino-event`'s `validate.rs`).
 #[derive(PartialEq, Eq)]
 struct WalkEntry {
     origin_server_ts: i64,
@@ -136,8 +136,7 @@ impl PartialOrd for WalkEntry {
 
 /// `origin_server_ts` of `event_id`, or `None` if it isn't in the local
 /// `events` table. Used to prime the priority queue with seed timestamps;
-/// a seed we don't hold contributes nothing — the same outcome as the old
-/// "enqueue then `hydrate_pdu` → `None`" path.
+/// a seed we don't hold contributes nothing.
 fn fetch_event_ts(conn: &Connection, event_id: &EventId) -> Result<Option<i64>, Error> {
     let ts: Option<i64> = conn
         .query_row(
@@ -153,10 +152,9 @@ fn fetch_event_ts(conn: &Connection, event_id: &EventId) -> Result<Option<i64>, 
 /// timeline DAG, `'prev_state'` for the state DAG), each paired with the
 /// parent's `origin_server_ts` so the priority-queue walk can enqueue them
 /// in newest-first order. `INNER JOIN events`: a parent we don't hold is
-/// omitted (it can't be hydrated or expanded — same outcome as the old
-/// enqueue-then-skip path). No room filter — a parent in another room is
-/// still returned so the walk enqueues it and `hydrate_pdu` terminates the
-/// branch at the room boundary, exactly as before (see D10).
+/// omitted (it can't be hydrated or expanded). No room filter — a parent
+/// in another room is still returned so the walk enqueues it and
+/// `hydrate_pdu` terminates the branch at the room boundary (see D10).
 fn fetch_prev_parents_with_ts(
     conn: &Connection,
     child_event_id: &EventId,
@@ -695,7 +693,7 @@ mod tests {
         //     only checks global existence; that passes. The walk
         //     then seeds with the cross-room id, `hydrate_pdu`
         //     room-scopes it to None, and the walk returns empty.
-        //   - `missing_events` no longer validates event IDs
+        //   - `missing_events` does not validate event IDs
         //     (Synapse-style), so the seed is fed straight to
         //     `fetch_edges` — which returns no parents because the
         //     cross-room event has no `prev_events` here — and the
@@ -1031,9 +1029,9 @@ mod tests {
     // point with no parents in the local store — the walk produces no
     // events. This mirrors Synapse's `_get_missing_events`
     // (storage/databases/main/event_federation.py), which performs no
-    // existence pre-check. The previous strict-reject contract
-    // contradicted the federation use case where peers legitimately
-    // hold events we haven't seen.
+    // existence pre-check. A strict-reject contract would contradict
+    // the federation use case where peers legitimately hold events we
+    // haven't seen.
     #[tokio::test]
     async fn missing_events_unknown_latest_returns_empty() {
         let s = store_with_room().await;

@@ -336,7 +336,8 @@ mod tests {
     /// underflow on a room that HAS a backward extremity but NO remote peer runs
     /// the (no-op) backfill round and returns the ORIGINAL page byte-for-byte, not
     /// an empty or garbage page. The full peer round-trip — backfill actually
-    /// persisting and the re-read returning fresh events — is Task 8's e2e.
+    /// persisting and the re-read returning fresh events — is left to a
+    /// separate end-to-end test.
     #[tokio::test]
     async fn backfill_and_reread_is_noop_without_peer() {
         let dir = TempDir::new().expect("tempdir");

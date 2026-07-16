@@ -108,8 +108,7 @@ pub async fn entrypoint(
 
     // Embedded low-bandwidth sidecar: when `lb_federation_port` is set we run a
     // `neutrino-lb` proxy in-process beside the homeserver (the embedded-on-
-    // mobile target — the in-process analogue of the legacy `DendriteService`
-    // owning the monolith). The ingress owns the public federation port peers
+    // mobile target). The ingress owns the public federation port peers
     // reach (`host(bind_addr):lb_federation_port`) and forwards inbound
     // federation to the homeserver's loopback; the homeserver routes its
     // outbound federation back through the egress, an internal loopback port we
@@ -170,7 +169,7 @@ pub async fn entrypoint(
                 // stopped on its own — always a failure (it has no clean early
                 // exit). Surface it loudly; dropping `hs` then stops the homeserver,
                 // which is why a sidecar bind/serve failure takes the whole server
-                // down (and, before this log existed, did so silently).
+                // down.
                 r = &mut lb => {
                     match &r {
                         Ok(()) => tracing::error!(
@@ -293,12 +292,6 @@ fn ingress_bind_for(bind_addr: &str, fed_port: u16) -> SocketAddr {
     }
 }
 
-/// Allocate an ephemeral loopback port for the sidecar egress (the homeserver's
-/// outbound forward proxy). Probe-bind `127.0.0.1:0`, read the assigned address,
-/// and release it; the egress listener re-binds it. The egress is loopback by
-/// construction, so its unauthenticated open forward proxy stays off the network
-/// without an explicit guard. (The brief probe→re-bind window is the same
-/// free-port pattern the e2e tests use.)
 /// Pin the loopback hostname `localhost` to `127.0.0.1`. `localhost` resolves to
 /// BOTH `127.0.0.1` and `::1`, and the homeserver's listener bind and the ingress
 /// upstream resolve it independently — so they can land on different families,
@@ -316,6 +309,12 @@ fn canonical_loopback(authority: &str) -> String {
     }
 }
 
+/// Allocate an ephemeral loopback port for the sidecar egress (the homeserver's
+/// outbound forward proxy). Probe-bind `127.0.0.1:0`, read the assigned address,
+/// and release it; the egress listener re-binds it. The egress is loopback by
+/// construction, so its unauthenticated open forward proxy stays off the network
+/// without an explicit guard. (The brief probe→re-bind window is the same
+/// free-port pattern the e2e tests use.)
 fn alloc_loopback_egress() -> Result<SocketAddr, String> {
     let probe = std::net::TcpListener::bind("127.0.0.1:0")
         .map_err(|e| format!("allocating sidecar egress port: {e}"))?;

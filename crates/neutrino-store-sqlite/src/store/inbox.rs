@@ -57,7 +57,7 @@ mod tests {
 
     use crate::tests::store;
 
-    // I1: first record returns false (was not recorded).
+    // first record returns false (was not recorded).
     #[tokio::test]
     async fn record_federation_txn_first_returns_false() {
         let s = store().await;
@@ -68,7 +68,7 @@ mod tests {
         assert!(!already);
     }
 
-    // I2: second record with the same key returns true (was recorded).
+    // second record with the same key returns true (was recorded).
     #[tokio::test]
     async fn record_federation_txn_second_returns_true() {
         let s = store().await;
@@ -82,7 +82,7 @@ mod tests {
         assert!(already);
     }
 
-    // I3: independent (origin, txn_id) pairs don't interfere.
+    // independent (origin, txn_id) pairs don't interfere.
     #[tokio::test]
     async fn record_federation_txn_independent_keys() {
         let s = store().await;
@@ -100,7 +100,7 @@ mod tests {
         assert!(s.record_federation_txn(origin_a, "txn2").await.unwrap());
     }
 
-    // I5: `federation_txn_seen` reports membership without recording.
+    // `federation_txn_seen` reports membership without recording.
     #[tokio::test]
     async fn federation_txn_seen_does_not_record() {
         let s = store().await;
@@ -113,7 +113,7 @@ mod tests {
         assert!(s.federation_txn_seen(origin, "txn1").await.unwrap());
     }
 
-    // I4: SQL injection defence. A malicious txn_id is stored verbatim
+    // SQL injection defence. A malicious txn_id is stored verbatim
     // (not interpreted), so the literal string is dedup'd on retry and
     // the `federation_txns` table is intact afterwards.
     #[tokio::test]

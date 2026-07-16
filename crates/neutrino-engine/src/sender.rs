@@ -19,7 +19,7 @@
 //!   tasks stay alive (bounded by the size of the mesh) rather than being
 //!   reaped and respawned.
 //!
-//! ## Flood control on startup (per Kegan, 2026-06-04)
+//! ## Flood control on startup
 //!
 //! On a restart with a large backlog, every destination would otherwise fire at
 //! once. Two bounds prevent that thundering herd:
@@ -33,7 +33,7 @@
 //!   all destinations at once. A backing-off destination holds no permit, so it
 //!   never starves a healthy one.
 //!
-//! ## Failure handling (per Kegan, 2026-06-04)
+//! ## Failure handling
 //!
 //! - **4xx** from a peer = the transaction was malformed/rejected at the
 //!   envelope level (the inbound handler only 4xxs the whole transaction, never
@@ -1136,7 +1136,7 @@ mod tests {
         );
     }
 
-    // Anti-entropy 4xx handling, PDU-batch side (the `sent_ok`-equivalent gate): a
+    // Anti-entropy 4xx handling, PDU-batch side: a
     // 4xx on a batch drops the batch from the outbox but must NOT clear a standing
     // advertisement obligation — our forward extremities never landed, so the duty
     // still stands. Driven through `deliver_batch` directly.
@@ -1237,12 +1237,9 @@ mod tests {
         );
     }
 
-    /// A permanent 5xx must (TEST4) keep the batch in the outbox — never lost —
-    /// and (SPEC1) reuse the SAME txn_id on every retry, so the receiver dedups.
     /// Cancelling the shutdown token makes the supervisor break out of its loop,
     /// abort its per-destination children, and RETURN — even with a live store and
-    /// a forever-retrying dead-peer child task. Pre-shutdown-wiring this hung
-    /// (the supervisor only returned when the store's persist-watch closed).
+    /// a forever-retrying dead-peer child task.
     #[tokio::test]
     async fn supervisor_returns_on_shutdown() {
         let dead: OwnedServerName = "dead.test".parse().unwrap();
@@ -1274,8 +1271,8 @@ mod tests {
             .expect("supervisor task must not panic");
     }
 
-    /// A permanent 5xx must (TEST4) keep the batch in the outbox — never lost —
-    /// and (SPEC1) reuse the SAME txn_id on every retry, so the receiver dedups.
+    /// A permanent 5xx must keep the batch in the outbox — never lost —
+    /// and reuse the SAME txn_id on every retry, so the receiver dedups.
     #[tokio::test]
     async fn permanent_5xx_keeps_batch_and_reuses_txn_id() {
         let stub = Arc::new(Stub {
@@ -1307,7 +1304,7 @@ mod tests {
         let attempts = stub.attempts.load(Ordering::SeqCst);
         assert!(attempts >= 2, "expected retries, got {attempts}");
 
-        // TEST4: a 5xx never removes the batch, and nothing was accepted.
+        // A 5xx never removes the batch, and nothing was accepted.
         assert!(
             !store
                 .pending_pdus(&dest, usize::MAX)
@@ -1318,7 +1315,7 @@ mod tests {
         );
         assert!(stub.accepted.lock().unwrap().is_empty());
 
-        // SPEC1: every retry carried one and the same txn_id.
+        // Every retry carried one and the same txn_id.
         let txns = stub.txns.lock().unwrap();
         assert!(txns.len() >= 2);
         assert!(

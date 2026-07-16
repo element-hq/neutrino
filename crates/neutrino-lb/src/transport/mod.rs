@@ -1,7 +1,7 @@
 //! The wire seam. `WireClient` (egress sender) and `WireServer` + `WireHandler`
-//! (ingress receiver) abstract the hop between two sidecars. v1 ships one
-//! HTTP+CBOR implementation in `http`; a CoAP/UDP implementation will live
-//! beside it and be selected in `crate::serve` without changing egress/ingress.
+//! (ingress receiver) abstract the hop between two sidecars. An HTTP+CBOR
+//! implementation lives in `http` and a CoAP/UDP one in `coap`; `crate::serve`
+//! selects between them without changing egress/ingress.
 
 use std::sync::Arc;
 

@@ -16,8 +16,8 @@
 //! re-dials instead of reusing a dead connection.
 //!
 //! The endpoint still binds its own ephemeral loopback UDP socket for QUIC
-//! transport (see [`RELAY_BIND`]); that is iroh-internal and unrelated to the
-//! deleted host-TUN data path.
+//! transport (see [`RELAY_BIND`]); that is iroh-internal and not a peer data
+//! path.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -230,14 +230,12 @@ impl IrohTransport {
             let config = iroh_ble_transport::transport::BleTransportConfig {
                 display_name: Some(name_rx.borrow().clone()),
                 verified_rx: Some(verified_rx),
-                // L2CAP upgrade DISABLED (2026-07-09): with the verified_rx
-                // wiring above the upgrade finally ran in the field — and the
-                // Android JNI data bridge under blew::L2capChannel passed zero
-                // bytes in either direction, so every swap produced a dead pipe
-                // and a ~10s wedge/reconnect/upgrade loop that killed
-                // federation outright. GATT works. Re-enable (PreferL2cap)
-                // only after the bridge is proven with the hop-by-hop logging
-                // now in vendor/blew l2cap_state.rs + L2capSocketManager.kt.
+                // L2CAP upgrade enabled (PreferL2cap): the verified_rx wiring
+                // above feeds QUIC-verified peers into the registry, which is
+                // what triggers the GATT->L2CAP upgrade. Instrumented with the
+                // hop-by-hop logging in vendor/blew l2cap_state.rs +
+                // L2capSocketManager.kt to validate the Android JNI data bridge
+                // under blew::L2capChannel across a swap.
                 l2cap_policy: iroh_ble_transport::transport::L2capPolicy::PreferL2cap,
                 ..Default::default()
             };

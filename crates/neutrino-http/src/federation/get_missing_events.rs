@@ -106,7 +106,7 @@ pub(crate) struct ResponseBody {
 /// Algorithm (cross-ref `docs/get-missing-events.md` §Handler/Algorithm):
 /// 1. Reject empty `latest_events` (400 M_INVALID_PARAM).
 /// 2. 404 if room is unknown (pre-checked via `RoomStore::room_exists`).
-/// 3. Clamp `limit`: default 10, max 20.
+/// 3. Clamp `limit`: default 10, max 1000.
 /// 4. Drop `_min_depth` (wire field `min_depth`) on the floor — Neutrino
 ///    has no depth column. See `RequestBody._min_depth` doc.
 /// 5. Call `DagStore::missing_events`.

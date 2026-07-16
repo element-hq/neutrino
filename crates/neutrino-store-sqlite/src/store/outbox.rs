@@ -178,14 +178,12 @@ mod tests {
         s
     }
 
-    // O1
     #[tokio::test]
     async fn pending_destinations_empty_initially() {
         let s = store().await;
         assert!(s.pending_destinations().await.unwrap().is_empty());
     }
 
-    // O2
     #[tokio::test]
     async fn pending_pdus_empty_for_unknown_destination() {
         let s = store().await;
@@ -197,7 +195,7 @@ mod tests {
         );
     }
 
-    // O3: same destination on two events → returned once.
+    // same destination on two events → returned once.
     #[tokio::test]
     async fn pending_destinations_distinct() {
         let s = store_with_room().await;
@@ -213,7 +211,7 @@ mod tests {
         assert_eq!(dests[0].as_str(), "matrix.org");
     }
 
-    // O4: events returned in insertion (outbox_id) order.
+    // events returned in insertion (outbox_id) order.
     #[tokio::test]
     async fn pending_pdus_in_outbox_order() {
         let s = store_with_room().await;
@@ -233,7 +231,7 @@ mod tests {
         assert_eq!(ids, expected_strs);
     }
 
-    // O9: `limit` caps the batch at the oldest N, in order.
+    // `limit` caps the batch at the oldest N, in order.
     #[tokio::test]
     async fn pending_pdus_respects_limit() {
         let s = store_with_room().await;
@@ -255,7 +253,7 @@ mod tests {
         assert_eq!(s.pending_pdus(dest, 100).await.unwrap().len(), 5);
     }
 
-    // O5: remove the named event_ids only.
+    // remove the named event_ids only.
     #[tokio::test]
     async fn remove_pdus_removes_specified() {
         let s = store_with_room().await;
@@ -275,7 +273,7 @@ mod tests {
         assert_eq!(pdus[0].event_id.as_str(), id_b.as_str());
     }
 
-    // O6: second remove of already-removed IDs is a silent no-op.
+    // second remove of already-removed IDs is a silent no-op.
     #[tokio::test]
     async fn remove_pdus_idempotent() {
         let s = store_with_room().await;
@@ -292,7 +290,7 @@ mod tests {
         assert!(s.pending_pdus(dest, usize::MAX).await.unwrap().is_empty());
     }
 
-    // O7: empty event_ids slice short-circuits — no SQL run.
+    // empty event_ids slice short-circuits — no SQL run.
     #[tokio::test]
     async fn remove_pdus_empty_list_short_circuits() {
         let s = store().await;
@@ -301,7 +299,7 @@ mod tests {
             .unwrap();
     }
 
-    // O8: unknown event_ids in the slice → silent no-op.
+    // unknown event_ids in the slice → silent no-op.
     #[tokio::test]
     async fn remove_pdus_unknown_event_ids_no_error() {
         let s = store().await;
@@ -313,7 +311,7 @@ mod tests {
         .unwrap();
     }
 
-    // O10 (anti-entropy): persist_resolved_event with `advertise_to` writes one
+    // Anti-entropy: persist_resolved_event with `advertise_to` writes one
     // pending_advertisements row per destination for the event's room;
     // advertisement_destinations enumerates them, pending_advertisements lists
     // a destination's owed rooms, and remove_advertisements clears them

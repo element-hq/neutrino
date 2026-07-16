@@ -1792,7 +1792,7 @@ mod qblock_server_tests {
     // A large body (over one block) must round-trip via the Q-Block burst:
     // multi-block Q-Block1 up, multi-block Q-Block2 down. This is the load-bearing
     // send_join shape, and it confirms the reassembled request still reaches our
-    // CoapDispatch handler with a populated response slot (verification gate 2).
+    // CoapDispatch handler with a populated response slot.
     #[tokio::test]
     async fn qblock_large_body_round_trips() {
         let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1880,8 +1880,8 @@ mod qblock_concurrency_tests {
 
     // Overlapping send_qblock calls through one pooled client must each receive
     // their own response. Q-Block adds background drive tasks + Request-Tag demux
-    // on top of token correlation; this is the gate deciding pool-vs-fresh-client
-    // (spec verification gate 1). Bodies are sized (with a 64 B block) to span
+    // on top of token correlation; this is the gate deciding pool-vs-fresh-client.
+    // Bodies are sized (with a 64 B block) to span
     // several Q-Block blocks each, so the test exercises *multi-block burst*
     // correlation under concurrency — not just the single-PDU case.
     #[tokio::test]

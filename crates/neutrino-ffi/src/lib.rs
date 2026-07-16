@@ -170,8 +170,8 @@ impl NeutrinoHandle {
     /// The server's resolved federation name — its derived node id, or `None`
     /// until the server has booted and resolved its identity (so the host can
     /// distinguish "not ready yet" from a value rather than racing on an empty
-    /// string). Since the embedded server no longer takes a configured name,
-    /// this is how the host learns the name to build user ids
+    /// string). Since the embedded server takes no configured name, this is
+    /// how the host learns the name to build user ids
     /// (`@localpart:server_name`).
     pub fn server_name(&self) -> Option<String> {
         self.identity.borrow().clone()

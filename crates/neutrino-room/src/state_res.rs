@@ -908,7 +908,7 @@ mod tests {
     /// forced to that room's derived create id; power-of-sender only consults
     /// the create's id, sender, and content. Needed by the reverse-topological-
     /// power-sort tests, which otherwise build a room with no create — an
-    /// unrealistic shape that used to silently yield power 0 for everyone.
+    /// unrealistic shape that would silently yield power 0 for everyone.
     fn seed_placeholder_create(provider: &mut InMemoryStateProvider) {
         let mut create = EventBuilder::new(
             user_id!("@alice:example.org").to_owned(),
@@ -1053,8 +1053,8 @@ mod tests {
     fn conflicted_subgraph_single_seed_is_just_the_seed() {
         // a → b → c (a's auth_events = [b], b's auth_events = [c]) with only
         // `a` conflicted: no path from `a` leads to another conflicted event,
-        // so its plain ancestors b and c stay out. (Full-closure inclusion
-        // here was the pre-fix bug.)
+        // so its plain ancestors b and c stay out. (A full-closure walk would
+        // wrongly include b and c.)
         let mut provider = InMemoryStateProvider::new();
         let mut bag = HashMap::new();
         insert(&mut provider, &mut bag, "c", &[]);
@@ -1816,8 +1816,8 @@ mod tests {
         // in the auth chain of P which also belong to the full conflicted set."
         // Here a contested self-join (NOT a power event) is the sender
         // membership a contested power_levels event depends on. It MUST land in
-        // the power-sort set, not the mainline set — the bug routed it to the
-        // mainline because the split was done purely by `is_power_event`.
+        // the power-sort set, not the mainline set — a split done purely by
+        // `is_power_event` would wrongly route it to the mainline.
         let (mut provider, create_id, room_id) = setup_default();
         let alice_join = EventBuilder::new(
             "@alice:example.org".parse().expect("user"),
@@ -1846,9 +1846,8 @@ mod tests {
             .into_iter()
             .collect();
 
-        // The naive `is_power_event` split (the old behaviour) excludes the
-        // self-join — proving the enlargement below is load-bearing, not a
-        // no-op.
+        // The naive `is_power_event` split excludes the self-join — proving
+        // the enlargement below is load-bearing, not a no-op.
         let (naive_power, naive_non_power) = split_power_events(&full, &provider).unwrap();
         assert!(
             !naive_power.contains(&join_id),
@@ -2230,7 +2229,7 @@ mod tests {
         // (topics) anchored at different power_levels. The topic under the
         // newer (resolved) PL must win, EVEN THOUGH it has the earlier ts —
         // mainline depth dominates ts, and the newer anchor sorts last so IAC
-        // pass 2's last-write-wins picks it. The buggy inverted indexing made
+        // pass 2's last-write-wins picks it. An inverted indexing would make
         // the older-anchored (later-ts) topic win instead.
         let (mut provider, create_id, room_id) = setup_default();
         let alice_join = EventBuilder::new(

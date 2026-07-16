@@ -1782,12 +1782,11 @@ async fn long_poll_wakes_on_new_event() {
 }
 
 /// An inbound out-of-band federated invite (`InviteStore::put_invite`) must
-/// wake an in-flight long-poll, not leave it parked until timeout. This is the
-/// regression for the observed ~30s invite-appearance delay: `put_invite`
-/// writes the `oob_invites` table but used to skip the stream-watch bump, so
-/// the federation `PUT /invite` landed silently and the invitee's open `/sync`
-/// only surfaced it on its next poll. Mirrors `long_poll_wakes_on_new_event`,
-/// but the wake is driven by an invite rather than a room event.
+/// wake an in-flight long-poll, not leave it parked until timeout: `put_invite`
+/// writes the `oob_invites` table and bumps the stream-watch, so the federation
+/// `PUT /invite` wakes the invitee's open `/sync` immediately rather than only
+/// on its next poll. Mirrors `long_poll_wakes_on_new_event`, but the wake is
+/// driven by an invite rather than a room event.
 #[tokio::test]
 async fn long_poll_wakes_on_oob_invite() {
     let (store, _tmp) = fresh_store().await;
