@@ -70,8 +70,7 @@ pub(crate) fn b64_url_unpadded(bytes: &[u8]) -> String {
 /// (yet) mention it. Save → redact → restore is the minimal divergence
 /// pending the MSC landing in the spec.
 ///
-/// See `project-msc4242-redaction` memory and `event-id-design.md`
-/// §"ruma redaction wrapper".
+/// See `event-id-design.md` §"ruma redaction wrapper".
 ///
 /// On error: `prev_state_events` is restored before returning, so the caller
 /// sees the input in its original shape regardless of outcome.
@@ -558,8 +557,8 @@ mod tests {
         assert_eq!(id.as_str(), "$mY2a13t3rnoKFepL_yWIHDCPjw7WoP1Rem5QJyvom9w",);
     }
 
-    /// Cross-check against a real matrix.org-produced event_id (supplied by
-    /// Kegan, 2026-05-27). Pre-MSC4242 event with `auth_events` on the wire
+    /// Cross-check against a real matrix.org-produced event_id.
+    /// Pre-MSC4242 event with `auth_events` on the wire
     /// (not `prev_state_events`), so our redaction wrapper's save/restore
     /// is a no-op and the result must match stock V11 behaviour byte-for-byte.
     /// If this drifts, either ruma's `redact_in_place` changed or our
@@ -602,8 +601,8 @@ mod tests {
         assert_eq!(id.as_str(), "$KXQOIuyr9pVHI6YAqMtwYCJbeh8-KtZbl8XCDHA53qY");
     }
 
-    /// Cross-check against a real MSC4242 / v12 event_id (supplied by Kegan,
-    /// 2026-05-27). This event has `prev_state_events` (not `auth_events`)
+    /// Cross-check against a real MSC4242 / v12 event_id. This event has
+    /// `prev_state_events` (not `auth_events`)
     /// on the wire and a v12-format room_id (`!` + 43 url-safe-b64 chars),
     /// so it exercises **the MSC4242 carve-out path itself**: without our
     /// save/restore of `prev_state_events` across V11 redaction, the field

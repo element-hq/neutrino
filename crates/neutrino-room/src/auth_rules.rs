@@ -379,7 +379,7 @@ fn parse_content(event: &Event) -> Value {
 /// `AuthContext::new`'s error domain. `StateResError::Internal` is the
 /// established "storage-side fault, not a verdict about the event" carrier.
 ///
-/// Honesty note on where that fault-not-verdict intent actually holds: the
+/// Where that fault-not-verdict intent actually holds: the
 /// state-res walk callers (`power_of_sender`, IAC) propagate it as a
 /// retryable fault; `check_auth_rules`, however, flattens every
 /// `AuthContext::new` error into `AuthError::CreateUnavailable`, so on the

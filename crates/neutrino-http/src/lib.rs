@@ -55,7 +55,7 @@ struct App {
     /// the room id of each freshly-staged PDU; the worker spawns or wakes that
     /// room's drain task. Best-effort (`try_send`): a full buffer just means the
     /// worker is already aware the room has work. Dropping the owning `AppState`
-    /// drops this sender, which shuts the worker down (see `federation::worker`).
+    /// drops this sender, which shuts the worker down (see `neutrino_engine::worker`).
     /// INVARIANT: this is the *only* long-lived holder of the poke sender — the
     /// worker tasks must never hold a clone, or the channel would never close
     /// and the worker (plus its `store`/`registry` `Arc`s) would leak.

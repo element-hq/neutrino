@@ -546,8 +546,6 @@ pub(crate) struct MakeLeaveResponse {
     pub(crate) room_version: String,
 }
 
-/// The production [`MissingEventsFetcher`]: a thin adapter that closes a
-/// received PDU's missing state ancestry by asking the originating peer via
 /// Map the reqwest-backed client error onto the engine's neutral
 /// [`TransportError`] at the port boundary: status codes pass through (the
 /// sender still distinguishes 4xx from 5xx), everything else collapses to a

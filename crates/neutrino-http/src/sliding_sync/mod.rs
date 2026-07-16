@@ -207,9 +207,9 @@ pub async fn handle<S: StorageBackend>(
     // and unwinds.
     let mut conn_guard = entry.conn.lock().await;
 
-    // Cache hit / pos validation, formerly the body of `resolve_conn`. Has
-    // to run under the conn lock — `last_request_pos`, `last_request_hash`,
-    // `last_response`, and `pos` all live inside the mutex.
+    // Cache hit / pos validation. Has to run under the conn lock —
+    // `last_request_pos`, `last_request_hash`, `last_response`, and `pos`
+    // all live inside the mutex.
     //
     // Note the ordering: cache-hit short-circuits *after* we paid the cost
     // of bumping cancel on the entry. A byte-identical retry that arrives

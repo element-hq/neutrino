@@ -199,7 +199,7 @@ pub(crate) async fn federated_join_if_remote(
             }
         },
         // A storage fault checking existence falls through to the local path
-        // (which surfaces it as a 500), matching the prior behaviour.
+        // (which surfaces it as a 500).
         Err(_) => return None,
     }
 

@@ -13,7 +13,7 @@
 //!   [`InviteStore::put_invite`]. That stripped state is what sync renders the
 //!   room from.
 //! - **Room we already host** (the inviting server may not realise we're
-//!   resident — *not* an error, per the 2026-06-05 decision): stage the event
+//!   resident — *not* an error): stage the event
 //!   and let the per-room worker integrate it through `apply_pdu` like any
 //!   inbound PDU (auth + state-res + persist), so it becomes normal
 //!   `current_state` rather than a redundant out-of-band stub.

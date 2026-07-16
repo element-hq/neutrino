@@ -11,9 +11,7 @@
 //!
 //! **NOTE (unverified):** none of the Android path below can be compiled in the
 //! dev sandbox (no `aarch64-linux-android` std, no libdbus for the host `ble`
-//! build), so it is written against the `jni` 0.22 / `blew` 0.2 / `ndk_context`
-//! 0.1 source but compiled for the first time in the Android workspace. Expect
-//! to iterate on first build.
+//! build); it is compiled for the first time in the Android workspace.
 //!
 //! On non-Android hosts (the binding-generation build, which compiles `ble` on
 //! the host) this is a no-op: `blew` uses CoreBluetooth / `bluer` there and

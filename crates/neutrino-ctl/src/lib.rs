@@ -2,7 +2,7 @@
 //!
 //! This is the broadest-scoped crate in the tree (whole-server lifecycle) and
 //! deliberately depends on nothing — it sits at the base alongside
-//! `neutrino-common` (event-scoped types) so every layer above can read the
+//! `neutrino-event` (event-scoped types) so every layer above can read the
 //! server's [`Config`] and accept host-pushed [`Command`]s without pulling in
 //! Matrix data types.
 

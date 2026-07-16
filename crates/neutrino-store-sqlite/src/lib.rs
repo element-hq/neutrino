@@ -4,11 +4,9 @@
 
 //! SQLite implementation of the `neutrino-store::StorageBackend` trait.
 //!
-//! See `docs/2026-05-14-sqlite-storage-backend.md` for the original design
-//! (driver choice, version gate, watch notification, restart semantics,
-//! error mapping). The reader/writer pool split — supersedes 05-14 §2
-//! "Pool initialization" and the uniform `run<F>` helper — is specified
-//! in `docs/2026-05-18-read-write-pool-split.md`.
+//! Covers the driver choice, schema version gate, watch notification,
+//! restart semantics, error mapping, and the reader/writer pool split
+//! (a multi-reader pool plus a single serialised writer).
 
 use std::path::Path;
 use std::time::Duration;
@@ -21,7 +19,7 @@ use tokio::sync::watch;
 /// Wall-clock ceiling for any single `run_write` call. The writer pool is
 /// size-1 and the underlying `spawn_blocking` thread cannot be cancelled,
 /// so a hung closure would otherwise stall every subsequent writer for
-/// the lifetime of the process (pool-split doc §6). The timeout doesn't
+/// the lifetime of the process. The timeout doesn't
 /// *unstall* the writer — the blocking thread keeps running and the
 /// connection is still held — but it surfaces the failure to the caller
 /// as `Internal("write timed out")` instead of letting the await hang
@@ -69,7 +67,7 @@ pub struct SqliteStore {
     /// `EventStore::subscribe` see the `StreamPos` of the most recently
     /// committed `persist_event`. Seeded at open from `MAX(stream_pos)`;
     /// monotonically advanced by `persist_event` via `send_if_modified`
-    /// from inside the `spawn_blocking` closure (05-14 §2).
+    /// from inside the `spawn_blocking` closure.
     watch_tx: watch::Sender<StreamPos>,
     /// Whether client-visible reads (`events_after` for `/sync`,
     /// `room_messages` for `/messages`) exclude soft-failed rows. `true` in
@@ -168,8 +166,8 @@ impl SqliteStore {
         Ok(store)
     }
 
-    /// Open a private in-memory store. Per pool-split doc §5: two
-    /// separate pools on `:memory:` would each see a private DB, so
+    /// Open a private in-memory store. Two separate pools on `:memory:`
+    /// would each see a private DB, so
     /// readers would never observe writes. Use the shared-cache URI with
     /// a per-store UUID so both pools attach to the same in-memory DB
     /// while staying isolated across tests.
@@ -187,9 +185,7 @@ impl SqliteStore {
     /// [`SqliteStore::open_in_dir`] on a `tempfile::TempDir` for any test
     /// that exercises the concurrent reader/writer surface — a `TempDir`
     /// reaps the DB *and* its WAL `-wal`/`-shm` sidecars on drop, which a
-    /// bare `NamedTempFile` would orphan. See
-    /// `docs/2026-05-18-read-write-pool-split.md` §5 for the full
-    /// rationale.
+    /// bare `NamedTempFile` would orphan.
     pub async fn open_in_memory() -> Result<Self, StorageError> {
         let name = uuid::Uuid::new_v4();
         let uri = format!("file:neutrino-store-{name}?mode=memory&cache=shared");
@@ -215,8 +211,7 @@ impl SqliteStore {
 
         // Seed the stream watch from MAX(stream_pos) via the reader pool
         // — read-only, no need to hold the single writer connection.
-        // New subscribers boot against this value after a restart — see
-        // 05-14 §2 "Restart & crash semantics".
+        // New subscribers boot against this value after a restart.
         let reader = reader_pool.get().await.map_err(Error::Pool)?;
         let initial: i64 = reader
             .interact(|conn| {
@@ -272,7 +267,7 @@ impl SqliteStore {
     }
 
     /// Advance the stream watch under the max-guard. Called *inside* the
-    /// `spawn_blocking` closure after `tx.commit()?` per design doc §2 —
+    /// `spawn_blocking` closure after `tx.commit()?` —
     /// `spawn_blocking` closures are non-cancellable, so a committed event
     /// can never be stranded without notification. Associated function
     /// (not `&self`) because the calling closure must be `'static` and

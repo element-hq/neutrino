@@ -1420,8 +1420,8 @@ mod tests {
         );
     }
 
-    // E51: `to = None` matches the historical unbounded behaviour — adding
-    // the parameter must not truncate or otherwise change a no-stop query.
+    // E51: `to = None` is unbounded — a no-stop query returns every event in
+    // range and is never truncated.
     #[tokio::test]
     async fn room_messages_to_none_matches_unbounded() {
         let s = store_with_room().await;
@@ -1442,8 +1442,8 @@ mod tests {
     // token is offset by one (Synapse `generate_next_token`) precisely so the
     // exclusive `to` lands correctly. Bounding a backward query at a probe's
     // token reproduces exactly that probe's page — the mirror of E50 for the
-    // backward bound pair. Under the old exclusive-`from`/no-offset scheme this
-    // page came back one event short.
+    // backward bound pair. Under an exclusive-`from`/no-offset scheme this
+    // page would come back one event short.
     #[tokio::test]
     async fn room_messages_backward_to_is_exclusive() {
         let s = store_with_room().await;
@@ -1624,9 +1624,8 @@ mod tests {
     }
 
     // E37: `persist_event` writes one `outbox` row per destination
-    // (idempotent via `UNIQUE(destination, event_id)`). `FederationOutbox`
-    // isn't implemented on this branch yet, so this test peeks at the
-    // table directly via `run_read`; swap to the trait once it lands.
+    // (idempotent via `UNIQUE(destination, event_id)`). This test peeks at
+    // the `outbox` table directly via `run_read`.
     #[tokio::test]
     async fn persist_event_writes_outbox_rows_per_destination() {
         let s = store_with_room().await;
@@ -1926,10 +1925,9 @@ mod tests {
 
     // E44-E49: `persist_historical_event` — backfill-class persistence
     // that writes events + edges but deliberately does *not* update
-    // `current_state` or the outbox. Resolves the unconditional-UPSERT
-    // ambiguity flagged in the SQLite-store review by giving the
-    // backfill handler a separate code path; `persist_event` keeps its
-    // forward-extension semantics.
+    // `current_state` or the outbox. Backfill has its own code path so
+    // `persist_event` keeps its forward-extension semantics (its
+    // unconditional current-state UPSERT).
 
     // E44: a historical event is visible via `get_events` and backward
     // `room_messages` (history reads), but — being assigned a `stream_pos`

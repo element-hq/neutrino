@@ -38,7 +38,7 @@ const EMIT_STATE_STUBS: bool = false;
 /// Build one sliding-sync response into the supplied connection.
 ///
 /// The caller is responsible for resolving the `Conn` (see
-/// `mod::handle::resolve_conn`) and holding its lock for the duration of the
+/// `super::handle`) and holding its lock for the duration of the
 /// call. This split exists so that the long-poll loop in `handle` can call
 /// `build_response` multiple times against the same locked conn, and so that
 /// the idempotency-cache check can short-circuit before we ever enter this
@@ -70,10 +70,10 @@ pub(super) async fn build_response<S: StorageBackend>(
     // On initial sync we skip the drain entirely — the per-room snapshot
     // comes from `room_messages`, not from `events_after` — and instead
     // anchor `last_event_stream_pos` at the store's current head via the
-    // watch's borrowed value. Previously we drained up to
-    // `EVENTS_PER_SYNC_LIMIT` and advanced only that far, which on a store
-    // holding > 1000 events would have the next sync re-emit positions
-    // 1001+ as "new" deltas the client already received in the snapshot.
+    // watch's borrowed value. Draining and advancing only up to
+    // `EVENTS_PER_SYNC_LIMIT` would, on a store holding > 1000 events, make
+    // the next sync re-emit positions 1001+ as "new" deltas the client
+    // already received in the snapshot.
     let (new_events_by_room, max_stream_pos) = if initial_sync {
         let head = state.store.subscribe().borrow().0;
         (HashMap::new(), head)

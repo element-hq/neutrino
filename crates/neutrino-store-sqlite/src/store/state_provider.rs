@@ -522,7 +522,7 @@ mod tests {
         assert!(present, "provider must read the create event inside the tx");
     }
 
-    // -------- denormalisation invariant (I3) --------
+    // -------- denormalisation invariant --------
 
     #[tokio::test]
     async fn auth_edges_mirror_auth_events_json() {

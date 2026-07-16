@@ -38,7 +38,7 @@
 //! request token, so a per-(client, token) port puts each exchange in its own
 //! conversation with pairing intact. Token-less datagrams (empty/signalling,
 //! non-CoAP) fall back to a per-node port. NOTE: if per-block tokens land
-//! (RFC 9177 §6, plan item 1b), this key must become the token's per-body part
+//! (RFC 9177 §6), this key must become the token's per-body part
 //! (its low 32 bits) or the Request-Tag, or blocks of one body will scatter
 //! across conversations. Timestamps are wall-clock ([`SystemTime`]); a merged
 //! two-device timeline (`mergecap`) is only as good as the two device clocks.

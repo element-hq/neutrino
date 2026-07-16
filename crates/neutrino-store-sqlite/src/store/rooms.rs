@@ -261,7 +261,7 @@ mod tests {
         },
     };
 
-    // R3: missing content.room_version
+    // missing content.room_version
     #[tokio::test]
     async fn create_room_rejects_missing_room_version() {
         let store = store().await;
@@ -279,7 +279,7 @@ mod tests {
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
 
-    // R3a: content.room_version is a JSON number, not a string
+    // content.room_version is a JSON number, not a string
     #[tokio::test]
     async fn create_room_rejects_non_string_room_version() {
         let store = store().await;
@@ -297,7 +297,7 @@ mod tests {
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
 
-    // R3b: content.room_version is the empty string — passes the
+    // content.room_version is the empty string — passes the
     // JSON-shape check but fails `RoomVersionId::from_str` (room version
     // ids must be 1..=32 chars per Matrix spec).
     #[tokio::test]
@@ -317,7 +317,7 @@ mod tests {
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
 
-    // R3c: content.room_version parses as a valid identifier but isn't
+    // content.room_version parses as a valid identifier but isn't
     // the MSC4242 unstable v12. Out of scope for now (CLAUDE.md: only
     // MSC4242-on-v12 targeted) — relax if we ever broaden the target.
     // Covers both the stable `"12"` (which ruma's RoomVersionId::V12
@@ -344,7 +344,7 @@ mod tests {
         }
     }
 
-    // R3d: m.room.create with non-empty prev_events is rejected. v12 spec:
+    // m.room.create with non-empty prev_events is rejected. v12 spec:
     // create is the genesis event, no parents. Without the gate, the
     // create event lands and writes orphan event_edges rows that show up
     // as federation-backfill boundaries on every subsequent DAG walk.
@@ -371,9 +371,9 @@ mod tests {
         assert_eq!(store.room_count().await.unwrap(), 0);
     }
 
-    // R3e: same as R3d but for prev_state_events — the MSC4242 state-DAG
-    // genesis case. The create event itself bootstraps state, so it can't
-    // claim prior state ancestors.
+    // Like the prev_events case, but for prev_state_events — the MSC4242
+    // state-DAG genesis case. The create event itself bootstraps state,
+    // so it can't claim prior state ancestors.
     #[tokio::test]
     async fn create_room_rejects_create_event_with_prev_state_events() {
         use crate::tests::make_event_with_raw_json;
@@ -397,7 +397,7 @@ mod tests {
         assert_eq!(store.room_count().await.unwrap(), 0);
     }
 
-    // R3f: arrays present but empty — accepted (this is the JSON shape
+    // arrays present but empty — accepted (this is the JSON shape
     // our own test helpers emit for the create event).
     #[tokio::test]
     async fn create_room_accepts_empty_prev_arrays() {
@@ -407,7 +407,7 @@ mod tests {
         assert_eq!(store.room_count().await.unwrap(), 1);
     }
 
-    // R4: top-level JSON is a string, not an object
+    // top-level JSON is a string, not an object
     #[tokio::test]
     async fn create_room_rejects_invalid_json_shape() {
         use crate::tests::make_event_with_raw_json;
@@ -424,7 +424,7 @@ mod tests {
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
 
-    // R5: duplicate room_id rejected on second create
+    // duplicate room_id rejected on second create
     #[tokio::test]
     async fn create_room_rejects_duplicate_room_id() {
         let store = store().await;
@@ -437,7 +437,7 @@ mod tests {
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
 
-    // R10: initial_event with mismatched room_id rejected (FK)
+    // initial_event with mismatched room_id rejected (FK)
     #[tokio::test]
     async fn create_room_rejects_initial_event_with_wrong_room_id() {
         let store = store().await;
@@ -448,7 +448,7 @@ mod tests {
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
 
-    // R8: get_room_version on unknown room → None
+    // get_room_version on unknown room → None
     #[tokio::test]
     async fn get_room_version_none_for_unknown() {
         let store = store().await;
@@ -456,7 +456,7 @@ mod tests {
         assert!(store.get_room_version(unknown).await.unwrap().is_none());
     }
 
-    // R9: room_count starts at 0 and increments per create_room
+    // room_count starts at 0 and increments per create_room
     #[tokio::test]
     async fn room_count_zero_then_increments() {
         let store = store().await;
@@ -475,7 +475,7 @@ mod tests {
         assert_eq!(store.room_count().await.unwrap(), 2);
     }
 
-    // R11: empty initial_events slice is allowed
+    // empty initial_events slice is allowed
     #[tokio::test]
     async fn create_room_empty_initial_events_ok() {
         let store = store().await;
@@ -484,7 +484,7 @@ mod tests {
         assert_eq!(store.room_count().await.unwrap(), 1);
     }
 
-    // R6: event_type must be exactly "m.room.create". Schema doesn't
+    // event_type must be exactly "m.room.create". Schema doesn't
     // constrain which event_type lands as the create event, so this is
     // enforced at the trait boundary.
     #[tokio::test]
@@ -505,7 +505,7 @@ mod tests {
         assert_eq!(store.room_count().await.unwrap(), 0);
     }
 
-    // R7a: state_key = None is rejected — v12 m.room.create must have
+    // state_key = None is rejected — v12 m.room.create must have
     // an empty-string state key, not a missing one.
     #[tokio::test]
     async fn create_room_rejects_none_state_key() {
@@ -525,7 +525,7 @@ mod tests {
         assert_eq!(store.room_count().await.unwrap(), 0);
     }
 
-    // R7b: non-empty state_key is rejected.
+    // non-empty state_key is rejected.
     #[tokio::test]
     async fn create_room_rejects_nonempty_state_key() {
         let store = store().await;
@@ -544,7 +544,7 @@ mod tests {
         assert_eq!(store.room_count().await.unwrap(), 0);
     }
 
-    // R12: success path — `create_room` with a valid create event plus
+    // success path — `create_room` with a valid create event plus
     // initial events makes (a) `get_room_version` return
     // `Some(V12)` and (b) every persisted event observable via the
     // EventStore read surface. Covers the rooms INSERT, the room-version
@@ -584,7 +584,7 @@ mod tests {
         assert!(stream_ids.contains(member_id.as_str()));
     }
 
-    // R13: atomic rollback on mid-batch failure. A bad initial event
+    // atomic rollback on mid-batch failure. A bad initial event
     // (membership value the `current_state` CHECK rejects) fires inside
     // the transaction *after* the rooms INSERT, the create event, and
     // an earlier good initial event have already executed. Every one of
@@ -625,7 +625,7 @@ mod tests {
         assert_eq!(cs_count, 0, "current_state not rolled back");
     }
 
-    // R14: subscribe-before-create receives the watch advance. Exercises
+    // subscribe-before-create receives the watch advance. Exercises
     // the "one watch advance for the whole batch" path. Receiver value
     // after the call must equal the last event's `stream_pos`.
     #[tokio::test]
@@ -645,7 +645,7 @@ mod tests {
         assert!(rx.has_changed().unwrap());
     }
 
-    // R15: a failed `create_room` must NOT advance the watch. The notify
+    // a failed `create_room` must NOT advance the watch. The notify
     // call sits after `tx.commit()?` so this is structurally safe, but
     // the regression test guards against someone moving the notify
     // earlier.
@@ -673,7 +673,7 @@ mod tests {
         assert!(!rx.has_changed().unwrap());
     }
 
-    // R16: every initial state event lands in `current_state`. Trait
+    // every initial state event lands in `current_state`. Trait
     // postcondition: "current state reflects all initial state events."
     // StateStore is not yet implemented on `SqliteStore`, so this test
     // reads `current_state` directly rather than going through the
@@ -728,7 +728,7 @@ mod tests {
         assert_eq!(member_row.1.as_deref(), Some("join"));
     }
 
-    // R17: `create_room` must not create outbox entries — there are no
+    // `create_room` must not create outbox entries — there are no
     // remote members on a fresh room. FederationOutbox isn't implemented
     // yet, so query the outbox table directly.
     #[tokio::test]
@@ -748,7 +748,7 @@ mod tests {
         assert_eq!(outbox_count, 0);
     }
 
-    // R18: initial_events land in `events` in input order and that order
+    // initial_events land in `events` in input order and that order
     // is the ascending `stream_pos` order. The contract for `events_after`
     // is "ascending stream order"; this asserts that ordering matches
     // the input slice for the create-room batch.
@@ -799,7 +799,7 @@ mod tests {
         assert!(positions.windows(2).all(|w| w[0] < w[1]));
     }
 
-    // R19: duplicate event_id within the `initial_events` batch is
+    // duplicate event_id within the `initial_events` batch is
     // rejected (UNIQUE on events.event_id) and the whole batch rolls
     // back. Covers both the rejection (InvalidInput) and the atomicity.
     #[tokio::test]
@@ -822,13 +822,12 @@ mod tests {
         assert!(stream.is_empty());
     }
 
-    // R20: the schema-level `CHECK (room_version = 'org.matrix.msc4242.12')`
+    // the schema-level `CHECK (room_version = 'org.matrix.msc4242.12')`
     // on `rooms` rejects any attempt to write a different room_version,
     // including the bypass path this test exercises (raw UPDATE outside
-    // the trait's `create_room` validation gate). Before the CHECK,
-    // `get_room_version` had to defensively parse the column on read and
-    // map a failure to `Internal`; now the bad row can't exist in the
-    // first place, so the defence-in-depth has moved one layer down.
+    // the trait's `create_room` validation gate). The CHECK is the
+    // authoritative defence, so the bad row can't reach the
+    // `get_room_version` read-path that would otherwise have to parse it.
     #[tokio::test]
     async fn rooms_check_constraint_rejects_non_msc4242_room_version() {
         let store = store().await;
@@ -853,7 +852,7 @@ mod tests {
         );
     }
 
-    // FE1: forward_extremities for an unknown room → None.
+    // forward_extremities for an unknown room → None.
     #[tokio::test]
     async fn forward_extremities_unknown_room_is_none() {
         let store = store().await;
@@ -864,7 +863,7 @@ mod tests {
         assert!(got.is_none());
     }
 
-    // FE2: a freshly created room (create event only) seeds both head-sets
+    // a freshly created room (create event only) seeds both head-sets
     // to the create event — createRoom writes a linear state chain whose last
     // event is the sole head of both DAGs.
     #[tokio::test]

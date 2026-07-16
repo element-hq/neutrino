@@ -25,7 +25,7 @@ use crate::{Event, ReferenceError};
 ///   state event), and not be rejected.
 ///
 /// Create events bypass all checks: they introduce the room, they have no
-/// `prev_state_events` (wire-format rule F4), and they are the create event whose
+/// `prev_state_events` (wire-format rule), and they are the create event whose
 /// existence rule 2 demands.
 pub fn validate_references(
     event: &Event,

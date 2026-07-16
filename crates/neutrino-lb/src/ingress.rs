@@ -376,8 +376,8 @@ mod tests {
     }
 
     // Proves the localhost/127.0.0.1 address-family mismatch is what turns a
-    // federated invite into a 502 (the "Empty Room" failure in
-    // create-room-fail.log). Production binds the homeserver v4-only
+    // federated invite into a 502 (the "Empty Room" failure). Production binds
+    // the homeserver v4-only
     // (`neutrino_main: listening on 127.0.0.1:8008`) but the ingress upstream is
     // the *hostname* `http://localhost:8008` (upstream_url passes a non-numeric
     // bind_addr through verbatim). On Android `localhost` also resolves to `::1`,

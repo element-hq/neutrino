@@ -667,9 +667,9 @@ mod tests {
         assert_eq!(got[0].1, Membership::Leave);
     }
 
-    // S14 (renumbered → S15 below): the old "unknown membership string"
-    // case is now unrepresentable at the type boundary — `Membership` is
-    // a closed enum, so no caller can ask for a bogus value.
+    // No S14: an unknown membership string is unrepresentable at the type
+    // boundary — `Membership` is a closed enum, so no caller can ask for a
+    // bogus value.
 
     // S15
     #[tokio::test]
@@ -1153,9 +1153,7 @@ mod tests {
     // S26: end-to-end — persist_event on an m.room.member whose JSON
     // lacks `content.membership` surfaces InvalidInput rather than
     // silently writing a NULL-membership current_state row. This pins
-    // the new persist_event behaviour at the trait boundary; previously
-    // the malformed event landed silently and only manifested as
-    // missing rows on the read side.
+    // persist_event's rejection behaviour at the trait boundary.
     #[tokio::test]
     async fn persist_event_rejects_member_without_membership() {
         let s = store().await;

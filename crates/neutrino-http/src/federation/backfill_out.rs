@@ -2,7 +2,7 @@
 //! our backward extremities, persist the fresh, correct-room ones as history.
 //! Best-effort — every fault logs and yields 0; the next pagination retries.
 //!
-//! Ties together the storage primitives from the earlier tasks
+//! Ties together the storage primitives
 //! ([`backward_extremities`](neutrino_store::DagStore::backward_extremities),
 //! [`joined_servers`](neutrino_store::StateStore::joined_servers),
 //! [`get_events`](neutrino_store::EventStore::get_events),

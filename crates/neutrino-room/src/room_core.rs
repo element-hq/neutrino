@@ -924,7 +924,7 @@ mod tests {
 
     #[test]
     fn apply_foreign_room_id_rejected() {
-        // C1: an event whose room_id doesn't match the RoomCore's room_id is
+        // An event whose room_id doesn't match the RoomCore's room_id is
         // refused upfront, even if the foreign room is well-formed and
         // present in the provider.
         let our_create = Arc::new(create_event("@alice:example.org"));
@@ -951,7 +951,7 @@ mod tests {
 
     #[test]
     fn apply_event_already_in_forward_extremities_is_noop() {
-        // C3: re-applying a state event that is already a forward extremity
+        // Re-applying a state event that is already a forward extremity
         // returns an empty effects list and does not mutate the RoomCore.
         let create = Arc::new(create_event("@alice:example.org"));
         let room_id = room_id_from_create(&create.event_id);
@@ -1053,7 +1053,7 @@ mod tests {
 
     #[test]
     fn apply_redelivered_non_state_event_is_noop() {
-        // Idempotency is now persisted-based: once the caller has honoured the
+        // Idempotency is persisted-based: once the caller has honoured the
         // first `Persist` (here: inserting into the provider), a re-delivered
         // copy is a no-op. This mirrors real usage — the actor persists the
         // event before any federation re-send can arrive.
@@ -1122,7 +1122,7 @@ mod tests {
 
     #[test]
     fn apply_soft_failed_event_does_not_advance_timeline_head() {
-        // I1 / synapse#5269: a soft-failed event is persisted but must NOT
+        // synapse#5269: a soft-failed event is persisted but must NOT
         // become a forward extremity nor drop the parents it references.
         // Setup: alice joins, then leaves. A message that claims its
         // state-before is the (stale) join passes step-3 auth but soft-fails

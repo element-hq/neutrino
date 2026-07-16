@@ -1,6 +1,6 @@
 //! v1 HTTP+CBOR wire transport. `HttpWireClient` (egress→peer) and
-//! `HttpWireServer` (peer→ingress). The CoAP/UDP transport will be a sibling
-//! module selected in `crate::serve`.
+//! `HttpWireServer` (peer→ingress). The CoAP/UDP transport is a sibling module
+//! (`coap`) selected in `crate::serve`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

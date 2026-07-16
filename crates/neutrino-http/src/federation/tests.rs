@@ -1589,7 +1589,7 @@ async fn seed_joined_room() -> (
     TempDir,
 ) {
     // Default to a no-progress fetcher: the in-order tests never trigger
-    // gap-fill, and the one that does (`…unfillable_missing_ancestry`) wants
+    // gap-fill, and the one that does (`send_unfillable_ancestry_stays_unapplied`) wants
     // exactly "the peer has nothing" — deterministic, no network.
     seed_joined_room_with_fetcher(StubFetcher::no_progress()).await
 }
@@ -1673,7 +1673,7 @@ fn topic_on(
 
 // ── async-worker poll helpers ────────────────────────────────────────────────
 //
-// `/send` now stages PDUs and returns 200 immediately; the background worker
+// `/send` stages PDUs and returns 200 immediately; the background worker
 // (`federation::worker`, auto-spawned by the test router) integrates them
 // asynchronously. So the e2e tests assert the *immediate* response, then poll
 // the store for the eventual outcome. ~5s budget at 10ms granularity — the
@@ -1931,8 +1931,8 @@ async fn send_semantically_malformed_ancestor_terminates_via_cascade_reject() {
 
 #[tokio::test]
 async fn send_gapfills_missing_ancestry_then_accepts() {
-    // The success path that was inert under the old `NoFetcher`: a PDU arrives
-    // referencing an `orphan` we don't hold; the fetcher supplies the orphan,
+    // The success path: a PDU arrives referencing an `orphan` we don't hold; the
+    // fetcher supplies the orphan,
     // it is staged → promoted (authed) → and the child is then accepted. Both
     // events end up committed.
     let fetcher = StubFetcher::no_progress();
@@ -2006,7 +2006,7 @@ async fn send_gapfills_missing_ancestry_then_accepts() {
 async fn send_gapfill_fetch_targets_frontier_and_state_boundary() {
     // Pin the outbound fetch arguments: `latest` is the triggering event (the
     // walk-from point), `earliest` is the room's *state-DAG* forward extremity
-    // (not the timeline one — the `state_dag_boundary` this PR introduced), and
+    // (not the timeline one — the `state_dag_boundary`), and
     // the first round uses the initial limit. A no-progress fetcher records one
     // call; the resulting unfillable error is irrelevant here.
     let fetcher = StubFetcher::no_progress();
@@ -2230,9 +2230,9 @@ async fn send_toposorts_out_of_order_batch() {
 #[tokio::test]
 async fn send_handles_duplicate_pdu_in_batch() {
     // A peer repeats the same PDU bytes in one transaction, and a third event
-    // references it. Before the dedup fix this underflowed `toposort`'s
-    // indegree bookkeeping (panic in debug). Now the duplicate is dropped and
-    // both distinct events are accepted.
+    // references it. The duplicate must be dropped before staging, or
+    // `toposort`'s indegree bookkeeping underflows (panic in debug); both
+    // distinct events are accepted.
     let (store, _tempfile) = fresh_store().await;
     let alice = alice();
     let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
@@ -2259,7 +2259,7 @@ async fn send_handles_duplicate_pdu_in_batch() {
 
     // `join` appears twice, `msg` (which references join) once. The handler
     // dedups by event_id before staging (and staging is event_id-keyed), so the
-    // worker's toposort never sees the duplicate that used to underflow it.
+    // worker's toposort never sees the duplicate that would otherwise underflow it.
     let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&join, &join, &msg])).await;
 
     assert_eq!(status, StatusCode::OK, "body = {body}");
@@ -2608,7 +2608,7 @@ async fn reconcile_converges_on_advertised_head() {
 
 #[tokio::test]
 async fn reconcile_ignores_advertisement_from_non_member_peer() {
-    // #5 honour-side: the advertising peer (TEST_PEER) is NOT a member of the room
+    // Honour-side: the advertising peer (TEST_PEER) is NOT a member of the room
     // (only alice, local, is). The honour-path's membership gate must drop the
     // advertisement *without issuing any fetch* — an unauthenticated peer can't
     // induce us to pull for a room it isn't in. Unit-tests `reconcile_room`
@@ -2648,7 +2648,7 @@ async fn reconcile_ignores_advertisement_from_non_member_peer() {
 
 #[tokio::test]
 async fn backfill_rejects_non_member_origin() {
-    // #5 for the backfill consumer (same `server_in_room` gate, separate handler).
+    // The backfill consumer uses the same `server_in_room` gate (separate handler).
     // The room is shared only with TEST_PEER.
     let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(2).await;
     let path = backfill_path(room_id.as_str(), &[msgs[1].as_str()], Some(10));
@@ -3620,7 +3620,7 @@ fn parse_server_names_handles_repeats_and_encoded_colon() {
     assert!(parse_server_names(None).is_empty());
 }
 
-// --- additional make_join / send_join / ingest coverage (review fixups) ---
+// --- additional make_join / send_join / ingest coverage ---
 
 /// Parse an event's canonical wire bytes into a JSON `Value` (for embedding in
 /// a stub resident's canned responses).
@@ -4018,7 +4018,7 @@ async fn invite_oob_stores_stub_and_returns_event() {
 /// An invite for a room we DO host is not an error (the inviting server may not
 /// know we're resident): it is staged and integrated through the worker via
 /// `apply_pdu` (auth + state-res + persist) — landing in `current_state` — NOT
-/// stored as an out-of-band stub. (2026-06-05 decision.)
+/// stored as an out-of-band stub.
 #[tokio::test]
 async fn invite_for_hosted_room_applies_via_worker_not_oob_stub() {
     // We host the room; alice is the joined creator (power to invite).
@@ -4043,7 +4043,7 @@ async fn invite_for_hosted_room_applies_via_worker_not_oob_stub() {
     .await;
     assert_eq!(status, StatusCode::OK, "body = {body}");
 
-    // Decision 3: hosted-room invite is applied (committed + current_state),
+    // A hosted-room invite is applied (committed + current_state),
     // not parked as an OOB stub.
     let committed = wait_committed(&store, invite_id.as_ref()).await;
     assert!(
@@ -4338,7 +4338,7 @@ async fn outbound_invite_peer_403_persists_nothing() {
 }
 
 /// Inbound `/invite/v2` for a room we DO host, authored by an **unauthorised**
-/// remote inviter (not in the room, no power): the decision-3 path stages it and
+/// remote inviter (not in the room, no power): the hosted-room path stages it and
 /// the worker integrates it through `apply_pdu`, which auth-REJECTS it. The
 /// invitee must NOT end up in current_state, and must NOT fall back to an
 /// out-of-band stub. (Exercises the hosted-room reject branch — the one most
@@ -4918,7 +4918,7 @@ async fn reject_then_reinvite_resurrects_stub() {
     let invite_id = invite.event_id.clone();
     let path = invite_path(room_id.as_str(), invite_id.as_str());
     // The invite's sender lives on `dead`; the inbound X-Matrix origin must own
-    // it (OOB-branch SEC1 check), so advertise that server explicitly rather than
+    // it (the OOB-branch origin-ownership check), so advertise that server explicitly rather than
     // relying on `drive`'s default injected origin.
     let auth = xm(dead.as_str());
 
@@ -5115,7 +5115,7 @@ async fn membership_handshake_rejects_wrong_origin() {
 
 #[tokio::test]
 async fn invite_oob_rejects_forged_sender() {
-    // SEC1 regression: an out-of-band invite (room we don't host) must have the
+    // An out-of-band invite (room we don't host) must have the
     // authenticated origin own the inviter, or an authenticated peer could plant a
     // stub with a forged sender that sync surfaces verbatim. The injected origin
     // is TEST_PEER (remote.example.org); the invite's sender is on bank.example.

@@ -1056,7 +1056,7 @@ mod tests {
         (code, opts)
     }
 
-    // The 1a wire pin (Wireshark CBOR reassembly): request PDUs must NOT carry
+    // The wire pin (Wireshark CBOR reassembly): request PDUs must NOT carry
     // Q-Block2 (option 31). Wireshark keeps one block-state slot per message
     // and dissects options in ascending number order, so a request-side
     // Q-Block2 (31 > Q-Block1's 19) clobbered the real Q-Block1 state and left
@@ -1208,7 +1208,7 @@ mod tests {
         shutdown(token, handle).await;
     }
 
-    // SECURITY (SEC1): the authenticated peer is NODE_A, but the request claims to
+    // SECURITY: the authenticated peer is NODE_A, but the request claims to
     // be NODE_B. That is impersonation over an authenticated link and MUST be
     // rejected with 401 before the handler runs — the EchoHandler can only ever
     // return 200, so a 401 proves the binding refused it pre-dispatch.

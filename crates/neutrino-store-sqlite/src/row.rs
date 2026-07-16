@@ -1,6 +1,6 @@
 //! Row ↔ event I/O. Single source of truth for the column shape on both
 //! the SELECT side (hydration into `Event`) and the INSERT side
-//! ([`EventRow::write_into_tx`]). Per design doc §3: keeping this in one
+//! ([`EventRow::write_into_tx`]). Keeping this in one
 //! place means the SELECTs and INSERTs in `store/{events,state,dag,outbox}.rs`
 //! all agree on what they project, and a schema change touches one file.
 //!
@@ -559,7 +559,7 @@ impl<'a> EventRow<'a> {
 mod tests {
     use super::{EVENT_COLUMNS, EVENT_COLUMNS_PREFIXED};
 
-    // C1: drift guard between the two column-list consts. If someone edits
+    // Drift guard between the two column-list consts. If someone edits
     // one and forgets the other, this test catches it. The two consts are
     // intentionally hand-written (clearer at the query call sites) rather
     // than macro-generated; this is the cost of that choice.

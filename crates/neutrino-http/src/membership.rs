@@ -345,8 +345,8 @@ async fn targeted(
 }
 
 /// `POST /rooms/{roomId}/invite` — invite `body.user_id` to the room. A
-/// **local** invitee emits an `m.room.member` event through the actor (as
-/// before). A **remote** invitee (a v12 room id carries no server, so "remote"
+/// **local** invitee emits an `m.room.member` event through the actor. A
+/// **remote** invitee (a v12 room id carries no server, so "remote"
 /// is decided by the target's domain vs ours) takes the federated path —
 /// `federation::invite::federated_invite` (federate-then-persist, atomic).
 pub(crate) async fn invite(
