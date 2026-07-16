@@ -819,11 +819,11 @@ mod tests {
         let ev = parse_event(raw(base_create()), eid("$create:example.org"), vec![])
             .expect("valid create");
         assert_eq!(ev.event_type, "m.room.create");
-        // F5 sister-check: room_id derived from event_id sigil swap.
+        // room_id is derived from the event_id via sigil swap.
         assert_eq!(ev.room_id.as_str(), "!create:example.org");
     }
 
-    // ---------- F15: auth_events present ----------
+    // ---------- auth_events present ----------
     #[test]
     fn rejects_auth_events_on_wire() {
         let mut v = base_event();
@@ -834,7 +834,7 @@ mod tests {
         ));
     }
 
-    // ---------- F1 / F2: too many prev_(state_)events (validate_pdu) ----------
+    // ---------- too many prev_(state_)events (validate_pdu) ----------
     #[test]
     fn validate_pdu_rejects_prev_events_over_20() {
         let mut v = base_event();
@@ -865,7 +865,7 @@ mod tests {
         ));
     }
 
-    // ---------- F3 / F4: create has prev_(state_)events (validate_pdu) ----------
+    // ---------- create has prev_(state_)events (validate_pdu) ----------
     #[test]
     fn validate_pdu_rejects_create_with_prev_events() {
         let mut v = base_create();
@@ -913,7 +913,7 @@ mod tests {
         ));
     }
 
-    // ---------- F5: create has room_id (parse_event — wire-only check) ----------
+    // ---------- create has room_id (parse_event — wire-only check) ----------
     #[test]
     fn rejects_create_with_room_id() {
         let mut v = base_create();
@@ -924,7 +924,7 @@ mod tests {
         ));
     }
 
-    // ---------- F6: unrecognised room_version (validate_pdu) ----------
+    // ---------- unrecognised room_version (validate_pdu) ----------
     #[test]
     fn validate_pdu_rejects_unrecognised_room_version() {
         let mut v = base_create();
@@ -938,15 +938,15 @@ mod tests {
 
     #[test]
     fn validate_pdu_accepts_create_without_room_version_field() {
-        // Per Kegan's call on F6: "default value" handling is separate from
-        // "is value valid". When room_version is absent we don't reject.
+        // "default value" handling is separate from "is value valid": when
+        // room_version is absent we don't reject.
         let mut v = base_create();
         v["content"] = json!({});
         let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
         validate_pdu(&ev).expect("absent room_version is permitted");
     }
 
-    // ---------- F7: additional_creators (validate_pdu) ----------
+    // ---------- additional_creators (validate_pdu) ----------
     #[test]
     fn validate_pdu_rejects_additional_creators_non_array() {
         let mut v = base_create();
@@ -982,7 +982,7 @@ mod tests {
         validate_pdu(&ev).expect("valid additional_creators");
     }
 
-    // ---------- F8: m.room.member missing parts (validate_pdu) ----------
+    // ---------- m.room.member missing parts (validate_pdu) ----------
     #[test]
     fn validate_pdu_rejects_member_without_state_key() {
         let mut v = base_event();
@@ -1009,7 +1009,7 @@ mod tests {
         ));
     }
 
-    // ---------- F10: rule 9 (@-prefixed state_key must match sender) (validate_pdu) ----------
+    // ---------- rule 9 (@-prefixed state_key must match sender) (validate_pdu) ----------
     #[test]
     fn validate_pdu_rejects_at_state_key_mismatch() {
         let mut v = base_event();
@@ -1054,7 +1054,7 @@ mod tests {
         validate_pdu(&ev).expect("m.room.member with different state_key/sender is valid");
     }
 
-    // ---------- F11 / F12 / F13: power_levels content (validate_pdu) ----------
+    // ---------- power_levels content (validate_pdu) ----------
     #[test]
     fn validate_pdu_rejects_power_levels_non_integer_int_field() {
         let mut v = base_event();
@@ -1128,7 +1128,7 @@ mod tests {
         validate_pdu(&ev).expect("valid power_levels");
     }
 
-    // ---------- F14: malformed IDs ----------
+    // ---------- malformed IDs ----------
     #[test]
     fn rejects_malformed_sender() {
         let mut v = base_event();
@@ -1168,7 +1168,7 @@ mod tests {
         ));
     }
 
-    // ---------- F16 / F17 / F18 / F19 / F20 / F22: required PDU fields ----------
+    // ---------- required PDU fields ----------
     #[test]
     fn rejects_missing_type() {
         let mut v = base_event();

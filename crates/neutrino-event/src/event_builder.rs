@@ -656,8 +656,7 @@ mod tests {
     fn build_surfaces_parse_event_error_when_caller_violates_rule_1_1() {
         // The builder doesn't reject every shape that `parse_event` rejects
         // — e.g. a create event with `prev_events` set passes the skeleton
-        // checks but trips v12 rule 1.1. Previously this `.expect`-panicked
-        // from inside `build()`; now the `FormatError` bubbles up so the
+        // checks but trips v12 rule 1.1. The `FormatError` bubbles up so the
         // caller sees the specific rule that fired.
         let err = EventBuilder::new(user("@a:d"), "m.room.create".to_owned())
             .state_key(String::new())
