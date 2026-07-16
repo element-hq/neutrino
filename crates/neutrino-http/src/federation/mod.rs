@@ -222,8 +222,17 @@ pub(crate) fn complete_membership_template(
 ) -> Option<neutrino_event::Event> {
     use neutrino_event::event_builder::{EventBuilder, from_wire};
     let raw = serde_json::value::RawValue::from_string(template.get().to_owned()).ok()?;
+    // Only the DAG pointers are taken from the template (never echoed — the
+    // event is rebuilt below and re-validated by `EventBuilder::build`), so a
+    // `Wire::Rejected` template is as usable as a valid one.
     let parsed = match from_wire(raw, Vec::new()) {
-        Ok(parsed) => parsed,
+        Ok(neutrino_event::Wire::Valid(ev)) => ev,
+        Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
+            // Usable (only the pointers are taken), but log it: the resident
+            // server handed us a malformed make_* template.
+            tracing::warn!(target: "neutrino_http", %room_id, %user, membership, %defect, "membership template from resident server is Wire::Rejected (rebuilding from its DAG pointers)");
+            ev
+        }
         Err(e) => {
             tracing::warn!(target: "neutrino_http", %room_id, %user, membership, error = %e, "could not parse the membership template from the resident server");
             return None;

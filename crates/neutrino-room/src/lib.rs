@@ -64,6 +64,18 @@ pub enum AuthError {
     #[error("m.room.create for the room could not be resolved")]
     CreateUnavailable,
 
+    /// A state event's content violates a shape that `validate_pdu`
+    /// guarantees for every accepted event (integer power levels, string
+    /// `additional_creators`, …). Unreachable through the live pipeline —
+    /// rejected events never enter a state map — so this indicates DB
+    /// corruption or a validation regression. Surfaced as an error rather
+    /// than a panic so one bad row can't crash the room actor.
+    #[error("state event `{event_type}` content is malformed: {detail}")]
+    MalformedStateContent {
+        event_type: &'static str,
+        detail: &'static str,
+    },
+
     /// `m.room.member` state_key did not parse as a Matrix user id (rule 9
     /// exempts `m.room.member` from the `@`-state_key format check, so rule 5
     /// is the first place this is detected). Raised by 5.4 / 5.5 / 5.6.
@@ -246,9 +258,10 @@ pub enum ReferenceError {
     RoomRejected(OwnedRoomId),
 
     /// v12 rule 2 (defensive): the event found at the derived create-event ID
-    /// is not actually an `m.room.create` event. Should be impossible for a
-    /// well-formed store but worth the explicit reject path.
-    #[error("event at derived create id is not m.room.create: {0}")]
+    /// is not a well-formed `m.room.create` — either the wrong `type` or a
+    /// non-empty `state_key`. Should be impossible for a well-formed store but
+    /// worth the explicit reject path.
+    #[error("event at derived create id is not a well-formed m.room.create: {0}")]
     RoomTypeMismatch(OwnedEventId),
 
     /// MSC4242: "If there are entries which were themselves rejected under

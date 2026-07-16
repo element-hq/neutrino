@@ -83,10 +83,18 @@ async fn persist_pdus(
 ) -> usize {
     let mut persisted = 0usize;
     for raw in pdus.into_iter().take(limit as usize) {
-        // `from_wire` derives the id from the reference hash; an unparseable PDU
-        // is dropped, exactly as the inbound `/send` path does.
+        // `from_wire` derives the id from the reference hash; an unparseable
+        // or drop-class PDU is dropped, exactly as the inbound `/send` path
+        // does. A `Wire::Rejected` event persists *as rejected* — history
+        // must carry the verdict so a descendant's reference check
+        // cascade-rejects, and so the malformed content can never surface as
+        // an accepted row (clients filter rejected; state-res excludes it).
         let event = match from_wire(raw, Vec::new()) {
-            Ok(event) => event,
+            Ok(neutrino_event::Wire::Valid(ev)) => ev,
+            Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
+                warn!(target: "neutrino_http", %room_id, event_id = %ev.event_id, %defect, "backfill: serving malformed PDU as rejected");
+                ev
+            }
             Err(e) => {
                 warn!(target: "neutrino_http", %room_id, error = %e, "backfill: skipping unparseable PDU");
                 continue;
@@ -323,6 +331,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backfill_once_persists_malformed_pdu_as_rejected() {
+        // The Wire contract at the backfill ingress: a semantically-malformed
+        // PDU (rule 5.1 — member without membership) fetched via /backfill
+        // must persist AS REJECTED, never as an accepted row — otherwise it
+        // would leak into client timelines, pass descendants' rule-2.3
+        // reference checks, and expose the auth machinery to malformed
+        // content via state walks. Hand-rolled wire JSON: EventBuilder
+        // refuses to produce it, and the wrong content hash is fine (member
+        // redaction keeps `membership`, which is absent — the defect
+        // survives).
+        let (store, _dir) = fresh_store().await;
+        let (stub, dest) = PeerStub::spawn().await;
+        let (room_id, _create) = seed_room_with_extremity(&store, &[alice(), user_on(&dest)]).await;
+        let bad_raw = json!({
+            "type": "m.room.member",
+            "state_key": "@mallory:remote.example.org",
+            "sender": alice().as_str(),
+            "room_id": room_id.as_str(),
+            "content": {},
+            "prev_events": ["$ghost:remote.example.org"],
+            "prev_state_events": [],
+            "origin_server_ts": 1_700_000_000_000u64,
+            "hashes": { "sha256": "wrong" },
+        })
+        .to_string();
+        let bad_id = from_wire(
+            serde_json::value::RawValue::from_string(bad_raw.clone()).expect("valid JSON"),
+            Vec::new(),
+        )
+        .expect("parseable")
+        .into_event()
+        .event_id;
+        stub.set_pdus(vec![bad_raw]);
+
+        let client = FederationClient::new(OWN.to_owned(), None);
+        let n = backfill_once(&store, &client, OWN, &room_id, 10).await;
+        assert_eq!(n, 1, "the rejected row still counts as persisted");
+        let got = store.get_events(&[bad_id.as_ref()]).await.expect("read");
+        assert_eq!(got.len(), 1, "the malformed PDU must be persisted");
+        assert!(got[0].rejected, "…and must carry the rejected verdict");
+    }
+
+    #[tokio::test]
     async fn backfill_once_caps_persisted_at_limit() {
         // The peer returns MORE fresh, correct-room PDUs than the requested
         // `limit`. The defensive `.take(limit)` in `persist_pdus` must bound
@@ -381,7 +432,8 @@ mod tests {
             serde_json::value::RawValue::from_string(held_raw.clone()).unwrap(),
             Vec::new(),
         )
-        .expect("parse held");
+        .expect("parse held")
+        .into_event();
         store
             .persist_historical_event(&held)
             .await
@@ -420,7 +472,8 @@ mod tests {
             serde_json::value::RawValue::from_string(held_raw.clone()).unwrap(),
             Vec::new(),
         )
-        .expect("parse held");
+        .expect("parse held")
+        .into_event();
         store
             .persist_historical_event(&held)
             .await

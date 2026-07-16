@@ -62,7 +62,11 @@ pub async fn entrypoint(
     // Open the store once, here, and resolve the server's stable identity from
     // it before anything reads `config`. The same handle is threaded into the
     // homeserver (`serve`) so the database is opened exactly once.
-    let store = Arc::new(SqliteStore::open_in_dir(&config.storage_dir).await?);
+    let store = Arc::new(
+        SqliteStore::open_in_dir(&config.storage_dir)
+            .await?
+            .client_hides_soft_failed(config.enable_soft_failure),
+    );
     let secret = resolve_server_identity(&mut config, &store).await?;
 
     // The local display name, sourced from the store (the client sets it via

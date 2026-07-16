@@ -108,6 +108,13 @@ pub enum FormatError {
     #[error("m.room.create event has a room_id field")]
     CreateHasRoomId,
 
+    /// `m.room.create` is a state event and its `state_key` must be `""`
+    /// (missing or non-empty is malformed). Not a valid PDU rather than an
+    /// auth-rule failure: a create can never ground a room under a non-empty
+    /// key, so it is dropped, not persisted rejected.
+    #[error("m.room.create event has a non-empty or missing state_key")]
+    CreateBadStateKey,
+
     /// v12 rule 1.3: "If `content.room_version` is present and is not a
     /// recognised version, reject."
     #[error("unrecognised room_version: {0}")]
@@ -151,6 +158,76 @@ pub enum FormatError {
     /// reject."
     #[error("power_levels users field is not {{valid-user-id: int}}")]
     PowerLevelsBadUsers,
+}
+
+/// What a [`validate_pdu`] failure means for a federation PDU, mirroring the
+/// spec's own split:
+///
+/// - [`Drop`](SemanticVerdict::Drop) — S-S receipt-check 1's "not a valid
+///   event": wire-shape errors, size limits, DAG fan-in caps, and the create
+///   structural rules. Such an event never enters the system (synapse's
+///   `unpersistable` class). For creates specifically, dropping also sidesteps
+///   the fact that a rejected create has no room row to persist under
+///   (`events.room_id` FK) — with hash-derived room ids the room simply never
+///   grounds.
+/// - [`Reject`](SemanticVerdict::Reject) — a **state-independent auth rule**
+///   (v12 rules 9, 5.1, 10.1–10.3): the spec's verdict is *reject*, so the
+///   event is persisted with `rejected = true` and a descendant referencing it
+///   in `prev_state_events` cascade-rejects (MSC4242 rule 2.3) instead of
+///   gapfill-refetching a dropped offender forever.
+///
+/// The gapfill wedge-termination is **reject-class only**. A *drop-class*
+/// defect on an event that a descendant references in `prev_state_events` is
+/// NOT terminated: the offender is never staged, so the descendant's
+/// `PrevStateNotFound` re-requests it on every retry indefinitely (the worker
+/// backoff caps the frequency, not the total attempts). This residual is
+/// accepted because the drop-class conditions (oversize, DAG fan-in caps,
+/// create-structural rules) are not ones a well-behaved peer's referenced
+/// state event should ever hit — a peer emitting them is already
+/// malfunctioning. If that assumption ever fails in practice, the fix is to
+/// re-tier the offending condition into `Reject`, not to special-case gapfill.
+///
+/// The match is deliberately **exhaustive with no wildcard**: adding a
+/// `FormatError` variant is a compile error here until it is classified, so a
+/// new rule can never silently default to Drop and re-grow the refetch wedge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticVerdict {
+    Drop,
+    Reject,
+}
+
+/// Classify a [`validate_pdu`] failure. See [`SemanticVerdict`].
+pub fn semantic_verdict(err: &FormatError) -> SemanticVerdict {
+    use SemanticVerdict::{Drop, Reject};
+    match err {
+        // Receipt-check 1 / PDU schema / size limits: not a valid event.
+        FormatError::InvalidJson(_)
+        | FormatError::MissingField(_)
+        | FormatError::InvalidFieldType { .. }
+        | FormatError::MalformedId { .. }
+        | FormatError::NonCanonical(_)
+        | FormatError::EventTooLarge
+        | FormatError::FieldTooLong(_)
+        | FormatError::AuthEventsPresent
+        | FormatError::TooManyPrevEvents
+        | FormatError::TooManyPrevStateEvents
+        // Create structural + content rules (1.1–1.4): see the FK rationale
+        // on the enum docs.
+        | FormatError::CreateHasPrevEvents
+        | FormatError::CreateHasPrevStateEvents
+        | FormatError::CreateHasRoomId
+        | FormatError::CreateBadStateKey
+        | FormatError::UnrecognisedRoomVersion(_)
+        | FormatError::InvalidAdditionalCreators => Drop,
+
+        // State-independent auth rules: the spec says reject.
+        FormatError::StateKeyAtSignSenderMismatch
+        | FormatError::MemberMissingStateKey
+        | FormatError::MemberMissingMembership
+        | FormatError::PowerLevelsBadIntField(_)
+        | FormatError::PowerLevelsBadObjectField(_)
+        | FormatError::PowerLevelsBadUsers => Reject,
+    }
 }
 
 /// Parse a raw event JSON into an `Event`. Wire-format only:
@@ -377,18 +454,26 @@ pub fn validate_pdu(event: &Event) -> Result<(), FormatError> {
         if !event.prev_state_events.is_empty() {
             return Err(FormatError::CreateHasPrevStateEvents);
         }
+        // A create is a state event with an empty state_key.
+        if event.state_key.as_deref() != Some("") {
+            return Err(FormatError::CreateBadStateKey);
+        }
     }
 
     // v12 rule 9: "If the event has a `state_key` that starts with an `@`
     // and does not match the `sender`, reject."
     //
-    // Rule 5 (m.room.member) is terminal for membership events and has its
-    // own rules about sender / state_key (the state_key is the *target*
-    // user, not the sender — that's how invites and kicks work). So rule 9
-    // must not apply to m.room.member events. Synapse's `event_auth.py`
-    // does the same exclusion.
-    if event.event_type != "m.room.member"
-        && let Some(sk) = &event.state_key
+    // Exemptions — types whose spec rules are *terminal* before rule 9 is
+    // ever evaluated, matching synapse's control flow in `event_auth.py`:
+    // - rule 1 (m.room.create): "Otherwise, allow" ends evaluation.
+    // - rule 5 (m.room.member): terminal, and its state_key is the *target*
+    //   user, not the sender — that's how invites and kicks work.
+    // - rule 7 (m.room.third_party_invite): "Allow if and only if …" is
+    //   terminal; its state_key is an opaque token that may start with `@`.
+    if !matches!(
+        event.event_type.as_str(),
+        "m.room.member" | "m.room.create" | "m.room.third_party_invite"
+    ) && let Some(sk) = &event.state_key
         && sk.starts_with('@')
         && sk != event.sender.as_str()
     {
@@ -596,6 +681,97 @@ mod tests {
         serde_json::value::to_raw_value(&v).expect("test fixture")
     }
 
+    /// Every `FormatError` variant's verdict, pinned one by one. The match in
+    /// `semantic_verdict` is exhaustive (adding a variant breaks the compile
+    /// until classified); this pins the *chosen* class so a variant can't be
+    /// silently re-tiered — REJECT→DROP re-grows the gapfill-refetch wedge,
+    /// DROP→REJECT persists events the spec says are not valid events.
+    #[test]
+    fn semantic_verdict_classification_is_pinned_per_variant() {
+        use SemanticVerdict::{Drop, Reject};
+        let io_err = || serde_json::from_str::<Value>("{").unwrap_err();
+        let cases: Vec<(FormatError, SemanticVerdict)> = vec![
+            (FormatError::InvalidJson(io_err()), Drop),
+            (FormatError::MissingField("type"), Drop),
+            (
+                FormatError::InvalidFieldType {
+                    field: "content",
+                    expected: "object",
+                },
+                Drop,
+            ),
+            (
+                FormatError::MalformedId {
+                    field: "sender",
+                    value: "x".into(),
+                },
+                Drop,
+            ),
+            (FormatError::EventTooLarge, Drop),
+            (FormatError::FieldTooLong("type"), Drop),
+            (FormatError::AuthEventsPresent, Drop),
+            (FormatError::TooManyPrevEvents, Drop),
+            (FormatError::TooManyPrevStateEvents, Drop),
+            (FormatError::CreateHasPrevEvents, Drop),
+            (FormatError::CreateHasPrevStateEvents, Drop),
+            (FormatError::CreateHasRoomId, Drop),
+            (FormatError::CreateBadStateKey, Drop),
+            (FormatError::UnrecognisedRoomVersion("9".into()), Drop),
+            (FormatError::InvalidAdditionalCreators, Drop),
+            // The state-independent auth rules: spec verdict = reject.
+            (FormatError::StateKeyAtSignSenderMismatch, Reject),
+            (FormatError::MemberMissingStateKey, Reject),
+            (FormatError::MemberMissingMembership, Reject),
+            (FormatError::PowerLevelsBadIntField("ban"), Reject),
+            (FormatError::PowerLevelsBadObjectField("events"), Reject),
+            (FormatError::PowerLevelsBadUsers, Reject),
+        ];
+        for (err, want) in cases {
+            assert_eq!(semantic_verdict(&err), want, "misclassified: {err}");
+        }
+        // `NonCanonical` can't be constructed here (ruma's error type has no
+        // public constructor); it is pinned as Drop by the exhaustive match.
+    }
+
+    /// v12 rule 9 exemptions: create and third_party_invite have terminal
+    /// spec rules (1 / 7) that end evaluation before rule 9 — an
+    /// `@`-prefixed state_key on them must NOT trip the mismatch check.
+    #[test]
+    fn rule_9_exempts_create_and_third_party_invite() {
+        // third_party_invite: opaque token state_key that happens to start
+        // with `@` and differs from the sender.
+        let mut ev = base_event();
+        ev["type"] = json!("m.room.third_party_invite");
+        ev["state_key"] = json!("@opaque-token");
+        let event = parse_event(
+            raw(ev),
+            eid("$Fw7pQdLu79h74bsZabn1UKXoXo7-q5M-cOwQxQxfh2c"),
+            vec![],
+        )
+        .expect("parses");
+        assert!(
+            !matches!(
+                validate_pdu(&event),
+                Err(FormatError::StateKeyAtSignSenderMismatch)
+            ),
+            "rule 9 must not evaluate for third_party_invite"
+        );
+        // Non-exempt custom type with the same shape still trips it.
+        let mut ev = base_event();
+        ev["type"] = json!("m.example.custom");
+        ev["state_key"] = json!("@bob:example.org");
+        let event = parse_event(
+            raw(ev),
+            eid("$Fw7pQdLu79h74bsZabn1UKXoXo7-q5M-cOwQxQxfh2c"),
+            vec![],
+        )
+        .expect("parses");
+        assert!(matches!(
+            validate_pdu(&event),
+            Err(FormatError::StateKeyAtSignSenderMismatch)
+        ));
+    }
+
     fn eid(s: &str) -> OwnedEventId {
         s.parse().expect("test fixture event id")
     }
@@ -709,6 +885,31 @@ mod tests {
         assert!(matches!(
             validate_pdu(&ev),
             Err(FormatError::CreateHasPrevStateEvents)
+        ));
+    }
+
+    #[test]
+    fn validate_pdu_rejects_create_with_non_empty_state_key() {
+        // Rule 9 exempts m.room.create, so this check is the only thing
+        // rejecting a create with a junk state_key. A create must have
+        // state_key "" — non-empty is dropped (it could never ground a room).
+        let mut v = base_create();
+        v["state_key"] = json!("@evil:example.org");
+        let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
+        assert!(matches!(
+            validate_pdu(&ev),
+            Err(FormatError::CreateBadStateKey)
+        ));
+    }
+
+    #[test]
+    fn validate_pdu_rejects_create_with_missing_state_key() {
+        let mut v = base_create();
+        v.as_object_mut().expect("obj").remove("state_key");
+        let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
+        assert!(matches!(
+            validate_pdu(&ev),
+            Err(FormatError::CreateBadStateKey)
         ));
     }
 

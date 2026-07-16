@@ -354,7 +354,14 @@ impl<'a> EventRow<'a> {
         }
         #[derive(Deserialize, Default)]
         struct WriteSideContent {
-            membership: Option<String>,
+            // Lenient `Value`, not `String`: a *rejected* member row may
+            // legitimately carry a non-string membership (rule 5.1 treats a
+            // present-but-wrong-typed value as a rejection verdict, and the
+            // row must still be storable so descendants cascade-reject). The
+            // string requirement for non-rejected rows is enforced below via
+            // `as_str()` — a non-string degrades to "missing" there and hits
+            // the same InvalidInput guard.
+            membership: Option<serde_json::Value>,
         }
 
         let cracked: WriteSideCracked = serde_json::from_str(self.raw.get())
@@ -412,10 +419,23 @@ impl<'a> EventRow<'a> {
         // (invisible to member filters) or skip the `current_state`
         // upsert entirely — both silently break the invariant. Reject
         // at the write boundary instead.
-        let membership = if self.event_type == "m.room.member" {
-            let m = cracked.content.membership.as_deref().ok_or_else(|| {
-                Error::InvalidInput("m.room.member event missing content.membership".into())
-            })?;
+        //
+        // Rejected rows are exempt: they never reach the `current_state`
+        // upsert (their verdict IS the `rejected` flag), and a
+        // semantically-malformed member — missing membership/state_key,
+        // persisted *as rejected* per rule 5.1's REJECT disposition — must
+        // be storable so a descendant's reference check cascade-rejects
+        // instead of gapfill-refetching the offender forever.
+        let membership = if self.event_type == "m.room.member" && !self.rejected {
+            // Absent OR non-string both fail here (see `WriteSideContent`).
+            let m = cracked
+                .content
+                .membership
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    Error::InvalidInput("m.room.member event missing content.membership".into())
+                })?;
             if self.state_key.is_none() {
                 return Err(Error::InvalidInput(
                     "m.room.member event missing state_key".into(),
@@ -504,7 +524,16 @@ impl<'a> EventRow<'a> {
             }
         }
 
-        if update_current_state && let Some(sk) = self.state_key.as_deref() {
+        // Rejected events never enter current_state (their verdict is the
+        // row flag; every resolved-state path already excludes them). The
+        // explicit gate keeps the simple `persist_event` path consistent
+        // with `persist_resolved_event`, and shields the CHECK constraint
+        // from the NULL-membership shape a rejected malformed member
+        // legitimately carries.
+        if update_current_state
+            && !self.rejected
+            && let Some(sk) = self.state_key.as_deref()
+        {
             tx.execute(
                 "INSERT INTO current_state \
                  (room_id, event_type, state_key, event_id, membership) \

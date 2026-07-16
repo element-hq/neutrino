@@ -80,10 +80,11 @@ CREATE TABLE events (
     -- events MUST still be observable so state-res can skip their
     -- auth-chains and child events can detect a rejected
     -- `prev_state_events` ancestor; the flag gates downstream
-    -- visibility (client relay, etc.). Default 0 covers the common
-    -- "freshly persisted, accepted" case — no production write path
-    -- emits `rejected = 1` yet (see `Event.rejected` in
-    -- `neutrino-common`).
+    -- visibility (client reads filter it; federation reads serve it).
+    -- Written by every federation ingest path: `apply_pdu` persists
+    -- auth-rejects, reference-cascade rejects, and `Wire::Rejected`
+    -- state-independent rule failures; backfill persists `Wire::Rejected`
+    -- history verbatim. See `Event.rejected` in `neutrino-event`.
     rejected          INTEGER NOT NULL DEFAULT 0
         CHECK (rejected IN (0, 1)),
     -- Server-side soft-fail verdict: the event passed auth against

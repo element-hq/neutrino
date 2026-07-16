@@ -264,10 +264,18 @@ async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
     let mut out = Vec::with_capacity(eligible.len());
     for p in eligible {
         match from_wire(p.raw.clone(), Vec::new()) {
-            Ok(event) => out.push(Staged {
-                event,
-                origin: p.origin.clone(),
-            }),
+            // Both variants proceed: a `Wire::Rejected` event carries
+            // `rejected = true` and `apply_pdu` short-circuits it to a
+            // rejected persist (the cascade terminator).
+            Ok(wire) => {
+                if let neutrino_event::Wire::Rejected(ev, defect) = &wire {
+                    tracing::warn!(event_id = %ev.event_id, %defect, "staging malformed PDU for rejected persist");
+                }
+                out.push(Staged {
+                    event: wire.into_event(),
+                    origin: p.origin.clone(),
+                });
+            }
             Err(e) => {
                 warn!(event_id = %p.event_id, error = %e, "dropping unparseable staged PDU");
                 unstage(ctx, &p.event_id).await;

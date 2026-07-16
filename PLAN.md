@@ -195,6 +195,72 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### Wire redesign: verdicts classified at parse, carried in the type (2026-07-16)
+- Supersedes the parked-verdict mechanics of the 2026-07-15 M5 entry below.
+  Root cause of the M5 review findings (5 majors): the verdict decision was
+  moved off the single ingress choke point (`from_wire`) to one consumer
+  (`apply_pdu`), leaving every non-apply persistence path (backfill, join
+  create, OOB invite) unvalidated, and letting malformed events travel as
+  ordinary `Event`s through code built on "accepted = shape-valid".
+- New shape: `from_wire -> Result<Wire, FormatError>` with
+  `Wire::{Valid(Event), Rejected(Event, FormatError)}`. `Err` = the spec's
+  receipt-check-1 "not a valid event" (unparseable, size, fan-in caps, create
+  rules) — never enters the system. `Rejected` = a state-independent auth
+  rule (9 / 5.1 / 10.1–10.3) with `rejected = true` baked in — "malformed but
+  accepted" is unrepresentable. The classification
+  (`neutrino_event::semantic_verdict`) is an exhaustive match: a new
+  `FormatError` variant won't compile until classified.
+- Every ingress now makes a compiler-forced, local choice: /send + worker +
+  gapfill + reconcile stage both variants (apply_pdu short-circuits a
+  pre-rejected event to persist after a room-existence probe — no reference
+  walk, so condemned events are never gapfilled); backfill persists
+  `Rejected` history as rejected; join fails on a rejected create; OOB
+  invite / send_join / send_leave 400 (local-refusal policy);
+  `EventBuilder::build` unchanged. `apply_pdu`'s validate_pdu run remains as
+  a backstop for hand-constructed events only.
+- Drop-class refetch loops terminate naturally now: drop-class ancestors are
+  never staged, so gapfill's staged_new==0 no-progress terminator fires
+  (the M5-review M-D loop existed only because the drop happened post-stage).
+- Store rider: `WriteSideContent.membership` is now a lenient `Value` (a
+  rejected member row may carry a non-string membership; the string
+  requirement for accepted rows is enforced via `as_str` hitting the same
+  guard).
+- Correction to the M5 entry below (spec review): synapse does NOT
+  persist-as-rejected for rules 10.1–10.3 — `_check_power_levels` raises
+  `SynapseError(400)`, which errors out of processing entirely. Persisting
+  rejected is what the spec's "reject" verdict calls for, so we keep it, but
+  the "synapse parity" citation for 10.x was wrong. Rules 9/5.1 do raise
+  `AuthError` in synapse, so parity holds there. Also: v12 rule 9 is now
+  correctly scoped to exclude `m.room.create` and `m.room.third_party_invite`
+  (their spec rules are terminal before rule 9; synapse matches).
+
+
+### Synapse-audit fix M5: state-independent rule failures REJECT-persist instead of DROP (2026-07-15)
+- Rules 9, 5.1, 10.1–10.3 (`validate_pdu` failures on parseable federation
+  PDUs) now persist as `rejected = true` instead of erroring, so a
+  descendant's reference check cascade-rejects (MSC4242 2.3) and terminates —
+  previously the descendant retried forever (gapfill refetch → drop → loop).
+  The split lives in `room_core::is_semantic_rejection`, next to the existing
+  reference-rejection classifier.
+- Placement in `apply_pdu`: the verdict is parked across
+  `validate_references` (so UnknownRoom stays RETRY — persisting needs the
+  room row, `events.room_id` FK) and fires before the state-before walk (no
+  gapfill for a condemned event; synapse's state-independent checks reject
+  without fetching state; the auth machinery never sees malformed content).
+- `from_wire` no longer runs `validate_pdu` — a malformed-but-parseable PDU
+  must reach `apply_pdu` to get its verdict. `EventBuilder::build` still runs
+  it (local sends 400, never persisted). `apply_pdu`'s run is authoritative.
+- Stays DROP: parse failures (no derivable event_id), size limits + >20 caps
+  (synapse `unpersistable` parity), and create rules 1.3/1.4 (a rejected
+  create has no room row to persist under; hash-derived room ids mean the
+  room just never grounds — descendants stay UnknownRoom-retryable).
+- Riders: `PowerLevels::parse` / additional_creators `.expect()`s →
+  `AuthError::MalformedStateContent` (a persisted-rejected malformed PL row
+  must never be one code-path away from a panic); store write boundary now
+  exempts rejected member rows from the membership guard AND gates the
+  `current_state` upsert on `!rejected` (rejected events never enter
+  current_state on any path).
+
 ### Synapse-audit fix M1: client-visibility filter is read-side SQL, federation reads stay unfiltered (2026-07-15)
 - Rejected/soft-failed events were persisted with correct flags but served to
   clients (audit finding M1). Fix is **read-side only**: `events_after` and

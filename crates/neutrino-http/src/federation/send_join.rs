@@ -68,11 +68,21 @@ pub(crate) async fn handle(
     let room_id = OwnedRoomId::try_from(room_id.as_str())
         .map_err(|_| FedError::BadRequest("invalid room_id"))?;
 
-    // Parse + compute the event id from the reference hash (also runs the
-    // format + semantic validators). `auth_events` start empty — apply_pdu is
-    // their sole authority.
-    let event =
-        from_wire(raw, Vec::new()).map_err(|_| FedError::BadRequest("malformed join event"))?;
+    // Parse + compute the event id from the reference hash. `auth_events`
+    // start empty — apply_pdu is their sole authority. Resident membership
+    // follows the *local* reject policy (refused, never persisted), so a
+    // `Wire::Rejected` join is a 400 like any other malformed event.
+    let event = match from_wire(raw, Vec::new()) {
+        Ok(neutrino_event::Wire::Valid(ev)) => ev,
+        Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
+            tracing::warn!(event_id = %ev.event_id, %defect, "send_join: refusing Wire::Rejected join");
+            return Err(FedError::BadRequest("malformed join event"));
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "send_join: refusing unparseable join");
+            return Err(FedError::BadRequest("malformed join event"));
+        }
+    };
 
     // Structural validation (spec §send_join). The signature check is skipped
     // (no signing keys); the sender-on-origin check is enforced below via the

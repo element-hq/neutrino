@@ -197,14 +197,16 @@ impl EventStore for SqliteStore {
         let limit_i64 = i64::try_from(limit)
             .map_err(|_| Error::InvalidInput(format!("limit {limit} exceeds i64::MAX")))?;
 
+        let soft_filter = self.soft_failed_filter();
         self.run_read(move |conn| -> Result<Vec<(StreamPos, Event)>, Error> {
-            // Client-visible reader: rejected and soft-failed events are
-            // persisted (federation policy) but must never reach a client
-            // timeline. Federation reads go through `get_events` (by id,
-            // unfiltered) so peers can still ground rejected ancestry.
+            // Client-visible reader: rejected events (always) and soft-failed
+            // events (unless the client-side filter is disabled) are persisted
+            // (federation policy) but must never reach a client timeline.
+            // Federation reads go through `get_events` (by id, unfiltered) so
+            // peers can still ground rejected ancestry.
             let query = format!(
                 "SELECT stream_pos, {EVENT_COLUMNS} FROM events \
-                 WHERE stream_pos > ? AND rejected = 0 AND soft_failed = 0 \
+                 WHERE stream_pos > ? AND rejected = 0{soft_filter} \
                  ORDER BY stream_pos ASC LIMIT ?"
             );
             let mut stmt = conn.prepare(&query)?;
@@ -258,6 +260,7 @@ impl EventStore for SqliteStore {
             },
         };
 
+        let soft_filter = self.soft_failed_filter();
         self.run_read(
             move |conn| -> Result<(Vec<Event>, Option<PaginationToken>), Error> {
                 // Pre-condition (trait: "the room must exist"). Surface a
@@ -299,7 +302,7 @@ impl EventStore for SqliteStore {
                 let query = format!(
                     "SELECT stream_pos, {EVENT_COLUMNS} FROM events \
                      WHERE room_id = ? AND stream_pos {from_cmp} ? AND stream_pos {to_cmp} ? \
-                     AND rejected = 0 AND soft_failed = 0 \
+                     AND rejected = 0{soft_filter} \
                      ORDER BY stream_pos {order} LIMIT ?"
                 );
                 let mut stmt = conn.prepare(&query)?;
@@ -803,6 +806,41 @@ mod tests {
         let got = s.get_events(&[&msg_id]).await.unwrap();
         assert_eq!(got.len(), 1);
         assert!(got[0].soft_failed);
+    }
+
+    // The client-side soft-fail filter is parameterised: hidden from
+    // `/messages` by default (production), visible when
+    // `client_hides_soft_failed(false)` (the convergence harness, so an
+    // order-dependent soft-fail verdict doesn't diverge client timelines).
+    #[tokio::test]
+    async fn room_messages_soft_fail_visibility_is_parameterised() {
+        async fn soft_failed_visible(hide: bool) -> bool {
+            let s = SqliteStore::open_in_memory()
+                .await
+                .unwrap()
+                .client_hides_soft_failed(hide);
+            setup_room(&s, *ALICE_ROOM_ID, *ALICE_USER_ID).await;
+            let mut msg = message(*ALICE_ROOM_ID, *ALICE_USER_ID, "sf");
+            msg.soft_failed = true;
+            let id = msg.event_id.clone();
+            let fe: BTreeSet<OwnedEventId> = [id.clone()].into_iter().collect();
+            s.persist_resolved_event(&msg, &fe, &fe, &BTreeMap::new(), &[], &[])
+                .await
+                .unwrap();
+            let (msgs, _) = s
+                .room_messages(*ALICE_ROOM_ID, None, None, Direction::Forward, 100)
+                .await
+                .unwrap();
+            msgs.iter().any(|e| e.event_id == id)
+        }
+        assert!(
+            !soft_failed_visible(true).await,
+            "default hides soft-failed from /messages"
+        );
+        assert!(
+            soft_failed_visible(false).await,
+            "filter off makes soft-failed visible in /messages"
+        );
     }
 
     // E2: persist_event for unknown room → InvalidInput (FK violation)
@@ -1528,6 +1566,41 @@ mod tests {
         );
         let result = s.persist_event(&bad, &[]).await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
+    }
+
+    // E35b: the membership guard is scoped to non-rejected rows. A
+    // semantically-malformed member (rule 5.1) is persisted *as rejected* so
+    // descendants cascade-reject — the write boundary must accept it; it never
+    // reaches the `current_state` upsert, so the membership invariant is
+    // untouched.
+    #[tokio::test]
+    async fn persist_event_accepts_rejected_member_without_membership() {
+        let s = store_with_room().await;
+        let mut bad = make_event(
+            *ALICE_ROOM_ID,
+            *ALICE_USER_ID,
+            "m.room.member",
+            Some(ALICE_USER_ID.as_str()),
+            json!({}), // no `membership` key
+            0,
+            &[],
+            &[],
+        );
+        bad.rejected = true;
+        let bad_id = bad.event_id.clone();
+        s.persist_event(&bad, &[])
+            .await
+            .expect("rejected row persists");
+        let got = s.get_events(&[&bad_id]).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].rejected);
+        // The malformed member never lands in current_state.
+        assert!(
+            s.current_state_event(*ALICE_ROOM_ID, "m.room.member", ALICE_USER_ID.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     // E36: m.room.member event without state_key → InvalidInput. State

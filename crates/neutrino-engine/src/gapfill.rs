@@ -113,9 +113,19 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
         // any room; only stage ones in *this* room — a foreign-room event is
         // never reachable by this room's `ancestry_gap` walk, so staging it
         // would be unreachable junk that nothing ever drains.
+        // Both `Wire` variants are staged: a `Rejected` ancestor is exactly
+        // the cascade terminator — the worker persists it rejected and the
+        // descendant's reference check ends via `PrevStateRejected`. A
+        // drop-class ancestor (`Err`) is never staged, so a round that
+        // fetches only those stages nothing and the no-progress terminator
+        // below correctly declares the gap unfillable.
         let mut staged_new = 0usize;
         for raw in fetched {
-            if let Ok(ancestor) = from_wire(raw, Vec::new()) {
+            if let Ok(wire) = from_wire(raw, Vec::new()) {
+                if let neutrino_event::Wire::Rejected(ev, defect) = &wire {
+                    tracing::warn!(event_id = %ev.event_id, %defect, "gapfill: staging malformed ancestor as rejected");
+                }
+                let ancestor = wire.into_event();
                 if ancestor.room_id != *room_id {
                     continue;
                 }

@@ -36,17 +36,7 @@ pub fn validate_references(
     }
 
     // v12 rule 2.
-    let derived_create_id = derive_create_event_id(&event.room_id)
-        .ok_or_else(|| ReferenceError::MalformedRoomId(event.room_id.clone()))?;
-    let create = provider
-        .get_event(&derived_create_id)?
-        .ok_or_else(|| ReferenceError::UnknownRoom(event.room_id.clone()))?;
-    if create.rejected {
-        return Err(ReferenceError::RoomRejected(event.room_id.clone()));
-    }
-    if create.event_type != "m.room.create" {
-        return Err(ReferenceError::RoomTypeMismatch(derived_create_id));
-    }
+    require_room_grounded(&event.room_id, provider)?;
 
     // MSC4242 prev_state_events triad.
     for psid in &event.prev_state_events {
@@ -64,6 +54,37 @@ pub fn validate_references(
         }
     }
 
+    Ok(())
+}
+
+/// Ground a non-create event's `room_id` to its `m.room.create` event and
+/// validate it (v12 rule 2). Shared by [`validate_references`] and the
+/// `RoomCore::apply_pdu` rejected short-circuit so the two cannot drift: both
+/// must reject an event whose room's create is missing, rejected, or
+/// malformed, and both must treat an unfetched create as retryable.
+///
+/// Errors mirror the rule-2 dispositions: [`ReferenceError::MalformedRoomId`]
+/// (room_id yields no create id — DROP), [`ReferenceError::UnknownRoom`]
+/// (create not fetched yet — RETRY), [`ReferenceError::RoomRejected`] (the
+/// create is itself rejected), and [`ReferenceError::RoomTypeMismatch`] (the
+/// event at the derived id is not a well-formed `m.room.create` — wrong type
+/// or a non-empty `state_key`).
+pub(crate) fn require_room_grounded(
+    room_id: &OwnedRoomId,
+    provider: &dyn StateProvider,
+) -> Result<(), ReferenceError> {
+    let create_id = derive_create_event_id(room_id)
+        .ok_or_else(|| ReferenceError::MalformedRoomId(room_id.clone()))?;
+    let create = provider
+        .get_event(&create_id)?
+        .ok_or_else(|| ReferenceError::UnknownRoom(room_id.clone()))?;
+    if create.rejected {
+        return Err(ReferenceError::RoomRejected(room_id.clone()));
+    }
+    // A well-formed v12 create is `m.room.create` with `state_key == ""`.
+    if create.event_type != "m.room.create" || create.state_key.as_deref() != Some("") {
+        return Err(ReferenceError::RoomTypeMismatch(create_id));
+    }
     Ok(())
 }
 

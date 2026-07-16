@@ -185,12 +185,18 @@ impl<'a> AuthContext<'a> {
             .and_then(Value::as_array)
         {
             for entry in arr {
-                let s = entry
+                // validate::check_create guarantees `[valid-user-id, ...]`
+                // for every accepted event; a mismatch here means a corrupt
+                // row or a validation regression (see
+                // `AuthError::MalformedStateContent`).
+                let uid: OwnedUserId = entry
                     .as_str()
-                    .expect("validate::check_create guarantees additional_creators is [string]");
-                let uid: OwnedUserId = s.parse().expect(
-                    "validate::check_create guarantees additional_creators entries are user ids",
-                );
+                    .and_then(|s| s.parse().ok())
+                    .ok_or(AuthError::MalformedStateContent {
+                        event_type: "m.room.create",
+                        detail: "additional_creators entry is not a valid user id",
+                    })
+                    .map_err(corrupt_state)?;
                 creators.insert(uid);
             }
         }
@@ -205,7 +211,7 @@ impl<'a> AuthContext<'a> {
 
         let pl_event = state.get(&("m.room.power_levels".to_string(), String::new()));
         let present_power_levels = pl_event.is_some();
-        let power_levels = PowerLevels::parse(pl_event.map(Arc::as_ref));
+        let power_levels = PowerLevels::parse(pl_event.map(Arc::as_ref)).map_err(corrupt_state)?;
 
         Ok(Self {
             state,
@@ -294,7 +300,7 @@ struct PowerLevels {
 }
 
 impl PowerLevels {
-    fn parse(event: Option<&Event>) -> Self {
+    fn parse(event: Option<&Event>) -> Result<Self, AuthError> {
         // Field-level defaults per the `m.room.power_levels` schema. Every
         // string below is a verbatim "Defaults to X if unspecified." clause
         // from https://spec.matrix.org/v1.18/client-server-api/#mroompower_levels
@@ -312,29 +318,35 @@ impl PowerLevels {
             events: HashMap::new(),
             notifications: HashMap::new(),
         };
-        let Some(ev) = event else { return out };
+        let Some(ev) = event else { return Ok(out) };
         let content = parse_content(ev);
-        // `validate::validate_pdu` (via `check_power_levels`) has
-        // rejected non-integer scalars (`PowerLevelsBadIntField`) and
+        // `validate::validate_pdu` (via `check_power_levels`) has rejected
+        // non-integer scalars (`PowerLevelsBadIntField`) and
         // non-`{string: int}` objects (`PowerLevelsBadObjectField` /
-        // `PowerLevelsBadUsers`) — so every value below either matches its
-        // expected shape or the field is absent. The `.expect`s exist to
-        // convert a future `validate_pdu` regression into a hard panic at the
-        // parse site rather than silently substituting defaults.
-        let take_scalar = |field: &'static str, slot: &mut i64| {
+        // `PowerLevelsBadUsers`) for every accepted event — and rejected
+        // events never enter a state map — so every value below either
+        // matches its expected shape or the field is absent. A mismatch
+        // means a corrupt row or a validation regression; surfaced as
+        // `MalformedStateContent` rather than a panic so one bad row can't
+        // crash the room actor.
+        const MALFORMED: fn(&'static str) -> AuthError =
+            |detail| AuthError::MalformedStateContent {
+                event_type: "m.room.power_levels",
+                detail,
+            };
+        let take_scalar = |field: &'static str, slot: &mut i64| -> Result<(), AuthError> {
             if let Some(v) = content.get(field) {
-                *slot = v
-                    .as_i64()
-                    .expect("validate::validate_pdu guarantees integer scalar");
+                *slot = v.as_i64().ok_or_else(|| MALFORMED("non-integer scalar"))?;
             }
+            Ok(())
         };
-        take_scalar("users_default", &mut out.users_default);
-        take_scalar("events_default", &mut out.events_default);
-        take_scalar("state_default", &mut out.state_default);
-        take_scalar("ban", &mut out.ban);
-        take_scalar("redact", &mut out.redact);
-        take_scalar("kick", &mut out.kick);
-        take_scalar("invite", &mut out.invite);
+        take_scalar("users_default", &mut out.users_default)?;
+        take_scalar("events_default", &mut out.events_default)?;
+        take_scalar("state_default", &mut out.state_default)?;
+        take_scalar("ban", &mut out.ban)?;
+        take_scalar("redact", &mut out.redact)?;
+        take_scalar("kick", &mut out.kick)?;
+        take_scalar("invite", &mut out.invite)?;
         for (target, key) in [
             (&mut out.users, "users"),
             (&mut out.events, "events"),
@@ -343,16 +355,16 @@ impl PowerLevels {
             if let Some(obj) = content.get(key) {
                 let obj = obj
                     .as_object()
-                    .expect("validate::validate_pdu guarantees map shape");
+                    .ok_or_else(|| MALFORMED("map field is not an object"))?;
                 for (k, v) in obj {
                     let n = v
                         .as_i64()
-                        .expect("validate::validate_pdu guarantees integer map values");
+                        .ok_or_else(|| MALFORMED("non-integer map value"))?;
                     target.insert(k.clone(), n);
                 }
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -361,6 +373,23 @@ fn parse_content(event: &Event) -> Value {
     // round-tripping it here cannot fail.
     serde_json::from_str(event.content.get())
         .expect("validate::parse_event guarantees event.content is valid JSON")
+}
+
+/// Map a corrupt-state [`AuthError::MalformedStateContent`] into
+/// `AuthContext::new`'s error domain. `StateResError::Internal` is the
+/// established "storage-side fault, not a verdict about the event" carrier.
+///
+/// Honesty note on where that fault-not-verdict intent actually holds: the
+/// state-res walk callers (`power_of_sender`, IAC) propagate it as a
+/// retryable fault; `check_auth_rules`, however, flattens every
+/// `AuthContext::new` error into `AuthError::CreateUnavailable`, so on the
+/// live apply path a corrupt state row surfaces as a REJECT verdict on the
+/// incoming event. Both are only reachable via genuine DB corruption or a
+/// validation regression (`from_wire` classification keeps malformed content
+/// out of accepted rows, and rejected rows out of state maps) — the point of
+/// this mapping is that neither path panics.
+fn corrupt_state(err: AuthError) -> StateResError {
+    StateResError::Internal(err.to_string())
 }
 
 // ----------------- rule 4 -----------------
@@ -750,7 +779,7 @@ fn check_rule_10_power_levels(
         return Ok(());
     }
 
-    let new_pl = PowerLevels::parse(Some(power_levels_event));
+    let new_pl = PowerLevels::parse(Some(power_levels_event))?;
     let cur_pl = &ctx.power_levels;
     let sender_power = ctx.user_power(power_levels_event.sender.as_ref());
 
@@ -927,6 +956,42 @@ mod tests {
     // but the real-world invariant "every event in a room shares that room's
     // create-derived room_id" is preserved by threading `&RoomId` through
     // each non-create helper; callers pass `&create.room_id`.
+
+    /// Corrupt-row guard: a power_levels event whose content violates the
+    /// shape `validate_pdu` guarantees (here a string `ban`) must surface as
+    /// `MalformedStateContent`, never a panic — one bad row in a state map
+    /// (DB corruption / validation regression) must not crash the room
+    /// actor. Built via `from_wire`, which skips semantic validation.
+    #[test]
+    fn power_levels_parse_malformed_content_errors_instead_of_panicking() {
+        let raw = json!({
+            "type": "m.room.power_levels",
+            "state_key": "",
+            "sender": "@alice:example.org",
+            "room_id": "!Fw7pQdLu79h74bsZabn1UKXoXo7-q5M-cOwQxQxfh2c",
+            "content": { "ban": "50" },
+            "prev_events": [],
+            "prev_state_events": [],
+            "origin_server_ts": next_ts(),
+            "hashes": { "sha256": "wrong" },
+        });
+        let ev = neutrino_event::event_builder::from_wire(
+            serde_json::value::RawValue::from_string(raw.to_string()).expect("valid JSON"),
+            Vec::new(),
+        )
+        .expect("parseable wire event")
+        .into_event();
+        // `ban` survives redaction, so the malformed value reaches parse.
+        // (match, not expect_err: `PowerLevels` deliberately has no Debug.)
+        let err = match PowerLevels::parse(Some(&ev)) {
+            Ok(_) => panic!("malformed content must error, not parse"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, AuthError::MalformedStateContent { .. }),
+            "got {err:?}"
+        );
+    }
 
     fn create_event(creator: &str, additional_creators: &[&str]) -> Arc<Event> {
         let mut content = json!({ "room_version": ROOM_VERSION_ID });

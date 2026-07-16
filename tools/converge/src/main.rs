@@ -1383,8 +1383,30 @@ fn build_neutrino() -> Result<std::path::PathBuf, String> {
     Err("cargo build produced no `neutrino` executable artifact".into())
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Convergence compares client `/messages` across servers. Soft-fail is an
+    // order-dependent, server-local verdict, so a message soft-failed on one
+    // server but accepted on others makes client timelines diverge permanently
+    // even when the state DAG converges. Turn the client-side soft-fail filter
+    // OFF for every rig server so `/messages` reflects the full DAG: the child
+    // servers inherit this env and `Config::from_env` reads it.
+    //
+    // An explicit `NEUTRINO_ENABLE_SOFT_FAILURE` wins, so the same seed can be
+    // reproduced with the production filter on (=true) to show it's the
+    // soft-fail visibility — not flakiness — that (un)converges.
+    // SAFETY: set before the Tokio runtime (and its worker threads) start, and
+    // nothing in this process reads the environment concurrently.
+    if std::env::var_os("NEUTRINO_ENABLE_SOFT_FAILURE").is_none() {
+        unsafe { std::env::set_var("NEUTRINO_ENABLE_SOFT_FAILURE", "false") };
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime")
+        .block_on(run_converge());
+}
+
+async fn run_converge() {
     let bin = match build_neutrino() {
         Ok(p) => p,
         Err(e) => {

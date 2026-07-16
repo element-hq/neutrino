@@ -47,6 +47,15 @@ impl From<NeutrinoConfig> for neutrino_main::Config {
                 c.outbound_concurrency as usize,
             ),
             lb_federation_port: c.lb_federation_port,
+            // Soft-fail hides events that fail auth against *current* state on
+            // arrival. In this trusted P2P mesh that mostly catches messages
+            // delivered late after a partition (the sender has since left) —
+            // hiding them silently drops legitimately-sent messages from the
+            // user's timeline, and the verdict is order-dependent so peers
+            // disagree on which. Turn the client-side filter off so the
+            // embedded client sees the full DAG (the same knob the convergence
+            // rig uses; the verdict is still computed and stored).
+            enable_soft_failure: false,
             // `federation_proxy` is internal/derived (set by neutrino-main when
             // the sidecar runs) and startup jitter isn't FFI-exposed; both take
             // their `Config::default()` values.

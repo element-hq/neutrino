@@ -12,7 +12,10 @@
 //!
 //! - [`from_wire`] is the inbound counterpart: it reads the canonical bytes
 //!   as the source of truth, computes the reference hash to derive the
-//!   event_id, then runs the same `parse_event` + `validate_pdu` pair.
+//!   event_id, runs `parse_event`, then `validate_pdu`, and classifies the
+//!   outcome — a state-independent auth-rule failure comes back as
+//!   [`Wire::Rejected`] (persisted rejected, not dropped at the wire edge),
+//!   not an error (see `from_wire`'s docs).
 //!
 //! See `event-id-design.md` §"Updated `EventBuilder`".
 
@@ -28,7 +31,7 @@ use serde::Serialize;
 use serde_json::value::{RawValue, to_raw_value};
 use serde_json::{Map, Value};
 
-use crate::validate::{parse_event, validate_pdu};
+use crate::validate::{SemanticVerdict, parse_event, semantic_verdict, validate_pdu};
 use crate::{Event, FormatError};
 
 /// Builder for server-authored Matrix v12 PDUs.
@@ -256,11 +259,23 @@ impl EventBuilder {
 /// - The object lacks `type` or has malformed `content`/`hashes`/`signatures`
 ///   shape (mapped via [`ref_hash_error_to_format_error`]).
 /// - Any downstream `parse_event` rejection.
+/// - Any `validate_pdu` failure classified [`SemanticVerdict::Drop`]
+///   (receipt-check 1: size limits, fan-in caps, create rules) — such an
+///   event never enters the system.
+///
+/// A `validate_pdu` failure classified [`SemanticVerdict::Reject`] (a
+/// state-independent auth rule: v12 rules 9 / 5.1 / 10.1–10.3) is NOT an
+/// error: the spec's verdict for those is *reject*, so the event comes back
+/// as [`Wire::Rejected`] with `rejected = true` already set. Every caller is
+/// thereby forced to decide what a rejected wire event means at its ingress
+/// (persist-as-rejected, refuse the request, fail the join, …) — it is
+/// impossible to obtain a malformed `Event` that still claims to be
+/// accepted.
 ///
 /// Performance note: this parses `raw` twice — once here to a
 /// `CanonicalJsonValue` for hash computation, then again in `parse_event`.
 /// Acceptable for the federation receive path's current scale.
-pub fn from_wire(raw: Box<RawValue>, auth_events: Vec<OwnedEventId>) -> Result<Event, FormatError> {
+pub fn from_wire(raw: Box<RawValue>, auth_events: Vec<OwnedEventId>) -> Result<Wire, FormatError> {
     let parsed: CanonicalJsonValue = serde_json::from_str(raw.get())?;
     let CanonicalJsonValue::Object(obj) = parsed else {
         return Err(FormatError::InvalidFieldType {
@@ -283,8 +298,54 @@ pub fn from_wire(raw: Box<RawValue>, auth_events: Vec<OwnedEventId>) -> Result<E
         RawValue::from_string(s).expect("canonical JSON parses as a RawValue")
     };
     let event = parse_event(raw_to_parse, event_id, auth_events)?;
-    validate_pdu(&event)?;
-    Ok(event)
+    match validate_pdu(&event) {
+        Ok(()) => Ok(Wire::Valid(event)),
+        Err(e) => match semantic_verdict(&e) {
+            SemanticVerdict::Drop => Err(e),
+            SemanticVerdict::Reject => {
+                let mut event = event;
+                event.rejected = true;
+                Ok(Wire::Rejected(event, e))
+            }
+        },
+    }
+}
+
+/// A parsed inbound wire event, classified at the parse boundary.
+///
+/// This is the only way to obtain an `Event` from wire bytes, so the
+/// classification cannot be skipped: an event that fails a state-independent
+/// auth rule travels as [`Wire::Rejected`] with `rejected = true` baked in —
+/// "malformed but accepted" is unrepresentable. Callers that treat both
+/// variants the same (staging, the worker) use [`Wire::into_event`]; callers
+/// with an ingress-specific policy (fail the join, 400 the invite, persist
+/// backfill as rejected) match.
+#[derive(Debug)]
+pub enum Wire {
+    /// Passed every wire-format and semantic check.
+    Valid(Event),
+    /// Parseable (event_id derivable) but fails a state-independent auth rule
+    /// (v12 rules 9 / 5.1 / 10.1–10.3). `Event.rejected` is already `true`;
+    /// the error says which rule condemned it.
+    Rejected(Event, FormatError),
+}
+
+impl Wire {
+    /// The event, whatever its verdict. A [`Wire::Rejected`] event comes out
+    /// with `rejected = true` set, so collapsing the variants can never
+    /// launder a malformed event into an accepted one.
+    pub fn into_event(self) -> Event {
+        match self {
+            Wire::Valid(ev) | Wire::Rejected(ev, _) => ev,
+        }
+    }
+
+    /// Borrow the event, whatever its verdict.
+    pub fn event(&self) -> &Event {
+        match self {
+            Wire::Valid(ev) | Wire::Rejected(ev, _) => ev,
+        }
+    }
 }
 
 fn ref_hash_error_to_format_error(err: ruma::canonical_json::RedactionError) -> FormatError {
@@ -636,7 +697,9 @@ mod tests {
             .build()
             .expect("builds");
 
-        let parsed = from_wire(built.raw.clone(), Vec::new()).expect("from_wire");
+        let parsed = from_wire(built.raw.clone(), Vec::new())
+            .expect("from_wire")
+            .into_event();
         // event_id is recomputed from raw — must match the builder's output.
         assert_eq!(parsed.event_id, built.event_id);
         assert_eq!(parsed.room_id, built.room_id);
@@ -654,7 +717,9 @@ mod tests {
             .build()
             .expect("create");
 
-        let parsed = from_wire(built.raw.clone(), Vec::new()).expect("from_wire");
+        let parsed = from_wire(built.raw.clone(), Vec::new())
+            .expect("from_wire")
+            .into_event();
         assert_eq!(parsed.event_id, built.event_id);
         // parse_event re-derived room_id from event_id via sigil swap —
         // must match the builder's.
@@ -662,6 +727,62 @@ mod tests {
         // Round-tripped raw still lacks `room_id` (v12 create invariant).
         let raw: serde_json::Value = serde_json::from_str(parsed.raw.get()).unwrap();
         assert!(raw.get("room_id").is_none());
+    }
+
+    #[test]
+    fn from_wire_classifies_semantically_malformed_pdu_as_rejected() {
+        // Contract pin: a PDU that parses but fails a state-independent auth
+        // rule (here rule 5.1, member without `membership`) comes back as
+        // `Wire::Rejected` with `rejected = true` baked in — never dropped at
+        // the wire edge, and never obtainable as an accepted `Event`.
+        // `EventBuilder::build`, by contrast, still refuses to produce it.
+        let raw = serde_json::json!({
+            "type": "m.room.member",
+            "state_key": "@mallory:remote.example",
+            "sender": "@alice:remote.example",
+            "room_id": "!Fw7pQdLu79h74bsZabn1UKXoXo7-q5M-cOwQxQxfh2c",
+            "content": {},
+            "prev_events": [],
+            "prev_state_events": [],
+            "origin_server_ts": 42,
+            "hashes": { "sha256": "wrong" },
+        });
+        let wire = from_wire(
+            RawValue::from_string(raw.to_string()).expect("valid JSON"),
+            Vec::new(),
+        )
+        .expect("parseable PDU must not be dropped at the wire edge");
+        let Wire::Rejected(ev, defect) = wire else {
+            panic!("rule-5.1 defect must classify as Wire::Rejected");
+        };
+        assert!(ev.rejected, "the rejected flag must be baked in");
+        assert!(matches!(defect, FormatError::MemberMissingMembership));
+    }
+
+    #[test]
+    fn from_wire_drop_class_defect_is_an_error() {
+        // The other half of the classification: a drop-class defect
+        // (here the >20 prev_events cap) is an `Err` — the event never
+        // enters the system at all.
+        let prevs: Vec<String> = (0..21)
+            .map(|i| format!("$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA{i:02}"))
+            .collect();
+        let raw = serde_json::json!({
+            "type": "m.room.message",
+            "sender": "@alice:remote.example",
+            "room_id": "!Fw7pQdLu79h74bsZabn1UKXoXo7-q5M-cOwQxQxfh2c",
+            "content": {"msgtype": "m.text", "body": "x"},
+            "prev_events": prevs,
+            "prev_state_events": [],
+            "origin_server_ts": 42,
+            "hashes": { "sha256": "wrong" },
+        });
+        let err = from_wire(
+            RawValue::from_string(raw.to_string()).expect("valid JSON"),
+            Vec::new(),
+        )
+        .expect_err("drop-class defect must not construct an event");
+        assert!(matches!(err, FormatError::TooManyPrevEvents));
     }
 
     #[test]
@@ -674,7 +795,9 @@ mod tests {
             .expect("builds");
 
         let auth = vec![eid("$x:d"), eid("$y:d")];
-        let parsed = from_wire(built.raw.clone(), auth.clone()).expect("from_wire");
+        let parsed = from_wire(built.raw.clone(), auth.clone())
+            .expect("from_wire")
+            .into_event();
         assert_eq!(parsed.auth_events, auth);
     }
 
@@ -709,12 +832,13 @@ mod tests {
         raw_obj["hashes"]["sha256"] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         let tampered_raw = serde_json::value::to_raw_value(&raw_obj).expect("raw");
 
-        let parsed = from_wire(tampered_raw, Vec::new()).expect("from_wire");
-        // event_id is unchanged — reference_hash runs over the redacted form
-        // which doesn't include `hashes` directly… wait, it does. After
-        // tampering the reference_hash differs too, so the parsed event_id
-        // here is the *tampered* hash. The point of the test is that the
-        // content was redacted (body stripped) rather than the event rejected.
+        let parsed = from_wire(tampered_raw, Vec::new())
+            .expect("from_wire")
+            .into_event();
+        // Tampering `hashes.sha256` also changes the reference hash, so the
+        // parsed event_id here is the *tampered* hash — not asserted. The point
+        // is that a content-hash mismatch REDACTS (body stripped) rather than
+        // rejecting the event.
         let parsed_raw: serde_json::Value = serde_json::from_str(parsed.raw.get()).unwrap();
         assert!(
             parsed_raw["content"]
@@ -740,7 +864,9 @@ mod tests {
             .origin_server_ts(1)
             .build()
             .expect("builds");
-        let parsed = from_wire(built.raw.clone(), Vec::new()).expect("from_wire");
+        let parsed = from_wire(built.raw.clone(), Vec::new())
+            .expect("from_wire")
+            .into_event();
         // Content survives — body field still there.
         let parsed_raw: serde_json::Value = serde_json::from_str(parsed.raw.get()).unwrap();
         assert_eq!(parsed_raw["content"]["body"].as_str(), Some("preserved"));

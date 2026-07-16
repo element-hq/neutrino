@@ -68,6 +68,15 @@ pub struct Config {
     /// before its first outbox drain (thundering-herd guard on restart). Default
     /// 30s; tests set it to 0 so post-restart redelivery is immediate.
     pub startup_jitter: Duration,
+    /// Whether client-facing reads (`/messages`, `/sync`) hide soft-failed
+    /// events. `true` in production: a soft-failed event stays in the DAG but
+    /// is invisible to clients. The soft-fail *verdict* is computed and stored
+    /// either way — this only gates client visibility. Set `false` by the
+    /// convergence harness: soft-fail is an order-dependent, server-local
+    /// verdict, so hiding it makes client timelines diverge permanently even
+    /// when the state DAG converges; showing it lets the rig compare full
+    /// timelines.
+    pub enable_soft_failure: bool,
 }
 
 impl Default for Config {
@@ -81,6 +90,7 @@ impl Default for Config {
             federation_proxy: None,
             lb_federation_port: None,
             startup_jitter: Duration::from_millis(DEFAULT_STARTUP_JITTER_MS),
+            enable_soft_failure: true,
         }
     }
 }
@@ -111,6 +121,11 @@ impl Config {
                     || Duration::from_millis(DEFAULT_STARTUP_JITTER_MS),
                     Duration::from_millis,
                 ),
+            // Default on (production); the convergence harness sets
+            // `NEUTRINO_ENABLE_SOFT_FAILURE=0`/`false` to make soft-failed
+            // events client-visible for the rig.
+            enable_soft_failure: std::env::var("NEUTRINO_ENABLE_SOFT_FAILURE")
+                .map_or(true, |v| !matches!(v.as_str(), "0" | "false")),
             // `localpart` (and any future non-env field) defaults from `Default`,
             // so the value lives in exactly one place.
             ..Default::default()
