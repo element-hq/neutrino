@@ -121,8 +121,11 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
         // below correctly declares the gap unfillable.
         let mut staged_new = 0usize;
         for raw in fetched {
-            if let Ok(ancestor) = from_wire(raw, Vec::new()) {
-                let ancestor = ancestor.into_event();
+            if let Ok(wire) = from_wire(raw, Vec::new()) {
+                if let neutrino_event::Wire::Rejected(ev, defect) = &wire {
+                    tracing::warn!(event_id = %ev.event_id, %defect, "gapfill: staging malformed ancestor as rejected");
+                }
+                let ancestor = wire.into_event();
                 if ancestor.room_id != *room_id {
                     continue;
                 }

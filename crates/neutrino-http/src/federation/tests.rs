@@ -2780,6 +2780,27 @@ fn remote_join(room_id: &RoomId, head: &OwnedEventId, user: &str) -> neutrino_ev
         .expect("build remote join")
 }
 
+/// A parseable `m.room.member` PDU that `from_wire` classifies as
+/// `Wire::Rejected` — not `Valid`, not `Err`. `content` omits `membership`
+/// (v12 rule 5.1, a REJECT-class defect) and the content hash is deliberately
+/// wrong, so `from_wire` redacts to empty content and then rejects on the
+/// missing membership. `EventBuilder` validates, so it can never produce such
+/// an event; hand-rolling the JSON is the only way to exercise the handlers'
+/// `Wire::Rejected` arm.
+fn rejected_member_json(room_id: &RoomId, head: &OwnedEventId, user: &str) -> Value {
+    json!({
+        "type": "m.room.member",
+        "sender": user,
+        "state_key": user,
+        "room_id": room_id.as_str(),
+        "content": {},
+        "prev_events": [head],
+        "prev_state_events": [head],
+        "origin_server_ts": 1000,
+        "hashes": { "sha256": "wrong" },
+    })
+}
+
 fn make_join_path(room_id: &RoomId, user: &str) -> String {
     format!("/_matrix/federation/v1/make_join/{room_id}/{user}?ver={ROOM_VERSION_ID}")
 }
@@ -3715,6 +3736,23 @@ async fn send_join_state_key_not_sender_returns_400() {
 }
 
 #[tokio::test]
+async fn send_join_wire_rejected_returns_400() {
+    // A member PDU that from_wire classifies as Wire::Rejected (missing
+    // content.membership) must be refused at send_join. This pins the
+    // Wire::Rejected arm specifically — no EventBuilder-built fixture can reach
+    // it, and the distinct error string proves the 400 came from that arm and
+    // not a downstream structural check.
+    let (router, _store, room_id, head, _tempfile) = seed_public_room().await;
+    let raw = rejected_member_json(&room_id, &head, ZARA).to_string();
+    // The path event_id is irrelevant here: the Wire::Rejected arm returns
+    // before the path-vs-body id comparison, so any real id serves.
+    let (status, body) = put_event(&router, &send_join_path(&room_id, &head), &raw).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(body["errcode"], "M_INVALID_PARAM");
+    assert_eq!(body["error"], "malformed join event");
+}
+
+#[tokio::test]
 async fn send_join_room_id_path_mismatch_returns_400() {
     let (router, _store, room_id, head, _tempfile) = seed_public_room().await;
     let join = remote_join(&room_id, &head, ZARA);
@@ -4103,6 +4141,36 @@ async fn invite_rejects_non_invite_membership() {
         body.get("errcode").and_then(|c| c.as_str()),
         Some("M_INVALID_PARAM")
     );
+}
+
+#[tokio::test]
+async fn invite_wire_rejected_returns_400() {
+    // A member PDU that from_wire classifies as Wire::Rejected (missing
+    // content.membership) must be refused at /invite. Pins the Wire::Rejected
+    // arm — the OOB branch must never surface an invalid stub to sync.
+    let (store, _tempfile) = fresh_store().await;
+    let router = router_with_store(config(), store);
+    let bob = inviter();
+    let create = EventBuilder::new(bob.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+    let room_id = create.room_id.clone();
+    let body = json!({
+        "event": rejected_member_json(&room_id, &create.event_id, bob.as_str()),
+        "room_version": ROOM_VERSION_ID,
+    });
+    // Path id irrelevant: the Wire::Rejected arm 400s before the id check.
+    let (status, resp) = put_json(
+        &router,
+        &invite_path(room_id.as_str(), create.event_id.as_str()),
+        &body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {resp}");
+    assert_eq!(resp["errcode"], "M_INVALID_PARAM");
+    assert_eq!(resp["error"], "malformed invite event");
 }
 
 /// The `eventId` path segment must match the event's computed reference hash.
@@ -4557,6 +4625,19 @@ async fn send_leave_non_leave_membership_returns_400() {
     let (status, body) = put_event(&router, &send_leave_path(&room_id, &id), join.raw.get()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
     assert_eq!(body["errcode"], "M_INVALID_PARAM");
+}
+
+#[tokio::test]
+async fn send_leave_wire_rejected_returns_400() {
+    // A member PDU that from_wire classifies as Wire::Rejected (missing
+    // content.membership) must be refused at send_leave. Pins the
+    // Wire::Rejected arm via the distinct error string.
+    let (router, _store, room_id, head, _tempfile) = seed_room_with_invited_zara().await;
+    let raw = rejected_member_json(&room_id, &head, ZARA).to_string();
+    let (status, body) = put_event(&router, &send_leave_path(&room_id, &head), &raw).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(body["errcode"], "M_INVALID_PARAM");
+    assert_eq!(body["error"], "malformed leave event");
 }
 
 #[tokio::test]

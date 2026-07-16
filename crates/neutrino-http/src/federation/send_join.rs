@@ -74,7 +74,12 @@ pub(crate) async fn handle(
     // `Wire::Rejected` join is a 400 like any other malformed event.
     let event = match from_wire(raw, Vec::new()) {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
-        Ok(neutrino_event::Wire::Rejected(..)) | Err(_) => {
+        Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
+            tracing::warn!(event_id = %ev.event_id, %defect, "send_join: refusing Wire::Rejected join");
+            return Err(FedError::BadRequest("malformed join event"));
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "send_join: refusing unparseable join");
             return Err(FedError::BadRequest("malformed join event"));
         }
     };

@@ -104,7 +104,12 @@ pub(crate) async fn handle(
     // invalid stub to sync.
     let event = match from_wire(raw, Vec::new()) {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
-        Ok(neutrino_event::Wire::Rejected(..)) | Err(_) => {
+        Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
+            tracing::warn!(event_id = %ev.event_id, %defect, "invite: refusing Wire::Rejected invite");
+            return Err(FedError::BadRequest("malformed invite event"));
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "invite: refusing unparseable invite");
             return Err(FedError::BadRequest("malformed invite event"));
         }
     };

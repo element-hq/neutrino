@@ -240,10 +240,13 @@ async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
         // Rejected wire events are staged too (the worker persists them
         // rejected; cascade termination needs the row); drop-class events
         // (`Err`) never enter the system.
-        let Ok(ev) = from_wire(raw, Vec::new()) else {
+        let Ok(wire) = from_wire(raw, Vec::new()) else {
             continue;
         };
-        let ev = ev.into_event();
+        if let neutrino_event::Wire::Rejected(rej, defect) = &wire {
+            tracing::warn!(event_id = %rej.event_id, %defect, "reconcile: staging malformed event as rejected");
+        }
+        let ev = wire.into_event();
         if ev.room_id != *room_id {
             continue;
         }

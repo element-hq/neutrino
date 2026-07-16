@@ -324,9 +324,13 @@ async fn ingest_state_dag(
         .chain(std::iter::once(resp.event))
     {
         match from_wire(raw, Vec::new()) {
+            Ok(neutrino_event::Wire::Valid(ev)) => events.push(ev),
             // Rejected events are staged too — they persist as rejected rows
             // so references to them cascade-reject instead of gapfilling.
-            Ok(wire) => events.push(wire.into_event()),
+            Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
+                warn!(%room_id, event_id = %ev.event_id, %defect, "send_join response: keeping malformed event as rejected");
+                events.push(ev);
+            }
             Err(_) => warn!(%room_id, "dropping unparseable event in send_join response"),
         }
     }

@@ -181,10 +181,14 @@ pub(crate) async fn handle(
         // Drop-class PDUs (`Err`) never enter the system; `Wire::Rejected`
         // ones are staged like any other — the worker persists them rejected
         // (the cascade terminator).
-        let Ok(wire) = from_wire(raw, Vec::new()) else {
-            continue;
+        let event = match from_wire(raw, Vec::new()) {
+            Ok(neutrino_event::Wire::Valid(ev)) => ev,
+            Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
+                tracing::warn!(event_id = %ev.event_id, %defect, "/send: staging malformed PDU as rejected");
+                ev
+            }
+            Err(_) => continue,
         };
-        let event = wire.into_event();
         if !seen.insert(event.event_id.clone()) {
             continue;
         }

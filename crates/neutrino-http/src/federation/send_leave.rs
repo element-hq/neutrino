@@ -47,7 +47,12 @@ pub(crate) async fn handle(
     // `Wire::Rejected` leave is a 400 like any other malformed event.
     let event = match from_wire(raw, Vec::new()) {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
-        Ok(neutrino_event::Wire::Rejected(..)) | Err(_) => {
+        Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
+            tracing::warn!(event_id = %ev.event_id, %defect, "send_leave: refusing Wire::Rejected leave");
+            return Err(FedError::BadRequest("malformed leave event"));
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "send_leave: refusing unparseable leave");
             return Err(FedError::BadRequest("malformed leave event"));
         }
     };

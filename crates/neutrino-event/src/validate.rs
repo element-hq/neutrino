@@ -169,6 +169,17 @@ pub enum FormatError {
 ///   in `prev_state_events` cascade-rejects (MSC4242 rule 2.3) instead of
 ///   gapfill-refetching a dropped offender forever.
 ///
+/// The gapfill wedge-termination is **reject-class only**. A *drop-class*
+/// defect on an event that a descendant references in `prev_state_events` is
+/// NOT terminated: the offender is never staged, so the descendant's
+/// `PrevStateNotFound` re-requests it on every retry indefinitely (the worker
+/// backoff caps the frequency, not the total attempts). This residual is
+/// accepted because the drop-class conditions (oversize, DAG fan-in caps,
+/// create-structural rules) are not ones a well-behaved peer's referenced
+/// state event should ever hit — a peer emitting them is already
+/// malfunctioning. If that assumption ever fails in practice, the fix is to
+/// re-tier the offending condition into `Reject`, not to special-case gapfill.
+///
 /// The match is deliberately **exhaustive with no wildcard**: adding a
 /// `FormatError` variant is a compile error here until it is classified, so a
 /// new rule can never silently default to Drop and re-grow the refetch wedge.

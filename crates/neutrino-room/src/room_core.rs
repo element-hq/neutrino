@@ -383,11 +383,10 @@ impl RoomCore {
         // excluded from every state-res / auth-chain walk, so the field is
         // never read.
         if event.rejected {
-            let create_id = validate::derive_create_event_id(&event.room_id)
-                .ok_or_else(|| ReferenceError::MalformedRoomId(event.room_id.clone()))?;
-            if provider.get_event(&create_id)?.is_none() {
-                return Err(ReferenceError::UnknownRoom(event.room_id.clone()).into());
-            }
+            // Shared with validate_references so the "is the room grounded?"
+            // check can't drift: an unfetched create stays RETRY (UnknownRoom),
+            // a missing/rejected/malformed create is a terminal reject.
+            validate::require_room_grounded(&event.room_id, provider)?;
             return Ok(vec![Effect::Persist { event }]);
         }
 
@@ -1658,7 +1657,11 @@ mod tests {
         // The wedge-terminating property end-to-end at core level: once the
         // semantically-bad event is persisted rejected, a child referencing
         // it in prev_state_events cascade-rejects via PrevStateRejected —
-        // two persisted rows, zero retries.
+        // two persisted rows, zero retries. The positive control at the end
+        // pins the cascade as the sole cause: the SAME invite pointing at a
+        // valid prev_state entry instead of bad_id auths cleanly, so the
+        // rejection can only be the PrevStateRejected cascade, not an
+        // incidental auth failure.
         let (mut room, mut provider, _create_id, join_id, room_id) = alice_creates_and_joins(true);
         let bad = wire_event(
             "m.room.member",
@@ -1684,14 +1687,33 @@ mod tests {
         );
         let effects = room.apply_pdu(child, &provider).expect("rejected, not Err");
         assert_rejected(&effects);
+
+        // Positive control: same invite, valid prev_state (alice's join)
+        // instead of bad_id. This one auths, proving bad_id was the cause.
+        let control = member_event(
+            "@alice:example.org",
+            "@bob:example.org",
+            "invite",
+            vec![join_id],
+            &room_id,
+        );
+        let effects = room.apply_pdu(control, &provider).expect("accepted");
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Persist { event } if !event.rejected)),
+            "control invite must be accepted, got {effects:?}"
+        );
     }
 
     #[test]
     fn apply_pdu_semantic_reject_in_unknown_room_stays_retryable() {
         // The FK guard: a semantically-bad event for a room we don't hold
-        // can't be persisted (no room row). validate_references runs first,
-        // so UnknownRoom wins and the event stays RETRY until the room
-        // lands — then the re-apply persists the rejection.
+        // can't be persisted (no room row). A pre-rejected event skips
+        // validate_references entirely; the UnknownRoom comes from the
+        // rejected short-circuit's own create-existence check (derive the
+        // create id, look it up, absent → UnknownRoom). The event stays RETRY
+        // until the room lands — then the re-apply persists the rejection.
         let ghost_create = create_event("@ghost:example.org");
         let ghost_room = room_id_from_create(&ghost_create.event_id);
         let mut room = RoomCore::new(ghost_room.clone());

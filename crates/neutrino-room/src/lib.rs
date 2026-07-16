@@ -258,9 +258,10 @@ pub enum ReferenceError {
     RoomRejected(OwnedRoomId),
 
     /// v12 rule 2 (defensive): the event found at the derived create-event ID
-    /// is not actually an `m.room.create` event. Should be impossible for a
-    /// well-formed store but worth the explicit reject path.
-    #[error("event at derived create id is not m.room.create: {0}")]
+    /// is not a well-formed `m.room.create` — either the wrong `type` or a
+    /// non-empty `state_key`. Should be impossible for a well-formed store but
+    /// worth the explicit reject path.
+    #[error("event at derived create id is not a well-formed m.room.create: {0}")]
     RoomTypeMismatch(OwnedEventId),
 
     /// MSC4242: "If there are entries which were themselves rejected under

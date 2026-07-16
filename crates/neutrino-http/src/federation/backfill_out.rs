@@ -90,7 +90,11 @@ async fn persist_pdus(
         // cascade-rejects, and so the malformed content can never surface as
         // an accepted row (clients filter rejected; state-res excludes it).
         let event = match from_wire(raw, Vec::new()) {
-            Ok(wire) => wire.into_event(),
+            Ok(neutrino_event::Wire::Valid(ev)) => ev,
+            Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
+                warn!(target: "neutrino_http", %room_id, event_id = %ev.event_id, %defect, "backfill: serving malformed PDU as rejected");
+                ev
+            }
             Err(e) => {
                 warn!(target: "neutrino_http", %room_id, error = %e, "backfill: skipping unparseable PDU");
                 continue;
