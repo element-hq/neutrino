@@ -1857,12 +1857,12 @@ async fn send_unfillable_ancestry_stays_unapplied() {
 
 #[tokio::test]
 async fn send_semantically_malformed_ancestor_terminates_via_cascade_reject() {
-    // The M5 wedge regression. E_bad fails a state-independent rule (5.1:
-    // member without `membership`). Pre-fix, apply DROPped it, so E_child's
-    // PrevStateNotFound stayed retryable and the worker looped: gapfill →
-    // refetch E_bad → drop → back off → forever. Now E_bad persists as
+    // End-to-end wedge terminator. E_bad fails a state-independent rule (5.1:
+    // member without `membership`). If it were DROPped, E_child's
+    // PrevStateNotFound would stay retryable and the worker would loop: gapfill
+    // → refetch E_bad → drop → back off → forever. Instead E_bad persists as
     // *rejected* and E_child cascade-rejects via PrevStateRejected: two
-    // committed rows, drained staging, and a bounded number of fetch rounds.
+    // committed rows, drained staging, bounded fetch rounds.
     let fetcher = StubFetcher::no_progress();
     let (app, store, room_id, alice, join_id, _tempfile) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;

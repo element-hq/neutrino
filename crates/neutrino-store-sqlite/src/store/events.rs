@@ -1531,10 +1531,10 @@ mod tests {
     }
 
     // E35b: the membership guard is scoped to non-rejected rows. A
-    // semantically-malformed member (rule 5.1) is persisted *as rejected*
-    // (the M5 REJECT disposition) so descendants cascade-reject — the
-    // write boundary must accept it; it never reaches the `current_state`
-    // upsert, so the membership invariant is untouched.
+    // semantically-malformed member (rule 5.1) is persisted *as rejected* so
+    // descendants cascade-reject — the write boundary must accept it; it never
+    // reaches the `current_state` upsert, so the membership invariant is
+    // untouched.
     #[tokio::test]
     async fn persist_event_accepts_rejected_member_without_membership() {
         let s = store_with_room().await;

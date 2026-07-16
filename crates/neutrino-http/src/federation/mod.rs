@@ -228,9 +228,8 @@ pub(crate) fn complete_membership_template(
     let parsed = match from_wire(raw, Vec::new()) {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
         Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
-            // Only the DAG pointers are taken (the event is rebuilt below), so a
-            // rejected template is still usable — but log the defect: it means
-            // the resident server handed us a malformed make_* template.
+            // Usable (only the pointers are taken), but log it: the resident
+            // server handed us a malformed make_* template.
             tracing::warn!(target: "neutrino_http", %room_id, %user, membership, %defect, "membership template from resident server is Wire::Rejected (rebuilding from its DAG pointers)");
             ev
         }

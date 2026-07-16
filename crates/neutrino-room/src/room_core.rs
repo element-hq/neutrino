@@ -1530,11 +1530,11 @@ mod tests {
     // ----- state-independent semantic rejects (rule 9 / 5.1 / 10.1-10.3) -----
     //
     // `EventBuilder::build` refuses to construct these, so the fixtures go
-    // through `from_wire` — which deliberately no longer runs `validate_pdu`
-    // (a malformed-but-parseable federation PDU must reach `apply_pdu` to be
-    // persisted as rejected rather than dropped at the wire edge). The wrong
-    // `hashes.sha256` below is intentional: `from_wire` redacts on mismatch,
-    // and the redacted event still carries the semantic defect under test.
+    // through `from_wire`, which classifies them `Wire::Rejected` (rejected =
+    // true baked in) — the same pre-classified event `apply_pdu` sees for a
+    // real wire PDU. The wrong `hashes.sha256` below is intentional:
+    // `from_wire` redacts on mismatch, and the redacted event still carries
+    // the semantic defect under test.
 
     /// Parse a hand-rolled wire PDU. `content`/`state_key` shapes that
     /// `EventBuilder` would reject are exactly the point.

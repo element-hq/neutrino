@@ -12,10 +12,10 @@
 //!
 //! - [`from_wire`] is the inbound counterpart: it reads the canonical bytes
 //!   as the source of truth, computes the reference hash to derive the
-//!   event_id, then runs `parse_event` only. Semantic validation
-//!   (`validate_pdu`) is deliberately left to `RoomCore::apply_pdu`, which
-//!   persists state-independent rule failures as *rejected* rather than
-//!   dropping them at the wire edge (see `from_wire`'s docs).
+//!   event_id, runs `parse_event`, then `validate_pdu`, and classifies the
+//!   outcome — a state-independent auth-rule failure comes back as
+//!   [`Wire::Rejected`] (persisted rejected, not dropped at the wire edge),
+//!   not an error (see `from_wire`'s docs).
 //!
 //! See `event-id-design.md` §"Updated `EventBuilder`".
 
@@ -734,9 +734,8 @@ mod tests {
         // Contract pin: a PDU that parses but fails a state-independent auth
         // rule (here rule 5.1, member without `membership`) comes back as
         // `Wire::Rejected` with `rejected = true` baked in — never dropped at
-        // the wire edge (the M5 gapfill-refetch wedge), and never obtainable
-        // as an accepted `Event`. `EventBuilder::build`, by contrast, still
-        // refuses to produce it.
+        // the wire edge, and never obtainable as an accepted `Event`.
+        // `EventBuilder::build`, by contrast, still refuses to produce it.
         let raw = serde_json::json!({
             "type": "m.room.member",
             "state_key": "@mallory:remote.example",
@@ -836,11 +835,10 @@ mod tests {
         let parsed = from_wire(tampered_raw, Vec::new())
             .expect("from_wire")
             .into_event();
-        // event_id is unchanged — reference_hash runs over the redacted form
-        // which doesn't include `hashes` directly… wait, it does. After
-        // tampering the reference_hash differs too, so the parsed event_id
-        // here is the *tampered* hash. The point of the test is that the
-        // content was redacted (body stripped) rather than the event rejected.
+        // Tampering `hashes.sha256` also changes the reference hash, so the
+        // parsed event_id here is the *tampered* hash — not asserted. The point
+        // is that a content-hash mismatch REDACTS (body stripped) rather than
+        // rejecting the event.
         let parsed_raw: serde_json::Value = serde_json::from_str(parsed.raw.get()).unwrap();
         assert!(
             parsed_raw["content"]

@@ -108,6 +108,13 @@ pub enum FormatError {
     #[error("m.room.create event has a room_id field")]
     CreateHasRoomId,
 
+    /// `m.room.create` is a state event and its `state_key` must be `""`
+    /// (missing or non-empty is malformed). Not a valid PDU rather than an
+    /// auth-rule failure: a create can never ground a room under a non-empty
+    /// key, so it is dropped, not persisted rejected.
+    #[error("m.room.create event has a non-empty or missing state_key")]
+    CreateBadStateKey,
+
     /// v12 rule 1.3: "If `content.room_version` is present and is not a
     /// recognised version, reject."
     #[error("unrecognised room_version: {0}")]
@@ -209,6 +216,7 @@ pub fn semantic_verdict(err: &FormatError) -> SemanticVerdict {
         | FormatError::CreateHasPrevEvents
         | FormatError::CreateHasPrevStateEvents
         | FormatError::CreateHasRoomId
+        | FormatError::CreateBadStateKey
         | FormatError::UnrecognisedRoomVersion(_)
         | FormatError::InvalidAdditionalCreators => Drop,
 
@@ -445,6 +453,10 @@ pub fn validate_pdu(event: &Event) -> Result<(), FormatError> {
         // MSC4242.
         if !event.prev_state_events.is_empty() {
             return Err(FormatError::CreateHasPrevStateEvents);
+        }
+        // A create is a state event with an empty state_key.
+        if event.state_key.as_deref() != Some("") {
+            return Err(FormatError::CreateBadStateKey);
         }
     }
 
@@ -703,6 +715,7 @@ mod tests {
             (FormatError::CreateHasPrevEvents, Drop),
             (FormatError::CreateHasPrevStateEvents, Drop),
             (FormatError::CreateHasRoomId, Drop),
+            (FormatError::CreateBadStateKey, Drop),
             (FormatError::UnrecognisedRoomVersion("9".into()), Drop),
             (FormatError::InvalidAdditionalCreators, Drop),
             // The state-independent auth rules: spec verdict = reject.
@@ -872,6 +885,31 @@ mod tests {
         assert!(matches!(
             validate_pdu(&ev),
             Err(FormatError::CreateHasPrevStateEvents)
+        ));
+    }
+
+    #[test]
+    fn validate_pdu_rejects_create_with_non_empty_state_key() {
+        // Rule 9 exempts m.room.create, so this check is the only thing
+        // rejecting a create with a junk state_key. A create must have
+        // state_key "" — non-empty is dropped (it could never ground a room).
+        let mut v = base_create();
+        v["state_key"] = json!("@evil:example.org");
+        let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
+        assert!(matches!(
+            validate_pdu(&ev),
+            Err(FormatError::CreateBadStateKey)
+        ));
+    }
+
+    #[test]
+    fn validate_pdu_rejects_create_with_missing_state_key() {
+        let mut v = base_create();
+        v.as_object_mut().expect("obj").remove("state_key");
+        let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
+        assert!(matches!(
+            validate_pdu(&ev),
+            Err(FormatError::CreateBadStateKey)
         ));
     }
 
