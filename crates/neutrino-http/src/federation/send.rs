@@ -178,9 +178,13 @@ pub(crate) async fn handle(
     // recording.
     let mut all_staged = true;
     for raw in body.pdus {
-        let Ok(event) = from_wire(raw, Vec::new()) else {
+        // Drop-class PDUs (`Err`) never enter the system; `Wire::Rejected`
+        // ones are staged like any other — the worker persists them rejected
+        // (the cascade terminator).
+        let Ok(wire) = from_wire(raw, Vec::new()) else {
             continue;
         };
+        let event = wire.into_event();
         if !seen.insert(event.event_id.clone()) {
             continue;
         }

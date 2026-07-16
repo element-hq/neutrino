@@ -354,7 +354,14 @@ impl<'a> EventRow<'a> {
         }
         #[derive(Deserialize, Default)]
         struct WriteSideContent {
-            membership: Option<String>,
+            // Lenient `Value`, not `String`: a *rejected* member row may
+            // legitimately carry a non-string membership (rule 5.1 treats a
+            // present-but-wrong-typed value as a rejection verdict, and the
+            // row must still be storable so descendants cascade-reject). The
+            // string requirement for non-rejected rows is enforced below via
+            // `as_str()` — a non-string degrades to "missing" there and hits
+            // the same InvalidInput guard.
+            membership: Option<serde_json::Value>,
         }
 
         let cracked: WriteSideCracked = serde_json::from_str(self.raw.get())
@@ -420,9 +427,15 @@ impl<'a> EventRow<'a> {
         // be storable so a descendant's reference check cascade-rejects
         // instead of gapfill-refetching the offender forever.
         let membership = if self.event_type == "m.room.member" && !self.rejected {
-            let m = cracked.content.membership.as_deref().ok_or_else(|| {
-                Error::InvalidInput("m.room.member event missing content.membership".into())
-            })?;
+            // Absent OR non-string both fail here (see `WriteSideContent`).
+            let m = cracked
+                .content
+                .membership
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    Error::InvalidInput("m.room.member event missing content.membership".into())
+                })?;
             if self.state_key.is_none() {
                 return Err(Error::InvalidInput(
                     "m.room.member event missing state_key".into(),

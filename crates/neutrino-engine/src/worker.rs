@@ -264,8 +264,11 @@ async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
     let mut out = Vec::with_capacity(eligible.len());
     for p in eligible {
         match from_wire(p.raw.clone(), Vec::new()) {
-            Ok(event) => out.push(Staged {
-                event,
+            // Both variants proceed: a `Wire::Rejected` event carries
+            // `rejected = true` and `apply_pdu` short-circuits it to a
+            // rejected persist (the cascade terminator).
+            Ok(wire) => out.push(Staged {
+                event: wire.into_event(),
                 origin: p.origin.clone(),
             }),
             Err(e) => {

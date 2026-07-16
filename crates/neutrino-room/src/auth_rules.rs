@@ -377,9 +377,17 @@ fn parse_content(event: &Event) -> Value {
 
 /// Map a corrupt-state [`AuthError::MalformedStateContent`] into
 /// `AuthContext::new`'s error domain. `StateResError::Internal` is the
-/// established "storage-side fault, not a verdict about the event" carrier —
-/// the caller backs off and retries rather than misclassifying corruption as
-/// an auth reject.
+/// established "storage-side fault, not a verdict about the event" carrier.
+///
+/// Honesty note on where that fault-not-verdict intent actually holds: the
+/// state-res walk callers (`power_of_sender`, IAC) propagate it as a
+/// retryable fault; `check_auth_rules`, however, flattens every
+/// `AuthContext::new` error into `AuthError::CreateUnavailable`, so on the
+/// live apply path a corrupt state row surfaces as a REJECT verdict on the
+/// incoming event. Both are only reachable via genuine DB corruption or a
+/// validation regression (`from_wire` classification keeps malformed content
+/// out of accepted rows, and rejected rows out of state maps) — the point of
+/// this mapping is that neither path panics.
 fn corrupt_state(err: AuthError) -> StateResError {
     StateResError::Internal(err.to_string())
 }
@@ -971,7 +979,8 @@ mod tests {
             serde_json::value::RawValue::from_string(raw.to_string()).expect("valid JSON"),
             Vec::new(),
         )
-        .expect("parseable wire event");
+        .expect("parseable wire event")
+        .into_event();
         // `ban` survives redaction, so the malformed value reaches parse.
         // (match, not expect_err: `PowerLevels` deliberately has no Debug.)
         let err = match PowerLevels::parse(Some(&ev)) {

@@ -4,7 +4,8 @@ pub mod event_id;
 pub mod event_view;
 pub mod validate;
 pub use event::Event;
-pub use validate::FormatError;
+pub use event_builder::Wire;
+pub use validate::{FormatError, SemanticVerdict, semantic_verdict};
 
 /// Wire identifier for the only room version this server speaks.
 ///

@@ -285,23 +285,24 @@ impl RoomCore {
     /// Three failure dispositions, distinguished so the caller can react:
     /// - **DROP** (`Err`, never persisted): the event is not a valid PDU —
     ///   `room_id` mismatch (a dispatch bug, not a verdict about the event)
-    ///   or a `validate_pdu` failure that synapse also refuses to persist
-    ///   (size limits, DAG fan-in caps, create structural rules — see
-    ///   [`is_semantic_rejection`] for the split).
+    ///   or a `validate_pdu` failure classified
+    ///   [`SemanticVerdict::Drop`](neutrino_event::SemanticVerdict) (size
+    ///   limits, DAG fan-in caps, create rules). Wire events in this class
+    ///   never get here — `from_wire` already refused to construct them.
     /// - **RETRY** (`Err`, caller backfills missing ancestry and re-applies):
     ///   `ReferenceError::PrevStateNotFound` / `UnknownRoom`,
     ///   `StateResError::MissingEvent`, or a storage fault. "We lack data",
     ///   not "the event is bad". See [`CoreError::is_retryable`].
     /// - **REJECT** (`Ok`, `event.rejected = true`, no FE/state mutation): the
     ///   event is present and evaluable but fails a rule — a state-independent
-    ///   auth rule (rule 9 / 5.1 / 10.1–10.3, surfaced by `validate_pdu`),
-    ///   auth against state-before-event, or a `prev_state_events` entry that
-    ///   is itself rejected / not a state event / in a different room
-    ///   (rejection cascades). The verdict is a deterministic function of the
-    ///   event and its references, never of this `RoomCore`'s in-memory state.
-    ///   Persisting (not dropping) these is what lets a descendant's reference
-    ///   check terminate via the cascade instead of gapfill-refetching the
-    ///   offender forever.
+    ///   auth rule (rule 9 / 5.1 / 10.1–10.3, pre-classified by `from_wire`
+    ///   as `Wire::Rejected`), auth against state-before-event, or a
+    ///   `prev_state_events` entry that is itself rejected / not a state event
+    ///   / in a different room (rejection cascades). The verdict is a
+    ///   deterministic function of the event and its references, never of this
+    ///   `RoomCore`'s in-memory state. Persisting (not dropping) these is what
+    ///   lets a descendant's reference check terminate via the cascade instead
+    ///   of gapfill-refetching the offender forever.
     ///
     /// **auth_events**: MSC4242 removes them from the wire, so `apply_pdu` is
     /// their sole authority — it computes them from state-before-event and
@@ -310,15 +311,16 @@ impl RoomCore {
     /// what the builder would have computed; `build_local_event` therefore
     /// does not set them.)
     ///
-    /// **Semantic validation happens here.** `EventBuilder::build()` runs
-    /// `validate::validate_pdu` (a malformed local event 400s before it ever
-    /// reaches the pipeline), but `Event::from_wire` deliberately does NOT —
-    /// a malformed-but-parseable federation PDU must reach `apply_pdu` to
-    /// receive its persist-as-rejected verdict rather than dying at the wire
-    /// edge. `apply_pdu`'s `validate_pdu` run is therefore the authoritative
-    /// one for federation events. Wire-format checks (`parse_event`) are NOT
-    /// re-run — they require the raw JSON bytes, which `Event` doesn't
-    /// expose in structured form.
+    /// **Semantic validation happens at parse.** Both `Event` constructors
+    /// classify: `EventBuilder::build()` errors on any `validate_pdu` failure
+    /// (a malformed local event 400s before the pipeline), and `from_wire`
+    /// returns `Wire::Rejected` (with `rejected = true` baked in) for a
+    /// state-independent auth-rule failure, or `Err` for the drop class. So a
+    /// pre-rejected event arriving here short-circuits to persist, and the
+    /// `validate_pdu` re-run below is a backstop for hand-constructed
+    /// `Event`s only. Wire-format checks (`parse_event`) are NOT re-run —
+    /// they require the raw JSON bytes, which `Event` doesn't expose in
+    /// structured form.
     ///
     /// Note: `apply_pdu` does NOT insert the event into `provider`. The caller
     /// is expected to honour `Effect::Persist` by writing through to storage
@@ -350,45 +352,57 @@ impl RoomCore {
             return Ok(Vec::new());
         }
 
-        // Semantic rules (no provider), classified. A state-independent auth
-        // rule failure (rule 9 / 5.1 / 10.1–10.3) is a REJECT — but the
-        // persist can't happen yet: persisting needs the room row (FK), and
-        // whether the room is known is exactly what `validate_references`
-        // establishes below. Park the verdict; everything else is a DROP as
-        // before (not a valid / persistable PDU).
-        let semantic_reject = match neutrino_event::validate::validate_pdu(&event) {
-            Ok(()) => false,
-            Err(e) if is_semantic_rejection(&e) => true,
-            Err(e) => return Err(e.into()),
-        };
+        // Backstop for hand-constructed events only. Wire events arrive
+        // pre-classified — `from_wire` returns `Wire::Rejected` with the flag
+        // already set for a state-independent auth-rule failure — and local
+        // events come from `EventBuilder::build`, which errors on any
+        // `validate_pdu` failure. So this re-run fires only for an `Event`
+        // assembled by hand; it applies the same classification `from_wire`
+        // would have.
+        if !event.rejected
+            && let Err(e) = neutrino_event::validate::validate_pdu(&event)
+        {
+            match neutrino_event::semantic_verdict(&e) {
+                // Not a valid event (receipt-check 1): DROP, never persisted.
+                neutrino_event::SemanticVerdict::Drop => return Err(e.into()),
+                // State-independent auth rule: same REJECT as `Wire::Rejected`.
+                neutrino_event::SemanticVerdict::Reject => {
+                    Arc::make_mut(&mut event).rejected = true;
+                }
+            }
+        }
+
+        // REJECT (pre-classified at parse, or by the backstop above): the
+        // verdict already rides the event. Establish only that the room
+        // exists — the persist needs the room row (`events.room_id` FK), and
+        // an unknown room stays RETRY until it lands — then persist.
+        // Deliberately nothing else: a condemned event's ancestry is dead
+        // weight (no reference walk, so no gapfill round-trips for it), and
+        // the auth machinery never sees its malformed content. Persisted with
+        // empty auth_events like the cascade branch below — rejected rows are
+        // excluded from every state-res / auth-chain walk, so the field is
+        // never read.
+        if event.rejected {
+            let create_id = validate::derive_create_event_id(&event.room_id)
+                .ok_or_else(|| ReferenceError::MalformedRoomId(event.room_id.clone()))?;
+            if provider.get_event(&create_id)?.is_none() {
+                return Err(ReferenceError::UnknownRoom(event.room_id.clone()).into());
+            }
+            return Ok(vec![Effect::Persist { event }]);
+        }
 
         // Reference validation, classified: a "bad reference" (rejected /
         // non-state / different-room prev_state, rejected create) is a REJECT
         // — persist the event marked rejected; rejection cascades. Everything
         // else (missing ancestry, lookup fault) is RETRY/DROP and propagates
         // as `Err`. The split is purely a function of the references, not of
-        // this room's state. An UnknownRoom here also covers a parked
-        // semantic reject: it stays RETRY until the room lands, then the
-        // re-apply comes back through this path and persists the rejection.
+        // this room's state.
         if let Err(ref_err) = validate::validate_references(&event, provider) {
             if is_reference_rejection(&ref_err) {
                 Arc::make_mut(&mut event).rejected = true;
                 return Ok(vec![Effect::Persist { event }]);
             }
             return Err(ref_err.into());
-        }
-
-        // REJECT: parked state-independent verdict, persisted now that the
-        // room is known. Deliberately BEFORE the state-before walk: no
-        // gapfill round-trips for a condemned event (synapse parity — its
-        // state-independent checks reject without fetching state), and the
-        // auth machinery below never sees the malformed content. Persisted
-        // with empty auth_events like the cascade branch above — rejected
-        // rows are excluded from every state-res / auth-chain walk, so the
-        // field is never read.
-        if semantic_reject {
-            Arc::make_mut(&mut event).rejected = true;
-            return Ok(vec![Effect::Persist { event }]);
         }
 
         // Shared cache for state-before walks: state_before(event) and
@@ -512,34 +526,6 @@ impl RoomCore {
         fes.insert(event.event_id.clone());
         fes
     }
-}
-
-/// Classify a [`FormatError`] from `validate_pdu` as a REJECT (persist the
-/// federation event marked rejected, so a descendant's reference check
-/// cascade-rejects and terminates) versus a DROP (never persisted).
-///
-/// REJECT covers the **state-independent auth rules** — v12 rules the spec
-/// says to reject and synapse persists-as-rejected via `AuthError`:
-/// rule 9 (`@`-state_key ≠ sender), rule 5.1 (member without state_key /
-/// membership), rules 10.1–10.3 (malformed power_levels content).
-///
-/// DROP keeps everything synapse also refuses to persist: size limits
-/// (`unpersistable` in synapse), the >20 DAG fan-in caps, and wire-shape
-/// errors. Create-content rules (1.3/1.4) also stay DROP — deliberately:
-/// a rejected create has no room row to persist under (`events.room_id`
-/// FK), and with hash-derived room ids a dropped create just means the
-/// room never grounds; its descendants stay UnknownRoom-retryable exactly
-/// like any room we've never heard of.
-fn is_semantic_rejection(err: &FormatError) -> bool {
-    matches!(
-        err,
-        FormatError::StateKeyAtSignSenderMismatch
-            | FormatError::MemberMissingStateKey
-            | FormatError::MemberMissingMembership
-            | FormatError::PowerLevelsBadIntField(_)
-            | FormatError::PowerLevelsBadObjectField(_)
-            | FormatError::PowerLevelsBadUsers
-    )
 }
 
 /// Classify a [`ReferenceError`] as a REJECT (the referenced data is present
@@ -1579,6 +1565,7 @@ mod tests {
             Vec::new(),
         )
         .expect("parseable wire event")
+        .into_event()
     }
 
     #[test]
@@ -1587,8 +1574,12 @@ mod tests {
         // descendant's reference check cascade-rejects instead of
         // gapfill-refetching the offender forever. auth_events stay empty
         // (the state-before walk is skipped; rejected rows are excluded from
-        // every state-res walk, so the field is never read).
+        // every state-res walk, so the field is never read). `wire_event`
+        // hands the event over pre-rejected (`Wire::Rejected`), exercising
+        // the short-circuit path production wire events take.
         let (mut room, provider, _create_id, join_id, room_id) = alice_creates_and_joins(true);
+        let heads_before = room.forward_extremities.clone();
+        let state_heads_before = room.state_forward_extremities.clone();
         let bad = wire_event(
             "m.room.member",
             Some("@mallory:example.org"),
@@ -1597,12 +1588,36 @@ mod tests {
             &join_id,
             &room_id,
         );
+        assert!(bad.rejected, "from_wire pre-classifies rule-5.1 defects");
         let effects = room.apply_pdu(bad, &provider).expect("rejected, not Err");
         assert_rejected(&effects);
         let [Effect::Persist { event }] = &effects[..] else {
             unreachable!("assert_rejected pinned the shape");
         };
         assert!(event.auth_events.is_empty(), "state walk must be skipped");
+        // The REJECT contract's other half: neither head-set moved.
+        assert_eq!(room.forward_extremities, heads_before);
+        assert_eq!(room.state_forward_extremities, state_heads_before);
+    }
+
+    #[test]
+    fn apply_pdu_backstop_classifies_unflagged_malformed_event() {
+        // A hand-constructed malformed `Event` that bypassed both
+        // constructors (no rejected flag) still can't sneak past: the
+        // backstop re-runs `validate_pdu` and applies the same
+        // classification `from_wire` would have.
+        let (mut room, provider, _create_id, join_id, room_id) = alice_creates_and_joins(true);
+        let mut bad = wire_event(
+            "m.room.member",
+            Some("@mallory:example.org"),
+            "@alice:example.org",
+            json!({}),
+            &join_id,
+            &room_id,
+        );
+        bad.rejected = false; // simulate a constructor bypass
+        let effects = room.apply_pdu(bad, &provider).expect("rejected, not Err");
+        assert_rejected(&effects);
     }
 
     #[test]
@@ -1694,24 +1709,33 @@ mod tests {
     }
 
     #[test]
-    fn apply_pdu_oversized_event_stays_dropped() {
-        // Tier-A pin: size-limit failures remain DROP (`Err`, never
-        // persisted) — synapse's `unpersistable` parity. The bulk sits in
-        // `state_key`: content would be stripped by `from_wire`'s
-        // hash-mismatch redaction, but state_key survives redaction, so the
-        // event is still oversized when `apply_pdu` measures it.
+    fn apply_pdu_drop_class_backstop_rejects_hand_constructed_event() {
+        // Drop-class defects are refused by `from_wire` itself (see the
+        // neutrino-event tests), so the only way one reaches `apply_pdu` is a
+        // hand-constructed `Event`. The backstop must DROP it (`Err`, never
+        // persisted). Constructed by mutating a built event's `state_key`
+        // past the 255-byte cap — `apply_pdu` doesn't re-check hashes, so the
+        // field/raw inconsistency is irrelevant here.
         let (mut room, provider, _create_id, join_id, room_id) = alice_creates_and_joins(true);
-        let big = wire_event(
-            "m.example.big",
-            Some(&"x".repeat(70_000)),
-            "@alice:example.org",
-            json!({}),
-            &join_id,
-            &room_id,
-        );
+        let mut big = EventBuilder::new(
+            "@alice:example.org".parse().expect("user"),
+            "m.example.big".to_owned(),
+        )
+        .room_id(room_id.clone())
+        .state_key("x".to_owned())
+        .content(json!({}))
+        .prev_events(vec![join_id.clone()])
+        .prev_state_events(vec![join_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid event");
+        big.state_key = Some("x".repeat(300));
         let err = room.apply_pdu(big, &provider).expect_err("dropped");
         assert!(
-            matches!(err, CoreError::Format(FormatError::EventTooLarge)),
+            matches!(
+                err,
+                CoreError::Format(FormatError::FieldTooLong("state_key"))
+            ),
             "got {err:?}"
         );
         assert!(!err.is_retryable());

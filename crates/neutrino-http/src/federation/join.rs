@@ -324,7 +324,9 @@ async fn ingest_state_dag(
         .chain(std::iter::once(resp.event))
     {
         match from_wire(raw, Vec::new()) {
-            Ok(ev) => events.push(ev),
+            // Rejected events are staged too — they persist as rejected rows
+            // so references to them cascade-reject instead of gapfilling.
+            Ok(wire) => events.push(wire.into_event()),
             Err(_) => warn!(%room_id, "dropping unparseable event in send_join response"),
         }
     }
@@ -342,6 +344,13 @@ async fn ingest_state_dag(
             .ok_or("state DAG is missing the create event")?;
         if create.room_id != *room_id {
             return Err("create event is for a different room");
+        }
+        // Unreachable today (every create-rule failure is drop-class, so a
+        // rejected create never parses out of `from_wire`) — but a room must
+        // never be founded on a condemned genesis event, so guard the
+        // classification rather than assume it.
+        if create.rejected {
+            return Err("create event in the send_join response is invalid");
         }
         store
             .create_room(create, &[])

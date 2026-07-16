@@ -1868,9 +1868,10 @@ async fn send_semantically_malformed_ancestor_terminates_via_cascade_reject() {
         seed_joined_room_with_fetcher(fetcher.clone()).await;
 
     // E_bad can't come from EventBuilder (build refuses to produce it); hand
-    // it to from_wire, which deliberately skips semantic validation. The
-    // wrong content hash is fine: member redaction keeps `membership`
-    // (absent here), so the redacted event still carries the defect.
+    // it to from_wire, which classifies it Wire::Rejected (rejected=true
+    // baked in). The wrong content hash is fine: member redaction keeps
+    // `membership` (absent here), so the redacted event still carries the
+    // defect.
     let bad_raw = json!({
         "type": "m.room.member",
         "state_key": "@mallory:remote.example.org",
@@ -1886,7 +1887,8 @@ async fn send_semantically_malformed_ancestor_terminates_via_cascade_reject() {
         serde_json::value::RawValue::from_string(bad_raw.to_string()).expect("valid JSON"),
         Vec::new(),
     )
-    .expect("parseable PDU");
+    .expect("parseable PDU")
+    .into_event();
     let bad_id = bad.event_id.clone();
     let child = message_on(
         &alice,

@@ -195,6 +195,46 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### Wire redesign: verdicts classified at parse, carried in the type (2026-07-16)
+- Supersedes the parked-verdict mechanics of the 2026-07-15 M5 entry below.
+  Root cause of the M5 review findings (5 majors): the verdict decision was
+  moved off the single ingress choke point (`from_wire`) to one consumer
+  (`apply_pdu`), leaving every non-apply persistence path (backfill, join
+  create, OOB invite) unvalidated, and letting malformed events travel as
+  ordinary `Event`s through code built on "accepted = shape-valid".
+- New shape: `from_wire -> Result<Wire, FormatError>` with
+  `Wire::{Valid(Event), Rejected(Event, FormatError)}`. `Err` = the spec's
+  receipt-check-1 "not a valid event" (unparseable, size, fan-in caps, create
+  rules) — never enters the system. `Rejected` = a state-independent auth
+  rule (9 / 5.1 / 10.1–10.3) with `rejected = true` baked in — "malformed but
+  accepted" is unrepresentable. The classification
+  (`neutrino_event::semantic_verdict`) is an exhaustive match: a new
+  `FormatError` variant won't compile until classified.
+- Every ingress now makes a compiler-forced, local choice: /send + worker +
+  gapfill + reconcile stage both variants (apply_pdu short-circuits a
+  pre-rejected event to persist after a room-existence probe — no reference
+  walk, so condemned events are never gapfilled); backfill persists
+  `Rejected` history as rejected; join fails on a rejected create; OOB
+  invite / send_join / send_leave 400 (local-refusal policy);
+  `EventBuilder::build` unchanged. `apply_pdu`'s validate_pdu run remains as
+  a backstop for hand-constructed events only.
+- Drop-class refetch loops terminate naturally now: drop-class ancestors are
+  never staged, so gapfill's staged_new==0 no-progress terminator fires
+  (the M5-review M-D loop existed only because the drop happened post-stage).
+- Store rider: `WriteSideContent.membership` is now a lenient `Value` (a
+  rejected member row may carry a non-string membership; the string
+  requirement for accepted rows is enforced via `as_str` hitting the same
+  guard).
+- Correction to the M5 entry below (spec review): synapse does NOT
+  persist-as-rejected for rules 10.1–10.3 — `_check_power_levels` raises
+  `SynapseError(400)`, which errors out of processing entirely. Persisting
+  rejected is what the spec's "reject" verdict calls for, so we keep it, but
+  the "synapse parity" citation for 10.x was wrong. Rules 9/5.1 do raise
+  `AuthError` in synapse, so parity holds there. Also: v12 rule 9 is now
+  correctly scoped to exclude `m.room.create` and `m.room.third_party_invite`
+  (their spec rules are terminal before rule 9; synapse matches).
+
+
 ### Synapse-audit fix M5: state-independent rule failures REJECT-persist instead of DROP (2026-07-15)
 - Rules 9, 5.1, 10.1–10.3 (`validate_pdu` failures on parseable federation
   PDUs) now persist as `rejected = true` instead of erroring, so a

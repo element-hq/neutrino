@@ -237,9 +237,13 @@ async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
         // Derive each event's id from its bytes (`from_wire`); an unkeyable PDU is
         // dropped. Only stage events for *this* room — a foreign-room event is
         // never reachable by this room's drain, so it would be junk.
+        // Rejected wire events are staged too (the worker persists them
+        // rejected; cascade termination needs the row); drop-class events
+        // (`Err`) never enter the system.
         let Ok(ev) = from_wire(raw, Vec::new()) else {
             continue;
         };
+        let ev = ev.into_event();
         if ev.room_id != *room_id {
             continue;
         }

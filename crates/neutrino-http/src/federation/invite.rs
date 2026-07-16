@@ -96,10 +96,18 @@ pub(crate) async fn handle(
     // hash, so this leaves the computed event_id unchanged.
     let raw = merge_invite_room_state(body.event, body.invite_room_state);
 
-    // Parse + compute the event id (also runs the format + semantic validators).
-    // `auth_events` start empty — they are never on the v12 wire.
-    let event =
-        from_wire(raw, Vec::new()).map_err(|_| FedError::BadRequest("malformed invite event"))?;
+    // Parse + compute the event id. `auth_events` start empty — they are
+    // never on the v12 wire. A `Wire::Rejected` invite (state-independent
+    // rule failure) is refused outright: neither branch below has any use
+    // for a condemned invite — the hosted branch would just persist a
+    // rejected row nobody reads, and the OOB branch must never surface an
+    // invalid stub to sync.
+    let event = match from_wire(raw, Vec::new()) {
+        Ok(neutrino_event::Wire::Valid(ev)) => ev,
+        Ok(neutrino_event::Wire::Rejected(..)) | Err(_) => {
+            return Err(FedError::BadRequest("malformed invite event"));
+        }
+    };
 
     // Structural validation (spec §invite). No signature check (no signing
     // keys). The X-Matrix origin is authenticated below; the origin==sender
@@ -300,10 +308,15 @@ pub(crate) async fn federated_invite(
     //    different one. `unsigned.invite_room_state` rides along harmlessly (it
     //    is outside the hash and never read for a remote member).
     let returned_event = match from_wire(returned, Vec::new()) {
-        Ok(ev) if ev.event_id == candidate.event_id => ev,
-        // The peer handed back a *different* event than we sent — a swap attempt
-        // worth a distinct log line, not just a parse failure.
-        Ok(ev) => {
+        // `Wire::Valid` with our reference hash: byte-identical to what we
+        // sent (a `Rejected` variant with the same id is impossible — our
+        // candidate came from `EventBuilder`, which validates).
+        Ok(neutrino_event::Wire::Valid(ev)) if ev.event_id == candidate.event_id => ev,
+        // The peer handed back a *different* (or condemned) event than we
+        // sent — a swap attempt worth a distinct log line, not just a parse
+        // failure.
+        Ok(wire) => {
+            let ev = wire.event();
             warn!(dest = %target.server_name(), %room_id, expected = %candidate.event_id, returned = %ev.event_id, "outbound invite: invitee server returned a different event id");
             return error_response(
                 StatusCode::BAD_GATEWAY,
