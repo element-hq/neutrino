@@ -200,6 +200,19 @@ never use .unwrap() in handler code.
 
 ## decisions log
 
+### coap forks in-house as path deps; no coap patches anywhere (2026-07-21)
+- `vendor/coap-lite` (kaylendog/coap-lite@d45e952, qblock-phase1 tip) joins
+  `vendor/coap-rs` in-tree; neutrino-lb and coap-rs reach both by **path dep**
+  instead of version + `[patch.crates-io]`. Rationale: path deps resolve
+  inside a git checkout, so external consumers of neutrino's crates by git
+  (neutrino-iroh) need no coap patch mirror at all — one repo, no separate
+  coap repos to maintain (Kegan's call), and the patch tables shrink to the
+  async-compat mirror. Both forks stay workspace-`exclude`d: cargo
+  auto-includes in-workspace path deps as members otherwise, dragging their
+  dev-deps into the shared lockfile (the complement image reuses that
+  lockfile, so its manifest mirrors the excludes and its Dockerfile COPYs
+  both vendor dirs).
+
 ### iroh removed from the workspace; media inject via LinkContext (2026-07-20)
 - Licensing driver: vendored `blew` + `iroh-ble-transport` are AGPL-3.0-
   **or-later**, incompatible with this repo's `AGPL-3.0-only OR

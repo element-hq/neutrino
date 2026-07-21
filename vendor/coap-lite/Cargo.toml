@@ -1,0 +1,43 @@
+[package]
+name = "coap-lite"
+description = """
+A lightweight CoAP message manipulation crate, ideal for embedded environments.
+"""
+version = "0.13.3"
+authors = ["Martin Disch <martindisch@gmail.com>"]
+repository = "https://github.com/martindisch/coap-lite"
+readme = "README.md"
+keywords = ["coap"]
+categories = ["network-programming", "no-std", "embedded"]
+license = "MIT OR Apache-2.0"
+edition = "2021"
+
+[lib]
+doctest = false
+
+[dependencies]
+coap-message = "0.2.3"
+coap-message-0-3 = { package = "coap-message", version = "0.3" }
+log = { version = "0.4.19", default-features = false, optional = true }
+lru_time_cache = { version = "0.11.11", optional = true }
+
+[dev-dependencies]
+coap-handler = "0.2.0"
+coap-handler-implementations = "0.5.0"
+
+[features]
+default = ["std"]
+std = ["lru_time_cache"]
+
+# UDP feature enables additional optimizations for CoAP over UDP.
+udp = []
+
+# Q-Block (RFC 9177) primitives: the block-range tracker and the
+# application/missing-blocks+cbor-seq codec. Pure, no_std, no extra deps.
+q-block = []
+
+[badges]
+maintenance = { status = "passively-maintained" }
+
+[[example]]
+name = "server_coaphandler"

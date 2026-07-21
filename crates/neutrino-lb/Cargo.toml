@@ -15,8 +15,12 @@ tracing.workspace = true
 
 axum = "0.8.7"
 ciborium = "0.2.2"
-coap = { version = "0.27.0", features = ["q-block"] }
-coap-lite = "0.13.3"
+# In-repo forks (see vendor/): q-block (RFC 9177) API + DoS knobs +
+# Server::*_with_config + the RFC 9177 conformance fix, none of which upstream
+# carries. Path deps (not [patch]) so they resolve identically when this repo
+# is consumed as a git dependency (patch tables don't cross workspace roots).
+coap = { path = "../../vendor/coap-rs", features = ["q-block"] }
+coap-lite = { path = "../../vendor/coap-lite" }
 reqwest = { version = "0.13.4", default-features = false }
 base64 = "0.22.1"
 # reqwest has no TLS backend in this workspace, but an out-of-tree composition
