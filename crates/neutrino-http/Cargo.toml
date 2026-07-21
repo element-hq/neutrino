@@ -46,11 +46,11 @@ neutrino-room = { path = "../neutrino-room" }
 neutrino-store = { path = "../neutrino-store" }
 neutrino-store-sqlite = { path = "../neutrino-store-sqlite" }
 reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
-# reqwest is on a no-provider rustls backend (iroh, via workspace feature
-# unification), so a crypto provider must be installed before building the
-# federation client (see `client::install_crypto_provider`). Already in the lock
-# graph; ring matches ffi/neutrino-lb. (neutrino-lb is only a dev-dependency, so
-# the lib can't reuse its helper.)
+# reqwest has no TLS backend in this workspace, but an out-of-tree composition
+# (the iroh/BLE medium) feature-unifies it onto no-provider rustls — a crypto
+# provider must then be installed before building the federation client (see
+# `client::install_crypto_provider`). ring matches neutrino-lb. (neutrino-lb is
+# only a dev-dependency, so the lib can't reuse its helper.)
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [dev-dependencies]

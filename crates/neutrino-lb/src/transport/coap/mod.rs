@@ -272,7 +272,7 @@ impl WireClient for CoapWireClient {
         let client = self.client_for(&dest).await?;
         let token = self.next_token();
         // Drive the actual exchange through the transport-agnostic helper shared
-        // with the iroh datagram client (see `datagram`); the only UDP-specific
+        // with the link datagram client (see `datagram`); the only UDP-specific
         // part is `client_for` (pooling + `UdpCoAPClient::new`) above.
         let result = exchange(
             &client,
@@ -294,7 +294,7 @@ impl WireClient for CoapWireClient {
 }
 
 /// Transport-agnostic CoAP request/response exchange, shared by the UDP client
-/// (`CoapWireClient`) and the iroh datagram client (`datagram::IrohCoapWireClient`).
+/// (`CoapWireClient`) and the link datagram client (`datagram::LinkCoapWireClient`).
 /// The ONLY transport-specific concern either path adds is how the
 /// `CoAPClient<T>` is built/pooled; the security-relevant logic — token tagging,
 /// CON-vs-Q-Block send selection, the untrusted-side response body cap, the
@@ -417,7 +417,7 @@ impl CoapWireServer {
 struct CoapDispatch {
     handler: Arc<dyn WireHandler>,
     max_body_bytes: usize,
-    /// Set only on the authenticated datagram ingress (the iroh build). When
+    /// Set only on the authenticated datagram ingress (the embedded build). When
     /// present, every inbound request's claimed `X-Matrix origin` is bound to the
     /// link-authenticated source node before the handler runs — a peer may assert
     /// only its own origin (see [`datagram::Hub::origin_binding_violation`]). The

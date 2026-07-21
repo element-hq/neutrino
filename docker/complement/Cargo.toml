@@ -1,15 +1,11 @@
 # Complement-only workspace manifest. The Complement image builds ONLY the
-# `neutrino` binary, which does not depend on `neutrino-ffi` or the vendored BLE
-# crates (`iroh-ble-transport`, `blew`). Those are pruned here so cargo-chef's
-# recipe never pulls `blew` at all — otherwise cargo-chef normalises the local
-# `vendor/blew` version to 0.0.1 in its recipe skeleton, no longer satisfying the
-# `blew` version requirements, so a second crates.io `blew` resolves and the two
-# `links = "blew"` crates collide (see docker/complement/Dockerfile).
+# `neutrino` binary, which does not depend on `neutrino-ffi`; excluding ffi
+# keeps uniffi out of the cargo-chef recipe. (The vendored BLE crates this file
+# used to prune moved out of the repo entirely — see iroh_repo/.)
 #
 # KEEP IN SYNC with the root ./Cargo.toml: this file must mirror its
-# `[workspace.dependencies]` and the non-`blew` `[patch.crates-io]` entries. It
-# deliberately drops the two `vendor/*` members, excludes `crates/neutrino-ffi`,
-# and omits the `blew` patch.
+# `[workspace.dependencies]` and `[patch.crates-io]` entries. It deliberately
+# excludes `crates/neutrino-ffi`.
 [workspace]
 members = [
     "./crates/*",
@@ -34,7 +30,8 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 uniffi = { version = "0.31.1" }
 proptest = "1"
-# required by iroh
+# Pinned to the 0.11 RC (mirrors the root manifest; neutrino-event's hashing is
+# written against the 0.11 API).
 sha2 = "=0.11.0-rc.5"
 
 [workspace.package]
@@ -43,17 +40,13 @@ sha2 = "=0.11.0-rc.5"
 license = "AGPL-3.0-only"
 
 [patch.crates-io]
-# NB: the root manifest's `blew` patch is intentionally absent — no crate in this
-# pruned workspace depends on `blew`, and `vendor/blew` is not copied into the
-# image, so a path patch here would fail to load.
 async-compat = { git = "https://github.com/element-hq/async-compat", rev = "5a27c8b290f1f1dcfc0c4ec22c464e38528aa591" }
 # Mirror the root manifest's in-tree fork (see ./Cargo.toml): the crates.io-
 # published `coap` 0.27.0 and the kaylendog git rev both predate the fields
 # neutrino-lb needs (`QBlockConfig::assume_peer_block_size`, `pub
 # UdpCoAPClient::MAX_PAYLOAD_BLOCK`). `vendor/coap-rs` carries them, so it is
 # copied into the image (docker/complement/Dockerfile) and patched by path here.
-# Unlike `blew`, `coap` is a patch-only, non-member crate with no `links` key, so
-# it does not trigger the cargo-chef member-normalisation collision that forced
-# the BLE crates to be pruned.
+# `coap` is a patch-only, non-member crate with no `links` key, so it does not
+# trigger cargo-chef's member-normalisation collision.
 coap = { path = "./vendor/coap-rs" }
 coap-lite = { git = "https://github.com/kaylendog/coap-lite", rev = "d45e95244bde0a65a36bf754eac7908beab7fafe" }

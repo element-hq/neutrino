@@ -119,12 +119,15 @@ pub fn init_tracing() {
         // `::`-delimited path segments, so a `neutrino` directive would NOT match
         // `neutrino_ffi`. A new neutrino crate is picked up automatically.
         //
-        // The federation medium lives in third-party crates (`iroh_ble_transport`,
-        // `blew`, `iroh`). Without them, BLE advertise/scan/discovery/connect
-        // failures are completely invisible — the entire transport is silent, which
-        // is exactly the class of failure we must never hide. Include the BLE stack
-        // down to DEBUG and iroh's QUIC at INFO (its DEBUG/TRACE is per-packet
-        // noise). Note `Level::TRACE > … > Level::ERROR`, so `level <= DEBUG` keeps
+        // The embedded federation medium is injected from out-of-tree crates
+        // (`iroh_ble_transport`, `blew`, `iroh` — the iroh/BLE composition).
+        // Without their targets, BLE advertise/scan/discovery/connect failures
+        // are completely invisible — the entire transport is silent, which is
+        // exactly the class of failure we must never hide. The prefixes below
+        // are plain strings, not dependencies: they cost nothing when the
+        // medium isn't linked in, and keep it debuggable when it is. Include
+        // the BLE stack down to DEBUG and the QUIC layer at INFO (its
+        // DEBUG/TRACE is per-packet noise). Note `Level::TRACE > … > Level::ERROR`, so `level <= DEBUG` keeps
         // everything except TRACE. `RUST_LOG` still overrides the whole thing.
         // `boxed()` is disambiguated via UFCS: both `FilterExt` and `Layer` define it
         // for these types (EnvFilter/FilterFn are each both a filter and a layer), so

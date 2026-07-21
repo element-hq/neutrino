@@ -1,8 +1,8 @@
 //! In-process datagram-backed CoAP wire path, a sibling of the UDP path in the
 //! parent module. For the embedded/Android target the OS UDP socket is replaced
-//! by an iroh QUIC transport keyed by a 32-byte peer **node id** — no socket, no
-//! IP, no ports. iroh itself stays in `neutrino-ffi`; this module is iroh-free
-//! and defines the [`DatagramLink`] seam that ffi will implement.
+//! by an injected transport keyed by a 32-byte peer **node id** — no socket, no
+//! IP, no ports. The concrete link (a QUIC endpoint over the BLE mesh) lives
+//! out of tree; this module defines the [`DatagramLink`] seam it implements.
 //!
 //! ## Why a Hub
 //!
@@ -10,7 +10,7 @@
 //! egress client and our ingress server each bind their *own* socket (own port),
 //! so responses to our outbound requests and inbound requests to our server
 //! arrive on physically distinct queues. A [`DatagramLink`] has a *single*
-//! inbound queue per process (one iroh endpoint) carrying BOTH. The [`Hub`] runs
+//! inbound queue per process (one link endpoint) carrying BOTH. The [`Hub`] runs
 //! one drain task over `link.recv()` and classifies each datagram by its CoAP
 //! header code:
 //!
@@ -66,9 +66,14 @@ use super::{CoapDispatch, MAX_QBLOCK_INFLIGHT_TRANSFERS, exchange, random_token_
 /// A datagram tagged with the 32-byte node it came from / is bound for.
 type NodeDatagram = ([u8; 32], Vec<u8>);
 
-/// The iroh-free transport seam. ffi implements this over an iroh QUIC endpoint,
-/// keyed by a 32-byte peer node id; the rest of lb stays iroh-free. A single
+/// The transport seam. The embedded composition injects an implementation (an
+/// authenticated QUIC endpoint, dialed over the BLE mesh on device) keyed by a
+/// 32-byte peer node id; lb never names the concrete transport. A single
 /// instance multiplexes BOTH directions (see the module-level Hub note).
+///
+/// Implementors MUST authenticate the source node id `recv` tags datagrams
+/// with — the ingress builds its origin↔node impersonation gate on it (see
+/// `LinkContext` in neutrino-main for the full contract).
 #[async_trait]
 pub trait DatagramLink: Send + Sync {
     /// Best-effort send of one datagram to peer node `dst` (32-byte id). A
@@ -82,16 +87,16 @@ pub trait DatagramLink: Send + Sync {
 
 /// Mux/demux over one [`DatagramLink`]. Owns the link, runs one background drain
 /// task that classifies every inbound datagram, and hands out per-node client
-/// inboxes (for [`IrohClientTransport`]) plus the single requests receiver (for
-/// [`IrohCoapListener`]).
+/// inboxes (for [`LinkClientTransport`]) plus the single requests receiver (for
+/// [`LinkCoapListener`]).
 pub struct Hub {
     link: Arc<dyn DatagramLink>,
     /// Per-node client inbox senders. A response datagram for node `n` is pushed
-    /// onto `clients[n]`; the matching `IrohClientTransport::recv` drains it.
+    /// onto `clients[n]`; the matching `LinkClientTransport::recv` drains it.
     /// A `std::sync::Mutex` (never held across an await — every critical section
     /// is one map op), so the inbox can be installed *synchronously* while the
     /// egress pool slot is claimed, keeping the pooled client and its inbox in
-    /// lockstep (see [`IrohCoapWireClient::client_for`]).
+    /// lockstep (see [`LinkCoapWireClient::client_for`]).
     clients: std::sync::Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<Vec<u8>>>>,
     /// The server-side request feed. The drain task pushes inbound *requests*
     /// here; the listener takes the receiver exactly once via [`Hub::take_requests`].
@@ -132,7 +137,7 @@ impl Hub {
     }
 
     /// The underlying link, so client transports can `send` and responders can
-    /// reply over the same iroh endpoint.
+    /// reply over the same endpoint.
     pub fn link(&self) -> Arc<dyn DatagramLink> {
         self.link.clone()
     }
@@ -306,17 +311,17 @@ fn classify(bytes: &[u8]) -> Class {
 
 /// coap-rs [`ClientTransport`](coap::client::ClientTransport) bound to one peer
 /// node. Sends go straight to the link; receives drain this node's Hub inbox.
-pub struct IrohClientTransport {
+pub struct LinkClientTransport {
     node: [u8; 32],
     hub: Arc<Hub>,
     /// This node's response inbox (its sender is installed into the Hub by
-    /// [`IrohCoapWireClient::client_for`] when it wins the pool slot). `Mutex`
+    /// [`LinkCoapWireClient::client_for`] when it wins the pool slot). `Mutex`
     /// because coap-rs calls `recv` from its receive loop and the trait takes
     /// `&self`.
     inbox: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
 }
 
-impl IrohClientTransport {
+impl LinkClientTransport {
     /// Build a transport bound to `node`, draining `inbox` for this node's response
     /// datagrams. Construction has no shared side effect: the matching sender is
     /// installed into the Hub by the pool winner, so a discarded losing build
@@ -331,7 +336,7 @@ impl IrohClientTransport {
 }
 
 #[async_trait]
-impl coap::client::ClientTransport for IrohClientTransport {
+impl coap::client::ClientTransport for LinkClientTransport {
     async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
         self.hub.link().send(self.node, buf).await?;
         Ok(buf.len())
@@ -360,13 +365,13 @@ impl coap::client::ClientTransport for IrohClientTransport {
 /// coap-rs [`Listener`] over the Hub's requests feed. `listen` spawns a task that
 /// turns each classified inbound request into a `(bytes, responder)` for the
 /// coap-rs server loop.
-struct IrohCoapListener {
+struct LinkCoapListener {
     hub: Arc<Hub>,
     requests_rx: mpsc::UnboundedReceiver<NodeDatagram>,
 }
 
 #[async_trait]
-impl Listener for IrohCoapListener {
+impl Listener for LinkCoapListener {
     async fn listen(
         self: Box<Self>,
         sender: TransportRequestSender,
@@ -375,7 +380,7 @@ impl Listener for IrohCoapListener {
         let mut requests_rx = self.requests_rx;
         Ok(tokio::spawn(async move {
             while let Some((node, bytes)) = requests_rx.recv().await {
-                let responder = Arc::new(IrohResponder {
+                let responder = Arc::new(LinkResponder {
                     node,
                     link: hub.link(),
                     addr: hub.addr_for(node),
@@ -392,14 +397,14 @@ impl Listener for IrohCoapListener {
 /// coap-rs [`Responder`] that sends a response datagram back to the originating
 /// node over the link. `address()` returns the same synthetic key coap-rs used to
 /// track this peer's reassembly state.
-struct IrohResponder {
+struct LinkResponder {
     node: [u8; 32],
     link: Arc<dyn DatagramLink>,
     addr: SocketAddr,
 }
 
 #[async_trait]
-impl Responder for IrohResponder {
+impl Responder for LinkResponder {
     async fn respond(&self, response: Vec<u8>) {
         if let Err(e) = self.link.send(self.node, &response).await {
             tracing::debug!("datagram: responder send failed: {e}");
@@ -410,13 +415,13 @@ impl Responder for IrohResponder {
     }
 }
 
-/// Egress wire client over a [`DatagramLink`]. The slim iroh twin of
-/// [`super::CoapWireClient`]: it pools one `CoAPClient<IrohClientTransport>` per
+/// Egress wire client over a [`DatagramLink`]. The slim link twin of
+/// [`super::CoapWireClient`]: it pools one `CoAPClient<LinkClientTransport>` per
 /// peer node and delegates the actual exchange to the shared [`exchange`] helper,
 /// so token tagging, CON/Q-Block selection, the response body cap and the
 /// whole-exchange timeout are NOT duplicated. The peer node is parsed from
 /// `WireRequest.dest` as a 64-char hex node id.
-pub struct IrohCoapWireClient {
+pub struct LinkCoapWireClient {
     hub: Arc<Hub>,
     block1_size: Option<usize>,
     qblock: Option<coap::qblock::QBlockConfig>,
@@ -425,11 +430,11 @@ pub struct IrohCoapWireClient {
     /// Per-node client pool. Each `CoAPClient` owns one inbox registration and
     /// spawns one coap-rs receive task; pooling reuses it across requests to a
     /// peer. Sharing is safe because each request carries a unique token.
-    pool: Mutex<HashMap<[u8; 32], Arc<CoAPClient<IrohClientTransport>>>>,
+    pool: Mutex<HashMap<[u8; 32], Arc<CoAPClient<LinkClientTransport>>>>,
     token_counter: AtomicU32,
 }
 
-impl IrohCoapWireClient {
+impl LinkCoapWireClient {
     /// CON-mode client. `block1_size` caps the per-request Block1 payload (`None`
     /// = coap-rs's 1024 B default).
     pub fn new(hub: Arc<Hub>, block1_size: Option<usize>) -> Self {
@@ -473,7 +478,7 @@ impl IrohCoapWireClient {
     /// spawning its receive task) on first use. The pool lock is not held across
     /// the `await` that builds the client; a race on the same node discards the
     /// loser.
-    async fn client_for(&self, node: [u8; 32]) -> Arc<CoAPClient<IrohClientTransport>> {
+    async fn client_for(&self, node: [u8; 32]) -> Arc<CoAPClient<LinkClientTransport>> {
         if let Some(client) = self.pool.lock().await.get(&node).cloned() {
             return client;
         }
@@ -483,7 +488,7 @@ impl IrohCoapWireClient {
         // dropped (its `rx` dies with it).
         let (tx, rx) = mpsc::unbounded_channel();
         let mut client =
-            CoAPClient::from_transport(IrohClientTransport::new(node, self.hub.clone(), rx));
+            CoAPClient::from_transport(LinkClientTransport::new(node, self.hub.clone(), rx));
         if let Some(size) = self.block1_size {
             client.set_block1_size(size);
         }
@@ -546,7 +551,7 @@ fn hex_nibble(c: u8) -> Result<u8, WireError> {
 }
 
 #[async_trait]
-impl WireClient for IrohCoapWireClient {
+impl WireClient for LinkCoapWireClient {
     async fn send(&self, req: WireRequest) -> Result<WireResponse, WireError> {
         // Reject a zero Block1 size before dialing — `chunks(0)` panics in coap-rs
         // (same guard as the UDP client).
@@ -589,19 +594,19 @@ impl WireClient for IrohCoapWireClient {
     }
 }
 
-/// Ingress wire server over a [`DatagramLink`]. The iroh twin of
+/// Ingress wire server over a [`DatagramLink`]. The link twin of
 /// [`super::CoapWireServer`]: it stands up a coap-rs `Server` from an
-/// [`IrohCoapListener`] and reuses [`CoapDispatch`] for per-request handling, so
+/// [`LinkCoapListener`] and reuses [`CoapDispatch`] for per-request handling, so
 /// the 413 over-cap guard, the no-response-slot skip and the response writing are
 /// NOT duplicated.
-pub struct IrohCoapWireServer {
+pub struct LinkCoapWireServer {
     hub: Arc<Hub>,
     max_message_size: Option<usize>,
     max_body_bytes: usize,
     qblock: Option<coap::qblock::QBlockConfig>,
 }
 
-impl IrohCoapWireServer {
+impl LinkCoapWireServer {
     pub fn new(hub: Arc<Hub>, max_message_size: Option<usize>) -> Self {
         Self {
             hub,
@@ -625,7 +630,7 @@ impl IrohCoapWireServer {
         let requests_rx = self.hub.take_requests().await.ok_or_else(|| {
             WireError::Serve("datagram hub already has an ingress listener".to_owned())
         })?;
-        let listener: Box<dyn Listener> = Box::new(IrohCoapListener {
+        let listener: Box<dyn Listener> = Box::new(LinkCoapListener {
             hub: self.hub.clone(),
             requests_rx,
         });
@@ -649,7 +654,7 @@ impl IrohCoapWireServer {
 }
 
 #[async_trait]
-impl WireServer for IrohCoapWireServer {
+impl WireServer for LinkCoapWireServer {
     async fn serve(
         self,
         handler: Arc<dyn WireHandler>,
@@ -769,7 +774,7 @@ mod tests {
         server_qblock: Option<coap::qblock::QBlockConfig>,
         block1_size: Option<usize>,
         max_message_size: Option<usize>,
-    ) -> (IrohCoapWireClient, CancellationToken, ServeHandle) {
+    ) -> (LinkCoapWireClient, CancellationToken, ServeHandle) {
         let (a_link, b_link) = MockLink::pair(NODE_A, NODE_B);
         rig_with_links(
             a_link,
@@ -791,13 +796,13 @@ mod tests {
         server_qblock: Option<coap::qblock::QBlockConfig>,
         block1_size: Option<usize>,
         max_message_size: Option<usize>,
-    ) -> (IrohCoapWireClient, CancellationToken, ServeHandle) {
+    ) -> (LinkCoapWireClient, CancellationToken, ServeHandle) {
         let hub_a = Hub::new(a_link);
         let hub_b = Hub::new(b_link);
 
         let server = match server_qblock {
-            Some(cfg) => IrohCoapWireServer::with_qblock(hub_b, cfg),
-            None => IrohCoapWireServer::new(hub_b, max_message_size),
+            Some(cfg) => LinkCoapWireServer::with_qblock(hub_b, cfg),
+            None => LinkCoapWireServer::new(hub_b, max_message_size),
         };
         let token = CancellationToken::new();
         let server_token = token.clone();
@@ -806,8 +811,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let client = match client_qblock {
-            Some(cfg) => IrohCoapWireClient::with_qblock(hub_a, block1_size, cfg),
-            None => IrohCoapWireClient::new(hub_a, block1_size),
+            Some(cfg) => LinkCoapWireClient::with_qblock(hub_a, block1_size, cfg),
+            None => LinkCoapWireClient::new(hub_a, block1_size),
         };
         (client, token, handle)
     }
@@ -1141,14 +1146,14 @@ mod tests {
         let (a_link, b_link) = MockLink::pair(NODE_A, NODE_B);
         let hub_a = Hub::new(a_link);
         let hub_b = Hub::new(b_link);
-        let server = IrohCoapWireServer::new(hub_b, None);
+        let server = LinkCoapWireServer::new(hub_b, None);
         let token = CancellationToken::new();
         let server_token = token.clone();
         let handle =
             tokio::spawn(async move { server.serve(Arc::new(EchoHandler), server_token).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let mut client = IrohCoapWireClient::new(hub_a, None);
+        let mut client = LinkCoapWireClient::new(hub_a, None);
         client.request_timeout = Duration::from_secs(2);
         let resp = client
             .send(WireRequest {
@@ -1170,9 +1175,9 @@ mod tests {
     async fn second_ingress_on_hub_is_refused() {
         let (_a, b_link) = MockLink::pair(NODE_A, NODE_B);
         let hub_b = Hub::new(b_link);
-        let first = IrohCoapWireServer::new(hub_b.clone(), None);
+        let first = LinkCoapWireServer::new(hub_b.clone(), None);
         assert!(first.build_server().await.is_ok());
-        let second = IrohCoapWireServer::new(hub_b, None);
+        let second = LinkCoapWireServer::new(hub_b, None);
         assert!(
             second.build_server().await.is_err(),
             "a hub must drive at most one ingress listener"

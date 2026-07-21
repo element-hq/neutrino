@@ -1,14 +1,6 @@
 uniffi::setup_scaffolding!("neutrino");
 
-#[cfg(feature = "ble")]
-mod ble_android;
-// The iroh-backed datagram link: implements `neutrino_main::DatagramLink` over an
-// iroh QUIC endpoint (keyed by 32-byte node ids). Built in `start` and injected
-// into the entrypoint via a `FederationLinkFactory`.
-mod relay_transport;
 mod watchdog;
-
-use relay_transport::{IrohTransport, RELAY_BIND};
 
 /// FFI-facing server configuration. Mirrors `neutrino_ctl::Config` so EX
 /// Android can fully configure the embedded homeserver. Kept here (not on the
@@ -102,15 +94,9 @@ impl std::fmt::Display for CaptureError {
 
 impl std::error::Error for CaptureError {}
 
-/// Fixed localpart for every embedded peer's user: user ids are
-/// `@n:{node_id}`. The discovery registry is localpart-agnostic — this is the
-/// embedded host's convention, applied by the BLE transport's discovery drain
-/// (see `relay_transport`) where the node id is known.
-#[cfg(feature = "ble")]
-const DISCOVERY_LOCALPART: &str = "n";
-
-/// A peer the embedded server has discovered out of band (over the BLE mesh),
-/// for the host to render in a Settings directory. Host-facing projection of
+/// A peer the embedded server has discovered out of band (over the federation
+/// medium's scan or the LAN mDNS browser), for the host to render in a
+/// Settings directory. Host-facing projection of
 /// `neutrino_ctl::DiscoveredPeer` plus its `server_name` key; the localpart is
 /// omitted (the host builds user ids itself from `server_name`).
 #[derive(uniffi::Record)]
@@ -230,50 +216,54 @@ impl NeutrinoHandle {
 /// immediate; only a runaway closure can delay this thread's exit.
 #[uniffi::export]
 pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
+    start_with(config, None)
+}
+
+/// The composition seam for out-of-tree federation media. Same as [`start`]
+/// but with an injected [`neutrino_main::FederationLinkFactory`]: a downstream
+/// crate that provides a concrete [`neutrino_main::DatagramLink`] (e.g. the
+/// iroh/BLE medium) calls this from its own `#[uniffi::export]`ed entrypoint,
+/// and its cdylib carries both crates' scaffolding. Deliberately NOT
+/// uniffi-exported — the factory is a Rust trait-object seam and cannot (and
+/// need not) cross the FFI. See `LinkContext` in neutrino-main for the
+/// contract an injected medium must uphold.
+pub fn start_with(
+    config: NeutrinoConfig,
+    link_factory: Option<neutrino_main::FederationLinkFactory>,
+) -> NeutrinoHandle {
     // Route logs to logcat before anything that can fail: a runtime-build error
     // or an `entrypoint` error below must be visible, not written to a stderr that
     // Android discards. Idempotent (entrypoint calls it too).
     neutrino_main::init_tracing();
-    // In this build reqwest's TLS backend is unified to rustls (pulled in by iroh)
-    // but with no default crypto provider, so building the federation client would
-    // panic ("No rustls crypto provider is configured"). The crypto provider is a
-    // process-global the embedding host must install; do it here, before the server
-    // (or iroh) builds any client. Idempotent: `install_default` returns `Err` if a
-    // provider is already set, which we ignore.
-    let _ = rustls::crypto::ring::default_provider().install_default();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let config: neutrino_main::Config = config.into();
     // Runtime-toggleable pcap capture of federation datagrams (a debug tap; see
     // `neutrino_lb::CaptureControl`). One handle wraps the link on the transport
     // hot path, an identical clone lives on `NeutrinoHandle` for the Settings
-    // toggle (`start_capture`/`stop_capture`). Off until the host arms it.
+    // toggle (`start_capture`/`stop_capture`). Off until the host arms it. With
+    // no injected link (the LAN/UDP build) the tap wraps nothing: the toggle
+    // still works but the capture file stays empty.
     let capture = neutrino_main::CaptureControl::new();
     let capture_for_link = capture.clone();
     // The entrypoint publishes the resolved server name here once identity
     // resolution completes; `server_name()` reads it back.
     let (handoff_tx, handoff_rx) = tokio::sync::watch::channel::<Option<String>>(None);
-    // Shared out-of-band discovery registry: the BLE transport writes the peers
-    // it scans into it, and the homeserver reads it for user-directory search.
-    // One handle for the homeserver (read by user-directory search), one for the
-    // BLE transport (which writes scanned peers into it — see the drain task).
+    // Shared out-of-band discovery registry: the federation medium (or the LAN
+    // mDNS browser) writes the peers it discovers into it, and the homeserver
+    // reads it for user-directory search. One handle for the homeserver, one
+    // reader-side handle for the FFI directory listing (`discovered_peers`);
+    // an injected medium receives the same `Arc` via its `LinkContext`.
     let discovery_for_server = std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new());
-    let discovery_for_link = discovery_for_server.clone();
-    // A third reader-side handle for the FFI directory listing (`discovered_peers`).
     let discovery_for_handle = discovery_for_server.clone();
-    // Build the federation datagram link from the resolved node secret: an iroh
-    // QUIC endpoint, addressed by 32-byte node id, carrying the sidecar's
-    // CoAP/CBOR wire over BLE (no OS socket / TUN / virtual IPs). The entrypoint
-    // calls this once it has resolved the secret, then injects the link into the
-    // lb sidecar. A bind failure is widened to `entrypoint`'s boxed error and
-    // fails startup loudly (logged on the runtime thread below).
-    let link_factory: neutrino_main::FederationLinkFactory = Box::new(move |secret, name_rx| {
-        Box::pin(async move {
-            let transport =
-                IrohTransport::bind(&secret, RELAY_BIND, name_rx, discovery_for_link).await?;
-            let link = transport as std::sync::Arc<dyn neutrino_main::DatagramLink>;
-            // Always install the (inert) capture tap so the host can toggle it at
-            // runtime without rebuilding the link.
-            Ok(neutrino_main::PcapCaptureLink::wrap(link, capture_for_link))
+    // Wrap whatever link the injected factory builds with the (inert) capture
+    // tap, so the host can toggle pcap at runtime without rebuilding the link —
+    // uniformly, for any medium, instead of each factory rewiring it.
+    let link_factory = link_factory.map(|factory| -> neutrino_main::FederationLinkFactory {
+        Box::new(move |ctx| {
+            Box::pin(async move {
+                let link = factory(ctx).await?;
+                Ok(neutrino_main::PcapCaptureLink::wrap(link, capture_for_link))
+            })
         })
     });
     std::thread::spawn(move || {
@@ -304,7 +294,7 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
                 config,
                 rx,
                 Some(handoff_tx),
-                Some(link_factory),
+                link_factory,
                 Some(discovery_for_server),
             )
             .await

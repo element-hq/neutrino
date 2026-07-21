@@ -62,27 +62,32 @@ rev-pinned in `[patch.crates-io]`. Designs:
 `docs/superpowers/specs/2026-06-{15,18,24}-neutrino-lb-*`.
 
 In-process datagram transport (`transport::coap::datagram`, STEP 1 done): an
-additive iroh-free CoAP path beside the UDP one, for the embedded/Android target.
-Replaces the OS UDP socket with a `DatagramLink` trait (ffi implements it over an
-iroh QUIC endpoint, keyed by 32-byte node ids — no socket/IP/ports). A `Hub` runs
-one drain task that classifies each inbound datagram by CoAP header code
-(request→server listener, else→per-node client inbox). `IrohCoapWireClient` /
-`IrohCoapWireServer` reuse the shared `exchange` helper + `CoapDispatch` from the
-UDP path. Wired into `LbConfig`/`serve` (STEP 2 done): `LbConfig.link:
-Option<Arc<dyn DatagramLink>>` selects the path purely by injection — `Some`
-routes the CoAP wire over the link, `None` keeps UDP. `neutrino-main::entrypoint`
-takes a `FederationLinkFactory` (4th param) that builds the link from the resolved
-node secret; `TunnelResolver` now yields the bare 64-char hex node id (not a vip).
-Not yet implemented in ffi.
+additive CoAP path beside the UDP one, for the embedded/Android target.
+Replaces the OS UDP socket with a `DatagramLink` trait (implemented out of tree
+over an authenticated QUIC endpoint, keyed by 32-byte node ids — no
+socket/IP/ports). A `Hub` runs one drain task that classifies each inbound
+datagram by CoAP header code (request→server listener, else→per-node client
+inbox). `LinkCoapWireClient` / `LinkCoapWireServer` reuse the shared `exchange`
+helper + `CoapDispatch` from the UDP path. Wired into `LbConfig`/`serve` (STEP 2
+done): `LbConfig.link: Option<Arc<dyn DatagramLink>>` selects the path purely by
+injection — `Some` routes the CoAP wire over the link, `None` keeps UDP.
+`neutrino-main::entrypoint` takes a `FederationLinkFactory` (4th param) that
+builds the link from a `LinkContext` (resolved node secret + display-name watch
++ discovery registry + command sender); `NodeIdResolver` yields the bare 64-char
+hex node id (not a vip).
 
-STEP 3 done: ffi's `IrohTransport` implements `neutrino_main::DatagramLink`
-(iroh QUIC datagram keyed by 32-byte node id); `start()` builds it via a
-`FederationLinkFactory` injected into `entrypoint`. The TUN/IP-relay data path
-(`Tunnel`/`RelayStack`/`relay_driver`/`TunPacketIo`/`start_tunnel`/`stop_tunnel`/
-`tunnel_address`, `TableSink`, the route table + vip) and the `neutrino-relay`
-crate are deleted. `TunnelHandoff` now carries only the resolved `server_name`.
-The federation data path is: homeserver → lb egress (CoAP/CBOR) →
-`IrohCoapWireClient` → `DatagramLink::send(node, datagram)` → iroh over BLE.
+STEP 3 done, then externalised (2026-07-20, licensing): the concrete
+`IrohTransport` (iroh QUIC datagram keyed by 32-byte node id) and the whole
+iroh/BLE stack (vendored `blew` + `iroh-ble-transport`, both AGPL-or-later, the
+blew Kotlin companions, `NativeBle`, the BLE manifest) moved to `iroh_repo/` —
+a self-contained workspace destined for its own repository. It composes via
+`neutrino_ffi::start_with(config, factory)` (pub, not uniffi-exported) and
+exports `start_ble` from its own crate; its .aar carries both uniffi namespaces
+in one `libneutrino.so` (see `iroh_repo/README.md`). In-tree `start()` passes
+no factory (plain UDP; LAN mode when it lands). This workspace has zero iroh
+deps. The embedded federation data path (BLE build) is unchanged: homeserver →
+lb egress (CoAP/CBOR) → `LinkCoapWireClient` → `DatagramLink::send(node,
+datagram)` → iroh over BLE.
 Done:
 - Integer-key CBOR codec (Layer A; port of Dendrite `internal/lb`): all transports
   now carry the integer-key transcode (`codec::keys`, 143 keys: 137 from Dendrite
@@ -194,6 +199,42 @@ never use .unwrap() in handler code.
 - Restricted rooms (`join_authorised_via_users_server`) — documented, not implemented
 
 ## decisions log
+
+### iroh removed from the workspace; media inject via LinkContext (2026-07-20)
+- Licensing driver: vendored `blew` + `iroh-ble-transport` are AGPL-3.0-
+  **or-later**, incompatible with this repo's `AGPL-3.0-only OR
+  LicenseRef-Element-Commercial` dual licence; iroh anchors that stack. All
+  concrete iroh/BLE code (relay_transport, ble_android, both vendor crates,
+  blew Kotlin companions, NativeBle, BLE manifest, loopback tests) moved to
+  `iroh_repo/` (self-contained workspace + Android project, plain AGPL,
+  destined for its own repository — Kegan externalises).
+- Seam widened: `FederationLinkFactory` now takes a `LinkContext { secret,
+  display_name watch, discovery: Arc<DiscoveryRegistry>, commands:
+  UnboundedSender<Command> }` built by `entrypoint` — the discovery feed and
+  KickBackoff-on-peer-appearance are contract, not closure-captured glue. The
+  contract's MUSTs (node id = ed25519 pubkey of the secret;
+  `DatagramLink::recv` source ids transport-authenticated — the only
+  authentication in a signature-free system, feeding the ingress origin↔node
+  gate) are documented on `LinkContext` + the trait.
+- `entrypoint` gained a command fan-in (internal channel): host-channel-close
+  is translated to an explicit `Shutdown` so drop-to-shutdown semantics
+  survive a medium holding a sender.
+- ffi split surface/composition: `pub fn start_with(config, Option<factory>)`
+  (NOT uniffi-exported; trait objects don't cross FFI) is the injection point;
+  `start()` = `start_with(config, None)` (UDP; LAN when it lands). The
+  `PcapCaptureLink` wrap moved into `start_with`, so every injected medium
+  gets the pcap tap uniformly. UniFFI multi-crate composition verified:
+  bindgen library-mode over `iroh_repo`'s cdylib emits Kotlin for both
+  namespaces; load names come from each crate's `uniffi.toml` (NOT the library
+  filename), so both pin `cdylib_name = "neutrino"` and the BLE .aar renames
+  its .so to `libneutrino.so` (EX Android unchanged).
+- Kept in-tree deliberately: `platform.rs` log-filter prefixes for
+  `iroh*`/`blew` (plain strings tuning an externally-injected medium's log
+  volume; zero licensing weight) and the lb/http/testkit
+  `install_crypto_provider` helpers + rustls deps (no-ops in this workspace's
+  TLS-less reqwest, load-bearing when these crates are rebuilt inside a
+  composition whose medium feature-unifies reqwest onto no-provider rustls,
+  as iroh does). `Iroh*` wire types renamed `Link*` (`LinkCoapWireClient` …).
 
 ### Wire redesign: verdicts classified at parse, carried in the type (2026-07-16)
 - Supersedes the parked-verdict mechanics of the 2026-07-15 M5 entry below.

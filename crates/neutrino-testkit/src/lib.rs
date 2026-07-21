@@ -148,9 +148,9 @@ pub struct Harness {
 
 /// Install rustls' ring crypto provider as the process default, once.
 ///
-/// reqwest's TLS backend is unified to rustls with NO default crypto provider
-/// (iroh, via `cargo test --workspace` feature unification), so building a
-/// `reqwest::Client` panics unless a provider is installed first. This harness
+/// reqwest has no TLS backend in this workspace, but a composed build can
+/// feature-unify it onto rustls with NO default crypto provider — building a
+/// `reqwest::Client` then panics unless a provider is installed first. This harness
 /// depends on no other neutrino crate (it spawns a binary), so it installs the
 /// provider itself rather than reusing `neutrino_lb::install_crypto_provider`.
 /// Idempotent (`install_default` is a no-op if one is already set); the `Once`

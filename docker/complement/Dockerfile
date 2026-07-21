@@ -7,13 +7,11 @@ FROM lukemathwalker/cargo-chef:latest-rust-1-slim-bookworm AS chef
 WORKDIR /src
 
 FROM chef AS planner
-# Use the pruned Complement workspace manifest (excludes neutrino-ffi + the
-# vendored BLE crates). `neutrino` — the only bin built here — doesn't use them,
-# and excluding them keeps `blew`/`iroh-ble-transport` out of the cargo-chef
-# recipe entirely, so cargo-chef's local-version normalisation can't trigger the
-# `links = "blew"` collision. `vendor/coap-rs` is the one vendored crate that IS
+# Use the pruned Complement workspace manifest (excludes neutrino-ffi, which
+# `neutrino` — the only bin built here — doesn't use; keeps uniffi out of the
+# cargo-chef recipe). `vendor/coap-rs` is the one vendored crate that IS
 # copied: neutrino-lb depends on it and the pruned manifest patches `coap` to
-# this path (it has no `links` key, so it can't collide like `blew`).
+# this path.
 COPY docker/complement/Cargo.toml ./Cargo.toml
 COPY Cargo.lock ./Cargo.lock
 COPY crates ./crates

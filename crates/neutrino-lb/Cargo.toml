@@ -19,8 +19,8 @@ coap = { version = "0.27.0", features = ["q-block"] }
 coap-lite = "0.13.3"
 reqwest = { version = "0.13.4", default-features = false }
 base64 = "0.22.1"
-# reqwest's TLS backend is unified to rustls (via iroh in the ffi build) with no
-# default crypto provider, so every process that builds a `reqwest::Client` must
-# install one first (see `install_crypto_provider`). Already in the lock graph via
-# iroh; ring keeps it aws-lc-rs-free, matching neutrino-ffi.
+# reqwest has no TLS backend in this workspace, but an out-of-tree composition
+# (the iroh/BLE medium) feature-unifies it onto rustls with no default crypto
+# provider — every process that builds a `reqwest::Client` must then install one
+# first (see `install_crypto_provider`). ring keeps it aws-lc-rs-free.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

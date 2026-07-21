@@ -10,8 +10,6 @@ name = "neutrino"
 
 [dependencies]
 async-compat = "0.2.5"
-# `neutrino_main::DatagramLink` is an `#[async_trait]` trait we implement over iroh.
-async-trait.workspace = true
 
 # Packet logging goes through the Neutrino tracing stack (so it reaches logcat via
 # the host's subscriber).
@@ -21,44 +19,12 @@ tokio.workspace = true
 uniffi.workspace = true
 
 neutrino-main = { path = "../neutrino-main" }
-iroh = { version = "0.98.2", features = ["unstable-custom-transports"] }
-# Install rustls' default crypto provider at startup (see `start`). reqwest's TLS
-# backend is unified to rustls (via iroh) with no default provider, so the
-# federation client build panics without this. `ring` is the provider already in
-# the graph (no aws-lc-rs); pin it explicitly. rustls + ring are already
-# transitive deps, so this only exposes them — it adds no new crate to the build.
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
-# BLE is the Android medium (`blew` over JNI); on Linux the transport's backend
-# is `bluer`, which needs system D-Bus/BlueZ. Gate it behind `ble` so the default
-# build (desktop LAN, CI) is iroh-only and needs no system Bluetooth stack. The
-# Android .aar build enables `ble`.
-iroh-ble-transport = { path = "../../vendor/iroh-ble-transport", optional = true }
-# `iroh::Connection::send_datagram` takes `bytes::Bytes`; used by the BLE
-# self-test (`ble` feature) and the loopback datagram test. Already in the tree
-# transitively via iroh, so no new compile cost.
-bytes = "1"
-
-# Android-only JNI bootstrap for blew (see src/ble_android.rs). `blew` is pulled
-# in directly so we can call its `init_jvm`; cargo unifies it with the copy
-# iroh-ble-transport already depends on. `jni`/`ndk-context` versions match what
-# `blew` uses so the `JavaVM` type is identical. None of these compile for non-
-# Android targets, so the host binding-gen build doesn't pull them.
-[target.'cfg(target_os = "android")'.dependencies]
-blew = { version = "0.2", optional = true }
-jni = { version = "0.22", optional = true }
-ndk-context = { version = "0.1", optional = true }
 
 [features]
-ble = ["dep:iroh-ble-transport", "dep:blew", "dep:jni", "dep:ndk-context"]
 # Diagnostic-only passthrough — see neutrino-http's `task-dump`. Build the FFI
 # lib with `RUSTFLAGS="--cfg tokio_unstable" cargo build -p neutrino-ffi
 # --features task-dump` to capture task backtraces when the sync backstop fires.
 task-dump = ["neutrino-main/task-dump"]
-
-[dev-dependencies]
-# The datagram-link test derives the expected node id from a secret to pin the
-# iroh-id == ed25519-pubkey invariant.
-ed25519-dalek = "2.2.0"
 
 [build-dependencies]
 uniffi = { workspace = true, features = ["build"] }

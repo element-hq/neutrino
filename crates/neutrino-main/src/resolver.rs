@@ -2,18 +2,19 @@
 //!
 //! A peer's federation `server_name` is its node id (lowercase hex, as derived
 //! by [`server_identity_from_secret`](crate::server_identity_from_secret)).
-//! [`NodeIdResolver`] is the one pure, iroh-free step that maps that name onto
-//! the wire: it rewrites the federation egress destination to the peer's bare
-//! 64-char hex node id, which the sidecar's datagram egress
-//! (`IrohCoapWireClient`) parses and dials the peer's iroh endpoint by. The
-//! transport over those node ids lives in the ffi/iroh layer.
+//! [`NodeIdResolver`] is the one pure step that maps that name onto the wire:
+//! it rewrites the federation egress destination to the peer's bare 64-char
+//! hex node id, which the sidecar's datagram egress (`LinkCoapWireClient`)
+//! parses and dials the peer's datagram link by. The transport over those node
+//! ids is the injected [`DatagramLink`](neutrino_lb::DatagramLink), out of
+//! tree.
 
 use neutrino_lb::DestinationResolver;
 use tracing::warn;
 
 /// A node's stable cryptographic identity, as raw ed25519 public-key bytes — the
-/// hex of this is the peer's `server_name`. This layer stays iroh-free and only
-/// needs the byte array to validate/round-trip the hex.
+/// hex of this is the peer's `server_name`. This layer only needs the byte
+/// array to validate/round-trip the hex.
 type NodeKey = [u8; 32];
 
 /// Parse a federation `server_name` (`host[:port]`, host = the peer's node id in
@@ -32,7 +33,7 @@ fn parse_server_name(authority: &str) -> Option<(NodeKey, Option<&str>)> {
     // Reject hex that isn't a valid ed25519 public key — a real node id always
     // is (it's how `server_name` is derived), so a non-node authority falls
     // through to direct dial rather than resolving to an unroutable id. Uses
-    // ed25519-dalek (already a dep), not iroh, keeping this layer iroh-free.
+    // ed25519-dalek (already a dep) — same curve check as any link's identity.
     ed25519_dalek::VerifyingKey::from_bytes(&key).ok()?;
     Some((key, port))
 }
@@ -52,8 +53,8 @@ impl NodeIdResolver {
 impl DestinationResolver for NodeIdResolver {
     fn resolve(&self, authority: String) -> String {
         match parse_server_name(&authority) {
-            // The datagram egress (`IrohCoapWireClient`) parses `dest` as a
-            // 64-char hex node id and dials the peer's iroh endpoint by it, so
+            // The datagram egress (`LinkCoapWireClient`) parses `dest` as a
+            // 64-char hex node id and dials the peer over the link by it, so
             // return the bare node id — no vip, no port.
             Some((key, _port)) => hex::encode(key),
             None => {
@@ -95,8 +96,8 @@ mod tests {
         // A bare node-id name resolves to itself (the 64-char hex node id the
         // datagram egress dials by) — no vip/port rewrite.
         assert_eq!(resolver.resolve(name.clone()), hex::encode(key));
-        // An explicit `:port` is dropped: the node id alone addresses the peer's
-        // iroh endpoint, so the port is meaningless on this path.
+        // An explicit `:port` is dropped: the node id alone addresses the peer
+        // over the link, so the port is meaningless on this path.
         assert_eq!(resolver.resolve(format!("{name}:7777")), hex::encode(key));
     }
 
