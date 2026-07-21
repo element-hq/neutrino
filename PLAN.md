@@ -89,6 +89,14 @@ deps. The embedded federation data path (BLE build) is unchanged: homeserver →
 lb egress (CoAP/CBOR) → `LinkCoapWireClient` → `DatagramLink::send(node,
 datagram)` → iroh over BLE.
 Done:
+- Link facts → encoding policy (`LinkProfile`, 2026-07-21): `DatagramLink`
+  gained a defaulted `profile()` returning `LinkProfile { max_datagram,
+  trust: LinkTrust }`. Mediums declare facts; `neutrino-main` derives policy —
+  startup refuses `trust < Transitive` (`require_transitive_trust`) and
+  `build_lb_config` sizes the Q-Block1 block from the MTU
+  (`WireKind::coap_qblock_for_mtu`; the default profile reproduces the old
+  hardcoded 512 B). `PcapCaptureLink` delegates `profile()`. See the
+  decisions log.
 - Integer-key CBOR codec (Layer A; port of Dendrite `internal/lb`): all transports
   now carry the integer-key transcode (`codec::keys`, 143 keys: 137 from Dendrite
   + 6 MSC4242 state-DAG keys) plus event-ID
@@ -125,6 +133,12 @@ Deferred follow-ups (write-ups, not done):
 - Per-hop timeouts on the sidecar's own reqwest clients (`LbConfig.timeouts`).
 - Q-Block2 (response) per-fragment size knob (no `max_message_size` equivalent
   on the Q-Block path yet; Block2 follows coap-rs's szx default).
+- Per-peer / mid-session MTU: `LinkProfile.max_datagram` is read once at
+  startup, but BLE MTU is per-peer and changes mid-session (L2CAP upgrade).
+  The end state is a per-peer profile query or watch — needs lb-side
+  block-size renegotiation (block size is fixed at wire construction today).
+  The `iroh_repo` medium should also override `profile()` with its real BLE
+  MTU rather than inheriting the 1280 B default.
 - FFI/Element X exposure of transport choice (`CoapQBlock` is the default, not yet
   selectable from `NeutrinoConfig`).
 
@@ -199,6 +213,41 @@ never use .unwrap() in handler code.
 - Restricted rooms (`join_authorised_via_users_server`) — documented, not implemented
 
 ## decisions log
+
+### LinkProfile: mediums declare link facts, the composition root derives encoding policy (2026-07-21)
+- Custom transports need to influence how neutrino encodes data (fragment size
+  for a varying MTU, eventually signatures). Split: the medium declares
+  **facts** — `DatagramLink::profile() -> LinkProfile { max_datagram, trust }`
+  (defaulted trait method in neutrino-lb; decorators MUST delegate, and
+  `PcapCaptureLink` does) — and `neutrino-main` translates facts into knob
+  settings, since only the medium knows its MTU/admission boundary and only
+  the composition root sees the whole stack. Mediums never see CoAP option
+  budgets or `WireKind`, so out-of-tree transports stay decoupled from the
+  wire stack's versioning.
+- `LinkTrust` is a strictly ordered lattice (`Unauthenticated <
+  PeerAuthenticated < Transitive`), not a bool: peer authentication alone
+  only attributes point-to-point claims ("A sent X") — ACLs and
+  origin-addressed requests — while DAG sync mostly delivers events authored
+  by third parties ("A relayed events from B"), unverifiable without
+  per-event signatures. `Transitive` names the trusted-network assumption
+  (admission implies honesty about relays). `entrypoint` refuses anything
+  below it (`require_transitive_trust`), with the refusal naming each level's
+  distinct gap — the previously ambient CLAUDE.md assumption is now a
+  greppable startup assertion a future internet-facing medium can't silently
+  stretch. Consumption stays split: peer auth bites at the ingress
+  origin↔node binding; transitive trust is a deployment invariant asserted
+  once at startup, NOT per-event provenance checks in engine/room.
+- Fragmentation: `build_lb_config` derives the Q-Block1 size via
+  `WireKind::coap_qblock_for_mtu(profile.max_datagram)` — clamp to coap-lite
+  `Packet::MAX_SIZE` (1280 B; `to_bytes()` refuses more regardless of link),
+  subtract `FEDERATION_OPTION_BUDGET` (384 B, documented from the 1024-block
+  stall diagnosis), largest SZX power of two via coap-rs's existing
+  `block1_size_for_mtu` (made `pub`; no duplicated SZX math). The default
+  profile reproduces the previously hardcoded 512 B (pinned by test); an
+  MTU under 412 B fails startup loudly instead of stalling on first send.
+- Static-at-startup is the honest granularity today: block size is fixed at
+  wire construction. Per-peer/mid-session MTU (BLE L2CAP upgrade) is a
+  deferred follow-up (see lb section).
 
 ### coap forks in-house as path deps; no coap patches anywhere (2026-07-21)
 - `vendor/coap-lite` (kaylendog/coap-lite@d45e952, qblock-phase1 tip) joins

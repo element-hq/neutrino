@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 pub use neutrino_ctl::{Command, Config, DiscoveredPeer, DiscoveryRegistry};
-pub use neutrino_lb::{CaptureControl, DatagramLink, PcapCaptureLink};
+pub use neutrino_lb::{CaptureControl, DatagramLink, LinkProfile, LinkTrust, PcapCaptureLink};
 
 use std::future::Future;
 use std::pin::Pin;
@@ -35,6 +35,10 @@ pub type DatagramLinkResult =
 ///   be transport-authenticated. Events carry no signatures, so link-level
 ///   authentication of the sender id is the only authentication in the system
 ///   (the ingress binds a request's claimed `X-Matrix origin` to it).
+/// - The link's declared [`DatagramLink::profile`] drives encoding policy:
+///   [`entrypoint`] refuses any trust level below [`LinkTrust::Transitive`]
+///   (see `require_transitive_trust` for why peer authentication alone is
+///   not enough) and sizes CoAP fragmentation from `max_datagram`.
 pub struct LinkContext {
     /// The persisted 32-byte node secret the server's identity is derived from.
     pub secret: [u8; 32],
@@ -149,6 +153,12 @@ pub async fn entrypoint(
         None => None,
     };
 
+    // The medium's declared link facts drive encoding policy: the trust gate
+    // here, CoAP fragmentation sizing in `build_lb_config` below. The UDP path
+    // (no link) uses the defaults, which state today's operating assumptions.
+    let link_profile = link.as_ref().map(|l| l.profile()).unwrap_or_default();
+    require_transitive_trust(link_profile.trust)?;
+
     // When embedded, publish the resolved server name to the host over the
     // handoff (the host reads it back off the watch channel). The node secret
     // reached the host via `link_factory` above; outbound federation is addressed
@@ -172,7 +182,13 @@ pub async fn entrypoint(
         Some(port) => {
             let egress_bind = alloc_loopback_egress()?;
             config.federation_proxy = Some(format!("http://{egress_bind}"));
-            Some(build_lb_config(&config, port, egress_bind, link.clone())?)
+            Some(build_lb_config(
+                &config,
+                port,
+                egress_bind,
+                link.clone(),
+                link_profile,
+            )?)
         }
         None => None,
     };
@@ -285,36 +301,62 @@ fn server_identity_from_secret(secret: &[u8; 32]) -> String {
     hex::encode(signing.verifying_key().to_bytes())
 }
 
+/// Refuse to serve over a federation medium declaring less than
+/// [`LinkTrust::Transitive`]. Events carry no signatures in this build, so
+/// relayed origin claims ("node A delivered events authored by B" — the common
+/// case when syncing DAGs) are accepted without cryptographic verification.
+/// That is sound only when the medium's admission boundary vouches for every
+/// member — precisely what `Transitive` declares. `PeerAuthenticated` would
+/// need per-event signatures to make DAG sync sound; `Unauthenticated` cannot
+/// even support the ingress origin↔node binding or server ACLs.
+fn require_transitive_trust(trust: LinkTrust) -> Result<(), String> {
+    if trust >= LinkTrust::Transitive {
+        return Ok(());
+    }
+    let gap = match trust {
+        LinkTrust::PeerAuthenticated => {
+            "point-to-point sender authentication alone leaves relayed events \
+             unverifiable; DAG sync would need per-event signatures, which this \
+             build does not implement"
+        }
+        _ => {
+            "an unauthenticated link cannot support the ingress origin↔node \
+             binding or server ACLs at all"
+        }
+    };
+    Err(format!(
+        "federation link declares LinkTrust::{trust:?}, but this signature-free \
+         build requires LinkTrust::Transitive (a trusted network where transitive \
+         delivery is taken on faith): {gap}"
+    ))
+}
+
 /// Derive the in-process sidecar's [`neutrino_lb::LbConfig`] from the homeserver
-/// `Config`, the chosen public federation port, and the already-allocated
-/// loopback `egress_bind`. The ingress reuses `bind_addr`'s host with the port
+/// `Config`, the chosen public federation port, the already-allocated loopback
+/// `egress_bind`, and the link's declared [`LinkProfile`] (the default profile
+/// on the UDP path). The ingress reuses `bind_addr`'s host with the port
 /// replaced by `fed_port` (only the port differs — see [`ingress_bind_for`]);
 /// the upstream is the homeserver's own `bind_addr` (which must be
 /// loopback-reachable). Errors if `bind_addr` is a concrete non-loopback
-/// address (see [`upstream_url`]).
+/// address (see [`upstream_url`]) or the profile's MTU is too small to frame a
+/// block.
 fn build_lb_config(
     config: &Config,
     fed_port: u16,
     egress_bind: SocketAddr,
     link: Option<Arc<dyn DatagramLink>>,
+    profile: LinkProfile,
 ) -> Result<neutrino_lb::LbConfig, Box<dyn std::error::Error>> {
     Ok(neutrino_lb::LbConfig {
         ingress_bind: ingress_bind_for(&config.bind_addr, fed_port),
         egress_bind,
         upstream: upstream_url(&config.bind_addr)?,
-        wire: neutrino_lb::WireKind::CoapQBlock {
-            // 512 B per Q-Block1 chunk, NOT coap-rs's 1024 default. Each block's
-            // serialized PDU also carries the request's options — the federation
-            // path (`/_matrix/federation/v2/invite/!room.../$event...`, long with
-            // room+event ids) plus forwarded headers and the Q-Block/Size/
-            // Request-Tag options — and coap-lite caps a serialized message at
-            // `Packet::MAX_SIZE` (1280 B). A 1024 B block + those options exceeds
-            // 1280, so `build_block`'s `to_bytes()` fails on the very first block
-            // and the send silently stalls (coap-rs drops the error). 512 leaves
-            // ample room for options under 1280 and under the link datagram MTU.
-            block1_size: Some(512),
-            qblock: neutrino_lb::QBlockTuning::default(),
-        },
+        // Q-Block sized to the medium's declared MTU. The default profile
+        // derives the same 512 B block the stall diagnosis hardcoded here (a
+        // 1024 B block + federation options overflows coap-lite's 1280 B
+        // message cap and the send silently stalls) — the full option-budget
+        // rationale now lives on `WireKind::coap_qblock_for_mtu`.
+        wire: neutrino_lb::WireKind::coap_qblock_for_mtu(profile.max_datagram)?,
         // The in-process sidecar is the embedded/datagram-link target: map a
         // peer's node-id `server_name` to its bare 64-char hex node id so the
         // datagram egress dials the peer over the link directly. Dormant for a
@@ -432,11 +474,60 @@ mod tests {
     #[test]
     fn build_lb_config_derives_ingress_from_bind_addr_and_port() {
         let c = cfg("0.0.0.0:8008");
-        let lb = build_lb_config(&c, 8448, egress(), None).expect("valid lb config");
+        let lb = build_lb_config(&c, 8448, egress(), None, LinkProfile::default())
+            .expect("valid lb config");
         assert_eq!(lb.ingress_bind, "[::]:8448".parse().unwrap());
         assert_eq!(lb.egress_bind, egress());
         assert_eq!(lb.upstream, "http://127.0.0.1:8008");
-        assert!(matches!(lb.wire, neutrino_lb::WireKind::CoapQBlock { .. }));
+        // The default profile must keep deriving the field-proven 512 B
+        // Q-Block1 size (a 1024 B block + federation options overflows the
+        // 1280 B coap-lite cap and stalls the send) — pinned so the
+        // profile-driven derivation can't silently drift from the old
+        // hardcoded value.
+        assert!(matches!(
+            lb.wire,
+            neutrino_lb::WireKind::CoapQBlock {
+                block1_size: Some(512),
+                ..
+            }
+        ));
+    }
+
+    // A medium with a constrained MTU shrinks the Q-Block1 size; an MTU that
+    // cannot frame a block refuses startup rather than stalling on first send.
+    #[test]
+    fn build_lb_config_sizes_blocks_from_link_profile() {
+        let c = cfg("0.0.0.0:8008");
+        let small = LinkProfile {
+            max_datagram: 700,
+            ..LinkProfile::default()
+        };
+        let lb = build_lb_config(&c, 8448, egress(), None, small).expect("valid lb config");
+        assert!(matches!(
+            lb.wire,
+            neutrino_lb::WireKind::CoapQBlock {
+                block1_size: Some(256),
+                ..
+            }
+        ));
+        let tiny = LinkProfile {
+            max_datagram: 64,
+            ..LinkProfile::default()
+        };
+        assert!(build_lb_config(&c, 8448, egress(), None, tiny).is_err());
+    }
+
+    // The startup trust gate: this signature-free build serves only over a
+    // medium declaring a trusted network. Peer authentication alone is not
+    // enough (relayed events stay unverifiable without per-event signatures),
+    // and each refusal names its distinct gap.
+    #[test]
+    fn transitive_trust_required() {
+        assert!(require_transitive_trust(LinkTrust::Transitive).is_ok());
+        let err = require_transitive_trust(LinkTrust::PeerAuthenticated).unwrap_err();
+        assert!(err.contains("per-event signatures"), "{err}");
+        let err = require_transitive_trust(LinkTrust::Unauthenticated).unwrap_err();
+        assert!(err.contains("origin↔node"), "{err}");
     }
 
     // A concrete loopback `bind_addr` keeps its host; only the port becomes the
@@ -444,7 +535,8 @@ mod tests {
     #[test]
     fn build_lb_config_ingress_reuses_concrete_host() {
         let c = cfg("127.0.0.1:8008");
-        let lb = build_lb_config(&c, 8448, egress(), None).expect("valid lb config");
+        let lb = build_lb_config(&c, 8448, egress(), None, LinkProfile::default())
+            .expect("valid lb config");
         assert_eq!(lb.ingress_bind, "127.0.0.1:8448".parse().unwrap());
         assert_eq!(lb.upstream, "http://127.0.0.1:8008");
     }
@@ -457,7 +549,8 @@ mod tests {
     #[test]
     fn build_lb_config_ingress_falls_back_to_unspecified_for_hostname() {
         let c = cfg("localhost:8008");
-        let lb = build_lb_config(&c, 8448, egress(), None).expect("valid lb config");
+        let lb = build_lb_config(&c, 8448, egress(), None, LinkProfile::default())
+            .expect("valid lb config");
         assert_eq!(lb.ingress_bind, "[::]:8448".parse().unwrap());
         assert_eq!(lb.upstream, "http://127.0.0.1:8008");
     }
@@ -494,7 +587,8 @@ mod tests {
     #[test]
     fn build_lb_config_upstream_loopbacks_an_unspecified_bind() {
         let c = cfg("0.0.0.0:8008");
-        let lb = build_lb_config(&c, 80, egress(), None).expect("valid lb config");
+        let lb = build_lb_config(&c, 80, egress(), None, LinkProfile::default())
+            .expect("valid lb config");
         assert_eq!(lb.upstream, "http://127.0.0.1:8008");
     }
 
@@ -504,7 +598,7 @@ mod tests {
     #[test]
     fn build_lb_config_rejects_non_loopback_bind_addr() {
         let c = cfg("192.168.1.5:8008");
-        assert!(build_lb_config(&c, 8448, egress(), None).is_err());
+        assert!(build_lb_config(&c, 8448, egress(), None, LinkProfile::default()).is_err());
     }
 
     // The self-allocated egress is always a loopback address: it is an

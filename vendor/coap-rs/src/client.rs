@@ -371,7 +371,11 @@ const BLOCK_OPTIONS_MAX_LENGTH: usize = 12;
 /// so a request self-sizes its blocks from the real per-message overhead rather
 /// than a static, overhead-blind `block1_size`. Errors if the MTU cannot fit
 /// even a 16-byte payload block alongside the request's options.
-fn block1_size_for_mtu(mtu: usize, non_payload_len: usize) -> IoResult<usize> {
+///
+/// Public so a caller can also derive a *static* `set_block1_size` value from a
+/// known link MTU and an assumed option budget (the Q-Block send path sizes
+/// blocks statically).
+pub fn block1_size_for_mtu(mtu: usize, non_payload_len: usize) -> IoResult<usize> {
     let budget = mtu
         .checked_sub(non_payload_len + BLOCK_OPTIONS_MAX_LENGTH)
         .filter(|&b| b >= 16)
