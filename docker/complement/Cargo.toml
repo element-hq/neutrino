@@ -13,7 +13,10 @@ members = [
     "./tools/xtask",
     "./tools/converge",
 ]
-exclude = ["./crates/neutrino-ffi"]
+# The vendor forks must stay excluded (mirroring the root manifest): cargo
+# auto-includes in-workspace path deps as members otherwise, dragging their
+# dev-deps into the lockfile this image reuses.
+exclude = ["./crates/neutrino-ffi", "./vendor/coap-rs", "./vendor/coap-lite"]
 resolver = "3"
 
 [workspace.dependencies]
@@ -41,12 +44,6 @@ license = "AGPL-3.0-only"
 
 [patch.crates-io]
 async-compat = { git = "https://github.com/element-hq/async-compat", rev = "5a27c8b290f1f1dcfc0c4ec22c464e38528aa591" }
-# Mirror the root manifest's in-tree fork (see ./Cargo.toml): the crates.io-
-# published `coap` 0.27.0 and the kaylendog git rev both predate the fields
-# neutrino-lb needs (`QBlockConfig::assume_peer_block_size`, `pub
-# UdpCoAPClient::MAX_PAYLOAD_BLOCK`). `vendor/coap-rs` carries them, so it is
-# copied into the image (docker/complement/Dockerfile) and patched by path here.
-# `coap` is a patch-only, non-member crate with no `links` key, so it does not
-# trigger cargo-chef's member-normalisation collision.
-coap = { path = "./vendor/coap-rs" }
-coap-lite = { git = "https://github.com/kaylendog/coap-lite", rev = "d45e95244bde0a65a36bf754eac7908beab7fafe" }
+# No coap/coap-lite entries: the in-house forks under vendor/ are plain path
+# deps of neutrino-lb (mirroring the root manifest), so the Dockerfile copies
+# vendor/coap-rs + vendor/coap-lite into the image and no patch is involved.

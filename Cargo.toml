@@ -5,15 +5,15 @@ members = [
     "./tools/xtask",
     "./tools/converge",
 ]
-# `vendor/coap-rs` is NOT a member: its dev-dependencies (quickcheck,
-# tokio-test) would enter the shared lockfile for nothing. It is wired in via
-# `[patch.crates-io]` below and keeps its own lockfile; run its tests with
-# `cargo test --features q-block --lib` from inside `vendor/coap-rs`.
-# `iroh_repo` is a self-contained workspace holding the iroh/BLE federation
-# medium (AGPL-or-later deps — kept out of this dual-licensed workspace; it is
-# destined for its own repository). It injects itself via
-# `neutrino_ffi::start_with`.
-exclude = ["./vendor/coap-rs", "./iroh_repo"]
+# `vendor/coap-rs` and `vendor/coap-lite` are in-house forks (q-block /
+# RFC 9177 API + DoS knobs + conformance fixes upstream doesn't carry),
+# consumed by neutrino-lb as plain **path deps** — no [patch] needed, and the
+# deps resolve identically when this repo's crates are consumed as git
+# dependencies (e.g. by neutrino-iroh). They are NOT members: their
+# dev-dependencies (quickcheck, tokio-test, coap-handler) would enter the
+# shared lockfile for nothing. Each keeps its own lockfile; run their tests
+# in-dir (`cargo test --features q-block --lib` inside `vendor/coap-rs`).
+exclude = ["./vendor/coap-rs", "./vendor/coap-lite"]
 default-members = [
     "./crates/*",
     "./tools/uniffi-bindgen",
@@ -47,28 +47,13 @@ sha2 = "=0.11.0-rc.5"
 
 [patch.crates-io]
 async-compat = { git = "https://github.com/element-hq/async-compat", rev = "5a27c8b290f1f1dcfc0c4ec22c464e38528aa591" }
-# Fork adds Server::*_with_config so neutrino-lb can set the CoAP per-message
-# size budget (BlockHandlerConfig.max_total_message_size) for Block2/response
-# fragmentation on constrained links, plus the Q-Block (RFC 9177) API
-# (CoAPClient::send_qblock + {Server,CoAPClient}::set_qblock_config) behind the
-# `q-block` feature. This rev also adds the Q-Block DoS hardening neutrino-lb
-# wires up: Server::set_qblock_max_body_len / set_qblock_max_transfers, inbound
-# source-address binding, and an abort-on-return guard on the client send task.
-# This rev also rejects an advertised Q-Block Size exceeding max_body_len in
-# QBlockReceiver::accept, closing a one-datagram OOM (a spoofed Size1/Size2 fed
-# RangeSet::missing() an unbounded allocation on the first recovery tick).
-# Vendored at `vendor/coap-rs` (base: kaylendog/coap-rs rev 9d9b49b) to carry the
-# RFC 9177 conformance fix the fork doesn't have yet: requests no longer carry a
-# blanket Q-Block2 opt-in (it also clobbered Wireshark's Q-Block reassembly state,
-# leaving fragmented CBOR request bodies undecodable); servers instead stream
-# large responses when `QBlockConfig.assume_peer_block_size` says the peer is
-# known to support Q-Block (both ends of the LB hop are this stack). Upstream the
-# `vendor/coap-rs` diff to the fork and re-pin a git rev when convenient.
-coap = { path = "./vendor/coap-rs" }
-# coap-rs's q-block feature needs coap-lite's qblock primitives (RangeSet,
-# missing_blocks). coap-rs's own [patch] for coap-lite is ignored when coap-rs is
-# consumed as a dependency, and crates.io coap-lite lacks them, so pin the fork
-# here. Rev-pinned (not branch-pinned) so `cargo update` can't silently move it —
-# reproducibility matters for the embedded/constrained target. The rev is the
-# `qblock-phase1` tip.
-coap-lite = { git = "https://github.com/kaylendog/coap-lite", rev = "d45e95244bde0a65a36bf754eac7908beab7fafe" }
+# The coap / coap-lite forks are in-house under vendor/ and reached by path
+# deps from neutrino-lb — see the exclude note above. Fork provenance:
+# vendor/coap-rs = kaylendog/coap-rs rev 9d9b49b (Server::*_with_config,
+# Q-Block RFC 9177 API + DoS hardening: qblock_max_body_len/max_transfers,
+# inbound source-address binding, abort-on-return client guard, advertised-Size
+# OOM rejection) + our RFC 9177 conformance fix on top (no blanket Q-Block2
+# opt-in on requests; servers stream large responses when
+# `QBlockConfig.assume_peer_block_size` says the peer supports Q-Block).
+# vendor/coap-lite = kaylendog/coap-lite rev d45e952 (`qblock-phase1` tip:
+# RangeSet block tracker + missing-blocks codec behind the q-block feature).

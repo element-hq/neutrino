@@ -18,7 +18,11 @@ tokio = { version = "^1.32", features = ["full"] }
 tokio-util = { version = "^0.7", features = ["codec", "net"] }
 tokio-stream = { version = "^0.1", features = ["time"] }
 futures = "^0.3"
-coap-lite = "0.13.2"
+# The sibling in-repo fork (adds the `q-block` feature: the RangeSet block
+# tracker + missing-blocks codec used by `crate::qblock`). A path dep, so it
+# resolves both in-workspace and when this repo is consumed as a git
+# dependency.
+coap-lite = { path = "../coap-lite" }
 async-trait = "0.1.74"
 
 # dependencies for dtls
@@ -74,11 +78,3 @@ socket2 = "0.5"
 # `test-util` supplies the paused-clock runtime (`start_paused`) the qblock
 # timing tests are written against.
 tokio = { version = "^1.32", features = ["full", "test-util"] }
-
-# Use the coap-lite fork (adds the `q-block` feature: the RangeSet block
-# tracker + missing-blocks codec used by `crate::qblock`), pinned to the same
-# rev as the consuming neutrino workspace. Only effective when this crate is
-# built standalone (a [patch] in a dependency manifest is ignored); the
-# neutrino workspace root carries the equivalent pin.
-[patch.crates-io]
-coap-lite = { git = "https://github.com/kaylendog/coap-lite", rev = "d45e95244bde0a65a36bf754eac7908beab7fafe" }
