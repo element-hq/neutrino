@@ -20,16 +20,43 @@ use tokio_util::sync::CancellationToken;
 pub type DatagramLinkResult =
     Result<std::sync::Arc<dyn DatagramLink>, Box<dyn std::error::Error + Send + Sync>>;
 
-/// Builds the federation datagram link once the node secret is resolved. ffi
-/// supplies one that binds an iroh transport; the dev binary passes `None`
-/// (plain UDP federation). Async because binding the transport is async.
-pub type FederationLinkFactory = Box<
-    dyn FnOnce(
-            [u8; 32],
-            watch::Receiver<String>,
-        ) -> Pin<Box<dyn Future<Output = DatagramLinkResult> + Send>>
-        + Send,
->;
+/// Everything an injected federation medium needs from the server, packed by
+/// [`entrypoint`] once identity resolution completes. This is the whole
+/// contract between the homeserver and an out-of-tree [`DatagramLink`]
+/// implementation — nothing may be smuggled in by closure capture, so the
+/// medium and the server cannot disagree on which registry (or channel) they
+/// share.
+///
+/// Contract for implementors:
+/// - The link's peer-visible node id MUST be the ed25519 public key derived
+///   from `secret` — the server's `server_name` is its lowercase hex, and
+///   outbound federation dials peers by that 32-byte id.
+/// - The source node id a [`DatagramLink::recv`] tags each datagram with MUST
+///   be transport-authenticated. Events carry no signatures, so link-level
+///   authentication of the sender id is the only authentication in the system
+///   (the ingress binds a request's claimed `X-Matrix origin` to it).
+pub struct LinkContext {
+    /// The persisted 32-byte node secret the server's identity is derived from.
+    pub secret: [u8; 32],
+    /// Current + future local display name: the medium advertises the current
+    /// value for peer discovery and re-advertises on change.
+    pub display_name: watch::Receiver<String>,
+    /// Shared out-of-band discovery registry. The medium writes the peers it
+    /// discovers into it, keyed by `server_name` (= lowercase hex node id);
+    /// user-directory search and the host's peer list read the same set.
+    pub discovery: Arc<DiscoveryRegistry>,
+    /// Command fan-in back into the server. A medium pulses
+    /// [`Command::KickBackoff`] when a peer (re)appears so destinations that
+    /// backed off while that peer was unreachable retry promptly.
+    pub commands: tokio::sync::mpsc::UnboundedSender<Command>,
+}
+
+/// Builds the federation datagram link once the node secret is resolved. The
+/// embedded build injects one (see [`LinkContext`] for the contract); the dev
+/// binary passes `None` (plain UDP federation). Async because binding the
+/// transport is async.
+pub type FederationLinkFactory =
+    Box<dyn FnOnce(LinkContext) -> Pin<Box<dyn Future<Output = DatagramLinkResult> + Send>> + Send>;
 
 /// Install the tracing subscriber that routes our logs to the platform sink
 /// (logcat on Android). Idempotent. [`entrypoint`] calls this itself, but an
@@ -80,20 +107,44 @@ pub async fn entrypoint(
         .unwrap_or_else(|| neutrino_ctl::DEFAULT_DISPLAY_NAME.to_string());
     let (display_name_tx, display_name_rx) = watch::channel(display_name);
 
+    // Command fan-in. The host's receiver is forwarded into an internal channel
+    // so an injected medium can also push commands (`KickBackoff` on peer
+    // reappearance) — the medium gets a sender clone via `LinkContext`, and
+    // `serve` drains the merged stream. When the host side closes (every handle
+    // dropped), forward a final `Shutdown`: the medium's sender keeps the
+    // internal channel open, so the old close-to-shutdown contract must ride an
+    // explicit command through the indirection.
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn({
+        let cmd_tx = cmd_tx.clone();
+        let mut host = commands;
+        async move {
+            while let Some(c) = host.recv().await {
+                if cmd_tx.send(c).is_err() {
+                    return; // server side gone — nothing left to forward to
+                }
+            }
+            let _ = cmd_tx.send(Command::Shutdown);
+        }
+    });
+
     // Build the federation datagram link from the resolved secret (the embedded
-    // iroh build injects a factory; the dev binary passes `None` for plain UDP
+    // build injects a factory; the dev binary passes `None` for plain UDP
     // federation). A failed transport bind must fail startup loudly — propagate
     // with `?` rather than silently falling back to UDP.
     // The factory's error is `Send + Sync` (so it can cross the ffi task
     // boundary); widen it to this function's plain `Box<dyn Error>` on the way
     // out, since the two boxed-trait-object types don't auto-convert via `?`.
-    // The transport reads the current display name from `display_name_rx` (for
-    // the initial advert) and watches it for re-advertise.
     let link = match link_factory {
         Some(factory) => Some(
-            factory(secret, display_name_rx)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error> { e })?,
+            factory(LinkContext {
+                secret,
+                display_name: display_name_rx,
+                discovery: discovery.clone(),
+                commands: cmd_tx,
+            })
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { e })?,
         ),
         None => None,
     };
@@ -148,7 +199,7 @@ pub async fn entrypoint(
                 listener,
                 config,
                 store,
-                commands,
+                cmd_rx,
                 discovery,
                 Some(display_name_tx),
             );
@@ -189,7 +240,7 @@ pub async fn entrypoint(
                 listener,
                 config,
                 store,
-                commands,
+                cmd_rx,
                 discovery,
                 Some(display_name_tx),
             )
@@ -260,16 +311,16 @@ fn build_lb_config(
             // `Packet::MAX_SIZE` (1280 B). A 1024 B block + those options exceeds
             // 1280, so `build_block`'s `to_bytes()` fails on the very first block
             // and the send silently stalls (coap-rs drops the error). 512 leaves
-            // ample room for options under 1280 and under the iroh datagram MTU.
+            // ample room for options under 1280 and under the link datagram MTU.
             block1_size: Some(512),
             qblock: neutrino_lb::QBlockTuning::default(),
         },
         // The in-process sidecar is the embedded/datagram-link target: map a
         // peer's node-id `server_name` to its bare 64-char hex node id so the
-        // datagram egress dials the peer's iroh endpoint directly. Dormant for a
+        // datagram egress dials the peer over the link directly. Dormant for a
         // non-node `server_name` (dev/named servers pass through to direct dial).
         resolver: Some(Arc::new(resolver::NodeIdResolver::new())),
-        // The injected federation transport (iroh, embedded build) — when `Some`,
+        // The injected federation transport (the embedded build) — when `Some`,
         // the sidecar's CoAP wire runs over it instead of a UDP socket. `None` for
         // dev/LAN keeps the UDP path.
         link,

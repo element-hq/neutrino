@@ -28,11 +28,11 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Install rustls' ring crypto provider as the process default, once.
 ///
-/// `iroh` (in the ffi build) unifies reqwest's TLS backend onto rustls with NO
-/// default crypto provider, and `cargo test --workspace` feature-unifies that
-/// onto every crate's reqwest — so any process that builds a `reqwest::Client`
-/// panics at build time ("No rustls crypto provider is configured") unless a
-/// provider is installed first. Every reqwest-client constructor on the
+/// In this workspace reqwest carries no TLS backend, but an out-of-tree
+/// composition (the iroh/BLE medium) feature-unifies reqwest onto rustls with
+/// NO default crypto provider — there, any process that builds a
+/// `reqwest::Client` panics at build time ("No rustls crypto provider is
+/// configured") unless a provider is installed first. Every reqwest-client constructor on the
 /// federation path calls this; `neutrino-ffi::start` installs the same provider.
 /// Idempotent: `install_default` returns `Err` if one is already set (we ignore
 /// it), and the `Once` keeps repeat calls from every construction site cheap.
@@ -171,7 +171,7 @@ pub struct LbConfig {
     /// resolver that maps `server_name` → its 64-char hex node id.
     pub resolver: Option<Arc<dyn DestinationResolver>>,
     /// In-process federation transport. When `Some`, the CoAP wire runs over this
-    /// datagram link (the embedded/iroh build) instead of a UDP socket — keyed by
+    /// datagram link (the embedded build) instead of a UDP socket — keyed by
     /// 32-byte node id, so `ingress_bind` is unused on this path and the resolver
     /// must yield a 64-char hex node id as the egress `dest`. `None` = UDP socket
     /// (dev / direct-LAN), the existing behaviour.
@@ -199,7 +199,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::ingress::IngressHandler;
-use crate::transport::coap::datagram::{Hub, IrohCoapWireClient, IrohCoapWireServer};
+use crate::transport::coap::datagram::{Hub, LinkCoapWireClient, LinkCoapWireServer};
 use crate::transport::coap::{CoapWireClient, CoapWireServer};
 use crate::transport::http::{HttpWireClient, HttpWireServer};
 use crate::transport::{WireClient, WireError, WireServer};
@@ -215,7 +215,7 @@ pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), 
         .resolver
         .clone()
         .unwrap_or_else(|| Arc::new(DirectResolver));
-    // When the embedding host injected a datagram link (the iroh build), the CoAP
+    // When the embedding host injected a datagram link (the embedded build), the CoAP
     // wire runs over it instead of a UDP socket; the framing config still comes
     // from `config.wire`. Selected purely by injection — `None` keeps the existing
     // UDP socket path 100% intact.
@@ -276,7 +276,7 @@ pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), 
 }
 
 /// Run the proxy with the CoAP wire over an injected [`DatagramLink`] (the
-/// embedded/iroh build). One [`Hub`] multiplexes both directions over the link
+/// embedded build). One [`Hub`] multiplexes both directions over the link
 /// and is shared between the egress client and the ingress server; the framing
 /// (CON / Q-Block, sizes) still comes from `config.wire`. The egress forward
 /// proxy on `egress_bind` and the resolver are transport-independent, so this
@@ -296,12 +296,12 @@ async fn serve_over_link(
             qblock,
         } => {
             let cfg = qblock.to_qblock_config(block1_size);
-            let wire_client: Arc<dyn WireClient> = Arc::new(IrohCoapWireClient::with_qblock(
+            let wire_client: Arc<dyn WireClient> = Arc::new(LinkCoapWireClient::with_qblock(
                 hub.clone(),
                 block1_size,
                 cfg.clone(),
             ));
-            let wire_server = IrohCoapWireServer::with_qblock(hub, cfg);
+            let wire_server = LinkCoapWireServer::with_qblock(hub, cfg);
             run_pair(
                 config.egress_bind,
                 wire_client,
@@ -317,8 +317,8 @@ async fn serve_over_link(
             max_message_size,
         } => {
             let wire_client: Arc<dyn WireClient> =
-                Arc::new(IrohCoapWireClient::new(hub.clone(), block1_size));
-            let wire_server = IrohCoapWireServer::new(hub, max_message_size);
+                Arc::new(LinkCoapWireClient::new(hub.clone(), block1_size));
+            let wire_server = LinkCoapWireServer::new(hub, max_message_size);
             run_pair(
                 config.egress_bind,
                 wire_client,

@@ -26,7 +26,6 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - run: cargo install cargo-ndk
       - name: Publish bindings to GitHub Packages
         run: cargo xtask publish --version "${GITHUB_REF_NAME#v}"

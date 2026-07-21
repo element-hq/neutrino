@@ -4,24 +4,16 @@ members = [
     "./tools/uniffi-bindgen",
     "./tools/xtask",
     "./tools/converge",
-    "./vendor/iroh-ble-transport",
-    "./vendor/blew"
 ]
-# `vendor/iroh-ble-transport` and `vendor/blew` are members (shared lockfile,
-# reachable via `-p` and neutrino-ffi's optional `ble` feature) but are
-# deliberately excluded from the default set: bare `cargo clippy`/`cargo nextest
-# run` skip them, so they don't pull `blew` → `bluer` → `libdbus-sys` (needs
-# system D-Bus). They still build in the `compile` CI job via `neutrino-ffi
-# --features ble` (which installs libdbus).
-# Do NOT add `--workspace` to the clippy/test CI steps — that would re-include them.
-# `vendor/blew` is a fork of the crates.io `blew` crate (see `[patch.crates-io]`
-# below): it adds extended-advertising + manufacturer-data support for BLE peer
-# discovery (advertise `node_id ‖ display_name`, surface it on scan).
 # `vendor/coap-rs` is NOT a member: its dev-dependencies (quickcheck,
 # tokio-test) would enter the shared lockfile for nothing. It is wired in via
 # `[patch.crates-io]` below and keeps its own lockfile; run its tests with
 # `cargo test --features q-block --lib` from inside `vendor/coap-rs`.
-exclude = ["./vendor/coap-rs"]
+# `iroh_repo` is a self-contained workspace holding the iroh/BLE federation
+# medium (AGPL-or-later deps — kept out of this dual-licensed workspace; it is
+# destined for its own repository). It injects itself via
+# `neutrino_ffi::start_with`.
+exclude = ["./vendor/coap-rs", "./iroh_repo"]
 default-members = [
     "./crates/*",
     "./tools/uniffi-bindgen",
@@ -49,15 +41,11 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 uniffi = { version = "0.31.1" }
 proptest = "1"
-# required by iroh
+# Pinned to the 0.11 RC while iroh (which required it) was in-tree;
+# neutrino-event's hashing is written against the 0.11 API, so the pin stays.
 sha2 = "=0.11.0-rc.5"
 
 [patch.crates-io]
-# Local fork of `blew` (vendored at `vendor/blew`): adds extended-advertising +
-# manufacturer-data (advertise + surface-on-scan) so BLE peer discovery can carry
-# a full 32-byte node id plus a display name in one extended advertisement — the
-# stock 0.2.3 only exposes `local_name` + `service_uuids` over legacy adverts.
-blew = { path = "./vendor/blew" }
 async-compat = { git = "https://github.com/element-hq/async-compat", rev = "5a27c8b290f1f1dcfc0c4ec22c464e38528aa591" }
 # Fork adds Server::*_with_config so neutrino-lb can set the CoAP per-message
 # size budget (BlockHandlerConfig.max_total_message_size) for Block2/response
