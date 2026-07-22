@@ -16,6 +16,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 neutrino-ctl = { path = "../neutrino-ctl" }
+# The trust policy seam: LinkTrust carries a KeyResolver, and the entrypoint
+# maps it onto the Provenance/EventSigner pair the http stack runs under.
+neutrino-event = { path = "../neutrino-event" }
 neutrino-http = { path = "../neutrino-http" }
 neutrino-lb = { path = "../neutrino-lb" }
 neutrino-store = { path = "../neutrino-store" }

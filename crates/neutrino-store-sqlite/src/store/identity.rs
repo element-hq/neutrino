@@ -18,6 +18,10 @@ use crate::{SqliteStore, error::Error};
 const KEY_SECRET: &str = "secret";
 /// The single key under which the local user's display name is stored.
 const KEY_DISPLAYNAME: &str = "displayname";
+/// The single key recording which trust domain the store's events belong to
+/// (`"transitive"` = unsigned events, `"signed"` = signature-verified). First
+/// write wins; a mode switch on existing data is refused by the caller.
+const KEY_TRUST_DOMAIN: &str = "trust_domain";
 
 #[async_trait]
 impl IdentityStore for SqliteStore {
@@ -71,6 +75,24 @@ impl IdentityStore for SqliteStore {
                 params![KEY_DISPLAYNAME, name],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn get_or_create_trust_domain(&self, current: &str) -> Result<String, StorageError> {
+        let current = current.to_owned();
+        self.run_write(move |conn| -> Result<String, Error> {
+            // Same first-write-wins idiom as the node secret: the domain the
+            // store was born under is the one it keeps for life.
+            conn.execute(
+                "INSERT OR IGNORE INTO server_identity (key, value) VALUES (?, ?)",
+                params![KEY_TRUST_DOMAIN, current],
+            )?;
+            Ok(conn.query_row(
+                "SELECT value FROM server_identity WHERE key = ?",
+                params![KEY_TRUST_DOMAIN],
+                |row| row.get::<_, String>(0),
+            )?)
         })
         .await
     }
@@ -147,6 +169,43 @@ mod tests {
         assert_eq!(
             store.get_display_name().await.expect("reopen read"),
             Some("Bob".to_string())
+        );
+    }
+
+    /// Trust domain is first-write-wins and stable across a reopen — the fact
+    /// the startup gate uses to stop a signed deployment reusing a store whose
+    /// events were persisted unsigned (and vice versa).
+    #[tokio::test]
+    async fn trust_domain_is_first_write_wins_and_stable() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("identity.db");
+        {
+            let store = SqliteStore::open(&path).await.expect("open");
+            assert_eq!(
+                store
+                    .get_or_create_trust_domain("transitive")
+                    .await
+                    .expect("first"),
+                "transitive",
+                "first start records its own mode"
+            );
+            assert_eq!(
+                store
+                    .get_or_create_trust_domain("signed")
+                    .await
+                    .expect("second"),
+                "transitive",
+                "a different mode later reads back the original — the caller refuses on mismatch"
+            );
+        }
+        let store = SqliteStore::open(&path).await.expect("reopen");
+        assert_eq!(
+            store
+                .get_or_create_trust_domain("signed")
+                .await
+                .expect("reopen read"),
+            "transitive",
+            "domain survives restart"
         );
     }
 

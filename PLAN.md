@@ -25,6 +25,7 @@
 - PUT /_matrix/federation/v2/invite/{roomId}/{eventId}
 - GET /_matrix/federation/v1/make_leave/{roomId}/{userId}
 - PUT /_matrix/federation/v2/send_leave/{roomId}/{eventId}
+- GET /_matrix/key/v2/server (signed deployments only; 404 on a trusted network)
 
 ## outstanding work
 
@@ -90,13 +91,13 @@ lb egress (CoAP/CBOR) → `LinkCoapWireClient` → `DatagramLink::send(node,
 datagram)` → iroh over BLE.
 Done:
 - Link facts → encoding policy (`LinkProfile`, 2026-07-21): `DatagramLink`
-  gained a defaulted `profile()` returning `LinkProfile { max_datagram,
-  trust: LinkTrust }`. Mediums declare facts; `neutrino-main` derives policy —
-  startup refuses `trust < Transitive` (`require_transitive_trust`) and
+  gained a defaulted `profile()` returning `LinkProfile { max_datagram }`;
   `build_lb_config` sizes the Q-Block1 block from the MTU
   (`WireKind::coap_qblock_for_mtu`; the default profile reproduces the old
-  hardcoded 512 B). `PcapCaptureLink` delegates `profile()`. See the
-  decisions log.
+  hardcoded 512 B). `PcapCaptureLink` delegates `profile()`. The medium's
+  *trust* declaration moved the same day to `neutrino-main::LinkTrust`
+  riding the link factory's result (see the event-signatures decisions
+  entry).
 - Integer-key CBOR codec (Layer A; port of Dendrite `internal/lb`): all transports
   now carry the integer-key transcode (`codec::keys`, 143 keys: 137 from Dendrite
   + 6 MSC4242 state-DAG keys) plus event-ID
@@ -133,6 +134,12 @@ Deferred follow-ups (write-ups, not done):
 - Per-hop timeouts on the sidecar's own reqwest clients (`LbConfig.timeouts`).
 - Q-Block2 (response) per-fragment size knob (no `max_message_size` equivalent
   on the Q-Block path yet; Block2 follows coap-rs's szx default).
+- iroh_repo medium migration: `FederationLinkFactory` now resolves to
+  `FederationLink { link, trust: LinkTrust }` — the out-of-tree medium must
+  wrap its link (`trust: LinkTrust::Transitive` preserves today's behaviour;
+  declaring `PeerAuthenticated(Arc::new(NodeIdKeyResolver))` flips the stack
+  into signed mode with zero key infrastructure, since node-id server names
+  ARE the verify keys).
 - Per-peer / mid-session MTU: `LinkProfile.max_datagram` is read once at
   startup, but BLE MTU is per-peer and changes mid-session (L2CAP upgrade).
   The end state is a per-peer profile query or watch — needs lb-side
@@ -213,6 +220,75 @@ never use .unwrap() in handler code.
 - Restricted rooms (`join_authorised_via_users_server`) — documented, not implemented
 
 ## decisions log
+
+### Event signatures land: LinkTrust::PeerAuthenticated(resolver) flips the stack into signed mode (2026-07-21)
+- Supersedes the same-day LinkProfile entry's trust half: `LinkTrust` left
+  `neutrino-lb` (the profile keeps only wire facts, i.e. `max_datagram`) and
+  became a **constructive** enum in `neutrino-main` — `Transitive |
+  PeerAuthenticated(Arc<dyn KeyResolver>)`, returned by the link factory
+  beside the link (`FederationLink { link, trust }`). No `Unauthenticated`
+  variant (it had no legitimate inhabitant — the DatagramLink contract
+  already MUSTs transport-auth), and peer-auth-without-keys is
+  unrepresentable. `entrypoint` maps it via `trust_policy` onto the pair the
+  http/engine stack runs under: `Provenance::{Faith,Signed(resolver)}`
+  (inbound admission) + `Option<Arc<EventSigner>>` (outbound signing),
+  threaded through `serve` → AppState/worker/sender/RoomRegistry.
+- **Primitives (neutrino-event `sign.rs`)**: sign/verify over the SAME byte
+  string as the reference hash (`redact_to_canonical_bytes`, MSC4242
+  carve-out included) — so event ids are signature-invariant and co-signing
+  is non-destructive. Fixed key id `ed25519:1` (the signing key IS the node
+  identity secret; `server_name` = hex pubkey for node-named servers, so
+  `NodeIdKeyResolver` is a pure decode with zero key infrastructure).
+  Spec golden vectors ported: the two "Signing JSON" vectors directly, the
+  two event vectors via V1-redaction composition (they predate v11
+  redaction). Caveat pinned in code: the spec's seed has a NON-ZERO trailing
+  base64 sextet — strict no-pad decoders reject it, so signature/key decode
+  is deliberately lenient (ecosystem parity).
+- **Ingress typestate**: `from_wire` now returns `UnverifiedWire`; the only
+  paths to `Wire` are `assume_transitive()` (trusted network/tests, greppable)
+  and async `verify(resolver)` — production ingress goes through
+  `Provenance::admit`, so no path can skip the provenance decision (same
+  philosophy as the 2026-07-16 Wire redesign). Signature failure =
+  `FormatError::SignatureCheck` = Drop class (S-S receipt checks; hash
+  mismatch already redacts-and-continues in `from_wire`). Exception with a
+  comment: `complete_membership_template` parses via `assume_transitive`
+  regardless of mode — a make_* template is a resident-authored protoevent
+  with OUR user as sender (it can never carry a valid sender's-server sig)
+  and nothing in it is trusted (only DAG pointers, rebuilt + re-auth-checked).
+- **Signing**: `EventBuilder.signer(Option<Arc<EventSigner>>)`, threaded to
+  every authoring site (`RoomCore::build_local_event` param → room actor /
+  registry; createRoom's `build_initial_events`; membership-template
+  completion). `Transitive` mode passes `None` — events MUST NOT carry
+  signatures on a trusted network, unchanged.
+- **Co-signing**: send_join / send_leave / invite handlers `co_sign` the
+  received event (adds our sig beside the origin's, regenerates `raw`, id
+  unchanged) before persisting/fanning out AND before the response copy, so
+  both sides hold the doubly-signed event (send_join responses already
+  carried `event`; the joiner ingests it; invite already applied the
+  *returned* event). The inviting side under Signed mode additionally
+  REQUIRES the invitee's co-signature on the returned event (502 otherwise).
+  send_leave's v2 response stays `{}` per spec — the leaver keeps its
+  singly-signed copy, which still verifies by sender's-server sig.
+- **Trust domains don't mix**: `IdentityStore::get_or_create_trust_domain`
+  (first-write-wins kv row, like the node secret) records
+  `signed`/`transitive` at first start; `entrypoint` hard-refuses a
+  mismatch (unsigned history can never serve a signed deployment — delete
+  the DB to switch).
+- **`GET /_matrix/key/v2/server`**: served on signed deployments (signed
+  JSON via `sign_json`, `ed25519:1`, empty `old_verify_keys`, rolling
+  30-day `valid_until_ts`, no rotation — the key is the identity); 404 on a
+  trusted network (no keys exist, by design).
+- **Out of scope, deliberately**: X-Matrix request signing (PeerAuthenticated
+  links still transport-authenticate requests point-to-point; only
+  third-party event provenance needed crypto), DNS/notary resolvers (future
+  `KeyResolver` impls; the e2e's test directory shows the shape), key
+  rotation.
+- Verified: spec vectors + 122 event-crate tests; signed-mode two-node e2e
+  (`e2e_signed_federation`: join with co-sign round-trip, bidirectional
+  messages, backfill — all under mandatory verification, where any missing
+  sig fails convergence); workspace clippy -D warnings + all lib tests +
+  lb/backfill/qblock e2e green. BREAKING for iroh_repo (see deferred
+  follow-up).
 
 ### LinkProfile: mediums declare link facts, the composition root derives encoding policy (2026-07-21)
 - Custom transports need to influence how neutrino encodes data (fragment size

@@ -55,8 +55,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use neutrino_event::Event;
-use neutrino_event::event_builder::from_wire;
+use neutrino_event::{Event, Provenance};
 use neutrino_store::{StagedPdu, StorageBackend, WithStateProvider};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, RoomId};
 use tokio::sync::{Notify, mpsc};
@@ -66,7 +65,7 @@ use tracing::{debug, error, info, warn};
 use crate::gapfill::fill_state_ancestry;
 use crate::ports::MissingEventsFetcher;
 use crate::room_actor::{RoomActorError, RoomRegistry};
-use crate::util::{BACKOFF_BASE, jitter, next_backoff};
+use crate::util::{BACKOFF_BASE, admit_wire, jitter, next_backoff};
 
 /// Buffer for the in-process poke channel. A poke is just a room id; the
 /// supervisor coalesces duplicates (re-reading the room's staged rows each
@@ -81,6 +80,8 @@ struct WorkerCtx<S> {
     store: Arc<S>,
     registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
+    /// Deployment-wide provenance policy from the medium's declared link trust.
+    provenance: Provenance,
     /// Backoff floor; [`BACKOFF_BASE`] in production, near-zero in tests so the
     /// retry path runs without real delays.
     backoff_base: Duration,
@@ -94,6 +95,7 @@ impl<S> Clone for WorkerCtx<S> {
             store: self.store.clone(),
             registry: self.registry.clone(),
             fetcher: self.fetcher.clone(),
+            provenance: self.provenance.clone(),
             backoff_base: self.backoff_base,
         }
     }
@@ -116,8 +118,9 @@ pub fn spawn<S: StorageBackend + WithStateProvider + 'static>(
     store: Arc<S>,
     registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
+    provenance: Provenance,
 ) -> mpsc::Sender<OwnedRoomId> {
-    spawn_with(store, registry, fetcher, BACKOFF_BASE)
+    spawn_with(store, registry, fetcher, provenance, BACKOFF_BASE)
 }
 
 /// Inner spawn with the backoff floor made explicit, so tests can drive the
@@ -126,6 +129,7 @@ fn spawn_with<S: StorageBackend + WithStateProvider + 'static>(
     store: Arc<S>,
     registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
+    provenance: Provenance,
     backoff_base: Duration,
 ) -> mpsc::Sender<OwnedRoomId> {
     let (tx, rx) = mpsc::channel(POKE_BUFFER);
@@ -133,6 +137,7 @@ fn spawn_with<S: StorageBackend + WithStateProvider + 'static>(
         store,
         registry,
         fetcher,
+        provenance,
         backoff_base,
     };
     tokio::spawn(supervise(ctx, rx));
@@ -263,7 +268,7 @@ async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
 ) -> Vec<Staged> {
     let mut out = Vec::with_capacity(eligible.len());
     for p in eligible {
-        match from_wire(p.raw.clone(), Vec::new()) {
+        match admit_wire(&ctx.provenance, p.raw.clone()).await {
             // Both variants proceed: a `Wire::Rejected` event carries
             // `rejected = true` and `apply_pdu` short-circuits it to a
             // rejected persist (the cascade terminator).
@@ -316,8 +321,14 @@ async fn process_one<S: StorageBackend + WithStateProvider + 'static>(
         // gap — back off rather than spin re-applying. `Err` (unfillable / peer
         // failure) also backs off.
         Err(RoomActorError::Apply(e)) if e.is_retryable() => {
-            match fill_state_ancestry(&*ctx.store, &staged.origin, &staged.event, &*ctx.fetcher)
-                .await
+            match fill_state_ancestry(
+                &*ctx.store,
+                &staged.origin,
+                &staged.event,
+                &*ctx.fetcher,
+                &ctx.provenance,
+            )
+            .await
             {
                 Ok(true) => {
                     backoff.remove(&id);

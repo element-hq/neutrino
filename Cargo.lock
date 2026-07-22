@@ -1759,12 +1759,14 @@ name = "neutrino-event"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "ed25519-dalek",
  "proptest",
  "ruma",
  "serde",
  "serde_json",
  "sha2 0.11.0-rc.5",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -1833,6 +1835,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "neutrino-ctl",
+ "neutrino-event",
  "neutrino-http",
  "neutrino-lb",
  "neutrino-store",

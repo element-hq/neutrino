@@ -11,7 +11,7 @@ pub mod transport;
 
 pub use error::LbError;
 pub use transport::coap::capture::{CaptureControl, PcapCaptureLink};
-pub use transport::coap::datagram::{DatagramLink, LinkProfile, LinkTrust};
+pub use transport::coap::datagram::{DatagramLink, LinkProfile};
 pub use transport::{DestinationResolver, DirectResolver};
 
 use std::net::SocketAddr;
@@ -395,21 +395,12 @@ async fn run_pair<S: WireServer>(
 mod profile_tests {
     use super::*;
 
-    // LinkTrust is a strictly ordered lattice so policy gates can compare
-    // levels instead of enumerating variants.
-    #[test]
-    fn link_trust_orders_by_strength() {
-        assert!(LinkTrust::Unauthenticated < LinkTrust::PeerAuthenticated);
-        assert!(LinkTrust::PeerAuthenticated < LinkTrust::Transitive);
-    }
-
-    // The default profile states today's operating assumptions — the values
+    // The default profile states today's operating assumption — the value
     // every existing medium implicitly ran under before profiles existed.
     #[test]
     fn default_profile_is_todays_assumptions() {
         let p = LinkProfile::default();
         assert_eq!(p.max_datagram, coap_lite::Packet::MAX_SIZE);
-        assert_eq!(p.trust, LinkTrust::Transitive);
     }
 
     // MTU → block derivation: the full 1280 B datagram budget yields the

@@ -38,14 +38,13 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
-use neutrino_event::event_builder::from_wire;
 use neutrino_store::{FederationInbox, StagingStore};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 use tracing::warn;
 
-use crate::federation::{FedError, auth};
+use crate::federation::{FedError, admit_wire, auth};
 use crate::{AppState, lock_app};
 use neutrino_engine::{ForwardExtremities, reconcile};
 
@@ -122,12 +121,13 @@ pub(crate) async fn handle(
         return Err(FedError::BadRequest("transaction exceeds 50 PDUs"));
     }
 
-    let (store, worker_poke, fetcher, our_name) = {
+    let (store, worker_poke, fetcher, provenance, our_name) = {
         let app = lock_app(&state);
         (
             app.store.clone(),
             app.worker_poke.clone(),
             app.fetcher.clone(),
+            app.provenance.clone(),
             app.config.server_name.clone(),
         )
     };
@@ -181,7 +181,7 @@ pub(crate) async fn handle(
         // Drop-class PDUs (`Err`) never enter the system; `Wire::Rejected`
         // ones are staged like any other — the worker persists them rejected
         // (the cascade terminator).
-        let event = match from_wire(raw, Vec::new()) {
+        let event = match admit_wire(&provenance, raw).await {
             Ok(neutrino_event::Wire::Valid(ev)) => ev,
             Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
                 tracing::warn!(event_id = %ev.event_id, %defect, "/send: staging malformed PDU as rejected");
@@ -252,11 +252,20 @@ pub(crate) async fn handle(
     for (room, heads) in advertised {
         let store = store.clone();
         let fetcher = fetcher.clone();
+        let provenance = provenance.clone();
         let worker_poke = worker_poke.clone();
         let origin = body.origin.clone();
         tokio::spawn(async move {
-            reconcile::reconcile_room(&*store, &*fetcher, &worker_poke, &origin, &room, &heads)
-                .await;
+            reconcile::reconcile_room(
+                &*store,
+                &*fetcher,
+                &provenance,
+                &worker_poke,
+                &origin,
+                &room,
+                &heads,
+            )
+            .await;
         });
     }
 

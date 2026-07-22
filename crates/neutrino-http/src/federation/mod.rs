@@ -199,6 +199,20 @@ pub(crate) fn map_apply_err(err: neutrino_engine::RoomActorError) -> FedError {
     }
 }
 
+/// Parse a wire PDU and admit it through the deployment-wide provenance
+/// policy ([`Provenance::admit`](neutrino_event::Provenance::admit)). Under
+/// [`Provenance::Faith`](neutrino_event::Provenance) this is exactly the bare
+/// parse; under `Signed` a signature failure is refused/skipped identically
+/// to a parse failure.
+pub(crate) async fn admit_wire(
+    provenance: &neutrino_event::Provenance,
+    raw: Box<serde_json::value::RawValue>,
+) -> Result<neutrino_event::Wire, neutrino_event::FormatError> {
+    provenance
+        .admit(neutrino_event::event_builder::from_wire(raw, Vec::new())?)
+        .await
+}
+
 /// Rebuild an `m.room.member` event from a remote `make_join`/`make_leave`
 /// template, taking **only** the template's DAG references (`prev_events` /
 /// `prev_state_events`) and setting `type` / `sender` / `state_key` / `content`
@@ -214,18 +228,26 @@ pub(crate) fn map_apply_err(err: neutrino_engine::RoomActorError) -> FedError {
 /// "simplify" this into reusing the template's fields; a regression test pins
 /// the invariant. `None` if the template is unparseable.
 pub(crate) fn complete_membership_template(
+    signer: Option<std::sync::Arc<neutrino_event::EventSigner>>,
     template: &serde_json::value::RawValue,
     room_id: &ruma::RoomId,
     user: &ruma::UserId,
     membership: &str,
     display_name: &str,
 ) -> Option<neutrino_event::Event> {
-    use neutrino_event::event_builder::{EventBuilder, from_wire};
+    use neutrino_event::event_builder::EventBuilder;
     let raw = serde_json::value::RawValue::from_string(template.get().to_owned()).ok()?;
-    // Only the DAG pointers are taken from the template (never echoed — the
-    // event is rebuilt below and re-validated by `EventBuilder::build`), so a
-    // `Wire::Rejected` template is as usable as a valid one.
-    let parsed = match from_wire(raw, Vec::new()) {
+    // Deliberately NOT `Provenance::admit`: a make_* template is a protoevent
+    // authored by the *resident* with OUR user as `sender`, so it can never
+    // carry a valid sender's-server signature — a signed deployment would
+    // refuse every template. That is safe precisely because nothing here is
+    // trusted: only the DAG pointers are taken (never echoed — the event is
+    // rebuilt below, re-validated by `EventBuilder::build`, and auth-checked
+    // by the resident), so a `Wire::Rejected` template is as usable as a
+    // valid one.
+    let parsed = match neutrino_event::event_builder::from_wire(raw, Vec::new())
+        .map(|uw| uw.assume_transitive())
+    {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
         Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
             // Usable (only the pointers are taken), but log it: the resident
@@ -248,6 +270,7 @@ pub(crate) fn complete_membership_template(
         .content(content)
         .prev_events(parsed.prev_events)
         .prev_state_events(parsed.prev_state_events)
+        .signer(signer)
         .build()
     {
         Ok(event) => Some(event),

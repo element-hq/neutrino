@@ -66,35 +66,15 @@ use super::{CoapDispatch, MAX_QBLOCK_INFLIGHT_TRANSFERS, exchange, random_token_
 /// A datagram tagged with the 32-byte node it came from / is bound for.
 type NodeDatagram = ([u8; 32], Vec<u8>);
 
-/// What a medium's admission + authentication properties let the server take
-/// on faith. Strictly ordered — each level subsumes the ones below it — so
-/// policy gates compare with `<` / `>=`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum LinkTrust {
-    /// `recv` source node ids are NOT authenticated. Nothing above the link
-    /// holds: no origin↔node binding, no server ACLs, no basis for even
-    /// point-to-point claims. Unusable by this server — and unfixable at the
-    /// event layer, since even signed events cannot attribute *requests*.
-    Unauthenticated,
-    /// Source ids are truthful, but only point-to-point: "node A sent X" is
-    /// attributable to A, while "A relayed events authored by B" is not
-    /// verifiable. Sufficient for ACLs and origin-addressed requests;
-    /// insufficient for DAG sync without per-event signatures (most events a
-    /// server receives were authored by third parties and arrive relayed).
-    PeerAuthenticated,
-    /// Trusted network: admission to the mesh implies honesty about relays,
-    /// so transitive delivery is accurate — origin claims on relayed events
-    /// are taken on faith without cryptographic verification. The level this
-    /// signature-free server requires (see `LinkContext` in neutrino-main).
-    Transitive,
-}
-
-/// Facts a medium declares about its link, consumed by the composition root
-/// (neutrino-main) to derive encoding policy: CoAP fragmentation from
-/// `max_datagram`, the startup trust gate from `trust`. Deliberately facts,
-/// not knob settings — the medium knows its MTU and admission boundary but
-/// not CoAP option budgets or wire framing, so the translation lives with the
-/// consumer and mediums stay decoupled from the wire stack.
+/// Wire-level facts a medium declares about its link, consumed to derive CoAP
+/// framing (fragment sizing from `max_datagram`). Deliberately facts, not
+/// knob settings — the medium knows its MTU but not CoAP option budgets, so
+/// the translation lives with the consumer and mediums stay decoupled from
+/// the wire stack.
+///
+/// The medium's *trust* declaration (`LinkTrust` in neutrino-main) rides the
+/// link factory's result instead: it carries the medium's key resolver, a
+/// type this transport crate has no business knowing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkProfile {
     /// Largest datagram the link carries in one `send` (the usable MTU after
@@ -102,19 +82,15 @@ pub struct LinkProfile {
     /// (1280 B in this build) buy nothing: a serialized CoAP message is
     /// capped there regardless.
     pub max_datagram: usize,
-    /// The trust level the medium's admission + authentication properties
-    /// support.
-    pub trust: LinkTrust,
 }
 
 impl Default for LinkProfile {
-    /// Today's operating assumptions: a full `Packet::MAX_SIZE` datagram
-    /// budget and a trusted network. Mediums on more constrained or more open
-    /// links override [`DatagramLink::profile`].
+    /// Today's operating assumption: a full `Packet::MAX_SIZE` datagram
+    /// budget. Mediums on more constrained links override
+    /// [`DatagramLink::profile`].
     fn default() -> Self {
         Self {
             max_datagram: coap_lite::Packet::MAX_SIZE,
-            trust: LinkTrust::Transitive,
         }
     }
 }
@@ -136,7 +112,7 @@ pub trait DatagramLink: Send + Sync {
     /// Next inbound `(cryptographically-authenticated source node, datagram)`, or
     /// `None` once the link is closed (which ends the [`Hub`] drain task).
     async fn recv(&self) -> Option<([u8; 32], Vec<u8>)>;
-    /// The link facts the composition root derives encoding policy from — see
+    /// The wire-level link facts CoAP framing is derived from — see
     /// [`LinkProfile`]. Defaults to today's assumptions so existing
     /// implementations are unaffected. Decorators MUST delegate to the wrapped
     /// link, or they mask its declared facts.

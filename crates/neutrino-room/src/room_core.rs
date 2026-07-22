@@ -251,6 +251,7 @@ impl RoomCore {
         event_type: String,
         state_key: Option<String>,
         content: Value,
+        signer: Option<std::sync::Arc<neutrino_event::EventSigner>>,
     ) -> Result<Event, FormatError> {
         let prev_events: Vec<OwnedEventId> = self.forward_extremities.iter().cloned().collect();
         let prev_state_events: Vec<OwnedEventId> =
@@ -259,7 +260,8 @@ impl RoomCore {
             .room_id(self.room_id.clone())
             .content(content)
             .prev_events(prev_events)
-            .prev_state_events(prev_state_events);
+            .prev_state_events(prev_state_events)
+            .signer(signer);
         if let Some(sk) = state_key {
             builder = builder.state_key(sk);
         }
@@ -1564,6 +1566,7 @@ mod tests {
             Vec::new(),
         )
         .expect("parseable wire event")
+        .assume_transitive()
         .into_event()
     }
 
@@ -1800,6 +1803,7 @@ mod tests {
                 "m.room.message".to_owned(),
                 None,
                 json!({ "msgtype": "m.text", "body": "hi" }),
+                None,
             )
             .expect("build");
         assert!(

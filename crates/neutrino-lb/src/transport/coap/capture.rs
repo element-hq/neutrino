@@ -262,7 +262,7 @@ impl DatagramLink for PcapCaptureLink {
 
     fn profile(&self) -> LinkProfile {
         // A tap changes no link fact; answering with the trait default here
-        // would mask the wrapped medium's declared MTU/trust on every embedded
+        // would mask the wrapped medium's declared MTU on every embedded
         // build (`start_with` wraps every injected medium in this tap).
         self.inner.profile()
     }
@@ -480,16 +480,13 @@ mod tests {
             None
         }
         fn profile(&self) -> LinkProfile {
-            LinkProfile {
-                max_datagram: 640,
-                trust: crate::LinkTrust::PeerAuthenticated,
-            }
+            LinkProfile { max_datagram: 640 }
         }
     }
 
     // The tap wraps every injected medium (`start_with`), so answering with the
     // trait default instead of delegating would mask the medium's declared
-    // MTU/trust on every embedded build.
+    // MTU on every embedded build.
     #[test]
     fn tap_delegates_link_profile() {
         let wrapped =

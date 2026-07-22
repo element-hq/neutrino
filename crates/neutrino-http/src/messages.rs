@@ -104,6 +104,7 @@ async fn backfill_and_reread(
     store: &neutrino_store_sqlite::SqliteStore,
     own_server: &str,
     client: &FederationClient,
+    provenance: &neutrino_event::Provenance,
     rid: &ruma::RoomId,
     read: (
         Option<PaginationToken>,
@@ -119,6 +120,7 @@ async fn backfill_and_reread(
     let n = crate::federation::backfill_out::backfill_once(
         store,
         client,
+        provenance,
         own_server,
         rid,
         limit as u32,
@@ -192,12 +194,13 @@ pub(crate) async fn get_messages(
     // the shared outbound `FederationClient` that `App` builds once at startup —
     // so a backward-underflow backfill round reuses its connection pool rather
     // than constructing a client per back-page.
-    let (store, own_server, fed_client) = {
+    let (store, own_server, fed_client, provenance) = {
         let app = lock_app(&state.0);
         (
             app.store.clone(),
             app.config.server_name.clone(),
             app.fed_client.clone(),
+            app.provenance.clone(),
         )
     };
 
@@ -253,6 +256,7 @@ pub(crate) async fn get_messages(
                 &store,
                 &own_server,
                 &fed_client,
+                &provenance,
                 &rid,
                 (from_again, to_again, dir, limit),
                 (events, next),
@@ -380,6 +384,7 @@ mod tests {
             &store,
             OWN,
             &client,
+            &neutrino_event::Provenance::Faith,
             &rid,
             (Some(head), None, Direction::Backward, 100),
             (orig_events, orig_next.clone()),

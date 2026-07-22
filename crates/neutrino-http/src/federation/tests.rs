@@ -1888,6 +1888,7 @@ async fn send_semantically_malformed_ancestor_terminates_via_cascade_reject() {
         Vec::new(),
     )
     .expect("parseable PDU")
+    .assume_transitive()
     .into_event();
     let bad_id = bad.event_id.clone();
     let child = message_on(
@@ -2632,6 +2633,7 @@ async fn reconcile_ignores_advertisement_from_non_member_peer() {
     neutrino_engine::reconcile::reconcile_room(
         &*store,
         &*fetcher,
+        &neutrino_event::Provenance::Faith,
         &poke_tx,
         peer,
         &room_id,
