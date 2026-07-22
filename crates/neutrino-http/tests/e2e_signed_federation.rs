@@ -1,6 +1,5 @@
 //! End-to-end: two homeservers federate in **signed mode**
-//! (`Provenance::Signed` + an `EventSigner` per node) — the
-//! `LinkTrust::PeerAuthenticated` configuration. Every locally-authored event
+//! (`EventSecurity::Signed`, i.e. `trusted_network = false`). Every locally-authored event
 //! is signed, every inbound event must carry a valid sender's-server
 //! signature, and the join handshake co-signs through the send_join
 //! round-trip. Convergence IS the assertion: with verification on at every
@@ -22,7 +21,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use neutrino_ctl::{Command, Config, DiscoveryRegistry};
-use neutrino_event::{EventSigner, KeyResolveError, KeyResolver, Provenance};
+use neutrino_event::{EventSecurity, EventSigner, KeyResolveError, KeyResolver};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -95,8 +94,7 @@ async fn start_signed_node(
             cmd_rx,
             std::sync::Arc::new(DiscoveryRegistry::new()),
             None,
-            Provenance::Signed(resolver),
-            Some(signer),
+            EventSecurity::Signed { signer, resolver },
         )
         .await;
     });

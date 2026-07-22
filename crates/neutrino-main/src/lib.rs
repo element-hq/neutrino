@@ -16,47 +16,18 @@ use rand::RngCore;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-/// The trust model a federation medium declares for its link, dictating the
-/// event-provenance policy the whole stack runs under. Declared constructively
-/// — `PeerAuthenticated` *carries* the medium's key resolver, so "peer-auth
-/// with no way to obtain keys" is unrepresentable, and there is no always-fail
-/// level to trip over.
-#[derive(Clone)]
-pub enum LinkTrust {
-    /// Trusted network: admission to the mesh implies honesty about relays,
-    /// so origin claims on relayed events are taken on faith and events carry
-    /// NO signatures. The dev/UDP default.
-    Transitive,
-    /// The link authenticates peers point-to-point only ("node A sent X"),
-    /// which cannot vouch for relayed events ("A delivered events authored by
-    /// B" — the common case when syncing DAGs). Declaring it flips the stack
-    /// into signed mode: every locally-authored event is signed, every
-    /// inbound event must carry a valid sender's-server signature, resolved
-    /// through the medium's nominated resolver (iroh/LAN node-id names decode
-    /// to their own key — [`neutrino_event::NodeIdKeyResolver`]; DNS/notary
-    /// resolvers are future implementations of the same port).
-    PeerAuthenticated(Arc<dyn neutrino_event::KeyResolver>),
-}
-
-// Hand-written: a resolver trait object has nothing useful to print.
-impl std::fmt::Debug for LinkTrust {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LinkTrust::Transitive => write!(f, "LinkTrust::Transitive"),
-            LinkTrust::PeerAuthenticated(_) => {
-                write!(f, "LinkTrust::PeerAuthenticated(<resolver>)")
-            }
-        }
-    }
-}
-
 /// What a federation medium's factory returns: the datagram link plus the
-/// trust level the medium declares for it. Wire-level facts (MTU) ride
-/// [`DatagramLink::profile`] instead — they are consumed by the CoAP framing
-/// layer, whereas `trust` is consumed here and by the event layer.
+/// medium's key-resolution *capability* — how `(server_name, key_id)` maps to
+/// a verify key in the medium's namespace (node-id names decode to their own
+/// key via [`neutrino_event::NodeIdKeyResolver`]; a DNS medium would fetch
+/// `/_matrix/key/v2/server`; `None` = the medium has no key story). Whether
+/// signing actually happens is NOT the medium's call — that is the app's
+/// `trusted_network` config; the capability is only consumed when the app
+/// opts into signed mode. Wire-level facts (MTU, connection authentication)
+/// ride [`DatagramLink::profile`].
 pub struct FederationLink {
     pub link: std::sync::Arc<dyn DatagramLink>,
-    pub trust: LinkTrust,
+    pub key_resolver: Option<Arc<dyn neutrino_event::KeyResolver>>,
 }
 
 /// Result of building the federation datagram link from the node secret.
@@ -77,11 +48,12 @@ pub type DatagramLinkResult = Result<FederationLink, Box<dyn std::error::Error +
 ///   be transport-authenticated. Events carry no signatures, so link-level
 ///   authentication of the sender id is the only authentication in the system
 ///   (the ingress binds a request's claimed `X-Matrix origin` to it).
-/// - The medium's declared facts drive encoding policy: CoAP fragmentation is
-///   sized from [`DatagramLink::profile`]'s `max_datagram`, and the
-///   [`LinkTrust`] returned beside the link selects the event-provenance
-///   policy — `Transitive` runs signature-free, `PeerAuthenticated` flips the
-///   stack into signed mode using the resolver the medium nominates.
+/// - The medium declares facts and capabilities, never policy: CoAP
+///   fragmentation is sized from [`DatagramLink::profile`]'s `max_datagram`,
+///   `authenticates_connections` states whether the hop is trusted, and the
+///   optional [`FederationLink::key_resolver`] says how keys resolve in the
+///   medium's namespace. Whether events are signed/verified is the app's
+///   `trusted_network` config (see `SecurityConfig` in [`entrypoint`]).
 pub struct LinkContext {
     /// The persisted 32-byte node secret the server's identity is derived from.
     pub secret: [u8; 32],
@@ -182,9 +154,9 @@ pub async fn entrypoint(
     // The factory's error is `Send + Sync` (so it can cross the ffi task
     // boundary); widen it to this function's plain `Box<dyn Error>` on the way
     // out, since the two boxed-trait-object types don't auto-convert via `?`.
-    let (link, trust) = match link_factory {
+    let (link, key_resolver) = match link_factory {
         Some(factory) => {
-            let FederationLink { link, trust } = factory(LinkContext {
+            let FederationLink { link, key_resolver } = factory(LinkContext {
                 secret,
                 display_name: display_name_rx,
                 discovery: discovery.clone(),
@@ -192,26 +164,39 @@ pub async fn entrypoint(
             })
             .await
             .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-            (Some(link), trust)
+            (Some(link), key_resolver)
         }
-        // No injected medium (dev/UDP): the trusted-network assumption.
-        None => (None, LinkTrust::Transitive),
+        // No injected medium: plain UDP, which authenticates nothing and has
+        // no key-resolution namespace of its own.
+        None => (None, None),
     };
 
-    // The medium's declared facts drive encoding policy. Wire level: CoAP
-    // fragmentation sized from the link profile in `build_lb_config` below
-    // (defaults on the UDP path). Event level: the declared trust selects the
-    // provenance policy + signer the http/engine stack runs under.
+    // Compose the deployment's security configuration from its two
+    // independently-owned facts: the transport declares whether the hop is
+    // authenticated (its LinkProfile; plain UDP authenticates nothing), the
+    // app declares whether origins are trusted on faith (`trusted_network`).
+    // All four combinations are valid deployments — e.g. sigs=on/auth=off is
+    // a future anonymous store-and-forward relay, sigs=off/auth=on is
+    // today's BLE mesh — so nothing is refused here; the composition is
+    // logged so a deployment's posture is one grep away.
     let link_profile = link.as_ref().map(|l| l.profile()).unwrap_or_default();
-    let (provenance, signer) = trust_policy(&trust, &secret, &config.server_name);
+    let security_config = SecurityConfig {
+        authenticate_connections: link
+            .as_ref()
+            .map(|l| l.profile().authenticates_connections)
+            .unwrap_or(false),
+        sign_messages: !config.trusted_network,
+    };
+    tracing::info!(?security_config, "federation security");
+    let security = event_security(&security_config, key_resolver, &secret, &config.server_name)?;
 
     // A store's events belong to exactly one trust domain: unsigned events
     // can never serve a signed deployment (nothing to verify) and vice versa.
     // First start records the mode; a later start under the other mode is
     // refused — wipe the database to switch.
-    let domain = match signer {
-        Some(_) => "signed",
-        None => "transitive",
+    let domain = match security_config.sign_messages {
+        true => "signed",
+        false => "transitive",
     };
     let recorded = store.get_or_create_trust_domain(domain).await?;
     if recorded != domain {
@@ -283,8 +268,7 @@ pub async fn entrypoint(
                 cmd_rx,
                 discovery,
                 Some(display_name_tx),
-                provenance,
-                signer,
+                security,
             );
             tokio::pin!(lb, hs);
             tokio::select! {
@@ -326,8 +310,7 @@ pub async fn entrypoint(
                 cmd_rx,
                 discovery,
                 Some(display_name_tx),
-                provenance,
-                signer,
+                security,
             )
             .await?
         }
@@ -370,30 +353,44 @@ fn server_identity_from_secret(secret: &[u8; 32]) -> String {
     hex::encode(signing.verifying_key().to_bytes())
 }
 
-/// Map the medium's declared [`LinkTrust`] onto the event-layer policy pair:
-/// the inbound provenance mode and the outbound signer. `Transitive` runs
-/// signature-free (events MUST NOT carry signatures on a trusted network);
-/// `PeerAuthenticated` signs every locally-authored event with the node
-/// identity secret and verifies every inbound event through the medium's
-/// nominated resolver.
-fn trust_policy(
-    trust: &LinkTrust,
+/// The deployment's security configuration — Kegan's two fundamental bools,
+/// each set by its own authority and composed only here:
+///
+/// - `authenticate_connections` ("trust the hop") comes from the pluggable
+///   transport: only it knows whether it authenticates who each datagram
+///   came from.
+/// - `sign_messages` ("trust the origin", inverted) comes from the app
+///   configuration: only the operator knows whether the network is trusted.
+///
+/// All four combinations are valid; this struct exists to make the composed
+/// posture explicit (and greppable in the startup log) rather than to gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SecurityConfig {
+    authenticate_connections: bool,
+    sign_messages: bool,
+}
+
+/// Realise a [`SecurityConfig`] as the [`neutrino_event::EventSecurity`]
+/// value the http/engine stack runs under. Signed mode needs the medium's
+/// key-resolution capability — the one composition that can fail: signing
+/// without any way to resolve peers' keys is a configuration error, not a
+/// policy choice.
+fn event_security(
+    config: &SecurityConfig,
+    key_resolver: Option<Arc<dyn neutrino_event::KeyResolver>>,
     secret: &[u8; 32],
     server_name: &str,
-) -> (
-    neutrino_event::Provenance,
-    Option<Arc<neutrino_event::EventSigner>>,
-) {
-    match trust {
-        LinkTrust::Transitive => (neutrino_event::Provenance::Faith, None),
-        LinkTrust::PeerAuthenticated(resolver) => (
-            neutrino_event::Provenance::Signed(resolver.clone()),
-            Some(Arc::new(neutrino_event::EventSigner::new(
-                secret,
-                server_name,
-            ))),
-        ),
+) -> Result<neutrino_event::EventSecurity, String> {
+    if !config.sign_messages {
+        return Ok(neutrino_event::EventSecurity::TrustedNetwork);
     }
+    let resolver = key_resolver.ok_or(
+        "trusted_network = false requires a key resolver, but the federation          medium provides none (FederationLink.key_resolver) — inbound events          could never be verified",
+    )?;
+    Ok(neutrino_event::EventSecurity::Signed {
+        signer: Arc::new(neutrino_event::EventSigner::new(secret, server_name)),
+        resolver,
+    })
 }
 
 /// Derive the in-process sidecar's [`neutrino_lb::LbConfig`] from the homeserver
@@ -563,7 +560,10 @@ mod tests {
     #[test]
     fn build_lb_config_sizes_blocks_from_link_profile() {
         let c = cfg("0.0.0.0:8008");
-        let small = LinkProfile { max_datagram: 700 };
+        let small = LinkProfile {
+            max_datagram: 700,
+            ..LinkProfile::default()
+        };
         let lb = build_lb_config(&c, 8448, egress(), None, small).expect("valid lb config");
         assert!(matches!(
             lb.wire,
@@ -572,30 +572,49 @@ mod tests {
                 ..
             }
         ));
-        let tiny = LinkProfile { max_datagram: 64 };
+        let tiny = LinkProfile {
+            max_datagram: 64,
+            ..LinkProfile::default()
+        };
         assert!(build_lb_config(&c, 8448, egress(), None, tiny).is_err());
     }
 
-    // The trust→policy mapping: Transitive = signature-free (Faith, no
-    // signer); PeerAuthenticated = signed mode, with the signer derived from
-    // the node secret so its name/key match the server identity.
+    // SecurityConfig → EventSecurity realisation: trusted network is
+    // signature-free regardless of resolver availability; signed mode needs
+    // the medium's resolver capability and derives the signer from the node
+    // secret so its name/key match the server identity.
     #[test]
-    fn trust_policy_maps_modes() {
+    fn event_security_composes_from_security_config() {
         let secret = [7u8; 32];
         let name = server_identity_from_secret(&secret);
+        let resolver: Arc<dyn neutrino_event::KeyResolver> =
+            Arc::new(neutrino_event::NodeIdKeyResolver);
 
-        let (prov, signer) = trust_policy(&LinkTrust::Transitive, &secret, &name);
-        assert!(matches!(prov, neutrino_event::Provenance::Faith));
-        assert!(signer.is_none(), "trusted network must not sign events");
+        // trusted_network = true → TrustedNetwork, resolver irrelevant.
+        let cfg = SecurityConfig {
+            authenticate_connections: true,
+            sign_messages: false,
+        };
+        let sec = event_security(&cfg, None, &secret, &name).expect("composes");
+        assert!(matches!(sec, neutrino_event::EventSecurity::TrustedNetwork));
+        assert!(sec.signer().is_none(), "trusted network must not sign");
 
-        let resolver = std::sync::Arc::new(neutrino_event::NodeIdKeyResolver);
-        let (prov, signer) = trust_policy(&LinkTrust::PeerAuthenticated(resolver), &secret, &name);
-        assert!(matches!(prov, neutrino_event::Provenance::Signed(_)));
-        let signer = signer.expect("signed mode must sign events");
-        // Identity symmetry: the signer's key IS the node identity, so a
-        // node-named server's name verifies its own signatures.
+        // trusted_network = false → Signed, with identity symmetry: the
+        // signer's key IS the node identity.
+        let cfg = SecurityConfig {
+            // sigs=on / connection-auth=off is legal (anonymous
+            // store-and-forward relays) — must compose, not refuse.
+            authenticate_connections: false,
+            sign_messages: true,
+        };
+        let sec = event_security(&cfg, Some(resolver), &secret, &name).expect("composes");
+        let signer = sec.signer().expect("signed mode must sign");
         assert_eq!(signer.server_name(), name);
         assert_eq!(hex::encode(signer.public_key()), name);
+
+        // Signed mode without any key-resolution capability is the one
+        // configuration error: inbound events could never be verified.
+        assert!(event_security(&cfg, None, &secret, &name).is_err());
     }
 
     // A concrete loopback `bind_addr` keeps its host; only the port becomes the

@@ -14,7 +14,7 @@ use axum::{
 };
 use neutrino_ctl::{Command, Config, DEFAULT_DISPLAY_NAME, DiscoveryRegistry};
 use neutrino_event::event_builder::EventBuilder;
-use neutrino_event::{Event, FormatError, Provenance, ROOM_VERSION_ID};
+use neutrino_event::{Event, EventSecurity, FormatError, ROOM_VERSION_ID};
 use neutrino_room::CoreError;
 use neutrino_room::provider::InMemoryStateProvider;
 use neutrino_room::room_core::{Effect, RoomCore};
@@ -84,15 +84,10 @@ struct App {
     /// /profile/.../displayname`), so the BLE transport can re-advertise it.
     /// `None` off the embedded path (dev binary / tests): nothing re-advertises.
     display_name_tx: Option<watch::Sender<String>>,
-    /// Deployment-wide provenance policy from the medium's declared link trust.
-    /// Every federation-ingress `from_wire` is admitted through this (shared
-    /// with the engine's worker/gap-fill/reconcile and sender pool).
-    provenance: Provenance,
-    /// Signs locally-authored events on a `PeerAuthenticated` deployment;
-    /// `None` on a trusted network (events then MUST NOT carry signatures).
-    /// The outbound half of the trust policy `provenance` is the inbound
-    /// half of.
-    signer: Option<Arc<neutrino_event::EventSigner>>,
+    /// The deployment's event-security policy (`sign_messages` composed at
+    /// the composition root): one value carrying both the ingress admission
+    /// mode and the signer for locally-authored events.
+    security: EventSecurity,
     config: Config,
     /// Latching cancellation signal shared with long-polls and the outbound
     /// federation sender. Fired once by [`AppState::begin_shutdown`]; after
@@ -231,29 +226,27 @@ impl AppState {
             config,
             store,
             Arc::new(DiscoveryRegistry::new()),
-            Provenance::Faith,
-            None,
+            EventSecurity::TrustedNetwork,
         )
     }
 
     /// Like [`AppState::from_store`] but with a caller-owned discovery registry
-    /// and provenance policy. The production path ([`serve`]) injects the
+    /// and security policy. The production path ([`serve`]) injects the
     /// registry the host holds a write handle to (so its BLE-discovery callback
     /// and the router read the same set); [`from_store`] passes a fresh empty
-    /// one (and [`Provenance::Faith`]) for tests/the dev binary.
+    /// one (and [`EventSecurity::TrustedNetwork`]) for tests/the dev binary.
     pub(crate) fn from_store_with_discovery(
         config: Config,
         store: Arc<SqliteStore>,
         discovery: Arc<DiscoveryRegistry>,
-        provenance: Provenance,
-        signer: Option<Arc<neutrino_event::EventSigner>>,
+        security: EventSecurity,
     ) -> Self {
         let client = Arc::new(FederationClient::new(
             config.server_name.clone(),
             config.federation_proxy.as_deref(),
         ));
         let fetcher: Arc<dyn MissingEventsFetcher> = Arc::new(ReqwestFetcher::new(client));
-        Self::from_store_with_fetcher(config, store, fetcher, discovery, provenance, signer)
+        Self::from_store_with_fetcher(config, store, fetcher, discovery, security)
     }
 
     /// Like [`AppState::from_store`] but with an explicit gap-fill `fetcher`
@@ -265,15 +258,14 @@ impl AppState {
         store: Arc<SqliteStore>,
         fetcher: Arc<dyn MissingEventsFetcher>,
         discovery: Arc<DiscoveryRegistry>,
-        provenance: Provenance,
-        signer: Option<Arc<neutrino_event::EventSigner>>,
+        security: EventSecurity,
     ) -> Self {
         let shutdown = CancellationToken::new();
         let sync_state = Arc::new(SyncState::new(store.clone(), shutdown.clone()));
         let room_registry = Arc::new(RoomRegistry::new(
             store.clone(),
             config.server_name.clone(),
-            signer.clone(),
+            security.signer().cloned(),
         ));
         // Spawn the inbound staging worker bound to this store/registry/fetcher.
         // It runs wherever the router does (production `serve` and the e2e
@@ -283,7 +275,7 @@ impl AppState {
             store.clone(),
             room_registry.clone(),
             fetcher.clone(),
-            provenance.clone(),
+            security.clone(),
         );
         // Receivers are taken later via `subscribe_kick` (one per destination
         // task); the initial receiver is dropped — `send_modify` notifies any
@@ -305,8 +297,7 @@ impl AppState {
             keys: None,
             discovery,
             display_name_tx: None,
-            provenance,
-            signer,
+            security,
             config,
             shutdown,
             kick_backoff,
@@ -334,17 +325,16 @@ impl AppState {
         lock_app(self).discovery.clone()
     }
 
-    /// The deployment-wide provenance policy, shared by every federation-ingress
-    /// admission (handlers, the inbound worker, and the sender pool's
-    /// reconciliation).
-    fn provenance(&self) -> Provenance {
-        lock_app(self).provenance.clone()
+    /// The deployment-wide event-security policy, shared by every
+    /// federation-ingress path and every event-authoring site.
+    fn security(&self) -> EventSecurity {
+        lock_app(self).security.clone()
     }
 
-    /// The local event signer (`None` on a trusted network) — the outbound
-    /// half of the same policy.
+    /// The local event signer (`None` on a trusted network) — derived from
+    /// the same policy value the ingress admission uses.
     fn signer(&self) -> Option<Arc<neutrino_event::EventSigner>> {
-        lock_app(self).signer.clone()
+        lock_app(self).security.signer().cloned()
     }
 
     /// The shared `get_missing_events` fetcher, for the outbound sender pool's
@@ -427,17 +417,16 @@ pub async fn serve(
     // Publishes the local display name on change so the BLE transport can
     // re-advertise. `None` off the embedded path (no BLE advert to update).
     display_name_tx: Option<watch::Sender<String>>,
-    // The event-trust policy pair, mapped by the composition root from the
-    // medium's declared LinkTrust: how inbound events are admitted, and the
-    // signer for locally-authored ones (`Faith`/`None` = trusted network).
-    provenance: Provenance,
-    signer: Option<Arc<neutrino_event::EventSigner>>,
+    // The event-security policy, composed by the composition root from the
+    // app's `trusted_network` config: one value carrying both the ingress
+    // admission mode and the signer for locally-authored events.
+    security: EventSecurity,
 ) -> Result<(), StartupError> {
     // The caller (the entrypoint) opens the store, resolves the server identity
     // from it, and hands the live handle in — so we build state around it rather
     // than re-opening the same DB.
     AppState::validate_config(&config)?;
-    let state = AppState::from_store_with_discovery(config, store, discovery, provenance, signer);
+    let state = AppState::from_store_with_discovery(config, store, discovery, security);
     lock_app(&state).display_name_tx = display_name_tx;
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
@@ -454,7 +443,7 @@ pub async fn serve(
         state.subscribe_shutdown(),
         state.subscribe_kick(),
         state.fetcher(),
-        state.provenance(),
+        state.security(),
         state.worker_poke(),
     );
     let router = build_router(&state);
@@ -543,8 +532,7 @@ pub(crate) fn router_with_store_and_fetcher(
         store,
         fetcher,
         Arc::new(DiscoveryRegistry::new()),
-        Provenance::Faith,
-        None,
+        EventSecurity::TrustedNetwork,
     );
     build_router(&state)
 }
@@ -789,14 +777,17 @@ async fn versions() -> Json<Value> {
 
 /// `GET /_matrix/key/v2/server` — this server's signing key, as signed JSON
 /// (spec §"Retrieving server keys"). Only meaningful on a signed
-/// (`PeerAuthenticated`) deployment: a trusted network has no signing keys at
+/// deployment (`trusted_network = false`): a trusted network has no signing keys at
 /// all, so the endpoint answers 404 there. No rotation mechanics — the key IS
 /// the node identity, `old_verify_keys` is permanently empty, and
 /// `valid_until_ts` is a rolling window that only paces peer re-fetches.
 async fn server_keys(state: State<AppState>) -> axum::response::Response {
     let (signer, server_name) = {
         let app = lock_app(&state.0);
-        (app.signer.clone(), app.config.server_name.clone())
+        (
+            app.security.signer().cloned(),
+            app.config.server_name.clone(),
+        )
     };
     let Some(signer) = signer else {
         return error_response(
@@ -1492,7 +1483,7 @@ async fn create_room(
         (
             app.store.clone(),
             app.config.server_name.clone(),
-            app.signer.clone(),
+            app.security.signer().cloned(),
         )
     };
 
@@ -2006,9 +1997,9 @@ async fn default_fallback() -> (StatusCode, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Command, Config, ControlFlow, DiscoveryRegistry, Event, OwnedUserId, Provenance,
-        SqliteStore, StatusCode, TcpListener, Value, build_initial_events, build_router, dispatch,
-        handle, invite_targets, join_rule_for, mpsc,
+        AppState, Command, Config, ControlFlow, DiscoveryRegistry, Event, EventSecurity,
+        OwnedUserId, SqliteStore, StatusCode, TcpListener, Value, build_initial_events,
+        build_router, dispatch, handle, invite_targets, join_rule_for, mpsc,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -2063,8 +2054,10 @@ mod tests {
             test_config(&tmp),
             store,
             Arc::new(DiscoveryRegistry::new()),
-            Provenance::Faith,
-            Some(Arc::new(signer)),
+            EventSecurity::Signed {
+                signer: Arc::new(signer),
+                resolver: Arc::new(neutrino_event::NodeIdKeyResolver),
+            },
         );
         let response = build_router(&state)
             .oneshot(request())
@@ -2456,8 +2449,7 @@ mod tests {
             rx,
             Arc::new(super::DiscoveryRegistry::new()),
             None,
-            Provenance::Faith,
-            None,
+            EventSecurity::TrustedNetwork,
         ));
 
         // Give the sender supervisor a moment to discover the dead peer and

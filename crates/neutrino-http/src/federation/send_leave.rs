@@ -44,7 +44,7 @@ pub(crate) async fn handle(
     // start empty — apply_pdu is their sole authority. Resident membership
     // follows the *local* reject policy (refused, never persisted), so a
     // `Wire::Rejected` leave is a 400 like any other malformed event.
-    let event = match admit_wire(&state.provenance(), raw).await {
+    let event = match admit_wire(&state.security(), raw).await {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
         Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
             tracing::warn!(event_id = %ev.event_id, %defect, "send_leave: refusing Wire::Rejected leave");
@@ -94,7 +94,7 @@ pub(crate) async fn handle(
         ));
     }
 
-    // Co-sign (PeerAuthenticated deployments): the resident signature rides
+    // Co-sign (signed deployments): the resident signature rides
     // the copy we persist + fan out. The v2 response is an empty object, so
     // the leaver keeps its singly-signed copy — fine, both verify by their
     // sender's-server signature. Event id unchanged.

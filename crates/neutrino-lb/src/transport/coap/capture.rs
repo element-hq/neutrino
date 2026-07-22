@@ -480,7 +480,10 @@ mod tests {
             None
         }
         fn profile(&self) -> LinkProfile {
-            LinkProfile { max_datagram: 640 }
+            LinkProfile {
+                max_datagram: 640,
+                authenticates_connections: false,
+            }
         }
     }
 

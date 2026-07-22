@@ -136,7 +136,7 @@ struct RoomActor<S> {
     /// (the config form) since it's only ever compared by value.
     own_server: String,
     /// Signs every locally-built event when the deployment is
-    /// `PeerAuthenticated`; `None` on a trusted network (events then MUST NOT
+    /// signed deployments; `None` on a trusted network (events then MUST NOT
     /// carry signatures). Handed to `RoomCore::build_local_event`.
     signer: Option<Arc<neutrino_event::EventSigner>>,
 }

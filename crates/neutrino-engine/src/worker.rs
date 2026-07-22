@@ -55,7 +55,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use neutrino_event::{Event, Provenance};
+use neutrino_event::{Event, EventSecurity};
 use neutrino_store::{StagedPdu, StorageBackend, WithStateProvider};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, RoomId};
 use tokio::sync::{Notify, mpsc};
@@ -80,8 +80,8 @@ struct WorkerCtx<S> {
     store: Arc<S>,
     registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
-    /// Deployment-wide provenance policy from the medium's declared link trust.
-    provenance: Provenance,
+    /// Deployment-wide security policy from the medium's declared link trust.
+    security: EventSecurity,
     /// Backoff floor; [`BACKOFF_BASE`] in production, near-zero in tests so the
     /// retry path runs without real delays.
     backoff_base: Duration,
@@ -95,7 +95,7 @@ impl<S> Clone for WorkerCtx<S> {
             store: self.store.clone(),
             registry: self.registry.clone(),
             fetcher: self.fetcher.clone(),
-            provenance: self.provenance.clone(),
+            security: self.security.clone(),
             backoff_base: self.backoff_base,
         }
     }
@@ -118,9 +118,9 @@ pub fn spawn<S: StorageBackend + WithStateProvider + 'static>(
     store: Arc<S>,
     registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
-    provenance: Provenance,
+    security: EventSecurity,
 ) -> mpsc::Sender<OwnedRoomId> {
-    spawn_with(store, registry, fetcher, provenance, BACKOFF_BASE)
+    spawn_with(store, registry, fetcher, security, BACKOFF_BASE)
 }
 
 /// Inner spawn with the backoff floor made explicit, so tests can drive the
@@ -129,7 +129,7 @@ fn spawn_with<S: StorageBackend + WithStateProvider + 'static>(
     store: Arc<S>,
     registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
-    provenance: Provenance,
+    security: EventSecurity,
     backoff_base: Duration,
 ) -> mpsc::Sender<OwnedRoomId> {
     let (tx, rx) = mpsc::channel(POKE_BUFFER);
@@ -137,7 +137,7 @@ fn spawn_with<S: StorageBackend + WithStateProvider + 'static>(
         store,
         registry,
         fetcher,
-        provenance,
+        security,
         backoff_base,
     };
     tokio::spawn(supervise(ctx, rx));
@@ -268,7 +268,7 @@ async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
 ) -> Vec<Staged> {
     let mut out = Vec::with_capacity(eligible.len());
     for p in eligible {
-        match admit_wire(&ctx.provenance, p.raw.clone()).await {
+        match admit_wire(&ctx.security, p.raw.clone()).await {
             // Both variants proceed: a `Wire::Rejected` event carries
             // `rejected = true` and `apply_pdu` short-circuits it to a
             // rejected persist (the cascade terminator).
@@ -326,7 +326,7 @@ async fn process_one<S: StorageBackend + WithStateProvider + 'static>(
                 &staged.origin,
                 &staged.event,
                 &*ctx.fetcher,
-                &ctx.provenance,
+                &ctx.security,
             )
             .await
             {

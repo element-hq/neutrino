@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use neutrino_event::event_builder::from_wire;
-use neutrino_event::{Event, FormatError, Provenance, Wire};
+use neutrino_event::{Event, EventSecurity, FormatError, Wire};
 use neutrino_store::{StagingStore, StorageError};
 use rand::Rng;
 use ruma::{OwnedRoomId, RoomId, ServerName};
@@ -61,15 +61,15 @@ impl TxnIdGen {
     }
 }
 
-/// Parse a wire PDU and admit it through the deployment-wide provenance
-/// policy ([`Provenance::admit`]). Under [`Provenance::Faith`] this is
+/// Parse a wire PDU and admit it through the deployment-wide security
+/// policy ([`EventSecurity::admit`]). Under [`EventSecurity::TrustedNetwork`] this is
 /// exactly the bare parse; under `Signed` a signature failure is skipped
 /// identically to a parse failure.
 pub(crate) async fn admit_wire(
-    provenance: &Provenance,
+    security: &EventSecurity,
     raw: Box<serde_json::value::RawValue>,
 ) -> Result<Wire, FormatError> {
-    provenance.admit(from_wire(raw, Vec::new())?).await
+    security.admit(from_wire(raw, Vec::new())?).await
 }
 
 /// Durably stage `events` for `room_id` (skipping any cross-room event a peer

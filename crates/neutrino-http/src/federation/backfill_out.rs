@@ -9,7 +9,7 @@
 //! [`persist_historical_event`](neutrino_store::EventStore::persist_historical_event))
 //! with the outbound [`FederationClient::backfill`] client call.
 
-use neutrino_event::Provenance;
+use neutrino_event::EventSecurity;
 use neutrino_store::{DagStore, EventStore, StateStore};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::RoomId;
@@ -31,7 +31,7 @@ const MAX_SEEDS: usize = 5;
 pub(crate) async fn backfill_once(
     store: &SqliteStore,
     client: &FederationClient,
-    provenance: &Provenance,
+    security: &EventSecurity,
     own_server: &str,
     room_id: &RoomId,
     limit: u32,
@@ -59,7 +59,7 @@ pub(crate) async fn backfill_once(
     // move on to the next.
     for dest in dests {
         match client.backfill(&dest, room_id, &seeds, limit).await {
-            Ok(pdus) => return persist_pdus(store, provenance, room_id, pdus, limit).await,
+            Ok(pdus) => return persist_pdus(store, security, room_id, pdus, limit).await,
             Err(e) => {
                 info!(target: "neutrino_http", %dest, %room_id, error = %e, "backfill: peer failed, trying next");
             }
@@ -79,7 +79,7 @@ pub(crate) async fn backfill_once(
 /// return more — `.take(limit)` bounds how many we persist regardless.
 async fn persist_pdus(
     store: &SqliteStore,
-    provenance: &Provenance,
+    security: &EventSecurity,
     room_id: &RoomId,
     pdus: Vec<Box<serde_json::value::RawValue>>,
     limit: u32,
@@ -92,7 +92,7 @@ async fn persist_pdus(
         // must carry the verdict so a descendant's reference check
         // cascade-rejects, and so the malformed content can never surface as
         // an accepted row (clients filter rejected; state-res excludes it).
-        let event = match admit_wire(provenance, raw).await {
+        let event = match admit_wire(security, raw).await {
             Ok(neutrino_event::Wire::Valid(ev)) => ev,
             Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
                 warn!(target: "neutrino_http", %room_id, event_id = %ev.event_id, %defect, "backfill: serving malformed PDU as rejected");
@@ -296,7 +296,15 @@ mod tests {
         let (room_id, _create) = seed_room_with_extremity(&store, &[alice()]).await;
         let client = FederationClient::new(OWN.to_owned(), None);
 
-        let n = backfill_once(&store, &client, &Provenance::Faith, OWN, &room_id, 10).await;
+        let n = backfill_once(
+            &store,
+            &client,
+            &EventSecurity::TrustedNetwork,
+            OWN,
+            &room_id,
+            10,
+        )
+        .await;
         assert_eq!(n, 0, "no other joined server -> nothing to backfill");
     }
 
@@ -313,7 +321,15 @@ mod tests {
         store.create_room(&create, &[join]).await.expect("create");
         let client = FederationClient::new(OWN.to_owned(), None);
 
-        let n = backfill_once(&store, &client, &Provenance::Faith, OWN, &room_id, 10).await;
+        let n = backfill_once(
+            &store,
+            &client,
+            &EventSecurity::TrustedNetwork,
+            OWN,
+            &room_id,
+            10,
+        )
+        .await;
         assert_eq!(n, 0, "grounded room -> no seeds -> nothing to backfill");
         assert_eq!(stub.hits(), 0, "no seeds -> peer never queried");
     }
@@ -328,7 +344,15 @@ mod tests {
         stub.set_pdus(vec![pdu_in(&room_id, "history")]);
 
         let client = FederationClient::new(OWN.to_owned(), None);
-        let n = backfill_once(&store, &client, &Provenance::Faith, OWN, &room_id, 10).await;
+        let n = backfill_once(
+            &store,
+            &client,
+            &EventSecurity::TrustedNetwork,
+            OWN,
+            &room_id,
+            10,
+        )
+        .await;
         assert_eq!(n, 1, "one fresh, correct-room PDU is persisted");
         assert_eq!(stub.hits(), 1, "the peer was queried once");
     }
@@ -364,13 +388,21 @@ mod tests {
             Vec::new(),
         )
         .expect("parseable")
-        .assume_transitive()
+        .admit_on_faith()
         .into_event()
         .event_id;
         stub.set_pdus(vec![bad_raw]);
 
         let client = FederationClient::new(OWN.to_owned(), None);
-        let n = backfill_once(&store, &client, &Provenance::Faith, OWN, &room_id, 10).await;
+        let n = backfill_once(
+            &store,
+            &client,
+            &EventSecurity::TrustedNetwork,
+            OWN,
+            &room_id,
+            10,
+        )
+        .await;
         assert_eq!(n, 1, "the rejected row still counts as persisted");
         let got = store.get_events(&[bad_id.as_ref()]).await.expect("read");
         assert_eq!(got.len(), 1, "the malformed PDU must be persisted");
@@ -393,7 +425,15 @@ mod tests {
         );
 
         let client = FederationClient::new(OWN.to_owned(), None);
-        let n = backfill_once(&store, &client, &Provenance::Faith, OWN, &room_id, 3).await;
+        let n = backfill_once(
+            &store,
+            &client,
+            &EventSecurity::TrustedNetwork,
+            OWN,
+            &room_id,
+            3,
+        )
+        .await;
         assert_eq!(n, 3, "persisted count is capped at the requested limit");
     }
 
@@ -417,7 +457,15 @@ mod tests {
         stub.set_pdus(vec![pdu_in(&other_room, "intruder")]);
 
         let client = FederationClient::new(OWN.to_owned(), None);
-        let n = backfill_once(&store, &client, &Provenance::Faith, OWN, &room_id, 10).await;
+        let n = backfill_once(
+            &store,
+            &client,
+            &EventSecurity::TrustedNetwork,
+            OWN,
+            &room_id,
+            10,
+        )
+        .await;
         assert_eq!(n, 0, "a wrong-room PDU must be rejected, not persisted");
     }
 
@@ -437,7 +485,7 @@ mod tests {
             Vec::new(),
         )
         .expect("parse held")
-        .assume_transitive()
+        .admit_on_faith()
         .into_event();
         store
             .persist_historical_event(&held)
@@ -447,7 +495,15 @@ mod tests {
         stub.set_pdus(vec![held_raw, fresh_raw]);
 
         let client = FederationClient::new(OWN.to_owned(), None);
-        let n = backfill_once(&store, &client, &Provenance::Faith, OWN, &room_id, 10).await;
+        let n = backfill_once(
+            &store,
+            &client,
+            &EventSecurity::TrustedNetwork,
+            OWN,
+            &room_id,
+            10,
+        )
+        .await;
         assert_eq!(
             n, 1,
             "the held PDU is deduped (not counted); the fresh sibling is still persisted"
@@ -478,7 +534,7 @@ mod tests {
             Vec::new(),
         )
         .expect("parse held")
-        .assume_transitive()
+        .admit_on_faith()
         .into_event();
         store
             .persist_historical_event(&held)
@@ -498,7 +554,15 @@ mod tests {
 
         stub.set_pdus(vec![held_raw]);
         let client = FederationClient::new(OWN.to_owned(), None);
-        let n = backfill_once(&store, &client, &Provenance::Faith, OWN, &room_id, 10).await;
+        let n = backfill_once(
+            &store,
+            &client,
+            &EventSecurity::TrustedNetwork,
+            OWN,
+            &room_id,
+            10,
+        )
+        .await;
         assert_eq!(n, 0, "the sole, already-held PDU is deduped → nothing new");
 
         let after = backward_ids(store.clone(), room_id.clone()).await;
@@ -536,7 +600,15 @@ mod tests {
         stub.set_pdus(vec![pdu_in(&room_id, "from second peer")]);
 
         let client = FederationClient::new(OWN.to_owned(), None);
-        let n = backfill_once(&store, &client, &Provenance::Faith, OWN, &room_id, 10).await;
+        let n = backfill_once(
+            &store,
+            &client,
+            &EventSecurity::TrustedNetwork,
+            OWN,
+            &room_id,
+            10,
+        )
+        .await;
         assert_eq!(n, 1, "failover reaches the live peer and persists its PDU");
         assert_eq!(stub.hits(), 1, "the live peer was queried once");
     }

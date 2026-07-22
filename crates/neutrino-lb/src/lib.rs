@@ -395,12 +395,13 @@ async fn run_pair<S: WireServer>(
 mod profile_tests {
     use super::*;
 
-    // The default profile states today's operating assumption — the value
+    // The default profile states today's operating assumptions — the values
     // every existing medium implicitly ran under before profiles existed.
     #[test]
     fn default_profile_is_todays_assumptions() {
         let p = LinkProfile::default();
         assert_eq!(p.max_datagram, coap_lite::Packet::MAX_SIZE);
+        assert!(p.authenticates_connections);
     }
 
     // MTU → block derivation: the full 1280 B datagram budget yields the

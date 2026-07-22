@@ -160,7 +160,7 @@ pub enum FormatError {
     PowerLevelsBadUsers,
 
     /// S-S receipt-check "Passes signature checks": no valid signature by the
-    /// event's sender's server (`PeerAuthenticated` links only; never raised
+    /// event's sender's server (signed deployments only; never raised
     /// on a trusted network). The string is the accumulated per-key failure
     /// detail from `verify_event_signature`.
     #[error("signature check failed: {0}")]

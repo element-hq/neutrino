@@ -135,11 +135,13 @@ Deferred follow-ups (write-ups, not done):
 - Q-Block2 (response) per-fragment size knob (no `max_message_size` equivalent
   on the Q-Block path yet; Block2 follows coap-rs's szx default).
 - iroh_repo medium migration: `FederationLinkFactory` now resolves to
-  `FederationLink { link, trust: LinkTrust }` — the out-of-tree medium must
-  wrap its link (`trust: LinkTrust::Transitive` preserves today's behaviour;
-  declaring `PeerAuthenticated(Arc::new(NodeIdKeyResolver))` flips the stack
-  into signed mode with zero key infrastructure, since node-id server names
-  ARE the verify keys).
+  `FederationLink { link, key_resolver: Option<Arc<dyn KeyResolver>> }` — the
+  out-of-tree medium must wrap its link (`key_resolver: None` compiles and
+  preserves today's behaviour; nominating `Some(Arc::new(NodeIdKeyResolver))`
+  costs nothing and lets the app opt into signed mode with zero key
+  infrastructure, since node-id server names ARE the verify keys — whether
+  signing happens is the app's `trusted_network` config, not the medium's
+  call).
 - Per-peer / mid-session MTU: `LinkProfile.max_datagram` is read once at
   startup, but BLE MTU is per-peer and changes mid-session (L2CAP upgrade).
   The end state is a per-peer profile query or watch — needs lb-side
@@ -220,6 +222,37 @@ never use .unwrap() in handler code.
 - Restricted rooms (`join_authorised_via_users_server`) — documented, not implemented
 
 ## decisions log
+
+### Security model rework: two owner-set bools, one threaded type (2026-07-22)
+- Kegan's critique of the 2026-07-21 enums (LinkTrust / Provenance /
+  assume_transitive): the fundamental config is two independent booleans with
+  two different owners — `authenticate_connections` ("trust the hop", only
+  the pluggable transport knows) and `sign_messages` ("trust the origin",
+  only the app config knows) — and ALL FOUR combinations are valid
+  deployments (sigs=on/auth=off: future anonymous store-and-forward relays;
+  sigs=off/auth=on: today's BLE mesh; sigs=off/auth=off: dev UDP rig on a
+  trusted network). My earlier LinkTrust welded the two axes into one
+  medium-declared enum — an authority confusion; deleted.
+- New shape: `Config.trusted_network: bool` (neutrino-ctl, default true, env
+  `NEUTRINO_TRUSTED_NETWORK`) + `LinkProfile.authenticates_connections: bool`
+  (neutrino-lb, default true; the no-link/UDP path composes as false) →
+  composed once in `entrypoint` into `SecurityConfig { authenticate_connections,
+  sign_messages }` (main-private, logged at startup, gates NOTHING) →
+  realised as `neutrino_event::EventSecurity { TrustedNetwork,
+  Signed { signer, resolver } }`, the ONE value threaded everywhere (replaces
+  the parallel Provenance + Option<EventSigner> params through
+  serve/AppState/worker/sender/registry; Faith-with-a-signer now
+  unrepresentable). The single composition failure: sign_messages with no
+  key-resolution capability (inbound events could never verify).
+- The medium now declares facts and capabilities, never policy:
+  `FederationLink { link, key_resolver: Option<Arc<dyn KeyResolver>> }` — the
+  resolver is a namespace capability consumed only if the app opts into
+  signing. `UnverifiedWire::assume_transitive` → `admit_on_faith`; the store
+  trust-domain strings ("signed"/"transitive") kept for value stability.
+- Verified: full workspace clippy -D warnings + 957 lib tests +
+  e2e_signed_federation/backfill + main lb_inprocess green. iroh_repo
+  migration note updated implicitly (factory now returns key_resolver, not
+  trust).
 
 ### Event signatures land: LinkTrust::PeerAuthenticated(resolver) flips the stack into signed mode (2026-07-21)
 - Supersedes the same-day LinkProfile entry's trust half: `LinkTrust` left

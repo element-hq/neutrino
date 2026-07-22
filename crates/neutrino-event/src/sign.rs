@@ -2,9 +2,9 @@
 //!
 //! Implements the S-S API "Signing Events" algorithm and the appendices'
 //! "Signing JSON" (needed for the `/_matrix/key/v2/server` response, which is
-//! signed JSON, not an event). Only used when the federation medium declares
-//! `LinkTrust::PeerAuthenticated` — on a `Transitive` (trusted-network) link
-//! events carry no signatures at all.
+//! signed JSON, not an event). Only used when the deployment runs signed
+//! (`EventSecurity::Signed`, i.e. `trusted_network = false`) — on a trusted
+//! network events carry no signatures at all.
 //!
 //! ## What a signature does and does not cover
 //!
@@ -265,7 +265,7 @@ pub struct KeyResolveError {
 
 /// The key-resolution port: `(server_name, key_id)` → 32-byte ed25519 verify
 /// key. The federation medium nominates an implementation when it declares
-/// `LinkTrust::PeerAuthenticated` — where the keys come from is the medium's
+/// signed deployments — where the keys come from is the medium's
 /// business (the node-id namespace, DNS `/_matrix/key/v2/server` lookups, a
 /// notary), not this crate's.
 ///
@@ -279,26 +279,29 @@ pub trait KeyResolver: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<[u8; 32], KeyResolveError>> + Send + 'a>>;
 }
 
-/// How inbound federation events are admitted past parse/classification —
-/// the deployment-wide provenance policy, built once at the composition root
-/// from the medium's declared `LinkTrust` and threaded to every ingress.
-///
-/// Dispatches [`UnverifiedWire`](crate::event_builder::UnverifiedWire) →
-/// [`Wire`](crate::Wire): `Faith` admits as-is (trusted network), `Signed`
-/// requires a valid sender's-server signature resolved through the medium's
-/// nominated [`KeyResolver`].
+/// Whether event provenance is cryptographic — the "trust the origin" half
+/// of the deployment's security configuration (`sign_messages` in
+/// neutrino-main's `SecurityConfig`), composed once at the composition root
+/// from the app's `trusted_network` config and threaded everywhere as ONE
+/// value: it is both the ingress admission policy
+/// ([`admit`](EventSecurity::admit)) and the authoring signer source
+/// ([`signer`](EventSecurity::signer)), so "verify inbound but don't sign
+/// outbound" (or vice versa) is unrepresentable.
 #[derive(Clone)]
-pub enum Provenance {
-    /// `LinkTrust::Transitive`: relayed origin claims are taken on faith;
-    /// events carry no signatures.
-    Faith,
-    /// `LinkTrust::PeerAuthenticated`: every inbound event must carry a valid
-    /// signature by its sender's server, keys resolved through the medium's
-    /// nominated resolver.
-    Signed(std::sync::Arc<dyn KeyResolver>),
+pub enum EventSecurity {
+    /// Trusted network: origin claims on relayed events are taken on faith;
+    /// events carry no signatures at all.
+    TrustedNetwork,
+    /// Untrusted origins: every locally-authored event is signed, and every
+    /// inbound event must carry a valid signature by its sender's server,
+    /// keys resolved through the medium's nominated resolver.
+    Signed {
+        signer: std::sync::Arc<EventSigner>,
+        resolver: std::sync::Arc<dyn KeyResolver>,
+    },
 }
 
-impl Provenance {
+impl EventSecurity {
     /// Admit a parsed wire event under this policy. Signature failure is
     /// Drop-class ([`FormatError::SignatureCheck`](crate::FormatError)).
     pub async fn admit(
@@ -306,19 +309,31 @@ impl Provenance {
         unverified: crate::event_builder::UnverifiedWire,
     ) -> Result<crate::Wire, crate::FormatError> {
         match self {
-            Provenance::Faith => Ok(unverified.assume_transitive()),
-            Provenance::Signed(resolver) => unverified.verify(resolver.as_ref()).await,
+            EventSecurity::TrustedNetwork => Ok(unverified.admit_on_faith()),
+            EventSecurity::Signed { resolver, .. } => unverified.verify(resolver.as_ref()).await,
+        }
+    }
+
+    /// The signer for locally-authored events — `None` on a trusted network
+    /// (events MUST NOT carry signatures there).
+    pub fn signer(&self) -> Option<&std::sync::Arc<EventSigner>> {
+        match self {
+            EventSecurity::TrustedNetwork => None,
+            EventSecurity::Signed { signer, .. } => Some(signer),
         }
     }
 }
 
 // Hand-written so `KeyResolver` needn't be `Debug` (same idiom as
 // neutrino-lb's `LbConfig`): the variant name is the useful information.
-impl std::fmt::Debug for Provenance {
+impl std::fmt::Debug for EventSecurity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Provenance::Faith => write!(f, "Provenance::Faith"),
-            Provenance::Signed(_) => write!(f, "Provenance::Signed(<resolver>)"),
+            EventSecurity::TrustedNetwork => write!(f, "EventSecurity::TrustedNetwork"),
+            EventSecurity::Signed { signer, .. } => f
+                .debug_struct("EventSecurity::Signed")
+                .field("signer", signer)
+                .finish_non_exhaustive(),
         }
     }
 }

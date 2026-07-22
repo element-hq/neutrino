@@ -128,7 +128,7 @@ impl EventBuilder {
         self
     }
 
-    /// Sign the built event with this server's key (`PeerAuthenticated`
+    /// Sign the built event with this server's key (signed
     /// deployments; `None` — the default — matches the trusted-network mode,
     /// where events MUST NOT carry signatures). The signature is computed
     /// over the redacted canonical form, so it does not affect the reference
@@ -224,7 +224,7 @@ impl EventBuilder {
         );
         canon.insert("hashes".to_owned(), CanonicalJsonValue::Object(hashes));
 
-        // Sign (PeerAuthenticated deployments): over the redacted canonical
+        // Sign (signed deployments): over the redacted canonical
         // form, which strips `signatures` — so the reference hash below (and
         // therefore the event id) is identical signed or unsigned, and the
         // signature covers the just-inserted content hash. Preconditions are
@@ -296,9 +296,9 @@ impl EventBuilder {
 /// accepted.
 ///
 /// Returns an [`UnverifiedWire`]: parse/classification verdicts are decided
-/// here, but the event's **provenance** (signature check on
-/// `PeerAuthenticated` links, faith on `Transitive` ones) is a separate,
-/// unskippable admission step — see [`UnverifiedWire`].
+/// here, but the event's **provenance** (signature check when signing is on,
+/// faith on a trusted network) is a separate, unskippable admission step —
+/// see [`UnverifiedWire`].
 ///
 /// Performance note: this parses `raw` twice — once here to a
 /// `CanonicalJsonValue` for hash computation, then again in `parse_event`.
@@ -345,12 +345,12 @@ pub fn from_wire(
 
 /// A parsed-and-classified wire event whose **provenance has not been checked
 /// yet**. [`from_wire`] only ever produces this; the only ways to reach
-/// [`Wire`] are [`UnverifiedWire::assume_transitive`] (trusted network) and
+/// [`Wire`] are [`UnverifiedWire::admit_on_faith`] (trusted network) and
 /// [`UnverifiedWire::verify`] (signature check) — the compiler demands a
 /// provenance decision at every ingress, none can forget it. Federation
 /// ingress code should not pick a method itself but route through
-/// [`Provenance::admit`](crate::sign::Provenance::admit), which dispatches on
-/// the deployment's declared link trust.
+/// [`EventSecurity::admit`](crate::sign::EventSecurity::admit), which
+/// dispatches on the deployment's security configuration.
 #[derive(Debug)]
 pub struct UnverifiedWire {
     wire: Wire,
@@ -363,18 +363,17 @@ pub struct UnverifiedWire {
 
 impl UnverifiedWire {
     /// Admit the event on faith — no signature check. Correct ONLY on a
-    /// `LinkTrust::Transitive` deployment (trusted network: transitive
-    /// delivery is accurate by assumption, and events carry no signatures at
-    /// all) and in tests. On a signed deployment every ingress reaches
-    /// [`Wire`] through [`Provenance::admit`](crate::sign::Provenance::admit)
-    /// instead — a bare `assume_transitive` in federation ingress code is a
-    /// review flag.
-    pub fn assume_transitive(self) -> Wire {
+    /// trusted network (`trusted_network = true`: origin claims are accurate
+    /// by assumption, and events carry no signatures at all) and in tests.
+    /// Otherwise every ingress reaches [`Wire`] through
+    /// [`EventSecurity::admit`](crate::sign::EventSecurity::admit) — a bare
+    /// `admit_on_faith` in federation ingress code is a review flag.
+    pub fn admit_on_faith(self) -> Wire {
         self.wire
     }
 
     /// Admit the event after verifying a signature by its sender's server
-    /// (`PeerAuthenticated` links). Failure is Drop-class per the S-S receipt
+    /// (signed deployments). Failure is Drop-class per the S-S receipt
     /// checks: a PDU failing the signature check never enters the system
     /// (unlike a content-hash mismatch, which [`from_wire`] already handled
     /// by redaction).
@@ -786,7 +785,7 @@ mod tests {
 
         let parsed = from_wire(built.raw.clone(), Vec::new())
             .expect("from_wire")
-            .assume_transitive()
+            .admit_on_faith()
             .into_event();
         // event_id is recomputed from raw — must match the builder's output.
         assert_eq!(parsed.event_id, built.event_id);
@@ -807,7 +806,7 @@ mod tests {
 
         let parsed = from_wire(built.raw.clone(), Vec::new())
             .expect("from_wire")
-            .assume_transitive()
+            .admit_on_faith()
             .into_event();
         assert_eq!(parsed.event_id, built.event_id);
         // parse_event re-derived room_id from event_id via sigil swap —
@@ -841,7 +840,7 @@ mod tests {
             Vec::new(),
         )
         .expect("parseable PDU must not be dropped at the wire edge")
-        .assume_transitive();
+        .admit_on_faith();
         let Wire::Rejected(ev, defect) = wire else {
             panic!("rule-5.1 defect must classify as Wire::Rejected");
         };
@@ -887,7 +886,7 @@ mod tests {
         let auth = vec![eid("$x:d"), eid("$y:d")];
         let parsed = from_wire(built.raw.clone(), auth.clone())
             .expect("from_wire")
-            .assume_transitive()
+            .admit_on_faith()
             .into_event();
         assert_eq!(parsed.auth_events, auth);
     }
@@ -925,7 +924,7 @@ mod tests {
 
         let parsed = from_wire(tampered_raw, Vec::new())
             .expect("from_wire")
-            .assume_transitive()
+            .admit_on_faith()
             .into_event();
         // Tampering `hashes.sha256` also changes the reference hash, so the
         // parsed event_id here is the *tampered* hash — not asserted. The point
@@ -958,7 +957,7 @@ mod tests {
             .expect("builds");
         let parsed = from_wire(built.raw.clone(), Vec::new())
             .expect("from_wire")
-            .assume_transitive()
+            .admit_on_faith()
             .into_event();
         // Content survives — body field still there.
         let parsed_raw: serde_json::Value = serde_json::from_str(parsed.raw.get()).unwrap();
@@ -1036,7 +1035,7 @@ mod tests {
     }
 
     /// An unsigned event refused by the signature-verifying ingress — the
-    /// PeerAuthenticated failure mode for events from a pre-signing build.
+    /// signed-deployment failure mode for events from a pre-signing build.
     #[tokio::test]
     async fn unsigned_event_fails_signed_admission() {
         let (_, sender) = node_signer_and_user();

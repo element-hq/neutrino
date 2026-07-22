@@ -59,7 +59,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use neutrino_event::{Provenance, now_ms};
+use neutrino_event::{EventSecurity, now_ms};
 
 use crate::ports::{FederationTransport, ForwardExtremities, MissingEventsFetcher, TransportError};
 use crate::reconcile;
@@ -77,8 +77,8 @@ struct SenderCtx<S> {
     /// a peer advertises on a transaction *response*. Shared with the inbound
     /// worker/handler (see `AppState`).
     fetcher: Arc<dyn MissingEventsFetcher>,
-    /// Deployment-wide provenance policy from the medium's declared link trust.
-    provenance: Provenance,
+    /// Deployment-wide security policy from the medium's declared link trust.
+    security: EventSecurity,
     /// Poke the inbound worker after reconciliation stages fetched events.
     worker_poke: mpsc::Sender<OwnedRoomId>,
 }
@@ -94,7 +94,7 @@ impl<S> Clone for SenderCtx<S> {
             idgen: self.idgen.clone(),
             send_slots: self.send_slots.clone(),
             fetcher: self.fetcher.clone(),
-            provenance: self.provenance.clone(),
+            security: self.security.clone(),
             worker_poke: self.worker_poke.clone(),
         }
     }
@@ -116,7 +116,7 @@ pub fn spawn<S: StorageBackend + 'static>(
     shutdown: CancellationToken,
     kick_rx: watch::Receiver<()>,
     fetcher: Arc<dyn MissingEventsFetcher>,
-    provenance: Provenance,
+    security: EventSecurity,
     worker_poke: mpsc::Sender<OwnedRoomId>,
 ) -> JoinHandle<()> {
     let watch_rx = store.subscribe();
@@ -133,7 +133,7 @@ pub fn spawn<S: StorageBackend + 'static>(
         idgen,
         send_slots,
         fetcher,
-        provenance,
+        security,
         worker_poke,
     };
     tokio::spawn(supervise(
@@ -542,14 +542,14 @@ fn spawn_reconcile<S: StorageBackend + 'static>(
     for (room, heads) in peer_fes {
         let store = ctx.store.clone();
         let fetcher = ctx.fetcher.clone();
-        let provenance = ctx.provenance.clone();
+        let security = ctx.security.clone();
         let worker_poke = ctx.worker_poke.clone();
         let dest = dest.to_owned();
         tokio::spawn(async move {
             reconcile::reconcile_room(
                 &*store,
                 &*fetcher,
-                &provenance,
+                &security,
                 &worker_poke,
                 &dest,
                 &room,
@@ -814,7 +814,7 @@ mod tests {
             idgen: Arc::new(TxnIdGen::new(now_ms())),
             send_slots: Arc::new(Semaphore::new(1)),
             fetcher: null_fetcher(),
-            provenance: Provenance::Faith,
+            security: EventSecurity::TrustedNetwork,
             worker_poke: null_poke(),
         }
     }
@@ -854,7 +854,7 @@ mod tests {
             no_shutdown(),
             no_kick(),
             null_fetcher(),
-            Provenance::Faith,
+            EventSecurity::TrustedNetwork,
             null_poke(),
         ));
         wait_drained(&store, &dest).await;
@@ -891,7 +891,7 @@ mod tests {
             no_shutdown(),
             no_kick(),
             null_fetcher(),
-            Provenance::Faith,
+            EventSecurity::TrustedNetwork,
             null_poke(),
         ));
         wait_drained(&store, &dest).await;
@@ -924,7 +924,7 @@ mod tests {
             no_shutdown(),
             no_kick(),
             null_fetcher(),
-            Provenance::Faith,
+            EventSecurity::TrustedNetwork,
             null_poke(),
         ));
         wait_drained(&store, &dest).await; // dropped → outbox empties
@@ -948,7 +948,7 @@ mod tests {
             no_shutdown(),
             no_kick(),
             null_fetcher(),
-            Provenance::Faith,
+            EventSecurity::TrustedNetwork,
             null_poke(),
         ));
         wait_drained(&store, &dest).await;
@@ -991,7 +991,7 @@ mod tests {
             no_shutdown(),
             no_kick(),
             null_fetcher(),
-            Provenance::Faith,
+            EventSecurity::TrustedNetwork,
             null_poke(),
         ));
 
@@ -1023,7 +1023,7 @@ mod tests {
             no_shutdown(),
             no_kick(),
             null_fetcher(),
-            Provenance::Faith,
+            EventSecurity::TrustedNetwork,
             null_poke(),
         ));
         // Give the supervisor a moment to reach its idle `changed()` await.
@@ -1066,7 +1066,7 @@ mod tests {
             no_shutdown(),
             no_kick(),
             null_fetcher(),
-            Provenance::Faith,
+            EventSecurity::TrustedNetwork,
             null_poke(),
         ));
         wait_adv_drained(&store, &dest).await;
@@ -1103,7 +1103,7 @@ mod tests {
             no_shutdown(),
             no_kick(),
             null_fetcher(),
-            Provenance::Faith,
+            EventSecurity::TrustedNetwork,
             null_poke(),
         ));
         wait_drained(&store, &dest).await;
@@ -1280,7 +1280,7 @@ mod tests {
             shutdown.clone(),
             no_kick(),
             null_fetcher(),
-            Provenance::Faith,
+            EventSecurity::TrustedNetwork,
             null_poke(),
         );
 
@@ -1316,7 +1316,7 @@ mod tests {
             no_shutdown(),
             no_kick(),
             null_fetcher(),
-            Provenance::Faith,
+            EventSecurity::TrustedNetwork,
             null_poke(),
         ));
 

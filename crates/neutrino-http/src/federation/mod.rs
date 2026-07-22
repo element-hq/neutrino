@@ -199,16 +199,16 @@ pub(crate) fn map_apply_err(err: neutrino_engine::RoomActorError) -> FedError {
     }
 }
 
-/// Parse a wire PDU and admit it through the deployment-wide provenance
-/// policy ([`Provenance::admit`](neutrino_event::Provenance::admit)). Under
-/// [`Provenance::Faith`](neutrino_event::Provenance) this is exactly the bare
+/// Parse a wire PDU and admit it through the deployment-wide security
+/// policy ([`EventSecurity::admit`](neutrino_event::EventSecurity::admit)). Under
+/// [`EventSecurity::TrustedNetwork`](neutrino_event::EventSecurity) this is exactly the bare
 /// parse; under `Signed` a signature failure is refused/skipped identically
 /// to a parse failure.
 pub(crate) async fn admit_wire(
-    provenance: &neutrino_event::Provenance,
+    security: &neutrino_event::EventSecurity,
     raw: Box<serde_json::value::RawValue>,
 ) -> Result<neutrino_event::Wire, neutrino_event::FormatError> {
-    provenance
+    security
         .admit(neutrino_event::event_builder::from_wire(raw, Vec::new())?)
         .await
 }
@@ -237,7 +237,7 @@ pub(crate) fn complete_membership_template(
 ) -> Option<neutrino_event::Event> {
     use neutrino_event::event_builder::EventBuilder;
     let raw = serde_json::value::RawValue::from_string(template.get().to_owned()).ok()?;
-    // Deliberately NOT `Provenance::admit`: a make_* template is a protoevent
+    // Deliberately NOT `EventSecurity::admit`: a make_* template is a protoevent
     // authored by the *resident* with OUR user as `sender`, so it can never
     // carry a valid sender's-server signature — a signed deployment would
     // refuse every template. That is safe precisely because nothing here is
@@ -246,7 +246,7 @@ pub(crate) fn complete_membership_template(
     // by the resident), so a `Wire::Rejected` template is as usable as a
     // valid one.
     let parsed = match neutrino_event::event_builder::from_wire(raw, Vec::new())
-        .map(|uw| uw.assume_transitive())
+        .map(|uw| uw.admit_on_faith())
     {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
         Ok(neutrino_event::Wire::Rejected(ev, defect)) => {

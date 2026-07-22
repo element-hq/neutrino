@@ -1566,7 +1566,7 @@ mod tests {
             Vec::new(),
         )
         .expect("parseable wire event")
-        .assume_transitive()
+        .admit_on_faith()
         .into_event()
     }
 

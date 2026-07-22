@@ -72,9 +72,9 @@ type NodeDatagram = ([u8; 32], Vec<u8>);
 /// the translation lives with the consumer and mediums stay decoupled from
 /// the wire stack.
 ///
-/// The medium's *trust* declaration (`LinkTrust` in neutrino-main) rides the
-/// link factory's result instead: it carries the medium's key resolver, a
-/// type this transport crate has no business knowing.
+/// The medium's key-resolution capability rides the link factory's result
+/// instead (`FederationLink.key_resolver` in neutrino-main): it is a trait
+/// object this transport crate has no business knowing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkProfile {
     /// Largest datagram the link carries in one `send` (the usable MTU after
@@ -82,15 +82,25 @@ pub struct LinkProfile {
     /// (1280 B in this build) buy nothing: a serialized CoAP message is
     /// capped there regardless.
     pub max_datagram: usize,
+    /// "Trust the hop": whether the transport authenticates the source node
+    /// ids `recv` tags datagrams with. When `true`, the ingress origin↔node
+    /// binding and any origin-addressed request handling are meaningful; an
+    /// unauthenticated link (e.g. a future anonymous store-and-forward relay)
+    /// declares `false` and relies on message signatures for origin trust
+    /// instead. Independent of the app's `trusted_network` config — all four
+    /// combinations are valid deployments.
+    pub authenticates_connections: bool,
 }
 
 impl Default for LinkProfile {
-    /// Today's operating assumption: a full `Packet::MAX_SIZE` datagram
-    /// budget. Mediums on more constrained links override
+    /// Today's injected-medium assumptions: a full `Packet::MAX_SIZE`
+    /// datagram budget and an authenticated hop (every current medium is an
+    /// authenticated QUIC endpoint). Mediums that differ override
     /// [`DatagramLink::profile`].
     fn default() -> Self {
         Self {
             max_datagram: coap_lite::Packet::MAX_SIZE,
+            authenticates_connections: true,
         }
     }
 }

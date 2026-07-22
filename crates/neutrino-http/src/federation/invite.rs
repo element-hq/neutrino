@@ -101,7 +101,7 @@ pub(crate) async fn handle(
     // for a condemned invite — the hosted branch would just persist a
     // rejected row nobody reads, and the OOB branch must never surface an
     // invalid stub to sync.
-    let event = match admit_wire(&state.provenance(), raw).await {
+    let event = match admit_wire(&state.security(), raw).await {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
         Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
             tracing::warn!(event_id = %ev.event_id, %defect, "invite: refusing Wire::Rejected invite");
@@ -163,7 +163,7 @@ pub(crate) async fn handle(
     // state to auth against, so it imposes that check itself.
     let caller = auth::authenticated_origin(&headers, &our_server)?;
 
-    // Co-sign (PeerAuthenticated deployments): the invited server's signature
+    // Co-sign (signed deployments): the invited server's signature
     // is what the round-trip exists to collect — it rides both the copy we
     // keep (hosted stage / OOB stub) and the response copy the inviter
     // persists and fans out. Event id unchanged. `None` on a trusted network.
@@ -239,12 +239,12 @@ pub(crate) async fn federated_invite(
     target: &UserId,
     reason: Option<String>,
 ) -> Response {
-    let (store, registry, provenance, own_server, federation_proxy) = {
+    let (store, registry, security, own_server, federation_proxy) = {
         let app = lock_app(state);
         (
             app.store.clone(),
             app.room_registry.clone(),
-            app.provenance.clone(),
+            app.security.clone(),
             app.config.server_name.clone(),
             app.config.federation_proxy.clone(),
         )
@@ -323,7 +323,7 @@ pub(crate) async fn federated_invite(
     //    the peer returned *our* event (same reference hash) — it can't swap in a
     //    different one. `unsigned.invite_room_state` rides along harmlessly (it
     //    is outside the hash and never read for a remote member).
-    let returned_event = match admit_wire(&provenance, returned).await {
+    let returned_event = match admit_wire(&security, returned).await {
         // `Wire::Valid` with our reference hash: byte-identical to what we
         // sent (a `Rejected` variant with the same id is impossible — our
         // candidate came from `EventBuilder`, which validates).
@@ -353,7 +353,7 @@ pub(crate) async fn federated_invite(
     // invited server's co-signature — require it before committing, or a
     // buggy/hostile invitee could hand back our own singly-signed event and
     // we would distribute an invite its server never endorsed.
-    if let neutrino_event::Provenance::Signed(resolver) = &provenance
+    if let neutrino_event::EventSecurity::Signed { resolver, .. } = &security
         && let Err(e) = neutrino_event::verify_event_signed_by(
             &returned_event,
             target.server_name().as_str(),

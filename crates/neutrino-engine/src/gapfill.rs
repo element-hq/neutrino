@@ -16,7 +16,7 @@
 //! ancestry and freshly-received PDUs flow through the *same* loop, so there is
 //! no separate "promote" step.
 
-use neutrino_event::{Event, Provenance};
+use neutrino_event::{Event, EventSecurity};
 use neutrino_store::StorageBackend;
 use ruma::{EventId, OwnedEventId, RoomId, ServerName};
 
@@ -60,7 +60,7 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
     origin: &ServerName,
     event: &Event,
     fetcher: &F,
-    provenance: &Provenance,
+    security: &EventSecurity,
 ) -> Result<bool, String> {
     let room_id = &event.room_id;
     let earliest = state_dag_boundary(store, room_id).await;
@@ -122,7 +122,7 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
         // below correctly declares the gap unfillable.
         let mut staged_new = 0usize;
         for raw in fetched {
-            if let Ok(wire) = admit_wire(provenance, raw).await {
+            if let Ok(wire) = admit_wire(security, raw).await {
                 if let neutrino_event::Wire::Rejected(ev, defect) = &wire {
                     tracing::warn!(event_id = %ev.event_id, %defect, "gapfill: staging malformed ancestor as rejected");
                 }

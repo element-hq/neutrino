@@ -50,7 +50,7 @@ pub(crate) async fn reject_invite(
         let app = lock_app(state);
         (
             app.store.clone(),
-            app.signer.clone(),
+            app.security.signer().cloned(),
             app.config.server_name.clone(),
             app.config.federation_proxy.clone(),
         )

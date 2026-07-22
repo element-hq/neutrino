@@ -77,6 +77,16 @@ pub struct Config {
     /// when the state DAG converges; showing it lets the rig compare full
     /// timelines.
     pub enable_soft_failure: bool,
+    /// The operator's declaration that every peer admitted to the federation
+    /// network is honest about relays ("trust the origin"): origin claims on
+    /// relayed events are taken on faith and events carry NO signatures.
+    /// `false` flips the stack into signed mode — every locally-authored
+    /// event is signed and every inbound event must carry a valid
+    /// origin-server signature. This is the app-side half of the security
+    /// configuration; the transport-side half (`authenticates_connections`,
+    /// "trust the hop") is declared by the medium on its `LinkProfile`. The
+    /// two are independent, and all four combinations are valid deployments.
+    pub trusted_network: bool,
 }
 
 impl Default for Config {
@@ -91,6 +101,7 @@ impl Default for Config {
             lb_federation_port: None,
             startup_jitter: Duration::from_millis(DEFAULT_STARTUP_JITTER_MS),
             enable_soft_failure: true,
+            trusted_network: true,
         }
     }
 }
@@ -125,6 +136,10 @@ impl Config {
             // `NEUTRINO_ENABLE_SOFT_FAILURE=0`/`false` to make soft-failed
             // events client-visible for the rig.
             enable_soft_failure: std::env::var("NEUTRINO_ENABLE_SOFT_FAILURE")
+                .map_or(true, |v| !matches!(v.as_str(), "0" | "false")),
+            // Default on (today's deployments); `NEUTRINO_TRUSTED_NETWORK=0`
+            // flips the stack into signed mode (see the field docs).
+            trusted_network: std::env::var("NEUTRINO_TRUSTED_NETWORK")
                 .map_or(true, |v| !matches!(v.as_str(), "0" | "false")),
             // `localpart` (and any future non-env field) defaults from `Default`,
             // so the value lives in exactly one place.

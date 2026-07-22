@@ -261,10 +261,10 @@ pub fn start_with(
     let link_factory = link_factory.map(|factory| -> neutrino_main::FederationLinkFactory {
         Box::new(move |ctx| {
             Box::pin(async move {
-                let neutrino_main::FederationLink { link, trust } = factory(ctx).await?;
+                let neutrino_main::FederationLink { link, key_resolver } = factory(ctx).await?;
                 Ok(neutrino_main::FederationLink {
                     link: neutrino_main::PcapCaptureLink::wrap(link, capture_for_link),
-                    trust,
+                    key_resolver,
                 })
             })
         })
