@@ -103,19 +103,58 @@ jobs:
         env:
           SKIP_IMAGE_BUILD: "1"
 
-  compile:
+  # Build the neutrino-iroh .aar against THIS commit (not its pinned rev) so a
+  # change here that breaks the UniFFI surface — a removed export, a type that no
+  # longer derives uniffi, a `start_with`/`DatagramLink`/`LinkContext` signature
+  # change — fails CI immediately, instead of only surfacing when neutrino-iroh
+  # next bumps its `rev`. Mirrors the release build (build-aar.sh), limited to
+  # one ABI for speed.
+  ffi-downstream:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
+          path: neutrino
+          persist-credentials: false
+      # Cross-repo checkout of the public neutrino-iroh: the default token reads
+      # public repos fine, so no extra secret is needed.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: element-hq/neutrino-iroh
+          path: neutrino-iroh
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
-          targets: aarch64-linux-android
           toolchain: stable
+          targets: aarch64-linux-android
       - uses: nttld/setup-ndk@2817442ee7c3346c1eb7d2ec60263c93206ba14f
         with:
           ndk-version: r27c
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9
+        with:
+          distribution: temurin
+          java-version: '17'
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: neutrino-iroh
+      # The host binding-generation build compiles blew's bluer backend (D-Bus).
+      - name: Install libdbus
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       - run: cargo install cargo-ndk
-      - run: cargo xtask compile -t arm64-v8a
+      # Redirect neutrino-iroh's git dependency to the checked-out neutrino
+      # source (sibling dir under $GITHUB_WORKSPACE) so the .aar builds against
+      # the code under test rather than the pinned rev.
+      - name: Point neutrino-iroh at this commit
+        working-directory: neutrino-iroh
+        run: |
+          {
+            echo ''
+            echo '[patch."https://github.com/element-hq/neutrino"]'
+            echo 'neutrino-ffi = { path = "../neutrino/crates/neutrino-ffi" }'
+            echo 'neutrino-main = { path = "../neutrino/crates/neutrino-main" }'
+          } >> Cargo.toml
+          echo '--- patched Cargo.toml tail ---'
+          tail -n 5 Cargo.toml
+      - name: Build the .aar
+        working-directory: neutrino-iroh
+        run: ABIS="arm64-v8a" ./build-aar.sh
