@@ -29,13 +29,12 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
-use neutrino_event::event_builder::from_wire;
 use neutrino_store::{DagStore, EventStore, RoomStore};
 use ruma::{EventId, OwnedEventId, OwnedRoomId};
 use serde::Serialize;
 use serde_json::value::RawValue as RawJsonValue;
 
-use crate::federation::{FedError, auth, map_apply_err};
+use crate::federation::{FedError, auth, co_sign_if_signed, map_apply_err};
 use crate::{AppState, lock_app};
 
 /// Recent timeline events to include in the `send_join` response. The joiner
@@ -72,7 +71,7 @@ pub(crate) async fn handle(
     // start empty — apply_pdu is their sole authority. Resident membership
     // follows the *local* reject policy (refused, never persisted), so a
     // `Wire::Rejected` join is a 400 like any other malformed event.
-    let event = match from_wire(raw, Vec::new()) {
+    let event = match state.security().admit_wire(raw).await {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
         Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
             tracing::warn!(event_id = %ev.event_id, %defect, "send_join: refusing Wire::Rejected join");
@@ -107,10 +106,6 @@ pub(crate) async fn handle(
         return Err(FedError::BadRequest("state_key must equal sender"));
     }
 
-    // Keep the wire bytes for the response `event` field before the apply
-    // consumes the parsed event.
-    let event_raw = event.raw.clone();
-
     let (store, registry, our_name) = {
         let app = lock_app(&state);
         (
@@ -129,6 +124,16 @@ pub(crate) async fn handle(
             "origin server does not own the event sender",
         ));
     }
+
+    // Co-sign (signed deployments): add the resident signature beside the
+    // origin's, so the copy we persist + fan out AND the response copy the
+    // joiner keeps both carry the two signatures. No-op on a trusted network.
+    let mut event = event;
+    co_sign_if_signed(&state, &mut event)?;
+
+    // Keep the wire bytes for the response `event` field before the apply
+    // consumes the parsed event.
+    let event_raw = event.raw.clone();
 
     // Apply through the resident path: accept ⇒ persisted + fanned out; reject
     // ⇒ 403; idempotent re-send ⇒ Ok. (`apply_resident` enqueues the fan-out.)

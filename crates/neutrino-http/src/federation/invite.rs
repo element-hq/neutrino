@@ -37,7 +37,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use neutrino_event::ROOM_VERSION_ID;
-use neutrino_event::event_builder::from_wire;
 use neutrino_store::{InviteStore, RoomStore, StateStore};
 use ruma::events::AnyStrippedStateEvent;
 use ruma::serde::Raw;
@@ -48,7 +47,7 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::federation::client::{FederationClient, FederationClientError};
-use crate::federation::{FedError, auth};
+use crate::federation::{FedError, auth, co_sign_if_signed};
 use crate::{AppState, error_response, lock_app};
 use neutrino_engine::{RoomActorError, stage_and_poke};
 
@@ -102,7 +101,7 @@ pub(crate) async fn handle(
     // for a condemned invite — the hosted branch would just persist a
     // rejected row nobody reads, and the OOB branch must never surface an
     // invalid stub to sync.
-    let event = match from_wire(raw, Vec::new()) {
+    let event = match state.security().admit_wire(raw).await {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
         Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
             tracing::warn!(event_id = %ev.event_id, %defect, "invite: refusing Wire::Rejected invite");
@@ -163,6 +162,13 @@ pub(crate) async fn handle(
     // require `origin == sender.server` there. The OOB branch below has no room
     // state to auth against, so it imposes that check itself.
     let caller = auth::authenticated_origin(&headers, &our_server)?;
+
+    // Co-sign (signed deployments): the invited server's signature is what the
+    // round-trip exists to collect — it rides both the copy we keep (hosted
+    // stage / OOB stub) and the response copy the inviter persists and fans
+    // out. No-op on a trusted network. Event id unchanged.
+    let mut event = event;
+    co_sign_if_signed(&state, &mut event)?;
 
     // Keep the wire bytes for the response before either path moves `event`.
     let event_raw = event.raw.clone();
@@ -229,11 +235,12 @@ pub(crate) async fn federated_invite(
     target: &UserId,
     reason: Option<String>,
 ) -> Response {
-    let (store, registry, own_server, federation_proxy) = {
+    let (store, registry, security, own_server, federation_proxy) = {
         let app = lock_app(state);
         (
             app.store.clone(),
             app.room_registry.clone(),
+            app.security.clone(),
             app.config.server_name.clone(),
             app.config.federation_proxy.clone(),
         )
@@ -312,7 +319,7 @@ pub(crate) async fn federated_invite(
     //    the peer returned *our* event (same reference hash) — it can't swap in a
     //    different one. `unsigned.invite_room_state` rides along harmlessly (it
     //    is outside the hash and never read for a remote member).
-    let returned_event = match from_wire(returned, Vec::new()) {
+    let returned_event = match security.admit_wire(returned).await {
         // `Wire::Valid` with our reference hash: byte-identical to what we
         // sent (a `Rejected` variant with the same id is impossible — our
         // candidate came from `EventBuilder`, which validates).
@@ -338,6 +345,26 @@ pub(crate) async fn federated_invite(
             );
         }
     };
+    // On a Signed deployment the whole round-trip exists to collect the
+    // invited server's co-signature — require it before committing, or a
+    // buggy/hostile invitee could hand back our own singly-signed event and
+    // we would distribute an invite its server never endorsed.
+    if let neutrino_event::EventSecurity::Signed { resolver, .. } = &security
+        && let Err(e) = neutrino_event::verify_event_signed_by(
+            &returned_event,
+            target.server_name().as_str(),
+            resolver.as_ref(),
+        )
+        .await
+    {
+        warn!(dest = %target.server_name(), %room_id, error = %e, "outbound invite: returned event lacks the invitee server's co-signature");
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "M_UNKNOWN",
+            "invitee server did not co-sign the invite",
+        );
+    }
+
     match registry.apply_resident(room_id, returned_event).await {
         Ok(()) => (StatusCode::OK, Json(json!({}))).into_response(),
         Err(RoomActorError::Rejected) => error_response(

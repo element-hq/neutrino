@@ -980,6 +980,7 @@ mod tests {
             Vec::new(),
         )
         .expect("parseable wire event")
+        .admit_on_faith()
         .into_event();
         // `ban` survives redaction, so the malformed value reaches parse.
         // (match, not expect_err: `PowerLevels` deliberately has no Debug.)

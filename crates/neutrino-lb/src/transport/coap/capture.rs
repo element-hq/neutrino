@@ -64,7 +64,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
-use super::datagram::DatagramLink;
+use super::datagram::{DatagramLink, LinkProfile};
 
 /// pcap classic magic (microsecond, little-endian on-disk).
 const PCAP_MAGIC: u32 = 0xa1b2_c3d4;
@@ -258,6 +258,13 @@ impl DatagramLink for PcapCaptureLink {
         let (node, data) = self.inner.recv().await?;
         self.control.record(false, node, &data);
         Some((node, data))
+    }
+
+    fn profile(&self) -> LinkProfile {
+        // A tap changes no link fact; answering with the trait default here
+        // would mask the wrapped medium's declared MTU on every embedded
+        // build (`start_with` wraps every injected medium in this tap).
+        self.inner.profile()
     }
 }
 
@@ -459,6 +466,35 @@ mod tests {
         async fn recv(&self) -> Option<([u8; 32], Vec<u8>)> {
             self.inbox.lock().unwrap().pop_front()
         }
+    }
+
+    /// A link that declares non-default facts, to prove the tap surfaces them.
+    struct ProfiledLink;
+
+    #[async_trait]
+    impl DatagramLink for ProfiledLink {
+        async fn send(&self, _dst: [u8; 32], _datagram: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+        async fn recv(&self) -> Option<([u8; 32], Vec<u8>)> {
+            None
+        }
+        fn profile(&self) -> LinkProfile {
+            LinkProfile {
+                max_datagram: 640,
+                authenticates_connections: false,
+            }
+        }
+    }
+
+    // The tap wraps every injected medium (`start_with`), so answering with the
+    // trait default instead of delegating would mask the medium's declared
+    // MTU on every embedded build.
+    #[test]
+    fn tap_delegates_link_profile() {
+        let wrapped =
+            PcapCaptureLink::wrap(Arc::new(ProfiledLink), Arc::new(CaptureControl::default()));
+        assert_eq!(wrapped.profile(), ProfiledLink.profile());
     }
 
     /// A unique temp path per test, no rng/clock (both are unavailable/forbidden).

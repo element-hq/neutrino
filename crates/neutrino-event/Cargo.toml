@@ -6,6 +6,12 @@ license.workspace = true
 
 [dependencies]
 base64 = "0.22.1"
+# Event signing/verification (PeerAuthenticated links). Same version as
+# neutrino-main's identity derivation — one key, two uses.
+ed25519-dalek = "2.2.0"
+# Node-id (server_name) hex codec — same version + operation as neutrino-main's
+# identity derivation, so the "server_name = hex(pubkey)" rule uses one decoder.
+hex = "0.4.3"
 ruma = { workspace = true, features = ["events"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -14,3 +20,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# Async signature-verification tests (the KeyResolver port is async).
+tokio.workspace = true

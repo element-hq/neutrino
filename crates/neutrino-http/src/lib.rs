@@ -14,7 +14,7 @@ use axum::{
 };
 use neutrino_ctl::{Command, Config, DEFAULT_DISPLAY_NAME, DiscoveryRegistry};
 use neutrino_event::event_builder::EventBuilder;
-use neutrino_event::{Event, FormatError, ROOM_VERSION_ID};
+use neutrino_event::{Event, EventSecurity, FormatError, ROOM_VERSION_ID};
 use neutrino_room::CoreError;
 use neutrino_room::provider::InMemoryStateProvider;
 use neutrino_room::room_core::{Effect, RoomCore};
@@ -84,6 +84,10 @@ struct App {
     /// /profile/.../displayname`), so the BLE transport can re-advertise it.
     /// `None` off the embedded path (dev binary / tests): nothing re-advertises.
     display_name_tx: Option<watch::Sender<String>>,
+    /// The deployment's event-security policy (`sign_messages` composed at
+    /// the composition root): one value carrying both the ingress admission
+    /// mode and the signer for locally-authored events.
+    security: EventSecurity,
     config: Config,
     /// Latching cancellation signal shared with long-polls and the outbound
     /// federation sender. Fired once by [`AppState::begin_shutdown`]; after
@@ -218,24 +222,31 @@ impl AppState {
     /// simplest to construct directly through the trait rather than via the
     /// CSAPI write path.
     pub(crate) fn from_store(config: Config, store: Arc<SqliteStore>) -> Self {
-        Self::from_store_with_discovery(config, store, Arc::new(DiscoveryRegistry::new()))
+        Self::from_store_with_discovery(
+            config,
+            store,
+            Arc::new(DiscoveryRegistry::new()),
+            EventSecurity::TrustedNetwork,
+        )
     }
 
-    /// Like [`AppState::from_store`] but with a caller-owned discovery registry.
-    /// The production path ([`serve`]) injects the registry the host holds a
-    /// write handle to (so its BLE-discovery callback and the router read the
-    /// same set); [`from_store`] passes a fresh empty one for tests/the dev binary.
+    /// Like [`AppState::from_store`] but with a caller-owned discovery registry
+    /// and security policy. The production path ([`serve`]) injects the
+    /// registry the host holds a write handle to (so its BLE-discovery callback
+    /// and the router read the same set); [`from_store`] passes a fresh empty
+    /// one (and [`EventSecurity::TrustedNetwork`]) for tests/the dev binary.
     pub(crate) fn from_store_with_discovery(
         config: Config,
         store: Arc<SqliteStore>,
         discovery: Arc<DiscoveryRegistry>,
+        security: EventSecurity,
     ) -> Self {
         let client = Arc::new(FederationClient::new(
             config.server_name.clone(),
             config.federation_proxy.as_deref(),
         ));
         let fetcher: Arc<dyn MissingEventsFetcher> = Arc::new(ReqwestFetcher::new(client));
-        Self::from_store_with_fetcher(config, store, fetcher, discovery)
+        Self::from_store_with_fetcher(config, store, fetcher, discovery, security)
     }
 
     /// Like [`AppState::from_store`] but with an explicit gap-fill `fetcher`
@@ -247,16 +258,25 @@ impl AppState {
         store: Arc<SqliteStore>,
         fetcher: Arc<dyn MissingEventsFetcher>,
         discovery: Arc<DiscoveryRegistry>,
+        security: EventSecurity,
     ) -> Self {
         let shutdown = CancellationToken::new();
         let sync_state = Arc::new(SyncState::new(store.clone(), shutdown.clone()));
-        let room_registry = Arc::new(RoomRegistry::new(store.clone(), config.server_name.clone()));
+        let room_registry = Arc::new(RoomRegistry::new(
+            store.clone(),
+            config.server_name.clone(),
+            security.signer().cloned(),
+        ));
         // Spawn the inbound staging worker bound to this store/registry/fetcher.
         // It runs wherever the router does (production `serve` and the e2e
         // tests), enumerates any leftover staged rows on startup, and stops when
         // this `AppState` is dropped (the `worker_poke` sender drops with it).
-        let worker_poke =
-            neutrino_engine::worker::spawn(store.clone(), room_registry.clone(), fetcher.clone());
+        let worker_poke = neutrino_engine::worker::spawn(
+            store.clone(),
+            room_registry.clone(),
+            fetcher.clone(),
+            security.clone(),
+        );
         // Receivers are taken later via `subscribe_kick` (one per destination
         // task); the initial receiver is dropped — `send_modify` notifies any
         // live receivers and is a no-op when there are none.
@@ -277,6 +297,7 @@ impl AppState {
             keys: None,
             discovery,
             display_name_tx: None,
+            security,
             config,
             shutdown,
             kick_backoff,
@@ -302,6 +323,18 @@ impl AppState {
     /// handler reads it.
     pub fn discovery(&self) -> Arc<DiscoveryRegistry> {
         lock_app(self).discovery.clone()
+    }
+
+    /// The deployment-wide event-security policy, shared by every
+    /// federation-ingress path and every event-authoring site.
+    fn security(&self) -> EventSecurity {
+        lock_app(self).security.clone()
+    }
+
+    /// The local event signer (`None` on a trusted network) — derived from
+    /// the same policy value the ingress admission uses.
+    fn signer(&self) -> Option<Arc<neutrino_event::EventSigner>> {
+        lock_app(self).security.signer().cloned()
     }
 
     /// The shared `get_missing_events` fetcher, for the outbound sender pool's
@@ -368,6 +401,9 @@ impl AppState {
     }
 }
 
+// The composition seam: every parameter is one injected policy/handle from the
+// entrypoint, and bundling them into a struct would just move the list.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     listener: TcpListener,
     config: Config,
@@ -381,12 +417,16 @@ pub async fn serve(
     // Publishes the local display name on change so the BLE transport can
     // re-advertise. `None` off the embedded path (no BLE advert to update).
     display_name_tx: Option<watch::Sender<String>>,
+    // The event-security policy, composed by the composition root from the
+    // app's `trusted_network` config: one value carrying both the ingress
+    // admission mode and the signer for locally-authored events.
+    security: EventSecurity,
 ) -> Result<(), StartupError> {
     // The caller (the entrypoint) opens the store, resolves the server identity
     // from it, and hands the live handle in — so we build state around it rather
     // than re-opening the same DB.
     AppState::validate_config(&config)?;
-    let state = AppState::from_store_with_discovery(config, store, discovery);
+    let state = AppState::from_store_with_discovery(config, store, discovery, security);
     lock_app(&state).display_name_tx = display_name_tx;
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
@@ -403,6 +443,7 @@ pub async fn serve(
         state.subscribe_shutdown(),
         state.subscribe_kick(),
         state.fetcher(),
+        state.security(),
         state.worker_poke(),
     );
     let router = build_router(&state);
@@ -491,6 +532,7 @@ pub(crate) fn router_with_store_and_fetcher(
         store,
         fetcher,
         Arc::new(DiscoveryRegistry::new()),
+        EventSecurity::TrustedNetwork,
     );
     build_router(&state)
 }
@@ -499,6 +541,7 @@ fn build_router(state: &AppState) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/_matrix/client/versions", get(versions))
+        .route("/_matrix/key/v2/server", get(server_keys))
         .route(
             "/_matrix/client/{version}/login",
             get(get_login).post(post_login),
@@ -730,6 +773,57 @@ async fn versions() -> Json<Value> {
         },
         "versions": ["v1.16"]
     }))
+}
+
+/// `GET /_matrix/key/v2/server` — this server's signing key, as signed JSON
+/// (spec §"Retrieving server keys"). Only meaningful on a signed
+/// deployment (`trusted_network = false`): a trusted network has no signing keys at
+/// all, so the endpoint answers 404 there. No rotation mechanics — the key IS
+/// the node identity, `old_verify_keys` is permanently empty, and
+/// `valid_until_ts` is a rolling window that only paces peer re-fetches.
+async fn server_keys(state: State<AppState>) -> axum::response::Response {
+    let (signer, server_name) = {
+        let app = lock_app(&state.0);
+        (
+            app.security.signer().cloned(),
+            app.config.server_name.clone(),
+        )
+    };
+    let Some(signer) = signer else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "this deployment runs on a trusted network and has no signing keys",
+        );
+    };
+    // 30 days: far enough that node-id peers (who never fetch) are unaffected
+    // and DNS-named peers re-fetch at a lazy cadence.
+    const VALIDITY_WINDOW_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+    let response = json!({
+        "server_name": server_name,
+        "valid_until_ts": neutrino_event::now_ms() + VALIDITY_WINDOW_MS,
+        "verify_keys": {
+            neutrino_event::SIGNING_KEY_ID: {
+                "key": neutrino_event::event_id::b64_unpadded(&signer.public_key()),
+            }
+        },
+        "old_verify_keys": {},
+    });
+    // Sign the response (appendices "Signing JSON"). The value tree above is
+    // canonical-JSON-safe by construction (strings + ints only), so the
+    // conversion cannot fail; refuse loudly rather than serve unsigned keys
+    // if that invariant is ever broken.
+    let Ok(ruma::CanonicalJsonValue::Object(mut obj)) =
+        ruma::CanonicalJsonValue::try_from(response)
+    else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            "key response is not canonical JSON",
+        );
+    };
+    signer.sign_json(&mut obj);
+    (StatusCode::OK, Json(obj)).into_response()
 }
 
 async fn get_login() -> Json<Value> {
@@ -1384,9 +1478,13 @@ async fn create_room(
     AuthUser(sender): AuthUser,
     body: Json<Value>,
 ) -> axum::response::Response {
-    let (store, own_server) = {
+    let (store, own_server, signer) = {
         let app = lock_app(&state.0);
-        (app.store.clone(), app.config.server_name.clone())
+        (
+            app.store.clone(),
+            app.config.server_name.clone(),
+            app.security.signer().cloned(),
+        )
     };
 
     // Build the spec-mandated initial-state batch (create → join →
@@ -1397,17 +1495,17 @@ async fn create_room(
     // server-authored), so it maps to 500. Only *local* invitees are baked into
     // the batch; remote invitees are federated separately below.
     let display_name = local_display_name(&store).await;
-    let (create, initial) = match build_initial_events(&sender, &body.0, &own_server, &display_name)
-    {
-        Ok(batch) => batch,
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "M_UNKNOWN",
-                &e.to_string(),
-            );
-        }
-    };
+    let (create, initial) =
+        match build_initial_events(&sender, &body.0, &own_server, &display_name, signer) {
+            Ok(batch) => batch,
+            Err(e) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "M_UNKNOWN",
+                    &e.to_string(),
+                );
+            }
+        };
     let room_id = create.room_id.clone();
 
     // SqliteStore requires `create_room` to register the room before any
@@ -1512,11 +1610,13 @@ fn build_initial_events(
     body: &Value,
     own_server: &str,
     display_name: &str,
+    signer: Option<Arc<neutrino_event::EventSigner>>,
 ) -> Result<(Event, Vec<Event>), CreateRoomError> {
     // create is special: no parents, room_id derived from its own event_id.
     let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
         .state_key(String::new())
         .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .signer(signer.clone())
         .build()?;
 
     let mut room = RoomCore::new(create.room_id.clone());
@@ -1532,6 +1632,7 @@ fn build_initial_events(
                 event_type.to_owned(),
                 Some(state_key.to_owned()),
                 content,
+                signer.clone(),
             )?;
             // apply_pdu is the sole authority for `auth_events`, stamping them
             // onto the event it hands back via `Persist` — persist *that*, not
@@ -1896,8 +1997,9 @@ async fn default_fallback() -> (StatusCode, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Command, Config, ControlFlow, Event, OwnedUserId, SqliteStore, TcpListener,
-        build_initial_events, dispatch, handle, invite_targets, join_rule_for, mpsc,
+        AppState, Command, Config, ControlFlow, DiscoveryRegistry, Event, EventSecurity,
+        OwnedUserId, SqliteStore, StatusCode, TcpListener, Value, build_initial_events,
+        build_router, dispatch, handle, invite_targets, join_rule_for, mpsc,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -1926,6 +2028,64 @@ mod tests {
         );
         let state = AppState::from_store(test_config(&tmp), store);
         (state, tmp)
+    }
+
+    /// `/_matrix/key/v2/server`: on a signed deployment it serves the node
+    /// key under `ed25519:1` with a signature block; on a trusted network
+    /// (no signer) it answers 404 — there are no keys to serve, by design.
+    #[tokio::test]
+    async fn server_keys_served_iff_signed_deployment() {
+        use tower::ServiceExt;
+        let secret = [7u8; 32];
+        let signer = neutrino_event::EventSigner::new(&secret, "127.0.0.1");
+        let expected_key = neutrino_event::event_id::b64_unpadded(&signer.public_key());
+
+        let request = || {
+            axum::http::Request::builder()
+                .uri("/_matrix/key/v2/server")
+                .body(axum::body::Body::empty())
+                .expect("request")
+        };
+
+        // Signed deployment: key + signature present.
+        let tmp = TempDir::new().expect("tempdir");
+        let store = Arc::new(SqliteStore::open_in_dir(tmp.path()).await.expect("open"));
+        let state = AppState::from_store_with_discovery(
+            test_config(&tmp),
+            store,
+            Arc::new(DiscoveryRegistry::new()),
+            EventSecurity::Signed {
+                signer: Arc::new(signer),
+                resolver: Arc::new(neutrino_event::NodeIdKeyResolver),
+            },
+        );
+        let response = build_router(&state)
+            .oneshot(request())
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let v: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["server_name"], "127.0.0.1");
+        assert_eq!(
+            v["verify_keys"][neutrino_event::SIGNING_KEY_ID]["key"],
+            json!(expected_key)
+        );
+        assert!(
+            v["signatures"]["127.0.0.1"][neutrino_event::SIGNING_KEY_ID].is_string(),
+            "key response must be signed JSON"
+        );
+        assert!(v["valid_until_ts"].is_u64());
+
+        // Trusted network: no keys exist.
+        let (state, _tmp) = test_state().await;
+        let response = build_router(&state)
+            .oneshot(request())
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2289,6 +2449,7 @@ mod tests {
             rx,
             Arc::new(super::DiscoveryRegistry::new()),
             None,
+            EventSecurity::TrustedNetwork,
         ));
 
         // Give the sender supervisor a moment to discover the dead peer and
@@ -2367,7 +2528,7 @@ mod tests {
             "is_direct": true,
             "invite": ["@bob:127.0.0.1", "@carol:remote.example"],
         });
-        let (_create, initial) = build_initial_events(&sender, &body, "127.0.0.1", "Alice")
+        let (_create, initial) = build_initial_events(&sender, &body, "127.0.0.1", "Alice", None)
             .expect("build initial events");
 
         // The creator's own join carries the server-wide display name.

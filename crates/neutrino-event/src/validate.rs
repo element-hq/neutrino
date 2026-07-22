@@ -158,6 +158,13 @@ pub enum FormatError {
     /// reject."
     #[error("power_levels users field is not {{valid-user-id: int}}")]
     PowerLevelsBadUsers,
+
+    /// S-S receipt-check "Passes signature checks": no valid signature by the
+    /// event's sender's server (signed deployments only; never raised
+    /// on a trusted network). The string is the accumulated per-key failure
+    /// detail from `verify_event_signature`.
+    #[error("signature check failed: {0}")]
+    SignatureCheck(String),
 }
 
 /// What a [`validate_pdu`] failure means for a federation PDU, mirroring the
@@ -218,7 +225,11 @@ pub fn semantic_verdict(err: &FormatError) -> SemanticVerdict {
         | FormatError::CreateHasRoomId
         | FormatError::CreateBadStateKey
         | FormatError::UnrecognisedRoomVersion(_)
-        | FormatError::InvalidAdditionalCreators => Drop,
+        | FormatError::InvalidAdditionalCreators
+        // S-S receipt-check "Passes signature checks, otherwise it is
+        // dropped": provenance failure means the event never enters the
+        // system (unlike hash mismatch, which redacts and continues).
+        | FormatError::SignatureCheck(_) => Drop,
 
         // State-independent auth rules: the spec says reject.
         FormatError::StateKeyAtSignSenderMismatch

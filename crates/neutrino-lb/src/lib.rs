@@ -11,7 +11,7 @@ pub mod transport;
 
 pub use error::LbError;
 pub use transport::coap::capture::{CaptureControl, PcapCaptureLink};
-pub use transport::coap::datagram::DatagramLink;
+pub use transport::coap::datagram::{DatagramLink, LinkProfile};
 pub use transport::{DestinationResolver, DirectResolver};
 
 use std::net::SocketAddr;
@@ -149,6 +149,42 @@ pub enum WireKind {
         block1_size: Option<usize>,
         qblock: QBlockTuning,
     },
+}
+
+/// Non-payload bytes assumed per CoAP request datagram when deriving a block
+/// size from a link MTU: header + token + the longest federation route's
+/// options (the v2 invite path carries a room id and an event id), the
+/// X-Matrix origin (a 64-char hex node id plus framing), forwarded headers,
+/// and the Request-Tag/Size1/Q-Block1 options. Field evidence bounds it from
+/// below: a 1024 B block plus real federation options overflowed the 1280 B
+/// message cap (>256 B of options), silently stalling the send. 384 B leaves
+/// comfortable margin above that while still yielding a 512 B block on a full
+/// 1280 B datagram — the value previously hardcoded in `neutrino-main` after
+/// that stall was diagnosed.
+const FEDERATION_OPTION_BUDGET: usize = 384;
+
+impl WireKind {
+    /// The Q-Block wire tuned for a link whose datagrams carry at most
+    /// `max_datagram` bytes: the per-block payload is the largest SZX power of
+    /// two (RFC 7959 §2.2) that fits the MTU alongside a federation request's
+    /// options ([`FEDERATION_OPTION_BUDGET`]); timing is [`QBlockTuning`]'s
+    /// default. Errors when the MTU cannot frame even a 16-byte block.
+    ///
+    /// The MTU is clamped to coap-lite's `Packet::MAX_SIZE` first —
+    /// `to_bytes()` refuses larger messages regardless of link capacity, so a
+    /// roomier link buys nothing per datagram. Both ends of a mesh derive
+    /// their size from their own link profile, so the mesh-wide-coordination
+    /// caveat on [`WireKind::Coap`] still applies: peers must see comparable
+    /// MTUs.
+    pub fn coap_qblock_for_mtu(max_datagram: usize) -> Result<Self, String> {
+        let mtu = max_datagram.min(coap_lite::Packet::MAX_SIZE);
+        let block1_size = coap::client::block1_size_for_mtu(mtu, FEDERATION_OPTION_BUDGET)
+            .map_err(|e| format!("deriving CoAP block size from link profile: {e}"))?;
+        Ok(WireKind::CoapQBlock {
+            block1_size: Some(block1_size),
+            qblock: QBlockTuning::default(),
+        })
+    }
 }
 
 /// Runtime configuration for the sidecar.
@@ -352,6 +388,37 @@ async fn run_pair<S: WireServer>(
     tokio::select! {
         r = egress => r.map_err(LbError::from),
         r = ingress => r.map_err(LbError::from),
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    // The default profile states today's operating assumptions — the values
+    // every existing medium implicitly ran under before profiles existed.
+    #[test]
+    fn default_profile_is_todays_assumptions() {
+        let p = LinkProfile::default();
+        assert_eq!(p.max_datagram, coap_lite::Packet::MAX_SIZE);
+        assert!(p.authenticates_connections);
+    }
+
+    // MTU → block derivation: the full 1280 B datagram budget yields the
+    // field-proven 512 B block; roomier links clamp to the coap-lite message
+    // cap; constrained links shrink by SZX powers of two; an MTU that cannot
+    // frame even a 16 B block errors instead of silently stalling on send.
+    #[test]
+    fn coap_qblock_for_mtu_derives_szx_block_sizes() {
+        let block = |mtu: usize| match WireKind::coap_qblock_for_mtu(mtu) {
+            Ok(WireKind::CoapQBlock { block1_size, .. }) => block1_size,
+            other => panic!("unexpected wire kind: {other:?}"),
+        };
+        assert_eq!(block(coap_lite::Packet::MAX_SIZE), Some(512));
+        assert_eq!(block(100_000), Some(512)); // clamped to Packet::MAX_SIZE
+        assert_eq!(block(700), Some(256));
+        assert_eq!(block(412), Some(16)); // smallest legal SZX still frames
+        assert!(WireKind::coap_qblock_for_mtu(411).is_err());
     }
 }
 

@@ -20,12 +20,11 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
-use neutrino_event::event_builder::from_wire;
 use ruma::OwnedRoomId;
 use serde_json::value::RawValue as RawJsonValue;
 use serde_json::{Value, json};
 
-use crate::federation::{FedError, auth, map_apply_err};
+use crate::federation::{FedError, auth, co_sign_if_signed, map_apply_err};
 use crate::{AppState, lock_app};
 
 /// Federation `/send_leave` (v2) handler. Returns `{}` on accept.
@@ -45,7 +44,7 @@ pub(crate) async fn handle(
     // start empty — apply_pdu is their sole authority. Resident membership
     // follows the *local* reject policy (refused, never persisted), so a
     // `Wire::Rejected` leave is a 400 like any other malformed event.
-    let event = match from_wire(raw, Vec::new()) {
+    let event = match state.security().admit_wire(raw).await {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
         Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
             tracing::warn!(event_id = %ev.event_id, %defect, "send_leave: refusing Wire::Rejected leave");
@@ -94,6 +93,13 @@ pub(crate) async fn handle(
             "origin server does not own the event sender",
         ));
     }
+
+    // Co-sign (signed deployments): the resident signature rides the copy we
+    // persist + fan out. The v2 response is an empty object, so the leaver
+    // keeps its singly-signed copy — fine, both verify by their sender's-server
+    // signature. No-op on a trusted network. Event id unchanged.
+    let mut event = event;
+    co_sign_if_signed(&state, &mut event)?;
 
     // Apply through the resident path: accept ⇒ persisted + fanned out; reject
     // ⇒ 403; idempotent re-send ⇒ Ok. (`apply_resident` enqueues the fan-out.)

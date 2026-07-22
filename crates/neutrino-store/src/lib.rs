@@ -663,6 +663,17 @@ pub trait IdentityStore: Send + Sync {
     /// Persist the local user's display name, replacing any previous value
     /// (`PUT /profile/{user}/displayname`).
     async fn set_display_name(&self, name: &str) -> Result<(), StorageError>;
+
+    /// Pre:  `current` names the trust domain this process is starting under
+    ///       (e.g. `"transitive"` / `"signed"` — the store is agnostic).
+    /// Post: first call persists `current` and returns it; every later call
+    ///       (and after a restart) returns the originally-persisted value,
+    ///       ignoring `current` — first write wins, like the node secret.
+    ///       The caller compares the result against its own mode and refuses
+    ///       startup on mismatch: a store whose events were persisted without
+    ///       signatures can never serve a signed deployment (and vice versa),
+    ///       so the two domains must not mix.
+    async fn get_or_create_trust_domain(&self, current: &str) -> Result<String, StorageError>;
 }
 
 /// Combined storage interface. Use as a generic bound: `S: StorageBackend`.

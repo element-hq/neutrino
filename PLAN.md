@@ -25,6 +25,7 @@
 - PUT /_matrix/federation/v2/invite/{roomId}/{eventId}
 - GET /_matrix/federation/v1/make_leave/{roomId}/{userId}
 - PUT /_matrix/federation/v2/send_leave/{roomId}/{eventId}
+- GET /_matrix/key/v2/server (signed deployments only; 404 on a trusted network)
 
 ## outstanding work
 
@@ -89,6 +90,14 @@ deps. The embedded federation data path (BLE build) is unchanged: homeserver →
 lb egress (CoAP/CBOR) → `LinkCoapWireClient` → `DatagramLink::send(node,
 datagram)` → iroh over BLE.
 Done:
+- Link facts → encoding policy (`LinkProfile`, 2026-07-21): `DatagramLink`
+  gained a defaulted `profile()` returning `LinkProfile { max_datagram }`;
+  `build_lb_config` sizes the Q-Block1 block from the MTU
+  (`WireKind::coap_qblock_for_mtu`; the default profile reproduces the old
+  hardcoded 512 B). `PcapCaptureLink` delegates `profile()`. The medium's
+  *trust* declaration moved the same day to `neutrino-main::LinkTrust`
+  riding the link factory's result (see the event-signatures decisions
+  entry).
 - Integer-key CBOR codec (Layer A; port of Dendrite `internal/lb`): all transports
   now carry the integer-key transcode (`codec::keys`, 143 keys: 137 from Dendrite
   + 6 MSC4242 state-DAG keys) plus event-ID
@@ -125,6 +134,20 @@ Deferred follow-ups (write-ups, not done):
 - Per-hop timeouts on the sidecar's own reqwest clients (`LbConfig.timeouts`).
 - Q-Block2 (response) per-fragment size knob (no `max_message_size` equivalent
   on the Q-Block path yet; Block2 follows coap-rs's szx default).
+- iroh_repo medium migration: `FederationLinkFactory` now resolves to
+  `FederationLink { link, key_resolver: Option<Arc<dyn KeyResolver>> }` — the
+  out-of-tree medium must wrap its link (`key_resolver: None` compiles and
+  preserves today's behaviour; nominating `Some(Arc::new(NodeIdKeyResolver))`
+  costs nothing and lets the app opt into signed mode with zero key
+  infrastructure, since node-id server names ARE the verify keys — whether
+  signing happens is the app's `trusted_network` config, not the medium's
+  call).
+- Per-peer / mid-session MTU: `LinkProfile.max_datagram` is read once at
+  startup, but BLE MTU is per-peer and changes mid-session (L2CAP upgrade).
+  The end state is a per-peer profile query or watch — needs lb-side
+  block-size renegotiation (block size is fixed at wire construction today).
+  The `iroh_repo` medium should also override `profile()` with its real BLE
+  MTU rather than inheriting the 1280 B default.
 - FFI/Element X exposure of transport choice (`CoapQBlock` is the default, not yet
   selectable from `NeutrinoConfig`).
 
@@ -199,6 +222,141 @@ never use .unwrap() in handler code.
 - Restricted rooms (`join_authorised_via_users_server`) — documented, not implemented
 
 ## decisions log
+
+### Security model rework: two owner-set bools, one threaded type (2026-07-22)
+- Kegan's critique of the 2026-07-21 enums (LinkTrust / Provenance /
+  assume_transitive): the fundamental config is two independent booleans with
+  two different owners — `authenticate_connections` ("trust the hop", only
+  the pluggable transport knows) and `sign_messages` ("trust the origin",
+  only the app config knows) — and ALL FOUR combinations are valid
+  deployments (sigs=on/auth=off: future anonymous store-and-forward relays;
+  sigs=off/auth=on: today's BLE mesh; sigs=off/auth=off: dev UDP rig on a
+  trusted network). My earlier LinkTrust welded the two axes into one
+  medium-declared enum — an authority confusion; deleted.
+- New shape: `Config.trusted_network: bool` (neutrino-ctl, default true, env
+  `NEUTRINO_TRUSTED_NETWORK`) + `LinkProfile.authenticates_connections: bool`
+  (neutrino-lb, default true; the no-link/UDP path composes as false) →
+  composed once in `entrypoint` into `SecurityConfig { authenticate_connections,
+  sign_messages }` (main-private, logged at startup, gates NOTHING) →
+  realised as `neutrino_event::EventSecurity { TrustedNetwork,
+  Signed { signer, resolver } }`, the ONE value threaded everywhere (replaces
+  the parallel Provenance + Option<EventSigner> params through
+  serve/AppState/worker/sender/registry; Faith-with-a-signer now
+  unrepresentable). The single composition failure: sign_messages with no
+  key-resolution capability (inbound events could never verify).
+- The medium now declares facts and capabilities, never policy:
+  `FederationLink { link, key_resolver: Option<Arc<dyn KeyResolver>> }` — the
+  resolver is a namespace capability consumed only if the app opts into
+  signing. `UnverifiedWire::assume_transitive` → `admit_on_faith`; the store
+  trust-domain strings ("signed"/"transitive") kept for value stability.
+- Verified: full workspace clippy -D warnings + 957 lib tests +
+  e2e_signed_federation/backfill + main lb_inprocess green. iroh_repo
+  migration note updated implicitly (factory now returns key_resolver, not
+  trust).
+
+### Event signatures land: LinkTrust::PeerAuthenticated(resolver) flips the stack into signed mode (2026-07-21)
+- Supersedes the same-day LinkProfile entry's trust half: `LinkTrust` left
+  `neutrino-lb` (the profile keeps only wire facts, i.e. `max_datagram`) and
+  became a **constructive** enum in `neutrino-main` — `Transitive |
+  PeerAuthenticated(Arc<dyn KeyResolver>)`, returned by the link factory
+  beside the link (`FederationLink { link, trust }`). No `Unauthenticated`
+  variant (it had no legitimate inhabitant — the DatagramLink contract
+  already MUSTs transport-auth), and peer-auth-without-keys is
+  unrepresentable. `entrypoint` maps it via `trust_policy` onto the pair the
+  http/engine stack runs under: `Provenance::{Faith,Signed(resolver)}`
+  (inbound admission) + `Option<Arc<EventSigner>>` (outbound signing),
+  threaded through `serve` → AppState/worker/sender/RoomRegistry.
+- **Primitives (neutrino-event `sign.rs`)**: sign/verify over the SAME byte
+  string as the reference hash (`redact_to_canonical_bytes`, MSC4242
+  carve-out included) — so event ids are signature-invariant and co-signing
+  is non-destructive. Fixed key id `ed25519:1` (the signing key IS the node
+  identity secret; `server_name` = hex pubkey for node-named servers, so
+  `NodeIdKeyResolver` is a pure decode with zero key infrastructure).
+  Spec golden vectors ported: the two "Signing JSON" vectors directly, the
+  two event vectors via V1-redaction composition (they predate v11
+  redaction). Caveat pinned in code: the spec's seed has a NON-ZERO trailing
+  base64 sextet — strict no-pad decoders reject it, so signature/key decode
+  is deliberately lenient (ecosystem parity).
+- **Ingress typestate**: `from_wire` now returns `UnverifiedWire`; the only
+  paths to `Wire` are `assume_transitive()` (trusted network/tests, greppable)
+  and async `verify(resolver)` — production ingress goes through
+  `Provenance::admit`, so no path can skip the provenance decision (same
+  philosophy as the 2026-07-16 Wire redesign). Signature failure =
+  `FormatError::SignatureCheck` = Drop class (S-S receipt checks; hash
+  mismatch already redacts-and-continues in `from_wire`). Exception with a
+  comment: `complete_membership_template` parses via `assume_transitive`
+  regardless of mode — a make_* template is a resident-authored protoevent
+  with OUR user as sender (it can never carry a valid sender's-server sig)
+  and nothing in it is trusted (only DAG pointers, rebuilt + re-auth-checked).
+- **Signing**: `EventBuilder.signer(Option<Arc<EventSigner>>)`, threaded to
+  every authoring site (`RoomCore::build_local_event` param → room actor /
+  registry; createRoom's `build_initial_events`; membership-template
+  completion). `Transitive` mode passes `None` — events MUST NOT carry
+  signatures on a trusted network, unchanged.
+- **Co-signing**: send_join / send_leave / invite handlers `co_sign` the
+  received event (adds our sig beside the origin's, regenerates `raw`, id
+  unchanged) before persisting/fanning out AND before the response copy, so
+  both sides hold the doubly-signed event (send_join responses already
+  carried `event`; the joiner ingests it; invite already applied the
+  *returned* event). The inviting side under Signed mode additionally
+  REQUIRES the invitee's co-signature on the returned event (502 otherwise).
+  send_leave's v2 response stays `{}` per spec — the leaver keeps its
+  singly-signed copy, which still verifies by sender's-server sig.
+- **Trust domains don't mix**: `IdentityStore::get_or_create_trust_domain`
+  (first-write-wins kv row, like the node secret) records
+  `signed`/`transitive` at first start; `entrypoint` hard-refuses a
+  mismatch (unsigned history can never serve a signed deployment — delete
+  the DB to switch).
+- **`GET /_matrix/key/v2/server`**: served on signed deployments (signed
+  JSON via `sign_json`, `ed25519:1`, empty `old_verify_keys`, rolling
+  30-day `valid_until_ts`, no rotation — the key is the identity); 404 on a
+  trusted network (no keys exist, by design).
+- **Out of scope, deliberately**: X-Matrix request signing (PeerAuthenticated
+  links still transport-authenticate requests point-to-point; only
+  third-party event provenance needed crypto), DNS/notary resolvers (future
+  `KeyResolver` impls; the e2e's test directory shows the shape), key
+  rotation.
+- Verified: spec vectors + 122 event-crate tests; signed-mode two-node e2e
+  (`e2e_signed_federation`: join with co-sign round-trip, bidirectional
+  messages, backfill — all under mandatory verification, where any missing
+  sig fails convergence); workspace clippy -D warnings + all lib tests +
+  lb/backfill/qblock e2e green. BREAKING for iroh_repo (see deferred
+  follow-up).
+
+### LinkProfile: mediums declare link facts, the composition root derives encoding policy (2026-07-21)
+- Custom transports need to influence how neutrino encodes data (fragment size
+  for a varying MTU, eventually signatures). Split: the medium declares
+  **facts** — `DatagramLink::profile() -> LinkProfile { max_datagram, trust }`
+  (defaulted trait method in neutrino-lb; decorators MUST delegate, and
+  `PcapCaptureLink` does) — and `neutrino-main` translates facts into knob
+  settings, since only the medium knows its MTU/admission boundary and only
+  the composition root sees the whole stack. Mediums never see CoAP option
+  budgets or `WireKind`, so out-of-tree transports stay decoupled from the
+  wire stack's versioning.
+- `LinkTrust` is a strictly ordered lattice (`Unauthenticated <
+  PeerAuthenticated < Transitive`), not a bool: peer authentication alone
+  only attributes point-to-point claims ("A sent X") — ACLs and
+  origin-addressed requests — while DAG sync mostly delivers events authored
+  by third parties ("A relayed events from B"), unverifiable without
+  per-event signatures. `Transitive` names the trusted-network assumption
+  (admission implies honesty about relays). `entrypoint` refuses anything
+  below it (`require_transitive_trust`), with the refusal naming each level's
+  distinct gap — the previously ambient CLAUDE.md assumption is now a
+  greppable startup assertion a future internet-facing medium can't silently
+  stretch. Consumption stays split: peer auth bites at the ingress
+  origin↔node binding; transitive trust is a deployment invariant asserted
+  once at startup, NOT per-event provenance checks in engine/room.
+- Fragmentation: `build_lb_config` derives the Q-Block1 size via
+  `WireKind::coap_qblock_for_mtu(profile.max_datagram)` — clamp to coap-lite
+  `Packet::MAX_SIZE` (1280 B; `to_bytes()` refuses more regardless of link),
+  subtract `FEDERATION_OPTION_BUDGET` (384 B, documented from the 1024-block
+  stall diagnosis), largest SZX power of two via coap-rs's existing
+  `block1_size_for_mtu` (made `pub`; no duplicated SZX math). The default
+  profile reproduces the previously hardcoded 512 B (pinned by test); an
+  MTU under 412 B fails startup loudly instead of stalling on first send.
+- Static-at-startup is the honest granularity today: block size is fixed at
+  wire construction. Per-peer/mid-session MTU (BLE L2CAP upgrade) is a
+  deferred follow-up (see lb section).
 
 ### coap forks in-house as path deps; no coap patches anywhere (2026-07-21)
 - `vendor/coap-lite` (kaylendog/coap-lite@d45e952, qblock-phase1 tip) joins

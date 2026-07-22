@@ -66,6 +66,45 @@ use super::{CoapDispatch, MAX_QBLOCK_INFLIGHT_TRANSFERS, exchange, random_token_
 /// A datagram tagged with the 32-byte node it came from / is bound for.
 type NodeDatagram = ([u8; 32], Vec<u8>);
 
+/// Wire-level facts a medium declares about its link, consumed to derive CoAP
+/// framing (fragment sizing from `max_datagram`). Deliberately facts, not
+/// knob settings — the medium knows its MTU but not CoAP option budgets, so
+/// the translation lives with the consumer and mediums stay decoupled from
+/// the wire stack.
+///
+/// The medium's key-resolution capability rides the link factory's result
+/// instead (`FederationLink.key_resolver` in neutrino-main): it is a trait
+/// object this transport crate has no business knowing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkProfile {
+    /// Largest datagram the link carries in one `send` (the usable MTU after
+    /// link-layer overhead). Values above coap-lite's `Packet::MAX_SIZE`
+    /// (1280 B in this build) buy nothing: a serialized CoAP message is
+    /// capped there regardless.
+    pub max_datagram: usize,
+    /// "Trust the hop": whether the transport authenticates the source node
+    /// ids `recv` tags datagrams with. When `true`, the ingress origin↔node
+    /// binding and any origin-addressed request handling are meaningful; an
+    /// unauthenticated link (e.g. a future anonymous store-and-forward relay)
+    /// declares `false` and relies on message signatures for origin trust
+    /// instead. Independent of the app's `trusted_network` config — all four
+    /// combinations are valid deployments.
+    pub authenticates_connections: bool,
+}
+
+impl Default for LinkProfile {
+    /// Today's injected-medium assumptions: a full `Packet::MAX_SIZE`
+    /// datagram budget and an authenticated hop (every current medium is an
+    /// authenticated QUIC endpoint). Mediums that differ override
+    /// [`DatagramLink::profile`].
+    fn default() -> Self {
+        Self {
+            max_datagram: coap_lite::Packet::MAX_SIZE,
+            authenticates_connections: true,
+        }
+    }
+}
+
 /// The transport seam. The embedded composition injects an implementation (an
 /// authenticated QUIC endpoint, dialed over the BLE mesh on device) keyed by a
 /// 32-byte peer node id; lb never names the concrete transport. A single
@@ -83,6 +122,13 @@ pub trait DatagramLink: Send + Sync {
     /// Next inbound `(cryptographically-authenticated source node, datagram)`, or
     /// `None` once the link is closed (which ends the [`Hub`] drain task).
     async fn recv(&self) -> Option<([u8; 32], Vec<u8>)>;
+    /// The wire-level link facts CoAP framing is derived from — see
+    /// [`LinkProfile`]. Defaults to today's assumptions so existing
+    /// implementations are unaffected. Decorators MUST delegate to the wrapped
+    /// link, or they mask its declared facts.
+    fn profile(&self) -> LinkProfile {
+        LinkProfile::default()
+    }
 }
 
 /// Mux/demux over one [`DatagramLink`]. Owns the link, runs one background drain

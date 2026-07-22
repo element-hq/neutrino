@@ -2,9 +2,14 @@ pub mod event;
 pub mod event_builder;
 pub mod event_id;
 pub mod event_view;
+pub mod sign;
 pub mod validate;
 pub use event::Event;
-pub use event_builder::Wire;
+pub use event_builder::{UnverifiedWire, Wire};
+pub use sign::{
+    CoSignError, EventSecurity, EventSigner, KeyResolveError, KeyResolver, NodeIdKeyResolver,
+    SIGNING_KEY_ID, VerifyError, verify_event_signature, verify_event_signed_by,
+};
 pub use validate::{FormatError, SemanticVerdict, semantic_verdict};
 
 /// Wire identifier for the only room version this server speaks.

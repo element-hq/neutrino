@@ -55,8 +55,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use neutrino_event::Event;
-use neutrino_event::event_builder::from_wire;
+use neutrino_event::{Event, EventSecurity};
 use neutrino_store::{StagedPdu, StorageBackend, WithStateProvider};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, RoomId};
 use tokio::sync::{Notify, mpsc};
@@ -81,6 +80,8 @@ struct WorkerCtx<S> {
     store: Arc<S>,
     registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
+    /// Deployment-wide security policy from the medium's declared link trust.
+    security: EventSecurity,
     /// Backoff floor; [`BACKOFF_BASE`] in production, near-zero in tests so the
     /// retry path runs without real delays.
     backoff_base: Duration,
@@ -94,6 +95,7 @@ impl<S> Clone for WorkerCtx<S> {
             store: self.store.clone(),
             registry: self.registry.clone(),
             fetcher: self.fetcher.clone(),
+            security: self.security.clone(),
             backoff_base: self.backoff_base,
         }
     }
@@ -116,8 +118,9 @@ pub fn spawn<S: StorageBackend + WithStateProvider + 'static>(
     store: Arc<S>,
     registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
+    security: EventSecurity,
 ) -> mpsc::Sender<OwnedRoomId> {
-    spawn_with(store, registry, fetcher, BACKOFF_BASE)
+    spawn_with(store, registry, fetcher, security, BACKOFF_BASE)
 }
 
 /// Inner spawn with the backoff floor made explicit, so tests can drive the
@@ -126,6 +129,7 @@ fn spawn_with<S: StorageBackend + WithStateProvider + 'static>(
     store: Arc<S>,
     registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
+    security: EventSecurity,
     backoff_base: Duration,
 ) -> mpsc::Sender<OwnedRoomId> {
     let (tx, rx) = mpsc::channel(POKE_BUFFER);
@@ -133,6 +137,7 @@ fn spawn_with<S: StorageBackend + WithStateProvider + 'static>(
         store,
         registry,
         fetcher,
+        security,
         backoff_base,
     };
     tokio::spawn(supervise(ctx, rx));
@@ -246,24 +251,31 @@ async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
             continue;
         }
 
-        // Apply parents before children that are staged together. Rows whose
-        // bytes no longer parse are junk (they passed `from_wire` when staged,
-        // so this is defensive) — unstage them rather than spin forever.
+        // Apply parents before children that are staged together. A row that
+        // fails admission here is dropped: for `/send`-staged rows this is the
+        // real signature/parse gate (they were staged on faith and deferred it
+        // here); for rows staged after an earlier admit it is defensive.
+        // Unstage rather than spin forever.
         for staged in toposort(parse_or_drop(&ctx, &eligible).await) {
             process_one(&ctx, &room, staged, &mut backoff).await;
         }
     }
 }
 
-/// Parse each eligible staged row to a [`Staged`]; a row whose bytes no longer
-/// round-trip through `from_wire` is unstaged and skipped.
+/// Admit each eligible staged row to a [`Staged`] under the deployment policy
+/// ([`EventSecurity::admit_wire`]). This is where a staged row's signature is
+/// verified on a signed deployment: `/send` stages on faith and defers the
+/// check here (the worker is the sole staged→applied authority). A row that
+/// fails admission — no longer parses, fails its content hash, or (under
+/// `Signed`) carries no valid sender's-server signature — is unstaged and
+/// skipped.
 async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
     ctx: &WorkerCtx<S>,
     eligible: &[StagedPdu],
 ) -> Vec<Staged> {
     let mut out = Vec::with_capacity(eligible.len());
     for p in eligible {
-        match from_wire(p.raw.clone(), Vec::new()) {
+        match ctx.security.admit_wire(p.raw.clone()).await {
             // Both variants proceed: a `Wire::Rejected` event carries
             // `rejected = true` and `apply_pdu` short-circuits it to a
             // rejected persist (the cascade terminator).
@@ -276,8 +288,12 @@ async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
                     origin: p.origin.clone(),
                 });
             }
+            // Failed admission: unparseable, bad content hash, or — under a
+            // signed deployment — no valid sender's-server signature (`/send`
+            // defers that check to here). It would fail identically on every
+            // retry, so drop it rather than spin.
             Err(e) => {
-                warn!(event_id = %p.event_id, error = %e, "dropping unparseable staged PDU");
+                warn!(event_id = %p.event_id, error = %e, "dropping staged PDU that failed admission (parse / content-hash / signature)");
                 unstage(ctx, &p.event_id).await;
             }
         }
@@ -316,8 +332,14 @@ async fn process_one<S: StorageBackend + WithStateProvider + 'static>(
         // gap — back off rather than spin re-applying. `Err` (unfillable / peer
         // failure) also backs off.
         Err(RoomActorError::Apply(e)) if e.is_retryable() => {
-            match fill_state_ancestry(&*ctx.store, &staged.origin, &staged.event, &*ctx.fetcher)
-                .await
+            match fill_state_ancestry(
+                &*ctx.store,
+                &staged.origin,
+                &staged.event,
+                &*ctx.fetcher,
+                &ctx.security,
+            )
+            .await
             {
                 Ok(true) => {
                     backoff.remove(&id);

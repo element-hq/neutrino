@@ -199,6 +199,26 @@ pub(crate) fn map_apply_err(err: neutrino_engine::RoomActorError) -> FedError {
     }
 }
 
+/// Co-sign a locally-committed federation event with this server's signature
+/// when the deployment is signed — the resident/invitee side of the
+/// `send_join` / `send_leave` / `invite` round-trips, so the copy we persist +
+/// fan out (and the response copy the peer keeps) carries our signature beside
+/// the origin's. A no-op on a trusted network (`signer()` is `None`). The event
+/// id is unchanged (signatures are outside the reference hash). An event that
+/// reached a handler came through `from_wire`, so `co_sign` only fails on a
+/// genuinely malformed `raw` — mapped to a 400.
+pub(crate) fn co_sign_if_signed(
+    state: &crate::AppState,
+    event: &mut neutrino_event::Event,
+) -> Result<(), FedError> {
+    if let Some(signer) = state.signer() {
+        signer
+            .co_sign(event)
+            .map_err(|_| FedError::BadRequest("event cannot be co-signed"))?;
+    }
+    Ok(())
+}
+
 /// Rebuild an `m.room.member` event from a remote `make_join`/`make_leave`
 /// template, taking **only** the template's DAG references (`prev_events` /
 /// `prev_state_events`) and setting `type` / `sender` / `state_key` / `content`
@@ -214,18 +234,26 @@ pub(crate) fn map_apply_err(err: neutrino_engine::RoomActorError) -> FedError {
 /// "simplify" this into reusing the template's fields; a regression test pins
 /// the invariant. `None` if the template is unparseable.
 pub(crate) fn complete_membership_template(
+    signer: Option<std::sync::Arc<neutrino_event::EventSigner>>,
     template: &serde_json::value::RawValue,
     room_id: &ruma::RoomId,
     user: &ruma::UserId,
     membership: &str,
     display_name: &str,
 ) -> Option<neutrino_event::Event> {
-    use neutrino_event::event_builder::{EventBuilder, from_wire};
+    use neutrino_event::event_builder::EventBuilder;
     let raw = serde_json::value::RawValue::from_string(template.get().to_owned()).ok()?;
-    // Only the DAG pointers are taken from the template (never echoed — the
-    // event is rebuilt below and re-validated by `EventBuilder::build`), so a
-    // `Wire::Rejected` template is as usable as a valid one.
-    let parsed = match from_wire(raw, Vec::new()) {
+    // Deliberately NOT `EventSecurity::admit`: a make_* template is a protoevent
+    // authored by the *resident* with OUR user as `sender`, so it can never
+    // carry a valid sender's-server signature — a signed deployment would
+    // refuse every template. That is safe precisely because nothing here is
+    // trusted: only the DAG pointers are taken (never echoed — the event is
+    // rebuilt below, re-validated by `EventBuilder::build`, and auth-checked
+    // by the resident), so a `Wire::Rejected` template is as usable as a
+    // valid one.
+    let parsed = match neutrino_event::event_builder::from_wire(raw, Vec::new())
+        .map(|uw| uw.admit_on_faith())
+    {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
         Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
             // Usable (only the pointers are taken), but log it: the resident
@@ -248,6 +276,7 @@ pub(crate) fn complete_membership_template(
         .content(content)
         .prev_events(parsed.prev_events)
         .prev_state_events(parsed.prev_state_events)
+        .signer(signer)
         .build()
     {
         Ok(event) => Some(event),

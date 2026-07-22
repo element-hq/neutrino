@@ -46,10 +46,11 @@ pub(crate) async fn reject_invite(
     room_id: &RoomId,
     invite: neutrino_event::Event,
 ) -> Response {
-    let (store, own_server, federation_proxy) = {
+    let (store, signer, own_server, federation_proxy) = {
         let app = lock_app(state);
         (
             app.store.clone(),
+            app.security.signer().cloned(),
             app.config.server_name.clone(),
             app.config.federation_proxy.clone(),
         )
@@ -64,6 +65,7 @@ pub(crate) async fn reject_invite(
     if let Err(e) = try_federated_leave(
         &own_server,
         federation_proxy.as_deref(),
+        signer,
         &dest,
         room_id,
         &user,
@@ -92,6 +94,7 @@ pub(crate) async fn reject_invite(
 async fn try_federated_leave(
     own_server: &str,
     proxy: Option<&str>,
+    signer: Option<std::sync::Arc<neutrino_event::EventSigner>>,
     dest: &ServerName,
     room_id: &RoomId,
     user: &UserId,
@@ -108,8 +111,15 @@ async fn try_federated_leave(
             template.room_version
         ));
     }
-    let leave = complete_membership_template(&template.event, room_id, user, "leave", display_name)
-        .ok_or_else(|| "could not complete the leave template".to_string())?;
+    let leave = complete_membership_template(
+        signer,
+        &template.event,
+        room_id,
+        user,
+        "leave",
+        display_name,
+    )
+    .ok_or_else(|| "could not complete the leave template".to_string())?;
     client
         .send_leave(dest, room_id, &leave.event_id, &leave.raw)
         .await
@@ -127,8 +137,8 @@ mod tests {
     /// leave event is always a clean `leave` membership authored by *our* user.
     /// If someone later rewrites `complete_membership_template` to reuse the
     /// template's fields, this fails.
-    #[test]
-    fn complete_leave_template_rebuilds_and_never_echoes_hostile_template() {
+    #[tokio::test]
+    async fn complete_leave_template_rebuilds_and_never_echoes_hostile_template() {
         let our_user = ruma::OwnedUserId::try_from("@victim:us.example").unwrap();
         let attacker = ruma::OwnedUserId::try_from("@attacker:resident.example").unwrap();
 
@@ -158,8 +168,9 @@ mod tests {
 
         // The leave we build must target our own room + our own user.
         let room_id = ruma::RoomId::parse("!room:resident.example").unwrap();
-        let event = complete_membership_template(&hostile, &room_id, &our_user, "leave", "Neo")
-            .expect("template completes");
+        let event =
+            complete_membership_template(None, &hostile, &room_id, &our_user, "leave", "Neo")
+                .expect("template completes");
         let v: Value = serde_json::from_str(event.raw.get()).unwrap();
         assert_eq!(v["type"], "m.room.member", "type must be ours");
         assert_eq!(v["sender"], our_user.as_str(), "sender must be our user");
