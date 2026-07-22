@@ -45,8 +45,6 @@ proptest = "1"
 # neutrino-event's hashing is written against the 0.11 API, so the pin stays.
 sha2 = "=0.11.0-rc.5"
 
-[patch.crates-io]
-async-compat = { git = "https://github.com/element-hq/async-compat", rev = "5a27c8b290f1f1dcfc0c4ec22c464e38528aa591" }
 # The coap / coap-lite forks are in-house under vendor/ and reached by path
 # deps from neutrino-lb — see the exclude note above. Fork provenance:
 # vendor/coap-rs = kaylendog/coap-rs rev 9d9b49b (Server::*_with_config,

@@ -211,18 +211,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f093eed78becd229346bf859eec0aa4dd7ddde0757287b2b4107a1f09c80002"
 
 [[package]]
-name = "async-compat"
-version = "0.2.5"
-source = "git+https://github.com/element-hq/async-compat?rev=5a27c8b290f1f1dcfc0c4ec22c464e38528aa591#5a27c8b290f1f1dcfc0c4ec22c464e38528aa591"
-dependencies = [
- "futures-core",
- "futures-io",
- "once_cell",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1774,7 +1762,6 @@ dependencies = [
 name = "neutrino-ffi"
 version = "0.1.0"
 dependencies = [
- "async-compat",
  "neutrino-main",
  "tokio",
  "tracing",
