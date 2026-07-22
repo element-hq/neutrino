@@ -336,6 +336,7 @@ mod tests {
             storage_dir: "/data/neutrino".to_string(),
             outbound_concurrency: 0, // must clamp to 1
             lb_federation_port: Some(8448),
+            trusted_network: true,
         };
         let cfg: neutrino_main::Config = nc.into();
         // Dropped from the FFI surface → empty, which triggers identity derivation.
@@ -439,6 +440,7 @@ mod tests {
             storage_dir: "/data/neutrino".to_string(),
             outbound_concurrency: 4,
             lb_federation_port: None,
+            trusted_network: true,
         };
         let cfg: neutrino_main::Config = nc.into();
         assert_eq!(cfg.outbound_concurrency, 4);
