@@ -247,24 +247,29 @@ async fn signed_federation_join_message_and_backfill_converge() {
     );
 }
 
-/// Rejection mirror of the convergence test: verification must **gate** ingress,
-/// not merely pass valid signatures through. A hosts a room; B joins over
-/// federation, but A's key directory holds **no** entry for B, so A cannot
-/// verify B's signature on the `send_join` event. A must refuse the join — a
-/// no-op verifier would let it through with a 200. Everything else (make_join,
-/// B's own signing) succeeds, so the failure is attributable to the missing
-/// key alone.
+/// Rejection direction with an **in-fixture positive control** (mirrors the
+/// invite test's two-case structure): verification must *gate* ingress, not
+/// merely pass valid signatures through. A hosts a room; B joins over
+/// federation. First B's key is ABSENT from A's directory, so A cannot verify
+/// B's `send_join` signature — the join must be refused and A must not admit B.
+/// Then the SAME B's key is added and the SAME join retried — it must now
+/// succeed. Same fixtures throughout, so the stage-1 failure is provably the
+/// missing key (a no-op verifier would 200 stage 1; a join broken for an
+/// unrelated reason — make_join, template completion, setup — would fail stage
+/// 2), rather than merely "the join failed for some reason".
 #[tokio::test]
 async fn signed_federation_rejects_join_when_signer_key_unknown() {
     let secret_a = [3u8; 32];
     let secret_b = [4u8; 32];
     let key_a = EventSigner::new(&secret_a, "").public_key();
+    let key_b = EventSigner::new(&secret_b, "").public_key();
 
     let directory = Arc::new(KeyDirectory(RwLock::new(HashMap::new())));
     let a = start_signed_node("alice", secret_a, directory.clone()).await;
     let b = start_signed_node("bob", secret_b, directory.clone()).await;
-    // Register ONLY A's key. A can verify its own locally-authored events, but
-    // B is unknown to A's resolver, so A cannot verify B's send_join signature.
+    // Register ONLY A's key for now. A can verify its own locally-authored
+    // events, but B is unknown to A's resolver, so A cannot yet verify B's
+    // send_join signature.
     {
         let mut map = directory.0.write().unwrap_or_else(|e| e.into_inner());
         map.insert(a.server_name.clone(), key_a);
@@ -284,17 +289,24 @@ async fn signed_federation_rejects_join_when_signer_key_unknown() {
     let body: Value = resp.json().await.unwrap();
     let room_id = body["room_id"].as_str().expect("room_id").to_owned();
 
-    // B joins over federation. A's send_join admission verifies B's signature
-    // against an absent key → refuses → B's /join fails end to end.
-    let resp = http
-        .post(format!(
-            "{}/_matrix/client/v3/join/{}?server_name={}",
-            b.http_base, room_id, a.server_name
-        ))
-        .json(&json!({}))
-        .send()
-        .await
-        .expect("join request");
+    // Runs B's federated join against A (the same request both stages).
+    let join = |room: String| {
+        let http = http.clone();
+        let base = b.http_base.clone();
+        let via = a.server_name.clone();
+        async move {
+            http.post(format!(
+                "{base}/_matrix/client/v3/join/{room}?server_name={via}"
+            ))
+            .json(&json!({}))
+            .send()
+            .await
+            .expect("join request")
+        }
+    };
+
+    // Stage 1 — key absent: A's send_join admission cannot verify B → refuse.
+    let resp = join(room_id.clone()).await;
     let status = resp.status();
     let body: Value = resp.json().await.unwrap();
     assert!(
@@ -303,7 +315,8 @@ async fn signed_federation_rejects_join_when_signer_key_unknown() {
          signature (a no-op verifier would return 200); got {status}: {body:?}"
     );
 
-    // And A must not have admitted B into the room.
+    // ...and A must not have admitted B into the room (rejection is synchronous
+    // in send_join, so B is never enqueued — a single immediate check is sound).
     let resp = http
         .get(format!(
             "{}/_matrix/client/v3/rooms/{}/members",
@@ -322,6 +335,22 @@ async fn signed_federation_rejects_join_when_signer_key_unknown() {
     assert!(
         !joined_b,
         "B must not be a member of A's room after a rejected join: {members:?}"
+    );
+
+    // Stage 2 — positive control: register B's key and retry the SAME join.
+    // Now A can verify B, so the identical handshake must succeed, proving
+    // stage 1's failure was the missing key and not a broken make_join / setup.
+    {
+        let mut map = directory.0.write().unwrap_or_else(|e| e.into_inner());
+        map.insert(b.server_name.clone(), key_b);
+    }
+    let resp = join(room_id.clone()).await;
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "join MUST succeed once the resident can verify the joiner's signature; \
+         got {status}: {body:?}"
     );
 }
 

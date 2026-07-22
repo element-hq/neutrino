@@ -251,17 +251,24 @@ async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
             continue;
         }
 
-        // Apply parents before children that are staged together. Rows whose
-        // bytes no longer parse are junk (they passed `from_wire` when staged,
-        // so this is defensive) — unstage them rather than spin forever.
+        // Apply parents before children that are staged together. A row that
+        // fails admission here is dropped: for `/send`-staged rows this is the
+        // real signature/parse gate (they were staged on faith and deferred it
+        // here); for rows staged after an earlier admit it is defensive.
+        // Unstage rather than spin forever.
         for staged in toposort(parse_or_drop(&ctx, &eligible).await) {
             process_one(&ctx, &room, staged, &mut backoff).await;
         }
     }
 }
 
-/// Parse each eligible staged row to a [`Staged`]; a row whose bytes no longer
-/// round-trip through `from_wire` is unstaged and skipped.
+/// Admit each eligible staged row to a [`Staged`] under the deployment policy
+/// ([`EventSecurity::admit_wire`]). This is where a staged row's signature is
+/// verified on a signed deployment: `/send` stages on faith and defers the
+/// check here (the worker is the sole staged→applied authority). A row that
+/// fails admission — no longer parses, fails its content hash, or (under
+/// `Signed`) carries no valid sender's-server signature — is unstaged and
+/// skipped.
 async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
     ctx: &WorkerCtx<S>,
     eligible: &[StagedPdu],
@@ -281,8 +288,12 @@ async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
                     origin: p.origin.clone(),
                 });
             }
+            // Failed admission: unparseable, bad content hash, or — under a
+            // signed deployment — no valid sender's-server signature (`/send`
+            // defers that check to here). It would fail identically on every
+            // retry, so drop it rather than spin.
             Err(e) => {
-                warn!(event_id = %p.event_id, error = %e, "dropping unparseable staged PDU");
+                warn!(event_id = %p.event_id, error = %e, "dropping staged PDU that failed admission (parse / content-hash / signature)");
                 unstage(ctx, &p.event_id).await;
             }
         }

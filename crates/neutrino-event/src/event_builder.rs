@@ -368,6 +368,17 @@ impl UnverifiedWire {
     /// Otherwise every ingress reaches [`Wire`] through
     /// [`EventSecurity::admit`](crate::sign::EventSecurity::admit) — a bare
     /// `admit_on_faith` in federation ingress code is a review flag.
+    ///
+    /// Two sanctioned exceptions carry the check elsewhere rather than skip it:
+    /// - The `/send` transaction handler parses on faith and **defers** the
+    ///   signature check to the inbound worker, which re-admits every staged
+    ///   row via [`EventSecurity::admit_wire`](crate::sign::EventSecurity::admit_wire)
+    ///   before applying it. The worker is the sole staged→applied authority
+    ///   and staged rows are pre-auth (never served), so a bad-signature PDU is
+    ///   dropped there and never reaches room state.
+    /// - The `make_*` template rebuild takes only the template's DAG pointers
+    ///   and re-signs + re-auths the event it builds, so the template's own
+    ///   (necessarily absent) signature is irrelevant.
     pub fn admit_on_faith(self) -> Wire {
         self.wire
     }
