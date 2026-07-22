@@ -4,34 +4,10 @@ Neutrino uses the [`xtask` pattern](https://github.com/matklad/cargo-xtask) for 
 tasks that don't fit a plain `cargo` invocation. Run `cargo xtask <command>` from the workspace
 root.
 
-## `compile`
-
-Builds the Android shared libraries and generates the Kotlin bindings, in three steps:
-
-1. **Builds the server for your host** (`cargo build --release`) so `uniffi-bindgen` can load the
-   resulting `cdylib` and generate bindings from it.
-2. **Builds the Android shared libraries** with `cargo-ndk` into `bindings/src/main/jniLibs`, for
-   all four supported ABIs (`armeabi-v7a`, `arm64-v8a`, `x86`, `x86_64`).
-3. **Generates the Kotlin bindings** from the host `cdylib` into `bindings/src/main/java`.
-
-Pass `-t <abi>` (repeatable) to restrict the Android targets - e.g. `cargo xtask compile -t
-arm64-v8a` builds a single ABI while iterating, which is much faster than the full four-target
-build.
-
-## `publish`
-
-Builds the bindings (always running `compile` first) and publishes the resulting `.aar`. The
-version is resolved as: the `--version <v>` flag if given, else the exact git tag on `HEAD` with
-any leading `v` stripped (`v0.1.0` → `0.1.0`), else the `0.1.0-SNAPSHOT` fallback.
-
-With `--local`, it runs `./gradlew :bindings:publishToMavenLocal`, dropping the artifact into
-`~/.m2`. Without it, it runs `./gradlew :bindings:publish` to publish to GitHub Packages
-(`https://maven.pkg.github.com/element-hq/neutrino`), which requires `GITHUB_ACTOR` and
-`GITHUB_TOKEN` in the environment for authentication.
-
-The GitHub Packages path should not be run by hand: pushing a `v*` tag triggers the
-[`release`](../../.github/workflows/release.yml) workflow, which builds all four Android ABIs and
-runs `cargo xtask publish --version "${tag#v}"`.
+Android artifact building and publishing (the `.aar` and its Kotlin bindings) live in the
+[`neutrino-iroh`](https://github.com/element-hq/neutrino-iroh) repository, which composes this crate
+over its iroh/BLE federation medium and produces the consumer artifact. This crate is built from
+source there; there is no Android tooling here.
 
 ## `complement`
 

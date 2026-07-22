@@ -1,6 +1,4 @@
-mod compile;
 mod complement;
-mod publish;
 mod sh;
 
 use std::process::ExitCode;
@@ -17,10 +15,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Build the Android shared libraries and generate the Kotlin bindings.
-    Compile(compile::CompileArgs),
-    /// Build the bindings and publish the AAR (local Maven or GitHub Packages).
-    Publish(publish::PublishArgs),
     /// Run the Complement suite against the neutrino image.
     Complement(complement::ComplementArgs),
 }
@@ -28,8 +22,6 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Compile(args) => compile::run(&args),
-        Command::Publish(args) => publish::run(&args),
         Command::Complement(args) => complement::run(&args),
     };
     match result {
