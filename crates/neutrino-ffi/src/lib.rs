@@ -15,6 +15,8 @@ pub struct NeutrinoConfig {
     /// `context.filesDir`). The DB is `<storage_dir>/neutrino.db`.
     pub storage_dir: String,
     pub outbound_concurrency: u32,
+    /// Whether the network is trusted and hence whether we can drop signatures
+    pub trusted_network: bool,
     /// When set, runs the in-process `neutrino-lb` CoAP low-bandwidth sidecar.
     /// This is the public federation port the ingress binds — peers'
     /// `server_name` resolves to `host(bind_addr):lb_federation_port`. The
@@ -48,6 +50,7 @@ impl From<NeutrinoConfig> for neutrino_main::Config {
             // embedded client sees the full DAG (the same knob the convergence
             // rig uses; the verdict is still computed and stored).
             enable_soft_failure: false,
+            trusted_network: c.trusted_network,
             // `federation_proxy` is internal/derived (set by neutrino-main when
             // the sidecar runs) and startup jitter isn't FFI-exposed; both take
             // their `Config::default()` values.
@@ -333,6 +336,7 @@ mod tests {
             storage_dir: "/data/neutrino".to_string(),
             outbound_concurrency: 0, // must clamp to 1
             lb_federation_port: Some(8448),
+            trusted_network: true,
         };
         let cfg: neutrino_main::Config = nc.into();
         // Dropped from the FFI surface → empty, which triggers identity derivation.
@@ -436,6 +440,7 @@ mod tests {
             storage_dir: "/data/neutrino".to_string(),
             outbound_concurrency: 4,
             lb_federation_port: None,
+            trusted_network: true,
         };
         let cfg: neutrino_main::Config = nc.into();
         assert_eq!(cfg.outbound_concurrency, 4);
