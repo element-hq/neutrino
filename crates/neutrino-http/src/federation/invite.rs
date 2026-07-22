@@ -47,7 +47,7 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::federation::client::{FederationClient, FederationClientError};
-use crate::federation::{FedError, admit_wire, auth};
+use crate::federation::{FedError, auth, co_sign_if_signed};
 use crate::{AppState, error_response, lock_app};
 use neutrino_engine::{RoomActorError, stage_and_poke};
 
@@ -101,7 +101,7 @@ pub(crate) async fn handle(
     // for a condemned invite — the hosted branch would just persist a
     // rejected row nobody reads, and the OOB branch must never surface an
     // invalid stub to sync.
-    let event = match admit_wire(&state.security(), raw).await {
+    let event = match state.security().admit_wire(raw).await {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
         Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
             tracing::warn!(event_id = %ev.event_id, %defect, "invite: refusing Wire::Rejected invite");
@@ -163,16 +163,12 @@ pub(crate) async fn handle(
     // state to auth against, so it imposes that check itself.
     let caller = auth::authenticated_origin(&headers, &our_server)?;
 
-    // Co-sign (signed deployments): the invited server's signature
-    // is what the round-trip exists to collect — it rides both the copy we
-    // keep (hosted stage / OOB stub) and the response copy the inviter
-    // persists and fans out. Event id unchanged. `None` on a trusted network.
+    // Co-sign (signed deployments): the invited server's signature is what the
+    // round-trip exists to collect — it rides both the copy we keep (hosted
+    // stage / OOB stub) and the response copy the inviter persists and fans
+    // out. No-op on a trusted network. Event id unchanged.
     let mut event = event;
-    if let Some(signer) = state.signer() {
-        signer
-            .co_sign(&mut event)
-            .map_err(|_| FedError::BadRequest("event cannot be co-signed"))?;
-    }
+    co_sign_if_signed(&state, &mut event)?;
 
     // Keep the wire bytes for the response before either path moves `event`.
     let event_raw = event.raw.clone();
@@ -323,7 +319,7 @@ pub(crate) async fn federated_invite(
     //    the peer returned *our* event (same reference hash) — it can't swap in a
     //    different one. `unsigned.invite_room_state` rides along harmlessly (it
     //    is outside the hash and never read for a remote member).
-    let returned_event = match admit_wire(&security, returned).await {
+    let returned_event = match security.admit_wire(returned).await {
         // `Wire::Valid` with our reference hash: byte-identical to what we
         // sent (a `Rejected` variant with the same id is impossible — our
         // candidate came from `EventBuilder`, which validates).

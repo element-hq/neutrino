@@ -15,7 +15,6 @@ use neutrino_store_sqlite::SqliteStore;
 use ruma::RoomId;
 use tracing::{info, warn};
 
-use crate::federation::admit_wire;
 use crate::federation::client::FederationClient;
 
 /// Synapse parity: cap the number of seeds we send so the `/backfill` URI's
@@ -92,7 +91,7 @@ async fn persist_pdus(
         // must carry the verdict so a descendant's reference check
         // cascade-rejects, and so the malformed content can never surface as
         // an accepted row (clients filter rejected; state-res excludes it).
-        let event = match admit_wire(security, raw).await {
+        let event = match security.admit_wire(raw).await {
             Ok(neutrino_event::Wire::Valid(ev)) => ev,
             Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
                 warn!(target: "neutrino_http", %room_id, event_id = %ev.event_id, %defect, "backfill: serving malformed PDU as rejected");

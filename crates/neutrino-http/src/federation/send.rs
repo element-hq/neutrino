@@ -26,7 +26,10 @@
 //! ## Trust model
 //!
 //! Requires an `X-Matrix` header (network-attested origin — see
-//! [`crate::federation::auth`]); no signature verification (no signing keys).
+//! [`crate::federation::auth`]). Signatures, on a signed deployment, are NOT
+//! checked here: the inbound worker re-admits every staged PDU under the
+//! deployment policy and is the sole authority on the staged→applied path, so
+//! ingress parses on faith and lets the worker drop any bad-signature row.
 //! The transaction's `origin` field is cross-checked against the header origin
 //! (rejected on mismatch), then used for txn deduplication and as the worker's
 //! gap-fill fetch target.
@@ -44,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 use tracing::warn;
 
-use crate::federation::{FedError, admit_wire, auth};
+use crate::federation::{FedError, auth};
 use crate::{AppState, lock_app};
 use neutrino_engine::{ForwardExtremities, reconcile};
 
@@ -178,10 +181,20 @@ pub(crate) async fn handle(
     // recording.
     let mut all_staged = true;
     for raw in body.pdus {
-        // Drop-class PDUs (`Err`) never enter the system; `Wire::Rejected`
-        // ones are staged like any other — the worker persists them rejected
-        // (the cascade terminator).
-        let event = match admit_wire(&security, raw).await {
+        // Parse only — signatures are NOT verified here. The inbound worker
+        // (`parse_or_drop` → `apply_pdu`) is the sole authority on the
+        // staged→applied path and re-admits every row under the deployment
+        // policy, so a bad-signature PDU that reaches staging is dropped there
+        // before it can apply; verifying at ingress too would just double the
+        // ed25519 work on the happy path (every legitimate PDU is validly
+        // signed). `admit_on_faith` runs the parse without the signature check
+        // (content-hash verify/redact + semantic classification still run).
+        // Drop-class PDUs (`Err`) are unkeyable and never enter the system;
+        // `Wire::Rejected` ones are staged like any other — the worker persists
+        // them rejected (the cascade terminator).
+        let event = match neutrino_event::event_builder::from_wire(raw, Vec::new())
+            .map(|uw| uw.admit_on_faith())
+        {
             Ok(neutrino_event::Wire::Valid(ev)) => ev,
             Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
                 tracing::warn!(event_id = %ev.event_id, %defect, "/send: staging malformed PDU as rejected");

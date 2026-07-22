@@ -24,7 +24,7 @@ use ruma::OwnedRoomId;
 use serde_json::value::RawValue as RawJsonValue;
 use serde_json::{Value, json};
 
-use crate::federation::{FedError, admit_wire, auth, map_apply_err};
+use crate::federation::{FedError, auth, co_sign_if_signed, map_apply_err};
 use crate::{AppState, lock_app};
 
 /// Federation `/send_leave` (v2) handler. Returns `{}` on accept.
@@ -44,7 +44,7 @@ pub(crate) async fn handle(
     // start empty — apply_pdu is their sole authority. Resident membership
     // follows the *local* reject policy (refused, never persisted), so a
     // `Wire::Rejected` leave is a 400 like any other malformed event.
-    let event = match admit_wire(&state.security(), raw).await {
+    let event = match state.security().admit_wire(raw).await {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
         Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
             tracing::warn!(event_id = %ev.event_id, %defect, "send_leave: refusing Wire::Rejected leave");
@@ -94,16 +94,12 @@ pub(crate) async fn handle(
         ));
     }
 
-    // Co-sign (signed deployments): the resident signature rides
-    // the copy we persist + fan out. The v2 response is an empty object, so
-    // the leaver keeps its singly-signed copy — fine, both verify by their
-    // sender's-server signature. Event id unchanged.
+    // Co-sign (signed deployments): the resident signature rides the copy we
+    // persist + fan out. The v2 response is an empty object, so the leaver
+    // keeps its singly-signed copy — fine, both verify by their sender's-server
+    // signature. No-op on a trusted network. Event id unchanged.
     let mut event = event;
-    if let Some(signer) = state.signer() {
-        signer
-            .co_sign(&mut event)
-            .map_err(|_| FedError::BadRequest("event cannot be co-signed"))?;
-    }
+    co_sign_if_signed(&state, &mut event)?;
 
     // Apply through the resident path: accept ⇒ persisted + fanned out; reject
     // ⇒ 403; idempotent re-send ⇒ Ok. (`apply_resident` enqueues the fan-out.)

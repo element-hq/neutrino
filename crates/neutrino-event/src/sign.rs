@@ -314,6 +314,22 @@ impl EventSecurity {
         }
     }
 
+    /// Parse wire bytes and admit the result under this policy in one step:
+    /// [`from_wire`](crate::event_builder::from_wire) (id derivation,
+    /// content-hash verify/redact, format + semantic classification) composed
+    /// with [`admit`](Self::admit) (signature check under `Signed`, on faith
+    /// under `TrustedNetwork`). The single parse+admit seam for inbound
+    /// federation bytes — the HTTP handlers and the engine
+    /// worker/reconcile/gapfill all funnel through here so the contract can't
+    /// drift between crates.
+    pub async fn admit_wire(
+        &self,
+        raw: Box<serde_json::value::RawValue>,
+    ) -> Result<crate::Wire, crate::FormatError> {
+        self.admit(crate::event_builder::from_wire(raw, Vec::new())?)
+            .await
+    }
+
     /// The signer for locally-authored events — `None` on a trusted network
     /// (events MUST NOT carry signatures there).
     pub fn signer(&self) -> Option<&std::sync::Arc<EventSigner>> {
@@ -359,25 +375,11 @@ impl KeyResolver for NodeIdKeyResolver {
     }
 }
 
-/// Decode a 64-char lowercase/uppercase hex server name into 32 key bytes.
+/// Decode a 64-char hex server name into 32 key bytes. `hex::decode` accepts
+/// upper- or lower-case; `try_into` enforces exactly 32 bytes, so any non-hex
+/// or wrong-length name falls out as `None` (not a node id).
 fn decode_node_id(server_name: &str) -> Option<[u8; 32]> {
-    let bytes = server_name.as_bytes();
-    if bytes.len() != 64 {
-        return None;
-    }
-    let nibble = |c: u8| -> Option<u8> {
-        match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
-            _ => None,
-        }
-    };
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = (nibble(bytes[i * 2])? << 4) | nibble(bytes[i * 2 + 1])?;
-    }
-    Some(out)
+    hex::decode(server_name).ok()?.try_into().ok()
 }
 
 /// Verify that `obj` carries a valid signature by `origin`: iterate the

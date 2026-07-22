@@ -34,7 +34,7 @@ use ruma::{EventId, OwnedEventId, OwnedRoomId};
 use serde::Serialize;
 use serde_json::value::RawValue as RawJsonValue;
 
-use crate::federation::{FedError, admit_wire, auth, map_apply_err};
+use crate::federation::{FedError, auth, co_sign_if_signed, map_apply_err};
 use crate::{AppState, lock_app};
 
 /// Recent timeline events to include in the `send_join` response. The joiner
@@ -71,7 +71,7 @@ pub(crate) async fn handle(
     // start empty — apply_pdu is their sole authority. Resident membership
     // follows the *local* reject policy (refused, never persisted), so a
     // `Wire::Rejected` join is a 400 like any other malformed event.
-    let event = match admit_wire(&state.security(), raw).await {
+    let event = match state.security().admit_wire(raw).await {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
         Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
             tracing::warn!(event_id = %ev.event_id, %defect, "send_join: refusing Wire::Rejected join");
@@ -125,17 +125,11 @@ pub(crate) async fn handle(
         ));
     }
 
-    // Co-sign (signed deployments): add the resident signature
-    // beside the origin's, so the copy we persist + fan out AND the response
-    // copy the joiner keeps both carry the two signatures. The event id is
-    // unchanged (signatures are outside the reference hash). `None` on a
-    // trusted network — the event stays exactly as received.
+    // Co-sign (signed deployments): add the resident signature beside the
+    // origin's, so the copy we persist + fan out AND the response copy the
+    // joiner keeps both carry the two signatures. No-op on a trusted network.
     let mut event = event;
-    if let Some(signer) = state.signer() {
-        signer
-            .co_sign(&mut event)
-            .map_err(|_| FedError::BadRequest("event cannot be co-signed"))?;
-    }
+    co_sign_if_signed(&state, &mut event)?;
 
     // Keep the wire bytes for the response `event` field before the apply
     // consumes the parsed event.

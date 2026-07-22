@@ -65,7 +65,7 @@ use tracing::{debug, error, info, warn};
 use crate::gapfill::fill_state_ancestry;
 use crate::ports::MissingEventsFetcher;
 use crate::room_actor::{RoomActorError, RoomRegistry};
-use crate::util::{BACKOFF_BASE, admit_wire, jitter, next_backoff};
+use crate::util::{BACKOFF_BASE, jitter, next_backoff};
 
 /// Buffer for the in-process poke channel. A poke is just a room id; the
 /// supervisor coalesces duplicates (re-reading the room's staged rows each
@@ -268,7 +268,7 @@ async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
 ) -> Vec<Staged> {
     let mut out = Vec::with_capacity(eligible.len());
     for p in eligible {
-        match admit_wire(&ctx.security, p.raw.clone()).await {
+        match ctx.security.admit_wire(p.raw.clone()).await {
             // Both variants proceed: a `Wire::Rejected` event carries
             // `rejected = true` and `apply_pdu` short-circuits it to a
             // rejected persist (the cascade terminator).

@@ -30,7 +30,6 @@ use serde_json::json;
 use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
-use crate::federation::admit_wire;
 use crate::federation::client::{FederationClient, FederationClientError, SendJoinResponse};
 use crate::{AppState, error_response, lock_app};
 
@@ -329,7 +328,7 @@ async fn ingest_state_dag(
         .chain(resp.timeline)
         .chain(std::iter::once(resp.event))
     {
-        match admit_wire(security, raw).await {
+        match security.admit_wire(raw).await {
             Ok(neutrino_event::Wire::Valid(ev)) => events.push(ev),
             // Rejected events are staged too — they persist as rejected rows
             // so references to them cascade-reject instead of gapfilling.

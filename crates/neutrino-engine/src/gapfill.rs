@@ -21,7 +21,6 @@ use neutrino_store::StorageBackend;
 use ruma::{EventId, OwnedEventId, RoomId, ServerName};
 
 use crate::ports::{MissingEventsFetcher, MissingEventsQuery};
-use crate::util::admit_wire;
 
 /// Initial `limit` for the first gap-fill request; doubled each round (MSC4242
 /// recommends exponentially increasing the limit until all ancestry is seen).
@@ -122,7 +121,7 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
         // below correctly declares the gap unfillable.
         let mut staged_new = 0usize;
         for raw in fetched {
-            if let Ok(wire) = admit_wire(security, raw).await {
+            if let Ok(wire) = security.admit_wire(raw).await {
                 if let neutrino_event::Wire::Rejected(ev, defect) = &wire {
                     tracing::warn!(event_id = %ev.event_id, %defect, "gapfill: staging malformed ancestor as rejected");
                 }

@@ -199,18 +199,24 @@ pub(crate) fn map_apply_err(err: neutrino_engine::RoomActorError) -> FedError {
     }
 }
 
-/// Parse a wire PDU and admit it through the deployment-wide security
-/// policy ([`EventSecurity::admit`](neutrino_event::EventSecurity::admit)). Under
-/// [`EventSecurity::TrustedNetwork`](neutrino_event::EventSecurity) this is exactly the bare
-/// parse; under `Signed` a signature failure is refused/skipped identically
-/// to a parse failure.
-pub(crate) async fn admit_wire(
-    security: &neutrino_event::EventSecurity,
-    raw: Box<serde_json::value::RawValue>,
-) -> Result<neutrino_event::Wire, neutrino_event::FormatError> {
-    security
-        .admit(neutrino_event::event_builder::from_wire(raw, Vec::new())?)
-        .await
+/// Co-sign a locally-committed federation event with this server's signature
+/// when the deployment is signed — the resident/invitee side of the
+/// `send_join` / `send_leave` / `invite` round-trips, so the copy we persist +
+/// fan out (and the response copy the peer keeps) carries our signature beside
+/// the origin's. A no-op on a trusted network (`signer()` is `None`). The event
+/// id is unchanged (signatures are outside the reference hash). An event that
+/// reached a handler came through `from_wire`, so `co_sign` only fails on a
+/// genuinely malformed `raw` — mapped to a 400.
+pub(crate) fn co_sign_if_signed(
+    state: &crate::AppState,
+    event: &mut neutrino_event::Event,
+) -> Result<(), FedError> {
+    if let Some(signer) = state.signer() {
+        signer
+            .co_sign(event)
+            .map_err(|_| FedError::BadRequest("event cannot be co-signed"))?;
+    }
+    Ok(())
 }
 
 /// Rebuild an `m.room.member` event from a remote `make_join`/`make_leave`

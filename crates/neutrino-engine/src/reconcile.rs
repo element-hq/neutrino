@@ -25,7 +25,6 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::ports::{ForwardExtremities, MissingEventsFetcher, MissingEventsQuery};
-use crate::util::admit_wire;
 
 /// Whether `server` has a joined member in `room_id`. A store-backed predicate
 /// (not an `X-Matrix` check): the advertised heads a peer sends are
@@ -245,7 +244,7 @@ async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
         // Rejected wire events are staged too (the worker persists them
         // rejected; cascade termination needs the row); drop-class events
         // (`Err`) never enter the system.
-        let Ok(wire) = admit_wire(security, raw).await else {
+        let Ok(wire) = security.admit_wire(raw).await else {
             continue;
         };
         if let neutrino_event::Wire::Rejected(rej, defect) = &wire {
