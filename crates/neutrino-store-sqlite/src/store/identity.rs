@@ -22,6 +22,10 @@ const KEY_DISPLAYNAME: &str = "displayname";
 /// (`"transitive"` = unsigned events, `"signed"` = signature-verified). First
 /// write wins; a mode switch on existing data is refused by the caller.
 const KEY_TRUST_DOMAIN: &str = "trust_domain";
+/// The single key recording the federation `server_name` (configured or derived
+/// from the secret) the store was born under. First write wins; a mismatch on
+/// existing data is refused by the caller (it would fork the server identity).
+const KEY_SERVER_NAME: &str = "server_name";
 
 #[async_trait]
 impl IdentityStore for SqliteStore {
@@ -91,6 +95,24 @@ impl IdentityStore for SqliteStore {
             Ok(conn.query_row(
                 "SELECT value FROM server_identity WHERE key = ?",
                 params![KEY_TRUST_DOMAIN],
+                |row| row.get::<_, String>(0),
+            )?)
+        })
+        .await
+    }
+
+    async fn get_or_create_server_name(&self, current: &str) -> Result<String, StorageError> {
+        let current = current.to_owned();
+        self.run_write(move |conn| -> Result<String, Error> {
+            // Same first-write-wins idiom as the node secret and trust domain:
+            // the name the store was born under is the one it keeps for life.
+            conn.execute(
+                "INSERT OR IGNORE INTO server_identity (key, value) VALUES (?, ?)",
+                params![KEY_SERVER_NAME, current],
+            )?;
+            Ok(conn.query_row(
+                "SELECT value FROM server_identity WHERE key = ?",
+                params![KEY_SERVER_NAME],
                 |row| row.get::<_, String>(0),
             )?)
         })
@@ -206,6 +228,43 @@ mod tests {
                 .expect("reopen read"),
             "transitive",
             "domain survives restart"
+        );
+    }
+
+    /// Server name is first-write-wins and stable across a reopen — the fact the
+    /// startup gate uses to stop a server rebooting against existing data under a
+    /// different name (which would fork its identity and orphan its rooms).
+    #[tokio::test]
+    async fn server_name_is_first_write_wins_and_stable() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("identity.db");
+        {
+            let store = SqliteStore::open(&path).await.expect("open");
+            assert_eq!(
+                store
+                    .get_or_create_server_name("hs.example")
+                    .await
+                    .expect("first"),
+                "hs.example",
+                "first start records its own name"
+            );
+            assert_eq!(
+                store
+                    .get_or_create_server_name("other.example")
+                    .await
+                    .expect("second"),
+                "hs.example",
+                "a different name later reads back the original — the caller refuses on mismatch"
+            );
+        }
+        let store = SqliteStore::open(&path).await.expect("reopen");
+        assert_eq!(
+            store
+                .get_or_create_server_name("other.example")
+                .await
+                .expect("reopen read"),
+            "hs.example",
+            "name survives restart"
         );
     }
 

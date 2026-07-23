@@ -674,6 +674,18 @@ pub trait IdentityStore: Send + Sync {
     ///       signatures can never serve a signed deployment (and vice versa),
     ///       so the two domains must not mix.
     async fn get_or_create_trust_domain(&self, current: &str) -> Result<String, StorageError>;
+
+    /// Pre:  `current` is the effective federation `server_name` this process is
+    ///       starting under — the configured value, or the one derived from the
+    ///       node secret when unconfigured.
+    /// Post: first call persists `current` and returns it; every later call (and
+    ///       after a restart) returns the originally-persisted value, ignoring
+    ///       `current` — first write wins, like the node secret and trust domain.
+    ///       The caller compares the result against the effective name and
+    ///       refuses startup on mismatch: the name is baked into every stored
+    ///       event's sender/origin, so changing it against existing data forks
+    ///       the server's identity and orphans its rooms.
+    async fn get_or_create_server_name(&self, current: &str) -> Result<String, StorageError>;
 }
 
 /// Combined storage interface. Use as a generic bound: `S: StorageBackend`.

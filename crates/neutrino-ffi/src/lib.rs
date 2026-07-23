@@ -11,6 +11,14 @@ mod watchdog;
 pub struct NeutrinoConfig {
     pub bind_addr: String,
     pub localpart: String,
+    /// The homeserver's federation `server_name` — the domain in
+    /// `@localpart:server_name`. `None` (or an empty string) lets the server
+    /// derive a stable name from its node identity, which is the embedded
+    /// default; the host then reads the result back via
+    /// `NeutrinoHandle::server_name()`. Set a concrete value to pin a specific
+    /// name: it is recorded on first start and every later start under a
+    /// different name is refused (see the server-name identity guard).
+    pub server_name: Option<String>,
     /// Absolute path to a writable directory the host owns (e.g. Android's
     /// `context.filesDir`). The DB is `<storage_dir>/neutrino.db`.
     pub storage_dir: String,
@@ -28,11 +36,11 @@ pub struct NeutrinoConfig {
 impl From<NeutrinoConfig> for neutrino_main::Config {
     fn from(c: NeutrinoConfig) -> Self {
         neutrino_main::Config {
-            // The embedded server has no operator-set name: it always derives its
-            // identity (a node id) from the persisted secret. An empty
-            // `server_name` triggers that derivation in the entrypoint; the host
-            // reads the result back via `NeutrinoHandle::server_name()`.
-            server_name: String::new(),
+            // Pass the host's choice through: `None`/empty derives the identity
+            // (a node id) from the persisted secret in the entrypoint — the
+            // embedded default, read back via `NeutrinoHandle::server_name()`; a
+            // concrete value is used verbatim (and pinned on first start).
+            server_name: c.server_name.unwrap_or_default(),
             bind_addr: c.bind_addr,
             localpart: c.localpart,
             storage_dir: std::path::PathBuf::from(c.storage_dir),
@@ -119,6 +127,12 @@ pub struct NeutrinoHandle {
     /// The server identity (its resolved `server_name`/node id), published by the
     /// entrypoint once resolved. Read by `server_name()`; `None` until booted.
     identity: tokio::sync::watch::Receiver<Option<String>>,
+    /// The fatal error the server exited with, if any (e.g. a bind failure, a
+    /// `server_name`/trust-domain mismatch against existing data, or a config
+    /// validation error). Published by the boot thread when the entrypoint
+    /// returns `Err`; read by `last_error()` so the host can raise a dialog.
+    /// `None` while the server is starting or running normally.
+    last_error: tokio::sync::watch::Receiver<Option<String>>,
     /// Out-of-band discovery registry, written by the BLE transport's scan drain
     /// and read back by `discovered_peers()`. Shared (same `Arc`) with the
     /// homeserver's user-directory search.
@@ -164,6 +178,17 @@ impl NeutrinoHandle {
     /// (`@localpart:server_name`).
     pub fn server_name(&self) -> Option<String> {
         self.identity.borrow().clone()
+    }
+
+    /// The fatal error the server exited with, or `None` while it is starting or
+    /// running normally. The host polls this alongside `server_name()`: a
+    /// `Some(server_name)` means "ready", a `Some(last_error)` means "refused to
+    /// start — show this message in a dialog". A non-blocking in-memory read
+    /// (like `server_name`), safe to call from the FFI/JNI thread. Startup
+    /// failures that used to only reach logcat (identity mismatch, bad config,
+    /// bind failure) are now observable by the host.
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.borrow().clone()
     }
 
     /// A single-shot snapshot of every peer discovered over the BLE mesh, sorted
@@ -251,6 +276,10 @@ pub fn start_with(
     // The entrypoint publishes the resolved server name here once identity
     // resolution completes; `server_name()` reads it back.
     let (handoff_tx, handoff_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+    // Fatal-error handoff: the boot thread publishes the entrypoint's error
+    // message here so the host can read it back via `last_error()` and raise a
+    // dialog, rather than the failure only reaching logcat.
+    let (error_tx, error_rx) = tokio::sync::watch::channel::<Option<String>>(None);
     // Shared out-of-band discovery registry: the federation medium (or the LAN
     // mDNS browser) writes the peers it discovers into it, and the homeserver
     // reads it for user-directory search. One handle for the homeserver, one
@@ -306,6 +335,9 @@ pub fn start_with(
             .await
             {
                 tracing::error!(error = %e, "neutrino: server entrypoint exited with an error");
+                // Surface the message to the host (dialog box); a send error just
+                // means the handle was dropped, so nothing is listening.
+                let _ = error_tx.send(Some(e.to_string()));
             }
         });
         // `rt` drops here on this OS thread (sync context — safe): the executor
@@ -319,6 +351,7 @@ pub fn start_with(
     NeutrinoHandle {
         tx,
         identity: handoff_rx,
+        last_error: error_rx,
         discovery: discovery_for_handle,
         capture,
     }
@@ -333,13 +366,14 @@ mod tests {
         let nc = NeutrinoConfig {
             bind_addr: "127.0.0.1:8008".to_string(),
             localpart: "alice".to_string(),
+            server_name: None,
             storage_dir: "/data/neutrino".to_string(),
             outbound_concurrency: 0, // must clamp to 1
             lb_federation_port: Some(8448),
             trusted_network: true,
         };
         let cfg: neutrino_main::Config = nc.into();
-        // Dropped from the FFI surface → empty, which triggers identity derivation.
+        // `None` from the FFI surface → empty, which triggers identity derivation.
         assert_eq!(cfg.server_name, "");
         assert_eq!(cfg.bind_addr, "127.0.0.1:8008");
         assert_eq!(cfg.localpart, "alice");
@@ -348,6 +382,23 @@ mod tests {
         assert_eq!(cfg.lb_federation_port, Some(8448));
         // `federation_proxy` is internal/derived, never set from the FFI surface.
         assert_eq!(cfg.federation_proxy, None);
+    }
+
+    #[test]
+    fn neutrino_config_passes_through_configured_server_name() {
+        // A concrete name from the host is used verbatim (not derived); the
+        // server pins it on first start. `None` (the case above) derives instead.
+        let nc = NeutrinoConfig {
+            bind_addr: "127.0.0.1:8008".to_string(),
+            localpart: "alice".to_string(),
+            server_name: Some("hs.example".to_string()),
+            storage_dir: "/data/neutrino".to_string(),
+            outbound_concurrency: 4,
+            lb_federation_port: None,
+            trusted_network: true,
+        };
+        let cfg: neutrino_main::Config = nc.into();
+        assert_eq!(cfg.server_name, "hs.example");
     }
 
     #[test]
@@ -360,6 +411,7 @@ mod tests {
         let handle = NeutrinoHandle {
             tx,
             identity: tokio::sync::watch::channel::<Option<String>>(None).1,
+            last_error: tokio::sync::watch::channel::<Option<String>>(None).1,
             discovery: std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new()),
             capture: neutrino_main::CaptureControl::new(),
         };
@@ -376,6 +428,7 @@ mod tests {
         let handle = NeutrinoHandle {
             tx,
             identity: tokio::sync::watch::channel::<Option<String>>(None).1,
+            last_error: tokio::sync::watch::channel::<Option<String>>(None).1,
             discovery: std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new()),
             capture: neutrino_main::CaptureControl::new(),
         };
@@ -405,6 +458,7 @@ mod tests {
         let handle = NeutrinoHandle {
             tx: tokio::sync::mpsc::unbounded_channel().0,
             identity: tokio::sync::watch::channel::<Option<String>>(None).1,
+            last_error: tokio::sync::watch::channel::<Option<String>>(None).1,
             discovery,
             capture: neutrino_main::CaptureControl::new(),
         };
@@ -420,10 +474,35 @@ mod tests {
     }
 
     #[test]
+    fn last_error_reads_back_published_message() {
+        // The boot thread publishes the entrypoint's fatal error on this watch
+        // channel; `last_error()` reads the latest value so the host can raise a
+        // dialog. `None` before anything fails, `Some(msg)` after.
+        let (error_tx, error_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+        let handle = NeutrinoHandle {
+            tx: tokio::sync::mpsc::unbounded_channel().0,
+            identity: tokio::sync::watch::channel::<Option<String>>(None).1,
+            last_error: error_rx,
+            discovery: std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new()),
+            capture: neutrino_main::CaptureControl::new(),
+        };
+        assert_eq!(handle.last_error(), None, "no error before boot fails");
+        error_tx
+            .send(Some("server_name mismatch".to_string()))
+            .expect("publish");
+        assert_eq!(
+            handle.last_error(),
+            Some("server_name mismatch".to_string()),
+            "the published fatal error is observable by the host"
+        );
+    }
+
+    #[test]
     fn discovered_peers_empty_registry() {
         let handle = NeutrinoHandle {
             tx: tokio::sync::mpsc::unbounded_channel().0,
             identity: tokio::sync::watch::channel::<Option<String>>(None).1,
+            last_error: tokio::sync::watch::channel::<Option<String>>(None).1,
             discovery: std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new()),
             capture: neutrino_main::CaptureControl::new(),
         };
@@ -437,6 +516,7 @@ mod tests {
         let nc = NeutrinoConfig {
             bind_addr: "127.0.0.1:8008".to_string(),
             localpart: "alice".to_string(),
+            server_name: None,
             storage_dir: "/data/neutrino".to_string(),
             outbound_concurrency: 4,
             lb_federation_port: None,
