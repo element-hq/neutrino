@@ -11,6 +11,14 @@ mod watchdog;
 pub struct NeutrinoConfig {
     pub bind_addr: String,
     pub localpart: String,
+    /// The homeserver's federation `server_name` — the domain in
+    /// `@localpart:server_name`. `None` (or an empty string) lets the server
+    /// derive a stable name from its node identity, which is the embedded
+    /// default; the host then reads the result back via
+    /// `NeutrinoHandle::server_name()`. Set a concrete value to pin a specific
+    /// name: it is recorded on first start and every later start under a
+    /// different name is refused (see the server-name identity guard).
+    pub server_name: Option<String>,
     /// Absolute path to a writable directory the host owns (e.g. Android's
     /// `context.filesDir`). The DB is `<storage_dir>/neutrino.db`.
     pub storage_dir: String,
@@ -28,11 +36,11 @@ pub struct NeutrinoConfig {
 impl From<NeutrinoConfig> for neutrino_main::Config {
     fn from(c: NeutrinoConfig) -> Self {
         neutrino_main::Config {
-            // The embedded server has no operator-set name: it always derives its
-            // identity (a node id) from the persisted secret. An empty
-            // `server_name` triggers that derivation in the entrypoint; the host
-            // reads the result back via `NeutrinoHandle::server_name()`.
-            server_name: String::new(),
+            // Pass the host's choice through: `None`/empty derives the identity
+            // (a node id) from the persisted secret in the entrypoint — the
+            // embedded default, read back via `NeutrinoHandle::server_name()`; a
+            // concrete value is used verbatim (and pinned on first start).
+            server_name: c.server_name.unwrap_or_default(),
             bind_addr: c.bind_addr,
             localpart: c.localpart,
             storage_dir: std::path::PathBuf::from(c.storage_dir),
@@ -358,13 +366,14 @@ mod tests {
         let nc = NeutrinoConfig {
             bind_addr: "127.0.0.1:8008".to_string(),
             localpart: "alice".to_string(),
+            server_name: None,
             storage_dir: "/data/neutrino".to_string(),
             outbound_concurrency: 0, // must clamp to 1
             lb_federation_port: Some(8448),
             trusted_network: true,
         };
         let cfg: neutrino_main::Config = nc.into();
-        // Dropped from the FFI surface → empty, which triggers identity derivation.
+        // `None` from the FFI surface → empty, which triggers identity derivation.
         assert_eq!(cfg.server_name, "");
         assert_eq!(cfg.bind_addr, "127.0.0.1:8008");
         assert_eq!(cfg.localpart, "alice");
@@ -373,6 +382,23 @@ mod tests {
         assert_eq!(cfg.lb_federation_port, Some(8448));
         // `federation_proxy` is internal/derived, never set from the FFI surface.
         assert_eq!(cfg.federation_proxy, None);
+    }
+
+    #[test]
+    fn neutrino_config_passes_through_configured_server_name() {
+        // A concrete name from the host is used verbatim (not derived); the
+        // server pins it on first start. `None` (the case above) derives instead.
+        let nc = NeutrinoConfig {
+            bind_addr: "127.0.0.1:8008".to_string(),
+            localpart: "alice".to_string(),
+            server_name: Some("hs.example".to_string()),
+            storage_dir: "/data/neutrino".to_string(),
+            outbound_concurrency: 4,
+            lb_federation_port: None,
+            trusted_network: true,
+        };
+        let cfg: neutrino_main::Config = nc.into();
+        assert_eq!(cfg.server_name, "hs.example");
     }
 
     #[test]
@@ -490,6 +516,7 @@ mod tests {
         let nc = NeutrinoConfig {
             bind_addr: "127.0.0.1:8008".to_string(),
             localpart: "alice".to_string(),
+            server_name: None,
             storage_dir: "/data/neutrino".to_string(),
             outbound_concurrency: 4,
             lb_federation_port: None,
