@@ -394,8 +394,8 @@ CREATE TABLE pending_advertisements (
 -- ----------------------------------------------------------------------------
 -- server_identity — IdentityStore
 -- ----------------------------------------------------------------------------
--- A small key/value bag of the server's persistent identity facts. Two keys
--- today, room to add more without a schema change:
+-- A small key/value bag of the server's persistent identity facts, room to add
+-- more without a schema change:
 --   'secret'      — 32 raw bytes, generated once on first start by the caller
 --                   (a Rust CSPRNG — NOT SQLite's `randomblob`, which is not a
 --                   guaranteed CSPRNG; see `get_or_create_node_secret`). The
@@ -405,6 +405,13 @@ CREATE TABLE pending_advertisements (
 --                   transport layer's concern, not this table's.
 --   'displayname' — the local user's profile display name (text), set via
 --                   `PUT /profile/{user}/displayname` and read back by `/profile`.
+--   'trust_domain'— which trust domain the store's events belong to
+--                   (`transitive`/`signed`); first-write-wins, a mode switch on
+--                   existing data is refused (see `get_or_create_trust_domain`).
+--   'server_name' — the federation `server_name` the store was born under;
+--                   first-write-wins, a mismatch on restart is refused because
+--                   it would fork the server identity (see
+--                   `get_or_create_server_name`).
 -- The `secret` row is length-checked to 32 bytes; other keys are unconstrained.
 -- No `user_version` bump (additive, no live data, no migration framework — same
 -- policy as the other late tables).

@@ -342,6 +342,24 @@ async fn resolve_server_identity(
     if config.server_name.is_empty() {
         config.server_name = server_identity_from_secret(&secret);
     }
+    // Pin the effective name to the store on first start and refuse to boot if a
+    // later start disagrees. The name is baked into every stored event's
+    // sender/origin, so booting existing data under a different name forks the
+    // server's identity: the new name is a member of nothing, its rooms are
+    // orphaned, and peers can no longer route to it. First write wins, like the
+    // node secret and trust domain — wipe the database to change the name.
+    let recorded = store.get_or_create_server_name(&config.server_name).await?;
+    if recorded != config.server_name {
+        let msg = format!(
+            "server_name mismatch: this database was created as {recorded:?} but the server \
+             is starting as {:?}. The name is baked into every stored event, so changing it \
+             would fork the server's identity and orphan its rooms — delete the database to \
+             start fresh under the new name.",
+            config.server_name
+        );
+        tracing::error!("{msg}");
+        return Err(msg.into());
+    }
     Ok(secret)
 }
 
@@ -771,6 +789,45 @@ mod tests {
         resolve_server_identity(&mut second, &open(&tmp).await)
             .await
             .expect("second");
+        assert_eq!(first.server_name, second.server_name);
+    }
+
+    #[tokio::test]
+    async fn resolve_identity_refuses_name_change_on_existing_store() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        // First boot pins the configured name into the store.
+        let mut first = cfg_in(&tmp, "hs.example");
+        resolve_server_identity(&mut first, &open(&tmp).await)
+            .await
+            .expect("first boot pins the name");
+        // A later boot under a different name must be refused, not silently
+        // accepted — that would fork the server identity against existing data.
+        let mut second = cfg_in(&tmp, "other.example");
+        let err = resolve_server_identity(&mut second, &open(&tmp).await)
+            .await
+            .expect_err("name change must refuse startup");
+        let msg = err.to_string();
+        assert!(msg.contains("hs.example"), "error names the recorded value");
+        assert!(
+            msg.contains("other.example"),
+            "error names the attempted value"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_identity_derived_name_survives_across_restart() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        // The derived name is a pure function of the persisted secret, so the
+        // guard is a no-op on the embedded (empty-name) path: a second boot
+        // recomputes the identical name and passes.
+        let mut first = cfg_in(&tmp, "");
+        resolve_server_identity(&mut first, &open(&tmp).await)
+            .await
+            .expect("first");
+        let mut second = cfg_in(&tmp, "");
+        resolve_server_identity(&mut second, &open(&tmp).await)
+            .await
+            .expect("derived name re-passes the guard");
         assert_eq!(first.server_name, second.server_name);
     }
 }
