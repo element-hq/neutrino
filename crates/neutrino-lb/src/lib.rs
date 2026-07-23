@@ -11,7 +11,7 @@ pub mod transport;
 
 pub use error::LbError;
 pub use transport::coap::capture::{CaptureControl, PcapCaptureLink};
-pub use transport::coap::datagram::{DatagramLink, LinkProfile};
+pub use transport::coap::datagram::{DatagramLink, LinkAddr, LinkProfile};
 pub use transport::{DestinationResolver, DirectResolver};
 
 use std::net::SocketAddr;
@@ -204,13 +204,14 @@ pub struct LbConfig {
     /// How a destination `server_name` is turned into the address the egress
     /// dials. `None` = direct dial (the authority verbatim), which is the
     /// desktop / direct-LAN behaviour. The embedded datagram build supplies a
-    /// resolver that maps `server_name` → its 64-char hex node id.
+    /// resolver whose output is the peer's link address (e.g. the bare 64-char
+    /// hex node id on the node-id medium).
     pub resolver: Option<Arc<dyn DestinationResolver>>,
     /// In-process federation transport. When `Some`, the CoAP wire runs over this
-    /// datagram link (the embedded build) instead of a UDP socket — keyed by
-    /// 32-byte node id, so `ingress_bind` is unused on this path and the resolver
-    /// must yield a 64-char hex node id as the egress `dest`. `None` = UDP socket
-    /// (dev / direct-LAN), the existing behaviour.
+    /// datagram link (the embedded build) instead of a UDP socket — keyed by an
+    /// opaque medium-defined link address, so `ingress_bind` is unused on this
+    /// path and the resolver's output bytes are the egress `dest` verbatim.
+    /// `None` = UDP socket (dev / direct-LAN), the existing behaviour.
     pub link: Option<Arc<dyn DatagramLink>>,
 }
 
@@ -317,7 +318,7 @@ pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), 
 /// (CON / Q-Block, sizes) still comes from `config.wire`. The egress forward
 /// proxy on `egress_bind` and the resolver are transport-independent, so this
 /// reuses [`run_pair`] unchanged. `ingress_bind` is unused on this path (the link
-/// is keyed by node id, not an IP/port).
+/// is keyed by its own link addresses, not an IP/port).
 async fn serve_over_link(
     link: Arc<dyn DatagramLink>,
     config: LbConfig,
@@ -452,10 +453,10 @@ mod serve_selection_tests {
 
     #[async_trait::async_trait]
     impl DatagramLink for ParkedLink {
-        async fn send(&self, _dst: [u8; 32], _datagram: &[u8]) -> std::io::Result<()> {
+        async fn send(&self, _dst: &[u8], _datagram: &[u8]) -> std::io::Result<()> {
             Ok(())
         }
-        async fn recv(&self) -> Option<([u8; 32], Vec<u8>)> {
+        async fn recv(&self) -> Option<(Vec<u8>, Vec<u8>)> {
             std::future::pending().await
         }
     }

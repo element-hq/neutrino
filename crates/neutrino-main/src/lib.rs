@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 pub use neutrino_ctl::{Command, Config, DiscoveredPeer, DiscoveryRegistry};
 pub use neutrino_event::{KeyResolver, NodeIdKeyResolver};
-pub use neutrino_lb::{CaptureControl, DatagramLink, LinkProfile, PcapCaptureLink};
+pub use neutrino_lb::{CaptureControl, DatagramLink, LinkAddr, LinkProfile, PcapCaptureLink};
 
 use std::future::Future;
 use std::pin::Pin;
@@ -42,13 +42,19 @@ pub type DatagramLinkResult = Result<FederationLink, Box<dyn std::error::Error +
 /// share.
 ///
 /// Contract for implementors:
-/// - The link's peer-visible node id MUST be the ed25519 public key derived
-///   from `secret` — the server's `server_name` is its lowercase hex, and
-///   outbound federation dials peers by that 32-byte id.
-/// - The source node id a [`DatagramLink::recv`] tags each datagram with MUST
-///   be transport-authenticated. Events carry no signatures, so link-level
-///   authentication of the sender id is the only authentication in the system
-///   (the ingress binds a request's claimed `X-Matrix origin` to it).
+/// - Link addresses are medium-defined bytes: a peer's address is its
+///   federation `server_name` as the egress resolver renders it (UTF-8,
+///   verbatim, any length). On the node-id medium that is the lowercase 64-hex
+///   of the peer's ed25519 public key — and the local node id MUST then be the
+///   public key derived from `secret` (the server's derived `server_name` is
+///   its lowercase hex). Other media (e.g. mDNS LAN names) define their own
+///   naming; the datagram path never interprets the bytes.
+/// - The source address a [`DatagramLink::recv`] tags each datagram with MUST
+///   identify the sending peer as strongly as the medium can
+///   (`authenticates_connections` declares how strongly). Events carry no
+///   signatures on a trusted network, so that tag is what the ingress binds a
+///   request's claimed `X-Matrix origin` to (exact byte equality — names are
+///   canonical, lowercase for hex media).
 /// - The medium declares facts and capabilities, never policy: CoAP
 ///   fragmentation is sized from [`DatagramLink::profile`]'s `max_datagram`,
 ///   `authenticates_connections` states whether the hop is trusted, and the
@@ -62,8 +68,9 @@ pub struct LinkContext {
     /// value for peer discovery and re-advertises on change.
     pub display_name: watch::Receiver<String>,
     /// Shared out-of-band discovery registry. The medium writes the peers it
-    /// discovers into it, keyed by `server_name` (= lowercase hex node id);
-    /// user-directory search and the host's peer list read the same set.
+    /// discovers into it, keyed by each peer's federation `server_name` (on
+    /// the node-id medium: the lowercase hex node id); user-directory search
+    /// and the host's peer list read the same set.
     pub discovery: Arc<DiscoveryRegistry>,
     /// Command fan-in back into the server. A medium pulses
     /// [`Command::KickBackoff`] when a peer (re)appears so destinations that

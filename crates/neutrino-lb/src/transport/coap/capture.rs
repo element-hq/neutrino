@@ -64,7 +64,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
-use super::datagram::{DatagramLink, LinkProfile};
+use super::datagram::{DatagramLink, LinkAddr, LinkProfile};
 
 /// pcap classic magic (microsecond, little-endian on-disk).
 const PCAP_MAGIC: u32 = 0xa1b2_c3d4;
@@ -172,7 +172,7 @@ impl CaptureControl {
     /// Mirror one datagram into the active session, if any. A no-op (single lock,
     /// no allocation) when disarmed. Skips (debug-logged) any datagram too large
     /// for a single IPv4/UDP frame — a non-event for MTU-sized CoAP blocks.
-    fn record(&self, local_is_src: bool, node: [u8; 32], payload: &[u8]) {
+    fn record(&self, local_is_src: bool, node: &[u8], payload: &[u8]) {
         let mut guard = self.active.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(session) = guard.as_mut() else {
             return;
@@ -249,14 +249,14 @@ impl PcapCaptureLink {
 
 #[async_trait]
 impl DatagramLink for PcapCaptureLink {
-    async fn send(&self, dst: [u8; 32], datagram: &[u8]) -> io::Result<()> {
+    async fn send(&self, dst: &[u8], datagram: &[u8]) -> io::Result<()> {
         self.control.record(true, dst, datagram);
         self.inner.send(dst, datagram).await
     }
 
-    async fn recv(&self) -> Option<([u8; 32], Vec<u8>)> {
+    async fn recv(&self) -> Option<(LinkAddr, Vec<u8>)> {
         let (node, data) = self.inner.recv().await?;
-        self.control.record(false, node, &data);
+        self.control.record(false, &node, &data);
         Some((node, data))
     }
 
@@ -268,8 +268,8 @@ impl DatagramLink for PcapCaptureLink {
     }
 }
 
-/// Synthetic endpoint registry: node id → IP (plus a token-less fallback port),
-/// and (client, token) → per-exchange client port. Peers are minted from
+/// Synthetic endpoint registry: link address → IP (plus a token-less fallback
+/// port), and (client, token) → per-exchange client port. Peers are minted from
 /// `10.0.0.2` / fallback port `49153` upward (`10.0.0.1` / `49152` is the local
 /// node), stable per node for the life of a session. Per-token ports are minted
 /// *downward* from `65535` so the two spaces cannot collide in any realistic
@@ -277,16 +277,16 @@ impl DatagramLink for PcapCaptureLink {
 #[derive(Default)]
 struct NodeRegistry {
     next: u32,
-    map: HashMap<[u8; 32], (Ipv4Addr, u16)>,
+    map: HashMap<LinkAddr, (Ipv4Addr, u16)>,
     /// Count of per-token ports minted; port = `65535 - token_minted`.
     token_minted: u16,
     /// (client node — `None` is the local node — and exchange token) → port.
-    token_ports: HashMap<(Option<[u8; 32]>, Vec<u8>), u16>,
+    token_ports: HashMap<(Option<LinkAddr>, Vec<u8>), u16>,
 }
 
 impl NodeRegistry {
-    fn addr_for(&mut self, node: [u8; 32]) -> (Ipv4Addr, u16) {
-        if let Some(addr) = self.map.get(&node) {
+    fn addr_for(&mut self, node: &[u8]) -> (Ipv4Addr, u16) {
+        if let Some(addr) = self.map.get(node) {
             return *addr;
         }
         // First peer is 10.0.0.2 / 49153, rolling upward; fine for a debug capture.
@@ -294,7 +294,7 @@ impl NodeRegistry {
         let client_port = US_CLIENT_PORT + 1 + self.next as u16;
         self.next += 1;
         let addr = (ip, client_port);
-        self.map.insert(node, addr);
+        self.map.insert(node.to_vec(), addr);
         addr
     }
 
@@ -302,8 +302,8 @@ impl NodeRegistry {
     /// endpoint (so two clients reusing the same token bytes stay distinct) and
     /// the CoAP token. Wraps after 16k exchanges — acceptable for a debug
     /// capture window.
-    fn port_for(&mut self, client: Option<[u8; 32]>, token: &[u8]) -> u16 {
-        let key = (client, token.to_vec());
+    fn port_for(&mut self, client: Option<&[u8]>, token: &[u8]) -> u16 {
+        let key = (client.map(|c| c.to_vec()), token.to_vec());
         if let Some(&port) = self.token_ports.get(&key) {
             return port;
         }
@@ -444,12 +444,12 @@ mod tests {
 
     /// Minimal in-memory link: records sends, replays a preloaded inbox on recv.
     struct MockLink {
-        sent: Mutex<Vec<([u8; 32], Vec<u8>)>>,
-        inbox: Mutex<VecDeque<([u8; 32], Vec<u8>)>>,
+        sent: Mutex<Vec<(LinkAddr, Vec<u8>)>>,
+        inbox: Mutex<VecDeque<(LinkAddr, Vec<u8>)>>,
     }
 
     impl MockLink {
-        fn new(inbox: Vec<([u8; 32], Vec<u8>)>) -> Arc<Self> {
+        fn new(inbox: Vec<(LinkAddr, Vec<u8>)>) -> Arc<Self> {
             Arc::new(Self {
                 sent: Mutex::new(Vec::new()),
                 inbox: Mutex::new(inbox.into()),
@@ -459,11 +459,14 @@ mod tests {
 
     #[async_trait]
     impl DatagramLink for MockLink {
-        async fn send(&self, dst: [u8; 32], datagram: &[u8]) -> io::Result<()> {
-            self.sent.lock().unwrap().push((dst, datagram.to_vec()));
+        async fn send(&self, dst: &[u8], datagram: &[u8]) -> io::Result<()> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((dst.to_vec(), datagram.to_vec()));
             Ok(())
         }
-        async fn recv(&self) -> Option<([u8; 32], Vec<u8>)> {
+        async fn recv(&self) -> Option<(LinkAddr, Vec<u8>)> {
             self.inbox.lock().unwrap().pop_front()
         }
     }
@@ -473,10 +476,10 @@ mod tests {
 
     #[async_trait]
     impl DatagramLink for ProfiledLink {
-        async fn send(&self, _dst: [u8; 32], _datagram: &[u8]) -> io::Result<()> {
+        async fn send(&self, _dst: &[u8], _datagram: &[u8]) -> io::Result<()> {
             Ok(())
         }
-        async fn recv(&self) -> Option<([u8; 32], Vec<u8>)> {
+        async fn recv(&self) -> Option<(LinkAddr, Vec<u8>)> {
             None
         }
         fn profile(&self) -> LinkProfile {
@@ -583,29 +586,29 @@ mod tests {
     /// Q-Block transfer out of the next transfer's Wireshark reassembly stream.
     #[tokio::test]
     async fn token_scoped_client_ports_separate_exchanges() {
-        let node = [9u8; 32];
+        let node = b"peer-9".to_vec();
         // Inbound: a response to our token-A request, then a request from the
         // peer with its own token C.
         let resp_a = b"\x64\x45\x00\x01\x0A\x0B\x0C\x0D".to_vec(); // ACK 2.05, tok A
         let req_c = b"\x44\x02\x00\x03\xC0\xC1\xC2\xC3".to_vec(); // CON POST, tok C
-        let mock = MockLink::new(vec![(node, resp_a), (node, req_c)]);
+        let mock = MockLink::new(vec![(node.clone(), resp_a), (node.clone(), req_c)]);
         let control = CaptureControl::new();
         let link = PcapCaptureLink::wrap(mock, control.clone());
         let path = temp_pcap();
 
         control.start(path.to_str().unwrap()).unwrap();
-        link.send(node, b"\x44\x01\x00\x01\x0A\x0B\x0C\x0D")
+        link.send(&node, b"\x44\x01\x00\x01\x0A\x0B\x0C\x0D")
             .await
             .unwrap(); // req, tok A
-        link.send(node, b"\x44\x01\x00\x02\x0E\x0F\x10\x11")
+        link.send(&node, b"\x44\x01\x00\x02\x0E\x0F\x10\x11")
             .await
             .unwrap(); // req, tok B
         link.recv().await.unwrap(); // response, tok A
         link.recv().await.unwrap(); // peer request, tok C
-        link.send(node, b"\x64\x45\x00\x03\xC0\xC1\xC2\xC3")
+        link.send(&node, b"\x64\x45\x00\x03\xC0\xC1\xC2\xC3")
             .await
             .unwrap(); // our response, tok C
-        link.send(node, b"\x40\x01\x00\x09").await.unwrap(); // token-less req
+        link.send(&node, b"\x40\x01\x00\x09").await.unwrap(); // token-less req
         control.stop();
 
         let frames = frames_of(&path);
@@ -639,17 +642,17 @@ mod tests {
         let link = PcapCaptureLink::wrap(mock.clone(), control.clone());
         assert!(!control.is_active());
         // Traffic while disarmed is delegated untouched and captures nothing.
-        link.send([1u8; 32], b"hi").await.unwrap();
+        link.send(b"peer-1", b"hi").await.unwrap();
         assert_eq!(mock.sent.lock().unwrap().len(), 1);
         assert!(!control.is_active());
     }
 
     #[tokio::test]
     async fn start_capture_stop_writes_both_directions() {
-        let node = [7u8; 32];
+        let node = b"peer-7".to_vec();
         // A real 2.05 Content response inbound; a 0.01 GET request outbound.
         let inbound = b"\x60\x45\x00\x00coap-response".to_vec();
-        let mock = MockLink::new(vec![(node, inbound.clone())]);
+        let mock = MockLink::new(vec![(node.clone(), inbound.clone())]);
         let control = CaptureControl::new();
         let link = PcapCaptureLink::wrap(mock.clone(), control.clone());
         let path = temp_pcap();
@@ -657,7 +660,7 @@ mod tests {
         control.start(path.to_str().unwrap()).unwrap();
         assert!(control.is_active());
         let outbound = b"\x40\x01\xAB\xCDcoap-request";
-        link.send(node, outbound).await.unwrap();
+        link.send(&node, outbound).await.unwrap();
         let (_, got) = link.recv().await.unwrap();
         assert_eq!(got, inbound);
         assert!(control.stop(), "stop reports it was capturing");
@@ -682,16 +685,16 @@ mod tests {
 
     #[tokio::test]
     async fn ports_reflect_server_role_for_inbound_request() {
-        let node = [3u8; 32];
+        let node = b"peer-3".to_vec();
         let request = b"\x40\x02\x00\x00hello".to_vec(); // 0.02 POST from the peer
-        let mock = MockLink::new(vec![(node, request.clone())]);
+        let mock = MockLink::new(vec![(node.clone(), request.clone())]);
         let control = CaptureControl::new();
         let link = PcapCaptureLink::wrap(mock, control.clone());
         let path = temp_pcap();
 
         control.start(path.to_str().unwrap()).unwrap();
         link.recv().await.unwrap(); // inbound request: peer is the client
-        link.send(node, b"\x60\x45\x00\x00world").await.unwrap(); // our 2.05 response
+        link.send(&node, b"\x60\x45\x00\x00world").await.unwrap(); // our 2.05 response
         control.stop();
 
         let frames = frames_of(&path);
@@ -716,15 +719,15 @@ mod tests {
         // First session: peer `b` is the second node seen, so it gets 10.0.0.3.
         let first = temp_pcap();
         control.start(first.to_str().unwrap()).unwrap();
-        link.send([1u8; 32], b"a").await.unwrap();
-        link.send([2u8; 32], b"b").await.unwrap();
+        link.send(b"peer-1", b"a").await.unwrap();
+        link.send(b"peer-2", b"b").await.unwrap();
         control.stop();
 
         // Second session must start a fresh file AND a fresh IP registry, so the
         // first node seen is 10.0.0.2 again (no bleed from the prior session).
         let second = temp_pcap();
         control.start(second.to_str().unwrap()).unwrap();
-        link.send([2u8; 32], b"b").await.unwrap();
+        link.send(b"peer-2", b"b").await.unwrap();
         control.stop();
 
         let f1 = frames_of(&first);
