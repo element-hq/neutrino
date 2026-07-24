@@ -1,8 +1,9 @@
 //! In-process datagram-backed CoAP wire path, a sibling of the UDP path in the
 //! parent module. For the embedded/Android target the OS UDP socket is replaced
-//! by an injected transport keyed by a 32-byte peer **node id** — no socket, no
-//! IP, no ports. The concrete link (a QUIC endpoint over the BLE mesh) lives
-//! out of tree; this module defines the [`DatagramLink`] seam it implements.
+//! by an injected transport keyed by an opaque, medium-defined **link address**
+//! (a byte string — no socket, no IP, no ports). The concrete link (e.g. a QUIC
+//! endpoint over the BLE mesh) lives out of
+//! tree; this module defines the [`DatagramLink`] seam it implements.
 //!
 //! ## Why a Hub
 //!
@@ -23,24 +24,26 @@
 //! coap-rs is structured around `SocketAddr`: it keys per-peer blockwise / Q-Block
 //! reassembly state by `Responder::address()`, and `ClientTransport::recv`
 //! returns an informational `Option<SocketAddr>`. We have no real address, so the
-//! [`Hub`] hands each 32-byte node a UNIQUE synthetic `SocketAddr` PURELY as that
+//! [`Hub`] hands each link address a UNIQUE synthetic `SocketAddr` PURELY as that
 //! in-process key ([`Hub::addr_for`]). It is never bound and never put on a wire;
-//! the real routing is the 32-byte node id carried alongside.
+//! the real routing is the link address carried alongside.
 //!
 //! The mapping is a lossless **bijection** (a monotonic counter), not a hash of
-//! the node bytes — because the *exact* source node must be recoverable from
-//! `request.source` ([`Hub::node_for`]) for the origin↔node binding below. A
-//! lossy projection would let a peer grind a key whose projection collides a
-//! victim's and be resolved as the victim.
+//! the address bytes — because the *exact* source address must be recoverable
+//! from `request.source` ([`Hub::node_for`]) for the origin↔source binding below.
+//! A lossy projection would let a peer grind an address whose projection collides
+//! a victim's and be resolved as the victim.
 //!
-//! ## Why an origin↔node binding
+//! ## Why an origin↔source binding
 //!
-//! The link cryptographically authenticates the source node, and a peer's
-//! federation `server_name` IS that node's hex id. `federation::auth` trusts the
-//! `X-Matrix origin` header *solely because the network layer authenticated the
-//! peer* — so this layer MUST enforce that an authenticated peer asserts only its
-//! own origin. [`Hub::origin_binding_violation`] rejects a request whose claimed
-//! `origin` node id ≠ the authenticated source node (impersonation).
+//! The link authenticates the source of each inbound datagram, and a peer's link
+//! address IS its federation `server_name` as the egress resolver renders it
+//! (UTF-8 bytes, verbatim — e.g. the 64-hex node id on an authenticated QUIC
+//! medium). `federation::auth` trusts the `X-Matrix origin` header *solely
+//! because the network layer authenticated the peer* — so this layer MUST enforce
+//! that an authenticated peer asserts only its own origin.
+//! [`Hub::origin_binding_violation`] rejects a request whose claimed `origin`
+//! bytes ≠ the authenticated source address (impersonation).
 
 use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
@@ -63,8 +66,16 @@ use crate::transport::{
 
 use super::{CoapDispatch, MAX_QBLOCK_INFLIGHT_TRANSFERS, exchange, random_token_seed};
 
-/// A datagram tagged with the 32-byte node it came from / is bound for.
-type NodeDatagram = ([u8; 32], Vec<u8>);
+/// A peer's link-layer address: its federation `server_name` as the egress
+/// resolver renders it, UTF-8 bytes, verbatim. Opaque to this crate — the
+/// medium defines what the bytes mean (a 64-hex node id for an authenticated
+/// QUIC medium) and any length is
+/// legal. Comparisons are exact bytes, so a `server_name` must be canonical
+/// (lowercase hex media produce lowercase).
+pub type LinkAddr = Vec<u8>;
+
+/// A datagram tagged with the link address it came from / is bound for.
+type NodeDatagram = (LinkAddr, Vec<u8>);
 
 /// Wire-level facts a medium declares about its link, consumed to derive CoAP
 /// framing (fragment sizing from `max_datagram`). Deliberately facts, not
@@ -82,13 +93,14 @@ pub struct LinkProfile {
     /// (1280 B in this build) buy nothing: a serialized CoAP message is
     /// capped there regardless.
     pub max_datagram: usize,
-    /// "Trust the hop": whether the transport authenticates the source node
-    /// ids `recv` tags datagrams with. When `true`, the ingress origin↔node
-    /// binding and any origin-addressed request handling are meaningful; an
-    /// unauthenticated link (e.g. a future anonymous store-and-forward relay)
-    /// declares `false` and relies on message signatures for origin trust
-    /// instead. Independent of the app's `trusted_network` config — all four
-    /// combinations are valid deployments.
+    /// "Trust the hop": whether the transport authenticates the source
+    /// addresses `recv` tags datagrams with. When `true`, the ingress
+    /// origin↔source binding and any origin-addressed request handling are
+    /// meaningful; an unauthenticated link (e.g. a plain-UDP LAN medium or a
+    /// future anonymous store-and-forward relay) declares `false` and relies
+    /// on message signatures — or the app's trusted-network posture — for
+    /// origin trust instead. Independent of the app's `trusted_network`
+    /// config — all four combinations are valid deployments.
     pub authenticates_connections: bool,
 }
 
@@ -105,23 +117,27 @@ impl Default for LinkProfile {
     }
 }
 
-/// The transport seam. The embedded composition injects an implementation (an
-/// authenticated QUIC endpoint, dialed over the BLE mesh on device) keyed by a
-/// 32-byte peer node id; lb never names the concrete transport. A single
+/// The transport seam. The embedded composition injects an implementation
+/// (e.g. an authenticated QUIC endpoint dialed over the BLE mesh)
+/// keyed by an opaque [`LinkAddr`]; lb never
+/// names the concrete transport or interprets the address bytes. A single
 /// instance multiplexes BOTH directions (see the module-level Hub note).
 ///
-/// Implementors MUST authenticate the source node id `recv` tags datagrams
-/// with — the ingress builds its origin↔node impersonation gate on it (see
+/// Implementors MUST tag each `recv` datagram with the source peer's link
+/// address — exactly the bytes the egress resolver yields for that peer's
+/// `server_name` — authenticated as strongly as the medium can
+/// ([`LinkProfile::authenticates_connections`] declares how strongly). The
+/// ingress builds its origin↔source impersonation gate on that tag (see
 /// `LinkContext` in neutrino-main for the full contract).
 #[async_trait]
 pub trait DatagramLink: Send + Sync {
-    /// Best-effort send of one datagram to peer node `dst` (32-byte id). A
+    /// Best-effort send of one datagram to the peer addressed by `dst`. A
     /// CoAP-level CON/Q-Block exchange tolerates loss, so "best effort" is the
     /// right contract: coap-rs drives retransmit/recovery on top.
-    async fn send(&self, dst: [u8; 32], datagram: &[u8]) -> std::io::Result<()>;
-    /// Next inbound `(cryptographically-authenticated source node, datagram)`, or
-    /// `None` once the link is closed (which ends the [`Hub`] drain task).
-    async fn recv(&self) -> Option<([u8; 32], Vec<u8>)>;
+    async fn send(&self, dst: &[u8], datagram: &[u8]) -> std::io::Result<()>;
+    /// Next inbound `(source link address, datagram)`, or `None` once the link
+    /// is closed (which ends the [`Hub`] drain task).
+    async fn recv(&self) -> Option<(LinkAddr, Vec<u8>)>;
     /// The wire-level link facts CoAP framing is derived from — see
     /// [`LinkProfile`]. Defaults to today's assumptions so existing
     /// implementations are unaffected. Decorators MUST delegate to the wrapped
@@ -132,37 +148,37 @@ pub trait DatagramLink: Send + Sync {
 }
 
 /// Mux/demux over one [`DatagramLink`]. Owns the link, runs one background drain
-/// task that classifies every inbound datagram, and hands out per-node client
+/// task that classifies every inbound datagram, and hands out per-peer client
 /// inboxes (for [`LinkClientTransport`]) plus the single requests receiver (for
 /// [`LinkCoapListener`]).
 pub struct Hub {
     link: Arc<dyn DatagramLink>,
-    /// Per-node client inbox senders. A response datagram for node `n` is pushed
+    /// Per-peer client inbox senders. A response datagram from peer `n` is pushed
     /// onto `clients[n]`; the matching `LinkClientTransport::recv` drains it.
     /// A `std::sync::Mutex` (never held across an await — every critical section
     /// is one map op), so the inbox can be installed *synchronously* while the
     /// egress pool slot is claimed, keeping the pooled client and its inbox in
     /// lockstep (see [`LinkCoapWireClient::client_for`]).
-    clients: std::sync::Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<Vec<u8>>>>,
+    clients: std::sync::Mutex<HashMap<LinkAddr, mpsc::UnboundedSender<Vec<u8>>>>,
     /// The server-side request feed. The drain task pushes inbound *requests*
     /// here; the listener takes the receiver exactly once via [`Hub::take_requests`].
     requests_tx: mpsc::UnboundedSender<NodeDatagram>,
     requests_rx: Mutex<Option<mpsc::UnboundedReceiver<NodeDatagram>>>,
-    /// Lossless node ↔ synthetic-`SocketAddr` bijection (see the module note).
-    /// A `std::sync::Mutex` (every critical section is one or two map ops, never
-    /// held across an await).
+    /// Lossless link-address ↔ synthetic-`SocketAddr` bijection (see the module
+    /// note). A `std::sync::Mutex` (every critical section is one or two map ops,
+    /// never held across an await).
     addrs: std::sync::Mutex<AddrRegistry>,
 }
 
-/// The node ↔ synthetic-`SocketAddr` bijection. A monotonic counter mints a fresh
-/// address per node, so distinct nodes never alias and the exact node is
-/// recoverable from any address it minted — the soundness requirement for the
-/// origin↔node binding.
+/// The link-address ↔ synthetic-`SocketAddr` bijection. A monotonic counter mints
+/// a fresh address per peer, so distinct peers never alias and the exact link
+/// address is recoverable from any address it minted — the soundness requirement
+/// for the origin↔source binding.
 #[derive(Default)]
 struct AddrRegistry {
     next: u128,
-    node_to_addr: HashMap<[u8; 32], SocketAddr>,
-    addr_to_node: HashMap<SocketAddr, [u8; 32]>,
+    node_to_addr: HashMap<LinkAddr, SocketAddr>,
+    addr_to_node: HashMap<SocketAddr, LinkAddr>,
 }
 
 impl Hub {
@@ -193,7 +209,7 @@ impl Hub {
     /// pooled `CoAPClient` are always the same transport — a concurrent first-send
     /// to the same node can't leave the pool pointing at one transport while the
     /// drain task routes responses to another's (discarded) inbox.
-    fn install_client(&self, node: [u8; 32], tx: mpsc::UnboundedSender<Vec<u8>>) {
+    fn install_client(&self, node: LinkAddr, tx: mpsc::UnboundedSender<Vec<u8>>) {
         self.clients
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -209,12 +225,12 @@ impl Hub {
     /// Route one classified response datagram to its per-node client inbox.
     /// Drops (debug-logged) when no inbox is registered for `node` — e.g. a late
     /// response after the exchange's transport was dropped.
-    fn deliver_response(&self, node: [u8; 32], bytes: Vec<u8>) {
+    fn deliver_response(&self, node: &[u8], bytes: Vec<u8>) {
         let tx = self
             .clients
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&node)
+            .get(node)
             .cloned();
         match tx {
             Some(tx) => {
@@ -230,36 +246,38 @@ impl Hub {
     /// Purely an in-process coap-rs key — never bound, never on a wire. Distinct
     /// nodes get distinct addresses (a monotonic counter), so the mapping is a
     /// bijection and [`Hub::node_for`] recovers the exact node.
-    fn addr_for(&self, node: [u8; 32]) -> SocketAddr {
+    fn addr_for(&self, node: &[u8]) -> SocketAddr {
         let mut reg = self.addrs.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(addr) = reg.node_to_addr.get(&node) {
+        if let Some(addr) = reg.node_to_addr.get(node) {
             return *addr;
         }
         let id = reg.next;
         reg.next = reg.next.wrapping_add(1);
         let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(id), 0, 0, 0));
-        reg.node_to_addr.insert(node, addr);
-        reg.addr_to_node.insert(addr, node);
+        reg.node_to_addr.insert(node.to_vec(), addr);
+        reg.addr_to_node.insert(addr, node.to_vec());
         addr
     }
 
-    /// Recover the exact node a synthetic `SocketAddr` was minted for, or `None`
-    /// if it was not minted by this hub.
-    fn node_for(&self, addr: SocketAddr) -> Option<[u8; 32]> {
+    /// Recover the exact link address a synthetic `SocketAddr` was minted for, or
+    /// `None` if it was not minted by this hub.
+    fn node_for(&self, addr: SocketAddr) -> Option<LinkAddr> {
         self.addrs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .addr_to_node
             .get(&addr)
-            .copied()
+            .cloned()
     }
 
     /// SECURITY — the trust-boundary binding `federation::auth` defers to. The
-    /// link authenticates the source node, and a peer's federation `server_name`
-    /// IS that node's 64-hex id, so a peer may assert only its OWN origin. Returns
-    /// `true` if the request MUST be rejected: a forwarded `X-Matrix origin` whose
-    /// node id ≠ the authenticated source `node` (impersonation), or a malformed
-    /// origin / unrecognised source over an authenticated link. A request with no
+    /// link tags each datagram with its source's link address, and a peer's
+    /// address IS its federation `server_name` as the resolver renders it, so a
+    /// peer may assert only its OWN origin. Returns `true` if the request MUST
+    /// be rejected: a forwarded `X-Matrix origin` whose bytes ≠ the source's
+    /// link address (impersonation), or an unrecognised source. The comparison
+    /// is exact bytes — a `server_name` is canonical (hex media produce
+    /// lowercase), so no case-folding happens here. A request with no
     /// `authorization` header claims no server identity, so it is left for the
     /// upstream's own auth gate (a 401 on protected routes) rather than
     /// over-rejected here (e.g. an unauthenticated `/version`).
@@ -274,19 +292,13 @@ impl Hub {
         else {
             return false; // no claimed origin — defer to the upstream auth gate
         };
-        // A server identity is now being asserted; it MUST match the authenticated
-        // source node. An unknown source or unparseable origin is a hard reject.
+        // A server identity is now being asserted; it MUST match the source's
+        // link address. An unknown source or unparseable origin is a hard reject.
         let Some(node) = source.and_then(|addr| self.node_for(addr)) else {
             return true;
         };
-        // The origin is a `server_name` == 64-hex node id; decode and compare bytes
-        // (case-insensitive via `parse_node`) rather than re-encoding the node.
-        match std::str::from_utf8(value)
-            .ok()
-            .and_then(xmatrix_origin)
-            .and_then(|origin| parse_node(origin).ok())
-        {
-            Some(claimed) => claimed != node,
+        match std::str::from_utf8(value).ok().and_then(xmatrix_origin) {
+            Some(origin) => origin.as_bytes() != node.as_slice(),
             None => true,
         }
     }
@@ -322,7 +334,7 @@ async fn drain_loop(hub: Arc<Hub>) {
                     tracing::debug!("datagram: requests channel closed, dropping request");
                 }
             }
-            Class::Response => hub.deliver_response(node, bytes),
+            Class::Response => hub.deliver_response(&node, bytes),
             Class::Drop => tracing::debug!("datagram: undecodable datagram, dropping"),
         }
     }
@@ -358,7 +370,7 @@ fn classify(bytes: &[u8]) -> Class {
 /// coap-rs [`ClientTransport`](coap::client::ClientTransport) bound to one peer
 /// node. Sends go straight to the link; receives drain this node's Hub inbox.
 pub struct LinkClientTransport {
-    node: [u8; 32],
+    node: LinkAddr,
     hub: Arc<Hub>,
     /// This node's response inbox (its sender is installed into the Hub by
     /// [`LinkCoapWireClient::client_for`] when it wins the pool slot). `Mutex`
@@ -372,7 +384,7 @@ impl LinkClientTransport {
     /// datagrams. Construction has no shared side effect: the matching sender is
     /// installed into the Hub by the pool winner, so a discarded losing build
     /// registers nothing.
-    fn new(node: [u8; 32], hub: Arc<Hub>, inbox: mpsc::UnboundedReceiver<Vec<u8>>) -> Self {
+    fn new(node: LinkAddr, hub: Arc<Hub>, inbox: mpsc::UnboundedReceiver<Vec<u8>>) -> Self {
         Self {
             node,
             hub,
@@ -384,7 +396,7 @@ impl LinkClientTransport {
 #[async_trait]
 impl coap::client::ClientTransport for LinkClientTransport {
     async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        self.hub.link().send(self.node, buf).await?;
+        self.hub.link().send(&self.node, buf).await?;
         Ok(buf.len())
     }
 
@@ -396,7 +408,7 @@ impl coap::client::ClientTransport for LinkClientTransport {
                 // practice; the clamp is defensive.
                 let n = bytes.len().min(buf.len());
                 buf[..n].copy_from_slice(&bytes[..n]);
-                Ok((n, Some(self.hub.addr_for(self.node))))
+                Ok((n, Some(self.hub.addr_for(&self.node))))
             }
             // Hub gone (link closed): end coap-rs's receive loop cleanly rather
             // than spinning. `BrokenPipe` is the natural "peer/link went away".
@@ -427,9 +439,9 @@ impl Listener for LinkCoapListener {
         Ok(tokio::spawn(async move {
             while let Some((node, bytes)) = requests_rx.recv().await {
                 let responder = Arc::new(LinkResponder {
-                    node,
+                    addr: hub.addr_for(&node),
                     link: hub.link(),
-                    addr: hub.addr_for(node),
+                    node,
                 });
                 if sender.send((bytes, responder)).is_err() {
                     break; // server loop gone
@@ -444,7 +456,7 @@ impl Listener for LinkCoapListener {
 /// node over the link. `address()` returns the same synthetic key coap-rs used to
 /// track this peer's reassembly state.
 struct LinkResponder {
-    node: [u8; 32],
+    node: LinkAddr,
     link: Arc<dyn DatagramLink>,
     addr: SocketAddr,
 }
@@ -452,7 +464,7 @@ struct LinkResponder {
 #[async_trait]
 impl Responder for LinkResponder {
     async fn respond(&self, response: Vec<u8>) {
-        if let Err(e) = self.link.send(self.node, &response).await {
+        if let Err(e) = self.link.send(&self.node, &response).await {
             tracing::debug!("datagram: responder send failed: {e}");
         }
     }
@@ -465,8 +477,8 @@ impl Responder for LinkResponder {
 /// [`super::CoapWireClient`]: it pools one `CoAPClient<LinkClientTransport>` per
 /// peer node and delegates the actual exchange to the shared [`exchange`] helper,
 /// so token tagging, CON/Q-Block selection, the response body cap and the
-/// whole-exchange timeout are NOT duplicated. The peer node is parsed from
-/// `WireRequest.dest` as a 64-char hex node id.
+/// whole-exchange timeout are NOT duplicated. The peer's link address is
+/// `WireRequest.dest`'s UTF-8 bytes, verbatim — never interpreted here.
 pub struct LinkCoapWireClient {
     hub: Arc<Hub>,
     block1_size: Option<usize>,
@@ -476,7 +488,7 @@ pub struct LinkCoapWireClient {
     /// Per-node client pool. Each `CoAPClient` owns one inbox registration and
     /// spawns one coap-rs receive task; pooling reuses it across requests to a
     /// peer. Sharing is safe because each request carries a unique token.
-    pool: Mutex<HashMap<[u8; 32], Arc<CoAPClient<LinkClientTransport>>>>,
+    pool: Mutex<HashMap<LinkAddr, Arc<CoAPClient<LinkClientTransport>>>>,
     token_counter: AtomicU32,
 }
 
@@ -524,8 +536,8 @@ impl LinkCoapWireClient {
     /// spawning its receive task) on first use. The pool lock is not held across
     /// the `await` that builds the client; a race on the same node discards the
     /// loser.
-    async fn client_for(&self, node: [u8; 32]) -> Arc<CoAPClient<LinkClientTransport>> {
-        if let Some(client) = self.pool.lock().await.get(&node).cloned() {
+    async fn client_for(&self, node: &[u8]) -> Arc<CoAPClient<LinkClientTransport>> {
+        if let Some(client) = self.pool.lock().await.get(node).cloned() {
             return client;
         }
         // Build the (cheap, I/O-free) transport + client outside the pool lock; its
@@ -533,8 +545,11 @@ impl LinkCoapWireClient {
         // below, so a losing concurrent first-send registers nothing and is just
         // dropped (its `rx` dies with it).
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut client =
-            CoAPClient::from_transport(LinkClientTransport::new(node, self.hub.clone(), rx));
+        let mut client = CoAPClient::from_transport(LinkClientTransport::new(
+            node.to_vec(),
+            self.hub.clone(),
+            rx,
+        ));
         if let Some(size) = self.block1_size {
             client.set_block1_size(size);
         }
@@ -554,45 +569,18 @@ impl LinkCoapWireClient {
         // transport's inbox and every request to that peer would time out until an
         // error rebuilt the client.
         let mut pool = self.pool.lock().await;
-        if let Some(existing) = pool.get(&node) {
+        if let Some(existing) = pool.get(node) {
             return existing.clone();
         }
-        self.hub.install_client(node, tx);
-        pool.insert(node, client.clone());
+        self.hub.install_client(node.to_vec(), tx);
+        pool.insert(node.to_vec(), client.clone());
         client
     }
 
     /// Drop the pooled client for `node` so the next send rebuilds it (re-registers
     /// the inbox, ends the stale receive task).
-    async fn evict(&self, node: [u8; 32]) {
-        self.pool.lock().await.remove(&node);
-    }
-}
-
-/// Parse `dest` as a 64-char (32-byte) hex node id (either case).
-fn parse_node(dest: &str) -> Result<[u8; 32], WireError> {
-    if dest.len() != 64 {
-        return Err(WireError::Transport(format!(
-            "node id must be 64 hex chars, got {}",
-            dest.len()
-        )));
-    }
-    let bytes = dest.as_bytes();
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let hi = hex_nibble(bytes[i * 2])?;
-        let lo = hex_nibble(bytes[i * 2 + 1])?;
-        *byte = (hi << 4) | lo;
-    }
-    Ok(out)
-}
-
-fn hex_nibble(c: u8) -> Result<u8, WireError> {
-    match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(c - b'a' + 10),
-        b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => Err(WireError::Transport("node id has non-hex char".to_owned())),
+    async fn evict(&self, node: &[u8]) {
+        self.pool.lock().await.remove(node);
     }
 }
 
@@ -606,7 +594,12 @@ impl WireClient for LinkCoapWireClient {
                 "coap block1_size must be non-zero".to_owned(),
             ));
         }
-        let node = parse_node(&req.dest)?;
+        // The dest string's bytes ARE the peer's link address — opaque here, the
+        // medium defines their meaning. An empty dest can address nothing.
+        if req.dest.is_empty() {
+            return Err(WireError::Transport("empty destination address".to_owned()));
+        }
+        let node = req.dest.as_bytes();
         // Per-request federation egress trace: the destination node, the request,
         // and the body size (the load-bearing field — a body over the Q-Block
         // block size must fit `block size + option overhead` within coap-lite's
@@ -732,25 +725,25 @@ mod mock {
     use super::*;
 
     /// One end of an in-memory [`DatagramLink`] pair. `send(dst, bytes)` enqueues
-    /// onto the peer's inbound channel tagged with *this* end's node id, so the
-    /// peer's `recv` yields `(our_node, bytes)` — exactly the link contract
-    /// (recv's source node is cryptographically authenticated; here it's just the
-    /// sender's known id).
+    /// onto the peer's inbound channel tagged with *this* end's link address, so
+    /// the peer's `recv` yields `(our_node, bytes)` — exactly the link contract
+    /// (recv's source address is authenticated by the medium; here it's just the
+    /// sender's known address).
     pub struct MockLink {
-        our_node: [u8; 32],
-        peer_node: [u8; 32],
+        our_node: LinkAddr,
+        peer_node: LinkAddr,
         to_peer: mpsc::UnboundedSender<NodeDatagram>,
         inbound: Mutex<mpsc::UnboundedReceiver<NodeDatagram>>,
     }
 
     impl MockLink {
-        /// Build a connected pair `(a, b)` with the given node ids.
-        pub fn pair(node_a: [u8; 32], node_b: [u8; 32]) -> (Arc<MockLink>, Arc<MockLink>) {
+        /// Build a connected pair `(a, b)` with the given link addresses.
+        pub fn pair(node_a: LinkAddr, node_b: LinkAddr) -> (Arc<MockLink>, Arc<MockLink>) {
             let (a_to_b, b_in) = mpsc::unbounded_channel();
             let (b_to_a, a_in) = mpsc::unbounded_channel();
             let a = Arc::new(MockLink {
-                our_node: node_a,
-                peer_node: node_b,
+                our_node: node_a.clone(),
+                peer_node: node_b.clone(),
                 to_peer: a_to_b,
                 inbound: Mutex::new(a_in),
             });
@@ -766,18 +759,18 @@ mod mock {
 
     #[async_trait]
     impl DatagramLink for MockLink {
-        async fn send(&self, dst: [u8; 32], datagram: &[u8]) -> std::io::Result<()> {
+        async fn send(&self, dst: &[u8], datagram: &[u8]) -> std::io::Result<()> {
             // The mock is a one-to-one link, so the only valid destination is the
             // configured peer; reject anything else so a mis-keyed test fails loud.
-            if dst != self.peer_node {
+            if dst != self.peer_node.as_slice() {
                 return Err(std::io::Error::other("mock link: unknown destination"));
             }
             self.to_peer
-                .send((self.our_node, datagram.to_vec()))
+                .send((self.our_node.clone(), datagram.to_vec()))
                 .map_err(|_| std::io::Error::other("mock link: peer gone"))
         }
 
-        async fn recv(&self) -> Option<([u8; 32], Vec<u8>)> {
+        async fn recv(&self) -> Option<(LinkAddr, Vec<u8>)> {
             self.inbound.lock().await.recv().await
         }
     }
@@ -789,11 +782,14 @@ mod tests {
     use super::*;
     use axum::http::Method;
 
-    const NODE_A: [u8; 32] = [0xAA; 32];
-    const NODE_B: [u8; 32] = [0xBB; 32];
+    /// Test link addresses: short, readable, and deliberately neither 32 bytes
+    /// nor hex — the seam treats an address as opaque bytes of any length (it
+    /// is the peer's `server_name` as the resolver rendered it).
+    const ADDR_A: &str = "addr-a";
+    const ADDR_B: &str = "addr-b";
 
-    fn hex_node(node: [u8; 32]) -> String {
-        node.iter().map(|b| format!("{b:02x}")).collect()
+    fn addr(name: &str) -> LinkAddr {
+        name.as_bytes().to_vec()
     }
 
     /// Echoes the decoded path (as a forwardable header) + body, mirroring the UDP
@@ -821,7 +817,7 @@ mod tests {
         block1_size: Option<usize>,
         max_message_size: Option<usize>,
     ) -> (LinkCoapWireClient, CancellationToken, ServeHandle) {
-        let (a_link, b_link) = MockLink::pair(NODE_A, NODE_B);
+        let (a_link, b_link) = MockLink::pair(addr(ADDR_A), addr(ADDR_B));
         rig_with_links(
             a_link,
             b_link,
@@ -889,26 +885,19 @@ mod tests {
     // would let a peer be resolved as a different node.
     #[tokio::test]
     async fn addr_registry_is_a_lossless_bijection() {
-        let (link, _peer) = MockLink::pair(NODE_A, NODE_B);
+        let (link, _peer) = MockLink::pair(addr(ADDR_A), addr(ADDR_B));
         let hub = Hub::new(link);
-        let addr_a = hub.addr_for(NODE_A);
-        let addr_b = hub.addr_for(NODE_B);
+        let addr_a = hub.addr_for(&addr(ADDR_A));
+        let addr_b = hub.addr_for(&addr(ADDR_B));
         // Stable per node, distinct across nodes.
-        assert_eq!(addr_a, hub.addr_for(NODE_A));
+        assert_eq!(addr_a, hub.addr_for(&addr(ADDR_A)));
         assert_ne!(addr_a, addr_b);
         // The exact node is recoverable; an addr this hub never minted resolves
         // to nothing.
-        assert_eq!(hub.node_for(addr_a), Some(NODE_A));
-        assert_eq!(hub.node_for(addr_b), Some(NODE_B));
+        assert_eq!(hub.node_for(addr_a), Some(addr(ADDR_A)));
+        assert_eq!(hub.node_for(addr_b), Some(addr(ADDR_B)));
         let unminted = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(u128::MAX), 9999, 0, 0));
         assert_eq!(hub.node_for(unminted), None);
-    }
-
-    #[test]
-    fn parse_node_round_trips_hex() {
-        assert_eq!(parse_node(&hex_node(NODE_A)).unwrap(), NODE_A);
-        assert!(parse_node("xyz").is_err());
-        assert!(parse_node(&"zz".repeat(32)).is_err());
     }
 
     // A small CON request/response must round-trip over the mock link: status,
@@ -918,7 +907,7 @@ mod tests {
         let (client, token, handle) = rig(None, None, None, None).await;
         let resp = client
             .send(WireRequest {
-                dest: hex_node(NODE_B),
+                dest: ADDR_B.to_owned(),
                 method: Method::PUT,
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![],
@@ -947,7 +936,7 @@ mod tests {
         let req_body: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
         let resp = client
             .send(WireRequest {
-                dest: hex_node(NODE_B),
+                dest: ADDR_B.to_owned(),
                 method: Method::PUT,
                 path: "/_matrix/federation/v2/send_join/!r:a/$e".to_owned(),
                 headers: vec![],
@@ -968,7 +957,7 @@ mod tests {
         let req_body: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
         let resp = client
             .send(WireRequest {
-                dest: hex_node(NODE_B),
+                dest: ADDR_B.to_owned(),
                 method: Method::PUT,
                 path: "/_matrix/federation/v1/send/txnq".to_owned(),
                 headers: vec![],
@@ -1000,15 +989,17 @@ mod tests {
     const INVITE_PATH: &str = "/_matrix/federation/v2/invite/!88A_2bLzwjMwxHxn5qqlhVZziTR6FgpPA2Id9z181ho/$XaldBICd02USS2D4qfkuKS0Zmw86YYlucgi_yB7CpkI";
     fn invite_headers() -> Vec<(String, Vec<u8>)> {
         // The federation `Authorization: X-Matrix` header is the heavy, always-
-        // present FORWARDABLE option (origin + destination node ids + key + sig);
+        // present FORWARDABLE option (origin + destination + key + sig);
         // `content-type` etc. are dropped by the egress allowlist, but this is
         // forwarded into every block's PDU. ~280 B — enough that a 1024 block's PDU
-        // exceeds coap-lite's 1280 cap, but a 512 block stays under it.
+        // exceeds coap-lite's 1280 cap, but a 512 block stays under it. The origin
+        // MUST be the rig's source address (`ADDR_A`) or the ingress origin↔source
+        // gate 401s the request before the handler; the sig padding keeps the
+        // header's byte weight at the ~280 B the overflow test relies on.
         let auth = format!(
-            "X-Matrix origin=\"{}\",destination=\"{}\",key=\"ed25519:1\",sig=\"{}\"",
-            "a".repeat(64),
+            "X-Matrix origin=\"{ADDR_A}\",destination=\"{}\",key=\"ed25519:1\",sig=\"{}\"",
             "b".repeat(64),
-            "c".repeat(86),
+            "c".repeat(144),
         );
         vec![
             ("content-type".to_owned(), b"application/cbor".to_vec()),
@@ -1024,7 +1015,7 @@ mod tests {
         let body: Vec<u8> = (0..1141).map(|i| (i % 251) as u8).collect();
         let result = client
             .send(WireRequest {
-                dest: hex_node(NODE_B),
+                dest: ADDR_B.to_owned(),
                 method: Method::PUT,
                 path: INVITE_PATH.to_owned(),
                 headers: invite_headers(),
@@ -1047,7 +1038,7 @@ mod tests {
         let body: Vec<u8> = (0..1141).map(|i| (i % 251) as u8).collect();
         let resp = client
             .send(WireRequest {
-                dest: hex_node(NODE_B),
+                dest: ADDR_B.to_owned(),
                 method: Method::PUT,
                 path: INVITE_PATH.to_owned(),
                 headers: invite_headers(),
@@ -1121,7 +1112,7 @@ mod tests {
         const Q_BLOCK1: u16 = 19;
         const Q_BLOCK2: u16 = 31;
 
-        let (a_link, b_link) = MockLink::pair(NODE_A, NODE_B);
+        let (a_link, b_link) = MockLink::pair(addr(ADDR_A), addr(ADDR_B));
         let control = CaptureControl::new();
         let a_link = PcapCaptureLink::wrap(a_link, control.clone());
         let path = std::env::temp_dir().join(format!(
@@ -1143,7 +1134,7 @@ mod tests {
         let req_body: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
         let resp = client
             .send(WireRequest {
-                dest: hex_node(NODE_B),
+                dest: ADDR_B.to_owned(),
                 method: Method::PUT,
                 path: "/_matrix/federation/v1/send/txnw".to_owned(),
                 headers: vec![],
@@ -1189,7 +1180,7 @@ mod tests {
     // directions (request reached the server; its response reached this client).
     #[tokio::test]
     async fn classifier_routes_response_to_client_not_server() {
-        let (a_link, b_link) = MockLink::pair(NODE_A, NODE_B);
+        let (a_link, b_link) = MockLink::pair(addr(ADDR_A), addr(ADDR_B));
         let hub_a = Hub::new(a_link);
         let hub_b = Hub::new(b_link);
         let server = LinkCoapWireServer::new(hub_b, None);
@@ -1203,7 +1194,7 @@ mod tests {
         client.request_timeout = Duration::from_secs(2);
         let resp = client
             .send(WireRequest {
-                dest: hex_node(NODE_B),
+                dest: ADDR_B.to_owned(),
                 method: Method::GET,
                 path: "/_matrix/federation/v1/event/$e".to_owned(),
                 headers: vec![],
@@ -1219,7 +1210,7 @@ mod tests {
     // receiver is taken exactly once.
     #[tokio::test]
     async fn second_ingress_on_hub_is_refused() {
-        let (_a, b_link) = MockLink::pair(NODE_A, NODE_B);
+        let (_a, b_link) = MockLink::pair(addr(ADDR_A), addr(ADDR_B));
         let hub_b = Hub::new(b_link);
         let first = LinkCoapWireServer::new(hub_b.clone(), None);
         assert!(first.build_server().await.is_ok());
@@ -1238,18 +1229,18 @@ mod tests {
         )
     }
 
-    // SECURITY: the rig authenticates the inbound peer as NODE_A (B's link yields
-    // that source). A request whose `X-Matrix origin` is NODE_A's own id is the
+    // SECURITY: the rig authenticates the inbound peer as ADDR_A (B's link yields
+    // that source). A request whose `X-Matrix origin` is ADDR_A's own id is the
     // peer asserting its own identity, so it must be accepted and echoed.
     #[tokio::test]
     async fn authenticated_origin_matching_source_node_is_accepted() {
         let (client, token, handle) = rig(None, None, None, None).await;
         let resp = client
             .send(WireRequest {
-                dest: hex_node(NODE_B),
+                dest: ADDR_B.to_owned(),
                 method: Method::PUT,
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
-                headers: vec![xmatrix_auth(&hex_node(NODE_A))],
+                headers: vec![xmatrix_auth(ADDR_A)],
                 body: vec![1, 2, 3],
             })
             .await
@@ -1259,8 +1250,8 @@ mod tests {
         shutdown(token, handle).await;
     }
 
-    // SECURITY: the authenticated peer is NODE_A, but the request claims to
-    // be NODE_B. That is impersonation over an authenticated link and MUST be
+    // SECURITY: the authenticated peer is ADDR_A, but the request claims to
+    // be ADDR_B. That is impersonation over an authenticated link and MUST be
     // rejected with 401 before the handler runs — the EchoHandler can only ever
     // return 200, so a 401 proves the binding refused it pre-dispatch.
     #[tokio::test]
@@ -1268,11 +1259,11 @@ mod tests {
         let (client, token, handle) = rig(None, None, None, None).await;
         let resp = client
             .send(WireRequest {
-                dest: hex_node(NODE_B),
+                dest: ADDR_B.to_owned(),
                 method: Method::PUT,
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
-                // Claims NODE_B while the link authenticated the sender as NODE_A.
-                headers: vec![xmatrix_auth(&hex_node(NODE_B))],
+                // Claims ADDR_B while the link authenticated the sender as ADDR_A.
+                headers: vec![xmatrix_auth(ADDR_B)],
                 body: vec![1, 2, 3],
             })
             .await
@@ -1282,14 +1273,16 @@ mod tests {
         shutdown(token, handle).await;
     }
 
-    // A malformed origin (not a 64-hex node id) on an authenticated link cannot be
-    // bound to the source node, so it is rejected rather than trusted.
+    // An origin that matches no known link address (here: a DNS-ish name that is
+    // not the source's address bytes) cannot be bound to the source, so it is
+    // rejected rather than trusted. The comparison is exact bytes — there is no
+    // parse step to "almost" pass.
     #[tokio::test]
     async fn malformed_origin_is_rejected_with_401() {
         let (client, token, handle) = rig(None, None, None, None).await;
         let resp = client
             .send(WireRequest {
-                dest: hex_node(NODE_B),
+                dest: ADDR_B.to_owned(),
                 method: Method::GET,
                 path: "/_matrix/federation/v1/event/$e".to_owned(),
                 headers: vec![xmatrix_auth("not-a-node-id.example")],
@@ -1310,7 +1303,7 @@ mod tests {
         let (client, token, handle) = rig(None, None, None, None).await;
         let resp = client
             .send(WireRequest {
-                dest: hex_node(NODE_B),
+                dest: ADDR_B.to_owned(),
                 method: Method::GET,
                 path: "/_matrix/federation/v1/version".to_owned(),
                 headers: vec![],
@@ -1342,7 +1335,7 @@ mod tests {
                 let body = vec![i; 32 + i as usize];
                 let resp = client
                     .send(WireRequest {
-                        dest: hex_node(NODE_B),
+                        dest: ADDR_B.to_owned(),
                         method: Method::PUT,
                         path: format!("/_matrix/federation/v1/send/txn{i}"),
                         headers: vec![],

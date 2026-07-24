@@ -1,16 +1,19 @@
 //! Federation routing glue for the datagram link.
 //!
-//! A peer's federation `server_name` is its node id (lowercase hex, as derived
-//! by [`server_identity_from_secret`](crate::server_identity_from_secret)).
+//! On the node-id medium a peer's federation `server_name` is its node id
+//! (lowercase hex, as derived by
+//! [`server_identity_from_secret`](crate::server_identity_from_secret)).
 //! [`NodeIdResolver`] is the one pure step that maps that name onto the wire:
 //! it rewrites the federation egress destination to the peer's bare 64-char
-//! hex node id, which the sidecar's datagram egress (`LinkCoapWireClient`)
-//! parses and dials the peer's datagram link by. The transport over those node
-//! ids is the injected [`DatagramLink`](neutrino_lb::DatagramLink), out of
-//! tree.
+//! hex node id; the sidecar's datagram egress (`LinkCoapWireClient`) passes
+//! those bytes to the link verbatim as the peer's address. This is the ONLY
+//! name-aware code on the datagram path — a `server_name` that is not a node
+//! id trickles down to the injected
+//! [`DatagramLink`](neutrino_lb::DatagramLink) unaltered, and the medium
+//! defines what its bytes mean.
 
 use neutrino_lb::DestinationResolver;
-use tracing::warn;
+use tracing::debug;
 
 /// A node's stable cryptographic identity, as raw ed25519 public-key bytes — the
 /// hex of this is the peer's `server_name`. This layer only needs the byte
@@ -38,10 +41,11 @@ fn parse_server_name(authority: &str) -> Option<(NodeKey, Option<&str>)> {
     Some((key, port))
 }
 
-/// [`DestinationResolver`] for the datagram link: maps a peer `server_name` to
-/// its bare 64-char hex node id (the datagram egress addresses peers by node id,
-/// not by an IP/port). Non-node authorities pass through unchanged so direct-dial
-/// federation is unaffected.
+/// [`DestinationResolver`] for the datagram link: maps a node-id `server_name`
+/// to its bare 64-char hex node id (dropping any `:port` — meaningless on a
+/// link). Non-node authorities pass through unchanged: on the UDP path that is
+/// direct dial; on a link medium with its own naming the bytes reach the link
+/// verbatim as the peer's address.
 pub(crate) struct NodeIdResolver;
 
 impl NodeIdResolver {
@@ -53,12 +57,14 @@ impl NodeIdResolver {
 impl DestinationResolver for NodeIdResolver {
     fn resolve(&self, authority: String) -> String {
         match parse_server_name(&authority) {
-            // The datagram egress (`LinkCoapWireClient`) parses `dest` as a
-            // 64-char hex node id and dials the peer over the link by it, so
-            // return the bare node id — no vip, no port.
+            // The datagram egress (`LinkCoapWireClient`) hands `dest`'s bytes to
+            // the link as the peer's address, so return the bare node id — no
+            // vip, no port.
             Some((key, _port)) => hex::encode(key),
+            // Not a node id: a supported path (medium-defined naming or direct
+            // dial), not a misconfig — so debug, not warn.
             None => {
-                warn!(%authority, "node-id resolver: server_name is not a node id; dialing verbatim");
+                debug!(%authority, "node-id resolver: server_name is not a node id; passing through verbatim");
                 authority
             }
         }
