@@ -8,7 +8,7 @@
 //! hex node id; the sidecar's datagram egress (`LinkCoapWireClient`) passes
 //! those bytes to the link verbatim as the peer's address. This is the ONLY
 //! name-aware code on the datagram path — a `server_name` that is not a node
-//! id (e.g. a 4-hex mDNS LAN name) trickles down to the injected
+//! id trickles down to the injected
 //! [`DatagramLink`](neutrino_lb::DatagramLink) unaltered, and the medium
 //! defines what its bytes mean.
 

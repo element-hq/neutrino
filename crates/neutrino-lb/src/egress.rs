@@ -1,8 +1,10 @@
 //! Egress: the local→wire half. A forward proxy. `neutrino-http`'s reqwest is
 //! configured with this as its HTTP proxy, so requests arrive in absolute form
-//! (`PUT http://{dest}/path`). We read `dest` from the request authority,
-//! transcode the JSON body to CBOR, hand it to the `WireClient`, and re-encode
-//! the CBOR response to JSON.
+//! (`PUT http://{dest}~/path` — the client suffixes the host with a sentinel
+//! so numeric server names survive reqwest's WHATWG host parsing; see
+//! [`strip_host_sentinel`]). We read `dest` from the request authority,
+//! strip the sentinel, transcode the JSON body to CBOR, hand it to the
+//! `WireClient`, and re-encode the CBOR response to JSON.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -52,7 +54,11 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
     // egress-internal failure below), not 400: the homeserver's sender drops a
     // 4xx permanently while it retries a 5xx, and a recoverable misconfig must
     // not make it silently discard queued PDUs.
-    let Some(authority) = parts.uri.authority().map(|a| a.as_str().to_owned()) else {
+    let Some(authority) = parts
+        .uri
+        .authority()
+        .map(|a| strip_host_sentinel(a.as_str()))
+    else {
         warn!(uri = %parts.uri, "egress: request missing authority (not proxied?)");
         return error_response(StatusCode::BAD_GATEWAY);
     };
@@ -146,6 +152,33 @@ fn error_response(status: StatusCode) -> Response {
         .status(status)
         .body(axum::body::Body::empty())
         .expect("static empty response is valid")
+}
+
+/// Undo the federation client's host sentinel: one trailing `~` on the host
+/// part of `authority` is stripped; everything else passes through verbatim.
+///
+/// The client appends `~` to the URL host on the proxied path because
+/// reqwest's WHATWG host parsing reinterprets an all-digit host as a legacy
+/// IPv4 numeric ("0104" → "0.0.0.68", octal) or rejects it ("0189"); the
+/// suffix makes every host a plain reg-name the parser preserves. `~` is
+/// URL-unreserved and illegal in Matrix server names, so a trailing one can
+/// only be the sentinel — stripping unconditionally is safe, and an
+/// un-suffixed authority (a bracketed IPv6 literal, or a non-reqwest caller)
+/// is untouched. Mirrored in `neutrino_http::federation::client` (kept local
+/// on both sides — this crate deliberately doesn't know the http crate).
+fn strip_host_sentinel(authority: &str) -> String {
+    // A bracketed IPv6 authority never carries the sentinel; `rsplit_once`
+    // would mis-split it, so pass it through before any port peeling.
+    if authority.starts_with('[') {
+        return authority.to_owned();
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) => match host.strip_suffix('~') {
+            Some(host) => format!("{host}:{port}"),
+            None => authority.to_owned(),
+        },
+        None => authority.strip_suffix('~').unwrap_or(authority).to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -277,6 +310,71 @@ mod tests {
 
         token.cancel();
         let _ = handle.await;
+    }
+
+    // Regression for the numeric-server-name mangle: reqwest's URL parser
+    // applies WHATWG host rules, so an all-digit name in the URL authority is
+    // reinterpreted as a legacy IPv4 numeric ("0104" → octal → "0.0.0.68") —
+    // which is why the client suffixes the host with the `~` sentinel
+    // ("0104~" is a plain reg-name the parser preserves) and this egress
+    // strips it. The full loop: a real reqwest proxied request to "0104~"
+    // must reach the wire client as exactly "0104".
+    #[tokio::test]
+    async fn host_sentinel_carries_a_numeric_name_through_url_parsing() {
+        let client = Arc::new(RecordingClient {
+            seen: Mutex::new(None),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let token = CancellationToken::new();
+        let client_dyn: Arc<dyn WireClient> = client.clone();
+        let server_token = token.clone();
+        let handle =
+            tokio::spawn(async move { serve(addr, client_dyn, direct(), server_token).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        crate::install_crypto_provider();
+        let http = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{addr}")).unwrap())
+            .build()
+            .unwrap();
+        let resp = http
+            // Un-suffixed, "0104" would already arrive here as "0.0.0.68".
+            .put("http://0104~/_matrix/federation/v1/send/9")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(r#"{"ping":true}"#)
+            .send()
+            .await
+            .expect("proxied request");
+        assert_eq!(resp.status(), 200);
+
+        let seen = client.seen.lock().unwrap().clone().unwrap();
+        assert_eq!(seen.dest, "0104", "sentinel stripped, name verbatim");
+
+        token.cancel();
+        let _ = handle.await;
+    }
+
+    // The pure sentinel-stripping rules: one trailing `~` comes off the host
+    // (port preserved), everything without one — including bracketed IPv6
+    // authorities, which `rsplit_once(':')` would mis-split — is untouched.
+    #[test]
+    fn strip_host_sentinel_rules() {
+        assert_eq!(strip_host_sentinel("0104~"), "0104");
+        assert_eq!(strip_host_sentinel("0104~:5683"), "0104:5683");
+        assert_eq!(strip_host_sentinel("localhost~:8448"), "localhost:8448");
+        assert_eq!(strip_host_sentinel("192.168.1.5~:8448"), "192.168.1.5:8448");
+        // No sentinel → verbatim (direct callers, IPv6 literals).
+        assert_eq!(
+            strip_host_sentinel("peer.example:8448"),
+            "peer.example:8448"
+        );
+        assert_eq!(
+            strip_host_sentinel("[2001:db8::1]:8448"),
+            "[2001:db8::1]:8448"
+        );
+        assert_eq!(strip_host_sentinel("[::1]"), "[::1]");
     }
 
     // A WireClient that returns a chosen status and an undecodable body.
