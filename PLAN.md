@@ -124,6 +124,11 @@ Deferred follow-ups (write-ups, not done):
   X-Matrix as a bare/indexed origin (~55 B → ~2–12 B; must ride every block and
   doubles as the reassembly key). send_join's real cost is its Block2 state-DAG
   response re-sending these options per block.
+  DONE (2026-07-28) — the static-framing half: the canonical
+  `authorization: X-Matrix origin="…",destination="…"` credential now rides
+  CoAP as bare `origin,destination` under dedicated option 2052 (`,` is not a
+  server-name char), re-expanded to the full header on ingress; non-canonical
+  values (key/sig) still travel verbatim as option 2050.
 - CON-path reassembly-time cap: the Q-Block path now bounds reassembly *before*
   allocation, but the RFC 7959 CON path still relies on the post-reassembly cap —
   coap-lite's accumulator isn't externally bounded mid-transfer. Acceptable under

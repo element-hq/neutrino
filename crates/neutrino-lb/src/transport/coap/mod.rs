@@ -28,6 +28,12 @@ mod paths;
 pub(crate) const OPT_HTTP_STATUS: u16 = 2048;
 /// One forwarded header per occurrence: `name` + 0x00 + `value`.
 pub(crate) const OPT_FWD_HEADER: u16 = 2050;
+/// The X-Matrix federation credential, compacted to bare `origin,destination`
+/// (`,` is not a valid server-name char). CoAP re-sends every option in every
+/// block, so the static `authorization` + `X-Matrix origin="…",destination="…"`
+/// framing is stripped on the wire and re-synthesised on ingress (see
+/// `message`).
+pub(crate) const OPT_X_MATRIX_AUTH: u16 = 2052;
 /// `application/cbor` (RFC 8949 §9.1).
 pub(crate) const CBOR_CONTENT_FORMAT: u16 = 60;
 

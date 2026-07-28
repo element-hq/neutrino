@@ -154,6 +154,7 @@ pub(crate) const KEYS: &[(&str, i64)] = &[
     ("partial_auth_chain_ids", 141),
     ("members_omitted", 142),
     ("additional_creators", 143),
+    ("forward_extremities", 144),
 ];
 
 static KEY_TO_INT: LazyLock<HashMap<&'static str, i64>> =
