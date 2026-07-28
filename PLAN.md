@@ -125,10 +125,7 @@ Done:
   before the origin binding, response pair around Block2. Failure mapping:
   egress errors → Transport (outbox retries); `decode_request` → 400
   (malformed, upgrade-together mesh); `encode_response` → 500.
-  `PcapCaptureLink` delegates (captures show the encoded wire). Design:
-  `docs/superpowers/specs/2026-07-28-neutrino-lb-link-codec-design.md`.
-  OUTSTANDING: the actual medium codecs in neutrino-mdns / neutrino-iroh
-  (path-id elision + server-name→index packing over the medium registry).
+  `PcapCaptureLink` delegates (captures show the encoded wire).
 
 Deferred follow-ups (write-ups, not done):
 - Wire-size reduction for small MTUs: carry v12 **room** IDs as **raw 32 B**

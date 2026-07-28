@@ -6,7 +6,10 @@ use std::sync::Arc;
 
 pub use neutrino_ctl::{Command, Config, DiscoveredPeer, DiscoveryRegistry};
 pub use neutrino_event::{KeyResolver, NodeIdKeyResolver};
-pub use neutrino_lb::{CaptureControl, DatagramLink, LinkAddr, LinkProfile, PcapCaptureLink};
+pub use neutrino_lb::{
+    CaptureControl, CodecError, DatagramLink, LinkAddr, LinkCodec, LinkProfile, PcapCaptureLink,
+    WireRequest, WireResponse,
+};
 
 use std::future::Future;
 use std::pin::Pin;
