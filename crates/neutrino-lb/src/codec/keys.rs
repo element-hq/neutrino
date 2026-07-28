@@ -207,7 +207,7 @@ mod tests {
         // MSC4242 additions (codes 138-143).
         assert_eq!(key_to_int("prev_state_events"), Some(138));
         assert_eq!(key_to_int("additional_creators"), Some(143));
-        assert_eq!(KEYS.len(), 143);
+        assert_eq!(KEYS.len(), 144);
         assert_eq!(key_to_int("not_a_matrix_key"), None);
     }
 }
