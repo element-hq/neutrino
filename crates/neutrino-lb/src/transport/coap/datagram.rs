@@ -117,6 +117,54 @@ impl Default for LinkProfile {
     }
 }
 
+/// A [`LinkCodec`] hook failed. Decode failures are treated as malformed
+/// input, never negotiated around: the whole mesh runs one stack and upgrades
+/// together, so a peer whose bytes don't decode is broken, not older.
+#[derive(Debug, thiserror::Error)]
+#[error("link codec: {0}")]
+pub struct CodecError(pub String);
+
+/// Medium-owned wire codec: rewrite the federation request/response — the
+/// path, headers (incl. the X-Matrix credential value) and the CBOR body —
+/// on its way over a [`DatagramLink`]. This is how medium-specific
+/// compression (e.g. server-name→index packing over the medium's discovery
+/// registry, or path-id elision) lives in the medium crate instead of here.
+///
+/// Hooks run on the **assembled** message: `encode_request` before the CoAP
+/// message is built (so transformed values feed the per-block options and the
+/// pre-segmentation payload), `decode_request` after reassembly+parse and
+/// **before** the origin↔source binding gate (so the gate compares canonical
+/// names), and the response pair mirrors that around Block2. A datagram-level
+/// hook could not do this — a block carries only a fragment of the body.
+///
+/// Contract: each `decode_*` must be the exact inverse of the peer's
+/// `encode_*`; `WireRequest::dest` is off-limits (it feeds the egress
+/// resolver, never the wire); both ends of a mesh run the same codec.
+/// Failure mapping: `encode_request`/`decode_response` → transport error
+/// (the federation outbox retries); `decode_request` → 400 before the
+/// handler; `encode_response` → 500.
+///
+/// All hooks default to no-ops so a codec overrides only the directions it
+/// transforms.
+pub trait LinkCodec: Send + Sync {
+    fn encode_request(&self, req: &mut WireRequest) -> Result<(), CodecError> {
+        let _ = req;
+        Ok(())
+    }
+    fn decode_request(&self, req: &mut WireRequest) -> Result<(), CodecError> {
+        let _ = req;
+        Ok(())
+    }
+    fn encode_response(&self, resp: &mut WireResponse) -> Result<(), CodecError> {
+        let _ = resp;
+        Ok(())
+    }
+    fn decode_response(&self, resp: &mut WireResponse) -> Result<(), CodecError> {
+        let _ = resp;
+        Ok(())
+    }
+}
+
 /// The transport seam. The embedded composition injects an implementation
 /// (e.g. an authenticated QUIC endpoint dialed over the BLE mesh)
 /// keyed by an opaque [`LinkAddr`]; lb never
@@ -144,6 +192,12 @@ pub trait DatagramLink: Send + Sync {
     /// link, or they mask its declared facts.
     fn profile(&self) -> LinkProfile {
         LinkProfile::default()
+    }
+    /// The medium's wire codec, if it declares one — see [`LinkCodec`].
+    /// Defaults to `None` (no transformation) so existing implementations are
+    /// unaffected. Decorators MUST delegate, or they strip the medium's codec.
+    fn codec(&self) -> Option<Arc<dyn LinkCodec>> {
+        None
     }
 }
 
@@ -257,6 +311,12 @@ impl Hub {
         reg.node_to_addr.insert(node.to_vec(), addr);
         reg.addr_to_node.insert(addr, node.to_vec());
         addr
+    }
+
+    /// The medium's wire codec ([`DatagramLink::codec`]), surfaced for the
+    /// client/server built over this hub.
+    pub(super) fn codec(&self) -> Option<Arc<dyn LinkCodec>> {
+        self.link.codec()
     }
 
     /// Recover the exact link address a synthetic `SocketAddr` was minted for, or
@@ -481,6 +541,10 @@ impl Responder for LinkResponder {
 /// `WireRequest.dest`'s UTF-8 bytes, verbatim — never interpreted here.
 pub struct LinkCoapWireClient {
     hub: Arc<Hub>,
+    /// The medium's wire codec (from [`DatagramLink::codec`], cached at
+    /// construction): `encode_request` before the exchange, `decode_response`
+    /// after. `None` = no transformation.
+    codec: Option<Arc<dyn LinkCodec>>,
     block1_size: Option<usize>,
     qblock: Option<coap::qblock::QBlockConfig>,
     request_timeout: Duration,
@@ -497,6 +561,7 @@ impl LinkCoapWireClient {
     /// = coap-rs's 1024 B default).
     pub fn new(hub: Arc<Hub>, block1_size: Option<usize>) -> Self {
         Self {
+            codec: hub.codec(),
             hub,
             block1_size,
             qblock: None,
@@ -599,6 +664,15 @@ impl WireClient for LinkCoapWireClient {
         if req.dest.is_empty() {
             return Err(WireError::Transport("empty destination address".to_owned()));
         }
+        // Medium codec, egress half: transform the request BEFORE the CoAP
+        // message is built, so the rewritten path/headers/body feed the
+        // per-block options and the pre-segmentation payload.
+        let mut req = req;
+        if let Some(codec) = &self.codec {
+            codec
+                .encode_request(&mut req)
+                .map_err(|e| WireError::Transport(format!("link codec encode_request: {e}")))?;
+        }
         let node = req.dest.as_bytes();
         // Per-request federation egress trace: the destination node, the request,
         // and the body size (the load-bearing field — a body over the Q-Block
@@ -616,6 +690,16 @@ impl WireClient for LinkCoapWireClient {
             self.request_timeout,
         )
         .await;
+        // Medium codec, egress half: undo the peer's `encode_response`. A
+        // response that doesn't decode is malformed — a transport error, so
+        // the outbox retries and the pooled client is evicted below.
+        let result = result.and_then(|mut resp| match &self.codec {
+            Some(codec) => codec
+                .decode_response(&mut resp)
+                .map(|()| resp)
+                .map_err(|e| WireError::Transport(format!("link codec decode_response: {e}"))),
+            None => Ok(resp),
+        });
         match &result {
             Ok(r) => {
                 tracing::debug!(dest = %req.dest, status = r.status, "datagram wire: federation request completed")
@@ -703,6 +787,7 @@ impl WireServer for LinkCoapWireServer {
         let dispatch = Arc::new(CoapDispatch {
             handler,
             max_body_bytes: self.max_body_bytes,
+            codec: self.hub.codec(),
             // The datagram ingress is the authenticated trust boundary: bind every
             // request's claimed origin to its source node via the hub.
             node_binding: Some(self.hub.clone()),
@@ -1219,6 +1304,290 @@ mod tests {
             second.build_server().await.is_err(),
             "a hub must drive at most one ingress listener"
         );
+    }
+
+    /// Test decorator: a link that declares a [`LinkCodec`]; everything else
+    /// delegates to the wrapped link.
+    struct CodecLink {
+        inner: Arc<dyn DatagramLink>,
+        codec: Arc<dyn LinkCodec>,
+    }
+
+    #[async_trait]
+    impl DatagramLink for CodecLink {
+        async fn send(&self, dst: &[u8], datagram: &[u8]) -> std::io::Result<()> {
+            self.inner.send(dst, datagram).await
+        }
+        async fn recv(&self) -> Option<(LinkAddr, Vec<u8>)> {
+            self.inner.recv().await
+        }
+        fn codec(&self) -> Option<Arc<dyn LinkCodec>> {
+            Some(self.codec.clone())
+        }
+    }
+
+    /// A reversible codec touching all four hooks, counting each firing.
+    /// Requests: path prefixed, body reversed, authorization value reversed
+    /// (so the on-wire form carries no canonical origin). Responses: a
+    /// trailing marker byte. Each decode is the exact inverse and errors if
+    /// the encoded shape is absent.
+    #[derive(Default)]
+    struct RoundTripCodec {
+        enc_req: std::sync::atomic::AtomicUsize,
+        dec_req: std::sync::atomic::AtomicUsize,
+        enc_resp: std::sync::atomic::AtomicUsize,
+        dec_resp: std::sync::atomic::AtomicUsize,
+    }
+
+    fn reverse_auth(headers: &mut [(String, Vec<u8>)]) {
+        for (name, value) in headers {
+            if name.eq_ignore_ascii_case("authorization") {
+                value.reverse();
+            }
+        }
+    }
+
+    impl LinkCodec for RoundTripCodec {
+        fn encode_request(&self, req: &mut WireRequest) -> Result<(), CodecError> {
+            self.enc_req.fetch_add(1, Ordering::SeqCst);
+            req.path = format!("/enc{}", req.path);
+            req.body.reverse();
+            reverse_auth(&mut req.headers);
+            Ok(())
+        }
+        fn decode_request(&self, req: &mut WireRequest) -> Result<(), CodecError> {
+            self.dec_req.fetch_add(1, Ordering::SeqCst);
+            req.path = req
+                .path
+                .strip_prefix("/enc")
+                .ok_or_else(|| CodecError("missing /enc prefix".to_owned()))?
+                .to_owned();
+            req.body.reverse();
+            reverse_auth(&mut req.headers);
+            Ok(())
+        }
+        fn encode_response(&self, resp: &mut WireResponse) -> Result<(), CodecError> {
+            self.enc_resp.fetch_add(1, Ordering::SeqCst);
+            resp.body.push(0xEE);
+            Ok(())
+        }
+        fn decode_response(&self, resp: &mut WireResponse) -> Result<(), CodecError> {
+            self.dec_resp.fetch_add(1, Ordering::SeqCst);
+            if resp.body.pop() != Some(0xEE) {
+                return Err(CodecError("missing response marker".to_owned()));
+            }
+            Ok(())
+        }
+    }
+
+    // The full codec path: A encodes the request (path/body/auth transformed
+    // on the wire), B decodes it before the origin binding + handler (the echo
+    // sees the original path, the binding accepts the canonical origin), B
+    // encodes the response, A decodes it. All four hooks fire exactly once.
+    #[tokio::test]
+    async fn link_codec_round_trips_and_decodes_before_binding() {
+        let codec = Arc::new(RoundTripCodec::default());
+        let (a_link, b_link) = MockLink::pair(addr(ADDR_A), addr(ADDR_B));
+        let a = Arc::new(CodecLink {
+            inner: a_link,
+            codec: codec.clone(),
+        });
+        let b = Arc::new(CodecLink {
+            inner: b_link,
+            codec: codec.clone(),
+        });
+        let (client, token, handle) = rig_with_links(a, b, None, None, None, None).await;
+
+        let resp = client
+            .send(WireRequest {
+                dest: ADDR_B.to_owned(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![xmatrix_auth(ADDR_A)],
+                body: vec![1, 2, 3],
+            })
+            .await
+            .expect("send");
+        assert_eq!(resp.status, 200, "binding must pass on the DECODED origin");
+        assert_eq!(resp.body, vec![1, 2, 3]);
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| k == "x-matrix-seen-path"
+                    && v == b"/_matrix/federation/v1/send/txn1"),
+            "handler must see the decoded path: {:?}",
+            resp.headers
+        );
+        for (hook, count) in [
+            ("encode_request", &codec.enc_req),
+            ("decode_request", &codec.dec_req),
+            ("encode_response", &codec.enc_resp),
+            ("decode_response", &codec.dec_resp),
+        ] {
+            assert_eq!(count.load(Ordering::SeqCst), 1, "{hook} firings");
+        }
+        shutdown(token, handle).await;
+    }
+
+    /// Reverses the authorization value on encode; no other transforms.
+    struct AuthReverser;
+
+    impl LinkCodec for AuthReverser {
+        fn encode_request(&self, req: &mut WireRequest) -> Result<(), CodecError> {
+            reverse_auth(&mut req.headers);
+            Ok(())
+        }
+    }
+
+    // Counter-proof of the decode-before-binding ordering: with the codec on
+    // A only, the origin arrives at B still encoded and the binding gate must
+    // 401 it — the gate reads exactly what decode_request yields (here:
+    // nothing decoded), never the pre-encode original.
+    #[tokio::test]
+    async fn encoded_origin_without_decoder_is_rejected_by_binding() {
+        let (a_link, b_link) = MockLink::pair(addr(ADDR_A), addr(ADDR_B));
+        let a = Arc::new(CodecLink {
+            inner: a_link,
+            codec: Arc::new(AuthReverser),
+        });
+        let (client, token, handle) = rig_with_links(a, b_link, None, None, None, None).await;
+        let resp = client
+            .send(WireRequest {
+                dest: ADDR_B.to_owned(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![xmatrix_auth(ADDR_A)],
+                body: vec![],
+            })
+            .await
+            .expect("send");
+        assert_eq!(resp.status, 401, "undecoded origin must fail the binding");
+        shutdown(token, handle).await;
+    }
+
+    /// Which hook a [`FailCodec`] errors at; every other hook is a no-op.
+    #[derive(PartialEq)]
+    enum Hook {
+        EncReq,
+        DecReq,
+        EncResp,
+        DecResp,
+    }
+
+    struct FailCodec(Hook);
+
+    impl FailCodec {
+        fn fail_if(&self, hook: Hook) -> Result<(), CodecError> {
+            if self.0 == hook {
+                Err(CodecError("boom".to_owned()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl LinkCodec for FailCodec {
+        fn encode_request(&self, _req: &mut WireRequest) -> Result<(), CodecError> {
+            self.fail_if(Hook::EncReq)
+        }
+        fn decode_request(&self, _req: &mut WireRequest) -> Result<(), CodecError> {
+            self.fail_if(Hook::DecReq)
+        }
+        fn encode_response(&self, _resp: &mut WireResponse) -> Result<(), CodecError> {
+            self.fail_if(Hook::EncResp)
+        }
+        fn decode_response(&self, _resp: &mut WireResponse) -> Result<(), CodecError> {
+            self.fail_if(Hook::DecResp)
+        }
+    }
+
+    /// Rig with a [`FailCodec`] on the client (A) side, or on the server (B)
+    /// side, per the documented failure mapping.
+    async fn fail_rig(
+        client_side: Option<Hook>,
+        server_side: Option<Hook>,
+    ) -> (LinkCoapWireClient, CancellationToken, ServeHandle) {
+        let (a_link, b_link) = MockLink::pair(addr(ADDR_A), addr(ADDR_B));
+        let a: Arc<dyn DatagramLink> = match client_side {
+            Some(hook) => Arc::new(CodecLink {
+                inner: a_link,
+                codec: Arc::new(FailCodec(hook)),
+            }),
+            None => a_link,
+        };
+        let b: Arc<dyn DatagramLink> = match server_side {
+            Some(hook) => Arc::new(CodecLink {
+                inner: b_link,
+                codec: Arc::new(FailCodec(hook)),
+            }),
+            None => b_link,
+        };
+        rig_with_links(a, b, None, None, None, None).await
+    }
+
+    fn codec_probe(dest: &str) -> WireRequest {
+        WireRequest {
+            dest: dest.to_owned(),
+            method: Method::PUT,
+            path: "/_matrix/federation/v1/send/txn1".to_owned(),
+            headers: vec![],
+            body: vec![7],
+        }
+    }
+
+    // Failure mapping, egress side: encode_request / decode_response errors
+    // surface as Transport errors so the federation outbox retries.
+    #[tokio::test]
+    async fn codec_egress_failures_are_transport_errors() {
+        let (client, token, handle) = fail_rig(Some(Hook::EncReq), None).await;
+        let err = client.send(codec_probe(ADDR_B)).await.expect_err("enc_req");
+        assert!(
+            matches!(&err, WireError::Transport(m) if m.contains("encode_request")),
+            "got {err:?}"
+        );
+        shutdown(token, handle).await;
+
+        let (client, token, handle) = fail_rig(Some(Hook::DecResp), None).await;
+        let err = client
+            .send(codec_probe(ADDR_B))
+            .await
+            .expect_err("dec_resp");
+        assert!(
+            matches!(&err, WireError::Transport(m) if m.contains("decode_response")),
+            "got {err:?}"
+        );
+        shutdown(token, handle).await;
+    }
+
+    // Failure mapping, ingress side: a request that doesn't decode is
+    // malformed (400, before the handler); a response our own codec can't
+    // encode is a bug (500) — never a corrupt wire message.
+    #[tokio::test]
+    async fn codec_ingress_failures_map_to_400_and_500() {
+        let (client, token, handle) = fail_rig(None, Some(Hook::DecReq)).await;
+        let resp = client.send(codec_probe(ADDR_B)).await.expect("dec_req");
+        assert_eq!(resp.status, 400, "undecodable request is malformed");
+        shutdown(token, handle).await;
+
+        let (client, token, handle) = fail_rig(None, Some(Hook::EncResp)).await;
+        let resp = client.send(codec_probe(ADDR_B)).await.expect("enc_resp");
+        assert_eq!(resp.status, 500, "unencodable response is a server bug");
+        shutdown(token, handle).await;
+    }
+
+    // The capture tap is a decorator: it must surface the wrapped medium's
+    // codec (same rule as `profile`), or every embedded build — which always
+    // wraps the medium in the tap — would silently strip the codec.
+    #[test]
+    fn pcap_capture_link_delegates_codec() {
+        let (a_link, _b) = MockLink::pair(addr(ADDR_A), addr(ADDR_B));
+        let with_codec = Arc::new(CodecLink {
+            inner: a_link,
+            codec: Arc::new(AuthReverser),
+        });
+        let control = crate::transport::coap::capture::CaptureControl::new();
+        let tapped = crate::transport::coap::capture::PcapCaptureLink::wrap(with_codec, control);
+        assert!(tapped.codec().is_some(), "tap must delegate codec()");
     }
 
     /// An `Authorization: X-Matrix origin="<server>"` header value.

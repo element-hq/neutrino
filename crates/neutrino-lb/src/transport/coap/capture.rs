@@ -266,6 +266,13 @@ impl DatagramLink for PcapCaptureLink {
         // build (`start_with` wraps every injected medium in this tap).
         self.inner.profile()
     }
+
+    fn codec(&self) -> Option<Arc<dyn super::datagram::LinkCodec>> {
+        // Same delegation rule as `profile`: answering `None` here would strip
+        // the wrapped medium's codec on every embedded build. The tap sits
+        // below CoAP serialization, so captures show the encoded wire.
+        self.inner.codec()
+    }
 }
 
 /// Synthetic endpoint registry: link address → IP (plus a token-less fallback

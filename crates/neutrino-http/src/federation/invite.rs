@@ -31,8 +31,8 @@
 
 use axum::{
     Json,
+    extract::State,
     extract::rejection::JsonRejection,
-    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -40,7 +40,7 @@ use neutrino_event::ROOM_VERSION_ID;
 use neutrino_store::{InviteStore, RoomStore, StateStore};
 use ruma::events::AnyStrippedStateEvent;
 use ruma::serde::Raw;
-use ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
+use ruma::{OwnedUserId, RoomId, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 use serde_json::{Value, json};
@@ -71,17 +71,19 @@ pub(crate) struct ResponseBody {
 }
 
 /// Federation `/invite/v2` handler.
+///
+/// The `{roomId}`/`{eventId}` path segments are IGNORED: the event body is
+/// authoritative for both (the event id is recomputed from the reference hash,
+/// never read), so a transport is free to compress/elide them and send
+/// placeholder segments.
 pub(crate) async fn handle(
     State(state): State<AppState>,
-    Path((room_id, event_id)): Path<(String, String)>,
     headers: HeaderMap,
     body: Result<Json<InviteRequestBody>, JsonRejection>,
 ) -> Result<Json<ResponseBody>, FedError> {
     let body = body
         .map_err(|_| FedError::BadRequest("body is not the v2 invite envelope"))?
         .0;
-    let room_id = OwnedRoomId::try_from(room_id.as_str())
-        .map_err(|_| FedError::BadRequest("invalid room_id"))?;
 
     // Version negotiation: we only host v12 + MSC4242.
     if body.room_version != ROOM_VERSION_ID {
@@ -113,19 +115,11 @@ pub(crate) async fn handle(
         }
     };
 
+    let room_id = event.room_id.clone();
+
     // Structural validation (spec §invite). No signature check (no signing
     // keys). The X-Matrix origin is authenticated below; the origin==sender
     // constraint is imposed only on the out-of-band path (see below).
-    if event.event_id.as_str() != event_id {
-        return Err(FedError::BadRequest(
-            "event_id in path does not match the event",
-        ));
-    }
-    if event.room_id != room_id {
-        return Err(FedError::BadRequest(
-            "room_id in path does not match the event",
-        ));
-    }
     if event.event_type != "m.room.member" {
         return Err(FedError::BadRequest("event is not an m.room.member event"));
     }

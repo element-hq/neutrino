@@ -14,13 +14,7 @@
 //! same leave as a no-op (`apply_resident` short-circuits empty effects) and we
 //! reply `{}` again.
 
-use axum::{
-    Json,
-    extract::rejection::JsonRejection,
-    extract::{Path, State},
-    http::HeaderMap,
-};
-use ruma::OwnedRoomId;
+use axum::{Json, extract::State, extract::rejection::JsonRejection, http::HeaderMap};
 use serde_json::value::RawValue as RawJsonValue;
 use serde_json::{Value, json};
 
@@ -28,17 +22,19 @@ use crate::federation::{FedError, auth, co_sign_if_signed, map_apply_err};
 use crate::{AppState, lock_app};
 
 /// Federation `/send_leave` (v2) handler. Returns `{}` on accept.
+///
+/// The `{roomId}`/`{eventId}` path segments are IGNORED: the event body is
+/// authoritative for both (the event id is recomputed from the reference hash,
+/// never read), so a transport is free to compress/elide them and send
+/// placeholder segments.
 pub(crate) async fn handle(
     State(state): State<AppState>,
-    Path((room_id, event_id)): Path<(String, String)>,
     headers: HeaderMap,
     body: Result<Json<Box<RawJsonValue>>, JsonRejection>,
 ) -> Result<Json<Value>, FedError> {
     let raw = body
         .map_err(|_| FedError::BadRequest("body is not valid JSON"))?
         .0;
-    let room_id = OwnedRoomId::try_from(room_id.as_str())
-        .map_err(|_| FedError::BadRequest("invalid room_id"))?;
 
     // Parse + compute the event id from the reference hash. `auth_events`
     // start empty — apply_pdu is their sole authority. Resident membership
@@ -55,22 +51,13 @@ pub(crate) async fn handle(
             return Err(FedError::BadRequest("malformed leave event"));
         }
     };
+    let room_id = event.room_id.clone();
 
     // Structural validation (spec §send_leave). The signature check is skipped
     // (no signing keys); the sender-on-origin check is enforced below via the
     // network-attested `X-Matrix` origin. state_key == sender is mandatory, so
     // this endpoint can only ever express a *self*-leave; a kick/ban of another
     // user rides `/send` as a normal PDU instead.
-    if event.event_id.as_str() != event_id {
-        return Err(FedError::BadRequest(
-            "event_id in path does not match the event",
-        ));
-    }
-    if event.room_id != room_id {
-        return Err(FedError::BadRequest(
-            "room_id in path does not match the event",
-        ));
-    }
     if event.event_type != "m.room.member" {
         return Err(FedError::BadRequest("event is not an m.room.member event"));
     }

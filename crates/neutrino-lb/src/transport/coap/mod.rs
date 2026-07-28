@@ -28,6 +28,12 @@ mod paths;
 pub(crate) const OPT_HTTP_STATUS: u16 = 2048;
 /// One forwarded header per occurrence: `name` + 0x00 + `value`.
 pub(crate) const OPT_FWD_HEADER: u16 = 2050;
+/// The X-Matrix federation credential, compacted to bare `origin,destination`
+/// (`,` is not a valid server-name char). CoAP re-sends every option in every
+/// block, so the static `authorization` + `X-Matrix origin="…",destination="…"`
+/// framing is stripped on the wire and re-synthesised on ingress (see
+/// `message`).
+pub(crate) const OPT_X_MATRIX_AUTH: u16 = 2052;
 /// `application/cbor` (RFC 8949 §9.1).
 pub(crate) const CBOR_CONTENT_FORMAT: u16 = 60;
 
@@ -424,6 +430,11 @@ struct CoapDispatch {
     /// UDP/HTTP transports run on a trusted LAN with no peer authentication, so
     /// they leave this `None` and keep `federation::auth`'s existing behaviour.
     node_binding: Option<Arc<datagram::Hub>>,
+    /// The medium's wire codec ([`datagram::LinkCodec`]), ingress half:
+    /// `decode_request` after parse and BEFORE the origin binding (so the gate
+    /// compares canonical names), `encode_response` before the response is
+    /// written (pre-Block2). Link ingress only; `None` on the UDP transport.
+    codec: Option<Arc<dyn datagram::LinkCodec>>,
 }
 
 impl CoapDispatch {
@@ -442,34 +453,66 @@ impl CoapDispatch {
         // handler/transcode — the network-exposed OOM guard, mirroring the HTTP
         // ingress. (coap-lite has already reassembled it; this still bounds the
         // downstream transcode + loopback forward — see the module OOM note.)
-        let wire_resp =
-            if request.message.payload.len() > self.max_body_bytes {
-                WireResponse {
-                    status: 413,
-                    headers: vec![],
-                    body: vec![],
-                }
-            } else {
-                let wire_req = message::parse_request(&request);
-                // Authenticated datagram ingress: a peer may assert only its own
-                // origin. Reject (401) before the handler runs if the claimed
-                // `X-Matrix origin` is not the link-authenticated source node.
-                if self.node_binding.as_ref().is_some_and(|hub| {
-                    hub.origin_binding_violation(request.source, &wire_req.headers)
-                }) {
-                    WireResponse {
-                        status: 401,
-                        headers: vec![],
-                        body: vec![],
+        let wire_resp = if request.message.payload.len() > self.max_body_bytes {
+            status_only(413)
+        } else {
+            self.dispatch(&request).await
+        };
+        // Medium codec, ingress half: transform the response BEFORE it is
+        // written (and Block2-segmented). A response our own codec can't
+        // encode is a bug surfaced as a 500, never a corrupt wire message.
+        let wire_resp = match &self.codec {
+            Some(codec) => {
+                let mut resp = wire_resp;
+                match codec.encode_response(&mut resp) {
+                    Ok(()) => resp,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "link codec encode_response failed");
+                        status_only(500)
                     }
-                } else {
-                    self.handler.handle(wire_req).await
                 }
-            };
+            }
+            None => wire_resp,
+        };
         if let Some(ref mut response) = request.response {
             message::write_response(response, &wire_resp);
         }
         request
+    }
+
+    /// Parse → decode (medium codec) → origin-binding gate → handler.
+    async fn dispatch(&self, request: &CoapRequest<SocketAddr>) -> WireResponse {
+        let mut wire_req = message::parse_request(request);
+        // Medium codec, ingress half: undo the peer's `encode_request`. Runs
+        // BEFORE the origin binding so the gate compares canonical names. A
+        // request that doesn't decode is malformed — 400, upgrade-together
+        // mesh, no fallback.
+        if let Some(codec) = &self.codec
+            && let Err(e) = codec.decode_request(&mut wire_req)
+        {
+            tracing::warn!(error = %e, "link codec decode_request failed");
+            return status_only(400);
+        }
+        // Authenticated datagram ingress: a peer may assert only its own
+        // origin. Reject (401) before the handler runs if the claimed
+        // `X-Matrix origin` is not the link-authenticated source node.
+        if self
+            .node_binding
+            .as_ref()
+            .is_some_and(|hub| hub.origin_binding_violation(request.source, &wire_req.headers))
+        {
+            return status_only(401);
+        }
+        self.handler.handle(wire_req).await
+    }
+}
+
+/// A bodyless, headerless `WireResponse` carrying only `status`.
+fn status_only(status: u16) -> WireResponse {
+    WireResponse {
+        status,
+        headers: vec![],
+        body: vec![],
     }
 }
 
@@ -505,8 +548,10 @@ impl WireServer for CoapWireServer {
         let dispatch = Arc::new(CoapDispatch {
             handler,
             max_body_bytes: self.max_body_bytes,
-            // UDP runs on a trusted LAN with no peer authentication — no binding.
+            // UDP runs on a trusted LAN with no peer authentication — no binding,
+            // and no medium codec (that seam is link-only).
             node_binding: None,
+            codec: None,
         });
 
         // `coap::Server::run` has no native shutdown, so race it against the
@@ -1174,6 +1219,7 @@ mod dispatch_tests {
             handler: Arc::new(Spy(ran.clone())),
             max_body_bytes: MAX_WIRE_BODY_BYTES,
             node_binding: None,
+            codec: None,
         };
         let mut request: Box<CoapRequest<SocketAddr>> = Box::new(CoapRequest::new());
         request.response = None;
@@ -1192,6 +1238,7 @@ mod dispatch_tests {
             handler: Arc::new(Spy(ran.clone())),
             max_body_bytes: MAX_WIRE_BODY_BYTES,
             node_binding: None,
+            codec: None,
         };
         let mut request: Box<CoapRequest<SocketAddr>> = Box::new(CoapRequest::new());
         request.response = Some(CoapResponse::new(&request.message).expect("response"));

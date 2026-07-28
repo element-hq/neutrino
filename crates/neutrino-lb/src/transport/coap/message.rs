@@ -1,6 +1,9 @@
 //! Mapping between `WireRequest`/`WireResponse` and `coap-lite` messages. The
 //! body is carried verbatim (opaque CBOR). Forwardable headers travel as
-//! `OPT_FWD_HEADER` options; the exact HTTP status as `OPT_HTTP_STATUS`.
+//! `OPT_FWD_HEADER` options; the exact HTTP status as `OPT_HTTP_STATUS`; the
+//! canonical X-Matrix credential is compacted to `origin,destination` under
+//! `OPT_X_MATRIX_AUTH` and re-expanded to a full `authorization` header on
+//! ingress.
 
 use std::collections::LinkedList;
 use std::net::SocketAddr;
@@ -11,7 +14,7 @@ use coap_lite::{CoapOption, CoapRequest, CoapResponse, RequestType};
 use crate::headers::is_forwardable;
 use crate::transport::{WireRequest, WireResponse};
 
-use super::{CBOR_CONTENT_FORMAT, OPT_FWD_HEADER, OPT_HTTP_STATUS};
+use super::{CBOR_CONTENT_FORMAT, OPT_FWD_HEADER, OPT_HTTP_STATUS, OPT_X_MATRIX_AUTH};
 
 /// HTTP method -> CoAP request type. Federation only uses GET/POST/PUT.
 fn to_coap_method(method: &Method) -> RequestType {
@@ -53,12 +56,23 @@ pub(crate) fn build_request(req: &WireRequest) -> CoapRequest<SocketAddr> {
     out.message
         .add_option(CoapOption::ContentFormat, content_format_bytes());
     for (name, value) in &req.headers {
-        if is_forwardable(name) {
-            out.message.add_option(
-                CoapOption::Unknown(OPT_FWD_HEADER),
-                encode_header(name, value),
-            );
+        if !is_forwardable(name) {
+            continue;
         }
+        // The X-Matrix credential is the heavy always-present header, so its
+        // canonical form travels as bare `origin,destination` under a dedicated
+        // option instead of the full `name` + scheme/param/quote framing.
+        if name.eq_ignore_ascii_case("authorization")
+            && let Some(compact) = compact_xmatrix(value)
+        {
+            out.message
+                .add_option(CoapOption::Unknown(OPT_X_MATRIX_AUTH), compact);
+            continue;
+        }
+        out.message.add_option(
+            CoapOption::Unknown(OPT_FWD_HEADER),
+            encode_header(name, value),
+        );
     }
     out.message.payload = req.body.clone();
     out
@@ -70,7 +84,19 @@ pub(crate) fn parse_request(req: &CoapRequest<SocketAddr>) -> WireRequest {
     let path_segs = option_values(req.message.get_option(CoapOption::UriPath));
     let queries = option_values(req.message.get_option(CoapOption::UriQuery));
     let path = super::paths::decode(&path_segs, &queries);
-    let headers = decode_headers(req.message.get_option(CoapOption::Unknown(OPT_FWD_HEADER)));
+    let mut headers = decode_headers(req.message.get_option(CoapOption::Unknown(OPT_FWD_HEADER)));
+    if let Some(auth) = req
+        .message
+        .get_first_option(CoapOption::Unknown(OPT_X_MATRIX_AUTH))
+        .and_then(|raw| expand_xmatrix(raw))
+    {
+        // The compact credential is authoritative: drop any verbatim
+        // `authorization` a peer also sent, so a second identity can't ride
+        // past whichever gate reads the other copy (the ingress origin↔source
+        // binding reads the first match — see `Hub::origin_binding_violation`).
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
+        headers.push(auth);
+    }
     WireRequest {
         dest: String::new(),
         method: to_http_method(req.get_method()),
@@ -114,6 +140,38 @@ pub(crate) fn parse_response(resp: &CoapResponse) -> WireResponse {
         headers,
         body: resp.message.payload.clone(),
     }
+}
+
+/// Compact the canonical X-Matrix credential this project's federation client
+/// sends — `X-Matrix origin="…",destination="…"` with no other auth-params (no
+/// `key`/`sig`; trusted network, see neutrino-http's `federation::auth`) — to
+/// bare `origin,destination` bytes. Server names contain no `,`/`"`, so the
+/// join is unambiguous; `None` for any other shape (a signing peer's
+/// `key`/`sig`, another scheme), which then travels verbatim as
+/// `OPT_FWD_HEADER`.
+fn compact_xmatrix(value: &[u8]) -> Option<Vec<u8>> {
+    let params = std::str::from_utf8(value).ok()?.strip_prefix("X-Matrix ")?;
+    let (origin, destination) = params.split_once(',')?;
+    let origin = origin.strip_prefix("origin=\"")?.strip_suffix('"')?;
+    let destination = destination
+        .strip_prefix("destination=\"")?
+        .strip_suffix('"')?;
+    // A `,`/`"` inside a "value" means extra auth-params or a non-server-name
+    // value — not the canonical form, and not representable compactly.
+    if origin.contains([',', '"']) || destination.contains([',', '"']) {
+        return None;
+    }
+    Some(format!("{origin},{destination}").into_bytes())
+}
+
+/// Re-synthesise the full `authorization` header from a compact
+/// `origin,destination` option value. `None` (the request then asserts no
+/// server identity) if the value is malformed, mirroring `decode_headers`
+/// dropping separator-less entries.
+fn expand_xmatrix(raw: &[u8]) -> Option<(String, Vec<u8>)> {
+    let (origin, destination) = std::str::from_utf8(raw).ok()?.split_once(',')?;
+    let value = format!("X-Matrix origin=\"{origin}\",destination=\"{destination}\"");
+    Some(("authorization".to_owned(), value.into_bytes()))
 }
 
 /// `name` + 0x00 + `value`.
@@ -187,6 +245,115 @@ mod tests {
             !got.headers.iter().any(|(k, _)| k == "content-length"),
             "non-forwardable header leaked"
         );
+    }
+
+    // Serialize a built request through packet bytes and reparse, as the tests
+    // below all need to prove survival across the actual wire encoding.
+    fn wire_round_trip(wire: &WireRequest) -> (CoapRequest<SocketAddr>, WireRequest) {
+        let coap = build_request(wire);
+        let bytes = coap.message.to_bytes().expect("to_bytes");
+        let packet = coap_lite::Packet::from_bytes(&bytes).expect("from_bytes");
+        let mut reparsed: CoapRequest<SocketAddr> = CoapRequest::new();
+        reparsed.message = packet;
+        let got = parse_request(&reparsed);
+        (reparsed, got)
+    }
+
+    fn auth_request(auth_value: &[u8]) -> WireRequest {
+        WireRequest {
+            dest: "peer:8448".to_owned(),
+            method: Method::PUT,
+            path: "/_matrix/federation/v1/send/txn1".to_owned(),
+            headers: vec![("authorization".to_owned(), auth_value.to_vec())],
+            body: vec![],
+        }
+    }
+
+    // The canonical credential must travel as bare `origin,destination` under
+    // OPT_X_MATRIX_AUTH — no header name, no scheme/param/quote framing — and
+    // re-expand to the exact full header on ingress. This is the low-bandwidth
+    // win: the option is re-sent in every block, so its size is ~the two names.
+    #[test]
+    fn canonical_xmatrix_compacts_on_wire_and_re_expands() {
+        let full = br#"X-Matrix origin="a.example",destination="b.example""#;
+        let (reparsed, got) = wire_round_trip(&auth_request(full));
+
+        let compact = reparsed
+            .message
+            .get_first_option(CoapOption::Unknown(OPT_X_MATRIX_AUTH))
+            .expect("compact auth option");
+        assert_eq!(compact, b"a.example,b.example");
+        assert!(
+            reparsed
+                .message
+                .get_option(CoapOption::Unknown(OPT_FWD_HEADER))
+                .is_none_or(|l| l.is_empty()),
+            "canonical credential must not also travel verbatim"
+        );
+        assert_eq!(
+            got.headers,
+            vec![("authorization".to_owned(), full.to_vec())],
+            "ingress must re-synthesise the exact full header"
+        );
+    }
+
+    // A non-canonical credential (a real signing peer's key/sig) cannot be
+    // represented compactly and must fall back to the verbatim path unchanged.
+    #[test]
+    fn xmatrix_with_key_and_sig_falls_back_to_verbatim() {
+        let signed =
+            br#"X-Matrix origin="a.example",destination="b.example",key="ed25519:1",sig="abc==""#;
+        let (reparsed, got) = wire_round_trip(&auth_request(signed));
+
+        assert!(
+            reparsed
+                .message
+                .get_first_option(CoapOption::Unknown(OPT_X_MATRIX_AUTH))
+                .is_none(),
+            "a key/sig credential must not be lossily compacted"
+        );
+        assert_eq!(
+            got.headers,
+            vec![("authorization".to_owned(), signed.to_vec())]
+        );
+    }
+
+    // A peer sending BOTH the compact option and a verbatim authorization must
+    // end up with exactly one identity — the compact one — so the ingress
+    // origin↔source binding and the upstream auth gate can't read different
+    // origins from the same request.
+    #[test]
+    fn compact_auth_overrides_verbatim_authorization() {
+        let mut coap: CoapRequest<SocketAddr> = CoapRequest::new();
+        coap.set_method(RequestType::Put);
+        coap.message.add_option(
+            CoapOption::Unknown(OPT_FWD_HEADER),
+            encode_header("authorization", br#"X-Matrix origin="evil.example""#),
+        );
+        coap.message.add_option(
+            CoapOption::Unknown(OPT_X_MATRIX_AUTH),
+            b"a.example,b.example".to_vec(),
+        );
+        let got = parse_request(&coap);
+        assert_eq!(
+            got.headers,
+            vec![(
+                "authorization".to_owned(),
+                br#"X-Matrix origin="a.example",destination="b.example""#.to_vec()
+            )]
+        );
+    }
+
+    // A malformed compact option (no separator) asserts no identity at all —
+    // the request proceeds headerless and the upstream auth gate 401s it.
+    #[test]
+    fn malformed_compact_auth_yields_no_authorization() {
+        let mut coap: CoapRequest<SocketAddr> = CoapRequest::new();
+        coap.set_method(RequestType::Get);
+        coap.message
+            .add_option(CoapOption::Unknown(OPT_X_MATRIX_AUTH), b"no-comma".to_vec());
+        let got = parse_request(&coap);
+        assert!(got.headers.is_empty(), "got {:?}", got.headers);
     }
 
     #[test]

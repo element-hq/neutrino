@@ -11,8 +11,8 @@ pub mod transport;
 
 pub use error::LbError;
 pub use transport::coap::capture::{CaptureControl, PcapCaptureLink};
-pub use transport::coap::datagram::{DatagramLink, LinkAddr, LinkProfile};
-pub use transport::{DestinationResolver, DirectResolver};
+pub use transport::coap::datagram::{CodecError, DatagramLink, LinkAddr, LinkCodec, LinkProfile};
+pub use transport::{DestinationResolver, DirectResolver, WireRequest, WireResponse};
 
 use std::net::SocketAddr;
 use std::time::Duration;

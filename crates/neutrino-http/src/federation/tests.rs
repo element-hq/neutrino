@@ -3059,15 +3059,24 @@ async fn send_join_rejected_join_returns_403() {
     );
 }
 
+// A transport may compress/elide `{roomId}`/`{eventId}` and deliver
+// placeholder segments: the handler must derive both from the event body
+// (which is authoritative) and never read the path.
 #[tokio::test]
-async fn send_join_event_id_path_mismatch_returns_400() {
-    let (router, _store, room_id, head, _tempfile) = seed_public_room().await;
+async fn send_join_accepts_placeholder_path_segments() {
+    let (router, store, room_id, head, _tempfile) = seed_public_room().await;
     let join = remote_join(&room_id, &head, ZARA);
-    // Path id is a *real, valid, different* event id (the room's state head), so
-    // the 400 can only come from the body-vs-path comparison, not a malformed id.
-    let (status, body) = put_event(&router, &send_join_path(&room_id, &head), join.raw.get()).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
-    assert_eq!(body["errcode"], "M_INVALID_PARAM");
+    let join_id = join.event_id.clone();
+    let path = "/_matrix/federation/v2/send_join/n/n";
+    let (status, body) = put_event(&router, path, join.raw.get()).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    // The join landed in the EVENT's room.
+    let member = store
+        .current_state_event(&room_id, "m.room.member", ZARA)
+        .await
+        .unwrap()
+        .expect("zara member row");
+    assert_eq!(member.event_id, join_id);
 }
 
 #[tokio::test]
@@ -3754,16 +3763,28 @@ async fn send_join_wire_rejected_returns_400() {
     assert_eq!(body["error"], "malformed join event");
 }
 
+// Path segments are ignored even when they carry real-looking ids: the event
+// body wins, so a join PUT under a *different* room id in the path still
+// applies to the event's own room (and nothing is created under the path id).
 #[tokio::test]
-async fn send_join_room_id_path_mismatch_returns_400() {
-    let (router, _store, room_id, head, _tempfile) = seed_public_room().await;
+async fn send_join_event_overrides_mismatched_path_ids() {
+    let (router, store, room_id, head, _tempfile) = seed_public_room().await;
     let join = remote_join(&room_id, &head, ZARA);
-    // Correct event_id in the path, but a different room id.
+    let join_id = join.event_id.clone();
     let other_room = ruma::RoomId::parse("!other:example.org").unwrap();
-    let path = send_join_path(&other_room, &join.event_id);
+    let path = send_join_path(&other_room, &head);
     let (status, body) = put_event(&router, &path, join.raw.get()).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
-    assert_eq!(body["errcode"], "M_INVALID_PARAM");
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let member = store
+        .current_state_event(&room_id, "m.room.member", ZARA)
+        .await
+        .unwrap()
+        .expect("zara member row");
+    assert_eq!(member.event_id, join_id);
+    assert!(
+        !store.room_exists(&other_room).await.unwrap(),
+        "nothing may be created under the path's room id"
+    );
 }
 
 #[test]
@@ -4175,9 +4196,11 @@ async fn invite_wire_rejected_returns_400() {
     assert_eq!(resp["error"], "malformed invite event");
 }
 
-/// The `eventId` path segment must match the event's computed reference hash.
+/// The `{roomId}`/`{eventId}` path segments are ignored (a transport may
+/// compress them to placeholders): the event body is authoritative, so the
+/// invite must succeed and store under the event's own ids.
 #[tokio::test]
-async fn invite_rejects_event_id_path_mismatch() {
+async fn invite_accepts_placeholder_path_segments() {
     let (store, _tempfile) = fresh_store().await;
     let router = router_with_store(config(), store);
     let bob = inviter();
@@ -4194,17 +4217,18 @@ async fn invite_rejects_event_id_path_mismatch() {
         "invite",
         std::slice::from_ref(&create.event_id),
     );
-    // Path carries a different (but syntactically valid) event id.
     let (status, body) = put_json(
         &router,
-        &invite_path(room_id.as_str(), create.event_id.as_str()),
+        "/_matrix/federation/v2/invite/n/n",
         &invite_body(&invite, None),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    // Our copy of the event comes back, keyed by the event's own ids.
     assert_eq!(
-        body.get("errcode").and_then(|c| c.as_str()),
-        Some("M_INVALID_PARAM")
+        body["event"]["state_key"].as_str(),
+        Some(alice().as_str()),
+        "body = {body}"
     );
 }
 
@@ -4642,16 +4666,23 @@ async fn send_leave_wire_rejected_returns_400() {
     assert_eq!(body["error"], "malformed leave event");
 }
 
+// The `{roomId}`/`{eventId}` path segments are ignored (a transport may
+// compress them to placeholders): the event body is authoritative, so the
+// leave applies to the event's own room.
 #[tokio::test]
-async fn send_leave_event_id_path_mismatch_returns_400() {
-    let (router, _store, room_id, head, _tempfile) = seed_room_with_invited_zara().await;
+async fn send_leave_accepts_placeholder_path_segments() {
+    let (router, store, room_id, head, _tempfile) = seed_room_with_invited_zara().await;
     let leave = remote_leave(&room_id, &head, ZARA);
-    // Path id is a real, valid, different id (the state head), so the 400 can
-    // only come from the body-vs-path comparison.
-    let (status, body) =
-        put_event(&router, &send_leave_path(&room_id, &head), leave.raw.get()).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
-    assert_eq!(body["errcode"], "M_INVALID_PARAM");
+    let leave_id = leave.event_id.clone();
+    let path = "/_matrix/federation/v2/send_leave/n/n";
+    let (status, body) = put_event(&router, path, leave.raw.get()).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let member = store
+        .current_state_event(&room_id, "m.room.member", ZARA)
+        .await
+        .unwrap()
+        .expect("zara member row");
+    assert_eq!(member.event_id, leave_id);
 }
 
 #[tokio::test]

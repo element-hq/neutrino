@@ -154,6 +154,7 @@ pub(crate) const KEYS: &[(&str, i64)] = &[
     ("partial_auth_chain_ids", 141),
     ("members_omitted", 142),
     ("additional_creators", 143),
+    ("forward_extremities", 144),
 ];
 
 static KEY_TO_INT: LazyLock<HashMap<&'static str, i64>> =
@@ -206,7 +207,7 @@ mod tests {
         // MSC4242 additions (codes 138-143).
         assert_eq!(key_to_int("prev_state_events"), Some(138));
         assert_eq!(key_to_int("additional_creators"), Some(143));
-        assert_eq!(KEYS.len(), 143);
+        assert_eq!(KEYS.len(), 144);
         assert_eq!(key_to_int("not_a_matrix_key"), None);
     }
 }

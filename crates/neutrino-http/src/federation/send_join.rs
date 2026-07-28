@@ -23,14 +23,9 @@
 //! Idempotent: a re-sent `send_join` (our response was lost) re-applies the
 //! same join as a no-op and we simply rebuild and return the state again.
 
-use axum::{
-    Json,
-    extract::rejection::JsonRejection,
-    extract::{Path, State},
-    http::HeaderMap,
-};
+use axum::{Json, extract::State, extract::rejection::JsonRejection, http::HeaderMap};
 use neutrino_store::{DagStore, EventStore, RoomStore};
-use ruma::{EventId, OwnedEventId, OwnedRoomId};
+use ruma::{EventId, OwnedEventId};
 use serde::Serialize;
 use serde_json::value::RawValue as RawJsonValue;
 
@@ -55,17 +50,19 @@ pub(crate) struct ResponseBody {
 }
 
 /// Federation `/send_join` handler.
+///
+/// The `{roomId}`/`{eventId}` path segments are IGNORED: the event body is
+/// authoritative for both (the event id is recomputed from the reference hash,
+/// never read), so a transport is free to compress/elide them and send
+/// placeholder segments.
 pub(crate) async fn handle(
     State(state): State<AppState>,
-    Path((room_id, event_id)): Path<(String, String)>,
     headers: HeaderMap,
     body: Result<Json<Box<RawJsonValue>>, JsonRejection>,
 ) -> Result<Json<ResponseBody>, FedError> {
     let raw = body
         .map_err(|_| FedError::BadRequest("body is not valid JSON"))?
         .0;
-    let room_id = OwnedRoomId::try_from(room_id.as_str())
-        .map_err(|_| FedError::BadRequest("invalid room_id"))?;
 
     // Parse + compute the event id from the reference hash. `auth_events`
     // start empty — apply_pdu is their sole authority. Resident membership
@@ -82,20 +79,11 @@ pub(crate) async fn handle(
             return Err(FedError::BadRequest("malformed join event"));
         }
     };
+    let room_id = event.room_id.clone();
 
     // Structural validation (spec §send_join). The signature check is skipped
     // (no signing keys); the sender-on-origin check is enforced below via the
     // network-attested `X-Matrix` origin. apply_resident remains the real auth.
-    if event.event_id.as_str() != event_id {
-        return Err(FedError::BadRequest(
-            "event_id in path does not match the event",
-        ));
-    }
-    if event.room_id != room_id {
-        return Err(FedError::BadRequest(
-            "room_id in path does not match the event",
-        ));
-    }
     if event.event_type != "m.room.member" {
         return Err(FedError::BadRequest("event is not an m.room.member event"));
     }
