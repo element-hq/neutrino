@@ -117,6 +117,19 @@ Done:
   `stop` joins the std-thread writer, so the file is flushed + `adb pull`-ready
   the moment it returns. ffi-only; not on the shared `Config`.
 
+- Link-owned wire codec seam (`LinkCodec`, 2026-07-28): `DatagramLink` gained
+  a defaulted `codec()` (the `profile()` pattern); a medium can rewrite the
+  assembled `WireRequest`/`WireResponse` — path, headers incl. the X-Matrix
+  value, CBOR body — on both wire directions. Hooks: `encode_request` pre
+  CoAP-build (transforms ride every block), `decode_request` post-parse and
+  before the origin binding, response pair around Block2. Failure mapping:
+  egress errors → Transport (outbox retries); `decode_request` → 400
+  (malformed, upgrade-together mesh); `encode_response` → 500.
+  `PcapCaptureLink` delegates (captures show the encoded wire). Design:
+  `docs/superpowers/specs/2026-07-28-neutrino-lb-link-codec-design.md`.
+  OUTSTANDING: the actual medium codecs in neutrino-mdns / neutrino-iroh
+  (path-id elision + server-name→index packing over the medium registry).
+
 Deferred follow-ups (write-ups, not done):
 - Wire-size reduction for small MTUs: carry v12 **room** IDs as **raw 32 B**
   (vs `sigil+base64`, −12 B/ID; needs a re-encode-or-fall-back-to-text guard like
