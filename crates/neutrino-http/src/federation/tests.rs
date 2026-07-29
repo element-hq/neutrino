@@ -3805,15 +3805,30 @@ fn parse_server_names_lowercase_colon_and_drops_garbage() {
 /// send_join returns `send_join_body`, get_missing_events returns no events.
 /// Lets a test drive the outbound ingest path against deliberately broken state.
 fn stub_resident(make_join_body: Value, send_join_body: Value) -> axum::Router {
+    stub_resident_counting(make_join_body, send_join_body).0
+}
+
+/// As [`stub_resident`], also returning a counter of make_join hits so a test
+/// can assert how many join handshakes actually ran.
+fn stub_resident_counting(
+    make_join_body: Value,
+    send_join_body: Value,
+) -> (axum::Router, Arc<std::sync::atomic::AtomicUsize>) {
     use axum::routing::{get as rget, post as rpost, put as rput};
     let mj = Arc::new(make_join_body);
     let sj = Arc::new(send_join_body);
-    axum::Router::new()
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mj_hits = hits.clone();
+    let router = axum::Router::new()
         .route(
             "/_matrix/federation/v1/make_join/{room}/{user}",
             rget(move || {
                 let mj = mj.clone();
-                async move { axum::Json((*mj).clone()) }
+                let hits = mj_hits.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json((*mj).clone())
+                }
             }),
         )
         .route(
@@ -3826,7 +3841,8 @@ fn stub_resident(make_join_body: Value, send_join_body: Value) -> axum::Router {
         .route(
             "/_matrix/federation/v1/get_missing_events/{room}",
             rpost(|| async { axum::Json(json!({ "events": [] })) }),
-        )
+        );
+    (router, hits)
 }
 
 #[tokio::test]
@@ -3926,6 +3942,117 @@ async fn federated_join_missing_create_in_response_fails_without_registering() {
     assert!(
         !a_store.room_exists(&room_id).await.unwrap(),
         "a create-less response must not register the room"
+    );
+}
+
+#[tokio::test]
+async fn federated_join_retry_reattaches_to_inflight_dance() {
+    // A /join whose client goes away must not abort the handshake, and a retry
+    // must re-attach to the running dance rather than re-running make_join +
+    // send_join — over a slow link every restart discards the send_join
+    // transfer's progress, so the join never converges (the radio join-timeout
+    // failure mode). Proven by counting make_join hits: one dance serves both
+    // an aborted waiter and its retry; only a /join arriving after the dance
+    // resolves starts a fresh one.
+    //
+    // The ghost-referencing template (as in
+    // `federated_join_times_out_when_state_never_grounds`) keeps the dance in
+    // flight for its full ingest wait, so the retry deterministically lands
+    // while it is still running.
+    let alice = alice();
+    let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .unwrap();
+    let room_id = create.room_id.clone();
+    let ghost = EventBuilder::new(alice, "m.room.message".to_owned())
+        .room_id(room_id.clone())
+        .content(json!({ "body": "ghost" }))
+        .prev_events(vec![create.event_id.clone()])
+        .build()
+        .unwrap();
+    let zara: OwnedUserId = ZARA.parse().unwrap();
+    let template = EventBuilder::new(zara.clone(), "m.room.member".to_owned())
+        .room_id(room_id.clone())
+        .state_key(zara.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create.event_id.clone()])
+        .prev_state_events(vec![ghost.event_id.clone()])
+        .build()
+        .unwrap();
+    let mj = json!({ "event": raw_to_value(&template), "room_version": ROOM_VERSION_ID });
+    let sj = json!({
+        "state_dag": [raw_to_value(&create), raw_to_value(&template)],
+        "timeline": [],
+        "event": raw_to_value(&template),
+    });
+    let (router, make_joins) = stub_resident_counting(mj, sj);
+    let b = crate::federation::test_support::spawn_stub(router).await;
+
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_state = crate::AppState::from_store(config_for("a.example", "bob"), a_store.clone());
+
+    // First /join: its client (waiter) will be aborted mid-dance.
+    let waiter = tokio::spawn({
+        let state = a_state.clone();
+        let zara = zara.clone();
+        let room_id = room_id.clone();
+        let b = b.clone();
+        async move {
+            crate::federation::join::federated_join_with(
+                &state,
+                zara,
+                &room_id,
+                &[b],
+                std::time::Duration::from_millis(1500),
+            )
+            .await
+        }
+    });
+    // The dance is underway once the resident has served make_join.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while make_joins.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("resident never saw make_join");
+    // The client gives up (reqwest timeout drops the request future).
+    waiter.abort();
+
+    // The retry re-attaches: it inherits the running dance's outcome (a 504
+    // after ITS 1500ms ingest wait — the retry's own 1ms timeout is unused)
+    // and the resident sees no second handshake.
+    let resp = crate::federation::join::federated_join_with(
+        &a_state,
+        zara.clone(),
+        &room_id,
+        std::slice::from_ref(&b),
+        std::time::Duration::from_millis(1),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(
+        make_joins.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a /join retry must re-attach to the in-flight dance, not restart the handshake"
+    );
+
+    // The dance resolved and deregistered itself — a later /join runs afresh.
+    let resp = crate::federation::join::federated_join_with(
+        &a_state,
+        zara,
+        &room_id,
+        &[b],
+        std::time::Duration::from_millis(1),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(
+        make_joins.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a /join after the dance resolves must start a fresh handshake"
     );
 }
 
