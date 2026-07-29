@@ -442,11 +442,10 @@ fn build_lb_config(
         ingress_bind: ingress_bind_for(&config.bind_addr, fed_port),
         egress_bind,
         upstream: upstream_url(&config.bind_addr)?,
-        // Q-Block sized to the medium's declared MTU. The default profile
-        // derives the same 512 B block the stall diagnosis hardcoded here (a
-        // 1024 B block + federation options overflows coap-lite's 1280 B
-        // message cap and the send silently stalls) — the full option-budget
-        // rationale now lives on `WireKind::coap_qblock_for_mtu`.
+        // Q-Block sized to the medium's declared MTU. Only the block-option
+        // framing is reserved — what else rides each block is controlled by
+        // the medium's LinkCodec, and an over-MTU datagram is the link's to
+        // detect and log loudly (see `WireKind::coap_qblock_for_mtu`).
         wire: neutrino_lb::WireKind::coap_qblock_for_mtu(profile.max_datagram)?,
         // The in-process sidecar is the embedded/datagram-link target: map a
         // peer's node-id `server_name` to its bare 64-char hex node id so the
@@ -570,15 +569,14 @@ mod tests {
         assert_eq!(lb.ingress_bind, "[::]:8448".parse().unwrap());
         assert_eq!(lb.egress_bind, egress());
         assert_eq!(lb.upstream, "http://127.0.0.1:8008");
-        // The default profile must keep deriving the field-proven 512 B
-        // Q-Block1 size (a 1024 B block + federation options overflows the
-        // 1280 B coap-lite cap and stalls the send) — pinned so the
-        // profile-driven derivation can't silently drift from the old
-        // hardcoded value.
+        // The default profile derives the SZX-max 1024 B Q-Block1 size: no
+        // per-request option budget is reserved any more — the medium's
+        // LinkCodec controls what rides each block, and an over-MTU datagram
+        // is the link's to detect and log loudly.
         assert!(matches!(
             lb.wire,
             neutrino_lb::WireKind::CoapQBlock {
-                block1_size: Some(512),
+                block1_size: Some(1024),
                 ..
             }
         ));
@@ -597,12 +595,12 @@ mod tests {
         assert!(matches!(
             lb.wire,
             neutrino_lb::WireKind::CoapQBlock {
-                block1_size: Some(256),
+                block1_size: Some(512),
                 ..
             }
         ));
         let tiny = LinkProfile {
-            max_datagram: 64,
+            max_datagram: 16,
             ..LinkProfile::default()
         };
         assert!(build_lb_config(&c, 8448, egress(), None, tiny).is_err());

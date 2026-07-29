@@ -151,24 +151,21 @@ pub enum WireKind {
     },
 }
 
-/// Non-payload bytes assumed per CoAP request datagram when deriving a block
-/// size from a link MTU: header + token + the longest federation route's
-/// options (the v2 invite path carries a room id and an event id), the
-/// X-Matrix origin (a 64-char hex node id plus framing), forwarded headers,
-/// and the Request-Tag/Size1/Q-Block1 options. Field evidence bounds it from
-/// below: a 1024 B block plus real federation options overflowed the 1280 B
-/// message cap (>256 B of options), silently stalling the send. 384 B leaves
-/// comfortable margin above that while still yielding a 512 B block on a full
-/// 1280 B datagram — the value previously hardcoded in `neutrino-main` after
-/// that stall was diagnosed.
-const FEDERATION_OPTION_BUDGET: usize = 384;
-
 impl WireKind {
     /// The Q-Block wire tuned for a link whose datagrams carry at most
     /// `max_datagram` bytes: the per-block payload is the largest SZX power of
-    /// two (RFC 7959 §2.2) that fits the MTU alongside a federation request's
-    /// options ([`FEDERATION_OPTION_BUDGET`]); timing is [`QBlockTuning`]'s
-    /// default. Errors when the MTU cannot frame even a 16-byte block.
+    /// two (RFC 7959 §2.2) that fits the MTU alongside the Block1/Q-Block
+    /// option framing; timing is [`QBlockTuning`]'s default. Errors when the
+    /// MTU cannot frame even a 16-byte block.
+    ///
+    /// No further per-request option budget is reserved: what rides each
+    /// block beyond the framing is the medium's business — its [`LinkCodec`]
+    /// controls the per-block options — and a datagram that still overflows
+    /// the link's MTU is the link's to detect and log loudly, not to size
+    /// around. (The pre-LinkCodec wire reserved 384 B here for the
+    /// uncompressed path/credential options, after a 1024 B block + real
+    /// federation options overflowed the 1280 B message cap and silently
+    /// stalled the send.)
     ///
     /// The MTU is clamped to coap-lite's `Packet::MAX_SIZE` first —
     /// `to_bytes()` refuses larger messages regardless of link capacity, so a
@@ -178,7 +175,7 @@ impl WireKind {
     /// MTUs.
     pub fn coap_qblock_for_mtu(max_datagram: usize) -> Result<Self, String> {
         let mtu = max_datagram.min(coap_lite::Packet::MAX_SIZE);
-        let block1_size = coap::client::block1_size_for_mtu(mtu, FEDERATION_OPTION_BUDGET)
+        let block1_size = coap::client::block1_size_for_mtu(mtu, 0)
             .map_err(|e| format!("deriving CoAP block size from link profile: {e}"))?;
         Ok(WireKind::CoapQBlock {
             block1_size: Some(block1_size),
@@ -405,21 +402,24 @@ mod profile_tests {
         assert!(p.authenticates_connections);
     }
 
-    // MTU → block derivation: the full 1280 B datagram budget yields the
-    // field-proven 512 B block; roomier links clamp to the coap-lite message
-    // cap; constrained links shrink by SZX powers of two; an MTU that cannot
-    // frame even a 16 B block errors instead of silently stalling on send.
+    // MTU → block derivation: only the block-option framing is reserved (the
+    // per-request options are the medium's LinkCodec's business), so the full
+    // 1280 B datagram yields a 1024 B block (the SZX max); roomier links
+    // clamp to the coap-lite message cap; constrained links shrink by SZX
+    // powers of two; an MTU that cannot frame even a 16 B block errors
+    // instead of silently stalling on send.
     #[test]
     fn coap_qblock_for_mtu_derives_szx_block_sizes() {
         let block = |mtu: usize| match WireKind::coap_qblock_for_mtu(mtu) {
             Ok(WireKind::CoapQBlock { block1_size, .. }) => block1_size,
             other => panic!("unexpected wire kind: {other:?}"),
         };
-        assert_eq!(block(coap_lite::Packet::MAX_SIZE), Some(512));
-        assert_eq!(block(100_000), Some(512)); // clamped to Packet::MAX_SIZE
-        assert_eq!(block(700), Some(256));
-        assert_eq!(block(412), Some(16)); // smallest legal SZX still frames
-        assert!(WireKind::coap_qblock_for_mtu(411).is_err());
+        assert_eq!(block(coap_lite::Packet::MAX_SIZE), Some(1024));
+        assert_eq!(block(100_000), Some(1024)); // clamped to Packet::MAX_SIZE
+        assert_eq!(block(700), Some(512));
+        assert_eq!(block(200), Some(128)); // the mdns medium's constrained MTU
+        assert_eq!(block(28), Some(16)); // smallest legal SZX still frames
+        assert!(WireKind::coap_qblock_for_mtu(27).is_err());
     }
 }
 
