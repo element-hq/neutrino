@@ -71,6 +71,14 @@ pub struct QBlockConfig {
     /// negotiated size is used). `None` (default): RFC 9177 behaviour — only
     /// requests that opt in via Q-Block2 get Q-Block2 responses.
     pub assume_peer_block_size: Option<usize>,
+    /// Minimum spacing between the block PDUs of one burst — the link's
+    /// declared drain rate. A burst sent at line rate into a link that drains
+    /// slower (e.g. a ~2 frames/s radio) builds a standing queue below the
+    /// UDP hop; the receiver's `NON_RECEIVE_TIMEOUT` then fires for blocks
+    /// that are merely queued, and the spurious retransmits deepen the queue.
+    /// RFC 9177 §7.2 leaves the NON-mode sending rate to the sender; this is
+    /// that knob. `Duration::ZERO` (default): line rate.
+    pub payload_gap: Duration,
 }
 
 impl Default for QBlockConfig {
@@ -85,6 +93,7 @@ impl Default for QBlockConfig {
             nstart: 1,
             non_probing_wait: Duration::from_secs(247),
             assume_peer_block_size: None,
+            payload_gap: Duration::ZERO,
         }
     }
 }
@@ -256,7 +265,11 @@ impl QBlockSender {
     }
 
     /// Sends the next burst (up to `MAX_PAYLOADS` lowest outstanding blocks) and
-    /// returns how many were sent. Does not sleep — the caller paces bursts.
+    /// returns how many were sent. Within the burst, consecutive blocks are
+    /// spaced `payload_gap` apart (the link's declared drain rate; zero =
+    /// back-to-back). Does not sleep *between* bursts — the caller paces those
+    /// (`inter_burst_delay` / the recovery driver's round trips), so there is
+    /// no gap after a burst's final block.
     pub async fn drain_burst<S: BlockSink + ?Sized>(&mut self, sink: &S) -> std::io::Result<u32> {
         self.ensure_started();
         let total = self.total_blocks();
@@ -266,6 +279,9 @@ impl QBlockSender {
             let Some(n) = self.outstanding.first() else {
                 break;
             };
+            if sent > 0 && !self.config.payload_gap.is_zero() {
+                tokio::time::sleep(self.config.payload_gap).await;
+            }
             let pdu = self.build_block(n, total)?;
             sink.send_block(pdu).await?;
             self.outstanding.remove(n);
@@ -980,6 +996,42 @@ mod tests {
         // Within a burst there is no delay.
         assert_eq!(times[10], times[19]);
         assert_eq!(times[20], times[24]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn payload_gap_spaces_blocks_within_a_burst() {
+        // 12 blocks, MAX_PAYLOADS=10, gap=450ms: burst of 10 with each block
+        // 450ms after the last, the inter-burst delay (with no stacked gap),
+        // then the paced 2-block tail.
+        let body: Vec<u8> = (0..12u16).flat_map(|i| [i as u8; 16]).collect();
+        let gap = Duration::from_millis(450);
+        let config = QBlockConfig {
+            max_payloads: 10,
+            non_timeout: Duration::from_secs(2),
+            payload_gap: gap,
+            ..Default::default()
+        };
+        let sink = RecordingSink::default();
+
+        sender(body, 0, config.clone()).run(&sink).await.unwrap();
+
+        let sent = sink.sent.lock().unwrap();
+        assert_eq!(sent.len(), 12);
+        // Within each burst: consecutive blocks exactly `gap` apart.
+        for i in 1..10 {
+            let d = sent[i].1 - sent[i - 1].1;
+            assert_eq!(d, gap, "blocks {}->{} spaced {d:?}, want {gap:?}", i - 1, i);
+        }
+        assert_eq!(sent[11].1 - sent[10].1, gap);
+        // The burst boundary is the inter-burst delay alone — the final block
+        // of a burst is not followed by a payload gap.
+        let boundary = sent[10].1 - sent[9].1;
+        let lo = config.non_timeout;
+        let hi = config.non_timeout.mul_f64(1.5);
+        assert!(
+            boundary >= lo && boundary < hi,
+            "burst boundary {boundary:?} outside [{lo:?}, {hi:?})"
+        );
     }
 
     #[tokio::test(start_paused = true)]

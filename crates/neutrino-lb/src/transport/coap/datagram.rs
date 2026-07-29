@@ -102,6 +102,16 @@ pub struct LinkProfile {
     /// origin trust instead. Independent of the app's `trusted_network`
     /// config — all four combinations are valid deployments.
     pub authenticates_connections: bool,
+    /// Minimum spacing between datagram sends the link can sustain
+    /// indefinitely — its drain rate, declared as a gap rather than bytes/s
+    /// because a slow medium's cost is typically per-frame airtime, not
+    /// payload bytes. `None` (default): the link drains faster than we can
+    /// fill it, send at line rate. `Some(gap)`: the Q-Block sender spaces a
+    /// burst's blocks this far apart (`QBlockTuning::payload_gap`), so a
+    /// multi-block body never builds a standing queue below the UDP hop —
+    /// a queue the receiver's gap-timer would misread as loss, answering
+    /// with retransmits that deepen it.
+    pub min_send_gap: Option<Duration>,
 }
 
 impl Default for LinkProfile {
@@ -113,6 +123,7 @@ impl Default for LinkProfile {
         Self {
             max_datagram: coap_lite::Packet::MAX_SIZE,
             authenticates_connections: true,
+            min_send_gap: None,
         }
     }
 }

@@ -73,6 +73,12 @@ pub struct QBlockTuning {
     pub non_receive_timeout: Duration,
     /// Max missing-block recovery rounds (`NON_MAX_RETRANSMIT`, default 4).
     pub non_max_retransmit: u32,
+    /// Minimum spacing between a burst's block sends — the link's declared
+    /// drain rate (`LinkProfile::min_send_gap`), zero = line rate (default).
+    /// RFC 9177 §7.2 leaves the NON-mode sending rate to the sender; a burst
+    /// fired at line rate into a slower link builds a standing queue whose
+    /// delay the receiver's gap-timer misreads as loss.
+    pub payload_gap: Duration,
 }
 
 impl Default for QBlockTuning {
@@ -82,6 +88,7 @@ impl Default for QBlockTuning {
             non_timeout: Duration::from_secs(2),
             non_receive_timeout: Duration::from_secs(4),
             non_max_retransmit: 4,
+            payload_gap: Duration::ZERO,
         }
     }
 }
@@ -104,6 +111,7 @@ impl QBlockTuning {
             non_timeout: self.non_timeout,
             non_receive_timeout: self.non_receive_timeout,
             non_max_retransmit: self.non_max_retransmit,
+            payload_gap: self.payload_gap,
             assume_peer_block_size: Some(
                 block1_size.unwrap_or(coap::client::UdpCoAPClient::MAX_PAYLOAD_BLOCK),
             ),
@@ -152,11 +160,12 @@ pub enum WireKind {
 }
 
 impl WireKind {
-    /// The Q-Block wire tuned for a link whose datagrams carry at most
-    /// `max_datagram` bytes: the per-block payload is the largest SZX power of
-    /// two (RFC 7959 §2.2) that fits the MTU alongside the Block1/Q-Block
-    /// option framing; timing is [`QBlockTuning`]'s default. Errors when the
-    /// MTU cannot frame even a 16-byte block.
+    /// The Q-Block wire tuned for a link's declared [`LinkProfile`]: the
+    /// per-block payload is the largest SZX power of two (RFC 7959 §2.2) that
+    /// fits the profile's `max_datagram` alongside the Block1/Q-Block option
+    /// framing; timing is [`QBlockTuning`]'s default adjusted for the
+    /// profile's drain rate (below). Errors when the MTU cannot frame even a
+    /// 16-byte block.
     ///
     /// No further per-request option budget is reserved: what rides each
     /// block beyond the framing is the medium's business — its [`LinkCodec`]
@@ -173,13 +182,26 @@ impl WireKind {
     /// their size from their own link profile, so the mesh-wide-coordination
     /// caveat on [`WireKind::Coap`] still applies: peers must see comparable
     /// MTUs.
-    pub fn coap_qblock_for_mtu(max_datagram: usize) -> Result<Self, String> {
-        let mtu = max_datagram.min(coap_lite::Packet::MAX_SIZE);
+    ///
+    /// The link's declared drain rate (`LinkProfile::min_send_gap`) becomes
+    /// the tuning's `payload_gap`, and the receiver's `non_receive_timeout`
+    /// is raised to outlast a fully-paced burst plus the sender's worst-case
+    /// inter-burst pause — lawful pacing must never read as loss, or the
+    /// receiver requests retransmits of blocks that are merely en route.
+    pub fn coap_qblock_for_profile(profile: &LinkProfile) -> Result<Self, String> {
+        let mtu = profile.max_datagram.min(coap_lite::Packet::MAX_SIZE);
         let block1_size = coap::client::block1_size_for_mtu(mtu, 0)
             .map_err(|e| format!("deriving CoAP block size from link profile: {e}"))?;
+        let mut qblock = QBlockTuning::default();
+        if let Some(gap) = profile.min_send_gap {
+            qblock.payload_gap = gap;
+            let paced_burst = gap.saturating_mul(qblock.max_payloads.saturating_sub(1));
+            let inter_burst = qblock.non_timeout.mul_f64(1.5);
+            qblock.non_receive_timeout = qblock.non_receive_timeout.max(paced_burst + inter_burst);
+        }
         Ok(WireKind::CoapQBlock {
             block1_size: Some(block1_size),
-            qblock: QBlockTuning::default(),
+            qblock,
         })
     }
 }
@@ -409,8 +431,12 @@ mod profile_tests {
     // powers of two; an MTU that cannot frame even a 16 B block errors
     // instead of silently stalling on send.
     #[test]
-    fn coap_qblock_for_mtu_derives_szx_block_sizes() {
-        let block = |mtu: usize| match WireKind::coap_qblock_for_mtu(mtu) {
+    fn coap_qblock_for_profile_derives_szx_block_sizes() {
+        let profile = |mtu: usize| LinkProfile {
+            max_datagram: mtu,
+            ..LinkProfile::default()
+        };
+        let block = |mtu: usize| match WireKind::coap_qblock_for_profile(&profile(mtu)) {
             Ok(WireKind::CoapQBlock { block1_size, .. }) => block1_size,
             other => panic!("unexpected wire kind: {other:?}"),
         };
@@ -419,7 +445,35 @@ mod profile_tests {
         assert_eq!(block(700), Some(512));
         assert_eq!(block(200), Some(128)); // the mdns medium's constrained MTU
         assert_eq!(block(28), Some(16)); // smallest legal SZX still frames
-        assert!(WireKind::coap_qblock_for_mtu(27).is_err());
+        assert!(WireKind::coap_qblock_for_profile(&profile(27)).is_err());
+    }
+
+    // Drain-rate derivation: a declared min_send_gap becomes the tuning's
+    // payload_gap, and non_receive_timeout grows to outlast a fully-paced
+    // burst plus the worst-case inter-burst pause — pacing must never read
+    // as loss. No gap declared → the default tuning, untouched.
+    #[test]
+    fn coap_qblock_for_profile_derives_pacing() {
+        let tuning = |gap: Option<Duration>| match WireKind::coap_qblock_for_profile(&LinkProfile {
+            max_datagram: 200,
+            min_send_gap: gap,
+            ..LinkProfile::default()
+        }) {
+            Ok(WireKind::CoapQBlock { qblock, .. }) => qblock,
+            other => panic!("unexpected wire kind: {other:?}"),
+        };
+
+        assert_eq!(tuning(None), QBlockTuning::default());
+
+        let gap = Duration::from_millis(450);
+        let paced = tuning(Some(gap));
+        assert_eq!(paced.payload_gap, gap);
+        // 9 gaps within a 10-block burst (4.05s) + 1.5 × non_timeout (3s).
+        assert_eq!(paced.non_receive_timeout, Duration::from_millis(7050));
+
+        // A tiny gap must not shrink the timer below its RFC default.
+        let tiny = tuning(Some(Duration::from_millis(10)));
+        assert_eq!(tiny.non_receive_timeout, Duration::from_secs(4));
     }
 }
 
@@ -566,12 +620,14 @@ mod qblock_tuning_tests {
             non_timeout: Duration::from_millis(500),
             non_receive_timeout: Duration::from_millis(900),
             non_max_retransmit: 2,
+            payload_gap: Duration::from_millis(450),
         };
         let c = t.to_qblock_config(Some(512));
         assert_eq!(c.max_payloads, 7);
         assert_eq!(c.non_timeout, Duration::from_millis(500));
         assert_eq!(c.non_receive_timeout, Duration::from_millis(900));
         assert_eq!(c.non_max_retransmit, 2);
+        assert_eq!(c.payload_gap, Duration::from_millis(450));
         // Closed deployment: peer Q-Block support is declared out of band, at
         // the wire's block size (falling back to coap-rs's 1024 B default).
         assert_eq!(c.assume_peer_block_size, Some(512));
