@@ -12,9 +12,18 @@
 //!    worker apply them through `apply_pdu` (auth + state-res + persist). No DAG
 //!    cap; incremental memory; crash-resume is free via `staged_rooms()`.
 //!
-//! The CSAPI request then blocks (polling current state for our `join`) until
-//! the worker grounds the DAG, or times out — on timeout the client errors but
-//! the drain keeps running, so a later sync still shows the join.
+//! The dance runs in a task detached from the CSAPI request, registered in
+//! `App::joins` under (room, user): the request merely awaits the dance's
+//! outcome, and a client that times out and retries `/join` re-attaches to
+//! the running dance instead of restarting the handshake. Over a slow link
+//! the send_join transfer outlives the client's HTTP timeout, and a restart
+//! would discard the transfer's progress (a fresh join event → a fresh
+//! transaction) while the orphaned transfer's retransmissions keep competing
+//! for the link — so the join would never converge.
+//!
+//! The dance blocks (watching current state for our `join`) until the worker
+//! grounds the DAG, or times out — on timeout the client errors but the drain
+//! keeps running, so a later sync still shows the join.
 
 use std::time::Duration;
 
@@ -38,6 +47,15 @@ use crate::{AppState, error_response, lock_app};
 /// error but the drain keeps running (a later sync will show the join).
 const JOIN_INGEST_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Cloneable outcome of a join dance, published to every attached waiter.
+/// `Ok` means our join is grounded in current state.
+type JoinOutcome = Result<(), JoinFailure>;
+
+/// A waiter's handle onto an in-flight join dance: `None` until the dance
+/// resolves. Stored in `App::joins` so a later `/join` for the same
+/// (room, user) re-attaches instead of restarting the handshake.
+pub(crate) type JoinWatch = watch::Receiver<Option<JoinOutcome>>;
+
 /// Join a room we don't host via the federation handshake, trying each
 /// candidate resident server in turn. Returns the CSAPI `/join` response.
 pub(crate) async fn federated_join(
@@ -51,6 +69,11 @@ pub(crate) async fn federated_join(
 
 /// As [`federated_join`], with the ingest-wait timeout injectable so a test can
 /// exercise the timeout (504) path without a 20s wall-clock wait.
+///
+/// The handshake runs in a detached task registered in `App::joins`; this
+/// function only spawns-or-attaches and awaits the outcome. A retried `/join`
+/// therefore re-uses the running dance (its `candidates`/`timeout` are the
+/// spawning call's), and an aborted request never aborts the transfer.
 pub(crate) async fn federated_join_with(
     state: &AppState,
     user: OwnedUserId,
@@ -58,6 +81,63 @@ pub(crate) async fn federated_join_with(
     candidates: &[OwnedServerName],
     timeout: Duration,
 ) -> Response {
+    let key = (room_id.to_owned(), user);
+    let mut rx = {
+        let mut app = lock_app(state);
+        match app.joins.get(&key) {
+            Some(rx) => rx.clone(),
+            None => {
+                let (tx, rx) = watch::channel(None);
+                app.joins.insert(key.clone(), rx.clone());
+                let state = state.clone();
+                let candidates = candidates.to_vec();
+                tokio::spawn(async move {
+                    let outcome =
+                        run_join_dance(&state, key.1.clone(), &key.0, &candidates, timeout).await;
+                    // Deregister before publishing: a /join arriving after the
+                    // publish must start a fresh dance, not adopt a stale
+                    // outcome. Waiters hold their receivers already.
+                    lock_app(&state).joins.remove(&key);
+                    let _ = tx.send(Some(outcome));
+                });
+                rx
+            }
+        }
+    };
+    loop {
+        // Scoped: a `watch::Ref` must not be held across an await.
+        {
+            let outcome = rx.borrow_and_update();
+            match outcome.as_ref() {
+                Some(Ok(())) => {
+                    return (StatusCode::OK, Json(json!({ "room_id": room_id }))).into_response();
+                }
+                Some(Err(f)) => return error_response(f.status, f.errcode, &f.reason),
+                None => {}
+            }
+        }
+        if rx.changed().await.is_err() {
+            // The dance task died without publishing (only possible if it
+            // panicked) — surface rather than hang the request.
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                "join task terminated unexpectedly",
+            );
+        }
+    }
+}
+
+/// One full join dance: try each candidate resident (make_join → send_join →
+/// ingest), then block until our join lands in current state (or `timeout`).
+/// Runs detached from any request — see [`federated_join_with`].
+async fn run_join_dance(
+    state: &AppState,
+    user: OwnedUserId,
+    room_id: &RoomId,
+    candidates: &[OwnedServerName],
+    timeout: Duration,
+) -> JoinOutcome {
     let (store, worker_poke, security, own_server, federation_proxy) = {
         let app = lock_app(state);
         (
@@ -92,27 +172,23 @@ pub(crate) async fn federated_join_with(
         {
             Ok(()) => {
                 // Staged + worker poked; block until our join lands (or time out).
-                return match wait_for_join(&*store, &mut persists, room_id, &user, timeout).await {
-                    Ok(()) => {
-                        // The join is grounded — drop any out-of-band invite stub
-                        // that sourced this join. A lingering stub would make a
-                        // later `/leave` route through the OOB-invite *decline*
-                        // path (`federation::leave::reject_invite`), which leaves
-                        // for the inviting server but never updates our own room
-                        // state — so the leaver stays `join` in its own view while
-                        // peers see `leave`. Best-effort: a stale stub is otherwise
-                        // superseded by the joined state in sync, so a removal
-                        // fault must not fail an already-successful join.
-                        if let Err(e) = store.remove_invite(room_id, &user).await {
-                            warn!(%room_id, %user, error = %e, "failed to clear invite stub after federated join");
-                        }
-                        (StatusCode::OK, Json(json!({ "room_id": room_id }))).into_response()
-                    }
-                    Err(resp) => resp,
-                };
+                wait_for_join(&*store, &mut persists, room_id, &user, timeout).await?;
+                // The join is grounded — drop any out-of-band invite stub
+                // that sourced this join. A lingering stub would make a
+                // later `/leave` route through the OOB-invite *decline*
+                // path (`federation::leave::reject_invite`), which leaves
+                // for the inviting server but never updates our own room
+                // state — so the leaver stays `join` in its own view while
+                // peers see `leave`. Best-effort: a stale stub is otherwise
+                // superseded by the joined state in sync, so a removal
+                // fault must not fail an already-successful join.
+                if let Err(e) = store.remove_invite(room_id, &user).await {
+                    warn!(%room_id, %user, error = %e, "failed to clear invite stub after federated join");
+                }
+                return Ok(());
             }
             Err(f) => {
-                warn!(%dest, error = f.reason, "federated join via candidate failed");
+                warn!(%dest, error = %f.reason, "federated join via candidate failed");
                 // A 403 is an authoritative auth refusal — once any candidate
                 // returns it, keep it rather than let a later unreachable
                 // candidate downgrade the client's error back to 502.
@@ -125,8 +201,7 @@ pub(crate) async fn federated_join_with(
             }
         }
     }
-    let f = terminal.unwrap_or_else(|| gateway("no resident server could be reached"));
-    error_response(f.status, f.errcode, f.reason)
+    Err(terminal.unwrap_or_else(|| gateway("no resident server could be reached")))
 }
 
 /// For a room we do NOT host, assemble the candidate resident servers and run a
@@ -233,24 +308,30 @@ pub(crate) async fn federated_join_if_remote(
     Some(federated_join(state, user.to_owned(), room_id, &candidates).await)
 }
 
-/// Why one candidate's join handshake failed, plus how to surface it to the
-/// CSAPI client if no candidate succeeds. A remote `403` is an authoritative
-/// auth refusal (invite-only / banned) and maps to the spec's `403
-/// M_FORBIDDEN`; every other failure (transport, 5xx, version mismatch, ingest)
-/// is a gateway failure → `502 M_UNKNOWN`.
-struct JoinFailure {
-    reason: &'static str,
+/// Why a join dance failed, plus how to surface it to the CSAPI client.
+/// A remote `403` is an authoritative auth refusal (invite-only / banned) and
+/// maps to the spec's `403 M_FORBIDDEN`; every other failure (transport, 5xx,
+/// version mismatch, ingest) is a gateway failure → `502 M_UNKNOWN`. `Clone`
+/// so one dance's outcome can fan out to every attached waiter.
+#[derive(Clone)]
+pub(crate) struct JoinFailure {
+    reason: String,
     status: StatusCode,
     errcode: &'static str,
 }
 
-/// A retryable/opaque candidate failure: `502 M_UNKNOWN` carrying `reason`.
-fn gateway(reason: &'static str) -> JoinFailure {
+/// A [`JoinFailure`] with an arbitrary status/errcode.
+fn failure(status: StatusCode, errcode: &'static str, reason: impl Into<String>) -> JoinFailure {
     JoinFailure {
-        reason,
-        status: StatusCode::BAD_GATEWAY,
-        errcode: "M_UNKNOWN",
+        reason: reason.into(),
+        status,
+        errcode,
     }
+}
+
+/// A retryable/opaque candidate failure: `502 M_UNKNOWN` carrying `reason`.
+fn gateway(reason: impl Into<String>) -> JoinFailure {
+    failure(StatusCode::BAD_GATEWAY, "M_UNKNOWN", reason)
 }
 
 /// Map a `make_join`/`send_join` client error into a [`JoinFailure`], promoting
@@ -258,11 +339,11 @@ fn gateway(reason: &'static str) -> JoinFailure {
 /// gateway failure tagged with `reason`.
 fn from_client_err(e: FederationClientError, reason: &'static str) -> JoinFailure {
     match e {
-        FederationClientError::Status(403) => JoinFailure {
-            reason: "resident refused the join",
-            status: StatusCode::FORBIDDEN,
-            errcode: "M_FORBIDDEN",
-        },
+        FederationClientError::Status(403) => failure(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            "resident refused the join",
+        ),
         _ => gateway(reason),
     }
 }
@@ -386,10 +467,10 @@ async fn wait_for_join(
     room_id: &RoomId,
     user: &UserId,
     timeout: Duration,
-) -> Result<(), Response> {
+) -> Result<(), JoinFailure> {
     let deadline = tokio::time::Instant::now() + timeout;
     let timed_out = || {
-        error_response(
+        failure(
             StatusCode::GATEWAY_TIMEOUT,
             "M_UNKNOWN",
             "timed out applying room state; the join is still being processed",
@@ -403,10 +484,10 @@ async fn wait_for_join(
             Ok(Some(ev)) if membership_is_join(&ev) => return Ok(()),
             Ok(_) => {}
             Err(e) => {
-                return Err(error_response(
+                return Err(failure(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "M_UNKNOWN",
-                    &e.to_string(),
+                    e.to_string(),
                 ));
             }
         }
@@ -421,7 +502,7 @@ async fn wait_for_join(
             Ok(Ok(())) => {}
             // Watch sender dropped (store shutting down) — nothing more will land.
             Ok(Err(_)) => {
-                return Err(error_response(
+                return Err(failure(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "M_UNKNOWN",
                     "store closed while joining",

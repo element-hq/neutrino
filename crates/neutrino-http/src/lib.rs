@@ -112,6 +112,13 @@ struct App {
     /// is parked in the delivery retry loop with PDUs still queued, not on that
     /// idle stream-position arm, so a position bump wouldn't reach it.
     kick_backoff: watch::Sender<()>,
+    /// In-flight outbound federated joins, keyed by (room, user). The dance
+    /// runs in a detached task; a client that times out and retries `/join`
+    /// re-attaches to the running dance instead of restarting the handshake —
+    /// over a slow link the send_join transfer outlives the client's HTTP
+    /// timeout, and a restart discards the transfer's progress while its
+    /// retransmissions keep competing for the link. See `federation::join`.
+    joins: HashMap<(OwnedRoomId, OwnedUserId), federation::join::JoinWatch>,
     /// Testing-only access-token → user map (multi-user shim). See
     /// `multi_user`. Absent from the production single-user build.
     #[cfg(feature = "multi-user-shim")]
@@ -301,6 +308,7 @@ impl AppState {
             config,
             shutdown,
             kick_backoff,
+            joins: HashMap::new(),
             #[cfg(feature = "multi-user-shim")]
             user_tokens: Arc::new(Mutex::new(multi_user::UserTokens::new())),
         };
