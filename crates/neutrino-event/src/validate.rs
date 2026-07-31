@@ -287,23 +287,24 @@ pub fn parse_event(
     // (backfill ordering etc.). v12 inbound events MAY include `depth` for
     // interop with non-MSC4242 senders; we ignore it.
 
-    // Hashes: required, well-formed object of strings. Content hashes are
-    // independent of signatures/keys — we keep this check even though we
-    // don't verify the hash values themselves.
-    let hashes = map
-        .get("hashes")
-        .ok_or(FormatError::MissingField("hashes"))?
-        .as_object()
-        .ok_or(FormatError::InvalidFieldType {
+    // Hashes: optional, but a well-formed object of strings when present.
+    // Optional because a trusted-network deployment omits the content hash
+    // along with signatures (the hash only earns its bytes by being covered by
+    // one) — see `EventBuilder::build`. Whether the value is *correct* is a
+    // receipt check, not a format one: `from_wire` verifies it and redacts on
+    // mismatch.
+    if let Some(hashes) = map.get("hashes") {
+        let hashes = hashes.as_object().ok_or(FormatError::InvalidFieldType {
             field: "hashes",
             expected: "object",
         })?;
-    for v in hashes.values() {
-        if !v.is_string() {
-            return Err(FormatError::InvalidFieldType {
-                field: "hashes",
-                expected: "{string: string}",
-            });
+        for v in hashes.values() {
+            if !v.is_string() {
+                return Err(FormatError::InvalidFieldType {
+                    field: "hashes",
+                    expected: "{string: string}",
+                });
+            }
         }
     }
 
@@ -1224,14 +1225,14 @@ mod tests {
         parse_event(raw(without_depth), eid("$e:example.org"), vec![]).expect("missing depth ok");
     }
 
+    /// `hashes` is optional: a trusted-network peer omits it along with
+    /// signatures, so an event without one is well-formed. (Whether a *present*
+    /// hash is correct is `from_wire`'s receipt check, not a format rule.)
     #[test]
-    fn rejects_missing_hashes() {
+    fn accepts_missing_hashes() {
         let mut v = base_event();
         v.as_object_mut().unwrap().remove("hashes");
-        assert!(matches!(
-            parse_event(raw(v), eid("$e:example.org"), vec![]),
-            Err(FormatError::MissingField("hashes"))
-        ));
+        parse_event(raw(v), eid("$e:example.org"), vec![]).expect("missing hashes is well-formed");
     }
 
     #[test]

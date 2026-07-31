@@ -79,10 +79,12 @@ pub struct Config {
     pub enable_soft_failure: bool,
     /// The operator's declaration that every peer admitted to the federation
     /// network is honest about relays ("trust the origin"): origin claims on
-    /// relayed events are taken on faith and events carry NO signatures.
-    /// `false` flips the stack into signed mode — every locally-authored
-    /// event is signed and every inbound event must carry a valid
-    /// origin-server signature. This is the app-side half of the security
+    /// relayed events are taken on faith and events carry NO signatures — and
+    /// therefore no content hashes either, since a content hash only earns its
+    /// bytes by being covered by a signature. `false` flips the stack into
+    /// signed mode — every locally-authored event carries a content hash and is
+    /// signed, and every inbound event must carry a valid origin-server
+    /// signature. This is the app-side half of the security
     /// configuration; the transport-side half (`authenticates_connections`,
     /// "trust the hop") is declared by the medium on its `LinkProfile`. The
     /// two are independent, and all four combinations are valid deployments.

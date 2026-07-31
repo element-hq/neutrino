@@ -1085,8 +1085,8 @@ async fn seed_invite(
 }
 
 /// Build an out-of-band invite `m.room.member` `Event` for a room we don't
-/// host: carries `hashes` (so it rehydrates through `get_invite`'s
-/// `parse_event` path) and the inviting server's stripped
+/// host: carries `hashes` (as a signed peer's invite would) and the
+/// inviting server's stripped
 /// `unsigned.invite_room_state`. `ts` is the invite's `origin_server_ts`, which
 /// `bump_stamp_for_invited` ranks on.
 fn oob_invite_event(

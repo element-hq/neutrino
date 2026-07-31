@@ -22,8 +22,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::event_id::{
-    b64_unpadded, content_hash, event_id_from_hash, redact_to_canonical_bytes, reference_hash,
-    verify_content_hash,
+    ContentHashCheck, b64_unpadded, check_content_hash, content_hash, event_id_from_hash,
+    redact_to_canonical_bytes, reference_hash,
 };
 use ruma::canonical_json::{CanonicalJsonObject, CanonicalJsonValue, try_from_json_map};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
@@ -133,6 +133,11 @@ impl EventBuilder {
     /// where events MUST NOT carry signatures). The signature is computed
     /// over the redacted canonical form, so it does not affect the reference
     /// hash or the event id; the signed `signatures` block rides `raw`.
+    ///
+    /// This also decides whether the event carries a content hash: `hashes`
+    /// and `signatures` are two halves of one fact (cryptographic event
+    /// integrity), so a signerless build emits neither — see `build`. It does
+    /// therefore affect the event id, which covers `hashes`.
     pub fn signer(mut self, signer: Option<std::sync::Arc<crate::sign::EventSigner>>) -> Self {
         self.signer = signer;
         self
@@ -216,13 +221,23 @@ impl EventBuilder {
         // Content hash → `hashes.sha256` (canonical-base64 standard alphabet
         // per spec). Order: content hash, insert, then reference hash, so the
         // reference hash covers the inserted content hash.
-        let ch = content_hash(&canon);
-        let mut hashes = CanonicalJsonObject::new();
-        hashes.insert(
-            "sha256".to_owned(),
-            CanonicalJsonValue::String(b64_unpadded(&ch)),
-        );
-        canon.insert("hashes".to_owned(), CanonicalJsonValue::Object(hashes));
+        //
+        // Emitted only in signed deployments. The content hash exists solely so
+        // the signature — computed over the *redacted* form, which keeps
+        // `hashes` — transitively covers redactable content; with no signature
+        // to anchor it, a self-attested hash proves nothing and is ~60 bytes of
+        // pure overhead on a bandwidth-constrained link. So on a trusted
+        // network (`trusted_network = true`, no signer) it is omitted, exactly
+        // as signatures are.
+        if self.signer.is_some() {
+            let ch = content_hash(&canon);
+            let mut hashes = CanonicalJsonObject::new();
+            hashes.insert(
+                "sha256".to_owned(),
+                CanonicalJsonValue::String(b64_unpadded(&ch)),
+            );
+            canon.insert("hashes".to_owned(), CanonicalJsonValue::Object(hashes));
+        }
 
         // Sign (signed deployments): over the redacted canonical
         // form, which strips `signatures` — so the reference hash below (and
@@ -270,12 +285,22 @@ impl EventBuilder {
 /// are supplied by the caller because MSC4242 removes them from the wire.
 ///
 /// **Content hash verification (Matrix S2S §"Validating hashes and signatures
-/// on received events")**: if `hashes.sha256` is absent or doesn't match the
-/// recomputed content hash, the event is redacted before being accepted —
-/// `raw` is replaced with the canonical redacted form and that's what
-/// `parse_event` sees. The event_id is unaffected (it's already computed
-/// over the redacted form). The receiving server is expected to accept the
-/// redacted version rather than drop the event entirely.
+/// on received events")**: if `hashes.sha256` doesn't match the recomputed
+/// content hash, the event is redacted before being accepted — `raw` is
+/// replaced with the canonical redacted form and that's what `parse_event`
+/// sees. The event_id is unaffected (it's already computed over the redacted
+/// form). The receiving server is expected to accept the redacted version
+/// rather than drop the event entirely.
+///
+/// **Divergence — an event with no `hashes` at all is accepted as-is**, where
+/// the spec would have it redacted. A trusted-network deployment
+/// (`trusted_network = true`) emits neither signatures nor content hashes, so
+/// the receipt check is driven by what the event carries rather than by local
+/// policy: hash present ⇒ held to it, hash absent ⇒ nothing to check. That is
+/// safe in signed mode too, because the signature covers the redacted form
+/// *including* `hashes` — a relay cannot strip the field without invalidating
+/// the signature, and an origin that never emitted one is only choosing not to
+/// attest content it authored itself.
 ///
 /// Errors:
 /// - `raw` is not a JSON object (`InvalidFieldType { field: "<root>" }`).
@@ -318,15 +343,19 @@ pub fn from_wire(
     let event_id = event_id_from_hash(&rh);
 
     // Replace raw with the canonical redacted form on content-hash mismatch.
+    // An event with no `hashes` at all is taken as-is: that is what a
+    // trusted-network peer emits (see `EventBuilder::build`), and redacting
+    // every such event would empty every message in the mesh.
     // `reference_hash` already exercised the same redaction step successfully
     // above, so `redact_to_canonical_bytes` here cannot fail.
-    let raw_to_parse = if verify_content_hash(&obj) {
-        raw
-    } else {
-        let bytes =
-            redact_to_canonical_bytes(&obj).expect("redaction succeeded above for reference_hash");
-        let s = String::from_utf8(bytes).expect("canonical JSON is valid UTF-8");
-        RawValue::from_string(s).expect("canonical JSON parses as a RawValue")
+    let raw_to_parse = match check_content_hash(&obj) {
+        ContentHashCheck::Absent | ContentHashCheck::Matches => raw,
+        ContentHashCheck::Mismatch => {
+            let bytes = redact_to_canonical_bytes(&obj)
+                .expect("redaction succeeded above for reference_hash");
+            let s = String::from_utf8(bytes).expect("canonical JSON is valid UTF-8");
+            RawValue::from_string(s).expect("canonical JSON parses as a RawValue")
+        }
     };
     let event = parse_event(raw_to_parse, event_id, auth_events)?;
     let wire = match validate_pdu(&event) {
@@ -526,14 +555,64 @@ mod tests {
         // room_id is NOT in raw (v12 spec: create events omit room_id on the wire).
         let raw: serde_json::Value = serde_json::from_str(ev.raw.get()).unwrap();
         assert!(raw.get("room_id").is_none());
-        // hashes.sha256 is present, standard-alphabet base64 (no `-`/`_`), no padding.
-        // 32-byte sha256 → 43 unpadded standard-b64 chars.
-        let hash_str = raw["hashes"]["sha256"].as_str().expect("sha256 string");
+    }
+
+    /// A signed build carries `hashes.sha256` in the spec's encoding;
+    /// a trusted-network build (no signer) carries no `hashes` at all — the
+    /// hash exists only to be covered by a signature, so the two travel
+    /// together. Wire-shape half of the pair; the id consequence is pinned by
+    /// `content_hash_presence_changes_the_event_id`.
+    #[test]
+    fn hashes_present_iff_signed() {
+        let (signer, sender) = node_signer_and_user();
+        let build = |signer: Option<std::sync::Arc<crate::sign::EventSigner>>| {
+            let ev = EventBuilder::new(sender.clone(), "m.room.message".to_owned())
+                .room_id(room("!r:d"))
+                .content(json!({ "msgtype": "m.text", "body": "hi" }))
+                .origin_server_ts(1)
+                .signer(signer)
+                .build()
+                .expect("builds");
+            serde_json::from_str::<serde_json::Value>(ev.raw.get()).expect("raw is JSON")
+        };
+
+        // Signed: hashes.sha256 is a 43-char standard-alphabet (no `-`/`_`),
+        // unpadded base64 string — 32-byte sha256.
+        let hash_str = build(Some(signer))["hashes"]["sha256"]
+            .as_str()
+            .expect("signed build must carry hashes.sha256")
+            .to_owned();
         assert_eq!(hash_str.len(), 43);
         assert!(
             !hash_str.contains(['-', '_']),
             "hashes.sha256 must use STANDARD b64 alphabet (`+`/`/`), not url-safe (`-`/`_`): {hash_str}"
         );
+
+        // Trusted network: no `hashes` key on the wire at all (bytes saved).
+        let unsigned = build(None);
+        assert!(
+            unsigned.get("hashes").is_none(),
+            "a signerless build must not carry hashes: {unsigned}"
+        );
+    }
+
+    /// Unlike a signature, the content hash IS covered by the reference hash,
+    /// so omitting it moves the event id. Both sides derive the id from the
+    /// bytes they actually see, so this is self-consistent — but it means a
+    /// deployment cannot change `trusted_network` and expect stable ids.
+    #[test]
+    fn content_hash_presence_changes_the_event_id() {
+        let (signer, sender) = node_signer_and_user();
+        let build = |signer: Option<std::sync::Arc<crate::sign::EventSigner>>| {
+            EventBuilder::new(sender.clone(), "m.room.message".to_owned())
+                .room_id(room("!r:d"))
+                .content(json!({ "body": "x" }))
+                .origin_server_ts(1)
+                .signer(signer)
+                .build()
+                .expect("builds")
+        };
+        assert_ne!(build(Some(signer)).event_id, build(None).event_id);
     }
 
     /// Wire bytes never carry `event_id` — it's the reference hash, computed
@@ -610,21 +689,59 @@ mod tests {
         assert_eq!(mk().event_id, mk().event_id);
     }
 
+    /// **Redactable** content reaches the event id only through the content
+    /// hash. The reference hash is computed over the *redacted* form, where an
+    /// `m.room.message` body is already gone; `hashes` (which survives
+    /// redaction) is what bound it in. So a trusted-network build — no content
+    /// hash — gives two bodies the same id, and a signed build does not.
+    ///
+    /// The consequence for `trusted_network = true`: two events are kept apart
+    /// by `prev_events` / `prev_state_events` and `origin_server_ts`, not by
+    /// their bodies. Local sends chain through the room actor (each takes the
+    /// previous as its head) and remote ones differ in `sender`, so a collision
+    /// needs two same-millisecond events from one sender on identical heads.
     #[test]
-    fn build_diverges_on_different_content() {
-        let a = EventBuilder::new(user("@a:d"), "m.room.message".to_owned())
-            .room_id(room("!r:d"))
-            .content(json!({ "body": "a" }))
-            .origin_server_ts(1)
-            .build()
-            .expect("a");
-        let b = EventBuilder::new(user("@a:d"), "m.room.message".to_owned())
-            .room_id(room("!r:d"))
-            .content(json!({ "body": "b" }))
-            .origin_server_ts(1)
-            .build()
-            .expect("b");
-        assert_ne!(a.event_id, b.event_id);
+    fn redactable_content_reaches_the_event_id_only_when_signed() {
+        let (signer, sender) = node_signer_and_user();
+        let build = |body: &str, signer: Option<std::sync::Arc<crate::sign::EventSigner>>| {
+            EventBuilder::new(sender.clone(), "m.room.message".to_owned())
+                .room_id(room("!r:d"))
+                .content(json!({ "msgtype": "m.text", "body": body }))
+                .origin_server_ts(1)
+                .signer(signer)
+                .build()
+                .expect("builds")
+                .event_id
+        };
+        assert_eq!(
+            build("a", None),
+            build("b", None),
+            "without a content hash, a redacted-away body cannot reach the id"
+        );
+        assert_ne!(
+            build("a", Some(signer.clone())),
+            build("b", Some(signer)),
+            "a signed build carries the content hash, which does reach the id"
+        );
+    }
+
+    /// The other half: content the redaction keep-list *preserves* still
+    /// diverges the id with no content hash in play — `m.room.member`'s
+    /// `membership` survives redaction, so join and leave are distinct events
+    /// on a trusted network too.
+    #[test]
+    fn build_diverges_on_different_non_redactable_content() {
+        let build = |membership: &str| {
+            EventBuilder::new(user("@a:d"), "m.room.member".to_owned())
+                .room_id(room("!r:d"))
+                .state_key("@a:d".to_owned())
+                .content(json!({ "membership": membership }))
+                .origin_server_ts(1)
+                .build()
+                .expect("builds")
+                .event_id
+        };
+        assert_ne!(build("join"), build("leave"));
     }
 
     #[test]
@@ -975,6 +1092,62 @@ mod tests {
         assert_eq!(parsed_raw["content"]["body"].as_str(), Some("preserved"));
     }
 
+    /// The trusted-network round trip: a build that emitted no `hashes` must
+    /// come back through `from_wire` with its content intact. The spec's
+    /// "no hash ⇒ redact" rule would strip the body of every message in the
+    /// mesh; the divergence documented on `from_wire` is what prevents it.
+    #[test]
+    fn from_wire_keeps_content_when_hashes_absent() {
+        let built = EventBuilder::new(user("@a:d"), "m.room.message".to_owned())
+            .room_id(room("!r:d"))
+            .content(json!({ "msgtype": "m.text", "body": "preserved" }))
+            .origin_server_ts(1)
+            .build()
+            .expect("builds");
+        let raw_json: serde_json::Value = serde_json::from_str(built.raw.get()).unwrap();
+        assert!(raw_json.get("hashes").is_none(), "precondition: no hashes");
+
+        let parsed = from_wire(built.raw.clone(), Vec::new())
+            .expect("from_wire")
+            .admit_on_faith()
+            .into_event();
+        assert_eq!(parsed.event_id, built.event_id);
+        let parsed_raw: serde_json::Value = serde_json::from_str(parsed.raw.get()).unwrap();
+        assert_eq!(parsed_raw["content"]["body"].as_str(), Some("preserved"));
+    }
+
+    /// An event that *does* carry `hashes` is still held to it — the absent
+    /// case above is not a licence to serve a hash-shaped placeholder. An empty
+    /// `hashes` object counts as a mismatch (redact), not as absence (accept);
+    /// the wrong-value arm is `from_wire_redacts_event_with_mismatched_content_hash`.
+    #[test]
+    fn from_wire_redacts_when_hashes_present_but_empty() {
+        let raw = to_raw_value(&json!({
+            "type": "m.room.message",
+            "sender": "@a:d",
+            "room_id": "!r:d",
+            "content": { "msgtype": "m.text", "body": "secret" },
+            "prev_events": [],
+            "prev_state_events": [],
+            "origin_server_ts": 1,
+            "hashes": {},
+        }))
+        .unwrap();
+        let parsed = from_wire(raw, Vec::new())
+            .expect("from_wire")
+            .admit_on_faith()
+            .into_event();
+        let parsed_raw: serde_json::Value = serde_json::from_str(parsed.raw.get()).unwrap();
+        assert!(
+            parsed_raw["content"]
+                .as_object()
+                .expect("content object")
+                .is_empty(),
+            "an empty `hashes` must redact, got: {}",
+            parsed_raw["content"]
+        );
+    }
+
     #[test]
     fn from_wire_rejects_object_without_type() {
         // No `type` field — ruma's `redact_in_place` reports
@@ -1007,27 +1180,24 @@ mod tests {
     }
 
     /// The end-to-end signed-build loop: build with a signer, feed the raw
-    /// through from_wire, admit via the signature-verifying path. Also pins
-    /// signature-invariance of the event id (same inputs signed vs unsigned
-    /// → same id) — the property co-signing relies on.
+    /// through from_wire, admit via the signature-verifying path.
+    ///
+    /// Signature-invariance of the event id (the property co-signing relies on)
+    /// is pinned by `sign::tests::co_sign_event_regenerates_raw_and_keeps_id`,
+    /// which adds a signature to a finished event. It cannot be pinned here by
+    /// comparing a signed to an unsigned *build*: those also differ in whether
+    /// `hashes` is emitted, which the id does cover — see
+    /// `content_hash_presence_changes_the_event_id`.
     #[tokio::test]
     async fn build_with_signer_round_trips_through_verify() {
         let (signer, sender) = node_signer_and_user();
-        let build = |signer: Option<std::sync::Arc<crate::sign::EventSigner>>| {
-            EventBuilder::new(sender.clone(), "m.room.message".to_owned())
-                .room_id(room("!r:d"))
-                .content(json!({ "msgtype": "m.text", "body": "signed" }))
-                .origin_server_ts(1)
-                .signer(signer)
-                .build()
-                .expect("builds")
-        };
-        let signed = build(Some(signer.clone()));
-        let unsigned = build(None);
-        assert_eq!(
-            signed.event_id, unsigned.event_id,
-            "signing must not change the event id"
-        );
+        let signed = EventBuilder::new(sender, "m.room.message".to_owned())
+            .room_id(room("!r:d"))
+            .content(json!({ "msgtype": "m.text", "body": "signed" }))
+            .origin_server_ts(1)
+            .signer(Some(signer.clone()))
+            .build()
+            .expect("builds");
 
         // The signed raw carries the signature block…
         let raw_json: serde_json::Value = serde_json::from_str(signed.raw.get()).unwrap();

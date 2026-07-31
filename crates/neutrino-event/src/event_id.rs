@@ -125,22 +125,44 @@ pub fn redact_to_canonical_bytes(obj: &CanonicalJsonObject) -> Result<Vec<u8>, R
     Ok(canonical(&clone))
 }
 
-/// Verify an event's content hash against its `hashes.sha256` field.
+/// The three states an inbound event's content hash can be in. `Absent` is
+/// distinct from `Mismatch` because a trusted-network deployment omits
+/// `hashes` entirely (it is dead weight without signatures to anchor it), so
+/// "no hash" and "wrong hash" call for different receipt handling — see
+/// [`from_wire`](crate::event_builder::from_wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentHashCheck {
+    /// No `hashes` field on the event at all.
+    Absent,
+    /// `hashes.sha256` is present and equals the recomputed content hash.
+    Matches,
+    /// `hashes` is present but its `sha256` entry is missing, not a string, or
+    /// does not equal the recomputed content hash.
+    Mismatch,
+}
+
+/// Check an event's content hash against its `hashes.sha256` field.
 ///
-/// Returns `true` iff the event has a well-shaped `hashes.sha256` string
-/// AND its value equals `b64_unpadded(content_hash(obj))`. Absent / malformed
-/// `hashes` returns `false`.
+/// An event carrying `hashes` at all is held to it: a missing / non-string /
+/// unequal `sha256` is a [`ContentHashCheck::Mismatch`], not an
+/// [`Absent`](ContentHashCheck::Absent).
 ///
 /// Spec: <https://spec.matrix.org/v1.18/server-server-api/#calculating-the-content-hash-for-an-event>.
-pub fn verify_content_hash(obj: &CanonicalJsonObject) -> bool {
-    let Some(CanonicalJsonValue::Object(hashes)) = obj.get("hashes") else {
-        return false;
+pub fn check_content_hash(obj: &CanonicalJsonObject) -> ContentHashCheck {
+    let Some(hashes) = obj.get("hashes") else {
+        return ContentHashCheck::Absent;
+    };
+    let CanonicalJsonValue::Object(hashes) = hashes else {
+        return ContentHashCheck::Mismatch;
     };
     let Some(CanonicalJsonValue::String(expected)) = hashes.get("sha256") else {
-        return false;
+        return ContentHashCheck::Mismatch;
     };
-    let computed = b64_unpadded(&content_hash(obj));
-    *expected == computed
+    if *expected == b64_unpadded(&content_hash(obj)) {
+        ContentHashCheck::Matches
+    } else {
+        ContentHashCheck::Mismatch
+    }
 }
 
 /// Format an event_id from a reference hash. v3+ rooms only.

@@ -223,11 +223,21 @@ mod tests {
 
     /// Build a real, parseable historical PDU in `room_id` (dangling prev so it
     /// has no ancestry requirement), returning its canonical wire bytes.
+    /// A distinct historical PDU per `body`. The label is folded into
+    /// `origin_server_ts` because on a trusted network the *body alone* does not
+    /// reach the event id: the reference hash is over the redacted form, and no
+    /// content hash is emitted to bind `content` into it. Deterministic, so the
+    /// same label always names the same event — the dedup tests below rely on
+    /// building the "held" copy twice.
     fn pdu_in(room_id: &OwnedRoomId, body: &str) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        body.hash(&mut hasher);
         EventBuilder::new(alice(), "m.room.message".to_owned())
             .room_id(room_id.clone())
             .content(json!({ "msgtype": "m.text", "body": body }))
             .prev_events(vec![event_id!("$ghost:remote.example.org").to_owned()])
+            .origin_server_ts(1_700_000_000_000 + hasher.finish() % 1_000_000)
             .build()
             .expect("build pdu")
             .raw

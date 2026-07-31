@@ -149,6 +149,15 @@ Deferred follow-ups (write-ups, not done):
   CoAP as bare `origin,destination` under dedicated option 2052 (`,` is not a
   server-name char), re-expanded to the full header on ingress; non-canonical
   values (key/sig) still travel verbatim as option 2050.
+  DONE (2026-07-31) — content hashes: `trusted_network = true` now drops
+  `hashes` alongside `signatures` (66 B of JSON / ~54 B of CBOR per PDU). The
+  cost: on a trusted network **redactable content no longer reaches the event
+  id** (the reference hash is over the redacted form, and `hashes` was what
+  bound `content` into it), so two events are distinguished only by
+  `sender` / heads / `origin_server_ts` / non-redactable content. Local sends
+  chain through the room actor, so a collision needs two same-millisecond
+  events from one sender on identical heads. If that ever bites, the fix is a
+  monotonic per-room `origin_server_ts` at build time, not the hash.
 - CON-path reassembly-time cap: the Q-Block path now bounds reassembly *before*
   allocation, but the RFC 7959 CON path still relies on the post-reassembly cap —
   coap-lite's accumulator isn't externally bounded mid-transfer. Acceptable under

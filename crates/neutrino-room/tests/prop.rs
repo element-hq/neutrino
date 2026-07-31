@@ -75,7 +75,8 @@ const REQUIRED_FIELDS: &[&str] = &[
     "prev_events",
     "prev_state_events",
     "room_id",
-    "hashes",
+    // `hashes` is deliberately absent: it is optional on the wire (a
+    // trusted-network peer omits it along with signatures).
 ];
 
 /// Removing any required top-level field from an otherwise-valid event
