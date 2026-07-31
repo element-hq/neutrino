@@ -11,7 +11,9 @@ pub mod transport;
 
 pub use error::LbError;
 pub use transport::coap::capture::{CaptureControl, PcapCaptureLink};
-pub use transport::coap::datagram::{CodecError, DatagramLink, LinkAddr, LinkCodec, LinkProfile};
+pub use transport::coap::datagram::{
+    CodecError, DatagramLink, LinkAddr, LinkCodec, LinkPacing, LinkProfile,
+};
 pub use transport::{DestinationResolver, DirectResolver, WireRequest, WireResponse};
 
 use std::net::SocketAddr;
@@ -87,6 +89,44 @@ impl Default for QBlockTuning {
 }
 
 impl QBlockTuning {
+    /// Size the NON-mode timing for a medium that meters its sends.
+    ///
+    /// Every value here is derived from the two facts the medium declares
+    /// ([`LinkPacing`]), not borrowed from a timer above: the link's own
+    /// service rate is the only thing the sidecar can size against that stays
+    /// correct for the next caller.
+    ///
+    /// - `max_payloads` — a burst wider than the queue's delay bound is
+    ///   self-defeating: the medium sheds the tail it cannot reach in time,
+    ///   every single time. So the burst is capped at what the bound admits.
+    /// - `non_timeout` — the pause between bursts must be at least as long as
+    ///   the previous burst takes to drain, or a standing backlog forms and
+    ///   the whole exchange ages out inside the medium.
+    /// - `non_receive_timeout` — coap-rs fires recovery on *time since last
+    ///   activity* (`QBlockReceiver::poll_recovery`), so this must exceed the
+    ///   sender's own deliberate inter-burst pause or the pause itself reads
+    ///   as loss. Sized to that pause plus a full queueing bound, which is
+    ///   the longest a block can legitimately still be in flight.
+    ///
+    /// Left alone: `non_max_retransmit` (recovery rounds are a loss-tolerance
+    /// choice, not a timing one) and the CON-mode fields the NON path ignores.
+    pub fn for_pacing(pacing: LinkPacing) -> Self {
+        let interval = pacing.datagram_interval.max(Duration::from_millis(1));
+        // How many datagrams can clear the queue inside its own bound — and
+        // therefore the widest burst that is not partly doomed on arrival.
+        let max_payloads =
+            u32::try_from(pacing.max_queueing_delay.as_millis() / interval.as_millis().max(1))
+                .unwrap_or(u32::MAX)
+                .max(1);
+        let non_timeout = interval * max_payloads;
+        Self {
+            max_payloads,
+            non_timeout,
+            non_receive_timeout: non_timeout + pacing.max_queueing_delay,
+            ..Self::default()
+        }
+    }
+
     /// Map to coap-rs's `QBlockConfig`, leaving its CON-mode fields
     /// (`probing_rate`, `nstart`, `non_probing_wait`) and the NON field
     /// `non_partial_timeout` (a partial-body hold time, not yet wired in coap-rs
@@ -174,12 +214,25 @@ impl WireKind {
     /// caveat on [`WireKind::Coap`] still applies: peers must see comparable
     /// MTUs.
     pub fn coap_qblock_for_mtu(max_datagram: usize) -> Result<Self, String> {
-        let mtu = max_datagram.min(coap_lite::Packet::MAX_SIZE);
+        Self::coap_qblock_for_profile(&LinkProfile {
+            max_datagram,
+            ..LinkProfile::default()
+        })
+    }
+
+    /// The Q-Block wire for a medium, sized from everything it declares: the
+    /// block size from its MTU, and — when it meters its sends — the NON-mode
+    /// timing from its pacing (see [`QBlockTuning::for_pacing`]). An unmetered
+    /// medium keeps the RFC-default timing.
+    pub fn coap_qblock_for_profile(profile: &LinkProfile) -> Result<Self, String> {
+        let mtu = profile.max_datagram.min(coap_lite::Packet::MAX_SIZE);
         let block1_size = coap::client::block1_size_for_mtu(mtu, 0)
             .map_err(|e| format!("deriving CoAP block size from link profile: {e}"))?;
         Ok(WireKind::CoapQBlock {
             block1_size: Some(block1_size),
-            qblock: QBlockTuning::default(),
+            qblock: profile
+                .pacing
+                .map_or_else(QBlockTuning::default, QBlockTuning::for_pacing),
         })
     }
 }
@@ -417,9 +470,77 @@ mod profile_tests {
         assert_eq!(block(coap_lite::Packet::MAX_SIZE), Some(1024));
         assert_eq!(block(100_000), Some(1024)); // clamped to Packet::MAX_SIZE
         assert_eq!(block(700), Some(512));
-        assert_eq!(block(200), Some(128)); // the mdns medium's constrained MTU
+        assert_eq!(block(200), Some(128));
         assert_eq!(block(28), Some(16)); // smallest legal SZX still frames
         assert!(WireKind::coap_qblock_for_mtu(27).is_err());
+    }
+
+    /// A metered medium's timing is derived from its own service rate.
+    #[test]
+    fn pacing_derives_qblock_timing_from_the_links_service_rate() {
+        let t = QBlockTuning::for_pacing(LinkPacing {
+            datagram_interval: Duration::from_secs(1),
+            max_queueing_delay: Duration::from_secs(5),
+        });
+        // Five datagrams clear the queue inside its bound, so that is the
+        // widest burst whose tail is not shed on arrival.
+        assert_eq!(t.max_payloads, 5);
+        // ...and the pause between bursts covers that burst draining.
+        assert_eq!(t.non_timeout, Duration::from_secs(5));
+        assert_eq!(t.non_receive_timeout, Duration::from_secs(10));
+        assert_eq!(
+            t.non_max_retransmit,
+            QBlockTuning::default().non_max_retransmit,
+            "recovery rounds are a loss-tolerance choice, not a timing one"
+        );
+    }
+
+    /// The two invariants that make the derived timing correct, over the whole
+    /// plausible range of link speeds rather than the one case above.
+    ///
+    /// The receive timeout is the load-bearing one: coap-rs fires recovery on
+    /// time-since-last-activity, so a receive timeout at or below the sender's
+    /// own inter-burst pause turns that deliberate pause into phantom loss —
+    /// and the recovery traffic then competes for the very air time that made
+    /// the link slow.
+    #[test]
+    fn derived_qblock_timing_never_mistakes_the_senders_own_pause_for_loss() {
+        for interval_ms in [50u64, 200, 500, 1_000, 2_000] {
+            for delay_mult in [1u32, 3, 5, 10] {
+                let interval = Duration::from_millis(interval_ms);
+                let pacing = LinkPacing {
+                    datagram_interval: interval,
+                    max_queueing_delay: interval * delay_mult,
+                };
+                let t = QBlockTuning::for_pacing(pacing);
+                assert!(
+                    t.non_receive_timeout > t.non_timeout,
+                    "{interval:?}/{delay_mult}x: receive timeout {:?} must outlast the \
+                     sender's own inter-burst pause {:?}",
+                    t.non_receive_timeout,
+                    t.non_timeout,
+                );
+                assert!(
+                    interval * t.max_payloads <= pacing.max_queueing_delay,
+                    "{interval:?}/{delay_mult}x: a {}-block burst cannot clear a {:?} bound",
+                    t.max_payloads,
+                    pacing.max_queueing_delay,
+                );
+                assert!(t.max_payloads >= 1, "a burst of zero blocks sends nothing");
+            }
+        }
+    }
+
+    /// An unmetered medium is left on the RFC defaults: the derivation exists
+    /// for links that withhold datagrams, and inventing pacing for a LAN would
+    /// make its loss recovery needlessly sluggish.
+    #[test]
+    fn an_unpaced_profile_keeps_the_default_timing() {
+        let wire = WireKind::coap_qblock_for_profile(&LinkProfile::default()).expect("wire");
+        match wire {
+            WireKind::CoapQBlock { qblock, .. } => assert_eq!(qblock, QBlockTuning::default()),
+            other => panic!("unexpected wire kind: {other:?}"),
+        }
     }
 }
 

@@ -52,6 +52,16 @@ Three wire transports, selected by `LbConfig.wire: WireKind`:
   recovery); the **`neutrino-main` default**. Reuses the `Coap` message mapping;
   tuned via `CoapQBlock { block1_size, qblock: QBlockTuning }` (RFC 9177 §6.2).
 
+`WireKind::coap_qblock_for_profile` sizes that tuning from everything the medium
+declares, not just its MTU. A medium that *meters* its sends declares
+`LinkProfile.pacing: Option<LinkPacing>`, and `QBlockTuning::for_pacing` derives
+`max_payloads` / `non_timeout` / `non_receive_timeout` from its service rate. The
+load-bearing one is `non_receive_timeout`: coap-rs fires recovery on
+time-since-last-activity, so a receive timeout at or below the sender's own
+inter-burst pause turns that deliberate pause into phantom loss, and the recovery
+traffic then competes for the air time that made the link slow. Unmetered mediums
+(LAN, QUIC) declare `None` and keep the RFC defaults.
+
 DoS posture (the public UDP port is the only network-exposed surface): assembled
 bodies are capped at `MAX_WIRE_BODY_BYTES` (ingress→413, egress→error); the
 Q-Block path also caps response/inbound reassembly *before* allocation, caps

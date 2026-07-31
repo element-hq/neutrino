@@ -102,6 +102,30 @@ pub struct LinkProfile {
     /// origin trust instead. Independent of the app's `trusted_network`
     /// config — all four combinations are valid deployments.
     pub authenticates_connections: bool,
+    /// Set by a medium that meters its sends, `None` by one that transmits
+    /// immediately (LAN, QUIC). See [`LinkPacing`] — the Q-Block timing is
+    /// derived from it, because timers sized for an unmetered link read a
+    /// metered one's deliberate waiting as loss.
+    pub pacing: Option<LinkPacing>,
+}
+
+/// What a medium that meters its sends declares about the wait it imposes.
+///
+/// A metered link is not simply a slow one: it *withholds* datagrams that it
+/// could physically send, so a peer's silence carries no information until
+/// longer than this has passed. Every timer above has to be sized against
+/// these two numbers or it fires on traffic that is still perfectly in
+/// flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkPacing {
+    /// Minimum gap between two datagrams entering the medium — its service
+    /// time, and so the unit everything else here is naturally expressed in.
+    pub datagram_interval: Duration,
+    /// Upper bound on how long an accepted datagram waits for its turn.
+    /// Past it the medium drops the datagram rather than sending it late,
+    /// which is what makes this a bound rather than an average: a peer can
+    /// attribute any longer silence to loss instead of to queueing.
+    pub max_queueing_delay: Duration,
 }
 
 impl Default for LinkProfile {
@@ -113,6 +137,8 @@ impl Default for LinkProfile {
         Self {
             max_datagram: coap_lite::Packet::MAX_SIZE,
             authenticates_connections: true,
+            // Unmetered: an authenticated QUIC endpoint sends when asked.
+            pacing: None,
         }
     }
 }

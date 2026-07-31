@@ -106,7 +106,7 @@ impl std::fmt::Display for CaptureError {
 impl std::error::Error for CaptureError {}
 
 /// A peer the embedded server has discovered out of band (over the federation
-/// medium's scan or the LAN mDNS browser), for the host to render in a
+/// medium's scan), for the host to render in a
 /// Settings directory. Host-facing projection of
 /// `neutrino_ctl::DiscoveredPeer` plus its `server_name` key; the localpart is
 /// omitted (the host builds user ids itself from `server_name`).
@@ -280,8 +280,8 @@ pub fn start_with(
     // message here so the host can read it back via `last_error()` and raise a
     // dialog, rather than the failure only reaching logcat.
     let (error_tx, error_rx) = tokio::sync::watch::channel::<Option<String>>(None);
-    // Shared out-of-band discovery registry: the federation medium (or the LAN
-    // mDNS browser) writes the peers it discovers into it, and the homeserver
+    // Shared out-of-band discovery registry: the federation medium
+    // writes the peers it discovers into it, and the homeserver
     // reads it for user-directory search. One handle for the homeserver, one
     // reader-side handle for the FFI directory listing (`discovered_peers`);
     // an injected medium receives the same `Arc` via its `LinkContext`.

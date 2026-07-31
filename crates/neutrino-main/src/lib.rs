@@ -7,8 +7,8 @@ use std::sync::Arc;
 pub use neutrino_ctl::{Command, Config, DiscoveredPeer, DiscoveryRegistry};
 pub use neutrino_event::{KeyResolver, NodeIdKeyResolver};
 pub use neutrino_lb::{
-    CaptureControl, CodecError, DatagramLink, LinkAddr, LinkCodec, LinkProfile, PcapCaptureLink,
-    WireRequest, WireResponse,
+    CaptureControl, CodecError, DatagramLink, LinkAddr, LinkCodec, LinkPacing, LinkProfile,
+    PcapCaptureLink, WireRequest, WireResponse,
 };
 
 use std::future::Future;
@@ -442,11 +442,13 @@ fn build_lb_config(
         ingress_bind: ingress_bind_for(&config.bind_addr, fed_port),
         egress_bind,
         upstream: upstream_url(&config.bind_addr)?,
-        // Q-Block sized to the medium's declared MTU. Only the block-option
-        // framing is reserved — what else rides each block is controlled by
-        // the medium's LinkCodec, and an over-MTU datagram is the link's to
-        // detect and log loudly (see `WireKind::coap_qblock_for_mtu`).
-        wire: neutrino_lb::WireKind::coap_qblock_for_mtu(profile.max_datagram)?,
+        // Q-Block sized to everything the medium declares: the block size
+        // from its MTU, and the NON-mode timing from its pacing when it meters
+        // its sends. Only the block-option framing is reserved — what else
+        // rides each block is controlled by the medium's LinkCodec, and an
+        // over-MTU datagram is the link's to detect and log loudly (see
+        // `WireKind::coap_qblock_for_profile`).
+        wire: neutrino_lb::WireKind::coap_qblock_for_profile(&profile)?,
         // The in-process sidecar is the embedded/datagram-link target: map a
         // peer's node-id `server_name` to its bare 64-char hex node id so the
         // datagram egress dials the peer over the link directly. Dormant for a
