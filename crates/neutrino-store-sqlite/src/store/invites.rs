@@ -142,8 +142,8 @@ mod tests {
     use crate::tests::store;
 
     /// A wire-shaped invite `m.room.member` event for a *remote* room we don't
-    /// host, carrying `hashes` (required by `parse_event`) and the inviting
-    /// server's `unsigned.invite_room_state`. The `event_id` is the real
+    /// host, carrying `hashes` (as a signed peer's invite would) and the
+    /// inviting server's `unsigned.invite_room_state`. The `event_id` is the real
     /// reference hash of the bytes (as it would be on receipt), so a
     /// `get_invite` that recomputes it matches; storing the whole raw is what
     /// preserves `unsigned` across the round trip.
@@ -155,8 +155,8 @@ mod tests {
             "state_key": invited.as_str(),
             "origin_server_ts": 1_700_000_000_000u64,
             "content": { "membership": "invite" },
-            // parse_event requires `hashes` present but does not verify the
-            // value — any string suffices for the fixture.
+            // `parse_event` shape-checks `hashes` but never verifies the value
+            // (that is `from_wire`'s receipt check) — any string suffices here.
             "hashes": { "sha256": "abcDEF0123456789" },
             "prev_events": [],
             "prev_state_events": [],

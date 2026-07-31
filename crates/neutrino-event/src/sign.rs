@@ -20,7 +20,10 @@
 //!   `m.room.message` body, say) — that is the content hash's job. Receipt
 //!   validation therefore needs BOTH checks: signature (provenance) and
 //!   content hash (integrity), per the spec's "Validating hashes and
-//!   signatures on received events".
+//!   signatures on received events". The converse also holds, which is why a
+//!   trusted-network deployment emits neither: an unsigned content hash is
+//!   self-attested and proves nothing, so it is dropped as dead weight (see
+//!   `EventBuilder::build`).
 //!
 //! ## Key ids
 //!

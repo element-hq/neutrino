@@ -203,8 +203,11 @@ pub async fn entrypoint(
 
     // A store's events belong to exactly one trust domain: unsigned events
     // can never serve a signed deployment (nothing to verify) and vice versa.
-    // First start records the mode; a later start under the other mode is
-    // refused — wipe the database to switch.
+    // The two modes also derive different event ids — a trusted-network event
+    // omits `hashes`, which the reference hash covers — so their histories are
+    // not merely untrustworthy to each other but differently named. First start
+    // records the mode; a later start under the other mode is refused — wipe the
+    // database to switch.
     let domain = match security_config.sign_messages {
         true => "signed",
         false => "transitive",
