@@ -493,6 +493,7 @@ mod tests {
             LinkProfile {
                 max_datagram: 640,
                 authenticates_connections: false,
+                ..LinkProfile::default()
             }
         }
     }

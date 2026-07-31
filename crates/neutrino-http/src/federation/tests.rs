@@ -3950,8 +3950,8 @@ async fn federated_join_retry_reattaches_to_inflight_dance() {
     // A /join whose client goes away must not abort the handshake, and a retry
     // must re-attach to the running dance rather than re-running make_join +
     // send_join — over a slow link every restart discards the send_join
-    // transfer's progress, so the join never converges (the radio join-timeout
-    // failure mode). Proven by counting make_join hits: one dance serves both
+    // transfer's progress, so the join never converges.
+    // Proven by counting make_join hits: one dance serves both
     // an aborted waiter and its retry; only a /join arriving after the dance
     // resolves starts a fresh one.
     //
