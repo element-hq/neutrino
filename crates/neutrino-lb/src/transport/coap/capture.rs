@@ -1,53 +1,53 @@
 // Copyright (c) 2026 Element Creations Ltd.
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial.
 
-//! Runtime-toggleable pcap capture for the [`DatagramLink`] seam.
+//! Runtime-toggleable pcap capture of the federation conversation, taken on the
+//! INSIDE of the medium codec.
 //!
-//! [`PcapCaptureLink`] always wraps the inner link, but stays inert until a
-//! [`CaptureControl`] is armed via [`CaptureControl::start`] (and disarmed via
-//! [`CaptureControl::stop`]). The host drives those from a Settings toggle over
-//! FFI, so a capture spans exactly the window the developer wants. When armed,
-//! every datagram — both directions — is mirrored into a classic-format pcap;
-//! the byte stream to the inner link is never altered.
+//! [`PcapCaptureLink`] attaches a [`CaptureControl`] to a link; the transport
+//! stays inert until that control is armed via [`CaptureControl::start`] (and
+//! disarmed via [`CaptureControl::stop`]). The host drives those from a Settings
+//! toggle over FFI, so a capture spans exactly the window the developer wants.
 //!
-//! ## Why this is enough to read the whole conversation in Wireshark
+//! ## What this capture is, and what it deliberately is not
 //!
-//! Each Q-Block / RFC 7959 blockwise fragment IS a complete CoAP message. So a
-//! datagram written as one UDP/IPv4 frame on the CoAP port (5683) is dissected
-//! natively: Wireshark attaches its CoAP dissector, runs its OWN block-wise
-//! reassembly across the fragments, and then dissects the reassembled CBOR body.
-//! We therefore get both the MTU-chunking view (per-fragment Block options +
-//! sizes) and the decoded payload without decoding anything ourselves.
+//! The tap sits at the four codec boundaries — before `encode_request` and after
+//! `decode_response` on egress, after `decode_request` and before
+//! `encode_response` on ingress — so it records the request and response as the
+//! Matrix layer sees them: real paths, the full `authorization` header,
+//! uncompressed CBOR. Each is written as ONE unfragmented CoAP message
+//! synthesized from the `WireRequest`/`WireResponse`, not as the datagrams that
+//! actually crossed the link.
+//!
+//! That means this file shows you *what* was federated and answers "is the DAG
+//! right, did the auth arrive, what is in this event". It does NOT show you the
+//! wire: no medium compression, no Q-Block segmentation, no retransmissions, no
+//! per-block option overhead.
+//!
+//! Because a synthesized message is never fragmented, Wireshark needs no
+//! block-wise reassembly here — it dissects each message, and its CBOR body,
+//! directly.
 //!
 //! Framing choices: link type is `LINKTYPE_RAW` (the frame begins at the IPv4
 //! header — no synthetic Ethernet MACs). "Us" is always `10.0.0.1`; each distinct
 //! peer node id is minted a stable `10.0.0.N` for the session. Ports are assigned
-//! by CoAP *role*, not fixed: the server endpoint of each datagram uses 5683 and
+//! by CoAP *role*, not fixed: the server endpoint of each message uses 5683 and
 //! the client uses a synthetic ephemeral port, so a request and its response form
-//! one client↔server:5683 conversation. This matters — Wireshark's block-wise
-//! reassembly keys off request/response direction, so forcing both ports to 5683
-//! collapses direction and leaves fragmented CBOR undecodable; role-based ports
-//! let it pair the exchange and reassemble.
+//! one client↔server:5683 conversation rather than collapsing into one direction.
 //!
-//! The client port is scoped per *token*, not per node: Wireshark keys its block
-//! reassembly by the 5-tuple alone (not token/Request-Tag), so putting all of a
-//! node's transfers on one conversation lets an abandoned or interleaved
-//! Q-Block1 transfer splice into the next one's reassembly ("Illegal block
-//! fragments", subtly corrupt CBOR). Every message of one exchange — request
-//! blocks, the response (and its Q-Block2 blocks), 4.08 recovery — echoes the
-//! request token, so a per-(client, token) port puts each exchange in its own
-//! conversation with pairing intact. Token-less datagrams (empty/signalling,
-//! non-CoAP) fall back to a per-node port. NOTE: if per-block tokens land
-//! (RFC 9177 §6), this key must become the token's per-body part
-//! (its low 32 bits) or the Request-Tag, or blocks of one body will scatter
-//! across conversations. Timestamps are wall-clock ([`SystemTime`]); a merged
-//! two-device timeline (`mergecap`) is only as good as the two device clocks.
+//! The client port is scoped per *token*, not per node, so each exchange is its
+//! own conversation and a request always sits next to its own response even when
+//! several are in flight to one peer. The token is the exchange's real one, taken
+//! from the egress client / the inbound packet rather than invented, so the two
+//! halves match. Token-less records fall back to a per-node port. Timestamps are
+//! wall-clock ([`SystemTime`]); a merged two-device timeline (`mergecap`) is only
+//! as good as the two device clocks.
 //!
 //! ## Threading
 //!
 //! The file is written on a dedicated std thread draining an unbounded channel,
 //! not on the Tokio runtime — so the hot path ([`CaptureControl::record`], called
-//! from the async `send`/`recv`) only does a non-blocking channel push, and
+//! from the async request/response paths) only does a non-blocking channel push, and
 //! [`CaptureControl::start`]/[`stop`] are plain sync calls safe to invoke from the
 //! FFI/JNI thread. `stop` joins the writer, guaranteeing the file is flushed and
 //! closed before it returns — i.e. immediately ready for `adb pull`.
@@ -56,15 +56,18 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use coap_lite::{CoapRequest, CoapResponse};
 
 use super::datagram::{DatagramLink, LinkAddr, LinkProfile};
+use super::message;
+use crate::transport::{WireRequest, WireResponse};
 
 /// pcap classic magic (microsecond, little-endian on-disk).
 const PCAP_MAGIC: u32 = 0xa1b2_c3d4;
@@ -169,9 +172,54 @@ impl CaptureControl {
             .is_some()
     }
 
-    /// Mirror one datagram into the active session, if any. A no-op (single lock,
-    /// no allocation) when disarmed. Skips (debug-logged) any datagram too large
-    /// for a single IPv4/UDP frame — a non-event for MTU-sized CoAP blocks.
+    /// Mirror one federation request into the active session, as the single
+    /// unfragmented CoAP message it would be without a medium codec. Cheap when
+    /// disarmed: the `is_active` check short-circuits before any serialization.
+    pub(super) fn record_request(
+        &self,
+        local_is_src: bool,
+        node: &[u8],
+        token: &[u8],
+        req: &WireRequest,
+    ) {
+        if !self.is_active() {
+            return;
+        }
+        let mut out = message::build_request(req);
+        out.message.set_token(token.to_vec());
+        if let Ok(bytes) = out.message.to_bytes() {
+            self.record(local_is_src, node, &bytes);
+        }
+    }
+
+    /// Mirror one federation response, as above. `seed` is any request packet
+    /// (coap-lite derives a response's type and message id from one); the token
+    /// is then overwritten with the exchange's, so the response lands in the same
+    /// Wireshark conversation as its request.
+    pub(super) fn record_response(
+        &self,
+        local_is_src: bool,
+        node: &[u8],
+        token: &[u8],
+        resp: &WireResponse,
+    ) {
+        if !self.is_active() {
+            return;
+        }
+        let seed: CoapRequest<SocketAddr> = CoapRequest::new();
+        let Some(mut out) = CoapResponse::new(&seed.message) else {
+            return;
+        };
+        message::write_response(&mut out, resp);
+        out.message.set_token(token.to_vec());
+        if let Ok(bytes) = out.message.to_bytes() {
+            self.record(local_is_src, node, &bytes);
+        }
+    }
+
+    /// Mirror one CoAP message into the active session, if any. A no-op (single
+    /// lock, no allocation) when disarmed. Skips (debug-logged) anything too
+    /// large for a single IPv4/UDP frame.
     fn record(&self, local_is_src: bool, node: &[u8], payload: &[u8]) {
         let mut guard = self.active.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(session) = guard.as_mut() else {
@@ -230,7 +278,12 @@ fn finish(session: Option<Session>) -> Option<()> {
     Some(())
 }
 
-/// A [`DatagramLink`] decorator that mirrors every datagram into a [`CaptureControl`].
+/// A [`DatagramLink`] decorator that attaches a [`CaptureControl`] to a link.
+///
+/// It passes datagrams straight through — the recording happens above, at the
+/// codec boundaries (see the module docs). This exists so the host edge can hand
+/// lb a capture sink the same way a medium hands it a codec: by declaring it on
+/// the link it injects, with no transport constructor plumbing.
 pub struct PcapCaptureLink {
     inner: Arc<dyn DatagramLink>,
     control: Arc<CaptureControl>,
@@ -250,14 +303,11 @@ impl PcapCaptureLink {
 #[async_trait]
 impl DatagramLink for PcapCaptureLink {
     async fn send(&self, dst: &[u8], datagram: &[u8]) -> io::Result<()> {
-        self.control.record(true, dst, datagram);
         self.inner.send(dst, datagram).await
     }
 
     async fn recv(&self) -> Option<(LinkAddr, Vec<u8>)> {
-        let (node, data) = self.inner.recv().await?;
-        self.control.record(false, &node, &data);
-        Some((node, data))
+        self.inner.recv().await
     }
 
     fn profile(&self) -> LinkProfile {
@@ -269,9 +319,14 @@ impl DatagramLink for PcapCaptureLink {
 
     fn codec(&self) -> Option<Arc<dyn super::datagram::LinkCodec>> {
         // Same delegation rule as `profile`: answering `None` here would strip
-        // the wrapped medium's codec on every embedded build. The tap sits
-        // below CoAP serialization, so captures show the encoded wire.
+        // the wrapped medium's codec on every embedded build.
         self.inner.codec()
+    }
+
+    fn capture(&self) -> Option<Arc<CaptureControl>> {
+        // The whole purpose of this decorator: surface the host's control to the
+        // CoAP layer, which does the recording at the codec boundaries.
+        Some(self.control.clone())
     }
 }
 
@@ -592,31 +647,23 @@ mod tests {
     /// response and distinct per client endpoint; token-less datagrams fall back
     /// to the per-node port. This is what keeps an abandoned or interleaved
     /// Q-Block transfer out of the next transfer's Wireshark reassembly stream.
-    #[tokio::test]
-    async fn token_scoped_client_ports_separate_exchanges() {
+    #[test]
+    fn token_scoped_client_ports_separate_exchanges() {
         let node = b"peer-9".to_vec();
         // Inbound: a response to our token-A request, then a request from the
         // peer with its own token C.
         let resp_a = b"\x64\x45\x00\x01\x0A\x0B\x0C\x0D".to_vec(); // ACK 2.05, tok A
         let req_c = b"\x44\x02\x00\x03\xC0\xC1\xC2\xC3".to_vec(); // CON POST, tok C
-        let mock = MockLink::new(vec![(node.clone(), resp_a), (node.clone(), req_c)]);
         let control = CaptureControl::new();
-        let link = PcapCaptureLink::wrap(mock, control.clone());
         let path = temp_pcap();
 
         control.start(path.to_str().unwrap()).unwrap();
-        link.send(&node, b"\x44\x01\x00\x01\x0A\x0B\x0C\x0D")
-            .await
-            .unwrap(); // req, tok A
-        link.send(&node, b"\x44\x01\x00\x02\x0E\x0F\x10\x11")
-            .await
-            .unwrap(); // req, tok B
-        link.recv().await.unwrap(); // response, tok A
-        link.recv().await.unwrap(); // peer request, tok C
-        link.send(&node, b"\x64\x45\x00\x03\xC0\xC1\xC2\xC3")
-            .await
-            .unwrap(); // our response, tok C
-        link.send(&node, b"\x40\x01\x00\x09").await.unwrap(); // token-less req
+        control.record(true, &node, b"\x44\x01\x00\x01\x0A\x0B\x0C\x0D"); // req, tok A
+        control.record(true, &node, b"\x44\x01\x00\x02\x0E\x0F\x10\x11"); // req, tok B
+        control.record(false, &node, &resp_a); // response, tok A
+        control.record(false, &node, &req_c); // peer request, tok C
+        control.record(true, &node, b"\x64\x45\x00\x03\xC0\xC1\xC2\xC3"); // our resp, tok C
+        control.record(true, &node, b"\x40\x01\x00\x09"); // token-less req
         control.stop();
 
         let frames = frames_of(&path);
@@ -643,34 +690,67 @@ mod tests {
         assert_eq!(coap_is_request(b"\x00"), None); // not version 1
     }
 
+    // The tap no longer records datagrams (recording moved to the codec
+    // boundaries in the CoAP layer) — but it must still pass bytes through
+    // untouched and surface the control to that layer, or capture is dead.
     #[tokio::test]
-    async fn disarmed_by_default_and_delegates() {
-        let mock = MockLink::new(vec![]);
-        let control = CaptureControl::new();
-        let link = PcapCaptureLink::wrap(mock.clone(), control.clone());
-        assert!(!control.is_active());
-        // Traffic while disarmed is delegated untouched and captures nothing.
-        link.send(b"peer-1", b"hi").await.unwrap();
-        assert_eq!(mock.sent.lock().unwrap().len(), 1);
-        assert!(!control.is_active());
-    }
-
-    #[tokio::test]
-    async fn start_capture_stop_writes_both_directions() {
-        let node = b"peer-7".to_vec();
-        // A real 2.05 Content response inbound; a 0.01 GET request outbound.
-        let inbound = b"\x60\x45\x00\x00coap-response".to_vec();
+    async fn tap_delegates_bytes_and_surfaces_the_control() {
+        let node = b"peer-1".to_vec();
+        let inbound = b"\x60\x45\x00\x00in".to_vec();
         let mock = MockLink::new(vec![(node.clone(), inbound.clone())]);
         let control = CaptureControl::new();
         let link = PcapCaptureLink::wrap(mock.clone(), control.clone());
+        assert!(!control.is_active());
+
+        link.send(&node, b"out").await.unwrap();
+        assert_eq!(
+            mock.sent.lock().unwrap().len(),
+            1,
+            "send must reach the link"
+        );
+        assert_eq!(mock.sent.lock().unwrap()[0].1, b"out", "bytes unaltered");
+        assert_eq!(link.recv().await.unwrap().1, inbound, "recv unaltered");
+        assert!(link.capture().is_some(), "the CoAP layer needs this sink");
+        assert!(
+            !control.is_active(),
+            "datagrams must not arm or record anything"
+        );
+    }
+
+    /// Even armed, the tap records nothing at the datagram level
+    #[tokio::test]
+    async fn armed_tap_records_no_datagrams() {
+        let node = b"peer-1".to_vec();
+        let mock = MockLink::new(vec![(node.clone(), b"\x60\x45\x00\x00in".to_vec())]);
+        let control = CaptureControl::new();
+        let link = PcapCaptureLink::wrap(mock, control.clone());
+        let path = temp_pcap();
+
+        control.start(path.to_str().unwrap()).unwrap();
+        link.send(&node, b"\x40\x01\x00\x01out").await.unwrap();
+        link.recv().await.unwrap();
+        control.stop();
+
+        assert!(
+            frames_of(&path).is_empty(),
+            "datagram-level tap must be gone"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn start_capture_stop_writes_both_directions() {
+        let node = b"peer-7".to_vec();
+        // A real 2.05 Content response inbound; a 0.01 GET request outbound.
+        let inbound = b"\x60\x45\x00\x00coap-response".to_vec();
+        let control = CaptureControl::new();
         let path = temp_pcap();
 
         control.start(path.to_str().unwrap()).unwrap();
         assert!(control.is_active());
         let outbound = b"\x40\x01\xAB\xCDcoap-request";
-        link.send(&node, outbound).await.unwrap();
-        let (_, got) = link.recv().await.unwrap();
-        assert_eq!(got, inbound);
+        control.record(true, &node, outbound);
+        control.record(false, &node, &inbound);
         assert!(control.stop(), "stop reports it was capturing");
         assert!(!control.is_active());
 
@@ -691,18 +771,16 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    #[tokio::test]
-    async fn ports_reflect_server_role_for_inbound_request() {
+    #[test]
+    fn ports_reflect_server_role_for_inbound_request() {
         let node = b"peer-3".to_vec();
         let request = b"\x40\x02\x00\x00hello".to_vec(); // 0.02 POST from the peer
-        let mock = MockLink::new(vec![(node.clone(), request.clone())]);
         let control = CaptureControl::new();
-        let link = PcapCaptureLink::wrap(mock, control.clone());
         let path = temp_pcap();
 
         control.start(path.to_str().unwrap()).unwrap();
-        link.recv().await.unwrap(); // inbound request: peer is the client
-        link.send(&node, b"\x60\x45\x00\x00world").await.unwrap(); // our 2.05 response
+        control.record(false, &node, &request); // inbound request: peer is client
+        control.record(true, &node, b"\x60\x45\x00\x00world"); // our 2.05 response
         control.stop();
 
         let frames = frames_of(&path);
@@ -718,24 +796,22 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    #[tokio::test]
-    async fn restart_rotates_file_and_resets_ips() {
-        let mock = MockLink::new(vec![]);
+    #[test]
+    fn restart_rotates_file_and_resets_ips() {
         let control = CaptureControl::new();
-        let link = PcapCaptureLink::wrap(mock, control.clone());
 
         // First session: peer `b` is the second node seen, so it gets 10.0.0.3.
         let first = temp_pcap();
         control.start(first.to_str().unwrap()).unwrap();
-        link.send(b"peer-1", b"a").await.unwrap();
-        link.send(b"peer-2", b"b").await.unwrap();
+        control.record(true, b"peer-1", b"a");
+        control.record(true, b"peer-2", b"b");
         control.stop();
 
         // Second session must start a fresh file AND a fresh IP registry, so the
         // first node seen is 10.0.0.2 again (no bleed from the prior session).
         let second = temp_pcap();
         control.start(second.to_str().unwrap()).unwrap();
-        link.send(b"peer-2", b"b").await.unwrap();
+        control.record(true, b"peer-2", b"b");
         control.stop();
 
         let f1 = frames_of(&first);

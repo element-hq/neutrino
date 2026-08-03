@@ -434,6 +434,11 @@ struct CoapDispatch {
     /// compares canonical names), `encode_response` before the response is
     /// written (pre-Block2). Link ingress only; `None` on the UDP transport.
     codec: Option<Arc<dyn datagram::LinkCodec>>,
+    /// The host's pcap sink, recorded on the codec's INSIDE: the request after
+    /// `decode_request` and the response before `encode_response`, so the capture
+    /// holds Matrix rather than the compressed wire (see [`capture`]). Link
+    /// ingress only; `None` on the UDP transport, which has no capture.
+    capture: Option<Arc<capture::CaptureControl>>,
 }
 
 impl CoapDispatch {
@@ -457,6 +462,14 @@ impl CoapDispatch {
         } else {
             self.dispatch(&request).await
         };
+        // pcap tap, ingress response: before `encode_response`, so the capture
+        // holds our real CBOR. Same token as the request it answers, so the pair
+        // shares one Wireshark conversation.
+        if let Some(capture) = &self.capture
+            && let Some(node) = self.peer(&request)
+        {
+            capture.record_response(true, &node, request.message.get_token(), &wire_resp);
+        }
         // Medium codec, ingress half: transform the response BEFORE it is
         // written (and Block2-segmented). A response our own codec can't
         // encode is a bug surfaced as a 500, never a corrupt wire message.
@@ -479,6 +492,13 @@ impl CoapDispatch {
         request
     }
 
+    /// The peer's link address for a request, for naming it in a capture. Only
+    /// the hub can recover it: the `SocketAddr` on a link-path request is a
+    /// synthetic key it minted, meaningless to anything else.
+    fn peer(&self, request: &CoapRequest<SocketAddr>) -> Option<datagram::LinkAddr> {
+        self.node_binding.as_ref()?.peer_of(request.source)
+    }
+
     /// Parse → decode (medium codec) → origin-binding gate → handler.
     async fn dispatch(&self, request: &CoapRequest<SocketAddr>) -> WireResponse {
         let mut wire_req = message::parse_request(request);
@@ -491,6 +511,14 @@ impl CoapDispatch {
         {
             tracing::warn!(error = %e, "link codec decode_request failed");
             return status_only(400);
+        }
+        // pcap tap, ingress request: after `decode_request`, so the capture holds
+        // the peer's real path/credential/CBOR rather than its compressed form.
+        // Before the binding gate, so a rejected request is still visible.
+        if let Some(capture) = &self.capture
+            && let Some(node) = self.peer(request)
+        {
+            capture.record_request(false, &node, request.message.get_token(), &wire_req);
         }
         // Authenticated datagram ingress: a peer may assert only its own
         // origin. Reject (401) before the handler runs if the claimed
@@ -549,9 +577,11 @@ impl WireServer for CoapWireServer {
             handler,
             max_body_bytes: self.max_body_bytes,
             // UDP runs on a trusted LAN with no peer authentication — no binding,
-            // and no medium codec (that seam is link-only).
+            // no medium codec and no capture (those seams are link-only; tcpdump
+            // on the interface already sees this transport's real wire).
             node_binding: None,
             codec: None,
+            capture: None,
         });
 
         // `coap::Server::run` has no native shutdown, so race it against the
@@ -1236,6 +1266,7 @@ mod dispatch_tests {
             max_body_bytes: MAX_WIRE_BODY_BYTES,
             node_binding: None,
             codec: None,
+            capture: None,
         };
         let mut request: Box<CoapRequest<SocketAddr>> = Box::new(CoapRequest::new());
         request.response = None;
@@ -1255,6 +1286,7 @@ mod dispatch_tests {
             max_body_bytes: MAX_WIRE_BODY_BYTES,
             node_binding: None,
             codec: None,
+            capture: None,
         };
         let mut request: Box<CoapRequest<SocketAddr>> = Box::new(CoapRequest::new());
         request.response = Some(CoapResponse::new(&request.message).expect("response"));

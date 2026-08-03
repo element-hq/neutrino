@@ -225,6 +225,12 @@ pub trait DatagramLink: Send + Sync {
     fn codec(&self) -> Option<Arc<dyn LinkCodec>> {
         None
     }
+    /// The host's pcap capture sink, if one is attached — see
+    /// [`PcapCaptureLink`](super::capture::PcapCaptureLink). Defaults to `None`
+    /// (no capture). Decorators MUST delegate, or they disable capture.
+    fn capture(&self) -> Option<Arc<super::capture::CaptureControl>> {
+        None
+    }
 }
 
 /// Mux/demux over one [`DatagramLink`]. Owns the link, runs one background drain
@@ -343,6 +349,18 @@ impl Hub {
     /// client/server built over this hub.
     pub(super) fn codec(&self) -> Option<Arc<dyn LinkCodec>> {
         self.link.codec()
+    }
+
+    /// The host's capture sink ([`DatagramLink::capture`]), surfaced for the
+    /// client/server built over this hub.
+    pub(super) fn capture(&self) -> Option<Arc<super::capture::CaptureControl>> {
+        self.link.capture()
+    }
+
+    /// The link address a synthetic `SocketAddr` was minted for, for the capture's
+    /// peer naming. Public twin of [`Hub::node_for`].
+    pub(super) fn peer_of(&self, addr: Option<SocketAddr>) -> Option<LinkAddr> {
+        addr.and_then(|a| self.node_for(a))
     }
 
     /// Recover the exact link address a synthetic `SocketAddr` was minted for, or
@@ -571,6 +589,10 @@ pub struct LinkCoapWireClient {
     /// construction): `encode_request` before the exchange, `decode_response`
     /// after. `None` = no transformation.
     codec: Option<Arc<dyn LinkCodec>>,
+    /// The host's pcap sink. Recording happens on the codec's INSIDE — the
+    /// pre-`encode_request` request and the post-`decode_response` response — so
+    /// the capture shows Matrix, not the compressed wire (see `super::capture`).
+    capture: Option<Arc<super::capture::CaptureControl>>,
     block1_size: Option<usize>,
     qblock: Option<coap::qblock::QBlockConfig>,
     request_timeout: Duration,
@@ -588,6 +610,7 @@ impl LinkCoapWireClient {
     pub fn new(hub: Arc<Hub>, block1_size: Option<usize>) -> Self {
         Self {
             codec: hub.codec(),
+            capture: hub.capture(),
             hub,
             block1_size,
             qblock: None,
@@ -690,10 +713,18 @@ impl WireClient for LinkCoapWireClient {
         if req.dest.is_empty() {
             return Err(WireError::Transport("empty destination address".to_owned()));
         }
+        let mut req = req;
+        // Minted before the codec runs so the capture and the exchange share one
+        // token, which is what pairs a recorded request with its response.
+        let token = self.next_token();
+        // pcap tap, egress request: on the codec's INSIDE, so the capture holds
+        // the real path/credential/CBOR rather than the compressed wire form.
+        if let Some(capture) = &self.capture {
+            capture.record_request(true, req.dest.as_bytes(), &token, &req);
+        }
         // Medium codec, egress half: transform the request BEFORE the CoAP
         // message is built, so the rewritten path/headers/body feed the
         // per-block options and the pre-segmentation payload.
-        let mut req = req;
         if let Some(codec) = &self.codec {
             codec
                 .encode_request(&mut req)
@@ -706,11 +737,10 @@ impl WireClient for LinkCoapWireClient {
         // 1280 message cap, which is why `block1_size` is kept small).
         tracing::debug!(dest = %req.dest, method = %req.method, path = %req.path, body_len = req.body.len(), qblock = self.qblock.is_some(), "datagram wire: dispatching federation request");
         let client = self.client_for(node).await;
-        let token = self.next_token();
         let result = exchange(
             &client,
             &req,
-            token,
+            token.clone(),
             self.qblock.is_some(),
             self.max_body_bytes,
             self.request_timeout,
@@ -726,6 +756,12 @@ impl WireClient for LinkCoapWireClient {
                 .map_err(|e| WireError::Transport(format!("link codec decode_response: {e}"))),
             None => Ok(resp),
         });
+        // pcap tap, egress response: after `decode_response`, so the body is the
+        // peer's real CBOR. `dest` is off-limits to codecs, so it still names the
+        // peer here.
+        if let (Some(capture), Ok(resp)) = (&self.capture, &result) {
+            capture.record_response(false, req.dest.as_bytes(), &token, resp);
+        }
         match &result {
             Ok(r) => {
                 tracing::debug!(dest = %req.dest, status = r.status, "datagram wire: federation request completed")
@@ -814,6 +850,7 @@ impl WireServer for LinkCoapWireServer {
             handler,
             max_body_bytes: self.max_body_bytes,
             codec: self.hub.codec(),
+            capture: self.hub.capture(),
             // The datagram ingress is the authenticated trust boundary: bind every
             // request's claimed origin to its source node via the hub.
             node_binding: Some(self.hub.clone()),
@@ -1169,7 +1206,7 @@ mod tests {
     }
 
     /// UDP payloads of a classic `LINKTYPE_RAW` pcap as written by the capture
-    /// tap (24 B global header, 16 B record headers, 20 B IPv4 + 8 B UDP).
+    /// (24 B global header, 16 B record headers, 20 B IPv4 + 8 B UDP).
     fn pcap_udp_payloads(bytes: &[u8]) -> Vec<Vec<u8>> {
         let mut payloads = Vec::new();
         let mut off = 24;
@@ -1181,6 +1218,103 @@ mod tests {
             off += incl;
         }
         payloads
+    }
+
+    /// Whether `needle` appears anywhere in `hay`.
+    fn holds(hay: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    // The reason the tap moved inside the codec: a capture must hold the Matrix
+    // view, not the medium's transformed wire. `RoundTripCodec` reverses the body
+    // and prefixes the path on egress, so a datagram-level tap — which is what
+    // this used to be — would have recorded the reversed body and the `/enc` path.
+    // Both legs are checked: the request is captured before `encode_request`, the
+    // response after `decode_response`.
+    #[tokio::test]
+    async fn capture_holds_the_pre_codec_view_not_the_wire() {
+        use super::super::capture::{CaptureControl, PcapCaptureLink};
+
+        let codec = Arc::new(RoundTripCodec::default());
+        let (a_link, b_link) = MockLink::pair(addr(ADDR_A), addr(ADDR_B));
+        let a: Arc<dyn DatagramLink> = Arc::new(CodecLink {
+            inner: a_link,
+            codec: codec.clone(),
+        });
+        let control = CaptureControl::new();
+        // Outermost, exactly as the embedded composition wraps it.
+        let a = PcapCaptureLink::wrap(a, control.clone());
+        let b = Arc::new(CodecLink {
+            inner: b_link,
+            codec: codec.clone(),
+        });
+        let path =
+            std::env::temp_dir().join(format!("neutrino-precodec-{}.pcap", std::process::id()));
+        control.start(path.to_str().unwrap()).unwrap();
+
+        let (client, token, handle) = rig_with_links(a, b, None, None, None, None).await;
+        // Distinctive and asymmetric, so its reverse cannot occur by chance.
+        let body: Vec<u8> = (0..32u8)
+            .map(|i| i.wrapping_mul(7).wrapping_add(3))
+            .collect();
+        let reversed: Vec<u8> = body.iter().rev().copied().collect();
+        client
+            .send(WireRequest {
+                dest: ADDR_B.to_owned(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![xmatrix_auth(ADDR_A)],
+                body: body.clone(),
+                ..Default::default()
+            })
+            .await
+            .expect("send");
+        shutdown(token, handle).await;
+        control.stop();
+
+        let payloads = pcap_udp_payloads(&std::fs::read(&path).unwrap());
+        std::fs::remove_file(&path).ok();
+        assert_eq!(payloads.len(), 2, "one request + one response recorded");
+        assert!(
+            payloads.iter().all(|p| holds(p, &body)),
+            "both legs must hold the untransformed body"
+        );
+        assert!(
+            !payloads.iter().any(|p| holds(p, &reversed)),
+            "the codec's transformed body must never reach the capture"
+        );
+        assert!(
+            !payloads.iter().any(|p| holds(p, b"enc")),
+            "the codec's rewritten path must never reach the capture"
+        );
+    }
+
+    /// A link decorator that keeps a copy of every datagram crossing it, in both
+    /// directions. The pcap tap deliberately no longer sees datagrams (it records
+    /// at the codec boundaries instead — see `super::super::capture`), so a test
+    /// that needs the actual on-wire PDUs taps them here.
+    struct WireTap {
+        inner: Arc<dyn DatagramLink>,
+        seen: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    #[async_trait]
+    impl DatagramLink for WireTap {
+        async fn send(&self, dst: &[u8], datagram: &[u8]) -> std::io::Result<()> {
+            self.seen.lock().await.push(datagram.to_vec());
+            self.inner.send(dst, datagram).await
+        }
+        async fn recv(&self) -> Option<(LinkAddr, Vec<u8>)> {
+            let (node, data) = self.inner.recv().await?;
+            self.seen.lock().await.push(data.clone());
+            Some((node, data))
+        }
+        fn profile(&self) -> LinkProfile {
+            self.inner.profile()
+        }
+        fn codec(&self) -> Option<Arc<dyn LinkCodec>> {
+            self.inner.codec()
+        }
     }
 
     /// (code byte, option numbers) of a CoAP message.
@@ -1220,23 +1354,20 @@ mod tests {
     // and dissects options in ascending number order, so a request-side
     // Q-Block2 (31 > Q-Block1's 19) clobbered the real Q-Block1 state and left
     // multi-block CBOR request bodies undecodable ("Malformed packet: CBOR").
-    // Asserted on the actual datagrams via the pcap tap, over a full Q-Block
-    // round-trip; the response leg must still stream Q-Block2 (via
+    // Asserted on the actual datagrams via a test-only link tap, over a full
+    // Q-Block round-trip; the response leg must still stream Q-Block2 (via
     // `assume_peer_block_size`, not a per-request opt-in).
     #[tokio::test]
     async fn qblock_requests_carry_no_qblock2_on_the_wire() {
-        use super::super::capture::{CaptureControl, PcapCaptureLink};
         const Q_BLOCK1: u16 = 19;
         const Q_BLOCK2: u16 = 31;
 
         let (a_link, b_link) = MockLink::pair(addr(ADDR_A), addr(ADDR_B));
-        let control = CaptureControl::new();
-        let a_link = PcapCaptureLink::wrap(a_link, control.clone());
-        let path = std::env::temp_dir().join(format!(
-            "neutrino-qblock2-wire-pin-{}.pcap",
-            std::process::id()
-        ));
-        control.start(path.to_str().unwrap()).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let a_link: Arc<dyn DatagramLink> = Arc::new(WireTap {
+            inner: a_link,
+            seen: seen.clone(),
+        });
 
         let qcfg = qblock_cfg(Some(128));
         let (client, token, handle) = rig_with_links(
@@ -1262,10 +1393,11 @@ mod tests {
             .expect("qblock send");
         assert_eq!(resp.body, req_body);
         shutdown(token, handle).await;
-        control.stop();
 
+        let datagrams = seen.lock().await.clone();
+        assert!(!datagrams.is_empty(), "the wire tap recorded nothing");
         let (mut q1_requests, mut q2_requests, mut q2_responses) = (0, 0, 0);
-        for payload in pcap_udp_payloads(&std::fs::read(&path).unwrap()) {
+        for payload in datagrams {
             let (code, opts) = coap_code_and_options(&payload);
             match code >> 5 {
                 0 if code != 0 => {
@@ -1276,7 +1408,6 @@ mod tests {
                 _ => {}
             }
         }
-        std::fs::remove_file(&path).ok();
         assert!(
             q1_requests > 1,
             "multi-block Q-Block1 request not exercised"
