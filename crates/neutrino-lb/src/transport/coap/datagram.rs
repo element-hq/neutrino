@@ -372,10 +372,7 @@ impl Hub {
         source: Option<SocketAddr>,
         headers: &[(String, Vec<u8>)],
     ) -> bool {
-        let Some((_, value)) = headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-        else {
+        let Some(value) = crate::headers::authorization(headers) else {
             return false; // no claimed origin — defer to the upstream auth gate
         };
         // A server identity is now being asserted; it MUST match the source's
@@ -383,30 +380,14 @@ impl Hub {
         let Some(node) = source.and_then(|addr| self.node_for(addr)) else {
             return true;
         };
-        match std::str::from_utf8(value).ok().and_then(xmatrix_origin) {
+        match std::str::from_utf8(value)
+            .ok()
+            .and_then(crate::headers::xmatrix_origin)
+        {
             Some(origin) => origin.as_bytes() != node.as_slice(),
             None => true,
         }
     }
-}
-
-/// Extract the unquoted `origin` auth-param from an `X-Matrix origin="…",…`
-/// Authorization value, for the transport-layer identity binding
-/// ([`Hub::origin_binding_violation`]). `None` if the scheme prefix or `origin`
-/// is absent. Mirrors `neutrino_http::federation::auth`'s parse, kept local so
-/// this Matrix-agnostic transport needn't depend on the http crate; it extracts
-/// the bytes only — the http layer still owns the real auth policy.
-fn xmatrix_origin(value: &str) -> Option<&str> {
-    let params = value.strip_prefix("X-Matrix ")?;
-    for part in params.split(',') {
-        let Some((key, val)) = part.split_once('=') else {
-            continue;
-        };
-        if key.trim() == "origin" {
-            return Some(val.trim().trim_matches('"'));
-        }
-    }
-    None
 }
 
 /// The single drain task: pull each inbound datagram off the link, classify it,
@@ -690,10 +671,11 @@ impl WireClient for LinkCoapWireClient {
         if req.dest.is_empty() {
             return Err(WireError::Transport("empty destination address".to_owned()));
         }
+        let mut req = req;
+        let token = self.next_token();
         // Medium codec, egress half: transform the request BEFORE the CoAP
         // message is built, so the rewritten path/headers/body feed the
         // per-block options and the pre-segmentation payload.
-        let mut req = req;
         if let Some(codec) = &self.codec {
             codec
                 .encode_request(&mut req)
@@ -706,7 +688,6 @@ impl WireClient for LinkCoapWireClient {
         // 1280 message cap, which is why `block1_size` is kept small).
         tracing::debug!(dest = %req.dest, method = %req.method, path = %req.path, body_len = req.body.len(), qblock = self.qblock.is_some(), "datagram wire: dispatching federation request");
         let client = self.client_for(node).await;
-        let token = self.next_token();
         let result = exchange(
             &client,
             &req,
@@ -914,6 +895,7 @@ mod tests {
                 status: 200,
                 headers: vec![("x-matrix-seen-path".to_owned(), req.path.into_bytes())],
                 body: req.body,
+                ..Default::default()
             }
         }
     }
@@ -940,8 +922,8 @@ mod tests {
         .await
     }
 
-    /// [`rig`] over caller-supplied links, so a test can interpose a tap (e.g.
-    /// [`PcapCaptureLink`](super::capture::PcapCaptureLink)) on A's side.
+    /// [`rig`] over caller-supplied links, so a test can interpose a decorator
+    /// (e.g. [`WireTap`]) on A's side.
     async fn rig_with_links(
         a_link: Arc<dyn DatagramLink>,
         b_link: Arc<dyn DatagramLink>,
@@ -1023,6 +1005,7 @@ mod tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![],
                 body: vec![1, 2, 3],
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -1052,6 +1035,7 @@ mod tests {
                 path: "/_matrix/federation/v2/send_join/!r:a/$e".to_owned(),
                 headers: vec![],
                 body: req_body.clone(),
+                ..Default::default()
             })
             .await
             .expect("blockwise send");
@@ -1073,6 +1057,7 @@ mod tests {
                 path: "/_matrix/federation/v1/send/txnq".to_owned(),
                 headers: vec![],
                 body: req_body.clone(),
+                ..Default::default()
             })
             .await
             .expect("qblock send");
@@ -1131,6 +1116,7 @@ mod tests {
                 path: INVITE_PATH.to_owned(),
                 headers: invite_headers(),
                 body,
+                ..Default::default()
             })
             .await;
         assert!(
@@ -1154,6 +1140,7 @@ mod tests {
                 path: INVITE_PATH.to_owned(),
                 headers: invite_headers(),
                 body: body.clone(),
+                ..Default::default()
             })
             .await
             .expect("512-block long federation request must round-trip");
@@ -1162,19 +1149,30 @@ mod tests {
         shutdown(token, handle).await;
     }
 
-    /// UDP payloads of a classic `LINKTYPE_RAW` pcap as written by the capture
-    /// tap (24 B global header, 16 B record headers, 20 B IPv4 + 8 B UDP).
-    fn pcap_udp_payloads(bytes: &[u8]) -> Vec<Vec<u8>> {
-        let mut payloads = Vec::new();
-        let mut off = 24;
-        while off + 16 <= bytes.len() {
-            let incl = u32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap()) as usize;
-            off += 16;
-            assert!(incl >= 28, "frame shorter than IPv4+UDP headers");
-            payloads.push(bytes[off + 28..off + incl].to_vec());
-            off += incl;
+    /// A link decorator that keeps a copy of every datagram crossing it, in both
+    /// directions, for tests that need the actual on-wire PDUs.
+    struct WireTap {
+        inner: Arc<dyn DatagramLink>,
+        seen: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    #[async_trait]
+    impl DatagramLink for WireTap {
+        async fn send(&self, dst: &[u8], datagram: &[u8]) -> std::io::Result<()> {
+            self.seen.lock().await.push(datagram.to_vec());
+            self.inner.send(dst, datagram).await
         }
-        payloads
+        async fn recv(&self) -> Option<(LinkAddr, Vec<u8>)> {
+            let (node, data) = self.inner.recv().await?;
+            self.seen.lock().await.push(data.clone());
+            Some((node, data))
+        }
+        fn profile(&self) -> LinkProfile {
+            self.inner.profile()
+        }
+        fn codec(&self) -> Option<Arc<dyn LinkCodec>> {
+            self.inner.codec()
+        }
     }
 
     /// (code byte, option numbers) of a CoAP message.
@@ -1214,23 +1212,20 @@ mod tests {
     // and dissects options in ascending number order, so a request-side
     // Q-Block2 (31 > Q-Block1's 19) clobbered the real Q-Block1 state and left
     // multi-block CBOR request bodies undecodable ("Malformed packet: CBOR").
-    // Asserted on the actual datagrams via the pcap tap, over a full Q-Block
-    // round-trip; the response leg must still stream Q-Block2 (via
+    // Asserted on the actual datagrams via a test-only link tap, over a full
+    // Q-Block round-trip; the response leg must still stream Q-Block2 (via
     // `assume_peer_block_size`, not a per-request opt-in).
     #[tokio::test]
     async fn qblock_requests_carry_no_qblock2_on_the_wire() {
-        use super::super::capture::{CaptureControl, PcapCaptureLink};
         const Q_BLOCK1: u16 = 19;
         const Q_BLOCK2: u16 = 31;
 
         let (a_link, b_link) = MockLink::pair(addr(ADDR_A), addr(ADDR_B));
-        let control = CaptureControl::new();
-        let a_link = PcapCaptureLink::wrap(a_link, control.clone());
-        let path = std::env::temp_dir().join(format!(
-            "neutrino-qblock2-wire-pin-{}.pcap",
-            std::process::id()
-        ));
-        control.start(path.to_str().unwrap()).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let a_link: Arc<dyn DatagramLink> = Arc::new(WireTap {
+            inner: a_link,
+            seen: seen.clone(),
+        });
 
         let qcfg = qblock_cfg(Some(128));
         let (client, token, handle) = rig_with_links(
@@ -1250,15 +1245,17 @@ mod tests {
                 path: "/_matrix/federation/v1/send/txnw".to_owned(),
                 headers: vec![],
                 body: req_body.clone(),
+                ..Default::default()
             })
             .await
             .expect("qblock send");
         assert_eq!(resp.body, req_body);
         shutdown(token, handle).await;
-        control.stop();
 
+        let datagrams = seen.lock().await.clone();
+        assert!(!datagrams.is_empty(), "the wire tap recorded nothing");
         let (mut q1_requests, mut q2_requests, mut q2_responses) = (0, 0, 0);
-        for payload in pcap_udp_payloads(&std::fs::read(&path).unwrap()) {
+        for payload in datagrams {
             let (code, opts) = coap_code_and_options(&payload);
             match code >> 5 {
                 0 if code != 0 => {
@@ -1269,7 +1266,6 @@ mod tests {
                 _ => {}
             }
         }
-        std::fs::remove_file(&path).ok();
         assert!(
             q1_requests > 1,
             "multi-block Q-Block1 request not exercised"
@@ -1310,6 +1306,7 @@ mod tests {
                 path: "/_matrix/federation/v1/event/$e".to_owned(),
                 headers: vec![],
                 body: vec![],
+                ..Default::default()
             })
             .await
             .expect("response must reach the originating client, not the server loop");
@@ -1431,6 +1428,7 @@ mod tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![xmatrix_auth(ADDR_A)],
                 body: vec![1, 2, 3],
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -1452,6 +1450,79 @@ mod tests {
         ] {
             assert_eq!(count.load(Ordering::SeqCst), 1, "{hook} firings");
         }
+        shutdown(token, handle).await;
+    }
+
+    /// Relabels the body's content-format on egress and restores it on ingress,
+    /// erroring if it did not survive.
+    struct FormatCodec;
+
+    const RELABELLED: u16 = 59;
+
+    impl LinkCodec for FormatCodec {
+        fn encode_request(&self, req: &mut WireRequest) -> Result<(), CodecError> {
+            req.content_format = RELABELLED;
+            Ok(())
+        }
+        fn decode_request(&self, req: &mut WireRequest) -> Result<(), CodecError> {
+            if req.content_format != RELABELLED {
+                return Err(CodecError(format!("request format {}", req.content_format)));
+            }
+            req.content_format = crate::transport::CBOR_CONTENT_FORMAT;
+            Ok(())
+        }
+        fn encode_response(&self, resp: &mut WireResponse) -> Result<(), CodecError> {
+            resp.content_format = RELABELLED;
+            Ok(())
+        }
+        fn decode_response(&self, resp: &mut WireResponse) -> Result<(), CodecError> {
+            if resp.content_format != RELABELLED {
+                return Err(CodecError(format!(
+                    "response format {}",
+                    resp.content_format
+                )));
+            }
+            resp.content_format = crate::transport::CBOR_CONTENT_FORMAT;
+            Ok(())
+        }
+    }
+
+    // A codec's content-format must reach the far side on both legs. The body is
+    // deliberately multi-block: CoAP repeats options per block, so this also
+    // catches a format that survives block 0 and is lost on the rest. Both
+    // decode hooks error if the label did not arrive, so a dropped option shows
+    // up as a failed send rather than a silently mis-typed body.
+    #[tokio::test]
+    async fn link_codec_content_format_survives_both_legs() {
+        let codec = Arc::new(FormatCodec);
+        let (a_link, b_link) = MockLink::pair(addr(ADDR_A), addr(ADDR_B));
+        let a = Arc::new(CodecLink {
+            inner: a_link,
+            codec: codec.clone(),
+        });
+        let b = Arc::new(CodecLink {
+            inner: b_link,
+            codec: codec.clone(),
+        });
+        let (client, token, handle) = rig_with_links(a, b, None, None, None, None).await;
+
+        let resp = client
+            .send(WireRequest {
+                dest: ADDR_B.to_owned(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![xmatrix_auth(ADDR_A)],
+                body: vec![0u8; 4096], // several blocks at the default 1024 B
+                ..Default::default()
+            })
+            .await
+            .expect("the relabelled format must survive to the peer");
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.content_format,
+            crate::transport::CBOR_CONTENT_FORMAT,
+            "decode_response must hand the caller a restored format"
+        );
         shutdown(token, handle).await;
     }
 
@@ -1484,6 +1555,7 @@ mod tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![xmatrix_auth(ADDR_A)],
                 body: vec![],
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -1558,6 +1630,7 @@ mod tests {
             path: "/_matrix/federation/v1/send/txn1".to_owned(),
             headers: vec![],
             body: vec![7],
+            ..Default::default()
         }
     }
 
@@ -1601,21 +1674,6 @@ mod tests {
         shutdown(token, handle).await;
     }
 
-    // The capture tap is a decorator: it must surface the wrapped medium's
-    // codec (same rule as `profile`), or every embedded build — which always
-    // wraps the medium in the tap — would silently strip the codec.
-    #[test]
-    fn pcap_capture_link_delegates_codec() {
-        let (a_link, _b) = MockLink::pair(addr(ADDR_A), addr(ADDR_B));
-        let with_codec = Arc::new(CodecLink {
-            inner: a_link,
-            codec: Arc::new(AuthReverser),
-        });
-        let control = crate::transport::coap::capture::CaptureControl::new();
-        let tapped = crate::transport::coap::capture::PcapCaptureLink::wrap(with_codec, control);
-        assert!(tapped.codec().is_some(), "tap must delegate codec()");
-    }
-
     /// An `Authorization: X-Matrix origin="<server>"` header value.
     fn xmatrix_auth(origin: &str) -> (String, Vec<u8>) {
         (
@@ -1637,6 +1695,7 @@ mod tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![xmatrix_auth(ADDR_A)],
                 body: vec![1, 2, 3],
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -1660,6 +1719,7 @@ mod tests {
                 // Claims ADDR_B while the link authenticated the sender as ADDR_A.
                 headers: vec![xmatrix_auth(ADDR_B)],
                 body: vec![1, 2, 3],
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -1682,6 +1742,7 @@ mod tests {
                 path: "/_matrix/federation/v1/event/$e".to_owned(),
                 headers: vec![xmatrix_auth("not-a-node-id.example")],
                 body: vec![],
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -1703,6 +1764,7 @@ mod tests {
                 path: "/_matrix/federation/v1/version".to_owned(),
                 headers: vec![],
                 body: vec![],
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -1735,6 +1797,7 @@ mod tests {
                         path: format!("/_matrix/federation/v1/send/txn{i}"),
                         headers: vec![],
                         body: body.clone(),
+                        ..Default::default()
                     })
                     .await
                     .expect("concurrent first-send must not time out");

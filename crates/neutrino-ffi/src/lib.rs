@@ -137,7 +137,7 @@ pub struct NeutrinoHandle {
     /// and read back by `discovered_peers()`. Shared (same `Arc`) with the
     /// homeserver's user-directory search.
     discovery: std::sync::Arc<neutrino_main::DiscoveryRegistry>,
-    /// Runtime-toggleable pcap capture of federation datagrams (a debug tap).
+    /// Runtime-toggleable pcap capture of federation HTTP/JSON (a debug tap).
     /// Same `Arc` as the one wrapping the transport link; the Settings toggle
     /// drives it via `start_capture`/`stop_capture`.
     capture: std::sync::Arc<neutrino_main::CaptureControl>,
@@ -208,11 +208,14 @@ impl NeutrinoHandle {
             .collect()
     }
 
-    /// Start mirroring every federation datagram into a Wireshark-readable pcap
-    /// at `path` (an absolute path in host-owned storage, e.g. app-specific
-    /// external storage so it is `adb pull`-able). Errors if the file can't be
-    /// opened. Calling it while already capturing rotates to the new file. A
-    /// non-blocking control call, safe from the FFI/JNI thread.
+    /// Start mirroring every federation HTTP request/response into a
+    /// Wireshark-readable pcap at `path` (an absolute path in host-owned
+    /// storage, e.g. app-specific external storage so it is `adb pull`-able).
+    /// The capture is HTTP/JSON — what a `tcpdump -i lo` on a desktop would
+    /// have shown of the two loopback legs, which Android cannot capture
+    /// itself. Errors if the file can't be opened. Calling it while already
+    /// capturing rotates to the new file. A non-blocking control call, safe
+    /// from the FFI/JNI thread.
     pub fn start_capture(&self, path: String) -> Result<(), CaptureError> {
         self.capture.start(&path).map_err(|e| CaptureError::Io {
             reason: e.to_string(),
@@ -265,14 +268,14 @@ pub fn start_with(
     neutrino_main::init_tracing();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let config: neutrino_main::Config = config.into();
-    // Runtime-toggleable pcap capture of federation datagrams (a debug tap; see
-    // `neutrino_lb::CaptureControl`). One handle wraps the link on the transport
-    // hot path, an identical clone lives on `NeutrinoHandle` for the Settings
-    // toggle (`start_capture`/`stop_capture`). Off until the host arms it. With
-    // no injected link (the LAN/UDP build) the tap wraps nothing: the toggle
-    // still works but the capture file stays empty.
+    // Runtime-toggleable pcap capture of the federation conversation (a debug
+    // tap; see `neutrino_lb::capture`). One handle is threaded into the lb
+    // sidecar's HTTP/JSON edges, an identical clone lives on `NeutrinoHandle`
+    // for the Settings toggle (`start_capture`/`stop_capture`). Off until the
+    // host arms it. The tap is transport-independent, so it records on every
+    // build — including the LAN/UDP one, which has no injected link.
     let capture = neutrino_main::CaptureControl::new();
-    let capture_for_link = capture.clone();
+    let capture_for_lb = capture.clone();
     // The entrypoint publishes the resolved server name here once identity
     // resolution completes; `server_name()` reads it back.
     let (handoff_tx, handoff_rx) = tokio::sync::watch::channel::<Option<String>>(None);
@@ -287,20 +290,6 @@ pub fn start_with(
     // an injected medium receives the same `Arc` via its `LinkContext`.
     let discovery_for_server = std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new());
     let discovery_for_handle = discovery_for_server.clone();
-    // Wrap whatever link the injected factory builds with the (inert) capture
-    // tap, so the host can toggle pcap at runtime without rebuilding the link —
-    // uniformly, for any medium, instead of each factory rewiring it.
-    let link_factory = link_factory.map(|factory| -> neutrino_main::FederationLinkFactory {
-        Box::new(move |ctx| {
-            Box::pin(async move {
-                let neutrino_main::FederationLink { link, key_resolver } = factory(ctx).await?;
-                Ok(neutrino_main::FederationLink {
-                    link: neutrino_main::PcapCaptureLink::wrap(link, capture_for_link),
-                    key_resolver,
-                })
-            })
-        })
-    });
     std::thread::spawn(move || {
         // Neutrino owns its runtime. current_thread = parity with the previous
         // async-compat global (also current_thread); all DB work is offloaded to
@@ -331,6 +320,7 @@ pub fn start_with(
                 Some(handoff_tx),
                 link_factory,
                 Some(discovery_for_server),
+                Some(capture_for_lb),
             )
             .await
             {

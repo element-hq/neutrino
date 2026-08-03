@@ -7,8 +7,8 @@ use std::sync::Arc;
 pub use neutrino_ctl::{Command, Config, DiscoveredPeer, DiscoveryRegistry};
 pub use neutrino_event::{KeyResolver, NodeIdKeyResolver};
 pub use neutrino_lb::{
-    CaptureControl, CodecError, DatagramLink, LinkAddr, LinkCodec, LinkPacing, LinkProfile,
-    PcapCaptureLink, WireRequest, WireResponse,
+    CBOR_CONTENT_FORMAT, CaptureControl, CodecError, DatagramLink, LinkAddr, LinkCodec, LinkPacing,
+    LinkProfile, WireRequest, WireResponse,
 };
 
 use std::future::Future;
@@ -112,6 +112,12 @@ pub async fn entrypoint(
     // homeserver's user-directory search read the same set. Non-embedded callers
     // (the dev binary / tests) pass `None` and a fresh empty registry is used.
     discovery: Option<Arc<DiscoveryRegistry>>,
+    // Runtime-toggleable pcap sink for the lb sidecar's HTTP/JSON edges. Rides
+    // alongside `Config` rather than inside it: `Config` lives in neutrino-ctl,
+    // which is dependency-free by design and cannot name an lb type. The
+    // embedding host keeps a clone to arm/disarm it from a Settings toggle;
+    // non-embedded callers pass `None`.
+    capture: Option<Arc<neutrino_lb::CaptureControl>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
     let discovery = discovery.unwrap_or_else(|| Arc::new(DiscoveryRegistry::new()));
@@ -252,6 +258,7 @@ pub async fn entrypoint(
                 egress_bind,
                 link.clone(),
                 link_profile,
+                capture,
             )?)
         }
         None => None,
@@ -440,6 +447,7 @@ fn build_lb_config(
     egress_bind: SocketAddr,
     link: Option<Arc<dyn DatagramLink>>,
     profile: LinkProfile,
+    capture: Option<Arc<neutrino_lb::CaptureControl>>,
 ) -> Result<neutrino_lb::LbConfig, Box<dyn std::error::Error>> {
     Ok(neutrino_lb::LbConfig {
         ingress_bind: ingress_bind_for(&config.bind_addr, fed_port),
@@ -461,6 +469,9 @@ fn build_lb_config(
         // the sidecar's CoAP wire runs over it instead of a UDP socket. `None` for
         // dev/LAN keeps the UDP path.
         link,
+        // The host's pcap sink, taken at the sidecar's HTTP/JSON edges — so it
+        // is independent of `link` and works on every transport.
+        capture,
     })
 }
 
@@ -569,7 +580,7 @@ mod tests {
     #[test]
     fn build_lb_config_derives_ingress_from_bind_addr_and_port() {
         let c = cfg("0.0.0.0:8008");
-        let lb = build_lb_config(&c, 8448, egress(), None, LinkProfile::default())
+        let lb = build_lb_config(&c, 8448, egress(), None, LinkProfile::default(), None)
             .expect("valid lb config");
         assert_eq!(lb.ingress_bind, "[::]:8448".parse().unwrap());
         assert_eq!(lb.egress_bind, egress());
@@ -596,7 +607,7 @@ mod tests {
             max_datagram: 700,
             ..LinkProfile::default()
         };
-        let lb = build_lb_config(&c, 8448, egress(), None, small).expect("valid lb config");
+        let lb = build_lb_config(&c, 8448, egress(), None, small, None).expect("valid lb config");
         assert!(matches!(
             lb.wire,
             neutrino_lb::WireKind::CoapQBlock {
@@ -608,7 +619,7 @@ mod tests {
             max_datagram: 16,
             ..LinkProfile::default()
         };
-        assert!(build_lb_config(&c, 8448, egress(), None, tiny).is_err());
+        assert!(build_lb_config(&c, 8448, egress(), None, tiny, None).is_err());
     }
 
     // SecurityConfig → EventSecurity realisation: trusted network is
@@ -654,7 +665,7 @@ mod tests {
     #[test]
     fn build_lb_config_ingress_reuses_concrete_host() {
         let c = cfg("127.0.0.1:8008");
-        let lb = build_lb_config(&c, 8448, egress(), None, LinkProfile::default())
+        let lb = build_lb_config(&c, 8448, egress(), None, LinkProfile::default(), None)
             .expect("valid lb config");
         assert_eq!(lb.ingress_bind, "127.0.0.1:8448".parse().unwrap());
         assert_eq!(lb.upstream, "http://127.0.0.1:8008");
@@ -668,7 +679,7 @@ mod tests {
     #[test]
     fn build_lb_config_ingress_falls_back_to_unspecified_for_hostname() {
         let c = cfg("localhost:8008");
-        let lb = build_lb_config(&c, 8448, egress(), None, LinkProfile::default())
+        let lb = build_lb_config(&c, 8448, egress(), None, LinkProfile::default(), None)
             .expect("valid lb config");
         assert_eq!(lb.ingress_bind, "[::]:8448".parse().unwrap());
         assert_eq!(lb.upstream, "http://127.0.0.1:8008");
@@ -706,7 +717,7 @@ mod tests {
     #[test]
     fn build_lb_config_upstream_loopbacks_an_unspecified_bind() {
         let c = cfg("0.0.0.0:8008");
-        let lb = build_lb_config(&c, 80, egress(), None, LinkProfile::default())
+        let lb = build_lb_config(&c, 80, egress(), None, LinkProfile::default(), None)
             .expect("valid lb config");
         assert_eq!(lb.upstream, "http://127.0.0.1:8008");
     }
@@ -717,7 +728,7 @@ mod tests {
     #[test]
     fn build_lb_config_rejects_non_loopback_bind_addr() {
         let c = cfg("192.168.1.5:8008");
-        assert!(build_lb_config(&c, 8448, egress(), None, LinkProfile::default()).is_err());
+        assert!(build_lb_config(&c, 8448, egress(), None, LinkProfile::default(), None).is_err());
     }
 
     // The self-allocated egress is always a loopback address: it is an
