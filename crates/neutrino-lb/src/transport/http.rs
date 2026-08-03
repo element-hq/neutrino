@@ -134,6 +134,7 @@ impl WireClient for HttpWireClient {
             status,
             headers,
             body,
+            ..Default::default()
         })
     }
 }
@@ -229,6 +230,7 @@ async fn dispatch(State(state): State<DispatchState>, req: Request) -> Response 
             path,
             headers,
             body,
+            ..Default::default()
         })
         .await;
     build_response(wire_resp)
@@ -313,6 +315,7 @@ mod tests {
                     ("Content-Length".to_owned(), b"999".to_vec()),
                 ],
                 body: b"CBORBYTES".to_vec(),
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -348,6 +351,7 @@ mod tests {
                 path: "/slow".to_owned(),
                 headers: vec![],
                 body: vec![],
+                ..Default::default()
             })
             .await
             .expect_err("slow peer must time out");
@@ -377,6 +381,7 @@ mod tests {
                 path: "/big".to_owned(),
                 headers: vec![],
                 body: vec![],
+                ..Default::default()
             })
             .await
             .expect_err("oversized peer response must error, not buffer");
@@ -394,6 +399,7 @@ mod tests {
                 status: 200,
                 headers: vec![],
                 body: serde_json::to_vec(&payload).unwrap(),
+                ..Default::default()
             }
         }
     }
@@ -419,6 +425,7 @@ mod tests {
                 path: "/_matrix/federation/v1/send/xyz".to_owned(),
                 headers: vec![],
                 body: vec![1, 2, 3],
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -455,6 +462,7 @@ mod tests {
                 path: "/_matrix/federation/v1/send/big".to_owned(),
                 headers: vec![],
                 body: vec![0u8; 100], // > 8-byte cap
+                ..Default::default()
             })
             .await
             .expect("send");

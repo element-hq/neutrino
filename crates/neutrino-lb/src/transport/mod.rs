@@ -30,6 +30,10 @@ pub enum WireError {
     Serve(String),
 }
 
+/// CoAP content-format for `application/cbor`, and the default for every
+/// [`WireRequest`]/[`WireResponse`] `content_format`.
+pub const CBOR_CONTENT_FORMAT: u16 = 60;
+
 /// A federation request ready for the wire. `body` is already CBOR (empty for a
 /// bodyless GET). `dest` is the peer `server_name` (== host:port for the v1 HTTP
 /// transport); it is unused on the ingress side.
@@ -41,6 +45,13 @@ pub struct WireRequest {
     pub path: String,
     pub headers: Vec<(String, Vec<u8>)>,
     pub body: Vec<u8>,
+    /// How `body` is encoded, as a CoAP content-format codepoint. Almost always
+    /// [`CBOR_CONTENT_FORMAT`]; a [`LinkCodec`](crate::LinkCodec) that rewrites
+    /// the body into some other encoding sets this so the far side knows what it
+    /// received, and so a capture is dissectable as the thing it actually is.
+    /// It rides the wire as the CoAP Content-Format option (the HTTP transport
+    /// has no equivalent and ignores it).
+    pub content_format: u16,
 }
 
 /// A federation response from the wire. `body` is CBOR.
@@ -49,6 +60,35 @@ pub struct WireResponse {
     pub status: u16,
     pub headers: Vec<(String, Vec<u8>)>,
     pub body: Vec<u8>,
+    /// How `body` is encoded — see [`WireRequest::content_format`].
+    pub content_format: u16,
+}
+
+// Hand-written rather than derived: `content_format` defaults to CBOR, not to
+// `u16::default()`, which is `0` — a real content-format (text/plain) and the
+// wrong one. Tests fill the field with `..Default::default()`.
+impl Default for WireRequest {
+    fn default() -> Self {
+        Self {
+            dest: String::new(),
+            method: Method::GET,
+            path: String::new(),
+            headers: Vec::new(),
+            body: Vec::new(),
+            content_format: CBOR_CONTENT_FORMAT,
+        }
+    }
+}
+
+impl Default for WireResponse {
+    fn default() -> Self {
+        Self {
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+            content_format: CBOR_CONTENT_FORMAT,
+        }
+    }
 }
 
 /// Egress side: send a CBOR request to a peer and return its CBOR response.

@@ -14,7 +14,9 @@ pub use transport::coap::capture::{CaptureControl, PcapCaptureLink};
 pub use transport::coap::datagram::{
     CodecError, DatagramLink, LinkAddr, LinkCodec, LinkPacing, LinkProfile,
 };
-pub use transport::{DestinationResolver, DirectResolver, WireRequest, WireResponse};
+pub use transport::{
+    CBOR_CONTENT_FORMAT, DestinationResolver, DirectResolver, WireRequest, WireResponse,
+};
 
 use std::net::SocketAddr;
 use std::time::Duration;

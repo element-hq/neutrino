@@ -914,6 +914,7 @@ mod tests {
                 status: 200,
                 headers: vec![("x-matrix-seen-path".to_owned(), req.path.into_bytes())],
                 body: req.body,
+                ..Default::default()
             }
         }
     }
@@ -1023,6 +1024,7 @@ mod tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![],
                 body: vec![1, 2, 3],
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -1052,6 +1054,7 @@ mod tests {
                 path: "/_matrix/federation/v2/send_join/!r:a/$e".to_owned(),
                 headers: vec![],
                 body: req_body.clone(),
+                ..Default::default()
             })
             .await
             .expect("blockwise send");
@@ -1073,6 +1076,7 @@ mod tests {
                 path: "/_matrix/federation/v1/send/txnq".to_owned(),
                 headers: vec![],
                 body: req_body.clone(),
+                ..Default::default()
             })
             .await
             .expect("qblock send");
@@ -1131,6 +1135,7 @@ mod tests {
                 path: INVITE_PATH.to_owned(),
                 headers: invite_headers(),
                 body,
+                ..Default::default()
             })
             .await;
         assert!(
@@ -1154,6 +1159,7 @@ mod tests {
                 path: INVITE_PATH.to_owned(),
                 headers: invite_headers(),
                 body: body.clone(),
+                ..Default::default()
             })
             .await
             .expect("512-block long federation request must round-trip");
@@ -1250,6 +1256,7 @@ mod tests {
                 path: "/_matrix/federation/v1/send/txnw".to_owned(),
                 headers: vec![],
                 body: req_body.clone(),
+                ..Default::default()
             })
             .await
             .expect("qblock send");
@@ -1310,6 +1317,7 @@ mod tests {
                 path: "/_matrix/federation/v1/event/$e".to_owned(),
                 headers: vec![],
                 body: vec![],
+                ..Default::default()
             })
             .await
             .expect("response must reach the originating client, not the server loop");
@@ -1431,6 +1439,7 @@ mod tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![xmatrix_auth(ADDR_A)],
                 body: vec![1, 2, 3],
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -1452,6 +1461,79 @@ mod tests {
         ] {
             assert_eq!(count.load(Ordering::SeqCst), 1, "{hook} firings");
         }
+        shutdown(token, handle).await;
+    }
+
+    /// Relabels the body's content-format on egress and restores it on ingress,
+    /// erroring if it did not survive.
+    struct FormatCodec;
+
+    const RELABELLED: u16 = 59;
+
+    impl LinkCodec for FormatCodec {
+        fn encode_request(&self, req: &mut WireRequest) -> Result<(), CodecError> {
+            req.content_format = RELABELLED;
+            Ok(())
+        }
+        fn decode_request(&self, req: &mut WireRequest) -> Result<(), CodecError> {
+            if req.content_format != RELABELLED {
+                return Err(CodecError(format!("request format {}", req.content_format)));
+            }
+            req.content_format = crate::transport::CBOR_CONTENT_FORMAT;
+            Ok(())
+        }
+        fn encode_response(&self, resp: &mut WireResponse) -> Result<(), CodecError> {
+            resp.content_format = RELABELLED;
+            Ok(())
+        }
+        fn decode_response(&self, resp: &mut WireResponse) -> Result<(), CodecError> {
+            if resp.content_format != RELABELLED {
+                return Err(CodecError(format!(
+                    "response format {}",
+                    resp.content_format
+                )));
+            }
+            resp.content_format = crate::transport::CBOR_CONTENT_FORMAT;
+            Ok(())
+        }
+    }
+
+    // A codec's content-format must reach the far side on both legs. The body is
+    // deliberately multi-block: CoAP repeats options per block, so this also
+    // catches a format that survives block 0 and is lost on the rest. Both
+    // decode hooks error if the label did not arrive, so a dropped option shows
+    // up as a failed send rather than a silently mis-typed body.
+    #[tokio::test]
+    async fn link_codec_content_format_survives_both_legs() {
+        let codec = Arc::new(FormatCodec);
+        let (a_link, b_link) = MockLink::pair(addr(ADDR_A), addr(ADDR_B));
+        let a = Arc::new(CodecLink {
+            inner: a_link,
+            codec: codec.clone(),
+        });
+        let b = Arc::new(CodecLink {
+            inner: b_link,
+            codec: codec.clone(),
+        });
+        let (client, token, handle) = rig_with_links(a, b, None, None, None, None).await;
+
+        let resp = client
+            .send(WireRequest {
+                dest: ADDR_B.to_owned(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![xmatrix_auth(ADDR_A)],
+                body: vec![0u8; 4096], // several blocks at the default 1024 B
+                ..Default::default()
+            })
+            .await
+            .expect("the relabelled format must survive to the peer");
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.content_format,
+            crate::transport::CBOR_CONTENT_FORMAT,
+            "decode_response must hand the caller a restored format"
+        );
         shutdown(token, handle).await;
     }
 
@@ -1484,6 +1566,7 @@ mod tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![xmatrix_auth(ADDR_A)],
                 body: vec![],
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -1558,6 +1641,7 @@ mod tests {
             path: "/_matrix/federation/v1/send/txn1".to_owned(),
             headers: vec![],
             body: vec![7],
+            ..Default::default()
         }
     }
 
@@ -1637,6 +1721,7 @@ mod tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![xmatrix_auth(ADDR_A)],
                 body: vec![1, 2, 3],
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -1660,6 +1745,7 @@ mod tests {
                 // Claims ADDR_B while the link authenticated the sender as ADDR_A.
                 headers: vec![xmatrix_auth(ADDR_B)],
                 body: vec![1, 2, 3],
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -1682,6 +1768,7 @@ mod tests {
                 path: "/_matrix/federation/v1/event/$e".to_owned(),
                 headers: vec![xmatrix_auth("not-a-node-id.example")],
                 body: vec![],
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -1703,6 +1790,7 @@ mod tests {
                 path: "/_matrix/federation/v1/version".to_owned(),
                 headers: vec![],
                 body: vec![],
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -1735,6 +1823,7 @@ mod tests {
                         path: format!("/_matrix/federation/v1/send/txn{i}"),
                         headers: vec![],
                         body: body.clone(),
+                        ..Default::default()
                     })
                     .await
                     .expect("concurrent first-send must not time out");

@@ -34,8 +34,7 @@ pub(crate) const OPT_FWD_HEADER: u16 = 2050;
 /// framing is stripped on the wire and re-synthesised on ingress (see
 /// `message`).
 pub(crate) const OPT_X_MATRIX_AUTH: u16 = 2052;
-/// `application/cbor` (RFC 8949 §9.1).
-pub(crate) const CBOR_CONTENT_FORMAT: u16 = 60;
+pub(crate) use crate::transport::CBOR_CONTENT_FORMAT;
 
 /// Cap on concurrent in-flight Q-Block1 (inbound request) reassemblies on the
 /// public federation port. Each holds up to `max_body_bytes`, so the worst-case
@@ -513,6 +512,7 @@ fn status_only(status: u16) -> WireResponse {
         status,
         headers: vec![],
         body: vec![],
+        ..Default::default()
     }
 }
 
@@ -665,6 +665,7 @@ mod client_tests {
                 path: "/_matrix/federation/v2/send_join/!r:a/$e".to_owned(),
                 headers: vec![],
                 body: vec![1, 2, 3],
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -707,6 +708,7 @@ mod client_tests {
                 path: "/_matrix/federation/v1/event/$e".to_owned(),
                 headers: vec![],
                 body: vec![],
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -727,6 +729,7 @@ mod client_tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![],
                 body: vec![0u8; 64],
+                ..Default::default()
             })
             .await
             .expect_err("zero block1_size must error, not panic");
@@ -754,6 +757,7 @@ mod server_tests {
                 status: 200,
                 headers: vec![("x-matrix-seen-path".to_owned(), req.path.into_bytes())],
                 body: req.body,
+                ..Default::default()
             }
         }
     }
@@ -779,6 +783,7 @@ mod server_tests {
                 path: "/_matrix/federation/v1/send/txn9".to_owned(),
                 headers: vec![],
                 body: vec![9, 9, 9],
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -827,6 +832,7 @@ mod blockwise_tests {
                 status: 200,
                 headers: vec![],
                 body: big,
+                ..Default::default()
             }
         }
     }
@@ -860,6 +866,7 @@ mod blockwise_tests {
                 path: "/_matrix/federation/v2/send_join/!r:a/$e".to_owned(),
                 headers: vec![],
                 body: req_body.clone(),
+                ..Default::default()
             })
             .await
             .expect("blockwise send");
@@ -892,6 +899,7 @@ mod blockwise_tests {
                 status: 200,
                 headers: vec![],
                 body: req.body,
+                ..Default::default()
             }
         }
     }
@@ -921,6 +929,7 @@ mod blockwise_tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![],
                 body: req_body.clone(),
+                ..Default::default()
             })
             .await
             .expect("small-block send");
@@ -972,6 +981,7 @@ mod blockwise_tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![],
                 body: req_body.clone(),
+                ..Default::default()
             })
             .await
             .expect("budgeted send");
@@ -1014,6 +1024,7 @@ mod cap_tests {
                 status: 200,
                 headers: vec![],
                 body: req.body,
+                ..Default::default()
             }
         }
     }
@@ -1045,6 +1056,7 @@ mod cap_tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![],
                 body: vec![0u8; 100], // > 8-byte cap
+                ..Default::default()
             })
             .await
             .expect("send");
@@ -1093,6 +1105,7 @@ mod cap_tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![],
                 body: vec![0u8; 100],
+                ..Default::default()
             })
             .await
             .expect_err("oversized peer response must error, not buffer");
@@ -1125,6 +1138,7 @@ mod cap_tests {
                 path: "/_matrix/federation/v1/event/$e".to_owned(),
                 headers: vec![],
                 body: vec![],
+                ..Default::default()
             }),
         )
         .await
@@ -1170,6 +1184,7 @@ mod cap_tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![],
                 body: req_body,
+                ..Default::default()
             })
             .await;
         match result {
@@ -1205,6 +1220,7 @@ mod dispatch_tests {
                 status: 200,
                 headers: vec![],
                 body: vec![],
+                ..Default::default()
             }
         }
     }
@@ -1271,6 +1287,7 @@ mod concurrency_tests {
                 status: 200,
                 headers: vec![],
                 body: req.body,
+                ..Default::default()
             }
         }
     }
@@ -1312,6 +1329,7 @@ mod concurrency_tests {
                         path: format!("/_matrix/federation/v1/send/txn{i}"),
                         headers: vec![],
                         body: body.clone(),
+                        ..Default::default()
                     })
                     .await
                     .expect("concurrent send");
@@ -1353,6 +1371,7 @@ mod loss_tests {
                 status: 200,
                 headers: vec![],
                 body: req.body,
+                ..Default::default()
             }
         }
     }
@@ -1449,6 +1468,7 @@ mod loss_tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![],
                 body: vec![0x5Au8; 64],
+                ..Default::default()
             })
             .await
             .expect("send must recover from the dropped datagram");
@@ -1475,6 +1495,7 @@ mod loss_tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![],
                 body: req_body.clone(),
+                ..Default::default()
             })
             .await
             .expect("blockwise send must recover from the mid-transfer drop");
@@ -1561,6 +1582,7 @@ mod loss_tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![],
                 body: req_body.clone(),
+                ..Default::default()
             }),
         )
         .await
@@ -1628,6 +1650,7 @@ mod qblock_client_tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![],
                 body: vec![1, 2, 3, 4],
+                ..Default::default()
             })
             .await
             .expect("qblock send");
@@ -1691,6 +1714,7 @@ mod qblock_client_tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![],
                 body: vec![0u8; 2048],
+                ..Default::default()
             })
             .await
             .expect_err("oversized Q-Block2 response must error, not OOM");
@@ -1757,6 +1781,7 @@ mod qblock_client_tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![],
                 body: vec![0u8; 4096], // multi-block burst with the default 1024 B block
+                ..Default::default()
             }),
         )
         .await
@@ -1785,6 +1810,7 @@ mod qblock_server_tests {
                 status: 200,
                 headers: vec![("x-matrix-seen-path".to_owned(), req.path.into_bytes())],
                 body: req.body,
+                ..Default::default()
             }
         }
     }
@@ -1813,6 +1839,7 @@ mod qblock_server_tests {
                 path: "/_matrix/federation/v1/send/txnq".to_owned(),
                 headers: vec![],
                 body: vec![7, 7, 7],
+                ..Default::default()
             })
             .await
             .expect("qblock send");
@@ -1873,6 +1900,7 @@ mod qblock_server_tests {
                 path: "/_matrix/federation/v2/send_join/!r:a/$e".to_owned(),
                 headers: vec![],
                 body: req_body.clone(),
+                ..Default::default()
             })
             .await
             .expect("qblock large send");
@@ -1921,6 +1949,7 @@ mod qblock_concurrency_tests {
                 status: 200,
                 headers: vec![],
                 body: req.body,
+                ..Default::default()
             }
         }
     }
@@ -1967,6 +1996,7 @@ mod qblock_concurrency_tests {
                         path: format!("/_matrix/federation/v1/send/txn{i}"),
                         headers: vec![],
                         body: body.clone(),
+                        ..Default::default()
                     })
                     .await
                     .expect("concurrent qblock send");

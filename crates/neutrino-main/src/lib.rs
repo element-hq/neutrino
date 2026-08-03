@@ -7,8 +7,8 @@ use std::sync::Arc;
 pub use neutrino_ctl::{Command, Config, DiscoveredPeer, DiscoveryRegistry};
 pub use neutrino_event::{KeyResolver, NodeIdKeyResolver};
 pub use neutrino_lb::{
-    CaptureControl, CodecError, DatagramLink, LinkAddr, LinkCodec, LinkPacing, LinkProfile,
-    PcapCaptureLink, WireRequest, WireResponse,
+    CBOR_CONTENT_FORMAT, CaptureControl, CodecError, DatagramLink, LinkAddr, LinkCodec, LinkPacing,
+    LinkProfile, PcapCaptureLink, WireRequest, WireResponse,
 };
 
 use std::future::Future;

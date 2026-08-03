@@ -34,9 +34,26 @@ fn to_http_method(rt: &RequestType) -> Method {
     }
 }
 
-/// CoAP content-format option value, minimally encoded (60 fits one byte).
-fn content_format_bytes() -> Vec<u8> {
-    vec![CBOR_CONTENT_FORMAT as u8]
+/// CoAP content-format option value, minimally encoded (RFC 7252 §3.2): the
+/// shortest big-endian form, so anything under 256 — including the CBOR default
+/// — costs a single byte in every block.
+fn content_format_bytes(format: u16) -> Vec<u8> {
+    match format {
+        0 => Vec::new(),
+        f if f < 256 => vec![f as u8],
+        f => f.to_be_bytes().to_vec(),
+    }
+}
+
+/// Read back [`content_format_bytes`]. An absent or over-long option means the
+/// peer said nothing usable, which is the CBOR default.
+fn parse_content_format(raw: Option<&Vec<u8>>) -> u16 {
+    match raw.map(Vec::as_slice) {
+        Some([]) => 0,
+        Some(&[b]) => u16::from(b),
+        Some(&[hi, lo]) => u16::from_be_bytes([hi, lo]),
+        _ => CBOR_CONTENT_FORMAT,
+    }
 }
 
 /// Egress: build a CoAP request from a `WireRequest`. The destination endpoint is
@@ -53,8 +70,10 @@ pub(crate) fn build_request(req: &WireRequest) -> CoapRequest<SocketAddr> {
     for q in queries {
         out.message.add_option(CoapOption::UriQuery, q.into_bytes());
     }
-    out.message
-        .add_option(CoapOption::ContentFormat, content_format_bytes());
+    out.message.add_option(
+        CoapOption::ContentFormat,
+        content_format_bytes(req.content_format),
+    );
     for (name, value) in &req.headers {
         if !is_forwardable(name) {
             continue;
@@ -103,6 +122,9 @@ pub(crate) fn parse_request(req: &CoapRequest<SocketAddr>) -> WireRequest {
         path,
         headers,
         body: req.message.payload.clone(),
+        content_format: parse_content_format(
+            req.message.get_first_option(CoapOption::ContentFormat),
+        ),
     }
 }
 
@@ -112,8 +134,10 @@ pub(crate) fn write_response(resp: &mut CoapResponse, wire: &WireResponse) {
         CoapOption::Unknown(OPT_HTTP_STATUS),
         wire.status.to_be_bytes().to_vec(),
     );
-    resp.message
-        .add_option(CoapOption::ContentFormat, content_format_bytes());
+    resp.message.add_option(
+        CoapOption::ContentFormat,
+        content_format_bytes(wire.content_format),
+    );
     for (name, value) in &wire.headers {
         if is_forwardable(name) {
             resp.message.add_option(
@@ -139,6 +163,9 @@ pub(crate) fn parse_response(resp: &CoapResponse) -> WireResponse {
         status,
         headers,
         body: resp.message.payload.clone(),
+        content_format: parse_content_format(
+            resp.message.get_first_option(CoapOption::ContentFormat),
+        ),
     }
 }
 
@@ -207,6 +234,64 @@ fn option_values(opt: Option<&LinkedList<Vec<u8>>>) -> Vec<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// The wire cost of the field: the option value must stay one byte for any
+    /// codepoint under 256, because CoAP repeats options in EVERY block — a
+    /// two-byte value is paid per block, not per message.
+    #[test]
+    fn content_format_under_256_costs_one_byte() {
+        assert_eq!(content_format_bytes(CBOR_CONTENT_FORMAT).len(), 1);
+        assert_eq!(content_format_bytes(59).len(), 1);
+        assert_eq!(content_format_bytes(255).len(), 1);
+        assert_eq!(content_format_bytes(0).len(), 0, "0 encodes empty");
+        assert_eq!(content_format_bytes(65000).len(), 2, "the range to avoid");
+    }
+
+    #[test]
+    fn content_format_encoding_round_trips() {
+        for f in [0u16, 59, 60, 255, 256, 65000, 65535] {
+            let bytes = content_format_bytes(f);
+            assert_eq!(parse_content_format(Some(&bytes)), f, "format {f}");
+        }
+    }
+
+    /// A peer that sets no content-format at all is talking CBOR — that is what
+    /// every pre-field build of this proxy emitted.
+    #[test]
+    fn absent_content_format_reads_as_cbor() {
+        assert_eq!(parse_content_format(None), CBOR_CONTENT_FORMAT);
+    }
+
+    /// A non-default format must survive serialization in both directions, or a
+    /// codec's compressed body would be read back as plain CBOR.
+    #[test]
+    fn non_default_content_format_survives_the_wire() {
+        let wire = WireRequest {
+            path: "/_matrix/federation/v1/send/1".to_owned(),
+            body: vec![0xde, 0xad],
+            content_format: 59,
+            ..Default::default()
+        };
+        let bytes = build_request(&wire).message.to_bytes().expect("to_bytes");
+        let packet = coap_lite::Packet::from_bytes(&bytes).expect("from_bytes");
+        let mut reparsed: CoapRequest<SocketAddr> = CoapRequest::new();
+        reparsed.message = packet;
+        assert_eq!(parse_request(&reparsed).content_format, 59);
+
+        let resp_wire = WireResponse {
+            status: 200,
+            body: vec![0xde, 0xad],
+            content_format: 59,
+            ..Default::default()
+        };
+        let req: CoapRequest<SocketAddr> = CoapRequest::new();
+        let mut resp = CoapResponse::new(&req.message).expect("response");
+        write_response(&mut resp, &resp_wire);
+        let bytes = resp.message.to_bytes().expect("to_bytes");
+        let mut reparsed = CoapResponse::new(&req.message).expect("response");
+        reparsed.message = coap_lite::Packet::from_bytes(&bytes).expect("from_bytes");
+        assert_eq!(parse_response(&reparsed).content_format, 59);
+    }
+
     #[test]
     fn request_round_trips_method_path_headers_body() {
         let wire = WireRequest {
@@ -222,6 +307,7 @@ mod tests {
                 ("content-length".to_owned(), b"99".to_vec()),
             ],
             body: vec![0xA1, 0x01, 0x02], // arbitrary CBOR-ish bytes
+            ..Default::default()
         };
         let coap = build_request(&wire);
         // Serialize + reparse through the packet to prove it survives the wire.
@@ -266,6 +352,7 @@ mod tests {
             path: "/_matrix/federation/v1/send/txn1".to_owned(),
             headers: vec![("authorization".to_owned(), auth_value.to_vec())],
             body: vec![],
+            ..Default::default()
         }
     }
 
@@ -366,6 +453,7 @@ mod tests {
             // would be (correctly) dropped, so use one that must survive.
             headers: vec![("x-matrix-test".to_owned(), b"v".to_vec())],
             body: vec![0xFF, 0x00],
+            ..Default::default()
         };
         write_response(&mut resp, &wire);
 
@@ -410,6 +498,7 @@ mod tests {
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![],
                 body: vec![],
+                ..Default::default()
             };
             let coap = build_request(&wire);
             let bytes = coap.message.to_bytes().expect("to_bytes");

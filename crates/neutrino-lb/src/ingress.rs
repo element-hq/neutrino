@@ -70,6 +70,7 @@ impl IngressHandler {
             status: 502,
             headers: vec![],
             body: vec![],
+            ..Default::default()
         }
     }
 }
@@ -102,6 +103,7 @@ impl WireHandler for IngressHandler {
                 status: 404,
                 headers: vec![],
                 body: vec![],
+                ..Default::default()
             };
         }
         let mut rb = self.http.request(req.method, parsed);
@@ -146,6 +148,7 @@ impl WireHandler for IngressHandler {
                 status,
                 headers,
                 body: cbor_body,
+                ..Default::default()
             },
             // A non-2xx with a non-JSON body (e.g. a framework error page) must
             // keep its status so the originating server's 4xx-give-up /
@@ -161,6 +164,7 @@ impl WireHandler for IngressHandler {
                     status,
                     headers,
                     body: vec![],
+                    ..Default::default()
                 }
             }
         }
@@ -210,6 +214,7 @@ mod tests {
                 path: "/_matrix/federation/v1/send/1".to_owned(),
                 headers: vec![],
                 body: cbor_in,
+                ..Default::default()
             })
             .await;
 
@@ -247,6 +252,7 @@ mod tests {
                 path: "/_matrix/federation/v1/backfill/!r".to_owned(),
                 headers: vec![],
                 body: vec![],
+                ..Default::default()
             })
             .await;
 
@@ -278,6 +284,7 @@ mod tests {
                 path: "/_matrix/federation/v1/make_join/!r/@u".to_owned(),
                 headers: vec![],
                 body: vec![],
+                ..Default::default()
             })
             .await;
 
@@ -302,6 +309,7 @@ mod tests {
                 path: "/_matrix/federation/v1/backfill/!r".to_owned(),
                 headers: vec![],
                 body: vec![],
+                ..Default::default()
             })
             .await;
 
@@ -334,6 +342,7 @@ mod tests {
                 path: "/_matrix/client/v3/createRoom".to_owned(),
                 headers: vec![],
                 body: vec![],
+                ..Default::default()
             })
             .await;
 
@@ -368,6 +377,7 @@ mod tests {
                 path: "/_matrix/federation/v1/../../client/v3/createRoom".to_owned(),
                 headers: vec![],
                 body: vec![],
+                ..Default::default()
             })
             .await;
 
@@ -399,6 +409,7 @@ mod tests {
             path: "/_matrix/federation/v2/invite/!r/$e".to_owned(),
             headers: vec![],
             body: json_to_cbor(br#"{"room_version":"org.matrix.msc4242.12"}"#).unwrap(),
+            ..Default::default()
         };
 
         // Matching family (v4) → reaches the v4-bound homeserver.

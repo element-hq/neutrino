@@ -102,6 +102,7 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
             path,
             headers,
             body: cbor_body,
+            ..Default::default()
         })
         .await
     {
@@ -207,6 +208,7 @@ mod tests {
                 status: 200,
                 headers: vec![],
                 body,
+                ..Default::default()
             })
         }
     }
@@ -390,6 +392,7 @@ mod tests {
                 status: self.status,
                 headers: vec![],
                 body: self.body.clone(),
+                ..Default::default()
             })
         }
     }
