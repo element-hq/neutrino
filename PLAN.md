@@ -104,7 +104,7 @@ Done:
   gained a defaulted `profile()` returning `LinkProfile { max_datagram }`;
   `build_lb_config` sizes the Q-Block1 block from the MTU
   (`WireKind::coap_qblock_for_mtu`; the default profile reproduces the old
-  hardcoded 512 B). `PcapCaptureLink` delegates `profile()`. The medium's
+  hardcoded 512 B). The medium's
   *trust* declaration moved the same day to `neutrino-main::LinkTrust`
   riding the link factory's result (see the event-signatures decisions
   entry).
@@ -113,19 +113,29 @@ Done:
   + 6 MSC4242 state-DAG keys) plus event-ID
   →raw-32 B packing with a re-encode/fall-back-to-text guard. CoAP path enums were
   already done (`transport::coap::paths`). (MSC3079.)
-- Wireshark pcap tap (`transport::coap::capture::PcapCaptureLink`): a
-  `DatagramLink` decorator that mirrors every datagram both directions into a
-  classic pcap (`LINKTYPE_RAW`, synthetic IPv4/UDP; us=10.0.0.1 / peer=10.0.0.N;
-  ports by CoAP role — server=5683, client=per-node ephemeral, so each exchange is
-  one client↔server conversation Wireshark can reassemble) and delegates untouched.
-  Each block is a full CoAP message, so Wireshark dissects CoAP + reassembles
-  blockwise + decodes CBOR natively (MTU chunking *and* payload, no custom decode).
-  Best-effort background writer; never
-  breaks transport. Runtime-toggleable from the host (`CaptureControl`): the tap
-  always wraps the link but stays inert until armed, so the FFI handle exposes
-  `start_capture(path)` / `stop_capture()` / `is_capturing()` (a Settings toggle).
-  `stop` joins the std-thread writer, so the file is flushed + `adb pull`-ready
-  the moment it returns. ffi-only; not on the shared `Config`.
+- Wireshark pcap tap (`capture`, moved to the HTTP/JSON edges 2026-08-03): the
+  Android stand-in for `tcpdump -i lo`. Both proxy hops are real loopback TCP,
+  so on a desktop tcpdump is strictly better — but a non-rooted Android app
+  cannot capture loopback (no tcpdump, no `CAP_NET_RAW`, VpnService's TUN never
+  sees 127/8), and that is where the toggle is used. Taps the four points where
+  the literal JSON exists: egress request (post body-read) / response (post
+  `cbor_to_json`), ingress request (post `cbor_to_json`) / response (the
+  upstream's bytes). Mirrored, because lb is a server on one leg and a client on
+  the other. Real bytes, not a CBOR re-transcode — a round trip is not
+  byte-identical (`codec::keys`, key order), so re-transcoding would hide codec
+  bugs. Emits HTTP/1.1 over synthetic IPv4/TCP (`LINKTYPE_RAW`; us=10.0.0.1 /
+  peer=10.0.0.N keyed by `server_name`; server port 80 so Wireshark dissects with
+  no "Decode As", the leg told apart by direction; one TCP stream per exchange
+  with SYN/SYN-ACK and MSS segmentation, so bodies have no size ceiling — the
+  old CoAP/UDP tap silently dropped >64 KiB, losing big `send_join`s). Every
+  response path is recorded including the errors. Best-effort background writer;
+  never breaks the proxy. Runtime-toggleable (`CaptureControl` on `LbConfig`,
+  threaded from ffi alongside `Config` since neutrino-ctl is dependency-free):
+  `start_capture(path)` / `stop_capture()` / `is_capturing()`. `stop` joins the
+  std-thread writer, so the file is flushed + `adb pull`-ready the moment it
+  returns. Transport-independent, so it now works on the UDP/LAN build too.
+  Blind by construction to anything below the tap: no CoAP framing, no `LinkCodec`
+  compression (deflate included), no Q-Block, no retransmits.
 
 - Link-owned wire codec seam (`LinkCodec`, 2026-07-28): `DatagramLink` gained
   a defaulted `codec()` (the `profile()` pattern); a medium can rewrite the
@@ -134,8 +144,8 @@ Done:
   CoAP-build (transforms ride every block), `decode_request` post-parse and
   before the origin binding, response pair around Block2. Failure mapping:
   egress errors → Transport (outbox retries); `decode_request` → 400
-  (malformed, upgrade-together mesh); `encode_response` → 500.
-  `PcapCaptureLink` delegates (captures show the encoded wire).
+  (malformed, upgrade-together mesh); `encode_response` → 500. A codec's effect
+  is invisible to the pcap capture, which sits above it at the HTTP/JSON edges.
 
 Deferred follow-ups (write-ups, not done):
 - Wire-size reduction for small MTUs: carry v12 **room** IDs as **raw 32 B**

@@ -25,6 +25,46 @@ pub fn is_forwardable(name: &str) -> bool {
     ALLOWED.contains(&lower.as_str()) || ALLOWED_PREFIXES.iter().any(|p| lower.starts_with(p))
 }
 
+/// Extract the unquoted `origin` auth-param from an `X-Matrix origin="…",…`
+/// Authorization value. `None` if the scheme prefix or `origin` is absent.
+///
+/// Two callers, one parser: the transport-layer identity binding
+/// (`Hub::origin_binding_violation`) and the pcap capture's peer naming, which
+/// is the only peer identity the ingress has — an inbound `WireRequest` carries
+/// no source. Mirrors `neutrino_http::federation::auth`'s parse, kept here so
+/// the Matrix-agnostic transport needn't depend on the http crate; it extracts
+/// the bytes only — the http layer still owns the real auth policy.
+pub fn xmatrix_origin(value: &str) -> Option<&str> {
+    let params = value.strip_prefix("X-Matrix ")?;
+    for part in params.split(',') {
+        let Some((key, val)) = part.split_once('=') else {
+            continue;
+        };
+        if key.trim() == "origin" {
+            return Some(val.trim().trim_matches('"'));
+        }
+    }
+    None
+}
+
+/// The raw `authorization` header value, if the list carries one. Split out
+/// because the transport binding must tell "no header" (defer to the upstream
+/// auth gate) from "header present but unparseable" (hard reject), a
+/// distinction [`claimed_origin`] collapses.
+pub fn authorization(headers: &[(String, Vec<u8>)]) -> Option<&[u8]> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .map(|(_, value)| value.as_slice())
+}
+
+/// The claimed `X-Matrix` origin `server_name` from a header list, if any.
+pub fn claimed_origin(headers: &[(String, Vec<u8>)]) -> Option<&str> {
+    std::str::from_utf8(authorization(headers)?)
+        .ok()
+        .and_then(xmatrix_origin)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

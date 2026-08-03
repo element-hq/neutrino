@@ -2,6 +2,7 @@
 //! between JSON (local side) and CBOR (wire side). See
 //! `docs/superpowers/specs/2026-06-15-neutrino-lb-cbor-proxy-design.md`.
 
+pub mod capture;
 pub mod codec;
 pub mod egress;
 mod error;
@@ -9,8 +10,8 @@ mod headers;
 pub mod ingress;
 pub mod transport;
 
+pub use capture::CaptureControl;
 pub use error::LbError;
-pub use transport::coap::capture::{CaptureControl, PcapCaptureLink};
 pub use transport::coap::datagram::{
     CodecError, DatagramLink, LinkAddr, LinkCodec, LinkPacing, LinkProfile,
 };
@@ -265,6 +266,12 @@ pub struct LbConfig {
     /// path and the resolver's output bytes are the egress `dest` verbatim.
     /// `None` = UDP socket (dev / direct-LAN), the existing behaviour.
     pub link: Option<Arc<dyn DatagramLink>>,
+    /// Runtime-toggleable pcap sink for both proxy halves (see [`capture`]).
+    /// Declared by the embedding host, which keeps a clone to arm/disarm it.
+    /// `None` = no tap at all, not even an inert one. Independent of `link`:
+    /// the capture is taken at the HTTP/JSON edges, so it works on every
+    /// transport.
+    pub capture: Option<Arc<CaptureControl>>,
 }
 
 // Hand-written so `DestinationResolver` needn't be `Debug` just to satisfy a
@@ -279,6 +286,7 @@ impl std::fmt::Debug for LbConfig {
             .field("wire", &self.wire)
             .field("resolver", &self.resolver.as_ref().map(|_| "<configured>"))
             .field("link", &self.link.as_ref().map(|_| "<configured>"))
+            .field("capture", &self.capture.as_ref().map(|_| "<configured>"))
             .finish()
     }
 }
@@ -298,7 +306,13 @@ use crate::transport::{WireClient, WireError, WireServer};
 /// Returns when both halves have wound down. The wire transport (HTTP or CoAP)
 /// is chosen by `config.wire`; egress/ingress are identical across both.
 pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), LbError> {
-    let ingress_handler = Arc::new(IngressHandler::new(config.upstream.clone()));
+    // One sink, both halves: the egress records the local→peer leg and the
+    // ingress the peer→local one, into the same file.
+    let capture = config.capture.clone();
+    let ingress_handler = Arc::new(IngressHandler::new(
+        config.upstream.clone(),
+        capture.clone(),
+    ));
     // Direct dial unless the embedding host injected a tunnel resolver.
     let resolver = config
         .resolver
@@ -309,7 +323,7 @@ pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), 
     // from `config.wire`. Selected purely by injection — `None` keeps the existing
     // UDP socket path 100% intact.
     if let Some(link) = config.link.clone() {
-        return serve_over_link(link, config, ingress_handler, resolver, shutdown).await;
+        return serve_over_link(link, config, ingress_handler, resolver, capture, shutdown).await;
     }
     match config.wire {
         WireKind::Http => {
@@ -321,6 +335,7 @@ pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), 
                 wire_server,
                 ingress_handler,
                 resolver,
+                capture,
                 shutdown,
             )
             .await
@@ -339,6 +354,7 @@ pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), 
                 wire_server,
                 ingress_handler,
                 resolver,
+                capture,
                 shutdown,
             )
             .await
@@ -357,6 +373,7 @@ pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), 
                 wire_server,
                 ingress_handler,
                 resolver,
+                capture,
                 shutdown,
             )
             .await
@@ -376,6 +393,7 @@ async fn serve_over_link(
     config: LbConfig,
     ingress_handler: Arc<IngressHandler>,
     resolver: Arc<dyn DestinationResolver>,
+    capture: Option<Arc<CaptureControl>>,
     shutdown: CancellationToken,
 ) -> Result<(), LbError> {
     let hub = Hub::new(link);
@@ -397,6 +415,7 @@ async fn serve_over_link(
                 wire_server,
                 ingress_handler,
                 resolver,
+                capture,
                 shutdown,
             )
             .await
@@ -414,6 +433,7 @@ async fn serve_over_link(
                 wire_server,
                 ingress_handler,
                 resolver,
+                capture,
                 shutdown,
             )
             .await
@@ -434,9 +454,16 @@ async fn run_pair<S: WireServer>(
     wire_server: S,
     ingress_handler: Arc<IngressHandler>,
     resolver: Arc<dyn DestinationResolver>,
+    capture: Option<Arc<CaptureControl>>,
     shutdown: CancellationToken,
 ) -> Result<(), LbError> {
-    let egress = egress::serve(egress_bind, wire_client, resolver, shutdown.clone());
+    let egress = egress::serve(
+        egress_bind,
+        wire_client,
+        resolver,
+        capture,
+        shutdown.clone(),
+    );
     let ingress = wire_server.serve(ingress_handler, shutdown.clone());
     tokio::select! {
         r = egress => r.map_err(LbError::from),
@@ -565,6 +592,7 @@ mod serve_selection_tests {
             wire,
             resolver: None,
             link: None,
+            capture: None,
         }
     }
 

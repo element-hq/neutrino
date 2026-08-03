@@ -18,16 +18,20 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::capture::{CaptureControl, Leg, record_response};
 use crate::codec::{cbor_to_json, json_to_cbor};
 use crate::headers::is_forwardable;
 use crate::transport::{DestinationResolver, WireClient, WireRequest};
 
-/// Shared egress state: the wire client used to reach peers, and the resolver
-/// that turns a destination `server_name` into the address to dial.
+/// Shared egress state: the wire client used to reach peers, the resolver that
+/// turns a destination `server_name` into the address to dial, and the pcap sink.
 #[derive(Clone)]
 struct EgressState {
     client: Arc<dyn WireClient>,
     resolver: Arc<dyn DestinationResolver>,
+    /// Runtime-toggleable pcap sink, `None` when the host declared no tap. This
+    /// is the local→peer leg of the capture (see [`crate::capture`]).
+    capture: Option<Arc<CaptureControl>>,
 }
 
 /// Bind the egress forward proxy on `bind` and run until `shutdown` fires.
@@ -35,11 +39,14 @@ pub async fn serve(
     bind: SocketAddr,
     client: Arc<dyn WireClient>,
     resolver: Arc<dyn DestinationResolver>,
+    capture: Option<Arc<CaptureControl>>,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
-    let app = Router::new()
-        .fallback(any(proxy))
-        .with_state(EgressState { client, resolver });
+    let app = Router::new().fallback(any(proxy)).with_state(EgressState {
+        client,
+        resolver,
+        capture,
+    });
     let listener = TcpListener::bind(bind).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
@@ -71,7 +78,7 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
         .path_and_query()
         .map(|pq| pq.as_str().to_owned())
         .unwrap_or_else(|| parts.uri.path().to_owned());
-    let headers = parts
+    let headers: Vec<(String, Vec<u8>)> = parts
         .headers
         .iter()
         .map(|(k, v)| (k.as_str().to_owned(), v.as_bytes().to_vec()))
@@ -87,10 +94,25 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
             return error_response(StatusCode::BAD_GATEWAY);
         }
     };
+    // pcap tap, request half: the literal JSON our homeserver emitted, before
+    // any transcode. Recorded before the send, so the gap to the response half
+    // is the true wire RTT. (The two failures above return without a pair —
+    // there is no exchange yet: one has no destination, the other no body.)
+    let exchange = state.capture.as_ref().and_then(|capture| {
+        capture.record_request(
+            Leg::Egress,
+            &authority,
+            parts.method.as_str(),
+            &path,
+            &headers,
+            &json_body,
+        )
+    });
     let cbor_body = match json_to_cbor(&json_body) {
         Ok(b) => b,
         Err(e) => {
             warn!(%e, "egress: JSON request body encode failed");
+            record_response(&state.capture, exchange, 502, &[], b"");
             return error_response(StatusCode::BAD_GATEWAY);
         }
     };
@@ -109,21 +131,39 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
         Ok(r) => r,
         Err(e) => {
             warn!(%e, "egress: wire send failed");
+            record_response(&state.capture, exchange, 502, &[], b"");
             return error_response(StatusCode::BAD_GATEWAY);
         }
     };
     match cbor_to_json(&wire_resp.body) {
-        Ok(json_resp) => build_response(wire_resp.status, &wire_resp.headers, json_resp),
+        Ok(json_resp) => {
+            record_response(
+                &state.capture,
+                exchange,
+                wire_resp.status,
+                &wire_resp.headers,
+                &json_resp,
+            );
+            build_response(wire_resp.status, &wire_resp.headers, json_resp)
+        }
         // A non-2xx whose body we can't decode must keep its status: the
         // homeserver's sender drops a 4xx but retries a 5xx, so masking the
         // real code as a generic 502 would invert that decision. Only a 2xx
         // payload we cannot deliver is a genuine proxy failure.
         Err(e) if (200..300).contains(&wire_resp.status) => {
             warn!(%e, "egress: CBOR response body decode failed");
+            record_response(&state.capture, exchange, 502, &[], b"");
             error_response(StatusCode::BAD_GATEWAY)
         }
         Err(e) => {
             warn!(%e, status = wire_resp.status, "egress: undecodable error body; forwarding status without it");
+            record_response(
+                &state.capture,
+                exchange,
+                wire_resp.status,
+                &wire_resp.headers,
+                b"",
+            );
             build_response(wire_resp.status, &wire_resp.headers, Vec::new())
         }
     }
@@ -225,7 +265,9 @@ mod tests {
         let client_dyn: Arc<dyn WireClient> = client.clone();
         let server_token = token.clone();
         let handle =
-            tokio::spawn(async move { serve(addr, client_dyn, direct(), server_token).await });
+            tokio::spawn(
+                async move { serve(addr, client_dyn, direct(), None, server_token).await },
+            );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Drive the egress as a forward proxy: reqwest in proxy mode emits an
@@ -290,7 +332,9 @@ mod tests {
         let resolver: Arc<dyn DestinationResolver> = Arc::new(RewriteResolver);
         let server_token = token.clone();
         let handle =
-            tokio::spawn(async move { serve(addr, client_dyn, resolver, server_token).await });
+            tokio::spawn(
+                async move { serve(addr, client_dyn, resolver, None, server_token).await },
+            );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         crate::install_crypto_provider();
@@ -333,7 +377,9 @@ mod tests {
         let client_dyn: Arc<dyn WireClient> = client.clone();
         let server_token = token.clone();
         let handle =
-            tokio::spawn(async move { serve(addr, client_dyn, direct(), server_token).await });
+            tokio::spawn(
+                async move { serve(addr, client_dyn, direct(), None, server_token).await },
+            );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         crate::install_crypto_provider();
@@ -415,7 +461,9 @@ mod tests {
         let client_dyn: Arc<dyn WireClient> = client.clone();
         let server_token = token.clone();
         let handle =
-            tokio::spawn(async move { serve(addr, client_dyn, direct(), server_token).await });
+            tokio::spawn(
+                async move { serve(addr, client_dyn, direct(), None, server_token).await },
+            );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Direct (origin-form) request, NOT proxy mode: the request target has
@@ -454,7 +502,9 @@ mod tests {
         let client_dyn: Arc<dyn WireClient> = client.clone();
         let server_token = token.clone();
         let handle =
-            tokio::spawn(async move { serve(addr, client_dyn, direct(), server_token).await });
+            tokio::spawn(
+                async move { serve(addr, client_dyn, direct(), None, server_token).await },
+            );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         crate::install_crypto_provider();
@@ -492,7 +542,9 @@ mod tests {
         let client_dyn: Arc<dyn WireClient> = client.clone();
         let server_token = token.clone();
         let handle =
-            tokio::spawn(async move { serve(addr, client_dyn, direct(), server_token).await });
+            tokio::spawn(
+                async move { serve(addr, client_dyn, direct(), None, server_token).await },
+            );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         crate::install_crypto_provider();

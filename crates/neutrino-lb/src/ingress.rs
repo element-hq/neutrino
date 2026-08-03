@@ -4,13 +4,15 @@
 //! to CBOR. Path/method are never interpreted, so no federation routes are
 //! mirrored.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tracing::warn;
 
+use crate::capture::{CaptureControl, Leg, record_response};
 use crate::codec::{cbor_to_json, json_to_cbor};
-use crate::headers::is_forwardable;
+use crate::headers::{claimed_origin, is_forwardable};
 use crate::transport::{WireHandler, WireRequest, WireResponse};
 
 /// The only path namespace the ingress forwards to the loopback homeserver.
@@ -39,14 +41,27 @@ pub struct IngressHandler {
     http: reqwest::Client,
     /// Base URL of local `neutrino-http`, e.g. `http://127.0.0.1:8008`.
     upstream: String,
+    /// Runtime-toggleable pcap sink, `None` when the host declared no tap. This
+    /// is the peer→local leg of the capture (see [`crate::capture`]).
+    capture: Option<Arc<CaptureControl>>,
 }
 
 impl IngressHandler {
-    pub fn new(upstream: String) -> Self {
-        Self::with_timeouts(upstream, crate::CONNECT_TIMEOUT, crate::REQUEST_TIMEOUT)
+    pub fn new(upstream: String, capture: Option<Arc<CaptureControl>>) -> Self {
+        Self::with_timeouts(
+            upstream,
+            capture,
+            crate::CONNECT_TIMEOUT,
+            crate::REQUEST_TIMEOUT,
+        )
     }
 
-    fn with_timeouts(upstream: String, connect: Duration, request: Duration) -> Self {
+    fn with_timeouts(
+        upstream: String,
+        capture: Option<Arc<CaptureControl>>,
+        connect: Duration,
+        request: Duration,
+    ) -> Self {
         // Bound the loopback hop to `neutrino-http`: a hung upstream must not
         // pin this wire-handler task (and its buffers) indefinitely.
         crate::install_crypto_provider();
@@ -61,7 +76,11 @@ impl IngressHandler {
             // + the timeouts (re-enabling ambient-proxy hijack and the dead-peer
             // request leak these settings exist to prevent).
             .expect("plaintext reqwest client always builds; no TLS backend to init");
-        Self { http, upstream }
+        Self {
+            http,
+            upstream,
+            capture,
+        }
     }
 
     /// `502` with an empty body, used when transcoding or the upstream fails.
@@ -85,6 +104,24 @@ impl WireHandler for IngressHandler {
                 return Self::bad_gateway();
             }
         };
+        // pcap tap, request half: the literal JSON about to be handed upstream.
+        // The peer's `server_name` is the claimed `X-Matrix origin` — an inbound
+        // `WireRequest` carries no source, so this is the only peer identity the
+        // ingress has. (On the datagram transport the claim was already bound to
+        // the link-authenticated node; see `Hub::origin_binding_violation`.)
+        // Recorded before the gates below, so a rejected request is still
+        // visible, and before the upstream call, so the gap to the response half
+        // is the upstream's service time.
+        let exchange = self.capture.as_ref().and_then(|capture| {
+            capture.record_request(
+                Leg::Ingress,
+                claimed_origin(&req.headers).unwrap_or("unknown"),
+                req.method.as_str(),
+                &req.path,
+                &req.headers,
+                &json_body,
+            )
+        });
         let url = format!("{}{}", self.upstream, req.path);
         // Parse first, then gate on the *normalized* path: a raw `starts_with`
         // is bypassable by `..` / percent-encoded-dot traversal (e.g.
@@ -94,11 +131,13 @@ impl WireHandler for IngressHandler {
             Ok(u) => u,
             Err(e) => {
                 warn!(%e, "ingress: upstream URL parse failed");
+                record_response(&self.capture, exchange, 502, &[], b"");
                 return Self::bad_gateway();
             }
         };
         if !parsed.path().starts_with(FEDERATION_PREFIX) {
             warn!(path = %parsed.path(), "ingress: rejecting non-federation path");
+            record_response(&self.capture, exchange, 404, &[], b"");
             return WireResponse {
                 status: 404,
                 headers: vec![],
@@ -123,6 +162,7 @@ impl WireHandler for IngressHandler {
                 // 111)" — the IPv4/IPv6 loopback mismatch) lives in the source
                 // chain, so log that too or the failure is undiagnosable.
                 warn!(%e, cause = %source_chain(&e), "ingress: upstream request failed");
+                record_response(&self.capture, exchange, 502, &[], b"");
                 return Self::bad_gateway();
             }
         };
@@ -131,7 +171,7 @@ impl WireHandler for IngressHandler {
         // ones — content-length/-type, etc. — are dropped per hop by the
         // downstream `is_forwardable` filter). Collected before the body is
         // consumed, mirroring `HttpWireClient::send`.
-        let headers = resp
+        let headers: Vec<(String, Vec<u8>)> = resp
             .headers()
             .iter()
             .map(|(k, v)| (k.as_str().to_owned(), v.as_bytes().to_vec()))
@@ -140,9 +180,15 @@ impl WireHandler for IngressHandler {
             Ok(b) => b.to_vec(),
             Err(e) => {
                 warn!(%e, "ingress: reading upstream response failed");
+                record_response(&self.capture, exchange, 502, &[], b"");
                 return Self::bad_gateway();
             }
         };
+        // pcap tap, response half: the upstream's literal JSON, before the
+        // transcode. Recorded on the non-JSON path too — what the homeserver
+        // actually returned (a framework error page, say) is the whole
+        // diagnostic there, even though it is not forwarded over the wire.
+        record_response(&self.capture, exchange, status, &headers, &resp_bytes);
         match json_to_cbor(&resp_bytes) {
             Ok(cbor_body) => WireResponse {
                 status,
@@ -205,7 +251,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let handler = IngressHandler::new(format!("http://{addr}"));
+        let handler = IngressHandler::new(format!("http://{addr}"), None);
         let cbor_in = json_to_cbor(br#"{"hello":"world"}"#).unwrap();
         let resp = handler
             .handle(WireRequest {
@@ -243,7 +289,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let handler = IngressHandler::new(format!("http://{addr}"));
+        let handler = IngressHandler::new(format!("http://{addr}"), None);
         let resp = handler
             .handle(WireRequest {
                 dest: String::new(),
@@ -276,7 +322,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let handler = IngressHandler::new(format!("http://{addr}"));
+        let handler = IngressHandler::new(format!("http://{addr}"), None);
         let resp = handler
             .handle(WireRequest {
                 dest: String::new(),
@@ -300,7 +346,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let handler = IngressHandler::new(format!("http://{addr}"));
+        let handler = IngressHandler::new(format!("http://{addr}"), None);
         let resp = handler
             .handle(WireRequest {
                 dest: String::new(),
@@ -334,7 +380,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let handler = IngressHandler::new(format!("http://{addr}"));
+        let handler = IngressHandler::new(format!("http://{addr}"), None);
         let resp = handler
             .handle(WireRequest {
                 dest: String::new(),
@@ -368,7 +414,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let handler = IngressHandler::new(format!("http://{addr}"));
+        let handler = IngressHandler::new(format!("http://{addr}"), None);
         let resp = handler
             .handle(WireRequest {
                 dest: String::new(),
@@ -413,7 +459,7 @@ mod tests {
         };
 
         // Matching family (v4) → reaches the v4-bound homeserver.
-        let matched = IngressHandler::new(format!("http://127.0.0.1:{port}"))
+        let matched = IngressHandler::new(format!("http://127.0.0.1:{port}"), None)
             .handle(invite())
             .await;
         assert_eq!(
@@ -423,7 +469,7 @@ mod tests {
 
         // Other family (v6) — the address `localhost` can resolve to — has no
         // listener, so the loopback connect fails and the ingress 502s.
-        let mismatched = IngressHandler::new(format!("http://[::1]:{port}"))
+        let mismatched = IngressHandler::new(format!("http://[::1]:{port}"), None)
             .handle(invite())
             .await;
         assert_eq!(

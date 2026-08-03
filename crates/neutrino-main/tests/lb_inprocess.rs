@@ -59,7 +59,7 @@ async fn start_node(localpart: &str) -> Node {
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        let _ = neutrino_main::entrypoint(config, cmd_rx, None, None, None).await;
+        let _ = neutrino_main::entrypoint(config, cmd_rx, None, None, None, None).await;
     });
 
     Node {
@@ -185,7 +185,7 @@ async fn entrypoint_tears_down_sidecar_when_homeserver_stops() {
     // `entrypoint`'s error is `Box<dyn Error>` (not `Send`), so map it to a
     // `String` inside the task to keep the `JoinHandle` output `Send`.
     let handle = tokio::spawn(async move {
-        neutrino_main::entrypoint(config, cmd_rx, None, None, None)
+        neutrino_main::entrypoint(config, cmd_rx, None, None, None, None)
             .await
             .map_err(|e| e.to_string())
     });
@@ -241,7 +241,7 @@ async fn embedded_config_with_handoff_comes_up_and_publishes_identity() {
     let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (handoff_tx, handoff_rx) = watch::channel(None);
     let handle = tokio::spawn(async move {
-        neutrino_main::entrypoint(config, cmd_rx, Some(handoff_tx), None, None)
+        neutrino_main::entrypoint(config, cmd_rx, Some(handoff_tx), None, None, None)
             .await
             .map_err(|e| e.to_string())
     });
@@ -295,7 +295,7 @@ async fn entrypoint_surfaces_a_sidecar_bind_failure() {
 
     let res = tokio::time::timeout(
         Duration::from_secs(5),
-        neutrino_main::entrypoint(config, cmd_rx, None, None, None),
+        neutrino_main::entrypoint(config, cmd_rx, None, None, None, None),
     )
     .await
     .expect("entrypoint did not return after the sidecar failed to bind");
