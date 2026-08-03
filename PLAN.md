@@ -227,6 +227,7 @@ Intentional gaps in the sliding-sync implementation — see `MSC4186-gaps.md`:
 - inbound `/get_missing_events` deterministic ordering: the spec wants min-hops + lexicographic, we sort by `origin_server_ts`; the responder also stops at `limit` rather than continuing to the create event (the multi-round requester compensates functionally)
 - large state-DAG handling: `send_join` / `send_leave` serialize the whole state DAG into one response and state-res holds it in memory — streaming JSON is a future option if rooms get large
 - anti-entropy advertisement coalescing: the joined-set-growth advertisement (MSC anti-entropy-extension) drains all of a destination's owed rooms in one transaction, but the MSC's optional ~30s debounce window — coalescing triggers that arrive moments apart into a single send — is not implemented; each trigger that finds the link quiet advertises promptly. Deferred (MAY).
+- the per-PDU `error` map in a `/send` response is ignored, so a PDU the peer 200s but fails to stage (a peer-side storage fault — staging itself is unbounded, there is no cap) is dropped from our outbox and lost. Reading that map and re-enqueueing an advertisement obligation for the affected room would restore the heal; the extremity omission narrowed the accidental cover this used to get.
 
 ### Code-quality follow-ons (noted, not blocking)
 

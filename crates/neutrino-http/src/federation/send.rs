@@ -174,6 +174,11 @@ pub(crate) async fn handle(
     let mut pdus = BTreeMap::new();
     let mut seen: HashSet<OwnedEventId> = HashSet::new();
     let mut touched: BTreeSet<OwnedRoomId> = BTreeSet::new();
+    // Event ids this transaction proves its sender already holds, so the response
+    // advertisement below can leave them off the wire (see
+    // `reconcile::strip_known`). Accumulated as we parse: no second pass, and no
+    // re-derivation of the parent lists.
+    let mut sender_holds: BTreeSet<OwnedEventId> = BTreeSet::new();
     // Stays true only if every keyable PDU was durably staged. A storage fault
     // on any one keeps the txn *unrecorded* so the peer's resend re-stages it
     // (never-lose). An unkeyable/malformed PDU is an intentional drop, not a
@@ -202,6 +207,16 @@ pub(crate) async fn handle(
             }
             Err(_) => continue,
         };
+        // The sender holds this event (it sent it) and its state-DAG parents (it
+        // could not have applied the event without grounding them). Its *timeline*
+        // parents only if it authored the event: a relayed PDU may reference
+        // `prev_events` the relaying server never fetched and does not hold, and a
+        // missing timeline parent is never gap-filled.
+        sender_holds.insert(event.event_id.clone());
+        sender_holds.extend(event.prev_state_events.iter().cloned());
+        if event.sender.server_name() == &*body.origin {
+            sender_holds.extend(event.prev_events.iter().cloned());
+        }
         if !seen.insert(event.event_id.clone()) {
             continue;
         }
@@ -247,17 +262,22 @@ pub(crate) async fn handle(
 
     // Anti-entropy. Advertise our own forward extremities back to the sender (so
     // it can reconcile against us from this response), for every room it
-    // advertised plus every room this transaction touched.
+    // advertised plus every room this transaction touched — minus the heads the
+    // transaction itself proves the sender already holds, which is commonly all of
+    // them (our heads are still the pre-batch ones, i.e. exactly what its PDUs
+    // reference, since staging is asynchronous). An empty-`pdus` advertisement
+    // strips nothing, so a peer asking to be reconciled always gets our heads.
     let advertised = body.forward_extremities;
     let mut resp_rooms: BTreeSet<OwnedRoomId> = touched;
     resp_rooms.extend(advertised.keys().cloned());
-    let mut forward_extremities = BTreeMap::new();
+    let mut ours = BTreeMap::new();
     for room in &resp_rooms {
         let fes = reconcile::local_extremities(&*store, room).await;
         if !fes.is_empty() {
-            forward_extremities.insert(room.clone(), fes);
+            ours.insert(room.clone(), fes);
         }
     }
+    let forward_extremities = reconcile::strip_known(&ours, &sender_holds);
 
     // Reconcile our view against the heads the sender advertised: fire-and-forget
     // so the 200 isn't blocked on peer round-trips. Each task fetches any

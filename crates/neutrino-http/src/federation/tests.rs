@@ -2648,6 +2648,128 @@ async fn reconcile_ignores_advertisement_from_non_member_peer() {
     );
 }
 
+/// Build a message PDU whose two parent lists differ — `prev_events` on the
+/// timeline head, `prev_state_events` on the state-DAG head. This is the shape of
+/// every real message once a room has any timeline history (only the first message
+/// after a state event has them equal, which is all [`message_on`] can express).
+fn message_on_split(
+    sender: &OwnedUserId,
+    room_id: &OwnedRoomId,
+    prev: &OwnedEventId,
+    prev_state: &OwnedEventId,
+    body: &str,
+    ts: u64,
+) -> neutrino_event::Event {
+    EventBuilder::new(sender.clone(), "m.room.message".to_owned())
+        .room_id(room_id.clone())
+        .content(json!({ "msgtype": "m.text", "body": body }))
+        .prev_events(vec![prev.clone()])
+        .prev_state_events(vec![prev_state.clone()])
+        .origin_server_ts(ts)
+        .build()
+        .expect("build message")
+}
+
+#[tokio::test]
+async fn send_response_omits_extremities_the_sender_already_holds() {
+    // Byte thrift, response side. Staging is asynchronous, so at response time our
+    // heads are still the pre-transaction ones — which for a converged room are
+    // exactly what the incoming PDU references. Advertising them back would tell
+    // the sender only about events it authored or built on, so the field is
+    // omitted entirely.
+    // A room we share with the peer: alice's join, then zara's (zara is on
+    // TEST_PEER, the origin `drive` injects). Zara's join is the head of both DAGs.
+    let (app, store, room_id, join_id, _tmp) = seed_room(&[
+        (
+            ALICE,
+            "m.room.member",
+            ALICE,
+            json!({ "membership": "join" }),
+        ),
+        (ZARA, "m.room.member", ZARA, json!({ "membership": "join" })),
+    ])
+    .await;
+    let peer: OwnedUserId = ZARA.parse().expect("zara");
+
+    // First transaction moves our timeline head to `first` (the state head stays
+    // the join — a message never advances the state DAG).
+    let first = message_on(&peer, &room_id, &join_id, "first", 1_700_000_001_000);
+    let (status, _) = put_json(&app, &send_path("t1"), &txn(&[&first])).await;
+    assert_eq!(status, StatusCode::OK);
+    wait_timeline_head(&store, &room_id, first.event_id.as_ref()).await;
+
+    // Second transaction: the peer's own next message, sitting on both our heads.
+    let second = message_on_split(
+        &peer,
+        &room_id,
+        &first.event_id,
+        &join_id,
+        "second",
+        1_700_000_002_000,
+    );
+    let (status, resp) = put_json(&app, &send_path("t2"), &txn(&[&second])).await;
+    assert_eq!(status, StatusCode::OK, "body = {resp}");
+    assert!(
+        resp.get("forward_extremities").is_none(),
+        "both our heads are covered by the sender's own PDU, so the whole field \
+         must be omitted: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn send_response_keeps_a_timeline_head_a_relayed_pdu_may_not_hold() {
+    // The `prev_events` half of the response filter is conditional on authorship:
+    // a server that merely *relays* a PDU may never have fetched that PDU's
+    // timeline parents (they are not needed to auth it, and a missing timeline
+    // parent is never gap-filled). So for a relayed PDU our timeline head must
+    // still be advertised, while the state head — which the relaying server
+    // provably holds, having applied the event — is still stripped.
+    // A room we share with the peer: alice's join, then zara's (zara is on
+    // TEST_PEER, the origin `drive` injects). Zara's join is the head of both DAGs.
+    let (app, store, room_id, join_id, _tmp) = seed_room(&[
+        (
+            ALICE,
+            "m.room.member",
+            ALICE,
+            json!({ "membership": "join" }),
+        ),
+        (ZARA, "m.room.member", ZARA, json!({ "membership": "join" })),
+    ])
+    .await;
+    let peer: OwnedUserId = ZARA.parse().expect("zara");
+
+    let first = message_on(&peer, &room_id, &join_id, "first", 1_700_000_001_000);
+    let (status, _) = put_json(&app, &send_path("t1"), &txn(&[&first])).await;
+    assert_eq!(status, StatusCode::OK);
+    wait_timeline_head(&store, &room_id, first.event_id.as_ref()).await;
+
+    // Same shape as the test above, but authored on a third server — TEST_PEER is
+    // relaying it, so its `prev_events` prove nothing about what TEST_PEER holds.
+    let relayed_author: OwnedUserId = "@carol:third.example".parse().unwrap();
+    let relayed = message_on_split(
+        &relayed_author,
+        &room_id,
+        &first.event_id,
+        &join_id,
+        "relayed",
+        1_700_000_002_000,
+    );
+    let (status, resp) = put_json(&app, &send_path("t2"), &txn(&[&relayed])).await;
+    assert_eq!(status, StatusCode::OK, "body = {resp}");
+    let advert = &resp["forward_extremities"][room_id.as_str()];
+    assert_eq!(
+        advert["timeline"],
+        json!([first.event_id.as_str()]),
+        "a relayed PDU's `prev_events` cannot strip our timeline head: {resp}"
+    );
+    assert_eq!(
+        advert["state"],
+        json!([]),
+        "the state head is still stripped — the relaying server applied the PDU, \
+         so it holds the state-DAG parents: {resp}"
+    );
+}
+
 #[tokio::test]
 async fn backfill_rejects_non_member_origin() {
     // The backfill consumer uses the same `server_in_room` gate (separate handler).
