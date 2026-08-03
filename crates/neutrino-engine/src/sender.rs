@@ -52,7 +52,7 @@ use std::time::Duration;
 use neutrino_store::{StorageBackend, StreamPos};
 #[cfg(test)]
 use neutrino_store_sqlite::SqliteStore;
-use ruma::{EventId, OwnedRoomId, OwnedServerName, RoomId, ServerName};
+use ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomId, ServerName};
 use serde_json::value::RawValue as RawJsonValue;
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -374,6 +374,20 @@ async fn send_transaction_with_retry<S: StorageBackend + 'static>(
     }
 }
 
+/// The event ids a transaction carrying `batch` tells its peer about by itself:
+/// each event in it, plus the `prev_state_events` those events force the peer to
+/// gap-fill in order to auth them. Fed to [`reconcile::strip_known`] so heads the
+/// peer will hold anyway are left off the wire; see that function for why
+/// `prev_events` is excluded.
+fn covered_by(batch: &[neutrino_event::Event]) -> BTreeSet<OwnedEventId> {
+    batch
+        .iter()
+        .flat_map(|e| {
+            std::iter::once(e.event_id.clone()).chain(e.prev_state_events.iter().cloned())
+        })
+        .collect()
+}
+
 /// Deliver one outbox batch to `dest`: a transaction carrying the batch's PDUs
 /// and our forward extremities. On a 2xx the batch is removed from the outbox
 /// and — because the transaction carried our heads — any standing advertisement
@@ -391,8 +405,8 @@ async fn deliver_batch<S: StorageBackend + 'static>(
     let pdus: Vec<Box<RawJsonValue>> = batch.iter().map(|e| e.raw.clone()).collect();
     let ids: Vec<&EventId> = batch.iter().map(|e| &*e.event_id).collect();
 
-    // Advertise our forward extremities for every room in the batch so the peer
-    // reconciles against us. Computed once (reused across retries — it's a hint).
+    // Our forward extremities for every room in the batch, so the peer can
+    // reconcile against us. Computed once (reused across retries — it's a hint).
     let mut our_fes: BTreeMap<OwnedRoomId, ForwardExtremities> = BTreeMap::new();
     let rooms: BTreeSet<OwnedRoomId> = batch.iter().map(|e| e.room_id.clone()).collect();
     for room in &rooms {
@@ -401,10 +415,18 @@ async fn deliver_batch<S: StorageBackend + 'static>(
             our_fes.insert(room.clone(), fes);
         }
     }
+    // What actually goes on the wire is only the part this transaction doesn't
+    // already tell the peer — commonly nothing at all (a message sits on our own
+    // head, so the peer derives the identical head-sets by applying the PDUs), in
+    // which case the field is omitted outright. `our_fes` stays whole below: it is
+    // the obligation ledger, not the advertisement. The two are different facts —
+    // the peer ends up *holding* a stripped head, which discharges the duty to
+    // advertise it more strongly than telling it the id would.
+    let advert = reconcile::strip_known(&our_fes, &covered_by(batch));
 
     let txn_id = ctx.idgen.next_id();
     loop {
-        match send_transaction_with_retry(ctx, dest, &txn_id, &pdus, &our_fes, backoff, kick_rx)
+        match send_transaction_with_retry(ctx, dest, &txn_id, &pdus, &advert, backoff, kick_rx)
             .await
         {
             SendOutcome::Shutdown => return false,
@@ -791,6 +813,57 @@ mod tests {
             .unwrap();
     }
 
+    /// Build a message on the room's heads exactly as `RoomCore::build_local_event`
+    /// would: `prev_events` = the timeline heads, `prev_state_events` = the state
+    /// heads. Nothing is persisted — the caller commits it (and decides the
+    /// resulting head-set), so two of these built from one snapshot are genuine
+    /// concurrent siblings.
+    ///
+    /// `ts` is what makes two such siblings distinct events: the reference hash is
+    /// taken over the *redacted* event, and redaction strips a message's `content`
+    /// entirely, so two messages agreeing on metadata share one event id however
+    /// much their bodies differ.
+    async fn message_on_heads(
+        store: &SqliteStore,
+        room: &RoomId,
+        body: &str,
+        ts: u64,
+    ) -> neutrino_event::Event {
+        use neutrino_store::RoomStore;
+        let alice: OwnedUserId = "@alice:local.test".parse().unwrap();
+        let (timeline, state) = store.forward_extremities(room).await.unwrap().unwrap();
+        EventBuilder::new(alice, "m.room.message".to_owned())
+            .room_id(room.to_owned())
+            .content(json!({ "msgtype": "m.text", "body": body }))
+            .prev_events(timeline.iter().cloned().collect())
+            .prev_state_events(state.iter().cloned().collect())
+            .origin_server_ts(ts)
+            .build()
+            .unwrap()
+    }
+
+    /// Commit `event` with `heads` as the room's timeline head-set (state heads
+    /// unchanged), enqueued for `dests`. The explicit head-set is what lets a test
+    /// model a fork: commit two siblings and name both as heads.
+    async fn commit_with_heads(
+        store: &SqliteStore,
+        event: &neutrino_event::Event,
+        heads: &[OwnedEventId],
+        dests: &[&ServerName],
+    ) {
+        use neutrino_store::RoomStore;
+        let (_, state) = store
+            .forward_extremities(&event.room_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let timeline: BTreeSet<OwnedEventId> = heads.iter().cloned().collect();
+        store
+            .persist_resolved_event(event, &timeline, &state, &BTreeMap::new(), dests, &[])
+            .await
+            .unwrap();
+    }
+
     /// Poll until `dest` has no pending advertisement obligation, or panic ~10s.
     async fn wait_adv_drained(store: &SqliteStore, dest: &ServerName) {
         for _ in 0..500 {
@@ -1121,6 +1194,95 @@ mod tests {
             accepted[0].len(),
             1,
             "the batch carried the one pending PDU"
+        );
+    }
+
+    // Byte thrift, common case: a batch that already tells the peer our heads (the
+    // message IS our timeline head, and its `prev_state_events` ARE our state
+    // heads) carries no `forward_extremities` at all — the peer derives the
+    // identical head-sets by applying the PDU. The standing obligation is still
+    // discharged: the peer ends up holding those heads, which is stronger than
+    // being told their ids, so no second (empty-`pdus`) advertisement is sent.
+    #[tokio::test]
+    async fn omits_forward_extremities_the_batch_already_covers() {
+        let stub = Arc::new(Stub::default());
+        let dest = peer();
+        let (store, _tmp, room, _ids) = store_with_outbox(&dest, 0).await;
+        // Obligation first, so the event below lands on top of it and its head
+        // stops being an extremity — otherwise the batch wouldn't cover our heads.
+        enqueue_advertisement(&store, &room, &dest).await;
+        let msg = message_on_heads(&store, &room, "on-our-head", 1_700_000_000_456).await;
+        commit_with_heads(&store, &msg, std::slice::from_ref(&msg.event_id), &[&dest]).await;
+
+        let ctx = test_ctx(store.clone(), stub.clone());
+        let batch = store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await.unwrap();
+        let mut backoff = BACKOFF_BASE;
+        let mut kick_rx = test_backoff();
+        assert!(deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await);
+
+        // Checked before the stub locks are taken, so no guard is held across it.
+        assert!(
+            store
+                .pending_advertisements(&dest)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a covering batch still discharges the obligation, filtered or not"
+        );
+
+        let accepted = stub.accepted.lock().unwrap();
+        assert_eq!(accepted.len(), 1, "one transaction");
+        assert_eq!(accepted[0].len(), 1, "carrying the one pending PDU");
+        let fes = stub.fes.lock().unwrap();
+        assert_eq!(
+            fes[0],
+            json!({}),
+            "every head is covered by the batch, so nothing is advertised: {:?}",
+            fes[0]
+        );
+    }
+
+    // The flip side: a concurrent extremity the batch does NOT carry is exactly
+    // what the advertisement exists for, so it survives — while the covered heads
+    // beside it are stripped.
+    #[tokio::test]
+    async fn advertises_only_the_heads_the_batch_leaves_out() {
+        let stub = Arc::new(Stub::default());
+        let dest = peer();
+        let (store, _tmp, room, _ids) = store_with_outbox(&dest, 0).await;
+        // Two siblings built from the same snapshot — neither references the other,
+        // so both are genuine concurrent extremities. Only `msg` is enqueued for
+        // `dest`, so `fork` is a head this batch cannot tell `dest` about.
+        let elsewhere: OwnedServerName = "other.test".parse().unwrap();
+        let fork = message_on_heads(&store, &room, "concurrent-fork", 1_700_000_000_456).await;
+        let msg = message_on_heads(&store, &room, "on-our-head", 1_700_000_000_789).await;
+        let heads = [msg.event_id.clone(), fork.event_id.clone()];
+        commit_with_heads(&store, &fork, &heads, &[&elsewhere]).await;
+        commit_with_heads(&store, &msg, &heads, &[&dest]).await;
+
+        let ctx = test_ctx(store.clone(), stub.clone());
+        let batch = store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await.unwrap();
+        let mut backoff = BACKOFF_BASE;
+        let mut kick_rx = test_backoff();
+        assert!(deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await);
+
+        assert_eq!(
+            batch.iter().map(|e| e.event_id.clone()).collect::<Vec<_>>(),
+            vec![msg.event_id.clone()],
+            "the batch carries only our own event, not the fork"
+        );
+        let fes = stub.fes.lock().unwrap();
+        assert_eq!(
+            fes[0][room.as_str()]["timeline"],
+            json!([fork.event_id.as_str()]),
+            "the uncovered fork head is advertised, the batch's own head is not: {:?}",
+            fes[0]
+        );
+        assert_eq!(
+            fes[0][room.as_str()]["state"],
+            json!([]),
+            "state heads are all covered by the PDU's prev_state_events: {:?}",
+            fes[0]
         );
     }
 

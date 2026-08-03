@@ -16,7 +16,7 @@
 //! one fetch. Reconciliation only ever *adds work to that pipeline*; it grants no
 //! trust — a fetched event is auth-checked and state-resolved like any other PDU.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use neutrino_event::EventSecurity;
 use neutrino_store::{StateStore, StorageBackend};
@@ -69,6 +69,52 @@ pub async fn local_extremities(
         },
         _ => ForwardExtremities::default(),
     }
+}
+
+/// The advertisement left after dropping every head `known` already covers, and
+/// every room thereby left with nothing to say (so the wire field can be omitted
+/// outright). An advertisement's only effect is to make the peer *fetch* a head
+/// it lacks (see [`reconcile_room`]), so a head the peer is certain to end up
+/// holding needs no advertisement at all.
+///
+/// The caller owns that certainty by choosing `known` — the safety argument is
+/// per-call-site, this is only the set difference. Both call sites derive `known`
+/// from one transaction's PDUs, but they are answering different questions and so
+/// admit different parents:
+///
+/// - **Outbound (`sender::deliver_batch`)** — "what will the *recipient* hold?"
+///   Its own event ids (the peer stages them from this very transaction) plus
+///   their `prev_state_events` (it must gap-fill those to auth them — see
+///   [`crate::gapfill`]). NOT `prev_events`: a missing *timeline* parent is never
+///   fetched, so omitting one would lose it. Costs nothing — a parent listed in
+///   `prev_events` has by definition been dropped from our head-set, so it is
+///   never a head we would advertise anyway.
+/// - **Inbound response (`/send`)** — "what does the transaction's *author*
+///   hold?" Its own event ids (it sent them) plus their `prev_state_events` (to
+///   have sent an event it must have applied it, and applying requires a grounded
+///   state DAG). `prev_events` too, but only for a PDU the author actually
+///   authored — one it merely relayed may reference timeline parents it never
+///   fetched and does not hold.
+pub fn strip_known(
+    fes: &BTreeMap<OwnedRoomId, ForwardExtremities>,
+    known: &BTreeSet<OwnedEventId>,
+) -> BTreeMap<OwnedRoomId, ForwardExtremities> {
+    let keep = |heads: &[OwnedEventId]| -> Vec<OwnedEventId> {
+        heads
+            .iter()
+            .filter(|h| !known.contains(*h))
+            .cloned()
+            .collect()
+    };
+    fes.iter()
+        .filter_map(|(room, heads)| {
+            let kept = ForwardExtremities {
+                timeline: keep(&heads.timeline),
+                state: keep(&heads.state),
+            };
+            (!kept.is_empty()).then(|| (room.clone(), kept))
+        })
+        .collect()
 }
 
 /// Reconcile our view of `room_id` against `advertised`: fetch any advertised
@@ -263,4 +309,78 @@ async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
         }
     }
     staged_new
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ruma::{OwnedRoomId, RoomId};
+
+    /// A distinct well-formed v12 event id (`$` + 43 url-safe base64 chars).
+    fn id(seed: char) -> OwnedEventId {
+        OwnedEventId::try_from(format!("${}", seed.to_string().repeat(43))).unwrap()
+    }
+
+    fn room() -> OwnedRoomId {
+        RoomId::parse(format!("!{}", "R".repeat(43))).unwrap()
+    }
+
+    fn fes(timeline: &[OwnedEventId], state: &[OwnedEventId]) -> ForwardExtremities {
+        ForwardExtremities {
+            timeline: timeline.to_vec(),
+            state: state.to_vec(),
+        }
+    }
+
+    // The common outbound case: both head-sets are covered by the transaction, so
+    // the room drops out of the advertisement entirely and the wire field can be
+    // omitted. (A `/send` batch passes its own event ids plus their
+    // `prev_state_events`, which is exactly `A`/`B` here.)
+    #[test]
+    fn drops_a_room_whose_every_head_is_covered() {
+        let advert = BTreeMap::from([(room(), fes(&[id('A')], &[id('B')]))]);
+        let known = BTreeSet::from([id('A'), id('B')]);
+        assert!(strip_known(&advert, &known).is_empty());
+    }
+
+    // A concurrent extremity the batch does not carry is the whole point of the
+    // advertisement: it survives, while the covered head next to it is stripped.
+    #[test]
+    fn keeps_heads_the_transaction_does_not_cover() {
+        let advert = BTreeMap::from([(room(), fes(&[id('A'), id('C')], &[id('B'), id('D')]))]);
+        let known = BTreeSet::from([id('A'), id('B')]);
+
+        let stripped = strip_known(&advert, &known);
+        let kept = stripped
+            .get(&room())
+            .expect("room still has heads to advertise");
+        assert_eq!(kept.timeline, vec![id('C')]);
+        assert_eq!(kept.state, vec![id('D')]);
+    }
+
+    // A half emptying does not drop the room while the other half still carries a
+    // head — the wire shape keeps an empty list rather than losing `D`.
+    #[test]
+    fn keeps_a_room_when_only_one_half_empties() {
+        let advert = BTreeMap::from([(room(), fes(&[id('A')], &[id('D')]))]);
+        let known = BTreeSet::from([id('A')]);
+
+        let stripped = strip_known(&advert, &known);
+        let kept = stripped.get(&room()).expect("state head keeps the room in");
+        assert!(kept.timeline.is_empty());
+        assert_eq!(kept.state, vec![id('D')]);
+    }
+
+    // An empty `known` set is the pre-optimisation behaviour: advertise everything.
+    #[test]
+    fn empty_known_set_strips_nothing() {
+        let advert = BTreeMap::from([(room(), fes(&[id('A')], &[id('B')]))]);
+        assert_eq!(
+            strip_known(&advert, &BTreeSet::new())
+                .get(&room())
+                .unwrap()
+                .timeline,
+            vec![id('A')]
+        );
+    }
 }

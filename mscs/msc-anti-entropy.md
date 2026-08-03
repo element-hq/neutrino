@@ -56,7 +56,8 @@ introduced and no existing field changes meaning.
 **Request.** The transaction body MAY include a `forward_extremities` object,
 keyed by room ID, listing the origin's extremities for each room referenced by
 the PDUs in this transaction (an implementation MAY also include rooms with no
-PDUs in the transaction):
+PDUs in the transaction), less any extremity the transaction already conveys —
+see *Omitting extremities the transaction already conveys* below:
 
 ```json
 {
@@ -74,7 +75,8 @@ PDUs in the transaction):
 
 **Response.** The transaction response MAY include a `forward_extremities`
 object of the same shape, listing the *destination's* extremities for the rooms
-that appeared in the request's `forward_extremities` (and/or in its PDUs):
+that appeared in the request's `forward_extremities` (and/or in its PDUs), again
+less any extremity the transaction already conveys:
 
 ```json
 {
@@ -92,6 +94,48 @@ Both arrays list raw event IDs. `timeline` and `state` are given separately so a
 peer can distinguish message-DAG divergence from state-DAG divergence; an
 implementation MAY advertise only the union if it does not track them separately,
 but a server targeting MSC4242 SHOULD advertise both.
+
+### Omitting extremities the transaction already conveys
+
+An advertisement's only effect is to make the peer fetch a head it does not
+hold. An extremity the peer is certain to hold once it has processed this
+transaction therefore needs no advertisement, and a server SHOULD omit it. A room
+left with nothing to advertise SHOULD be dropped from the object, and a
+transaction left with no rooms SHOULD omit `forward_extremities` entirely.
+
+The two directions may omit on different grounds, because they assert different
+things.
+
+**Request.** The origin knows what the destination will hold: every event in
+`pdus`, and every event named in those events' `prev_state_events` — under
+MSC4242 the destination cannot authorise a PDU without a grounded state DAG, so
+it must obtain that ancestry regardless. The origin MUST NOT omit an extremity on
+the basis of a PDU's `prev_events`: a missing *timeline* parent does not block
+authorisation and so is never fetched, and an extremity omitted on that basis may
+never reach the destination at all. That restriction costs nothing, because an
+event named in `prev_events` has by definition already been dropped from the
+origin's own extremity set, and so was never going to be advertised.
+
+In the common case this empties the object: a single event built on the origin's
+own heads *is* the new timeline extremity, and its `prev_state_events` *are* the
+state extremities.
+
+**Response.** The destination knows what the origin holds: every event in `pdus`
+(the origin sent them) and every event named in their `prev_state_events` (the
+origin cannot have sent an event it had not itself applied, and applying requires
+that ancestry). It MAY also omit on the basis of a PDU's `prev_events`, but only
+where that PDU's `sender` is on the transaction's `origin`: a server that
+authored an event necessarily built it on extremities it held, whereas a server
+that merely relayed one may never have fetched that event's timeline parents.
+
+A transaction with an empty `pdus` array conveys no events, so nothing is omitted
+from it — see the [joined-set-growth extension](anti-entropy-extension.md), whose
+advertisements always carry the full set.
+
+Omission is an optimisation, not a signal. An absent `forward_extremities` field
+is not an assertion of convergence and a server MUST NOT read it as one; it is
+indistinguishable from, and MUST be treated identically to, the same field's
+absence from a peer that has not implemented this MSC.
 
 ### Extending `get_missing_events`
 
@@ -193,13 +237,20 @@ share.
   `forward_extremities`) that would close the quiescent case without changing
   this wire format.
 
-- **Redundant heads on every transaction.** With no hashing, a server advertises
+- **Redundant heads on every transaction.** A server would otherwise advertise
   its full extremity set on every transaction even when the two servers are
-  already converged. Forward-extremity sets are small in healthy operation
-  (typically one element, a handful after a DAG merge), so the overhead is a few
-  event IDs per transaction. A future digest form (advertise a hash; send the
-  list only on mismatch) reduces the converged-case cost to a single value but is
-  out of scope here.
+  already converged. *Omitting extremities the transaction already conveys*
+  (above) removes that in the common case — a single event on the origin's own
+  heads carries no `forward_extremities` in either direction — leaving only the
+  genuinely forked case, where a server holds a concurrent extremity the
+  transaction does not account for, which is exactly when the advertisement is
+  load-bearing. A reference implementation measured a converged single-message
+  exchange fall from 607 + 250 bytes of JSON (request + response) to 417 + 60, the
+  advertisement being the whole of the difference. Extremity sets are small in
+  healthy operation anyway (typically one element, a handful after a DAG merge),
+  so what remains is a few event IDs on the transactions that need them. A future
+  digest form (advertise a hash; send the list only on mismatch) would compact
+  those too, but is out of scope here.
 
 - **Unbounded extremity lists.** A pathologically forked DAG could accumulate
   many forward extremities, inflating the advertised list. Implementations SHOULD
@@ -243,10 +294,12 @@ share.
   dropped.
 
 - **Digest/Merkle fingerprint instead of raw heads.** Advertise a hash of the
-  extremity set and exchange the actual IDs only on mismatch. Strictly better
-  bandwidth in the converged steady state, at the cost of an agreed canonical
-  hash and a second exchange on mismatch. Deferred as an optimisation layered on
-  this MSC's wire format.
+  extremity set and exchange the actual IDs only on mismatch. Better bandwidth
+  than advertising raw heads unconditionally, at the cost of an agreed canonical
+  hash and a second exchange on mismatch — but the converged steady state, which
+  is where a digest wins most, is already free here: the omission rule sends
+  nothing at all for it, without a hash or an extra exchange. Deferred as an
+  optimisation layered on this MSC's wire format.
 
 - **Per-server stream-position / version vectors.** Track and exchange a vector
   of per-origin stream positions. Heavier persistent state and a new comparison
