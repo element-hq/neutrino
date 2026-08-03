@@ -70,12 +70,26 @@ receives one processes it as any other transaction: it reconciles against the
 advertised forward extremities and returns its own, so the sending server also
 reconciles from the response.
 
+Carrying no PDUs, an advertisement conveys no events by itself, so the base
+proposal's omission rule strips nothing from it in either direction: an
+advertisement always carries the full extremity set, and so does its response.
+
 ### Advertising on joined-set growth
 
 A server SHOULD maintain, per `(destination, room)`, the forward extremities it
-most recently advertised to that destination (`last_advertised`), updated by every
-outbound transaction carrying `forward_extremities` — whether a piggybacked
-`/send` (base proposal) or an advertisement.
+most recently *conveyed* to that destination (`last_advertised`), updated by every
+outbound transaction — whether a piggybacked `/send` (base proposal) or an
+advertisement.
+
+`last_advertised` records the extremities the transaction conveyed, **not** the
+contents of its `forward_extremities` field. The base proposal lets a server omit
+extremities the transaction already conveys, so a piggybacked `/send` commonly
+carries no such field at all while still conveying everything: the destination
+receives the events themselves, which is stronger than being told their IDs. A
+server that updated the cache from the literal field would treat such a
+transaction as having conveyed nothing, and would follow a successful delivery
+with a redundant advertisement of heads the destination provably already holds —
+one extra transaction on exactly the path this extension exists to keep quiet.
 
 When applying an event causes a server `P` to become joined in a room's current
 state, having not previously been joined, the server:
