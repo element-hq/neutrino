@@ -89,6 +89,14 @@ pub struct Config {
     /// "trust the hop") is declared by the medium on its `LinkProfile`. The
     /// two are independent, and all four combinations are valid deployments.
     pub trusted_network: bool,
+    /// Directory the server writes rotating log files into, in addition to the
+    /// platform log sink (stdout, or logcat on Android). `None` — the default —
+    /// means the platform sink only. Set by a host that needs the logs to
+    /// outlive the sink: Android's logcat is a small ring buffer that also
+    /// drops lines from chatty UIDs, so the embedded build points this at the
+    /// directory its bug reporter collects from. The server creates the
+    /// directory if missing.
+    pub log_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -104,6 +112,7 @@ impl Default for Config {
             startup_jitter: Duration::from_millis(DEFAULT_STARTUP_JITTER_MS),
             enable_soft_failure: true,
             trusted_network: true,
+            log_dir: None,
         }
     }
 }
@@ -143,6 +152,9 @@ impl Config {
             // flips the stack into signed mode (see the field docs).
             trusted_network: std::env::var("NEUTRINO_TRUSTED_NETWORK")
                 .map_or(true, |v| !matches!(v.as_str(), "0" | "false")),
+            // Unset (the default) = stdout only; the embedded host sets this
+            // over the FFI rather than through the environment.
+            log_dir: std::env::var("NEUTRINO_LOG_DIR").ok().map(PathBuf::from),
             // `localpart` (and any future non-env field) defaults from `Default`,
             // so the value lives in exactly one place.
             ..Default::default()

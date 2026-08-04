@@ -247,6 +247,11 @@ Intentional gaps in the sliding-sync implementation — see `MSC4186-gaps.md`:
 - `storage_dir` empty-string handling: an exported-but-empty `NEUTRINO_STORAGE_DIR=` (and the FFI
   `NeutrinoConfig.storage_dir`) is taken literally as `""` rather than falling back to the default,
   aborting startup with an opaque `creating storage dir : …`; validate/normalise empty → default
+- `Config.log_dir` is set once at startup and the file sink's level is fixed for the
+  process. The host's tracing-log-level preference could drive it via a `Command`
+  variant, mirroring how the SDK's `updateWriteToFilesConfiguration` is re-applied.
+- the file sink is not `cfg`-gated to Android, so the dev binary can opt in with
+  `NEUTRINO_LOG_DIR`. Nothing consumes that yet beyond manual debugging.
 
 ## stack
 - framework: axum + tokio
