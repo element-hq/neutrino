@@ -5,8 +5,9 @@ mod watchdog;
 /// FFI-facing server configuration. Mirrors `neutrino_ctl::Config` so EX
 /// Android can fully configure the embedded homeserver. Kept here (not on the
 /// common `Config`) so UniFFI stays out of the common crates — see the
-/// crate-structure rule in CLAUDE.md. All fields are required; defaults live
-/// in `Config::default`/`from_env` for the dev binary.
+/// crate-structure rule in CLAUDE.md. Fields are required unless marked with a
+/// `uniffi` default; the dev binary's defaults live in
+/// `Config::default`/`from_env`.
 #[derive(uniffi::Record)]
 pub struct NeutrinoConfig {
     pub bind_addr: String,
@@ -31,6 +32,14 @@ pub struct NeutrinoConfig {
     /// egress is an internal loopback port the server allocates. `None` = direct
     /// federation (no in-process sidecar).
     pub lb_federation_port: Option<u16>,
+    /// Absolute path to a directory the server writes rotating `neutrino.*` log
+    /// files into, on top of logcat. Android's logcat is a small ring buffer
+    /// that also drops lines from chatty UIDs, so a bug report filed minutes
+    /// after a failure has already lost it; point this at the host's bug-report
+    /// log directory to keep a day of history that the report can upload. The
+    /// server creates the directory if missing. `None` = logcat only.
+    #[uniffi(default = None)]
+    pub log_dir: Option<String>,
 }
 
 impl From<NeutrinoConfig> for neutrino_main::Config {
@@ -49,6 +58,7 @@ impl From<NeutrinoConfig> for neutrino_main::Config {
                 c.outbound_concurrency as usize,
             ),
             lb_federation_port: c.lb_federation_port,
+            log_dir: c.log_dir.map(std::path::PathBuf::from),
             // Soft-fail hides events that fail auth against *current* state on
             // arrival. In this trusted P2P mesh that mostly catches messages
             // delivered late after a partition (the sender has since left) —
@@ -262,12 +272,15 @@ pub fn start_with(
     config: NeutrinoConfig,
     link_factory: Option<neutrino_main::FederationLinkFactory>,
 ) -> NeutrinoHandle {
-    // Route logs to logcat before anything that can fail: a runtime-build error
-    // or an `entrypoint` error below must be visible, not written to a stderr that
-    // Android discards. Idempotent (entrypoint calls it too).
-    neutrino_main::init_tracing();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    // Converted first only to read `log_dir` off it; the conversion is pure
+    // field mapping and cannot fail, so it does not weaken the guarantee below.
     let config: neutrino_main::Config = config.into();
+    // Route logs to logcat (and the host's log directory, if it named one)
+    // before anything that can fail: a runtime-build error or an `entrypoint`
+    // error below must be visible, not written to a stderr that Android
+    // discards. Idempotent (entrypoint calls it too, with the same directory).
+    neutrino_main::init_tracing(config.log_dir.as_deref());
     // Runtime-toggleable pcap capture of the federation conversation (a debug
     // tap; see `neutrino_lb::capture`). One handle is threaded into the lb
     // sidecar's HTTP/JSON edges, an identical clone lives on `NeutrinoHandle`
@@ -361,6 +374,7 @@ mod tests {
             outbound_concurrency: 0, // must clamp to 1
             lb_federation_port: Some(8448),
             trusted_network: true,
+            log_dir: None,
         };
         let cfg: neutrino_main::Config = nc.into();
         // `None` from the FFI surface → empty, which triggers identity derivation.
@@ -372,6 +386,29 @@ mod tests {
         assert_eq!(cfg.lb_federation_port, Some(8448));
         // `federation_proxy` is internal/derived, never set from the FFI surface.
         assert_eq!(cfg.federation_proxy, None);
+        // No directory asked for → platform sink only, no file sink.
+        assert_eq!(cfg.log_dir, None);
+    }
+
+    #[test]
+    fn neutrino_config_passes_through_log_dir() {
+        // The host's log directory reaches `Config` as a path, which is what
+        // `init_tracing` needs to install the rotating file sink.
+        let nc = NeutrinoConfig {
+            bind_addr: "127.0.0.1:8008".to_string(),
+            localpart: "alice".to_string(),
+            server_name: None,
+            storage_dir: "/data/neutrino".to_string(),
+            outbound_concurrency: 4,
+            lb_federation_port: None,
+            trusted_network: true,
+            log_dir: Some("/data/cache/logs".to_string()),
+        };
+        let cfg: neutrino_main::Config = nc.into();
+        assert_eq!(
+            cfg.log_dir,
+            Some(std::path::PathBuf::from("/data/cache/logs"))
+        );
     }
 
     #[test]
@@ -386,6 +423,7 @@ mod tests {
             outbound_concurrency: 4,
             lb_federation_port: None,
             trusted_network: true,
+            log_dir: None,
         };
         let cfg: neutrino_main::Config = nc.into();
         assert_eq!(cfg.server_name, "hs.example");
@@ -511,6 +549,7 @@ mod tests {
             outbound_concurrency: 4,
             lb_federation_port: None,
             trusted_network: true,
+            log_dir: None,
         };
         let cfg: neutrino_main::Config = nc.into();
         assert_eq!(cfg.outbound_concurrency, 4);

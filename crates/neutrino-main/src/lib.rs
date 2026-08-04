@@ -93,8 +93,11 @@ pub type FederationLinkFactory =
 /// embedding host (the FFI) should also call it *before* spawning the server
 /// runtime so that a failure to even build the runtime — or any error returned
 /// from `entrypoint` — is logged rather than written to a stderr nothing reads.
-pub fn init_tracing() {
-    platform::init_tracing();
+///
+/// `log_dir` adds a rotating on-disk sink alongside the platform one — pass
+/// [`Config::log_dir`] so the two calls agree; whichever runs first wins.
+pub fn init_tracing(log_dir: Option<&std::path::Path>) {
+    platform::init_tracing(log_dir);
 }
 
 pub async fn entrypoint(
@@ -119,7 +122,7 @@ pub async fn entrypoint(
     // non-embedded callers pass `None`.
     capture: Option<Arc<neutrino_lb::CaptureControl>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    init_tracing();
+    init_tracing(config.log_dir.as_deref());
     let discovery = discovery.unwrap_or_else(|| Arc::new(DiscoveryRegistry::new()));
 
     // Open the store once, here, and resolve the server's stable identity from

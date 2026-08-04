@@ -14,6 +14,11 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Hourly rotation + pruning for the optional on-disk log sink (`Config::log_dir`),
+# and the off-thread writer that keeps file I/O off the async tasks. Same crate
+# matrix-rust-sdk uses for its own rotation, so the embedded build's two log
+# sets behave identically.
+tracing-appender = "0.2.3"
 
 neutrino-ctl = { path = "../neutrino-ctl" }
 # The trust policy seam: LinkTrust carries a KeyResolver, and the entrypoint
