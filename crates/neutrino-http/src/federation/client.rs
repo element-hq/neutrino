@@ -31,7 +31,6 @@ use neutrino_engine::{
 };
 
 use crate::federation::get_missing_events;
-use neutrino_event::now_ms;
 
 /// Connection-establishment timeout for a federation request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -173,8 +172,9 @@ impl FederationClient {
     }
 
     /// `PUT http://{dest}/_matrix/federation/v1/send/{txn_id}` carrying `pdus`
-    /// (and an empty `edus` list — EDUs are out of scope) plus our
-    /// `forward_extremities` advertisement. The per-PDU result map in the response
+    /// plus our `forward_extremities` advertisement (`edus` is omitted — EDUs
+    /// are out of scope; `origin`/`origin_server_ts` too — see
+    /// [`TransactionRequest`]). The per-PDU result map in the response
     /// is ignored (the spec marks `error` advisory, and our durable retry lives in
     /// the outbox), but the response's `forward_extremities` (the peer's heads) is
     /// returned so the sender can reconcile against them. A response that omits or
@@ -194,10 +194,6 @@ impl FederationClient {
             self.url_authority(dest)
         );
         let body = TransactionRequest {
-            origin: &self.origin,
-            // The peer ignores this (see inbound `_origin_server_ts`), but the
-            // field is required by the wire shape, so send a real timestamp.
-            origin_server_ts: now_ms(),
             pdus,
             edus: &[],
             forward_extremities,
@@ -671,11 +667,22 @@ impl MissingEventsFetcher for ReqwestFetcher {
 }
 
 /// Outbound transaction body. Borrows everything — no clones on the send path.
+///
+/// `origin` and `origin_server_ts` are deliberately **not** sent, despite being
+/// required by the v1.18 spec's `Transaction` schema. Both are vestigial: the
+/// sending server is already carried (network-attested) by the `X-Matrix`
+/// header, and nothing on the receiving side reads a per-transaction timestamp —
+/// each PDU carries its own `origin_server_ts`. See
+/// <https://github.com/matrix-org/matrix-spec/issues/374>: the fields are
+/// redundant and the spec text is what needs updating, so omitting them costs
+/// nothing functionally and saves bytes on a bandwidth-constrained link.
 #[derive(Serialize)]
 struct TransactionRequest<'a> {
-    origin: &'a str,
-    origin_server_ts: u64,
     pdus: &'a [Box<RawJsonValue>],
+    /// EDUs are out of scope (see the crate root), so this is always empty in
+    /// practice — kept as a field so a future EDU sender has the plumbing.
+    /// Omitted when empty rather than sent as a `[]` nobody reads.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
     edus: &'a [Box<RawJsonValue>],
     /// Anti-entropy: our per-room forward extremities. Omitted when empty so a
     /// transaction with nothing to advertise keeps the legacy wire shape.
@@ -801,13 +808,14 @@ mod tests {
             .clone()
             .expect("stub got a request");
         assert_eq!(txn, "txn-1");
-        assert_eq!(body["origin"], "local.test");
         // PDU order is preserved on the wire.
         assert_eq!(body["pdus"][0]["n"], 1);
         assert_eq!(body["pdus"][1]["n"], 2);
-        assert!(body["edus"].as_array().unwrap().is_empty());
-        // A real (non-saturated) timestamp, not the pre-epoch floor.
-        assert!(body["origin_server_ts"].as_u64().unwrap() > 0);
+        // The payload carries nothing but the PDUs: no `edus: []` (we never send
+        // EDUs), and no `origin`/`origin_server_ts` (vestigial — see
+        // `TransactionRequest`). Every byte counts on a low-bandwidth link.
+        let keys: Vec<&String> = body.as_object().expect("object body").keys().collect();
+        assert_eq!(keys, vec!["pdus"], "trimmed payload: {body}");
     }
 
     #[tokio::test]
@@ -1064,8 +1072,6 @@ mod tests {
         let pdu = raw(r#"{"type":"m.room.message"}"#);
         let fes = BTreeMap::new();
         let txn = TransactionRequest {
-            origin: "local.test",
-            origin_server_ts: 12345,
             pdus: std::slice::from_ref(&pdu),
             edus: &[],
             forward_extremities: &fes,
@@ -1110,8 +1116,6 @@ mod tests {
         // Request half: outbound body parses on the inbound handler.
         let pdu = raw(r#"{"type":"m.room.message"}"#);
         let txn = TransactionRequest {
-            origin: "local.test",
-            origin_server_ts: 1,
             pdus: std::slice::from_ref(&pdu),
             edus: &[],
             forward_extremities: &fes,

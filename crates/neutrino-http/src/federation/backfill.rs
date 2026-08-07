@@ -1,8 +1,9 @@
 //! `GET /_matrix/federation/v1/backfill/{roomId}`.
 //!
 //! Walks the room's `prev_events` DAG backward from the `v` query-param
-//! event IDs and returns up to `limit` PDUs, newest-first, wrapped in the
-//! federation transaction envelope `{ origin, origin_server_ts, pdus }`.
+//! event IDs and returns up to `limit` PDUs, newest-first, as `{ pdus }` — the
+//! federation transaction envelope minus its vestigial `origin` /
+//! `origin_server_ts` (see [`ResponseBody`]).
 //!
 //! Reuses `DagStore::events_before` (the seeds-included reverse-chronological
 //! priority-queue walk) rather than a dedicated storage method. Trusted-mesh
@@ -39,16 +40,24 @@ const MAX_LIMIT: u32 = 100;
 ///
 /// ruma's `#[response]` macro emits an `OutgoingResponse` impl, not a plain
 /// `Serialize`, so — as with the `get_missing_events` sibling — we hand-roll
-/// the JSON body the federation spec wants: a transaction envelope of
-/// `origin`, `origin_server_ts`, and the opaque `pdus`.
+/// the JSON body: the opaque `pdus`, and nothing else.
 ///
-/// `Deserialize` is derived (and the fields made `pub(crate)`) so the outbound
+/// The spec's transaction envelope also carries `origin` and `origin_server_ts`.
+/// Both are omitted here for the same reason the outbound `/send` body omits
+/// them (see [`crate::federation::client`]): the responding server is already
+/// known — the requester dialled it — and no per-transaction timestamp is read
+/// anywhere, since each PDU carries its own. See
+/// <https://github.com/matrix-org/matrix-spec/issues/374>; this is a deviation
+/// from spec *text* that costs nothing functionally and saves bytes on a
+/// bandwidth-constrained link.
+///
+/// `Deserialize` is derived (and the field made `pub(crate)`) so the outbound
 /// [`crate::federation::client::FederationClient::backfill`] can parse this same
 /// envelope back, mirroring the dual-derive `get_missing_events::ResponseBody`.
+/// Unknown keys are ignored, so a peer that still sends the full envelope parses
+/// fine.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct ResponseBody {
-    pub(crate) origin: String,
-    pub(crate) origin_server_ts: u64,
     pub(crate) pdus: Vec<Box<RawJsonValue>>,
 }
 
@@ -88,15 +97,14 @@ pub(crate) async fn handle(
         return Err(FedError::BadRequest("limit must be a positive integer"));
     }
 
-    let (store, origin) = {
+    let (store, our_name) = {
         let app = lock_app(&state);
         (app.store.clone(), app.config.server_name.clone())
     };
 
-    // Authenticate the caller (network-attested `X-Matrix` origin) — `origin`
-    // here is *our* name (the response envelope's `origin`), used as the
-    // expected `destination`.
-    let caller = auth::authenticated_origin(&headers, &origin)?;
+    // Authenticate the caller (network-attested `X-Matrix` origin). `our_name`
+    // is passed so a caller claiming to be us is rejected.
+    let caller = auth::authenticated_origin(&headers, &our_name)?;
 
     // (4)
     if !store.room_exists(&room_id).await? {
@@ -146,11 +154,7 @@ pub(crate) async fn handle(
     let pdus: Vec<Box<RawJsonValue>> =
         crate::federation::events_before_raw(&*store, &room_id, &known_refs, limit).await?;
 
-    Ok(Json(ResponseBody {
-        origin,
-        origin_server_ts: neutrino_event::now_ms(),
-        pdus,
-    }))
+    Ok(Json(ResponseBody { pdus }))
 }
 
 /// Parse the backfill query string into the repeated `v` event-id values
@@ -230,6 +234,32 @@ fn percent_decode(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_body_serializes_to_pdus_only() {
+        let body = ResponseBody {
+            pdus: vec![
+                serde_json::value::to_raw_value(&serde_json::json!({"type": "m.room.message"}))
+                    .unwrap(),
+            ],
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        let keys: Vec<&String> = json.as_object().expect("object").keys().collect();
+        assert_eq!(keys, vec!["pdus"], "vestigial envelope fields must be gone");
+    }
+
+    #[test]
+    fn response_body_parses_a_legacy_full_envelope() {
+        // A peer still sending the spec's `origin` / `origin_server_ts` parses
+        // fine — the fields are simply ignored (no `deny_unknown_fields`).
+        let legacy = serde_json::json!({
+            "origin": "hs1",
+            "origin_server_ts": 1_700_000_000_000u64,
+            "pdus": [ { "type": "m.room.message" } ],
+        });
+        let body: ResponseBody = serde_json::from_value(legacy).expect("legacy envelope parses");
+        assert_eq!(body.pdus.len(), 1);
+    }
 
     #[test]
     fn parse_none_query_is_empty() {
