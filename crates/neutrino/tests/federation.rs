@@ -282,3 +282,73 @@ async fn crash_recovers_committed_state_and_redelivers_outbox() {
     )
     .await;
 }
+
+/// Synthesised delivery receipts, end to end over real federation.
+///
+/// Server 0 sends a message; server 1's homeserver 2xx's the transaction
+/// carrying it. That acknowledgement — and nothing else, since this server
+/// neither sends nor receives receipt EDUs — is what server 0 turns into an
+/// `m.read` receipt for `@u:1` against the event it just sent.
+///
+/// The rig runs with `NEUTRINO_DELIVERY_RECEIPTS=1` (see `spawn_neutrino`); the
+/// off case is covered by the unit tests, which can flip the knob per-server.
+#[tokio::test]
+async fn delivery_receipt_follows_the_peers_ack() {
+    let h = Harness::start(2, neutrino_bin()).await;
+    let room = h.create_room(0, "receipts").await;
+    assert!(matches!(h.invite(0, &room, &h.mxid(1)).await, 200..=299));
+    assert!(matches!(h.join(1, &room, h.name(0)).await, 200..=299));
+    h.await_converged(&room, &[0, 1]).await;
+
+    assert!(matches!(
+        h.send_message(0, &room, "receipt-me").await,
+        200..=299
+    ));
+    // Delivery is what we're asserting, so wait on the peer actually holding it
+    // rather than on a timer.
+    h.await_timeline(1, &room, "sees 0's message", |e| {
+        msg_body(e) == Some("receipt-me")
+    })
+    .await;
+
+    // The event id isn't exposed by the client helpers, so assert on the shape:
+    // exactly one `m.read` entry, for server 1's user, under some event.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mxid = h.mxid(1);
+    loop {
+        if let Some(content) = h.sync_receipts(0, &room).await {
+            let readers: Vec<&str> = content
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(_, receipts)| receipts.get("m.read")?.as_object())
+                .flat_map(|read| read.keys().map(String::as_str))
+                .collect();
+            if readers == [mxid.as_str()] {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server 0 never synthesised a delivery receipt for {mxid}; last: {:?}",
+            h.sync_receipts(0, &room).await
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // The receipt is local synthesis, not a federated EDU: server 1 has no
+    // acknowledgement from server 0 for that message (it never sent it), so it
+    // must not have invented a receipt for its own user.
+    let peer_view = h.sync_receipts(1, &room).await;
+    let peer_sees_own_user = peer_view
+        .as_ref()
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(_, receipts)| receipts.get("m.read")?.as_object())
+        .any(|read| read.contains_key(mxid.as_str()));
+    assert!(
+        !peer_sees_own_user,
+        "receipts are synthesised per-server from local acks, not federated: {peer_view:?}"
+    );
+}

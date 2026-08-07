@@ -290,6 +290,31 @@ CREATE TABLE outbox (
 CREATE INDEX ix_outbox_dest_order ON outbox(destination, outbox_id);
 
 -- ----------------------------------------------------------------------------
+-- deliveries — DeliveryStore
+-- The newest event of a room a destination has acknowledged receiving (2xx'd
+-- the /send transaction carrying it). A high-water mark, so exactly one row per
+-- (room, destination) — bounded by rooms × peers, not events × peers — and
+-- `record_delivery` only moves it forward: the ON CONFLICT update is guarded on
+-- `excluded.stream_pos > stream_pos`, which is why `stream_pos` is denormalised
+-- out of `events` rather than joined on read. `delivery_pos` orders the marks
+-- against each other (MAX+1 on every advance) so sliding sync can ask for "marks
+-- that moved since pos N" the same way it asks for events; it is *not* an
+-- `events.stream_pos`. No `user_version` bump (additive, no live data, no
+-- migration framework — same policy as the other late tables).
+-- ----------------------------------------------------------------------------
+CREATE TABLE deliveries (
+    room_id      TEXT    NOT NULL,
+    destination  TEXT    NOT NULL,
+    event_id     TEXT    NOT NULL REFERENCES events(event_id),
+    stream_pos   INTEGER NOT NULL,
+    delivery_pos INTEGER NOT NULL,
+    ts           INTEGER NOT NULL,
+    PRIMARY KEY (room_id, destination)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX ix_deliveries_pos ON deliveries(delivery_pos);
+
+-- ----------------------------------------------------------------------------
 -- staged_events — StagingStore
 -- A pre-auth holding pen for federation ancestry fetched while gap-filling a
 -- received PDU's state DAG. Events here are NOT yet authorised: we must auth

@@ -40,6 +40,14 @@ pub struct NeutrinoConfig {
     /// server creates the directory if missing. `None` = logcat only.
     #[uniffi(default = None)]
     pub log_dir: Option<String>,
+    /// Whether `/sync` surfaces synthesised delivery receipts: an `m.read`
+    /// receipt for a remote user once that user's server has acknowledged the
+    /// federation transaction carrying the event. It is a deliberate lie —
+    /// their server *received* it, nobody read it — so it is off unless the
+    /// host (or the medium's own start wrapper) asks for it. Defaulted so
+    /// existing callers are unaffected.
+    #[uniffi(default = false)]
+    pub delivery_receipts: bool,
 }
 
 impl From<NeutrinoConfig> for neutrino_main::Config {
@@ -69,6 +77,7 @@ impl From<NeutrinoConfig> for neutrino_main::Config {
             // rig uses; the verdict is still computed and stored).
             enable_soft_failure: false,
             trusted_network: c.trusted_network,
+            delivery_receipts: c.delivery_receipts,
             // `federation_proxy` is internal/derived (set by neutrino-main when
             // the sidecar runs) and startup jitter isn't FFI-exposed; both take
             // their `Config::default()` values.
@@ -375,6 +384,7 @@ mod tests {
             lb_federation_port: Some(8448),
             trusted_network: true,
             log_dir: None,
+            delivery_receipts: false,
         };
         let cfg: neutrino_main::Config = nc.into();
         // `None` from the FFI surface → empty, which triggers identity derivation.
@@ -391,6 +401,30 @@ mod tests {
     }
 
     #[test]
+    fn neutrino_config_passes_through_delivery_receipts() {
+        // Off by default for every host; a medium's start wrapper (or the host
+        // itself) flips it on, and the flag must survive the mapping — the
+        // sync-side synthesis reads it from `Config`, nothing else.
+        let nc = NeutrinoConfig {
+            bind_addr: "127.0.0.1:8008".to_string(),
+            localpart: "alice".to_string(),
+            server_name: None,
+            storage_dir: "/data/neutrino".to_string(),
+            outbound_concurrency: 4,
+            lb_federation_port: None,
+            trusted_network: true,
+            log_dir: None,
+            delivery_receipts: true,
+        };
+        let cfg: neutrino_main::Config = nc.into();
+        assert!(cfg.delivery_receipts);
+        assert!(
+            !neutrino_main::Config::default().delivery_receipts,
+            "and the default stays off"
+        );
+    }
+
+    #[test]
     fn neutrino_config_passes_through_log_dir() {
         // The host's log directory reaches `Config` as a path, which is what
         // `init_tracing` needs to install the rotating file sink.
@@ -403,6 +437,7 @@ mod tests {
             lb_federation_port: None,
             trusted_network: true,
             log_dir: Some("/data/cache/logs".to_string()),
+            delivery_receipts: false,
         };
         let cfg: neutrino_main::Config = nc.into();
         assert_eq!(
@@ -424,6 +459,7 @@ mod tests {
             lb_federation_port: None,
             trusted_network: true,
             log_dir: None,
+            delivery_receipts: false,
         };
         let cfg: neutrino_main::Config = nc.into();
         assert_eq!(cfg.server_name, "hs.example");
@@ -550,6 +586,7 @@ mod tests {
             lb_federation_port: None,
             trusted_network: true,
             log_dir: None,
+            delivery_receipts: false,
         };
         let cfg: neutrino_main::Config = nc.into();
         assert_eq!(cfg.outbound_concurrency, 4);

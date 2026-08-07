@@ -2977,3 +2977,322 @@ async fn initial_sync_anchors_high_water_at_store_head() {
         "second sync with no new events omits room — high-water is at store head"
     );
 }
+
+// -----------------------------------------------------------------------------
+// Synthesised delivery receipts (`Config::delivery_receipts`).
+//
+// The fact under test is `DeliveryStore`'s mark — "peer.test acknowledged this
+// event" — being rendered as an `m.read` receipt for that peer's users. See
+// `super::receipts` for why the receipt type is a deliberate lie.
+// -----------------------------------------------------------------------------
+
+/// A room `alice` (local) and `bob` (on `peer.test`) are both joined to, plus
+/// one message from alice. Returns the message's event id — the thing a
+/// delivery mark points at.
+async fn room_with_remote_member(
+    store: &SqliteStore,
+    room: &RoomId,
+    alice: &UserId,
+    bob: &UserId,
+) -> ruma::OwnedEventId {
+    setup_joined_room(store, room, alice).await;
+    seed_member(store, room, bob, bob, "join", 50).await;
+    let msg = make_event(
+        room,
+        "m.room.message",
+        None,
+        alice,
+        100,
+        serde_json::json!({"body": "hi bob", "msgtype": "m.text"}),
+    );
+    seed(store, &msg).await;
+    msg.event_id
+}
+
+/// A sync request opted into the receipts extension.
+fn req_with_receipts(lists: BTreeMap<String, request::List>) -> Request {
+    let mut req = Request::new();
+    req.lists = lists;
+    req.extensions.receipts.enabled = Some(true);
+    req
+}
+
+/// The `{user: ts}` map of an `m.read` receipt for `event_id` in `room`'s
+/// receipts extension entry, or `None` if there is no such entry.
+fn read_receipt_users(
+    resp: &ruma::api::client::sync::sync_events::v5::Response,
+    room: &RoomId,
+    event_id: &ruma::EventId,
+) -> Option<BTreeMap<String, u64>> {
+    let raw = resp.extensions.receipts.rooms.get(room)?;
+    let value: Value = serde_json::from_str(raw.json().get()).expect("receipt is JSON");
+    assert_eq!(value["type"], "m.receipt", "ephemeral is an m.receipt");
+    let read = value["content"][event_id.as_str()]["m.read"].as_object()?;
+    Some(
+        read.iter()
+            .map(|(user, body)| {
+                (
+                    user.clone(),
+                    body["ts"].as_u64().expect("receipt carries a ts"),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The load-bearing case: once `peer.test` has 2xx'd the transaction carrying
+/// the event, the sync surfaces an `m.read` receipt for `peer.test`'s user —
+/// with the delivery's timestamp, not the event's.
+#[tokio::test]
+async fn delivery_mark_surfaces_as_a_receipt_for_that_servers_users() {
+    use neutrino_store::DeliveryStore;
+
+    let (store, _tmp) = fresh_store().await;
+    let alice = user_id!("@alice:example.org");
+    let bob = user_id!("@bob:peer.test");
+    let room = room_id!("!room:example.org");
+    let event_id = room_with_remote_member(&store, room, alice, bob).await;
+    store
+        .record_delivery(
+            ruma::server_name!("peer.test"),
+            room,
+            &event_id,
+            1_700_000_000_000,
+        )
+        .await
+        .unwrap();
+
+    let mut state = SyncState::new(store, no_shutdown());
+    state.delivery_receipts = true;
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let resp = handle(&state, alice, req_with_receipts(lists))
+        .await
+        .unwrap();
+
+    let users = read_receipt_users(&resp, room, &event_id).expect("room has a receipt");
+    assert_eq!(
+        users,
+        BTreeMap::from([("@bob:peer.test".to_owned(), 1_700_000_000_000)]),
+        "the acknowledging server's user, stamped with the delivery time"
+    );
+}
+
+/// The knob is the whole point: with `delivery_receipts` off (the default) the
+/// marks still accrue but no client ever sees them.
+#[tokio::test]
+async fn no_receipts_when_the_server_knob_is_off() {
+    use neutrino_store::DeliveryStore;
+
+    let (store, _tmp) = fresh_store().await;
+    let alice = user_id!("@alice:example.org");
+    let bob = user_id!("@bob:peer.test");
+    let room = room_id!("!room:example.org");
+    let event_id = room_with_remote_member(&store, room, alice, bob).await;
+    store
+        .record_delivery(ruma::server_name!("peer.test"), room, &event_id, 1)
+        .await
+        .unwrap();
+
+    // `SyncState::new` leaves `delivery_receipts` off.
+    let state = SyncState::new(store, no_shutdown());
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let resp = handle(&state, alice, req_with_receipts(lists))
+        .await
+        .unwrap();
+
+    assert!(
+        resp.extensions.receipts.rooms.is_empty(),
+        "receipts stay off the wire until the deployment asks for them"
+    );
+}
+
+/// Extension semantics: a client that didn't opt into receipts gets none, even
+/// with the server knob on.
+#[tokio::test]
+async fn no_receipts_when_the_client_did_not_opt_in() {
+    use neutrino_store::DeliveryStore;
+
+    let (store, _tmp) = fresh_store().await;
+    let alice = user_id!("@alice:example.org");
+    let bob = user_id!("@bob:peer.test");
+    let room = room_id!("!room:example.org");
+    let event_id = room_with_remote_member(&store, room, alice, bob).await;
+    store
+        .record_delivery(ruma::server_name!("peer.test"), room, &event_id, 1)
+        .await
+        .unwrap();
+
+    let mut state = SyncState::new(store, no_shutdown());
+    state.delivery_receipts = true;
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let mut req = Request::new();
+    req.lists = lists;
+    let resp = handle(&state, alice, req).await.unwrap();
+
+    assert!(
+        resp.extensions.receipts.rooms.is_empty(),
+        "the receipts extension is opt-in per MSC3960"
+    );
+}
+
+/// Delta semantics: a mark already rendered is not rendered again, and a mark
+/// that moves afterwards is.
+#[tokio::test]
+async fn receipts_are_not_repeated_across_syncs() {
+    use neutrino_store::DeliveryStore;
+
+    let (store, _tmp) = fresh_store().await;
+    let alice = user_id!("@alice:example.org");
+    let bob = user_id!("@bob:peer.test");
+    let room = room_id!("!room:example.org");
+    let first = room_with_remote_member(&store, room, alice, bob).await;
+    let peer = ruma::server_name!("peer.test");
+    store.record_delivery(peer, room, &first, 10).await.unwrap();
+
+    let mut state = SyncState::new(store.clone(), no_shutdown());
+    state.delivery_receipts = true;
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+
+    let resp1 = handle(&state, alice, req_with_receipts(lists.clone()))
+        .await
+        .unwrap();
+    assert!(
+        read_receipt_users(&resp1, room, &first).is_some(),
+        "initial sync carries the current marks"
+    );
+
+    let mut req2 = req_with_receipts(lists.clone());
+    req2.pos = Some(resp1.pos);
+    let resp2 = handle(&state, alice, req2).await.unwrap();
+    assert!(
+        resp2.extensions.receipts.rooms.is_empty(),
+        "an unchanged mark is not re-sent"
+    );
+
+    // The peer acknowledges a newer event: the mark moves, so the delta carries
+    // it — against the new event id, not the old one.
+    let second = make_event(
+        room,
+        "m.room.message",
+        None,
+        alice,
+        200,
+        serde_json::json!({"body": "and again", "msgtype": "m.text"}),
+    );
+    seed(&store, &second).await;
+    store
+        .record_delivery(peer, room, &second.event_id, 20)
+        .await
+        .unwrap();
+
+    let mut req3 = req_with_receipts(lists);
+    req3.pos = Some(resp2.pos);
+    let resp3 = handle(&state, alice, req3).await.unwrap();
+    assert!(
+        read_receipt_users(&resp3, room, &second.event_id).is_some(),
+        "a mark that moved is sent again at its new event"
+    );
+    assert!(
+        read_receipt_users(&resp3, room, &first).is_none(),
+        "and only at its new event"
+    );
+}
+
+/// A delivery mark is new data with no new event behind it, so it must wake an
+/// idle long-poll on its own — otherwise the tick lands up to a timeout late.
+#[tokio::test]
+async fn long_poll_wakes_on_a_delivery_mark() {
+    use neutrino_store::DeliveryStore;
+
+    let (store, _tmp) = fresh_store().await;
+    let alice = user_id!("@alice:example.org");
+    let bob = user_id!("@bob:peer.test");
+    let room = room_id!("!room:example.org");
+    let event_id = room_with_remote_member(&store, room, alice, bob).await;
+
+    let mut state = SyncState::new(store.clone(), no_shutdown());
+    state.delivery_receipts = true;
+    let state = Arc::new(state);
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let resp1 = handle(&state, alice, req_with_receipts(lists.clone()))
+        .await
+        .unwrap();
+
+    let store_for_task = store.clone();
+    let mark_event = event_id.clone();
+    let room_owned = room.to_owned();
+    let waker = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        store_for_task
+            .record_delivery(
+                ruma::server_name!("peer.test"),
+                &room_owned,
+                &mark_event,
+                1_700_000_000_000,
+            )
+            .await
+            .unwrap();
+    });
+
+    let mut req2 = req_with_receipts(lists);
+    req2.pos = Some(resp1.pos);
+    req2.timeout = Some(std::time::Duration::from_millis(2000));
+
+    let start = std::time::Instant::now();
+    let resp2 = handle(&state, alice, req2).await.unwrap();
+    let elapsed = start.elapsed();
+    waker.await.unwrap();
+
+    // Same latency reasoning as `long_poll_wakes_on_new_event`: a broken wake
+    // (or a `has_data` that ignores receipts) only returns at the 2s timeout.
+    assert!(
+        elapsed < std::time::Duration::from_millis(1500),
+        "should wake on the delivery mark well before the 2s timeout, got {elapsed:?}"
+    );
+    assert!(
+        read_receipt_users(&resp2, room, &event_id).is_some(),
+        "the mark that woke the poll is in the response"
+    );
+}
+
+/// Delivery is per-server; the receipt is per-user. A second user on the same
+/// peer is covered by the one acknowledgement, while a user on a server that
+/// hasn't acknowledged is not.
+#[tokio::test]
+async fn receipt_covers_every_user_of_the_acking_server_only() {
+    use neutrino_store::DeliveryStore;
+
+    let (store, _tmp) = fresh_store().await;
+    let alice = user_id!("@alice:example.org");
+    let bob = user_id!("@bob:peer.test");
+    let carol = user_id!("@carol:peer.test");
+    let dave = user_id!("@dave:other.test");
+    let room = room_id!("!room:example.org");
+    let event_id = room_with_remote_member(&store, room, alice, bob).await;
+    seed_member(&store, room, carol, carol, "join", 60).await;
+    seed_member(&store, room, dave, dave, "join", 70).await;
+    store
+        .record_delivery(ruma::server_name!("peer.test"), room, &event_id, 5)
+        .await
+        .unwrap();
+
+    let mut state = SyncState::new(store, no_shutdown());
+    state.delivery_receipts = true;
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let resp = handle(&state, alice, req_with_receipts(lists))
+        .await
+        .unwrap();
+
+    let users = read_receipt_users(&resp, room, &event_id).expect("room has a receipt");
+    assert_eq!(
+        users.keys().cloned().collect::<Vec<_>>(),
+        vec!["@bob:peer.test".to_owned(), "@carol:peer.test".to_owned()],
+        "both of peer.test's users, and nobody from a server that never acked"
+    );
+}
