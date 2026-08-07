@@ -92,6 +92,14 @@ pub struct RoomSent {
 pub struct Conn {
     pub pos: u64,
     pub last_event_stream_pos: u64,
+    /// `last_event_stream_pos`'s sibling for the delivery stream: the highest
+    /// `DeliveryPos` whose federation delivery mark this connection has already
+    /// rendered into a receipts extension. Only advanced when the client opted
+    /// into receipts and the server has them enabled, so a connection that
+    /// never asks for receipts leaves it at 0 and gets the full set if it later
+    /// does. Held as a plain `u64` for the same reason `last_event_stream_pos`
+    /// is — the newtype belongs to the store's API, not the cursor.
+    pub last_delivery_pos: u64,
     pub lists: BTreeMap<String, ListCfg>,
     pub subs: BTreeMap<OwnedRoomId, SubCfg>,
     pub sent: HashMap<OwnedRoomId, RoomSent>,

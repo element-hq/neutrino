@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use deadpool_sqlite::{Config, Hook, HookError, Pool, Runtime, rusqlite::Connection};
 use neutrino_room::provider::StateProvider;
-use neutrino_store::{StorageError, StreamPos, WithStateProvider};
+use neutrino_store::{DeliveryPos, StorageError, StreamPos, WithStateProvider};
 use tokio::sync::watch;
 
 /// Wall-clock ceiling for any single `run_write` call. The writer pool is
@@ -69,6 +69,13 @@ pub struct SqliteStore {
     /// monotonically advanced by `persist_event` via `send_if_modified`
     /// from inside the `spawn_blocking` closure.
     watch_tx: watch::Sender<StreamPos>,
+    /// The delivery-stream sibling of `watch_tx`: receivers handed out via
+    /// `DeliveryStore::subscribe_deliveries` see the `DeliveryPos` of the most
+    /// recently advanced federation delivery mark. Seeded at open from
+    /// `MAX(delivery_pos)`; advanced by `record_delivery`. Separate from
+    /// `watch_tx` because an acknowledgement is not an event — it must wake a
+    /// long-poll without pretending the event stream moved.
+    delivery_watch_tx: watch::Sender<DeliveryPos>,
     /// Whether client-visible reads (`events_after` for `/sync`,
     /// `room_messages` for `/messages`) exclude soft-failed rows. `true` in
     /// production; the convergence harness sets it `false` (see
@@ -225,12 +232,26 @@ impl SqliteStore {
             .map_err(Error::Interact)?
             .map_err(Error::Sqlite)?;
 
+        let initial_delivery: i64 = reader
+            .interact(|conn| {
+                conn.query_row(
+                    "SELECT COALESCE(MAX(delivery_pos), 0) FROM deliveries",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .await
+            .map_err(Error::Interact)?
+            .map_err(Error::Sqlite)?;
+
         let (watch_tx, _) = watch::channel(StreamPos(initial as u64));
+        let (delivery_watch_tx, _) = watch::channel(DeliveryPos(initial_delivery as u64));
 
         Ok(Self {
             reader_pool,
             writer_pool,
             watch_tx,
+            delivery_watch_tx,
             // Production default: soft-failed events are hidden from clients.
             hide_soft_failed: true,
         })
@@ -295,6 +316,24 @@ impl SqliteStore {
     /// for being an associated fn as [`Self::notify_watch`].
     pub(crate) fn notify_watch_changed(watch_tx: &watch::Sender<StreamPos>) {
         watch_tx.send_modify(|_| {});
+    }
+
+    /// Advance the delivery watch under the same max-guard (and for the same
+    /// `'static`-closure reason) as [`Self::notify_watch`]. Called after the
+    /// `record_delivery` write, so a visible mark always has its wake-up.
+    pub(crate) fn notify_delivery_watch(
+        delivery_watch_tx: &watch::Sender<DeliveryPos>,
+        new_pos: i64,
+    ) {
+        let new_pos = DeliveryPos(new_pos as u64);
+        delivery_watch_tx.send_if_modified(|cur| {
+            if new_pos > *cur {
+                *cur = new_pos;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// Run a read-only closure on a connection from the reader pool.

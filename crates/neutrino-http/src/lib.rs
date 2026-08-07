@@ -268,7 +268,9 @@ impl AppState {
         security: EventSecurity,
     ) -> Self {
         let shutdown = CancellationToken::new();
-        let sync_state = Arc::new(SyncState::new(store.clone(), shutdown.clone()));
+        let mut sync_state = SyncState::new(store.clone(), shutdown.clone());
+        sync_state.delivery_receipts = config.delivery_receipts;
+        let sync_state = Arc::new(sync_state);
         let room_registry = Arc::new(RoomRegistry::new(
             store.clone(),
             config.server_name.clone(),
@@ -1180,7 +1182,10 @@ struct SyncResponseWire {
     lists: BTreeMap<String, v5::response::List>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     rooms: BTreeMap<OwnedRoomId, v5::response::Room>,
-    #[serde(skip_serializing_if = "extensions_is_empty")]
+    // Ruma's own emptiness check, not a local one: it covers every extension
+    // field it knows about, so a newly-populated extension (receipts) can't be
+    // silently dropped here by a predicate that predates it.
+    #[serde(skip_serializing_if = "v5::response::Extensions::is_empty")]
     extensions: v5::response::Extensions,
 }
 
@@ -1194,13 +1199,6 @@ impl From<v5::Response> for SyncResponseWire {
             extensions: r.extensions,
         }
     }
-}
-
-fn extensions_is_empty(e: &v5::response::Extensions) -> bool {
-    e.to_device.is_none()
-        && e.e2ee.device_lists.is_empty()
-        && e.e2ee.device_one_time_keys_count.is_empty()
-        && e.e2ee.device_unused_fallback_key_types.is_none()
 }
 
 /// Extract the localpart from a login identifier that may be a full MXID
@@ -2013,6 +2011,32 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    /// The wire mirror must keep an extensions object that carries *only*
+    /// receipts. It previously used a hand-rolled emptiness predicate that knew
+    /// about to-device and e2ee alone, so a receipts-only response serialised
+    /// with the whole extensions object dropped — the synthesised receipt was
+    /// built and then silently discarded at the JSON edge.
+    #[test]
+    fn wire_keeps_a_receipts_only_extensions_object() {
+        use ruma::api::client::sync::sync_events::v5;
+
+        let mut resp = v5::Response::new("1".to_owned());
+        resp.extensions.receipts.rooms.insert(
+            ruma::room_id!("!r:example.org").to_owned(),
+            ruma::serde::Raw::new(&json!({ "type": "m.receipt", "content": {} }))
+                .expect("raw receipt")
+                .cast_unchecked(),
+        );
+
+        let wire = serde_json::to_value(super::SyncResponseWire::from(resp)).expect("serialise");
+        assert!(
+            wire["extensions"]["receipts"]["rooms"]
+                .get("!r:example.org")
+                .is_some(),
+            "receipts must survive the wire mirror: {wire}"
+        );
+    }
 
     fn test_config(tmp: &TempDir) -> Config {
         Config {

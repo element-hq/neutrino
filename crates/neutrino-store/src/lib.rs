@@ -552,6 +552,78 @@ pub trait FederationOutbox: Send + Sync {
     ) -> Result<(), StorageError>;
 }
 
+/// Federation delivery marks: the newest event of a room that a given
+/// destination has acknowledged receiving.
+///
+/// The fact is produced by the outbound sender when a peer 2xx's a `/send`
+/// transaction, and consumed by sync to synthesise delivery receipts. It is a
+/// **high-water mark, one row per (room, destination)** — the same "up to and
+/// including" shape a read receipt has — so it costs O(rooms × peers) rather
+/// than O(events × peers), and a mark that is missed (a crash between the 2xx
+/// and the write) is repaired by the next delivery to that peer rather than
+/// being lost for good.
+///
+/// What the mark actually asserts is weaker than "applied": our own `/send`
+/// returns 200 once a transaction's PDUs are durably *staged*, so the peer may
+/// still drop an event at auth. Delivery, not acceptance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivery {
+    pub room_id: OwnedRoomId,
+    pub destination: OwnedServerName,
+    /// The newest event in `room_id` that `destination` has acknowledged.
+    pub event_id: OwnedEventId,
+    /// When the acknowledgement arrived (Unix ms), for the receipt's `ts`.
+    pub ts: u64,
+    /// This mark's position in the delivery stream — see [`DeliveryPos`].
+    pub pos: DeliveryPos,
+}
+
+/// Position in the delivery stream, advanced every time a mark moves forward.
+///
+/// Distinct from [`StreamPos`]: that orders *events*, this orders
+/// *acknowledgements of events*, and one event is acknowledged once per peer.
+/// Sync uses it exactly as it uses `StreamPos` — a per-connection high-water
+/// mark, so a delta only carries marks that moved since the client's last
+/// response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct DeliveryPos(pub u64);
+
+#[async_trait]
+pub trait DeliveryStore: Send + Sync {
+    /// Pre:  must only be called after `destination` returned HTTP 2xx for a
+    ///       `/send` transaction carrying `event_id`; `event_id` must be a
+    ///       persisted event in `room_id`.
+    /// Post: moves the `(room_id, destination)` mark to `event_id` and advances
+    ///       the delivery stream, **iff** `event_id` is newer (by `StreamPos`)
+    ///       than the current mark. An older or equal event is a no-op, so an
+    ///       out-of-order or replayed acknowledgement can never walk the mark
+    ///       backwards. An unknown `event_id` is a no-op (not an error): the
+    ///       event was deleted between delivery and this call, which leaves
+    ///       nothing meaningful to mark.
+    async fn record_delivery(
+        &self,
+        destination: &ServerName,
+        room_id: &RoomId,
+        event_id: &EventId,
+        ts: u64,
+    ) -> Result<(), StorageError>;
+
+    /// Pre:  none.
+    /// Post: every mark whose `pos` is strictly greater than `after`, in
+    ///       ascending `pos` order. `DeliveryPos(0)` returns every mark the
+    ///       server holds — which is the whole delivery state, since each
+    ///       (room, destination) keeps exactly one row.
+    async fn deliveries_since(&self, after: DeliveryPos) -> Result<Vec<Delivery>, StorageError>;
+
+    /// Pre:  none.
+    /// Post: returns a receiver whose value is the newest [`DeliveryPos`],
+    ///       advanced by `record_delivery`. Same subscribe-before-query
+    ///       discipline as [`EventStore::subscribe`]: subscribe first, then
+    ///       read, or a mark recorded between the two is missed until the next
+    ///       unrelated wake-up.
+    fn subscribe_deliveries(&self) -> watch::Receiver<DeliveryPos>;
+}
+
 #[async_trait]
 pub trait FederationInbox: Send + Sync {
     /// Pre:  none.
@@ -696,6 +768,7 @@ pub trait StorageBackend:
     + DagStore
     + FederationOutbox
     + FederationInbox
+    + DeliveryStore
     + StagingStore
     + InviteStore
     + IdentityStore
@@ -709,6 +782,7 @@ impl<T> StorageBackend for T where
         + DagStore
         + FederationOutbox
         + FederationInbox
+        + DeliveryStore
         + StagingStore
         + InviteStore
         + IdentityStore

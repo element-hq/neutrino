@@ -12,7 +12,7 @@ use ruma::{OwnedRoomId, RoomId, UserId};
 use serde_json::value::RawValue;
 
 use super::conn::{Conn, ListCfg, RoomSent, SubCfg};
-use super::{SyncError, SyncState};
+use super::{SyncError, SyncState, receipts};
 
 /// How many globally-new events we drain from the store per sync request.
 /// Mobile-scale: the embedded server processes events at modest rates, and a
@@ -167,6 +167,12 @@ pub(super) async fn build_response<S: StorageBackend>(
     resp.txn_id = req.txn_id.clone();
     resp.lists = lists_response;
     resp.rooms = rooms_response;
+    // Delivery receipts: server-enabled and client-opted-in, or nothing at all
+    // (the marks keep accruing either way, so enabling either side later
+    // surfaces the current state rather than starting from empty).
+    if state.delivery_receipts && req.extensions.receipts.enabled == Some(true) {
+        resp.extensions.receipts = receipts::build_receipts(state, conn, initial_sync).await?;
+    }
     Ok(resp)
 }
 

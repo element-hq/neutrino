@@ -34,6 +34,7 @@ use tokio_util::sync::CancellationToken;
 
 mod build;
 mod conn;
+mod receipts;
 
 #[cfg(test)]
 mod tests;
@@ -101,6 +102,11 @@ pub enum SyncError {
 pub struct SyncState<S> {
     pub store: Arc<S>,
     pub registry: ConnRegistry,
+    /// Whether to synthesise delivery receipts from federation delivery marks
+    /// (`Config::delivery_receipts`, off by default — see [`receipts`]). Set by
+    /// the composition root; a client must *also* opt into the receipts
+    /// extension to be sent any.
+    pub delivery_receipts: bool,
     /// Shared shutdown latch. When fired (via `CancellationToken::cancel`),
     /// every in-flight long-poll breaks out of its idle select so the connection
     /// is released promptly instead of waiting up to 30 s for its deadline.
@@ -112,6 +118,7 @@ impl<S> SyncState<S> {
         Self {
             store,
             registry: ConnRegistry::new(),
+            delivery_receipts: false,
             shutdown,
         }
     }
@@ -202,6 +209,10 @@ pub async fn handle<S: StorageBackend>(
     // so any `persist_event` that lands between our query and the watch
     // registration still wakes us. The trait docs spell this out.
     let mut rx = state.store.subscribe();
+    // Same discipline for the delivery stream, which advances independently of
+    // the event stream: a peer acknowledging an event we sent minutes ago is
+    // new data for this client without any new event behind it.
+    let mut delivery_rx = state.store.subscribe_deliveries();
 
     // Short wait while the prior holder (if any) observes the cancel above
     // and unwinds.
@@ -270,14 +281,24 @@ pub async fn handle<S: StorageBackend>(
         //   cache; a body-differing newer request will see the advanced
         //   `conn.pos` and either match it (process fresh) or return
         //   UnknownPos.
-        // - `rx.changed()` fires → new event(s); rebuild with the advanced
-        //   high-water mark.
+        // - `rx.changed()` / `delivery_rx.changed()` fires → new event(s) or a
+        //   new federation delivery mark; rebuild with the advanced high-water
+        //   mark. Either is enough to make the next build non-empty, so they
+        //   share one arm. The delivery half is disabled when receipts are off
+        //   — marks are recorded either way, and waking a client for data the
+        //   next build will not emit is pure battery on the embedded target.
         // - `tokio::time::timeout` elapses → return the current empty resp.
+        let new_data = async {
+            tokio::select! {
+                _ = rx.changed() => {}
+                _ = delivery_rx.changed(), if state.delivery_receipts => {}
+            }
+        };
         tokio::select! {
             biased;
             _ = state.shutdown.cancelled() => break resp,            // server shutting down
             _ = cancel_rx.wait_for(|g| *g > my_gen) => break resp,
-            res = tokio::time::timeout(remaining, rx.changed()) => match res {
+            res = tokio::time::timeout(remaining, new_data) => match res {
                 Ok(_) => continue,
                 Err(_) => break resp,
             },
@@ -388,7 +409,8 @@ fn clamp_timeout(req_timeout: Option<Duration>) -> Duration {
 /// Whether the response carries any user-visible update worth returning to
 /// the client right now (vs. continuing to wait in the long-poll loop).
 ///
-/// **Today's definition is deliberately narrow: `!resp.rooms.is_empty()`.**
+/// **Today's definition is deliberately narrow: a non-empty `rooms`, or a
+/// receipts extension carrying at least one synthesised delivery receipt.**
 /// This is correct *only* for the current scope — the embedded server with
 /// stubbed extensions and no EDUs. The following signals do NOT cause this
 /// helper to return `true`, even though a fully-spec'd server would have to
@@ -397,7 +419,8 @@ fn clamp_timeout(req_timeout: Option<Duration>) -> Duration {
 /// - **Device-list changes** (`extensions.e2ee.device_lists`).
 /// - **New to-device messages** (`extensions.to_device.events`).
 /// - **Account-data updates** (`extensions.account_data.*`).
-/// - **Receipts / typing / presence**.
+/// - **Typing / presence** (and any real, federated receipt — the receipts
+///   below are locally synthesised delivery marks, not EDUs).
 /// - **List `count` changes** (a room joining/leaving the candidate set
 ///   without otherwise being included in `resp.rooms`).
 ///
@@ -410,7 +433,7 @@ fn clamp_timeout(req_timeout: Option<Duration>) -> Duration {
 /// the one place that needs to learn about them — or the loop will hold the
 /// connection open for events the response no longer reflects.
 fn has_data(resp: &v5::Response) -> bool {
-    !resp.rooms.is_empty()
+    !resp.rooms.is_empty() || !resp.extensions.receipts.rooms.is_empty()
 }
 
 /// Echo the e2ee / to_device extensions when the client opted in.

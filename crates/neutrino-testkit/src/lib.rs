@@ -96,6 +96,10 @@ fn spawn_neutrino(
         .env("NEUTRINO_STORAGE_DIR", storage)
         // No startup jitter in tests: a revived server redrains its outbox at once.
         .env("NEUTRINO_STARTUP_JITTER_MS", "0")
+        // Synthesised delivery receipts on, so a test can assert them. Inert for
+        // every other test: the receipts extension is opt-in per request, and
+        // only `sync_receipts` opts in.
+        .env("NEUTRINO_DELIVERY_RECEIPTS", "1")
         .env("RUST_LOG", "info")
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
@@ -504,6 +508,30 @@ impl Harness {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// `i`'s synthesised delivery receipts for `room` — the `m.receipt` content
+    /// (`{event_id: {"m.read": {user: {ts}}}}`) from the receipts extension, or
+    /// `None` if there are none yet.
+    ///
+    /// Each call is a fresh connection (no `pos`), so it always reports the
+    /// server's *current* marks rather than a delta — which is what a polling
+    /// assertion wants.
+    pub async fn sync_receipts(&self, i: usize, room: &str) -> Option<Value> {
+        let body = json!({
+            "lists": { "default": { "ranges": [[0, 99]], "timeline_limit": 1 } },
+            "extensions": { "receipts": { "enabled": true } },
+        });
+        let (st, val) = self.request(i, reqwest::Method::POST, SYNC, body).await;
+        if !(200..300).contains(&st) {
+            return None;
+        }
+        val.get("extensions")?
+            .get("receipts")?
+            .get("rooms")?
+            .get(room)?
+            .get("content")
+            .cloned()
     }
 
     // ---- polls --------------------------------------------------------------

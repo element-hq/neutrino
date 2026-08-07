@@ -442,30 +442,72 @@ async fn deliver_batch<S: StorageBackend + 'static>(
                     }
                 }
             },
-            SendOutcome::Delivered(peer_fes) => match ctx.store.remove_pdus(dest, &ids).await {
-                Ok(()) => {
-                    // The transaction carried `our_fes`, so this 2xx satisfied any
-                    // standing advertisement obligation for the rooms it covered.
-                    if !our_fes.is_empty() {
-                        let room_refs: Vec<&RoomId> = our_fes.keys().map(AsRef::as_ref).collect();
-                        if let Err(e) = ctx.store.remove_advertisements(dest, &room_refs).await {
-                            warn!(%dest, error = %e, "clearing satisfied advertisement obligations");
+            SendOutcome::Delivered(peer_fes) => {
+                // Before the outbox rows go: once they're gone this batch is
+                // unrecoverable, so a mark written after a crashed removal
+                // would be a mark we could never derive again. Recording first
+                // can only ever duplicate (the re-send re-marks the same event,
+                // which the store's max-guard absorbs).
+                record_deliveries(ctx, dest, batch).await;
+                match ctx.store.remove_pdus(dest, &ids).await {
+                    Ok(()) => {
+                        // The transaction carried `our_fes`, so this 2xx satisfied any
+                        // standing advertisement obligation for the rooms it covered.
+                        if !our_fes.is_empty() {
+                            let room_refs: Vec<&RoomId> =
+                                our_fes.keys().map(AsRef::as_ref).collect();
+                            if let Err(e) = ctx.store.remove_advertisements(dest, &room_refs).await
+                            {
+                                warn!(%dest, error = %e, "clearing satisfied advertisement obligations");
+                            }
+                        }
+                        // Reconcile against the heads the peer advertised back. Spawned
+                        // so a peer round-trip doesn't stall this destination's drain.
+                        spawn_reconcile(ctx, dest, peer_fes);
+                        return true;
+                    }
+                    Err(e) => {
+                        // Rows survive a removal fault; back off and re-send under the
+                        // same txn id (the peer dedups) rather than hot-looping.
+                        error!(%dest, error = %e, "removing delivered PDUs from outbox");
+                        if sleep_backoff(backoff, kick_rx).await {
+                            *backoff = BACKOFF_BASE;
                         }
                     }
-                    // Reconcile against the heads the peer advertised back. Spawned
-                    // so a peer round-trip doesn't stall this destination's drain.
-                    spawn_reconcile(ctx, dest, peer_fes);
-                    return true;
                 }
-                Err(e) => {
-                    // Rows survive a removal fault; back off and re-send under the
-                    // same txn id (the peer dedups) rather than hot-looping.
-                    error!(%dest, error = %e, "removing delivered PDUs from outbox");
-                    if sleep_backoff(backoff, kick_rx).await {
-                        *backoff = BACKOFF_BASE;
-                    }
-                }
-            },
+            }
+        }
+    }
+}
+
+/// Mark, per room in the delivered batch, the newest event `dest` has now
+/// acknowledged holding — the raw material sync turns into delivery receipts.
+///
+/// One mark per room rather than per event: the mark means "everything up to
+/// here", exactly as a read receipt does, and the batch is drained in causal
+/// order so the last event of a room in the batch is its newest. `dest`
+/// acknowledged the *transaction*, so every event in it is covered.
+///
+/// Best-effort by design, in both directions:
+/// - A write fault is logged and swallowed. Federation delivery must never
+///   stall on a receipt, and the mark is self-repairing — the next delivery to
+///   this destination re-marks the room from wherever it got to.
+/// - The peer 2xx'd a *durably staged* transaction, not an applied one, so a
+///   marked event can still be dropped later at auth. This is delivery, not
+///   acceptance; see `DeliveryStore`.
+async fn record_deliveries<S: StorageBackend + 'static>(
+    ctx: &SenderCtx<S>,
+    dest: &ServerName,
+    batch: &[neutrino_event::Event],
+) {
+    let mut newest: BTreeMap<&RoomId, &EventId> = BTreeMap::new();
+    for event in batch {
+        newest.insert(&event.room_id, &event.event_id);
+    }
+    let ts = now_ms();
+    for (room, event_id) in newest {
+        if let Err(e) = ctx.store.record_delivery(dest, room, event_id, ts).await {
+            warn!(%dest, %room, error = %e, "recording federation delivery mark");
         }
     }
 }
@@ -1357,6 +1399,135 @@ mod tests {
             1,
             "a batch 4xx must leave the advertisement obligation intact (heads never landed)"
         );
+    }
+
+    /// The delivery marks a store holds, as `(room, destination, event_id)`
+    /// triples — enough to assert both "who was told what" and "how many rows".
+    async fn marks(store: &SqliteStore) -> Vec<(String, String, String)> {
+        use neutrino_store::{DeliveryPos, DeliveryStore};
+        store
+            .deliveries_since(DeliveryPos(0))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| {
+                (
+                    d.room_id.to_string(),
+                    d.destination.to_string(),
+                    d.event_id.to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// A 2xx marks the batch's newest event per room as delivered to that peer
+    /// — one mark, not one per event, since the mark means "up to here".
+    #[tokio::test]
+    async fn delivery_records_the_batch_high_water_mark() {
+        let stub = Arc::new(Stub::default());
+        let dest = peer();
+        let (store, _tmp, room, ids) = store_with_outbox(&dest, 3).await;
+
+        let ctx = test_ctx(store.clone(), stub.clone());
+        let batch = store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await.unwrap();
+        let mut backoff = BACKOFF_BASE;
+        let mut kick_rx = test_backoff();
+        assert!(deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await);
+
+        assert_eq!(
+            marks(&store).await,
+            vec![(
+                room.to_string(),
+                dest.to_string(),
+                ids[2].to_string() // the newest of the three, not all three
+            )]
+        );
+    }
+
+    /// A 4xx drops the batch without marking anything: the peer rejected the
+    /// envelope, so it holds none of it. Claiming delivery here would tick a
+    /// receipt for an event that never landed.
+    #[tokio::test]
+    async fn rejected_batch_records_no_delivery() {
+        let stub = Arc::new(Stub {
+            fail_until: u64::MAX,
+            fail_status: 400,
+            ..Stub::default()
+        });
+        let dest = peer();
+        let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 1).await;
+
+        let ctx = test_ctx(store.clone(), stub.clone());
+        let batch = store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await.unwrap();
+        let mut backoff = BACKOFF_BASE;
+        let mut kick_rx = test_backoff();
+        assert!(deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await);
+
+        assert!(
+            marks(&store).await.is_empty(),
+            "a rejected transaction delivered nothing"
+        );
+    }
+
+    /// An advertisement carries no PDUs, so a 2xx on one says nothing about any
+    /// event and must leave the marks alone.
+    #[tokio::test]
+    async fn advertisement_records_no_delivery() {
+        let stub = Arc::new(Stub::default());
+        let dest = peer();
+        let (store, _tmp, room, _ids) = store_with_outbox(&dest, 0).await;
+        enqueue_advertisement(&store, &room, &dest).await;
+
+        let ctx = test_ctx(store.clone(), stub.clone());
+        let rooms = store.pending_advertisements(&dest).await.unwrap();
+        let mut backoff = BACKOFF_BASE;
+        let mut kick_rx = test_backoff();
+        assert!(send_advertisement(&ctx, &dest, &rooms, &mut backoff, &mut kick_rx).await);
+
+        assert!(
+            marks(&store).await.is_empty(),
+            "an empty-pdus advertisement delivers no event"
+        );
+    }
+
+    /// Two peers are marked independently, each at the event *it* was sent —
+    /// a peer must never inherit another peer's progress.
+    #[tokio::test]
+    async fn marks_are_per_destination() {
+        let stub = Arc::new(Stub::default());
+        let one = peer();
+        let two: OwnedServerName = "other.test".parse().unwrap();
+        // `one` is sent both messages; `two` only the second.
+        let (store, _tmp, room, ids) = store_with_outbox(&one, 1).await;
+        let second = message_on_heads(&store, &room, "second", 1_700_000_001_000).await;
+        commit_with_heads(
+            &store,
+            &second,
+            std::slice::from_ref(&second.event_id),
+            &[&two],
+        )
+        .await;
+
+        let ctx = test_ctx(store.clone(), stub.clone());
+        let mut backoff = BACKOFF_BASE;
+        let mut kick_rx = test_backoff();
+        for dest in [&one, &two] {
+            let batch = store.pending_pdus(dest, MAX_PDUS_PER_TXN).await.unwrap();
+            assert!(deliver_batch(&ctx, dest, &batch, &mut backoff, &mut kick_rx).await);
+        }
+
+        let mut got = marks(&store).await;
+        got.sort();
+        let mut want = vec![
+            (room.to_string(), one.to_string(), ids[0].to_string()),
+            (
+                room.to_string(),
+                two.to_string(),
+                second.event_id.to_string(),
+            ),
+        ];
+        want.sort();
+        assert_eq!(got, want);
     }
 
     #[test]

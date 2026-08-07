@@ -97,6 +97,18 @@ pub struct Config {
     /// directory its bug reporter collects from. The server creates the
     /// directory if missing.
     pub log_dir: Option<PathBuf>,
+    /// Whether `/sync` surfaces synthesised delivery receipts: an `m.read`
+    /// receipt for a remote user once that user's server has 2xx'd the
+    /// federation transaction carrying the event. Off by default because the
+    /// receipt is a deliberate lie — the remote server *received* the event, it
+    /// did not read it — so only a deployment whose client is written to read it
+    /// that way should ask for it.
+    ///
+    /// This gates the client surface only. The underlying per-(room,
+    /// destination) delivery marks are recorded regardless (see
+    /// `DeliveryStore`), so flipping this on takes effect immediately rather
+    /// than from the next delivery onwards.
+    pub delivery_receipts: bool,
 }
 
 impl Default for Config {
@@ -113,6 +125,7 @@ impl Default for Config {
             enable_soft_failure: true,
             trusted_network: true,
             log_dir: None,
+            delivery_receipts: false,
         }
     }
 }
@@ -155,6 +168,10 @@ impl Config {
             // Unset (the default) = stdout only; the embedded host sets this
             // over the FFI rather than through the environment.
             log_dir: std::env::var("NEUTRINO_LOG_DIR").ok().map(PathBuf::from),
+            // Default off; `NEUTRINO_DELIVERY_RECEIPTS=1`/`true` opts in (see
+            // the field docs — the receipts are synthesised, not real).
+            delivery_receipts: std::env::var("NEUTRINO_DELIVERY_RECEIPTS")
+                .is_ok_and(|v| matches!(v.as_str(), "1" | "true")),
             // `localpart` (and any future non-env field) defaults from `Default`,
             // so the value lives in exactly one place.
             ..Default::default()
