@@ -251,8 +251,12 @@ pub(crate) fn complete_membership_template(
     // rebuilt below, re-validated by `EventBuilder::build`, and auth-checked
     // by the resident), so a `Wire::Rejected` template is as usable as a
     // valid one.
-    let parsed = match neutrino_event::event_builder::from_wire(raw, Vec::new())
-        .map(|uw| uw.admit_on_faith())
+    let parsed = match neutrino_event::event_builder::from_wire(
+        raw,
+        Vec::new(),
+        &neutrino_event::event_id::REFERENCE_HASH_IDS,
+    )
+    .map(|uw| uw.admit_on_faith())
     {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
         Ok(neutrino_event::Wire::Rejected(ev, defect)) => {

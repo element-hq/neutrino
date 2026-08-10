@@ -93,6 +93,18 @@ impl<'a> EventRow<'a> {
 fn debug_assert_event_id_matches_raw(event: &Event) {
     #[cfg(debug_assertions)]
     {
+        // A deployment can nominate a different `EventIdScheme`, whose ids this
+        // check cannot reproduce — storage has no scheme to hand, and threading
+        // one through `From<&Event>` (a conversion, not a store method) would
+        // put the scheme on `SqliteStore::open`, which runs *before* the
+        // composition root has resolved it. Those ids are checked at their only
+        // two sources instead (`EventBuilder::build` and `from_wire`, which
+        // derive from the same canonical bytes this would re-read), so restrict
+        // the check to ids the default scheme can produce. Every event in this
+        // repository is in that shape.
+        if !neutrino_event::event_id::is_reference_hash_id(&event.event_id) {
+            return;
+        }
         match neutrino_event::event_id::compute_event_id(&event.raw) {
             Ok(computed) if computed == event.event_id => {}
             Ok(computed) => panic!(

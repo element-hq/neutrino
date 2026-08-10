@@ -1878,6 +1878,7 @@ async fn send_semantically_malformed_ancestor_terminates_via_cascade_reject() {
     let bad = neutrino_event::event_builder::from_wire(
         serde_json::value::RawValue::from_string(bad_raw.to_string()).expect("valid JSON"),
         Vec::new(),
+        &neutrino_event::event_id::REFERENCE_HASH_IDS,
     )
     .expect("parseable PDU")
     .admit_on_faith()
@@ -2655,7 +2656,7 @@ async fn reconcile_ignores_advertisement_from_non_member_peer() {
     neutrino_engine::reconcile::reconcile_room(
         &*store,
         &*fetcher,
-        &neutrino_event::EventSecurity::TrustedNetwork,
+        &neutrino_event::EventPolicy::trusted_network(),
         &poke_tx,
         peer,
         &room_id,

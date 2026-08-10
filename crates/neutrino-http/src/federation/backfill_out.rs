@@ -9,7 +9,7 @@
 //! [`persist_historical_event`](neutrino_store::EventStore::persist_historical_event))
 //! with the outbound [`FederationClient::backfill`] client call.
 
-use neutrino_event::EventSecurity;
+use neutrino_event::EventPolicy;
 use neutrino_store::{DagStore, EventStore, StateStore};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::RoomId;
@@ -30,7 +30,7 @@ const MAX_SEEDS: usize = 5;
 pub(crate) async fn backfill_once(
     store: &SqliteStore,
     client: &FederationClient,
-    security: &EventSecurity,
+    policy: &EventPolicy,
     own_server: &str,
     room_id: &RoomId,
     limit: u32,
@@ -58,7 +58,7 @@ pub(crate) async fn backfill_once(
     // move on to the next.
     for dest in dests {
         match client.backfill(&dest, room_id, &seeds, limit).await {
-            Ok(pdus) => return persist_pdus(store, security, room_id, pdus, limit).await,
+            Ok(pdus) => return persist_pdus(store, policy, room_id, pdus, limit).await,
             Err(e) => {
                 info!(target: "neutrino_http", %dest, %room_id, error = %e, "backfill: peer failed, trying next");
             }
@@ -78,7 +78,7 @@ pub(crate) async fn backfill_once(
 /// return more — `.take(limit)` bounds how many we persist regardless.
 async fn persist_pdus(
     store: &SqliteStore,
-    security: &EventSecurity,
+    policy: &EventPolicy,
     room_id: &RoomId,
     pdus: Vec<Box<serde_json::value::RawValue>>,
     limit: u32,
@@ -91,7 +91,7 @@ async fn persist_pdus(
         // must carry the verdict so a descendant's reference check
         // cascade-rejects, and so the malformed content can never surface as
         // an accepted row (clients filter rejected; state-res excludes it).
-        let event = match security.admit_wire(raw).await {
+        let event = match policy.admit_wire(raw).await {
             Ok(neutrino_event::Wire::Valid(ev)) => ev,
             Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
                 warn!(target: "neutrino_http", %room_id, event_id = %ev.event_id, %defect, "backfill: serving malformed PDU as rejected");
@@ -308,7 +308,7 @@ mod tests {
         let n = backfill_once(
             &store,
             &client,
-            &EventSecurity::TrustedNetwork,
+            &EventPolicy::trusted_network(),
             OWN,
             &room_id,
             10,
@@ -333,7 +333,7 @@ mod tests {
         let n = backfill_once(
             &store,
             &client,
-            &EventSecurity::TrustedNetwork,
+            &EventPolicy::trusted_network(),
             OWN,
             &room_id,
             10,
@@ -356,7 +356,7 @@ mod tests {
         let n = backfill_once(
             &store,
             &client,
-            &EventSecurity::TrustedNetwork,
+            &EventPolicy::trusted_network(),
             OWN,
             &room_id,
             10,
@@ -395,6 +395,7 @@ mod tests {
         let bad_id = from_wire(
             serde_json::value::RawValue::from_string(bad_raw.clone()).expect("valid JSON"),
             Vec::new(),
+            &neutrino_event::event_id::REFERENCE_HASH_IDS,
         )
         .expect("parseable")
         .admit_on_faith()
@@ -406,7 +407,7 @@ mod tests {
         let n = backfill_once(
             &store,
             &client,
-            &EventSecurity::TrustedNetwork,
+            &EventPolicy::trusted_network(),
             OWN,
             &room_id,
             10,
@@ -437,7 +438,7 @@ mod tests {
         let n = backfill_once(
             &store,
             &client,
-            &EventSecurity::TrustedNetwork,
+            &EventPolicy::trusted_network(),
             OWN,
             &room_id,
             3,
@@ -469,7 +470,7 @@ mod tests {
         let n = backfill_once(
             &store,
             &client,
-            &EventSecurity::TrustedNetwork,
+            &EventPolicy::trusted_network(),
             OWN,
             &room_id,
             10,
@@ -492,6 +493,7 @@ mod tests {
         let held: Event = from_wire(
             serde_json::value::RawValue::from_string(held_raw.clone()).unwrap(),
             Vec::new(),
+            &neutrino_event::event_id::REFERENCE_HASH_IDS,
         )
         .expect("parse held")
         .admit_on_faith()
@@ -507,7 +509,7 @@ mod tests {
         let n = backfill_once(
             &store,
             &client,
-            &EventSecurity::TrustedNetwork,
+            &EventPolicy::trusted_network(),
             OWN,
             &room_id,
             10,
@@ -541,6 +543,7 @@ mod tests {
         let held: Event = from_wire(
             serde_json::value::RawValue::from_string(held_raw.clone()).unwrap(),
             Vec::new(),
+            &neutrino_event::event_id::REFERENCE_HASH_IDS,
         )
         .expect("parse held")
         .admit_on_faith()
@@ -566,7 +569,7 @@ mod tests {
         let n = backfill_once(
             &store,
             &client,
-            &EventSecurity::TrustedNetwork,
+            &EventPolicy::trusted_network(),
             OWN,
             &room_id,
             10,
@@ -612,7 +615,7 @@ mod tests {
         let n = backfill_once(
             &store,
             &client,
-            &EventSecurity::TrustedNetwork,
+            &EventPolicy::trusted_network(),
             OWN,
             &room_id,
             10,

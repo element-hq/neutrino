@@ -125,13 +125,13 @@ pub(crate) async fn handle(
         return Err(FedError::BadRequest("transaction exceeds 50 PDUs"));
     }
 
-    let (store, worker_poke, fetcher, security, our_name) = {
+    let (store, worker_poke, fetcher, policy, our_name) = {
         let app = lock_app(&state);
         (
             app.store.clone(),
             app.worker_poke.clone(),
             app.fetcher.clone(),
-            app.security.clone(),
+            app.policy.clone(),
             app.config.server_name.clone(),
         )
     };
@@ -198,8 +198,12 @@ pub(crate) async fn handle(
         // Drop-class PDUs (`Err`) are unkeyable and never enter the system;
         // `Wire::Rejected` ones are staged like any other — the worker persists
         // them rejected (the cascade terminator).
-        let event = match neutrino_event::event_builder::from_wire(raw, Vec::new())
-            .map(|uw| uw.admit_on_faith())
+        let event = match neutrino_event::event_builder::from_wire(
+            raw,
+            Vec::new(),
+            &neutrino_event::event_id::REFERENCE_HASH_IDS,
+        )
+        .map(|uw| uw.admit_on_faith())
         {
             Ok(neutrino_event::Wire::Valid(ev)) => ev,
             Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
@@ -286,14 +290,14 @@ pub(crate) async fn handle(
     for (room, heads) in advertised {
         let store = store.clone();
         let fetcher = fetcher.clone();
-        let security = security.clone();
+        let policy = policy.clone();
         let worker_poke = worker_poke.clone();
         let origin = origin.clone();
         tokio::spawn(async move {
             reconcile::reconcile_room(
                 &*store,
                 &*fetcher,
-                &security,
+                &policy,
                 &worker_poke,
                 &origin,
                 &room,

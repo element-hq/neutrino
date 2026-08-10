@@ -165,6 +165,14 @@ pub enum FormatError {
     /// detail from `verify_event_signature`.
     #[error("signature check failed: {0}")]
     SignatureCheck(String),
+
+    /// The deployment's [`EventIdScheme`](crate::event_id::EventIdScheme)
+    /// could not derive an id for this event: the fields its derivation reads
+    /// are absent or malformed. Never raised by the default reference-hash
+    /// scheme, whose only failure mode is a redaction precondition (already
+    /// covered by `MissingField` / `InvalidFieldType`).
+    #[error("cannot derive event id: {0}")]
+    EventId(String),
 }
 
 /// What a [`validate_pdu`] failure means for a federation PDU, mirroring the
@@ -229,7 +237,10 @@ pub fn semantic_verdict(err: &FormatError) -> SemanticVerdict {
         // S-S receipt-check "Passes signature checks, otherwise it is
         // dropped": provenance failure means the event never enters the
         // system (unlike hash mismatch, which redacts and continues).
-        | FormatError::SignatureCheck(_) => Drop,
+        | FormatError::SignatureCheck(_)
+        // An event whose id cannot be derived cannot be named, stored or
+        // referenced, so it never enters the system.
+        | FormatError::EventId(_) => Drop,
 
         // State-independent auth rules: the spec says reject.
         FormatError::StateKeyAtSignSenderMismatch

@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use neutrino_event::EventSecurity;
+use neutrino_event::EventPolicy;
 use neutrino_store::{StateStore, StorageBackend};
 use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId, ServerName};
 use tokio::sync::mpsc;
@@ -126,7 +126,7 @@ pub fn strip_known(
 pub async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
     store: &impl StorageBackend,
     fetcher: &F,
-    security: &EventSecurity,
+    policy: &EventPolicy,
     worker_poke: &mpsc::Sender<OwnedRoomId>,
     peer: &ServerName,
     room_id: &RoomId,
@@ -175,7 +175,7 @@ pub async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
     let mut staged = fetch_unknown(
         store,
         fetcher,
-        security,
+        policy,
         peer,
         room_id,
         &advertised.state,
@@ -188,7 +188,7 @@ pub async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
         fetch_unknown(
             store,
             fetcher,
-            security,
+            policy,
             peer,
             room_id,
             &advertised.timeline,
@@ -223,7 +223,7 @@ pub async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
 async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
     store: &impl StorageBackend,
     fetcher: &F,
-    security: &EventSecurity,
+    policy: &EventPolicy,
     peer: &ServerName,
     room_id: &RoomId,
     heads: &[OwnedEventId],
@@ -290,7 +290,7 @@ async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
         // Rejected wire events are staged too (the worker persists them
         // rejected; cascade termination needs the row); drop-class events
         // (`Err`) never enter the system.
-        let Ok(wire) = security.admit_wire(raw).await else {
+        let Ok(wire) = policy.admit_wire(raw).await else {
             continue;
         };
         if let neutrino_event::Wire::Rejected(rej, defect) = &wire {

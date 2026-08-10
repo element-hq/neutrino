@@ -210,6 +210,79 @@ pub enum ComputeIdError {
     Redaction(RedactionError),
 }
 
+/// How event ids are derived from event bytes.
+///
+/// v12 mandates the reference hash ([`ReferenceHashIds`], the default and the
+/// only scheme in this repository). The trait exists so a *medium* can nominate
+/// a cheaper derivation.
+///
+/// The load-bearing invariant is that an id stays a pure function of the event's
+/// canonical bytes: nothing transmits an id, every receiver recomputes the same
+/// one, and no side table exists. That is why the outbound and inbound halves
+/// are split — [`stamp`](Self::stamp) may *add* the inputs an id is derived
+/// from, but only [`derive`](Self::derive) turns bytes into an id, and both the
+/// authoring and the receiving side call it.
+pub trait EventIdScheme: Send + Sync + std::fmt::Debug {
+    /// Outbound only: stamp any identity-bearing fields this scheme needs into
+    /// `obj`. Runs *before* the content hash and the signature are computed, so
+    /// both cover whatever is inserted. Default: insert nothing.
+    fn stamp(&self, obj: &mut CanonicalJsonObject) -> Result<(), EventIdError> {
+        let _ = obj;
+        Ok(())
+    }
+
+    /// The event's id, from its canonical object alone. Pure — no side effects,
+    /// no I/O, no dependence on room state or on what the receiver has seen.
+    fn derive(&self, obj: &CanonicalJsonObject) -> Result<OwnedEventId, EventIdError>;
+}
+
+/// Failure modes for an [`EventIdScheme`].
+#[derive(Debug, Error)]
+pub enum EventIdError {
+    /// The object violates ruma's redaction preconditions (missing `type`,
+    /// non-object `content`/`hashes`/`signatures`) — only the reference-hash
+    /// scheme can raise this.
+    #[error("redaction precondition failed: {0}")]
+    Redaction(RedactionError),
+
+    /// The scheme's own inputs are missing or malformed on this event.
+    #[error("event id scheme: {0}")]
+    Scheme(String),
+}
+
+/// The v12 scheme: `event_id = "$" + b64url(reference_hash(event))`.
+///
+/// Stamps nothing — the id is already a function of the bytes as they stand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReferenceHashIds;
+
+/// The default scheme, as a `'static` reference for callers that have no
+/// configured scheme to hand (test fixtures, the dev binary, every call site
+/// that predates the seam).
+pub static REFERENCE_HASH_IDS: ReferenceHashIds = ReferenceHashIds;
+
+impl EventIdScheme for ReferenceHashIds {
+    fn derive(&self, obj: &CanonicalJsonObject) -> Result<OwnedEventId, EventIdError> {
+        let rh = reference_hash(obj).map_err(EventIdError::Redaction)?;
+        Ok(event_id_from_hash(&rh))
+    }
+}
+
+/// Whether `id` has the shape [`ReferenceHashIds`] produces: `$` followed by
+/// exactly 43 url-safe-base64 characters.
+///
+/// Used by storage's debug-build round-trip assert, which can only re-derive
+/// the default scheme (it has no configured [`EventIdScheme`] to hand) and so
+/// must skip ids minted by any other one.
+pub fn is_reference_hash_id(id: &EventId) -> bool {
+    let b = id.as_str().as_bytes();
+    b.len() == 44
+        && b[0] == b'$'
+        && b[1..]
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_')
+}
+
 /// Derive a room_id from a create event's event_id.
 ///
 /// Room v12 uses `RoomIdFormatVersion::V2`: the room_id is the create event's
@@ -492,6 +565,19 @@ mod tests {
         let hash = [0_u8; 32];
         let id = event_id_from_hash(&hash);
         assert_eq!(id.as_str(), "$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    }
+
+    /// A pluggable [`EventIdScheme`] can mint ids that are neither 43 chars
+    /// nor base64, and `room_id_from_create` turns any of them into a room id
+    /// by sigil swap — so if ruma rejected such a shape, the swap would panic
+    /// on every create. Uses a short id containing `_`, the character most
+    /// likely to be refused by a stricter parser.
+    #[test]
+    fn short_non_base64_id_parses_as_event_id_and_room_id() {
+        let id = OwnedEventId::try_from("$1700000000000_3").expect("short event id parses");
+        assert_eq!(id.as_str(), "$1700000000000_3");
+        let room_id = room_id_from_create(&id);
+        assert_eq!(room_id.as_str(), "!1700000000000_3");
     }
 
     #[test]

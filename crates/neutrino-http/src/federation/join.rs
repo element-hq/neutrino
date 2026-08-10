@@ -32,7 +32,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use neutrino_event::{EventSecurity, ROOM_VERSION_ID};
+use neutrino_event::{EventPolicy, ROOM_VERSION_ID};
 use neutrino_store::{InviteStore, RoomStore, StagingStore, StateStore, StreamPos};
 use ruma::{OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId};
 use serde_json::json;
@@ -138,12 +138,12 @@ async fn run_join_dance(
     candidates: &[OwnedServerName],
     timeout: Duration,
 ) -> JoinOutcome {
-    let (store, worker_poke, security, own_server, federation_proxy) = {
+    let (store, worker_poke, policy, own_server, federation_proxy) = {
         let app = lock_app(state);
         (
             app.store.clone(),
             app.worker_poke.clone(),
-            app.security.clone(),
+            app.policy.clone(),
             app.config.server_name.clone(),
             app.config.federation_proxy.clone(),
         )
@@ -162,7 +162,7 @@ async fn run_join_dance(
             &client,
             &*store,
             &worker_poke,
-            &security,
+            &policy,
             dest,
             room_id,
             &user,
@@ -356,7 +356,7 @@ async fn try_join_via(
     client: &FederationClient,
     store: &(impl RoomStore + StagingStore),
     worker_poke: &mpsc::Sender<OwnedRoomId>,
-    security: &EventSecurity,
+    policy: &EventPolicy,
     dest: &ServerName,
     room_id: &RoomId,
     user: &UserId,
@@ -371,7 +371,7 @@ async fn try_join_via(
     }
 
     let join = crate::federation::complete_membership_template(
-        security.signer().cloned(),
+        policy.signer().cloned(),
         &template.event,
         room_id,
         user,
@@ -386,7 +386,7 @@ async fn try_join_via(
         .await
         .map_err(|e| from_client_err(e, "send_join request failed"))?;
 
-    ingest_state_dag(store, worker_poke, security, dest, room_id, resp)
+    ingest_state_dag(store, worker_poke, policy, dest, room_id, resp)
         .await
         .map_err(gateway)
 }
@@ -397,7 +397,7 @@ async fn try_join_via(
 async fn ingest_state_dag(
     store: &(impl RoomStore + StagingStore),
     worker_poke: &mpsc::Sender<OwnedRoomId>,
-    security: &EventSecurity,
+    policy: &EventPolicy,
     origin: &ServerName,
     room_id: &RoomId,
     resp: SendJoinResponse,
@@ -409,7 +409,7 @@ async fn ingest_state_dag(
         .chain(resp.timeline)
         .chain(std::iter::once(resp.event))
     {
-        match security.admit_wire(raw).await {
+        match policy.admit_wire(raw).await {
             Ok(neutrino_event::Wire::Valid(ev)) => events.push(ev),
             // Rejected events are staged too — they persist as rejected rows
             // so references to them cascade-reject instead of gapfilling.

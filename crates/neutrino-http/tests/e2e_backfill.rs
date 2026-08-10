@@ -80,7 +80,7 @@ async fn start_node(localpart: &str) -> Node {
             cmd_rx,
             std::sync::Arc::new(DiscoveryRegistry::new()),
             None,
-            neutrino_event::EventSecurity::TrustedNetwork,
+            neutrino_event::EventPolicy::trusted_network(),
         )
         .await;
     });

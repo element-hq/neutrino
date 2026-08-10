@@ -55,7 +55,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use neutrino_event::{Event, EventSecurity};
+use neutrino_event::{Event, EventPolicy};
 use neutrino_store::{StagedPdu, StorageBackend, WithStateProvider};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, RoomId};
 use tokio::sync::{Notify, mpsc};
@@ -80,8 +80,8 @@ struct WorkerCtx<S> {
     store: Arc<S>,
     registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
-    /// Deployment-wide security policy from the medium's declared link trust.
-    security: EventSecurity,
+    /// Deployment-wide event policy from the medium's declared link trust.
+    policy: EventPolicy,
     /// Backoff floor; [`BACKOFF_BASE`] in production, near-zero in tests so the
     /// retry path runs without real delays.
     backoff_base: Duration,
@@ -95,7 +95,7 @@ impl<S> Clone for WorkerCtx<S> {
             store: self.store.clone(),
             registry: self.registry.clone(),
             fetcher: self.fetcher.clone(),
-            security: self.security.clone(),
+            policy: self.policy.clone(),
             backoff_base: self.backoff_base,
         }
     }
@@ -118,9 +118,9 @@ pub fn spawn<S: StorageBackend + WithStateProvider + 'static>(
     store: Arc<S>,
     registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
-    security: EventSecurity,
+    policy: EventPolicy,
 ) -> mpsc::Sender<OwnedRoomId> {
-    spawn_with(store, registry, fetcher, security, BACKOFF_BASE)
+    spawn_with(store, registry, fetcher, policy, BACKOFF_BASE)
 }
 
 /// Inner spawn with the backoff floor made explicit, so tests can drive the
@@ -129,7 +129,7 @@ fn spawn_with<S: StorageBackend + WithStateProvider + 'static>(
     store: Arc<S>,
     registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
-    security: EventSecurity,
+    policy: EventPolicy,
     backoff_base: Duration,
 ) -> mpsc::Sender<OwnedRoomId> {
     let (tx, rx) = mpsc::channel(POKE_BUFFER);
@@ -137,7 +137,7 @@ fn spawn_with<S: StorageBackend + WithStateProvider + 'static>(
         store,
         registry,
         fetcher,
-        security,
+        policy,
         backoff_base,
     };
     tokio::spawn(supervise(ctx, rx));
@@ -263,7 +263,7 @@ async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
 }
 
 /// Admit each eligible staged row to a [`Staged`] under the deployment policy
-/// ([`EventSecurity::admit_wire`]). This is where a staged row's signature is
+/// ([`EventPolicy::admit_wire`]). This is where a staged row's signature is
 /// verified on a signed deployment: `/send` stages on faith and defers the
 /// check here (the worker is the sole staged→applied authority). A row that
 /// fails admission — no longer parses, fails its content hash, or (under
@@ -275,7 +275,7 @@ async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
 ) -> Vec<Staged> {
     let mut out = Vec::with_capacity(eligible.len());
     for p in eligible {
-        match ctx.security.admit_wire(p.raw.clone()).await {
+        match ctx.policy.admit_wire(p.raw.clone()).await {
             // Both variants proceed: a `Wire::Rejected` event carries
             // `rejected = true` and `apply_pdu` short-circuits it to a
             // rejected persist (the cascade terminator).
@@ -337,7 +337,7 @@ async fn process_one<S: StorageBackend + WithStateProvider + 'static>(
                 &staged.origin,
                 &staged.event,
                 &*ctx.fetcher,
-                &ctx.security,
+                &ctx.policy,
             )
             .await
             {

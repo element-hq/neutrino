@@ -47,7 +47,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use ruma::canonical_json::{CanonicalJsonObject, CanonicalJsonValue, RedactionError};
 use thiserror::Error;
 
-use crate::event_id::{b64_unpadded, canonical, redact_to_canonical_bytes};
+use crate::event_id::{EventIdScheme, b64_unpadded, canonical, redact_to_canonical_bytes};
 
 /// The fixed key id this server signs under. No rotation mechanics: the
 /// signing key is the node identity secret, so the key lives exactly as long
@@ -317,22 +317,6 @@ impl EventSecurity {
         }
     }
 
-    /// Parse wire bytes and admit the result under this policy in one step:
-    /// [`from_wire`](crate::event_builder::from_wire) (id derivation,
-    /// content-hash verify/redact, format + semantic classification) composed
-    /// with [`admit`](Self::admit) (signature check under `Signed`, on faith
-    /// under `TrustedNetwork`). The single parse+admit seam for inbound
-    /// federation bytes — the HTTP handlers and the engine
-    /// worker/reconcile/gapfill all funnel through here so the contract can't
-    /// drift between crates.
-    pub async fn admit_wire(
-        &self,
-        raw: Box<serde_json::value::RawValue>,
-    ) -> Result<crate::Wire, crate::FormatError> {
-        self.admit(crate::event_builder::from_wire(raw, Vec::new())?)
-            .await
-    }
-
     /// The signer for locally-authored events — `None` on a trusted network
     /// (events MUST NOT carry signatures there).
     pub fn signer(&self) -> Option<&std::sync::Arc<EventSigner>> {
@@ -340,6 +324,65 @@ impl EventSecurity {
             EventSecurity::TrustedNetwork => None,
             EventSecurity::Signed { signer, .. } => Some(signer),
         }
+    }
+}
+
+/// The two event-level facts a deployment owns, composed once at the
+/// composition root and threaded as one value: how provenance is established
+/// ([`EventSecurity`]) and how ids are derived ([`EventIdScheme`]).
+///
+/// They are independent — every combination is a real deployment — so this is
+/// a carrier, not a policy enum. It exists because the one place that needs
+/// both at once is the parse+admit seam ([`admit_wire`](Self::admit_wire)),
+/// and because threading two parameters through the same dozen signatures
+/// would be twice the churn for the same fact.
+#[derive(Clone, Debug)]
+pub struct EventPolicy {
+    pub security: EventSecurity,
+    pub ids: std::sync::Arc<dyn EventIdScheme>,
+}
+
+impl EventPolicy {
+    /// Compose from the deployment's two facts. `ids: None` selects the v12
+    /// reference hash — the spec's scheme and the only one in this repository.
+    pub fn new(security: EventSecurity, ids: Option<std::sync::Arc<dyn EventIdScheme>>) -> Self {
+        Self {
+            security,
+            ids: ids.unwrap_or_else(|| std::sync::Arc::new(crate::event_id::ReferenceHashIds)),
+        }
+    }
+
+    /// A trusted-network policy on the default id scheme — the shape almost
+    /// every test wants.
+    pub fn trusted_network() -> Self {
+        Self::new(EventSecurity::TrustedNetwork, None)
+    }
+
+    /// Parse wire bytes and admit the result under this policy in one step:
+    /// [`from_wire`](crate::event_builder::from_wire) (id derivation,
+    /// content-hash verify/redact, format + semantic classification) composed
+    /// with [`admit`](EventSecurity::admit) (signature check under `Signed`,
+    /// on faith under `TrustedNetwork`). The single parse+admit seam for
+    /// inbound federation bytes — the HTTP handlers and the engine
+    /// worker/reconcile/gapfill all funnel through here so the contract can't
+    /// drift between crates.
+    pub async fn admit_wire(
+        &self,
+        raw: Box<serde_json::value::RawValue>,
+    ) -> Result<crate::Wire, crate::FormatError> {
+        self.security
+            .admit(crate::event_builder::from_wire(
+                raw,
+                Vec::new(),
+                self.ids.as_ref(),
+            )?)
+            .await
+    }
+
+    /// The signer for locally-authored events — see
+    /// [`EventSecurity::signer`].
+    pub fn signer(&self) -> Option<&std::sync::Arc<EventSigner>> {
+        self.security.signer()
     }
 }
 

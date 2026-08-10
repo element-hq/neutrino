@@ -7,8 +7,8 @@ pub mod validate;
 pub use event::Event;
 pub use event_builder::{UnverifiedWire, Wire};
 pub use sign::{
-    CoSignError, EventSecurity, EventSigner, KeyResolveError, KeyResolver, NodeIdKeyResolver,
-    SIGNING_KEY_ID, VerifyError, verify_event_signature, verify_event_signed_by,
+    CoSignError, EventPolicy, EventSecurity, EventSigner, KeyResolveError, KeyResolver,
+    NodeIdKeyResolver, SIGNING_KEY_ID, VerifyError, verify_event_signature, verify_event_signed_by,
 };
 pub use validate::{FormatError, SemanticVerdict, semantic_verdict};
 

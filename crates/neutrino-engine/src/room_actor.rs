@@ -135,10 +135,10 @@ struct RoomActor<S> {
     /// set so we never federate an event back to ourselves. Held as a `String`
     /// (the config form) since it's only ever compared by value.
     own_server: String,
-    /// Signs every locally-built event when the deployment is
-    /// signed deployments; `None` on a trusted network (events then MUST NOT
-    /// carry signatures). Handed to `RoomCore::build_local_event`.
-    signer: Option<Arc<neutrino_event::EventSigner>>,
+    /// The deployment's event policy: how locally-built events are signed
+    /// (never, on a trusted network) and how their ids are derived. Handed to
+    /// `RoomCore::build_local_event`.
+    policy: neutrino_event::EventPolicy,
 }
 
 impl<S: StorageBackend + WithStateProvider + 'static> RoomActor<S> {
@@ -192,13 +192,9 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomActor<S> {
         state_key: Option<String>,
         content: Value,
     ) -> Result<Arc<Event>, RoomActorError> {
-        let event = self.room.build_local_event(
-            sender,
-            event_type,
-            state_key,
-            content,
-            self.signer.clone(),
-        )?;
+        let event =
+            self.room
+                .build_local_event(sender, event_type, state_key, content, &self.policy)?;
         Ok(Arc::new(event))
     }
 
@@ -362,13 +358,9 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomActor<S> {
         // Build the event on the room's current heads — the state machine owns
         // the builder (`RoomCore::build_local_event`) so the actor and the
         // createRoom batch share one construction path.
-        let event = self.room.build_local_event(
-            sender,
-            event_type,
-            state_key,
-            content,
-            self.signer.clone(),
-        )?;
+        let event =
+            self.room
+                .build_local_event(sender, event_type, state_key, content, &self.policy)?;
 
         let (next, effects) = self.run_apply("local", event).await?;
 
@@ -610,21 +602,17 @@ pub struct RoomRegistry<S> {
     /// This homeserver's own name, handed to each spawned actor so it can
     /// exclude itself from outbound federation destinations.
     own_server: String,
-    /// Cloned into every spawned actor — see `RoomActor::signer`.
-    signer: Option<Arc<neutrino_event::EventSigner>>,
+    /// Cloned into every spawned actor — see `RoomActor::policy`.
+    policy: neutrino_event::EventPolicy,
     actors: Mutex<HashMap<OwnedRoomId, mpsc::Sender<Command>>>,
 }
 
 impl<S: StorageBackend + WithStateProvider + 'static> RoomRegistry<S> {
-    pub fn new(
-        store: Arc<S>,
-        own_server: String,
-        signer: Option<Arc<neutrino_event::EventSigner>>,
-    ) -> Self {
+    pub fn new(store: Arc<S>, own_server: String, policy: neutrino_event::EventPolicy) -> Self {
         Self {
             store,
             own_server,
-            signer,
+            policy,
             actors: Mutex::new(HashMap::new()),
         }
     }
@@ -756,7 +744,7 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomRegistry<S> {
                 room,
                 store: self.store.clone(),
                 own_server: self.own_server.clone(),
-                signer: self.signer.clone(),
+                policy: self.policy.clone(),
             }
             .run(rx),
         );
@@ -805,7 +793,11 @@ mod tests {
             .expect("build create");
         let room_id = create.room_id.clone();
         store.create_room(&create, &[]).await.expect("create_room");
-        let registry = RoomRegistry::new(store.clone(), "example.org".to_owned(), None);
+        let registry = RoomRegistry::new(
+            store.clone(),
+            "example.org".to_owned(),
+            neutrino_event::EventPolicy::trusted_network(),
+        );
         (registry, store, room_id, alice)
     }
 
@@ -1013,7 +1005,11 @@ mod tests {
         let room_id = create.room_id.clone();
         let create_id = create.event_id.clone();
         store.create_room(&create, &[]).await.expect("create_room");
-        let registry = RoomRegistry::new(store.clone(), "example.org".to_owned(), None);
+        let registry = RoomRegistry::new(
+            store.clone(),
+            "example.org".to_owned(),
+            neutrino_event::EventPolicy::trusted_network(),
+        );
         (registry, store, room_id, alice, create_id)
     }
 

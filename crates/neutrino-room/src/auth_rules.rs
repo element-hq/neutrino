@@ -978,6 +978,7 @@ mod tests {
         let ev = neutrino_event::event_builder::from_wire(
             serde_json::value::RawValue::from_string(raw.to_string()).expect("valid JSON"),
             Vec::new(),
+            &neutrino_event::event_id::REFERENCE_HASH_IDS,
         )
         .expect("parseable wire event")
         .admit_on_faith()

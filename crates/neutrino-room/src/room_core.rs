@@ -251,7 +251,7 @@ impl RoomCore {
         event_type: String,
         state_key: Option<String>,
         content: Value,
-        signer: Option<std::sync::Arc<neutrino_event::EventSigner>>,
+        policy: &neutrino_event::EventPolicy,
     ) -> Result<Event, FormatError> {
         let prev_events: Vec<OwnedEventId> = self.forward_extremities.iter().cloned().collect();
         let prev_state_events: Vec<OwnedEventId> =
@@ -261,7 +261,8 @@ impl RoomCore {
             .content(content)
             .prev_events(prev_events)
             .prev_state_events(prev_state_events)
-            .signer(signer);
+            .signer(policy.signer().cloned())
+            .ids(Some(policy.ids.clone()));
         if let Some(sk) = state_key {
             builder = builder.state_key(sk);
         }
@@ -1564,6 +1565,7 @@ mod tests {
         neutrino_event::event_builder::from_wire(
             serde_json::value::RawValue::from_string(obj.to_string()).expect("valid JSON"),
             Vec::new(),
+            &neutrino_event::event_id::REFERENCE_HASH_IDS,
         )
         .expect("parseable wire event")
         .admit_on_faith()
@@ -1803,7 +1805,7 @@ mod tests {
                 "m.room.message".to_owned(),
                 None,
                 json!({ "msgtype": "m.text", "body": "hi" }),
-                None,
+                &neutrino_event::EventPolicy::trusted_network(),
             )
             .expect("build");
         assert!(

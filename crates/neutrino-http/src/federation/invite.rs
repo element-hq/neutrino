@@ -103,7 +103,7 @@ pub(crate) async fn handle(
     // for a condemned invite — the hosted branch would just persist a
     // rejected row nobody reads, and the OOB branch must never surface an
     // invalid stub to sync.
-    let event = match state.security().admit_wire(raw).await {
+    let event = match state.policy().admit_wire(raw).await {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
         Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
             tracing::warn!(event_id = %ev.event_id, %defect, "invite: refusing Wire::Rejected invite");
@@ -229,12 +229,12 @@ pub(crate) async fn federated_invite(
     target: &UserId,
     reason: Option<String>,
 ) -> Response {
-    let (store, registry, security, own_server, federation_proxy) = {
+    let (store, registry, policy, own_server, federation_proxy) = {
         let app = lock_app(state);
         (
             app.store.clone(),
             app.room_registry.clone(),
-            app.security.clone(),
+            app.policy.clone(),
             app.config.server_name.clone(),
             app.config.federation_proxy.clone(),
         )
@@ -313,7 +313,7 @@ pub(crate) async fn federated_invite(
     //    the peer returned *our* event (same reference hash) — it can't swap in a
     //    different one. `unsigned.invite_room_state` rides along harmlessly (it
     //    is outside the hash and never read for a remote member).
-    let returned_event = match security.admit_wire(returned).await {
+    let returned_event = match policy.admit_wire(returned).await {
         // `Wire::Valid` with our reference hash: byte-identical to what we
         // sent (a `Rejected` variant with the same id is impossible — our
         // candidate came from `EventBuilder`, which validates).
@@ -343,7 +343,7 @@ pub(crate) async fn federated_invite(
     // invited server's co-signature — require it before committing, or a
     // buggy/hostile invitee could hand back our own singly-signed event and
     // we would distribute an invite its server never endorsed.
-    if let neutrino_event::EventSecurity::Signed { resolver, .. } = &security
+    if let neutrino_event::EventSecurity::Signed { resolver, .. } = &policy.security
         && let Err(e) = neutrino_event::verify_event_signed_by(
             &returned_event,
             target.server_name().as_str(),

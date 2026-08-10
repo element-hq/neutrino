@@ -32,6 +32,9 @@ use tokio_util::sync::CancellationToken;
 pub struct FederationLink {
     pub link: std::sync::Arc<dyn DatagramLink>,
     pub key_resolver: Option<Arc<dyn neutrino_event::KeyResolver>>,
+    /// How event ids are derived on this medium. `None` — the default
+    /// is the v12 reference hash.
+    pub event_ids: Option<Arc<dyn neutrino_event::event_id::EventIdScheme>>,
 }
 
 /// Result of building the federation datagram link from the node secret.
@@ -174,9 +177,13 @@ pub async fn entrypoint(
     // The factory's error is `Send + Sync` (so it can cross the ffi task
     // boundary); widen it to this function's plain `Box<dyn Error>` on the way
     // out, since the two boxed-trait-object types don't auto-convert via `?`.
-    let (link, key_resolver) = match link_factory {
+    let (link, key_resolver, event_ids) = match link_factory {
         Some(factory) => {
-            let FederationLink { link, key_resolver } = factory(LinkContext {
+            let FederationLink {
+                link,
+                key_resolver,
+                event_ids,
+            } = factory(LinkContext {
                 secret,
                 display_name: display_name_rx,
                 discovery: discovery.clone(),
@@ -184,11 +191,11 @@ pub async fn entrypoint(
             })
             .await
             .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-            (Some(link), key_resolver)
+            (Some(link), key_resolver, event_ids)
         }
         // No injected medium: plain UDP, which authenticates nothing and has
         // no key-resolution namespace of its own.
-        None => (None, None),
+        None => (None, None, None),
     };
 
     // Compose the deployment's security configuration from its two
@@ -209,6 +216,9 @@ pub async fn entrypoint(
     };
     tracing::info!(?security_config, "federation security");
     let security = event_security(&security_config, key_resolver, &secret, &config.server_name)?;
+    // The deployment's two event-level facts, composed once and threaded as one
+    // value from here down (see `EventPolicy`).
+    let policy = neutrino_event::EventPolicy::new(security, event_ids);
 
     // A store's events belong to exactly one trust domain: unsigned events
     // can never serve a signed deployment (nothing to verify) and vice versa.
@@ -292,7 +302,7 @@ pub async fn entrypoint(
                 cmd_rx,
                 discovery,
                 Some(display_name_tx),
-                security,
+                policy,
             );
             tokio::pin!(lb, hs);
             tokio::select! {
@@ -334,7 +344,7 @@ pub async fn entrypoint(
                 cmd_rx,
                 discovery,
                 Some(display_name_tx),
-                security,
+                policy,
             )
             .await?
         }
@@ -365,6 +375,16 @@ async fn resolve_server_identity(
     if config.server_name.is_empty() {
         config.server_name = server_identity_from_secret(&secret);
     }
+    // Same rule for the other half of the user id: an empty `localpart` asks
+    // for one derived from the node secret. Unlike `server_name` — which a host
+    // may set, and which is therefore pinned and mismatch-checked below — a
+    // derived localpart cannot drift, because the secret it comes from is
+    // itself first-write-wins. It is exactly as old as the store, which is what
+    // a caller opting in wants: a wiped store is a new install and gets a new
+    // name, no matter what the host asks to be called.
+    if config.localpart.is_empty() {
+        config.localpart = install_id_from_secret(&secret);
+    }
     // Pin the effective name to the store on first start and refuse to boot if a
     // later start disagrees. The name is baked into every stored event's
     // sender/origin, so booting existing data under a different name forks the
@@ -393,6 +413,28 @@ async fn resolve_server_identity(
 fn server_identity_from_secret(secret: &[u8; 32]) -> String {
     let signing = ed25519_dalek::SigningKey::from_bytes(secret);
     hex::encode(signing.verifying_key().to_bytes())
+}
+
+/// Number of bytes in a derived localpart. 2 bytes ⇒ 4 hex chars ⇒ a 1/65536
+/// chance that a reinstall on the same device collides with its own past name.
+const INSTALL_ID_BYTES: usize = 2;
+
+/// Domain separator, so a derived localpart is not a prefix of a derived
+/// `server_name` when both come from the same secret.
+const INSTALL_ID_DOMAIN: &[u8] = b"neutrino install id";
+
+/// Derive a short install identity from the node secret: `INSTALL_ID_BYTES` of
+/// the key's (deterministic) signature over a fixed domain separator,
+/// lowercase hex.
+///
+/// Deliberately *not* a slice of [`server_identity_from_secret`]: the two
+/// halves of the user id would then share bytes and read as one repeated value
+/// in logs. Signing rather than hashing keeps this to the crates the identity
+/// derivation already uses.
+fn install_id_from_secret(secret: &[u8; 32]) -> String {
+    use ed25519_dalek::Signer;
+    let signature = ed25519_dalek::SigningKey::from_bytes(secret).sign(INSTALL_ID_DOMAIN);
+    hex::encode(&signature.to_bytes()[..INSTALL_ID_BYTES])
 }
 
 /// The deployment's security configuration — Kegan's two fundamental bools,
@@ -774,6 +816,15 @@ mod tests {
         }
     }
 
+    /// Same as `cfg_in`, but opting into a derived localpart the way a medium
+    /// that owns the whole user id does.
+    fn cfg_in_derived_localpart(dir: &tempfile::TempDir, server_name: &str) -> Config {
+        Config {
+            localpart: String::new(),
+            ..cfg_in(dir, server_name)
+        }
+    }
+
     async fn open(dir: &tempfile::TempDir) -> SqliteStore {
         SqliteStore::open_in_dir(dir.path())
             .await
@@ -789,6 +840,91 @@ mod tests {
             .await
             .expect("resolve");
         assert_eq!(config.server_name.len(), 64, "derived a 64-char identity");
+    }
+
+    #[tokio::test]
+    async fn resolve_identity_keeps_configured_localpart() {
+        // The default config carries a localpart, and a host that sets one owns
+        // it: derivation is opt-in via the empty string, exactly as it is for
+        // `server_name`.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = open(&tmp).await;
+        let mut config = cfg_in(&tmp, "hs.example");
+        let configured = config.localpart.clone();
+        assert!(!configured.is_empty(), "default config sets a localpart");
+        resolve_server_identity(&mut config, &store)
+            .await
+            .expect("resolve");
+        assert_eq!(config.localpart, configured);
+    }
+
+    #[tokio::test]
+    async fn resolve_identity_derives_localpart_when_empty() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = open(&tmp).await;
+        let mut config = cfg_in_derived_localpart(&tmp, "1f3e");
+        resolve_server_identity(&mut config, &store)
+            .await
+            .expect("resolve");
+        assert_eq!(
+            config.localpart.len(),
+            INSTALL_ID_BYTES * 2,
+            "derived localpart is INSTALL_ID_BYTES of lowercase hex"
+        );
+        assert!(
+            config
+                .localpart
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        );
+        // The whole point of deriving it: a user id that a human-settable
+        // routing address cannot make repeat.
+        assert_eq!(config.user_id(), format!("@{}:1f3e", config.localpart));
+    }
+
+    #[tokio::test]
+    async fn derived_localpart_is_stable_across_restart_and_dies_with_the_store() {
+        // Stable for as long as the store lives — it is a function of the
+        // first-write-wins node secret…
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut first = cfg_in_derived_localpart(&tmp, "1f3e");
+        resolve_server_identity(&mut first, &open(&tmp).await)
+            .await
+            .expect("first");
+        let mut second = cfg_in_derived_localpart(&tmp, "1f3e");
+        resolve_server_identity(&mut second, &open(&tmp).await)
+            .await
+            .expect("second");
+        assert_eq!(first.localpart, second.localpart);
+
+        // …and gone with it. A wiped store is a new install, so it gets a new
+        // name even though the host asks to be called the same thing — this is
+        // what closes the reinstall-collision hole that a human-settable
+        // `server_name` cannot.
+        let fresh = tempfile::TempDir::new().expect("tempdir");
+        let mut third = cfg_in_derived_localpart(&fresh, "1f3e");
+        resolve_server_identity(&mut third, &open(&fresh).await)
+            .await
+            .expect("third");
+        assert_ne!(first.localpart, third.localpart);
+    }
+
+    #[test]
+    fn install_id_is_not_a_slice_of_the_derived_server_name() {
+        // Both halves of the user id can derive from the same secret; if the
+        // install id were a slice of the public-key fingerprint they would read
+        // as one repeated value.
+        let secret = [11u8; 32];
+        let install = install_id_from_secret(&secret);
+        assert!(
+            !server_identity_from_secret(&secret).contains(&install),
+            "install id must be domain-separated from the server identity"
+        );
+        assert_ne!(
+            install_id_from_secret(&[11u8; 32]),
+            install_id_from_secret(&[12u8; 32]),
+            "distinct secrets must yield distinct install ids"
+        );
     }
 
     #[tokio::test]

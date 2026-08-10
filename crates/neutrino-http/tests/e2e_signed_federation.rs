@@ -1,5 +1,5 @@
 //! End-to-end: two homeservers federate in **signed mode**
-//! (`EventSecurity::Signed`, i.e. `trusted_network = false`). Every locally-authored event
+//! (`EventPolicy::Signed`, i.e. `trusted_network = false`). Every locally-authored event
 //! is signed, every inbound event must carry a valid sender's-server
 //! signature, and the join handshake co-signs through the send_join
 //! round-trip. Convergence IS the assertion: with verification on at every
@@ -27,7 +27,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use neutrino_ctl::{Command, Config, DiscoveryRegistry};
-use neutrino_event::{EventSecurity, EventSigner, KeyResolveError, KeyResolver};
+use neutrino_event::{EventPolicy, EventSigner, KeyResolveError, KeyResolver};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -100,7 +100,10 @@ async fn start_signed_node(
             cmd_rx,
             std::sync::Arc::new(DiscoveryRegistry::new()),
             None,
-            EventSecurity::Signed { signer, resolver },
+            EventPolicy::new(
+                neutrino_event::EventSecurity::Signed { signer, resolver },
+                None,
+            ),
         )
         .await;
     });
@@ -378,10 +381,14 @@ async fn stub_invite_handler(
         Some(s) => {
             let raw = serde_json::value::RawValue::from_string(event.to_string())
                 .expect("candidate serializes");
-            let mut ev = neutrino_event::event_builder::from_wire(raw, Vec::new())
-                .expect("candidate parses")
-                .admit_on_faith()
-                .into_event();
+            let mut ev = neutrino_event::event_builder::from_wire(
+                raw,
+                Vec::new(),
+                &neutrino_event::event_id::REFERENCE_HASH_IDS,
+            )
+            .expect("candidate parses")
+            .admit_on_faith()
+            .into_event();
             s.co_sign(&mut ev).expect("stub co-signs");
             serde_json::from_str(ev.raw.get()).expect("co-signed raw is JSON")
         }
