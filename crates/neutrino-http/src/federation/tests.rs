@@ -1265,11 +1265,12 @@ async fn backfill_respects_limit() {
     );
 }
 
-// The transaction envelope carries `origin` (our server name) and a
-// numeric `origin_server_ts` alongside `pdus`, per the ruma /
-// Synapse backfill response shape.
+// The response envelope is `pdus` and nothing else: `origin` (we are the server
+// the requester dialled) and `origin_server_ts` (no per-transaction timestamp is
+// ever read — each PDU carries its own) are omitted as vestigial, per
+// https://github.com/matrix-org/matrix-spec/issues/374.
 #[tokio::test]
-async fn backfill_response_has_transaction_envelope() {
+async fn backfill_response_envelope_is_pdus_only() {
     let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(1).await;
 
     let (status, body) = get(
@@ -1279,18 +1280,9 @@ async fn backfill_response_has_transaction_envelope() {
     .await;
 
     assert_eq!(status, StatusCode::OK, "body = {body}");
-    assert_eq!(
-        body.get("origin").and_then(Value::as_str),
-        Some("example.org"),
-        "origin must be our server name: {body}"
-    );
-    assert!(
-        body.get("origin_server_ts")
-            .and_then(Value::as_u64)
-            .is_some(),
-        "origin_server_ts must be a number: {body}"
-    );
     assert!(body.get("pdus").and_then(Value::as_array).is_some());
+    let keys: Vec<&String> = body.as_object().expect("object body").keys().collect();
+    assert_eq!(keys, vec!["pdus"], "trimmed envelope: {body}");
 }
 
 // Wire bytes verbatim — v12 / MSC4242 PDUs never carry `event_id`
@@ -2300,6 +2292,36 @@ async fn send_is_idempotent_on_duplicate_txn_id() {
     // The event is present exactly once.
     let fetched = store.get_events(&[msg_id.as_ref()]).await.unwrap();
     assert_eq!(fetched.len(), 1);
+}
+
+#[tokio::test]
+async fn send_accepts_trimmed_envelope_and_keys_it_off_the_header_origin() {
+    // What our own sender now puts on the wire: `pdus` and nothing else — no
+    // `origin`, no `origin_server_ts`, no empty `edus` (matrix-spec#374). The
+    // network-attested `X-Matrix` origin supplies the identity, so the PDU is
+    // staged and integrated exactly as with a full envelope.
+    let (app, store, room_id, alice, join_id, _tempfile) = seed_joined_room().await;
+    let msg = message_on(&alice, &room_id, &join_id, "trimmed", 1_700_000_001_000);
+    let msg_id = msg.event_id.clone();
+    let pdu: Value = serde_json::from_str(msg.raw.get()).expect("pdu raw is valid JSON");
+
+    let (status, body) =
+        put_json(&app, &send_path("trim1"), &json!({ "pdus": [pdu.clone()] })).await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(
+        body.get("pdus").and_then(|p| p.get(msg_id.as_str())),
+        Some(&json!({})),
+        "body = {body}"
+    );
+    wait_committed(&store, msg_id.as_ref()).await;
+    wait_timeline_head(&store, &room_id, msg_id.as_ref()).await;
+
+    // Txn dedup is keyed off the header origin, not the (absent) body one: the
+    // resend short-circuits to an empty results map.
+    let (s2, body2) = put_json(&app, &send_path("trim1"), &json!({ "pdus": [pdu] })).await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(body2, json!({ "pdus": {} }), "body = {body2}");
 }
 
 #[tokio::test]

@@ -30,9 +30,10 @@
 //! checked here: the inbound worker re-admits every staged PDU under the
 //! deployment policy and is the sole authority on the staged→applied path, so
 //! ingress parses on faith and lets the worker drop any bad-signature row.
-//! The transaction's `origin` field is cross-checked against the header origin
-//! (rejected on mismatch), then used for txn deduplication and as the worker's
-//! gap-fill fetch target.
+//! The header origin is what drives txn deduplication and the worker's gap-fill
+//! fetch target. The transaction's own `origin` field is optional (our sender
+//! omits it); when a peer does send one it is cross-checked against the header
+//! origin and a mismatch is rejected.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -59,15 +60,15 @@ use neutrino_engine::{ForwardExtremities, reconcile};
 /// `backfill.rs` / `get_missing_events.rs`: PDUs are opaque `RawValue`s.
 #[derive(Deserialize)]
 pub(crate) struct TransactionBody {
-    /// The sending server's name. Required to equal the network-attested
-    /// `X-Matrix` origin (rejected on mismatch), then used for transaction
-    /// deduplication + as the worker's gap-fill fetch target (recorded as the
-    /// staged row's `origin`).
-    origin: OwnedServerName,
-    /// Required by the spec; parsed for shape validation then ignored — this
-    /// server stores no per-transaction timestamp.
-    #[serde(rename = "origin_server_ts")]
-    _origin_server_ts: u64,
+    /// The sending server's name, as self-asserted by the envelope. Optional:
+    /// our own sender omits it (redundant with the network-attested `X-Matrix`
+    /// origin — see [`crate::federation::client`] and
+    /// <https://github.com/matrix-org/matrix-spec/issues/374>), while a real
+    /// Matrix peer still sends it. When present it MUST equal the header origin
+    /// (rejected on mismatch); the header origin is what actually drives txn
+    /// dedup, staging and the gap-fill fetch target either way.
+    #[serde(default)]
+    origin: Option<OwnedServerName>,
     /// The events to integrate. Optional in the wire format; a missing key is
     /// an empty transaction.
     #[serde(default)]
@@ -136,12 +137,12 @@ pub(crate) async fn handle(
     };
 
     // Authenticate the sender via its `X-Matrix` header. The header origin is
-    // network-attested; `body.origin` is self-asserted. Require them to agree so
-    // the authenticated identity governs txn dedup, the staged gap-fill target,
-    // and reconciliation — a peer can't claim one origin in the envelope and
-    // another at the network layer.
+    // network-attested and is the *only* identity used below (txn dedup, the
+    // staged gap-fill target, reconciliation). A self-asserted `body.origin`, if
+    // the peer sent one, must agree — a peer can't claim one origin in the
+    // envelope and another at the network layer.
     let origin = auth::authenticated_origin(&headers, &our_name)?;
-    if origin != body.origin {
+    if body.origin.is_some_and(|claimed| claimed != origin) {
         return Err(FedError::Unauthorized(
             "X-Matrix origin does not match the transaction origin",
         ));
@@ -152,7 +153,7 @@ pub(crate) async fn handle(
     // the matching *record* happens only after staging succeeds (below), so a
     // mid-stage fault never marks the txn done and a resend re-stages.
     if store
-        .federation_txn_seen(&body.origin, &txn_id)
+        .federation_txn_seen(&origin, &txn_id)
         .await
         .map_err(FedError::Storage)?
     {
@@ -214,7 +215,7 @@ pub(crate) async fn handle(
         // missing timeline parent is never gap-filled.
         sender_holds.insert(event.event_id.clone());
         sender_holds.extend(event.prev_state_events.iter().cloned());
-        if event.sender.server_name() == &*body.origin {
+        if event.sender.server_name() == &*origin {
             sender_holds.extend(event.prev_events.iter().cloned());
         }
         if !seen.insert(event.event_id.clone()) {
@@ -222,7 +223,7 @@ pub(crate) async fn handle(
         }
         let id = event.event_id.to_string();
         let result = match store
-            .stage_pdu(&body.origin, &event.room_id, &event.event_id, &event.raw)
+            .stage_pdu(&origin, &event.room_id, &event.event_id, &event.raw)
             .await
         {
             // Staged (newly, or already present from an earlier delivery) — in
@@ -248,7 +249,7 @@ pub(crate) async fn handle(
     // staged (and only if all of them are) — the never-lose ordering.
     if all_staged {
         store
-            .record_federation_txn(&body.origin, &txn_id)
+            .record_federation_txn(&origin, &txn_id)
             .await
             .map_err(FedError::Storage)?;
     }
@@ -287,7 +288,7 @@ pub(crate) async fn handle(
         let fetcher = fetcher.clone();
         let security = security.clone();
         let worker_poke = worker_poke.clone();
-        let origin = body.origin.clone();
+        let origin = origin.clone();
         tokio::spawn(async move {
             reconcile::reconcile_room(
                 &*store,
