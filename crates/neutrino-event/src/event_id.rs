@@ -74,11 +74,21 @@ pub(crate) fn b64_url_unpadded(bytes: &[u8]) -> String {
 ///
 /// On error: `prev_state_events` is restored before returning, so the caller
 /// sees the input in its original shape regardless of outcome.
-pub(crate) fn redact_for_hash(obj: &mut CanonicalJsonObject) -> Result<(), RedactionError> {
-    let saved_prev_state = obj.remove("prev_state_events");
+/// `identity_fields` are the active [`EventIdScheme`]'s inputs, preserved by
+/// the same save/restore as `prev_state_events` — see
+/// [`EventIdScheme::identity_fields`]. Empty for the reference hash, which
+/// reads nothing outside the redacted form.
+pub(crate) fn redact_for_hash(
+    obj: &mut CanonicalJsonObject,
+    identity_fields: &[&str],
+) -> Result<(), RedactionError> {
+    let saved: Vec<(String, CanonicalJsonValue)> = std::iter::once("prev_state_events")
+        .chain(identity_fields.iter().copied())
+        .filter_map(|k| obj.remove(k).map(|v| (k.to_owned(), v)))
+        .collect();
     let result = redact_in_place(obj, &RoomVersionRules::V12.redaction, None);
-    if let Some(v) = saved_prev_state {
-        obj.insert("prev_state_events".to_owned(), v);
+    for (k, v) in saved {
+        obj.insert(k, v);
     }
     result
 }
@@ -101,8 +111,10 @@ pub fn content_hash(obj: &CanonicalJsonObject) -> [u8; 32] {
 ///
 /// Spec: <https://spec.matrix.org/v1.18/server-server-api/#calculating-the-reference-hash-for-an-event>.
 /// Runs [`redact_to_canonical_bytes`] and SHA-256s the result.
+/// The reference hash reads only fields inside the redacted form, so it needs
+/// no identity-field carve-out of its own.
 pub fn reference_hash(obj: &CanonicalJsonObject) -> Result<[u8; 32], RedactionError> {
-    Ok(sha256(&redact_to_canonical_bytes(obj)?))
+    Ok(sha256(&redact_to_canonical_bytes(obj, &[])?))
 }
 
 /// Apply V12 redaction (with the MSC4242 `prev_state_events` carve-out),
@@ -117,9 +129,12 @@ pub fn reference_hash(obj: &CanonicalJsonObject) -> Result<[u8; 32], RedactionEr
 ///
 /// Returns `RedactionError` only if the input violates ruma's redaction
 /// preconditions (non-object `content`/`hashes`/`signatures`, missing `type`).
-pub fn redact_to_canonical_bytes(obj: &CanonicalJsonObject) -> Result<Vec<u8>, RedactionError> {
+pub fn redact_to_canonical_bytes(
+    obj: &CanonicalJsonObject,
+    identity_fields: &[&str],
+) -> Result<Vec<u8>, RedactionError> {
     let mut clone = obj.clone();
-    redact_for_hash(&mut clone)?;
+    redact_for_hash(&mut clone, identity_fields)?;
     clone.remove("signatures");
     clone.remove("unsigned");
     Ok(canonical(&clone))
@@ -189,8 +204,12 @@ pub fn compute_event_id(raw: &serde_json::value::RawValue) -> Result<OwnedEventI
     let CanonicalJsonValue::Object(obj) = parsed else {
         return Err(ComputeIdError::NonObjectRoot);
     };
-    let rh = reference_hash(&obj).map_err(ComputeIdError::Redaction)?;
-    Ok(event_id_from_hash(&rh))
+    // Delegates to the scheme rather than restating `reference_hash` +
+    // `event_id_from_hash`, so there is one expression of the v12 derivation.
+    REFERENCE_HASH_IDS.derive(&obj).map_err(|e| match e {
+        EventIdError::Redaction(r) => ComputeIdError::Redaction(r),
+        EventIdError::Scheme(m) => ComputeIdError::Scheme(m),
+    })
 }
 
 /// Failure modes for [`compute_event_id`].
@@ -208,6 +227,10 @@ pub enum ComputeIdError {
     /// (missing `type`, non-object `content`/`hashes`/`signatures`).
     #[error("redaction precondition failed: {0}")]
     Redaction(RedactionError),
+
+    /// A non-default scheme could not name this event.
+    #[error("event id scheme: {0}")]
+    Scheme(String),
 }
 
 /// How event ids are derived from event bytes.
@@ -233,7 +256,33 @@ pub trait EventIdScheme: Send + Sync + std::fmt::Debug {
 
     /// The event's id, from its canonical object alone. Pure — no side effects,
     /// no I/O, no dependence on room state or on what the receiver has seen.
+    ///
+    /// Two further obligations the reference hash meets for free, and which an
+    /// implementor MUST uphold because subsystems depend on them:
+    ///
+    /// - **Redaction-invariant.** Receipt-check 3 redacts an event whose
+    ///   content hash does not match and carries on with it, so the id must be
+    ///   the same before and after. This is what [`identity_fields`] exists to
+    ///   guarantee: whatever `derive` reads must survive redaction.
+    /// - **Signature-invariant.** A resident co-signing a join/leave/invite
+    ///   must not rename the event, so `derive` must ignore `signatures`
+    ///   (and `unsigned`, which is likewise not covered).
     fn derive(&self, obj: &CanonicalJsonObject) -> Result<OwnedEventId, EventIdError>;
+
+    /// Top-level fields this scheme's [`derive`](Self::derive) reads, which
+    /// must therefore survive redaction — preserved alongside the MSC4242
+    /// `prev_state_events` carve-out.
+    ///
+    /// Without this, a stamped field is stripped by the v12 redaction
+    /// algorithm, which has three consequences: the signature (computed over
+    /// the redacted form) would not cover the id's own inputs, a
+    /// content-hash-mismatch redaction would persist bytes the id cannot be
+    /// re-derived from, and a redacted event would change its name.
+    ///
+    /// Default: none, which is correct for any scheme that stamps nothing.
+    fn identity_fields(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// Failure modes for an [`EventIdScheme`].
@@ -266,21 +315,6 @@ impl EventIdScheme for ReferenceHashIds {
         let rh = reference_hash(obj).map_err(EventIdError::Redaction)?;
         Ok(event_id_from_hash(&rh))
     }
-}
-
-/// Whether `id` has the shape [`ReferenceHashIds`] produces: `$` followed by
-/// exactly 43 url-safe-base64 characters.
-///
-/// Used by storage's debug-build round-trip assert, which can only re-derive
-/// the default scheme (it has no configured [`EventIdScheme`] to hand) and so
-/// must skip ids minted by any other one.
-pub fn is_reference_hash_id(id: &EventId) -> bool {
-    let b = id.as_str().as_bytes();
-    b.len() == 44
-        && b[0] == b'$'
-        && b[1..]
-            .iter()
-            .all(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_')
 }
 
 /// Derive a room_id from a create event's event_id.
@@ -367,7 +401,7 @@ mod tests {
             "origin_server_ts": 1000,
             "unsigned": { "age": 5 }
         }));
-        redact_for_hash(&mut o).expect("redaction succeeds");
+        redact_for_hash(&mut o, &[]).expect("redaction succeeds");
 
         // prev_state_events survives.
         assert_eq!(
@@ -397,7 +431,7 @@ mod tests {
             "prev_events": [],
             "origin_server_ts": 1000
         }));
-        redact_for_hash(&mut o).expect("redaction succeeds");
+        redact_for_hash(&mut o, &[]).expect("redaction succeeds");
         assert!(!o.contains_key("prev_state_events"));
     }
 

@@ -102,8 +102,15 @@ impl EventSigner {
     ///
     /// Errors only if the event violates redaction preconditions (missing
     /// `type`, non-object `content`/`hashes`/`signatures`).
-    pub fn sign_event(&self, obj: &mut CanonicalJsonObject) -> Result<(), RedactionError> {
-        let bytes = redact_to_canonical_bytes(obj)?;
+    /// `identity_fields` are the active [`EventIdScheme`]'s inputs; they are
+    /// kept in the signed byte string so the signature covers the event's own
+    /// name. See [`EventIdScheme::identity_fields`].
+    pub fn sign_event(
+        &self,
+        obj: &mut CanonicalJsonObject,
+        identity_fields: &[&str],
+    ) -> Result<(), RedactionError> {
+        let bytes = redact_to_canonical_bytes(obj, identity_fields)?;
         self.attach(obj, self.sign_bytes(&bytes));
         Ok(())
     }
@@ -128,12 +135,16 @@ impl EventSigner {
     /// carries, regenerating `raw`. The event id is untouched (signatures are
     /// outside the reference hash) — this is the resident/invitee side of the
     /// `send_join` / `send_leave` / `invite` round-trips.
-    pub fn co_sign(&self, event: &mut crate::Event) -> Result<(), CoSignError> {
+    pub fn co_sign(
+        &self,
+        event: &mut crate::Event,
+        identity_fields: &[&str],
+    ) -> Result<(), CoSignError> {
         let parsed: CanonicalJsonValue = serde_json::from_str(event.raw.get())?;
         let CanonicalJsonValue::Object(mut obj) = parsed else {
             return Err(CoSignError::NonObjectRoot);
         };
-        self.sign_event(&mut obj)?;
+        self.sign_event(&mut obj, identity_fields)?;
         let bytes = canonical(&obj);
         let s = String::from_utf8(bytes).expect("canonical JSON is valid UTF-8");
         event.raw = serde_json::value::RawValue::from_string(s)
@@ -242,6 +253,7 @@ pub async fn verify_event_signed_by(
     event: &crate::Event,
     origin: &str,
     resolver: &dyn KeyResolver,
+    identity_fields: &[&str],
 ) -> Result<(), VerifyError> {
     let parsed: CanonicalJsonValue =
         serde_json::from_str(event.raw.get()).map_err(|e| VerifyError::NoValidSignature {
@@ -254,7 +266,7 @@ pub async fn verify_event_signed_by(
             detail: "event raw root is not an object".to_owned(),
         });
     };
-    verify_event_signature(&obj, origin, resolver).await
+    verify_event_signature(&obj, origin, resolver, identity_fields).await
 }
 
 /// Key-resolution failure, produced by a [`KeyResolver`].
@@ -437,8 +449,9 @@ pub async fn verify_event_signature(
     obj: &CanonicalJsonObject,
     origin: &str,
     resolver: &dyn KeyResolver,
+    identity_fields: &[&str],
 ) -> Result<(), VerifyError> {
-    let bytes = redact_to_canonical_bytes(obj)?;
+    let bytes = redact_to_canonical_bytes(obj, identity_fields)?;
     let entries = origin_signature_entries(obj, origin)?;
 
     let mut failures = Vec::new();
@@ -650,8 +663,8 @@ mod tests {
     async fn sign_then_verify_round_trips_via_node_id_resolver() {
         let signer = node_signer(7);
         let mut event = v12_event();
-        signer.sign_event(&mut event).expect("signs");
-        verify_event_signature(&event, signer.server_name(), &NodeIdKeyResolver)
+        signer.sign_event(&mut event, &[]).expect("signs");
+        verify_event_signature(&event, signer.server_name(), &NodeIdKeyResolver, &[])
             .await
             .expect("verifies");
     }
@@ -661,7 +674,7 @@ mod tests {
         let signer = node_signer(7);
         let imposter = node_signer(8); // different key, different name
         let mut event = v12_event();
-        signer.sign_event(&mut event).expect("signs");
+        signer.sign_event(&mut event, &[]).expect("signs");
         // Claim the imposter's name signed it: resolver derives the imposter
         // key from the name, under which the signature must not verify.
         let CanonicalJsonValue::Object(sigs) = event.remove("signatures").unwrap() else {
@@ -672,7 +685,7 @@ mod tests {
         forged.insert(imposter.server_name().to_owned(), by_signer);
         event.insert("signatures".to_owned(), CanonicalJsonValue::Object(forged));
 
-        let err = verify_event_signature(&event, imposter.server_name(), &NodeIdKeyResolver)
+        let err = verify_event_signature(&event, imposter.server_name(), &NodeIdKeyResolver, &[])
             .await
             .expect_err("must not verify");
         assert!(matches!(err, VerifyError::NoValidSignature { .. }), "{err}");
@@ -682,9 +695,9 @@ mod tests {
     async fn verify_fails_when_origin_absent_from_signatures() {
         let signer = node_signer(7);
         let mut event = v12_event();
-        signer.sign_event(&mut event).expect("signs");
+        signer.sign_event(&mut event, &[]).expect("signs");
         let other = node_signer(9);
-        let err = verify_event_signature(&event, other.server_name(), &NodeIdKeyResolver)
+        let err = verify_event_signature(&event, other.server_name(), &NodeIdKeyResolver, &[])
             .await
             .expect_err("origin never signed");
         assert!(
@@ -702,7 +715,7 @@ mod tests {
     async fn signature_covers_redacted_form_only() {
         let signer = node_signer(7);
         let mut event = v12_event();
-        signer.sign_event(&mut event).expect("signs");
+        signer.sign_event(&mut event, &[]).expect("signs");
 
         // Tamper with redactable content → signature still verifies.
         let mut tampered_content = event.clone();
@@ -712,9 +725,14 @@ mod tests {
                 .try_into()
                 .unwrap(),
         );
-        verify_event_signature(&tampered_content, signer.server_name(), &NodeIdKeyResolver)
-            .await
-            .expect("redactable tampering is invisible to the signature");
+        verify_event_signature(
+            &tampered_content,
+            signer.server_name(),
+            &NodeIdKeyResolver,
+            &[],
+        )
+        .await
+        .expect("redactable tampering is invisible to the signature");
 
         // Tamper with a protected field → signature breaks.
         let mut tampered_sender = event.clone();
@@ -722,9 +740,14 @@ mod tests {
             "sender".to_owned(),
             CanonicalJsonValue::String("@evil:server".to_owned()),
         );
-        verify_event_signature(&tampered_sender, signer.server_name(), &NodeIdKeyResolver)
-            .await
-            .expect_err("protected-field tampering must break the signature");
+        verify_event_signature(
+            &tampered_sender,
+            signer.server_name(),
+            &NodeIdKeyResolver,
+            &[],
+        )
+        .await
+        .expect_err("protected-field tampering must break the signature");
     }
 
     /// Co-signing: a second server signing the same event must not clobber
@@ -735,13 +758,15 @@ mod tests {
         let origin = node_signer(7);
         let resident = node_signer(8);
         let mut event = v12_event();
-        origin.sign_event(&mut event).expect("origin signs");
-        resident.sign_event(&mut event).expect("resident co-signs");
+        origin.sign_event(&mut event, &[]).expect("origin signs");
+        resident
+            .sign_event(&mut event, &[])
+            .expect("resident co-signs");
 
-        verify_event_signature(&event, origin.server_name(), &NodeIdKeyResolver)
+        verify_event_signature(&event, origin.server_name(), &NodeIdKeyResolver, &[])
             .await
             .expect("origin signature survives co-signing");
-        verify_event_signature(&event, resident.server_name(), &NodeIdKeyResolver)
+        verify_event_signature(&event, resident.server_name(), &NodeIdKeyResolver, &[])
             .await
             .expect("resident signature verifies");
     }
@@ -767,13 +792,13 @@ mod tests {
             .expect("builds");
         let id_before = event.event_id.clone();
 
-        resident.co_sign(&mut event).expect("co-signs");
+        resident.co_sign(&mut event, &[]).expect("co-signs");
 
         assert_eq!(event.event_id, id_before, "co-sign must not change the id");
-        verify_event_signed_by(&event, origin.server_name(), &NodeIdKeyResolver)
+        verify_event_signed_by(&event, origin.server_name(), &NodeIdKeyResolver, &[])
             .await
             .expect("origin signature survives in the regenerated raw");
-        verify_event_signed_by(&event, resident.server_name(), &NodeIdKeyResolver)
+        verify_event_signed_by(&event, resident.server_name(), &NodeIdKeyResolver, &[])
             .await
             .expect("resident signature present in the regenerated raw");
         // The regenerated raw still derives the same id (canonical bytes).

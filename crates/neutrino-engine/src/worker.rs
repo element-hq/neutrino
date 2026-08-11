@@ -80,7 +80,8 @@ struct WorkerCtx<S> {
     store: Arc<S>,
     registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
-    /// Deployment-wide event policy from the medium's declared link trust.
+    /// Deployment-wide event policy: the security posture composed from the
+    /// medium's declared link trust, and the medium's nominated id scheme.
     policy: EventPolicy,
     /// Backoff floor; [`BACKOFF_BASE`] in production, near-zero in tests so the
     /// retry path runs without real delays.

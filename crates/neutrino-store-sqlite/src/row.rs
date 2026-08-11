@@ -41,6 +41,13 @@ pub(crate) const EVENT_COLUMNS_PREFIXED: &str = "e.event_id, e.room_id, e.event_
 ///   (owned). Unwrap via [`EventRow::into_event`].
 /// - **Write**: `EventRow::from(&event).write_into_tx(&tx)?` borrows the
 ///   caller's event; no clone.
+///
+/// No id round-trip check on the way in: an `Event` can only be built by
+/// `EventBuilder::build` or `from_wire`, both of which derive the id from the
+/// same canonical bytes a check here would re-read, so it verified the
+/// deriving code against itself. Re-deriving also needs the deployment's
+/// `EventIdScheme`, which storage would have to be told about purely for an
+/// assertion.
 pub(crate) struct EventRow<'a>(pub Cow<'a, Event>);
 
 impl Deref for EventRow<'_> {
@@ -52,14 +59,12 @@ impl Deref for EventRow<'_> {
 
 impl<'a> From<&'a Event> for EventRow<'a> {
     fn from(event: &'a Event) -> Self {
-        debug_assert_event_id_matches_raw(event);
         Self(Cow::Borrowed(event))
     }
 }
 
 impl From<Event> for EventRow<'static> {
     fn from(event: Event) -> Self {
-        debug_assert_event_id_matches_raw(&event);
         Self(Cow::Owned(event))
     }
 }
@@ -74,56 +79,6 @@ impl<'a> EventRow<'a> {
     #[cfg(test)]
     pub(crate) fn unchecked(event: &'a Event) -> Self {
         Self(Cow::Borrowed(event))
-    }
-}
-
-/// Defence-in-depth: in debug builds, every event handed to the storage
-/// layer (through `EventRow::from`) must round-trip through
-/// `compute_event_id(raw)` and produce the `event_id` already attached to
-/// the struct. Production code goes through `EventBuilder` / `from_wire`,
-/// both of which compute the event_id from the same canonical bytes — a
-/// mismatch is a caller bug (hand-rolled event with the wrong id) and a
-/// hard-fail signal during development. No-op in release builds.
-///
-/// `EventRow::from` is the single chokepoint for every write path
-/// (`persist_event`, `persist_historical_event`, `create_room`'s initial
-/// events, the `setup_room` test helper, etc.) — placing the check here
-/// rather than in each `EventStore` method ensures no write path can skip it.
-#[track_caller]
-fn debug_assert_event_id_matches_raw(event: &Event) {
-    #[cfg(debug_assertions)]
-    {
-        // A deployment can nominate a different `EventIdScheme`, whose ids this
-        // check cannot reproduce — storage has no scheme to hand, and threading
-        // one through `From<&Event>` (a conversion, not a store method) would
-        // put the scheme on `SqliteStore::open`, which runs *before* the
-        // composition root has resolved it. Those ids are checked at their only
-        // two sources instead (`EventBuilder::build` and `from_wire`, which
-        // derive from the same canonical bytes this would re-read), so restrict
-        // the check to ids the default scheme can produce. Every event in this
-        // repository is in that shape.
-        if !neutrino_event::event_id::is_reference_hash_id(&event.event_id) {
-            return;
-        }
-        match neutrino_event::event_id::compute_event_id(&event.raw) {
-            Ok(computed) if computed == event.event_id => {}
-            Ok(computed) => panic!(
-                "EventRow::from: event.event_id ({}) does not match reference \
-                 hash of event.raw ({}). Either build via EventBuilder / \
-                 from_wire, or fix the caller's hand-rolled id.",
-                event.event_id, computed,
-            ),
-            Err(e) => panic!(
-                "EventRow::from: failed to compute event_id from event.raw \
-                 ({}). The raw bytes do not satisfy `compute_event_id`'s \
-                 preconditions. Underlying error: {e}",
-                event.event_id,
-            ),
-        }
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = event;
     }
 }
 

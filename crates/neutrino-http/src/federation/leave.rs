@@ -46,11 +46,11 @@ pub(crate) async fn reject_invite(
     room_id: &RoomId,
     invite: neutrino_event::Event,
 ) -> Response {
-    let (store, signer, own_server, federation_proxy) = {
+    let (store, policy, own_server, federation_proxy) = {
         let app = lock_app(state);
         (
             app.store.clone(),
-            app.policy.signer().cloned(),
+            app.policy.clone(),
             app.config.server_name.clone(),
             app.config.federation_proxy.clone(),
         )
@@ -65,7 +65,7 @@ pub(crate) async fn reject_invite(
     if let Err(e) = try_federated_leave(
         &own_server,
         federation_proxy.as_deref(),
-        signer,
+        &policy,
         &dest,
         room_id,
         &user,
@@ -94,7 +94,7 @@ pub(crate) async fn reject_invite(
 async fn try_federated_leave(
     own_server: &str,
     proxy: Option<&str>,
-    signer: Option<std::sync::Arc<neutrino_event::EventSigner>>,
+    policy: &neutrino_event::EventPolicy,
     dest: &ServerName,
     room_id: &RoomId,
     user: &UserId,
@@ -112,7 +112,7 @@ async fn try_federated_leave(
         ));
     }
     let leave = complete_membership_template(
-        signer,
+        policy,
         &template.event,
         room_id,
         user,
@@ -168,9 +168,15 @@ mod tests {
 
         // The leave we build must target our own room + our own user.
         let room_id = ruma::RoomId::parse("!room:resident.example").unwrap();
-        let event =
-            complete_membership_template(None, &hostile, &room_id, &our_user, "leave", "Neo")
-                .expect("template completes");
+        let event = complete_membership_template(
+            &neutrino_event::EventPolicy::trusted_network(),
+            &hostile,
+            &room_id,
+            &our_user,
+            "leave",
+            "Neo",
+        )
+        .expect("template completes");
         let v: Value = serde_json::from_str(event.raw.get()).unwrap();
         assert_eq!(v["type"], "m.room.member", "type must be ours");
         assert_eq!(v["sender"], our_user.as_str(), "sender must be our user");

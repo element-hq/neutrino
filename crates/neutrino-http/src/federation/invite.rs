@@ -348,6 +348,7 @@ pub(crate) async fn federated_invite(
             &returned_event,
             target.server_name().as_str(),
             resolver.as_ref(),
+            policy.ids.identity_fields(),
         )
         .await
     {

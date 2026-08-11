@@ -213,7 +213,7 @@ pub(crate) fn co_sign_if_signed(
 ) -> Result<(), FedError> {
     if let Some(signer) = state.signer() {
         signer
-            .co_sign(event)
+            .co_sign(event, state.policy().ids.identity_fields())
             .map_err(|_| FedError::BadRequest("event cannot be co-signed"))?;
     }
     Ok(())
@@ -234,7 +234,7 @@ pub(crate) fn co_sign_if_signed(
 /// "simplify" this into reusing the template's fields; a regression test pins
 /// the invariant. `None` if the template is unparseable.
 pub(crate) fn complete_membership_template(
-    signer: Option<std::sync::Arc<neutrino_event::EventSigner>>,
+    policy: &neutrino_event::EventPolicy,
     template: &serde_json::value::RawValue,
     room_id: &ruma::RoomId,
     user: &ruma::UserId,
@@ -254,7 +254,7 @@ pub(crate) fn complete_membership_template(
     let parsed = match neutrino_event::event_builder::from_wire(
         raw,
         Vec::new(),
-        &neutrino_event::event_id::REFERENCE_HASH_IDS,
+        policy.ids.as_ref(),
     )
     .map(|uw| uw.admit_on_faith())
     {
@@ -280,7 +280,8 @@ pub(crate) fn complete_membership_template(
         .content(content)
         .prev_events(parsed.prev_events)
         .prev_state_events(parsed.prev_state_events)
-        .signer(signer)
+        .signer(policy.signer().cloned())
+        .ids(Some(policy.ids.clone()))
         .build()
     {
         Ok(event) => Some(event),

@@ -264,7 +264,7 @@ impl EventBuilder {
         // the same as reference_hash's, so this cannot fail either.
         if let Some(signer) = &self.signer {
             signer
-                .sign_event(&mut canon)
+                .sign_event(&mut canon, ids.identity_fields())
                 .expect("builder-assembled object satisfies ruma redaction preconditions");
         }
 
@@ -366,13 +366,20 @@ pub fn from_wire(
     // An event with no `hashes` at all is taken as-is: that is what a
     // trusted-network peer emits (see `EventBuilder::build`), and redacting
     // every such event would empty every message in the mesh.
-    // `reference_hash` already exercised the same redaction step successfully
-    // above, so `redact_to_canonical_bytes` here cannot fail.
+    // The scheme's identity fields are kept, so the redacted bytes can still
+    // re-derive this event's id — receipt-check 3 redacts and carries on, so
+    // the id must survive it.
+    //
+    // Not an `expect`: this used to be guaranteed because `reference_hash`
+    // had already run the same redaction a few lines above, but an arbitrary
+    // `EventIdScheme::derive` need not touch redaction at all, so a malformed
+    // `content`/`hashes`/`signatures` can reach here and fail. Attacker-supplied
+    // bytes must not panic the ingress.
     let raw_to_parse = match check_content_hash(&obj) {
         ContentHashCheck::Absent | ContentHashCheck::Matches => raw,
         ContentHashCheck::Mismatch => {
-            let bytes = redact_to_canonical_bytes(&obj)
-                .expect("redaction succeeded above for reference_hash");
+            let bytes = redact_to_canonical_bytes(&obj, ids.identity_fields())
+                .map_err(ref_hash_error_to_format_error)?;
             let s = String::from_utf8(bytes).expect("canonical JSON is valid UTF-8");
             RawValue::from_string(s).expect("canonical JSON parses as a RawValue")
         }
@@ -389,7 +396,11 @@ pub fn from_wire(
             }
         },
     };
-    Ok(UnverifiedWire { wire, obj })
+    Ok(UnverifiedWire {
+        wire,
+        obj,
+        identity_fields: ids.identity_fields(),
+    })
 }
 
 /// A parsed-and-classified wire event whose **provenance has not been checked
@@ -408,6 +419,10 @@ pub struct UnverifiedWire {
     /// redaction, so verifying against this is equivalent for both the
     /// as-received and the hash-mismatch-redacted event.
     obj: CanonicalJsonObject,
+    /// The deriving scheme's identity fields, captured at parse time so
+    /// [`verify`](Self::verify) keeps them in the signed byte string without
+    /// every ingress having to carry the scheme a second time.
+    identity_fields: &'static [&'static str],
 }
 
 impl UnverifiedWire {
@@ -442,7 +457,7 @@ impl UnverifiedWire {
         resolver: &dyn crate::sign::KeyResolver,
     ) -> Result<Wire, FormatError> {
         let origin = self.event().sender.server_name().as_str().to_owned();
-        crate::sign::verify_event_signature(&self.obj, &origin, resolver)
+        crate::sign::verify_event_signature(&self.obj, &origin, resolver, self.identity_fields)
             .await
             .map_err(|e| FormatError::SignatureCheck(e.to_string()))?;
         Ok(self.wire)
@@ -1227,6 +1242,15 @@ mod tests {
             OwnedEventId::try_from(format!("${}", i64::from(*ts)))
                 .map_err(|e| EventIdError::Scheme(e.to_string()))
         }
+
+        fn identity_fields(&self) -> &'static [&'static str] {
+            Self::FIELDS
+        }
+    }
+
+    impl TimestampIds {
+        /// `id_ts` is the id's only input, so it must survive redaction.
+        const FIELDS: &'static [&'static str] = &["id_ts"];
     }
 
     fn timestamp_ids() -> std::sync::Arc<dyn crate::event_id::EventIdScheme> {
@@ -1289,6 +1313,48 @@ mod tests {
             ContentHashCheck::Matches,
             "the emitted content hash must cover the stamped `id_ts`"
         );
+    }
+
+    /// Receipt-check 3 redacts a content-hash-mismatched event and carries on
+    /// with it, so a scheme's inputs must survive redaction — otherwise the
+    /// bytes we persist can no longer re-derive the id we just assigned, and
+    /// the event dies at the next hop that re-reads it.
+    #[test]
+    fn identity_fields_survive_the_hash_mismatch_redaction() {
+        let (signer, sender) = node_signer_and_user();
+        let built = EventBuilder::new(sender, "m.room.message".to_owned())
+            .room_id(room("!r:d"))
+            .content(json!({ "msgtype": "m.text", "body": "hi" }))
+            .origin_server_ts(1)
+            .signer(Some(signer))
+            .ids(Some(timestamp_ids()))
+            .build()
+            .expect("builds");
+
+        // Tamper with `content` so the emitted content hash no longer matches,
+        // driving `from_wire` down the redaction path.
+        let mut raw_json: serde_json::Value = serde_json::from_str(built.raw.get()).unwrap();
+        raw_json["content"]["body"] = json!("tampered");
+        let tampered = RawValue::from_string(raw_json.to_string()).expect("raw");
+
+        let ids = timestamp_ids();
+        let parsed = from_wire(tampered, Vec::new(), ids.as_ref())
+            .expect("from_wire")
+            .admit_on_faith();
+        let event = parsed.event();
+        assert_eq!(event.event_id, built.event_id, "the id must be unchanged");
+
+        // The persisted bytes were replaced by the redacted form — and can
+        // still re-derive the id, which is the property under test.
+        let CanonicalJsonValue::Object(redacted) =
+            serde_json::from_str::<CanonicalJsonValue>(event.raw.get()).expect("canonical")
+        else {
+            panic!("expected object");
+        };
+        let redelivered = ids
+            .derive(&redacted)
+            .expect("redacted bytes still name the event");
+        assert_eq!(redelivered, built.event_id);
     }
 
     /// A scheme whose inputs are missing is drop-class, not a panic and not a

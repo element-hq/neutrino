@@ -1,5 +1,5 @@
 //! End-to-end: two homeservers federate in **signed mode**
-//! (`EventPolicy::Signed`, i.e. `trusted_network = false`). Every locally-authored event
+//! (`EventSecurity::Signed`, i.e. `trusted_network = false`). Every locally-authored event
 //! is signed, every inbound event must carry a valid sender's-server
 //! signature, and the join handshake co-signs through the send_join
 //! round-trip. Convergence IS the assertion: with verification on at every
@@ -389,7 +389,7 @@ async fn stub_invite_handler(
             .expect("candidate parses")
             .admit_on_faith()
             .into_event();
-            s.co_sign(&mut ev).expect("stub co-signs");
+            s.co_sign(&mut ev, &[]).expect("stub co-signs");
             serde_json::from_str(ev.raw.get()).expect("co-signed raw is JSON")
         }
     };

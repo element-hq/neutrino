@@ -77,7 +77,8 @@ struct SenderCtx<S> {
     /// a peer advertises on a transaction *response*. Shared with the inbound
     /// worker/handler (see `AppState`).
     fetcher: Arc<dyn MissingEventsFetcher>,
-    /// Deployment-wide event policy from the medium's declared link trust.
+    /// Deployment-wide event policy: the security posture composed from the
+    /// medium's declared link trust, and the medium's nominated id scheme.
     policy: EventPolicy,
     /// Poke the inbound worker after reconciliation stages fetched events.
     worker_poke: mpsc::Sender<OwnedRoomId>,

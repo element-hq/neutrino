@@ -371,7 +371,7 @@ async fn try_join_via(
     }
 
     let join = crate::federation::complete_membership_template(
-        policy.signer().cloned(),
+        policy,
         &template.event,
         room_id,
         user,
