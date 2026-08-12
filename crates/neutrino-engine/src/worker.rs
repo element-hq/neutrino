@@ -55,9 +55,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use neutrino_event::{Event, EventSecurity};
+use neutrino_event::{Event, EventPolicy};
 use neutrino_store::{StagedPdu, StorageBackend, WithStateProvider};
-use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, RoomId};
+use ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomId};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -65,7 +65,7 @@ use tracing::{debug, error, info, warn};
 use crate::gapfill::fill_state_ancestry;
 use crate::ports::MissingEventsFetcher;
 use crate::room_actor::{RoomActorError, RoomRegistry};
-use crate::util::{BACKOFF_BASE, jitter, next_backoff};
+use crate::util::{BACKOFF_BASE, jitter, next_backoff, room_version};
 
 /// Buffer for the in-process poke channel. A poke is just a room id; the
 /// supervisor coalesces duplicates (re-reading the room's staged rows each
@@ -80,8 +80,10 @@ struct WorkerCtx<S> {
     store: Arc<S>,
     registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
-    /// Deployment-wide security policy from the medium's declared link trust.
-    security: EventSecurity,
+    /// Deployment-wide event policy: the security posture composed from the
+    /// medium's declared link trust, and the room versions this build speaks
+    /// (each room's own version is read from the store, per room).
+    policy: EventPolicy,
     /// Backoff floor; [`BACKOFF_BASE`] in production, near-zero in tests so the
     /// retry path runs without real delays.
     backoff_base: Duration,
@@ -95,7 +97,7 @@ impl<S> Clone for WorkerCtx<S> {
             store: self.store.clone(),
             registry: self.registry.clone(),
             fetcher: self.fetcher.clone(),
-            security: self.security.clone(),
+            policy: self.policy.clone(),
             backoff_base: self.backoff_base,
         }
     }
@@ -118,9 +120,9 @@ pub fn spawn<S: StorageBackend + WithStateProvider + 'static>(
     store: Arc<S>,
     registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
-    security: EventSecurity,
+    policy: EventPolicy,
 ) -> mpsc::Sender<OwnedRoomId> {
-    spawn_with(store, registry, fetcher, security, BACKOFF_BASE)
+    spawn_with(store, registry, fetcher, policy, BACKOFF_BASE)
 }
 
 /// Inner spawn with the backoff floor made explicit, so tests can drive the
@@ -129,7 +131,7 @@ fn spawn_with<S: StorageBackend + WithStateProvider + 'static>(
     store: Arc<S>,
     registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
-    security: EventSecurity,
+    policy: EventPolicy,
     backoff_base: Duration,
 ) -> mpsc::Sender<OwnedRoomId> {
     let (tx, rx) = mpsc::channel(POKE_BUFFER);
@@ -137,7 +139,7 @@ fn spawn_with<S: StorageBackend + WithStateProvider + 'static>(
         store,
         registry,
         fetcher,
-        security,
+        policy,
         backoff_base,
     };
     tokio::spawn(supervise(ctx, rx));
@@ -251,19 +253,47 @@ async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
             continue;
         }
 
+        // The room's version names every row below. Resolved once per round,
+        // not per PDU.
+        let version = match room_version(ctx.store.as_ref(), &ctx.policy.versions, &room).await {
+            Ok(v) => v,
+            // Retryable (a storage fault): leave the rows staged. Dropping here
+            // would lose events the next round could still apply.
+            Err(e) if e.is_retryable() => {
+                warn!(%room, error = %e, "cannot name this room's events yet; leaving rows staged");
+                sleep_or_poke(ctx.backoff_base, &notify).await;
+                continue;
+            }
+            // Terminal: no row for this room, or a version this build cannot
+            // speak. These rows can never be applied, so drop them — the same
+            // verdict `process_one` reaches for `UnknownRoom`, and for the same
+            // reason: retrying forever would let an unauthenticated peer
+            // accumulate un-drainable staged rows and a permanent per-room task
+            // by naming rooms we are not in.
+            Err(e) => {
+                let ids: Vec<&EventId> = eligible.iter().map(|p| p.event_id.as_ref()).collect();
+                warn!(%room, error = %e, count = ids.len(), "dropping staged PDUs we can never name");
+                if let Err(e) = ctx.store.unstage_events(&ids).await {
+                    error!(%room, error = %e, "unstaging unnameable PDUs");
+                }
+                backoff.clear();
+                continue;
+            }
+        };
+
         // Apply parents before children that are staged together. A row that
         // fails admission here is dropped: for `/send`-staged rows this is the
         // real signature/parse gate (they were staged on faith and deferred it
         // here); for rows staged after an earlier admit it is defensive.
         // Unstage rather than spin forever.
-        for staged in toposort(parse_or_drop(&ctx, &eligible).await) {
+        for staged in toposort(parse_or_drop(&ctx, &eligible, &version).await) {
             process_one(&ctx, &room, staged, &mut backoff).await;
         }
     }
 }
 
 /// Admit each eligible staged row to a [`Staged`] under the deployment policy
-/// ([`EventSecurity::admit_wire`]). This is where a staged row's signature is
+/// ([`EventPolicy::admit_wire`]). This is where a staged row's signature is
 /// verified on a signed deployment: `/send` stages on faith and defers the
 /// check here (the worker is the sole staged→applied authority). A row that
 /// fails admission — no longer parses, fails its content hash, or (under
@@ -272,10 +302,11 @@ async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
 async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
     ctx: &WorkerCtx<S>,
     eligible: &[StagedPdu],
+    version: &Arc<neutrino_event::RoomVersion>,
 ) -> Vec<Staged> {
     let mut out = Vec::with_capacity(eligible.len());
     for p in eligible {
-        match ctx.security.admit_wire(p.raw.clone()).await {
+        match ctx.policy.admit_wire(p.raw.clone(), version).await {
             // Both variants proceed: a `Wire::Rejected` event carries
             // `rejected = true` and `apply_pdu` short-circuits it to a
             // rejected persist (the cascade terminator).
@@ -337,7 +368,7 @@ async fn process_one<S: StorageBackend + WithStateProvider + 'static>(
                 &staged.origin,
                 &staged.event,
                 &*ctx.fetcher,
-                &ctx.security,
+                &ctx.policy,
             )
             .await
             {
@@ -482,20 +513,28 @@ mod tests {
     /// returned oldest-first; `create` is the grounded root, not part of a batch.
     fn chain() -> (Event, Event, Event) {
         let alice: OwnedUserId = "@alice:example.org".parse().unwrap();
-        let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(json!({ "room_version": ROOM_VERSION_ID }))
-            .build()
-            .unwrap();
+        let create = EventBuilder::new(
+            alice.clone(),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .unwrap();
         let room_id = create.room_id.clone();
         let on = |prev: &Event, body: &str| {
-            EventBuilder::new(alice.clone(), "m.room.message".to_owned())
-                .room_id(room_id.clone())
-                .content(json!({ "msgtype": "m.text", "body": body }))
-                .prev_events(vec![prev.event_id.clone()])
-                .prev_state_events(vec![prev.event_id.clone()])
-                .build()
-                .unwrap()
+            EventBuilder::new(
+                alice.clone(),
+                "m.room.message".to_owned(),
+                neutrino_event::base_version().clone(),
+            )
+            .room_id(room_id.clone())
+            .content(json!({ "msgtype": "m.text", "body": body }))
+            .prev_events(vec![prev.event_id.clone()])
+            .prev_state_events(vec![prev.event_id.clone()])
+            .build()
+            .unwrap()
         };
         let a = on(&create, "a");
         let b = on(&a, "b");

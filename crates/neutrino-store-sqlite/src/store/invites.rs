@@ -7,7 +7,7 @@
 //! invited user; `INSERT OR REPLACE` on that PK gives latest-invite-wins.
 //!
 //! Only the canonical invite event `json` is stored; `get_invite` rehydrates
-//! the `Event` verbatim via `compute_event_id` + `parse_event` — the same
+//! the `Event` verbatim from its stored id + `parse_event` — the same
 //! wire→`Event` field parsing `from_wire` uses, **minus the redaction step**.
 //! Skipping redaction is the point: `from_wire` redacts on a content-hash
 //! miss, which would strip the inviting server's `unsigned.invite_room_state`
@@ -22,10 +22,9 @@
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{OptionalExtension, params};
 use neutrino_event::Event;
-use neutrino_event::event_id::compute_event_id;
 use neutrino_event::validate::parse_event;
 use neutrino_store::{InviteStore, StorageError};
-use ruma::{OwnedRoomId, RoomId, UserId};
+use ruma::{OwnedEventId, OwnedRoomId, RoomId, UserId};
 use serde_json::value::RawValue as RawJsonValue;
 
 use crate::{SqliteStore, error::Error};
@@ -41,15 +40,16 @@ impl InviteStore for SqliteStore {
         let room_id = room_id.as_str().to_owned();
         let state_key = user_id.as_str().to_owned();
         let json = event.raw.get().to_owned();
+        let event_id = event.event_id.as_str().to_owned();
         let watch_tx = self.watch_tx.clone();
 
         self.run_write(move |conn| -> Result<(), Error> {
             // INSERT OR REPLACE on the (room_id, state_key) PK: a re-invite for
             // the same pair overwrites the prior stub — latest wins.
             conn.execute(
-                "INSERT OR REPLACE INTO oob_invites (room_id, state_key, json) \
-                 VALUES (?, ?, ?)",
-                params![room_id, state_key, json],
+                "INSERT OR REPLACE INTO oob_invites (room_id, state_key, event_id, json) \
+                 VALUES (?, ?, ?, ?)",
+                params![room_id, state_key, event_id, json],
             )?;
             // Wake any in-flight sliding-sync long-poll so the invite surfaces
             // now, not at the poll's timeout. Inside the closure (like
@@ -68,24 +68,30 @@ impl InviteStore for SqliteStore {
         let room_id = room_id.as_str().to_owned();
         let state_key = user_id.as_str().to_owned();
         self.run_read(move |conn| -> Result<Option<Event>, Error> {
-            let json: Option<String> = conn
+            let row: Option<(String, String)> = conn
                 .query_row(
-                    "SELECT json FROM oob_invites WHERE room_id = ? AND state_key = ?",
+                    "SELECT event_id, json FROM oob_invites WHERE room_id = ? AND state_key = ?",
                     params![room_id, state_key],
-                    |row| row.get::<_, String>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .optional()?;
-            let Some(json) = json else { return Ok(None) };
+            let Some((event_id, json)) = row else {
+                return Ok(None);
+            };
             let raw = RawJsonValue::from_string(json).map_err(|e| {
                 Error::Internal(format!("malformed oob invite json in DB row: {e}"))
             })?;
-            // Verbatim rehydrate: compute the id from the canonical bytes, then
-            // parse the fields keeping `raw` (and `unsigned.invite_room_state`)
+            // Verbatim rehydrate: take the id from its column, then parse the
+            // fields keeping `raw` (and `unsigned.invite_room_state`)
             // byte-for-byte. NOT `from_wire` — that redacts on a content-hash
             // miss and would strip `unsigned`. The event was validated on
             // receipt, so a parse failure here is DB corruption ⇒ Internal.
-            let event_id = compute_event_id(&raw).map_err(|e| {
-                Error::Internal(format!("oob invite event_id recompute failed: {e}"))
+            //
+            // The id is read, never recomputed: it was derived under the
+            // room's version when the invite arrived, and this is a room we do
+            // not host — there is no `rooms` row to recover that version from.
+            let event_id = OwnedEventId::try_from(event_id).map_err(|e| {
+                Error::Internal(format!("malformed event_id in oob_invites row: {e}"))
             })?;
             let event = parse_event(raw, event_id, Vec::new()).map_err(|e| {
                 Error::Internal(format!("malformed oob invite event in DB row: {e}"))
@@ -133,7 +139,7 @@ impl InviteStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use neutrino_event::Event;
-    use neutrino_event::event_id::compute_event_id;
+    use neutrino_event::event_id::base_version_event_id;
     use neutrino_store::InviteStore;
     use ruma::{RoomId, UserId, room_id, user_id};
     use serde_json::value::RawValue;
@@ -170,7 +176,7 @@ mod tests {
             }
         });
         let raw = RawValue::from_string(serde_json::to_string(&body).unwrap()).unwrap();
-        let event_id = compute_event_id(&raw).expect("fixture computes event_id");
+        let event_id = base_version_event_id(&raw).expect("fixture computes event_id");
         let content = serde_json::value::to_raw_value(body.get("content").unwrap()).unwrap();
         Event {
             event_id,

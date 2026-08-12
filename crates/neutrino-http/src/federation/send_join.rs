@@ -64,11 +64,28 @@ pub(crate) async fn handle(
         .map_err(|_| FedError::BadRequest("body is not valid JSON"))?
         .0;
 
+    let (store, registry, our_name) = {
+        let app = lock_app(&state);
+        (
+            app.store.clone(),
+            app.room_registry.clone(),
+            app.config.server_name.clone(),
+        )
+    };
+
+    // The join names itself under the version of the room it joins, so the
+    // version has to be resolved from the room *before* the event can be
+    // parsed. The `{roomId}` path segment is not trusted for this (it is
+    // ignored by contract); the room the event itself claims is.
+    let version =
+        neutrino_engine::room_version_for_wire(store.as_ref(), &state.policy().versions, &raw)
+            .await?;
+
     // Parse + compute the event id from the reference hash. `auth_events`
     // start empty — apply_pdu is their sole authority. Resident membership
     // follows the *local* reject policy (refused, never persisted), so a
     // `Wire::Rejected` join is a 400 like any other malformed event.
-    let event = match state.security().admit_wire(raw).await {
+    let event = match state.policy().admit_wire(raw, &version).await {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
         Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
             tracing::warn!(event_id = %ev.event_id, %defect, "send_join: refusing Wire::Rejected join");
@@ -94,15 +111,6 @@ pub(crate) async fn handle(
         return Err(FedError::BadRequest("state_key must equal sender"));
     }
 
-    let (store, registry, our_name) = {
-        let app = lock_app(&state);
-        (
-            app.store.clone(),
-            app.room_registry.clone(),
-            app.config.server_name.clone(),
-        )
-    };
-
     // A server may only send_join its own user's membership event — the
     // authenticated origin must own the event's sender. Cheap pre-filter;
     // apply_resident's auth rules remain authoritative.
@@ -117,7 +125,7 @@ pub(crate) async fn handle(
     // origin's, so the copy we persist + fan out AND the response copy the
     // joiner keeps both carry the two signatures. No-op on a trusted network.
     let mut event = event;
-    co_sign_if_signed(&state, &mut event)?;
+    co_sign_if_signed(&state, &mut event, &version)?;
 
     // Keep the wire bytes for the response `event` field before the apply
     // consumes the parsed event.

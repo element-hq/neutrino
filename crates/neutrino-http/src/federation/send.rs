@@ -3,9 +3,9 @@
 //! A transaction is an envelope of up to 50 PDUs (plus EDUs, which this server
 //! stubs out — they are deserialized for shape validation and dropped). Each
 //! PDU is a fully-formed v12 event; we parse it via
-//! [`neutrino_event::event_builder::from_wire`] (which derives the event_id from the
-//! reference hash, verifies/redacts on content-hash mismatch, and runs the
-//! format + semantic validators).
+//! [`neutrino_event::event_builder::from_wire`] (which derives the event_id
+//! under the room's version, verifies/redacts on content-hash mismatch, and
+//! runs the format + semantic validators).
 //!
 //! ## Stage-then-async
 //!
@@ -35,7 +35,8 @@
 //! omits it); when a peer does send one it is cross-checked against the header
 //! origin and a mismatch is rejected.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use axum::{
     Json,
@@ -125,13 +126,13 @@ pub(crate) async fn handle(
         return Err(FedError::BadRequest("transaction exceeds 50 PDUs"));
     }
 
-    let (store, worker_poke, fetcher, security, our_name) = {
+    let (store, worker_poke, fetcher, policy, our_name) = {
         let app = lock_app(&state);
         (
             app.store.clone(),
             app.worker_poke.clone(),
             app.fetcher.clone(),
-            app.security.clone(),
+            app.policy.clone(),
             app.config.server_name.clone(),
         )
     };
@@ -186,6 +187,14 @@ pub(crate) async fn handle(
     // failure — it would fail identically on every resend, so it must not block
     // recording.
     let mut all_staged = true;
+    // One version lookup per distinct room in the transaction, not per PDU: a
+    // transaction commonly carries several events for one room. Only *decided*
+    // outcomes are cached (a resolved version, or `None` for a terminal refusal
+    // that no retry can change); a storage fault is deliberately not cached, so
+    // it neither poisons the rest of the transaction nor is mistaken for a
+    // refusal.
+    let mut versions: HashMap<Option<OwnedRoomId>, Option<Arc<neutrino_event::RoomVersion>>> =
+        HashMap::new();
     for raw in body.pdus {
         // Parse only — signatures are NOT verified here. The inbound worker
         // (`parse_or_drop` → `apply_pdu`) is the sole authority on the
@@ -198,7 +207,44 @@ pub(crate) async fn handle(
         // Drop-class PDUs (`Err`) are unkeyable and never enter the system;
         // `Wire::Rejected` ones are staged like any other — the worker persists
         // them rejected (the cascade terminator).
-        let event = match neutrino_event::event_builder::from_wire(raw, Vec::new())
+        // A PDU can only be named under its room's version, so resolve that
+        // first: the room it claims (the common case) or, for a create, the
+        // version the create declares.
+        //
+        // A *terminal* refusal (we are not in that room, or we do not speak its
+        // version) is a drop, exactly as an unparseable PDU is dropped — guessing
+        // a version would invent a different event. A *storage fault* is not:
+        // the version is on disk and a resend can succeed, so the PDU is left
+        // unstaged AND the transaction is left unrecorded (`all_staged = false`),
+        // which is what makes the peer resend it. Dropping on a fault would lose
+        // the event for good, since the txn-dedup would swallow the resend.
+        let keys = neutrino_event::room_version_keys(&raw);
+        let cached = versions.get(&keys.room_id).cloned();
+        let version = match cached {
+            Some(decided) => decided,
+            None => match neutrino_engine::room_version_for_wire(&*store, &policy.versions, &raw)
+                .await
+            {
+                Ok(v) => {
+                    versions.insert(keys.room_id.clone(), Some(v.clone()));
+                    Some(v)
+                }
+                Err(e) if e.is_retryable() => {
+                    warn!(room_id = ?keys.room_id, error = %e, "/send: cannot name this room's events; leaving the transaction unrecorded so the peer resends");
+                    all_staged = false;
+                    continue;
+                }
+                Err(e) => {
+                    warn!(room_id = ?keys.room_id, error = %e, "/send: dropping PDU we can never name");
+                    versions.insert(keys.room_id.clone(), None);
+                    None
+                }
+            },
+        };
+        let Some(version) = version else {
+            continue;
+        };
+        let event = match neutrino_event::event_builder::from_wire(raw, Vec::new(), &version)
             .map(|uw| uw.admit_on_faith())
         {
             Ok(neutrino_event::Wire::Valid(ev)) => ev,
@@ -286,14 +332,14 @@ pub(crate) async fn handle(
     for (room, heads) in advertised {
         let store = store.clone();
         let fetcher = fetcher.clone();
-        let security = security.clone();
+        let policy = policy.clone();
         let worker_poke = worker_poke.clone();
         let origin = origin.clone();
         tokio::spawn(async move {
             reconcile::reconcile_room(
                 &*store,
                 &*fetcher,
-                &security,
+                &policy,
                 &worker_poke,
                 &origin,
                 &room,

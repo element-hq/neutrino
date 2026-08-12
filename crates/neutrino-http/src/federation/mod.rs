@@ -113,6 +113,24 @@ pub(crate) enum FedError {
     Storage(#[from] StorageError),
 }
 
+/// A version we could not resolve, told apart by whether a retry can help: a
+/// storage fault is ours to own (500, the peer should retry), a room we are not
+/// in is a 404, and a version this build cannot speak is a 500 — not the peer's
+/// fault either, and not an `M_INCOMPATIBLE_ROOM_VERSION`, which means the
+/// *requester* lacks the version.
+impl From<neutrino_engine::VersionError> for FedError {
+    fn from(e: neutrino_engine::VersionError) -> Self {
+        use neutrino_engine::VersionError;
+        match e {
+            VersionError::UnknownRoom => FedError::RoomNotFound,
+            VersionError::Unsupported(_) => {
+                FedError::Internal("room is of an unsupported room version")
+            }
+            VersionError::Fault(e) => FedError::Storage(e),
+        }
+    }
+}
+
 impl IntoResponse for FedError {
     fn into_response(self) -> Response {
         // `M_INCOMPATIBLE_ROOM_VERSION` carries an extra `room_version` field
@@ -196,6 +214,12 @@ pub(crate) fn map_apply_err(err: neutrino_engine::RoomActorError) -> FedError {
         RoomActorError::NotApplied | RoomActorError::ActorGone => {
             FedError::Internal("apply did not produce a result")
         }
+        // Our own store holds a room whose version this build cannot speak, so
+        // we cannot name its events. Not the peer's fault: a 500, not an
+        // incompatible-version 400.
+        RoomActorError::UnsupportedRoomVersion(_) => {
+            FedError::Internal("room is of an unsupported room version")
+        }
     }
 }
 
@@ -210,10 +234,11 @@ pub(crate) fn map_apply_err(err: neutrino_engine::RoomActorError) -> FedError {
 pub(crate) fn co_sign_if_signed(
     state: &crate::AppState,
     event: &mut neutrino_event::Event,
+    version: &neutrino_event::RoomVersion,
 ) -> Result<(), FedError> {
     if let Some(signer) = state.signer() {
         signer
-            .co_sign(event)
+            .co_sign(event, version)
             .map_err(|_| FedError::BadRequest("event cannot be co-signed"))?;
     }
     Ok(())
@@ -234,7 +259,8 @@ pub(crate) fn co_sign_if_signed(
 /// "simplify" this into reusing the template's fields; a regression test pins
 /// the invariant. `None` if the template is unparseable.
 pub(crate) fn complete_membership_template(
-    signer: Option<std::sync::Arc<neutrino_event::EventSigner>>,
+    policy: &neutrino_event::EventPolicy,
+    version: &std::sync::Arc<neutrino_event::RoomVersion>,
     template: &serde_json::value::RawValue,
     room_id: &ruma::RoomId,
     user: &ruma::UserId,
@@ -251,7 +277,7 @@ pub(crate) fn complete_membership_template(
     // rebuilt below, re-validated by `EventBuilder::build`, and auth-checked
     // by the resident), so a `Wire::Rejected` template is as usable as a
     // valid one.
-    let parsed = match neutrino_event::event_builder::from_wire(raw, Vec::new())
+    let parsed = match neutrino_event::event_builder::from_wire(raw, Vec::new(), version)
         .map(|uw| uw.admit_on_faith())
     {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
@@ -270,13 +296,13 @@ pub(crate) fn complete_membership_template(
     // join/leave), so it carries the server-wide display name.
     let mut content = json!({ "membership": membership });
     crate::set_member_displayname(&mut content, display_name);
-    match EventBuilder::new(user.to_owned(), "m.room.member".to_owned())
+    match EventBuilder::new(user.to_owned(), "m.room.member".to_owned(), version.clone())
         .room_id(room_id.to_owned())
         .state_key(user.to_string())
         .content(content)
         .prev_events(parsed.prev_events)
         .prev_state_events(parsed.prev_state_events)
-        .signer(signer)
+        .signer(policy.signer().cloned())
         .build()
     {
         Ok(event) => Some(event),

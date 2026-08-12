@@ -18,13 +18,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use neutrino_event::EventSecurity;
+use neutrino_event::EventPolicy;
 use neutrino_store::{StateStore, StorageBackend};
 use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId, ServerName};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::ports::{ForwardExtremities, MissingEventsFetcher, MissingEventsQuery};
+use crate::util::room_version;
 
 /// Whether `server` has a joined member in `room_id`. A store-backed predicate
 /// (not an `X-Matrix` check): the advertised heads a peer sends are
@@ -126,7 +127,7 @@ pub fn strip_known(
 pub async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
     store: &impl StorageBackend,
     fetcher: &F,
-    security: &EventSecurity,
+    policy: &EventPolicy,
     worker_poke: &mpsc::Sender<OwnedRoomId>,
     peer: &ServerName,
     room_id: &RoomId,
@@ -153,6 +154,16 @@ pub async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
     let Ok(Some((our_timeline, our_state))) = store.forward_extremities(room_id).await else {
         return;
     };
+    // The version every fetched event is named under. Resolved once for both
+    // DAG walks; absent means we cannot name this room's events, so there is
+    // nothing useful to fetch.
+    let version = match room_version(store, &policy.versions, room_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(%peer, %room_id, error = %e, "reconcile: cannot name this room's events");
+            return;
+        }
+    };
     let our_timeline: Vec<OwnedEventId> = our_timeline.into_iter().collect();
     let our_state: Vec<OwnedEventId> = our_state.into_iter().collect();
 
@@ -175,7 +186,8 @@ pub async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
     let mut staged = fetch_unknown(
         store,
         fetcher,
-        security,
+        policy,
+        &version,
         peer,
         room_id,
         &advertised.state,
@@ -188,7 +200,8 @@ pub async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
         fetch_unknown(
             store,
             fetcher,
-            security,
+            policy,
+            &version,
             peer,
             room_id,
             &advertised.timeline,
@@ -223,7 +236,8 @@ pub async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
 async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
     store: &impl StorageBackend,
     fetcher: &F,
-    security: &EventSecurity,
+    policy: &EventPolicy,
+    version: &std::sync::Arc<neutrino_event::RoomVersion>,
     peer: &ServerName,
     room_id: &RoomId,
     heads: &[OwnedEventId],
@@ -290,7 +304,7 @@ async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
         // Rejected wire events are staged too (the worker persists them
         // rejected; cascade termination needs the row); drop-class events
         // (`Err`) never enter the system.
-        let Ok(wire) = security.admit_wire(raw).await else {
+        let Ok(wire) = policy.admit_wire(raw, version).await else {
             continue;
         };
         if let neutrino_event::Wire::Rejected(rej, defect) = &wire {

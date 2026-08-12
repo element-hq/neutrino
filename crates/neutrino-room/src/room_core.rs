@@ -58,7 +58,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use neutrino_event::event_builder::EventBuilder;
-use neutrino_event::{Event, FormatError};
+use neutrino_event::{Event, FormatError, RoomVersion};
 use ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId};
 use serde_json::Value;
 
@@ -176,18 +176,20 @@ pub enum Effect {
 #[derive(Debug, Clone)]
 pub struct RoomCore {
     pub(crate) room_id: OwnedRoomId,
+    pub(crate) version: Arc<RoomVersion>,
     pub(crate) forward_extremities: BTreeSet<OwnedEventId>,
     pub(crate) state_forward_extremities: BTreeSet<OwnedEventId>,
     pub(crate) current_state: Arc<StateMap<Arc<Event>>>,
 }
 
 impl RoomCore {
-    /// Create a fresh `RoomCore` for `room_id`. Starts with empty forward
-    /// extremities and empty current_state — the first `apply` call is
-    /// expected to be the room's create event.
-    pub fn new(room_id: OwnedRoomId) -> Self {
+    /// Create a fresh `RoomCore` for `room_id` under `version`. Starts with
+    /// empty forward extremities and empty current_state — the first `apply`
+    /// call is expected to be the room's create event.
+    pub fn new(room_id: OwnedRoomId, version: Arc<RoomVersion>) -> Self {
         Self {
             room_id,
+            version,
             forward_extremities: BTreeSet::new(),
             state_forward_extremities: BTreeSet::new(),
             current_state: Arc::new(StateMap::new()),
@@ -202,16 +204,23 @@ impl RoomCore {
     /// heads (`state_forward_extremities`).
     pub fn hydrate(
         room_id: OwnedRoomId,
+        version: Arc<RoomVersion>,
         timeline_fes: BTreeSet<OwnedEventId>,
         state_fes: BTreeSet<OwnedEventId>,
         current_state: StateMap<Arc<Event>>,
     ) -> Self {
         Self {
             room_id,
+            version,
             forward_extremities: timeline_fes,
             state_forward_extremities: state_fes,
             current_state: Arc::new(current_state),
         }
+    }
+
+    /// The version of the room this state machine is tracking
+    pub fn version(&self) -> &Arc<RoomVersion> {
+        &self.version
     }
 
     /// The room this state machine is tracking.
@@ -245,23 +254,26 @@ impl RoomCore {
     /// [`apply_pdu`](Self::apply_pdu) (or to persist as part of an initial
     /// batch) — `auth_events` are deliberately left empty here; `apply_pdu`
     /// computes and stamps them as the sole authority (see its docs).
+    ///
+    /// `signer` is `None` on a trusted network (events MUST NOT carry
+    /// signatures there); the room's version comes from the core itself.
     pub fn build_local_event(
         &self,
         sender: OwnedUserId,
         event_type: String,
         state_key: Option<String>,
         content: Value,
-        signer: Option<std::sync::Arc<neutrino_event::EventSigner>>,
+        signer: Option<&Arc<neutrino_event::EventSigner>>,
     ) -> Result<Event, FormatError> {
         let prev_events: Vec<OwnedEventId> = self.forward_extremities.iter().cloned().collect();
         let prev_state_events: Vec<OwnedEventId> =
             self.state_forward_extremities.iter().cloned().collect();
-        let mut builder = EventBuilder::new(sender, event_type)
+        let mut builder = EventBuilder::new(sender, event_type, self.version.clone())
             .room_id(self.room_id.clone())
             .content(content)
             .prev_events(prev_events)
             .prev_state_events(prev_state_events)
-            .signer(signer);
+            .signer(signer.cloned());
         if let Some(sk) = state_key {
             builder = builder.state_key(sk);
         }
@@ -362,7 +374,7 @@ impl RoomCore {
         // assembled by hand; it applies the same classification `from_wire`
         // would have.
         if !event.rejected
-            && let Err(e) = neutrino_event::validate::validate_pdu(&event)
+            && let Err(e) = neutrino_event::validate::validate_pdu(&event, &self.version)
         {
             match neutrino_event::semantic_verdict(&e) {
                 // Not a valid event (receipt-check 1): DROP, never persisted.
@@ -607,12 +619,16 @@ mod tests {
         if !federate {
             content["m.federate"] = json!(false);
         }
-        EventBuilder::new(creator.parse().expect("user"), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(content)
-            .origin_server_ts(next_ts())
-            .build()
-            .expect("valid create")
+        EventBuilder::new(
+            creator.parse().expect("user"),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(content)
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid create")
     }
 
     /// Build an `m.room.member` event. `prev_state_events` and `auth_events`
@@ -628,16 +644,20 @@ mod tests {
         prev_state: Vec<OwnedEventId>,
         room: &ruma::RoomId,
     ) -> Event {
-        EventBuilder::new(sender.parse().expect("user"), "m.room.member".to_owned())
-            .room_id(room.to_owned())
-            .state_key(target.to_owned())
-            .content(json!({ "membership": membership }))
-            .auth_events(prev_state.clone())
-            .prev_events(prev_state.clone())
-            .prev_state_events(prev_state)
-            .origin_server_ts(next_ts())
-            .build()
-            .expect("valid member")
+        EventBuilder::new(
+            sender.parse().expect("user"),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room.to_owned())
+        .state_key(target.to_owned())
+        .content(json!({ "membership": membership }))
+        .auth_events(prev_state.clone())
+        .prev_events(prev_state.clone())
+        .prev_state_events(prev_state)
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid member")
     }
 
     /// Build an `m.room.power_levels` event.
@@ -650,6 +670,7 @@ mod tests {
         EventBuilder::new(
             sender.parse().expect("user"),
             "m.room.power_levels".to_owned(),
+            neutrino_event::base_version().clone(),
         )
         .room_id(room.to_owned())
         .state_key(String::new())
@@ -678,7 +699,7 @@ mod tests {
         let room_id = room_id_from_create(&create.event_id);
         let create_id = create.event_id.clone();
         let mut provider = InMemoryStateProvider::new();
-        let mut room = RoomCore::new(room_id.clone());
+        let mut room = RoomCore::new(room_id.clone(), neutrino_event::base_version().clone());
         room.apply_pdu((*create).clone(), &provider)
             .expect("create");
         // Honour Persist after apply (matches real usage; pre-inserting would
@@ -698,6 +719,7 @@ mod tests {
         EventBuilder::new(
             "@alice:example.org".parse().expect("user"),
             "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
         )
         .room_id(room.to_owned())
         .state_key("@alice:example.org".to_owned())
@@ -731,7 +753,7 @@ mod tests {
         let room_id = room_id_from_create(&create.event_id);
         let create_id = create.event_id.clone();
         let provider = InMemoryStateProvider::new();
-        let mut room = RoomCore::new(room_id);
+        let mut room = RoomCore::new(room_id, neutrino_event::base_version().clone());
 
         let effects = room
             .apply_pdu(create.clone(), &provider)
@@ -768,7 +790,7 @@ mod tests {
         let room_id = room_id_from_create(&create.event_id);
         let create_id = create.event_id.clone();
         let mut provider = InMemoryStateProvider::new();
-        let mut room = RoomCore::new(room_id.clone());
+        let mut room = RoomCore::new(room_id.clone(), neutrino_event::base_version().clone());
         room.apply_pdu((*create).clone(), &provider)
             .expect("create");
         // Honour Persist after apply (matches real usage; pre-inserting would
@@ -818,7 +840,7 @@ mod tests {
         let room_id = room_id_from_create(&create.event_id);
         let create_id = create.event_id.clone();
         let mut provider = InMemoryStateProvider::new();
-        let mut room = RoomCore::new(room_id.clone());
+        let mut room = RoomCore::new(room_id.clone(), neutrino_event::base_version().clone());
         room.apply_pdu((*create).clone(), &provider)
             .expect("create");
         // Honour Persist after apply (matches real usage; pre-inserting would
@@ -833,6 +855,7 @@ mod tests {
         let msg = EventBuilder::new(
             "@alice:example.org".parse().expect("user"),
             "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
         )
         .room_id(room_id.clone())
         .content(json!({ "msgtype": "m.text", "body": "hi" }))
@@ -875,7 +898,7 @@ mod tests {
         let create_id = phantom_create.event_id.clone();
         // Provider has nothing — the create is NOT inserted.
         let provider = InMemoryStateProvider::new();
-        let mut room = RoomCore::new(room_id.clone());
+        let mut room = RoomCore::new(room_id.clone(), neutrino_event::base_version().clone());
 
         let join = alice_join_event(&create_id, &room_id);
         let err = room.apply_pdu(join, &provider).expect_err("unknown room");
@@ -891,7 +914,7 @@ mod tests {
         let room_id = room_id_from_create(&create.event_id);
         let create_id = create.event_id.clone();
         let mut provider = InMemoryStateProvider::new();
-        let mut room = RoomCore::new(room_id.clone());
+        let mut room = RoomCore::new(room_id.clone(), neutrino_event::base_version().clone());
         room.apply_pdu((*create).clone(), &provider)
             .expect("create");
         // Honour Persist after apply (matches real usage; pre-inserting would
@@ -904,6 +927,7 @@ mod tests {
         let bob_topic = EventBuilder::new(
             "@bob:example.org".parse().expect("user"),
             "m.room.topic".to_owned(),
+            neutrino_event::base_version().clone(),
         )
         .room_id(room_id)
         .state_key(String::new())
@@ -939,7 +963,7 @@ mod tests {
         insert(&mut provider, our_create.clone());
         insert(&mut provider, other_create.clone());
 
-        let mut room = RoomCore::new(our_room_id.clone());
+        let mut room = RoomCore::new(our_room_id.clone(), neutrino_event::base_version().clone());
         room.apply_pdu((*our_create).clone(), &provider)
             .expect("ours");
 
@@ -958,7 +982,7 @@ mod tests {
         let create = Arc::new(create_event("@alice:example.org"));
         let room_id = room_id_from_create(&create.event_id);
         let mut provider = InMemoryStateProvider::new();
-        let mut room = RoomCore::new(room_id.clone());
+        let mut room = RoomCore::new(room_id.clone(), neutrino_event::base_version().clone());
         room.apply_pdu((*create).clone(), &provider)
             .expect("create");
         // Honour Persist after apply (matches real usage; pre-inserting would
@@ -988,7 +1012,7 @@ mod tests {
         let room_id = room_id_from_create(&create.event_id);
         let create_id = create.event_id.clone();
         let provider = InMemoryStateProvider::new();
-        let mut room = RoomCore::new(room_id);
+        let mut room = RoomCore::new(room_id, neutrino_event::base_version().clone());
         room.apply_pdu(create, &provider).expect("create accepted");
 
         assert_eq!(
@@ -1028,6 +1052,7 @@ mod tests {
         let msg = EventBuilder::new(
             "@alice:example.org".parse().expect("user"),
             "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
         )
         .room_id(room_id)
         .content(json!({ "msgtype": "m.text", "body": "hi" }))
@@ -1065,6 +1090,7 @@ mod tests {
             EventBuilder::new(
                 "@alice:example.org".parse().expect("user"),
                 "m.room.message".to_owned(),
+                neutrino_event::base_version().clone(),
             )
             .room_id(room_id)
             .content(json!({ "msgtype": "m.text", "body": "hi" }))
@@ -1108,7 +1134,13 @@ mod tests {
             Arc::new(create),
         );
 
-        let room = RoomCore::hydrate(room_id.clone(), timeline.clone(), state.clone(), current);
+        let room = RoomCore::hydrate(
+            room_id.clone(),
+            neutrino_event::base_version().clone(),
+            timeline.clone(),
+            state.clone(),
+            current,
+        );
 
         assert_eq!(room.room_id(), &*room_id);
         assert_eq!(room.forward_extremities(), &timeline);
@@ -1149,6 +1181,7 @@ mod tests {
         let msg = EventBuilder::new(
             "@alice:example.org".parse().expect("user"),
             "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
         )
         .room_id(room_id)
         .content(json!({ "msgtype": "m.text", "body": "hi" }))
@@ -1185,7 +1218,7 @@ mod tests {
         let room_id = room_id_from_create(&create.event_id);
         let create_id = create.event_id.clone();
         let mut provider = InMemoryStateProvider::new();
-        let mut room = RoomCore::new(room_id.clone());
+        let mut room = RoomCore::new(room_id.clone(), neutrino_event::base_version().clone());
         room.apply_pdu((*create).clone(), &provider)
             .expect("create");
         // Honour Persist after apply (matches real usage; pre-inserting would
@@ -1434,6 +1467,7 @@ mod tests {
         EventBuilder::new(
             "@alice:example.org".parse().expect("user"),
             "m.room.topic".to_owned(),
+            neutrino_event::base_version().clone(),
         )
         .room_id(room.to_owned())
         .state_key(String::new())
@@ -1564,6 +1598,7 @@ mod tests {
         neutrino_event::event_builder::from_wire(
             serde_json::value::RawValue::from_string(obj.to_string()).expect("valid JSON"),
             Vec::new(),
+            neutrino_event::base_version(),
         )
         .expect("parseable wire event")
         .admit_on_faith()
@@ -1719,7 +1754,7 @@ mod tests {
         // until the room lands — then the re-apply persists the rejection.
         let ghost_create = create_event("@ghost:example.org");
         let ghost_room = room_id_from_create(&ghost_create.event_id);
-        let mut room = RoomCore::new(ghost_room.clone());
+        let mut room = RoomCore::new(ghost_room.clone(), neutrino_event::base_version().clone());
         let provider = InMemoryStateProvider::new(); // knows nothing
         let bad = wire_event(
             "m.room.member",
@@ -1745,6 +1780,7 @@ mod tests {
         let mut big = EventBuilder::new(
             "@alice:example.org".parse().expect("user"),
             "m.example.big".to_owned(),
+            neutrino_event::base_version().clone(),
         )
         .room_id(room_id.clone())
         .state_key("x".to_owned())

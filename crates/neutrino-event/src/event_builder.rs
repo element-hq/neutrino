@@ -22,9 +22,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::event_id::{
-    ContentHashCheck, b64_unpadded, check_content_hash, content_hash, event_id_from_hash,
-    redact_to_canonical_bytes, reference_hash,
+    ContentHashCheck, EventIdError, b64_unpadded, check_content_hash, content_hash,
+    redact_to_canonical_bytes,
 };
+use crate::room_version::RoomVersion;
 use ruma::canonical_json::{CanonicalJsonObject, CanonicalJsonValue, try_from_json_map};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 use serde::Serialize;
@@ -36,9 +37,9 @@ use crate::{Event, FormatError};
 
 /// Builder for server-authored Matrix v12 PDUs.
 ///
-/// `new` takes the two strictly-required fields (`sender`, `type`); everything
-/// else has a sensible default applied at `build()` time. Setters consume and
-/// return `Self` for chaining.
+/// `new` takes the strictly-required fields (`sender`, `type`, and the room
+/// version the event is named under); everything else has a sensible default
+/// applied at `build()` time. Setters consume and return `Self` for chaining.
 ///
 /// **For `m.room.create` events**: do not set `room_id` (it's derived from
 /// the computed event_id post-hash). The `state_key` must be `""`.
@@ -58,13 +59,23 @@ pub struct EventBuilder {
     origin_server_ts: Option<u64>,
     unsigned: Option<Value>,
     signer: Option<std::sync::Arc<crate::sign::EventSigner>>,
+    version: std::sync::Arc<RoomVersion>,
 }
 
 impl EventBuilder {
-    /// Start a new builder. Defaults: `content` = `{}`, `origin_server_ts` =
-    /// `now_ms()` (applied at `build()` time), all parent lists empty,
-    /// `state_key` / `room_id` / `unsigned` absent.
-    pub fn new(sender: OwnedUserId, event_type: String) -> Self {
+    /// Start a new builder for an event in a room of `version` — whose rules
+    /// supply the id derivation, the identity-field stamping and the redaction
+    /// keep-list. There is no default: an event cannot be named without its
+    /// room's version, and guessing one invents a different event.
+    ///
+    /// Other defaults: `content` = `{}`, `origin_server_ts` = `now_ms()`
+    /// (applied at `build()` time), all parent lists empty, `state_key` /
+    /// `room_id` / `unsigned` absent.
+    pub fn new(
+        sender: OwnedUserId,
+        event_type: String,
+        version: std::sync::Arc<RoomVersion>,
+    ) -> Self {
         Self {
             sender,
             event_type,
@@ -77,6 +88,7 @@ impl EventBuilder {
             origin_server_ts: None,
             unsigned: None,
             signer: None,
+            version,
         }
     }
 
@@ -218,6 +230,15 @@ impl EventBuilder {
         let mut canon: CanonicalJsonObject =
             try_from_json_map(map).map_err(FormatError::NonCanonical)?;
 
+        let version = self.version;
+
+        // Stamp the version's identity-bearing fields, if its scheme has any.
+        // Must precede the content hash and the signature so both cover them;
+        // the base version's scheme inserts nothing, so this is a no-op there.
+        version
+            .stamp(&mut canon)
+            .map_err(id_error_to_format_error)?;
+
         // Content hash → `hashes.sha256` (canonical-base64 standard alphabet
         // per spec). Order: content hash, insert, then reference hash, so the
         // reference hash covers the inserted content hash.
@@ -242,20 +263,23 @@ impl EventBuilder {
         // Sign (signed deployments): over the redacted canonical
         // form, which strips `signatures` — so the reference hash below (and
         // therefore the event id) is identical signed or unsigned, and the
-        // signature covers the just-inserted content hash. Preconditions are
-        // the same as reference_hash's, so this cannot fail either.
+        // signature covers the just-inserted content hash.
+        //
+        // Not an `expect`: the builder's own fields satisfy ruma's redaction
+        // preconditions, but `stamp` above can have inserted anything, so a
+        // scheme is able to break them (a non-object `hashes`, say). A caller
+        // bug in a scheme must surface as an error, not a panic.
         if let Some(signer) = &self.signer {
             signer
-                .sign_event(&mut canon)
-                .expect("builder-assembled object satisfies ruma redaction preconditions");
+                .sign_event(&mut canon, &version)
+                .map_err(ref_hash_error_to_format_error)?;
         }
 
-        // Reference hash → event_id. By construction `canon` has a string
-        // `type`, an object `content`, and an object `hashes`, so ruma's
-        // redaction preconditions all hold — `reference_hash` cannot fail.
-        let rh = reference_hash(&canon)
-            .expect("builder-assembled object satisfies ruma redaction preconditions");
-        let event_id = event_id_from_hash(&rh);
+        // Derive the event_id — the same function every receiver runs against
+        // these bytes, which is what keeps the id a function of the event
+        // rather than of who computed it. For the base version this is the
+        // reference hash.
+        let event_id = version.event_id(&canon).map_err(id_error_to_format_error)?;
 
         let raw = serialise_canonical(&canon);
 
@@ -272,7 +296,7 @@ impl EventBuilder {
         // etc. Bubble the `FormatError` up so the caller sees the specific
         // reason rather than a panic from inside the builder.
         let event = parse_event(raw, event_id, self.auth_events)?;
-        validate_pdu(&event)?;
+        validate_pdu(&event, &version)?;
         Ok(event)
     }
 }
@@ -331,6 +355,7 @@ impl EventBuilder {
 pub fn from_wire(
     raw: Box<RawValue>,
     auth_events: Vec<OwnedEventId>,
+    version: &std::sync::Arc<RoomVersion>,
 ) -> Result<UnverifiedWire, FormatError> {
     let parsed: CanonicalJsonValue = serde_json::from_str(raw.get())?;
     let CanonicalJsonValue::Object(obj) = parsed else {
@@ -339,26 +364,33 @@ pub fn from_wire(
             expected: "object",
         });
     };
-    let rh = reference_hash(&obj).map_err(ref_hash_error_to_format_error)?;
-    let event_id = event_id_from_hash(&rh);
+    // The same derivation the author ran in `build` — never a transmitted id.
+    let event_id = version.event_id(&obj).map_err(id_error_to_format_error)?;
 
     // Replace raw with the canonical redacted form on content-hash mismatch.
     // An event with no `hashes` at all is taken as-is: that is what a
     // trusted-network peer emits (see `EventBuilder::build`), and redacting
     // every such event would empty every message in the mesh.
-    // `reference_hash` already exercised the same redaction step successfully
-    // above, so `redact_to_canonical_bytes` here cannot fail.
+    // The version's `extra_redaction_keys` are kept, so the redacted bytes can
+    // still re-derive this event's id — receipt-check 3 redacts and carries on,
+    // so the id must survive it.
+    //
+    // Not an `expect`: this used to be guaranteed because `reference_hash`
+    // had already run the same redaction a few lines above, but an arbitrary
+    // `EventIdScheme::derive` need not touch redaction at all, so a malformed
+    // `content`/`hashes`/`signatures` can reach here and fail. Attacker-supplied
+    // bytes must not panic the ingress.
     let raw_to_parse = match check_content_hash(&obj) {
         ContentHashCheck::Absent | ContentHashCheck::Matches => raw,
         ContentHashCheck::Mismatch => {
-            let bytes = redact_to_canonical_bytes(&obj)
-                .expect("redaction succeeded above for reference_hash");
+            let bytes =
+                redact_to_canonical_bytes(&obj, version).map_err(ref_hash_error_to_format_error)?;
             let s = String::from_utf8(bytes).expect("canonical JSON is valid UTF-8");
             RawValue::from_string(s).expect("canonical JSON parses as a RawValue")
         }
     };
     let event = parse_event(raw_to_parse, event_id, auth_events)?;
-    let wire = match validate_pdu(&event) {
+    let wire = match validate_pdu(&event, version) {
         Ok(()) => Wire::Valid(event),
         Err(e) => match semantic_verdict(&e) {
             SemanticVerdict::Drop => return Err(e),
@@ -369,7 +401,74 @@ pub fn from_wire(
             }
         },
     };
-    Ok(UnverifiedWire { wire, obj })
+    Ok(UnverifiedWire {
+        wire,
+        obj,
+        version: version.clone(),
+    })
+}
+
+/// What an inbound event's wire bytes say about which room version names it.
+///
+/// Naming an event requires its room version, and the version is only knowable
+/// from the room — so every ingress must resolve it *before* calling
+/// [`from_wire`]. This is the pure half of that resolution: it reads the two
+/// fields the answer depends on and nothing else. The store lookup is the
+/// caller's, because this crate has no provider dependency by design.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomVersionKeys {
+    /// The room this event claims to be in — look its version up in
+    /// `rooms.room_version`. Absent on an `m.room.create`, which carries no
+    /// `room_id` at all under v12 (the room id is derived from the create's own
+    /// event id), and absent on a malformed event, which `from_wire` will
+    /// reject once it is named.
+    pub room_id: Option<OwnedRoomId>,
+    /// `content.room_version` **of an `m.room.create`** — the one case where an
+    /// event says its own version. Look it up in the registry: unknown means we
+    /// do not speak this room's version and must refuse it. Absent from a
+    /// create is permitted (v12 rule 1.3), and means the base version.
+    ///
+    /// Only ever set for a create, so it cannot be populated alongside
+    /// [`room_id`](Self::room_id) by any well-formed event: a `room_version` in
+    /// some other event type's content is that content's own business and says
+    /// nothing about which version names the event.
+    pub declared: Option<String>,
+}
+
+/// Read an inbound event's [`RoomVersionKeys`] from its wire bytes.
+///
+/// Deliberately not a full parse: only `type`, `room_id` and
+/// `content.room_version` are deserialised. The `type` gate is not cosmetic —
+/// without it any event could volunteer a `content.room_version` and offer the
+/// caller two contradictory answers. Every *other* rejection of malformed bytes
+/// belongs to [`from_wire`], which runs after the version is resolved (a create
+/// that also carries a `room_id`, say, is refused there as
+/// [`FormatError::CreateHasRoomId`]) — duplicating those checks here would let
+/// the two disagree.
+pub fn room_version_keys(raw: &RawValue) -> RoomVersionKeys {
+    #[derive(serde::Deserialize)]
+    struct Keys {
+        r#type: Option<String>,
+        room_id: Option<String>,
+        content: Option<Content>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Content {
+        room_version: Option<String>,
+    }
+    let Ok(keys) = serde_json::from_str::<Keys>(raw.get()) else {
+        return RoomVersionKeys {
+            room_id: None,
+            declared: None,
+        };
+    };
+    let is_create = keys.r#type.as_deref() == Some("m.room.create");
+    RoomVersionKeys {
+        room_id: keys.room_id.and_then(|r| r.parse().ok()),
+        declared: is_create
+            .then(|| keys.content.and_then(|c| c.room_version))
+            .flatten(),
+    }
 }
 
 /// A parsed-and-classified wire event whose **provenance has not been checked
@@ -388,6 +487,11 @@ pub struct UnverifiedWire {
     /// redaction, so verifying against this is equivalent for both the
     /// as-received and the hash-mismatch-redacted event.
     obj: CanonicalJsonObject,
+    /// The room version this event was parsed under, captured so
+    /// [`verify`](Self::verify) computes the signed byte string under the same
+    /// redaction keep-list the id was derived with — without every ingress
+    /// having to carry the version a second time.
+    version: std::sync::Arc<RoomVersion>,
 }
 
 impl UnverifiedWire {
@@ -422,7 +526,7 @@ impl UnverifiedWire {
         resolver: &dyn crate::sign::KeyResolver,
     ) -> Result<Wire, FormatError> {
         let origin = self.event().sender.server_name().as_str().to_owned();
-        crate::sign::verify_event_signature(&self.obj, &origin, resolver)
+        crate::sign::verify_event_signature(&self.obj, &origin, resolver, &self.version)
             .await
             .map_err(|e| FormatError::SignatureCheck(e.to_string()))?;
         Ok(self.wire)
@@ -475,6 +579,18 @@ impl Wire {
     }
 }
 
+/// Map an [`EventIdScheme`] failure onto the format vocabulary. A redaction
+/// precondition is the reference-hash scheme's only failure mode and already
+/// has a `FormatError` shape; anything else is scheme-specific and lands on
+/// [`FormatError::EventId`] — both are drop-class (an event that cannot be
+/// named cannot enter the system).
+fn id_error_to_format_error(err: EventIdError) -> FormatError {
+    match err {
+        EventIdError::Redaction(e) => ref_hash_error_to_format_error(e),
+        EventIdError::Scheme(msg) => FormatError::EventId(msg),
+    }
+}
+
 fn ref_hash_error_to_format_error(err: ruma::canonical_json::RedactionError) -> FormatError {
     use ruma::canonical_json::RedactionError;
     match err {
@@ -523,6 +639,7 @@ fn serialise_canonical(obj: &CanonicalJsonObject) -> Box<RawValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::room_version::base_version;
     use serde_json::json;
 
     fn user(s: &str) -> OwnedUserId {
@@ -541,12 +658,16 @@ mod tests {
 
     #[test]
     fn build_create_event_derives_room_id_from_event_id() {
-        let ev = EventBuilder::new(user("@alice:example.org"), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(json!({ "room_version": crate::ROOM_VERSION_ID }))
-            .origin_server_ts(1_700_000_000_000)
-            .build()
-            .expect("create event builds");
+        let ev = EventBuilder::new(
+            user("@alice:example.org"),
+            "m.room.create".to_owned(),
+            base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": crate::ROOM_VERSION_ID }))
+        .origin_server_ts(1_700_000_000_000)
+        .build()
+        .expect("create event builds");
 
         // event_id and room_id share their suffix (43 url-safe-b64 chars).
         assert!(ev.event_id.as_str().starts_with('$'));
@@ -566,13 +687,17 @@ mod tests {
     fn hashes_present_iff_signed() {
         let (signer, sender) = node_signer_and_user();
         let build = |signer: Option<std::sync::Arc<crate::sign::EventSigner>>| {
-            let ev = EventBuilder::new(sender.clone(), "m.room.message".to_owned())
-                .room_id(room("!r:d"))
-                .content(json!({ "msgtype": "m.text", "body": "hi" }))
-                .origin_server_ts(1)
-                .signer(signer)
-                .build()
-                .expect("builds");
+            let ev = EventBuilder::new(
+                sender.clone(),
+                "m.room.message".to_owned(),
+                base_version().clone(),
+            )
+            .room_id(room("!r:d"))
+            .content(json!({ "msgtype": "m.text", "body": "hi" }))
+            .origin_server_ts(1)
+            .signer(signer)
+            .build()
+            .expect("builds");
             serde_json::from_str::<serde_json::Value>(ev.raw.get()).expect("raw is JSON")
         };
 
@@ -604,13 +729,17 @@ mod tests {
     fn content_hash_presence_changes_the_event_id() {
         let (signer, sender) = node_signer_and_user();
         let build = |signer: Option<std::sync::Arc<crate::sign::EventSigner>>| {
-            EventBuilder::new(sender.clone(), "m.room.message".to_owned())
-                .room_id(room("!r:d"))
-                .content(json!({ "body": "x" }))
-                .origin_server_ts(1)
-                .signer(signer)
-                .build()
-                .expect("builds")
+            EventBuilder::new(
+                sender.clone(),
+                "m.room.message".to_owned(),
+                base_version().clone(),
+            )
+            .room_id(room("!r:d"))
+            .content(json!({ "body": "x" }))
+            .origin_server_ts(1)
+            .signer(signer)
+            .build()
+            .expect("builds")
         };
         assert_ne!(build(Some(signer)).event_id, build(None).event_id);
     }
@@ -623,25 +752,33 @@ mod tests {
     /// `Map::insert` overwrite. Pin both arms (create + message).
     #[test]
     fn build_output_raw_lacks_event_id() {
-        let create = EventBuilder::new(user("@alice:example.org"), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(json!({ "room_version": crate::ROOM_VERSION_ID }))
-            .origin_server_ts(1_700_000_000_000)
-            .build()
-            .expect("create event builds");
+        let create = EventBuilder::new(
+            user("@alice:example.org"),
+            "m.room.create".to_owned(),
+            base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": crate::ROOM_VERSION_ID }))
+        .origin_server_ts(1_700_000_000_000)
+        .build()
+        .expect("create event builds");
         let create_raw: serde_json::Value = serde_json::from_str(create.raw.get()).unwrap();
         assert!(
             create_raw.get("event_id").is_none(),
             "create event wire bytes must not carry event_id: {create_raw}",
         );
 
-        let msg = EventBuilder::new(user("@alice:example.org"), "m.room.message".to_owned())
-            .room_id(create.room_id.clone())
-            .content(json!({ "msgtype": "m.text", "body": "hi" }))
-            .prev_events(vec![create.event_id.clone()])
-            .origin_server_ts(1_700_000_000_001)
-            .build()
-            .expect("message event builds");
+        let msg = EventBuilder::new(
+            user("@alice:example.org"),
+            "m.room.message".to_owned(),
+            base_version().clone(),
+        )
+        .room_id(create.room_id.clone())
+        .content(json!({ "msgtype": "m.text", "body": "hi" }))
+        .prev_events(vec![create.event_id.clone()])
+        .origin_server_ts(1_700_000_000_001)
+        .build()
+        .expect("message event builds");
         let msg_raw: serde_json::Value = serde_json::from_str(msg.raw.get()).unwrap();
         assert!(
             msg_raw.get("event_id").is_none(),
@@ -651,18 +788,26 @@ mod tests {
 
     #[test]
     fn build_message_event_round_trips() {
-        let create = EventBuilder::new(user("@alice:example.org"), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(json!({ "room_version": crate::ROOM_VERSION_ID }))
-            .build()
-            .expect("create");
-        let msg = EventBuilder::new(user("@alice:example.org"), "m.room.message".to_owned())
-            .room_id(create.room_id.clone())
-            .content(json!({ "msgtype": "m.text", "body": "hi" }))
-            .prev_events(vec![create.event_id.clone()])
-            .origin_server_ts(1_700_000_000_001)
-            .build()
-            .expect("message");
+        let create = EventBuilder::new(
+            user("@alice:example.org"),
+            "m.room.create".to_owned(),
+            base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": crate::ROOM_VERSION_ID }))
+        .build()
+        .expect("create");
+        let msg = EventBuilder::new(
+            user("@alice:example.org"),
+            "m.room.message".to_owned(),
+            base_version().clone(),
+        )
+        .room_id(create.room_id.clone())
+        .content(json!({ "msgtype": "m.text", "body": "hi" }))
+        .prev_events(vec![create.event_id.clone()])
+        .origin_server_ts(1_700_000_000_001)
+        .build()
+        .expect("message");
 
         // event_id format check.
         assert!(msg.event_id.as_str().starts_with('$'));
@@ -679,12 +824,16 @@ mod tests {
         // Same inputs (same ts, same fields) must produce the same event_id —
         // the hash is a pure function of the wire bytes.
         let mk = || {
-            EventBuilder::new(user("@a:d"), "m.room.message".to_owned())
-                .room_id(room("!r:d"))
-                .content(json!({ "body": "x" }))
-                .origin_server_ts(1)
-                .build()
-                .expect("builds")
+            EventBuilder::new(
+                user("@a:d"),
+                "m.room.message".to_owned(),
+                base_version().clone(),
+            )
+            .room_id(room("!r:d"))
+            .content(json!({ "body": "x" }))
+            .origin_server_ts(1)
+            .build()
+            .expect("builds")
         };
         assert_eq!(mk().event_id, mk().event_id);
     }
@@ -704,14 +853,18 @@ mod tests {
     fn redactable_content_reaches_the_event_id_only_when_signed() {
         let (signer, sender) = node_signer_and_user();
         let build = |body: &str, signer: Option<std::sync::Arc<crate::sign::EventSigner>>| {
-            EventBuilder::new(sender.clone(), "m.room.message".to_owned())
-                .room_id(room("!r:d"))
-                .content(json!({ "msgtype": "m.text", "body": body }))
-                .origin_server_ts(1)
-                .signer(signer)
-                .build()
-                .expect("builds")
-                .event_id
+            EventBuilder::new(
+                sender.clone(),
+                "m.room.message".to_owned(),
+                base_version().clone(),
+            )
+            .room_id(room("!r:d"))
+            .content(json!({ "msgtype": "m.text", "body": body }))
+            .origin_server_ts(1)
+            .signer(signer)
+            .build()
+            .expect("builds")
+            .event_id
         };
         assert_eq!(
             build("a", None),
@@ -732,14 +885,18 @@ mod tests {
     #[test]
     fn build_diverges_on_different_non_redactable_content() {
         let build = |membership: &str| {
-            EventBuilder::new(user("@a:d"), "m.room.member".to_owned())
-                .room_id(room("!r:d"))
-                .state_key("@a:d".to_owned())
-                .content(json!({ "membership": membership }))
-                .origin_server_ts(1)
-                .build()
-                .expect("builds")
-                .event_id
+            EventBuilder::new(
+                user("@a:d"),
+                "m.room.member".to_owned(),
+                base_version().clone(),
+            )
+            .room_id(room("!r:d"))
+            .state_key("@a:d".to_owned())
+            .content(json!({ "membership": membership }))
+            .origin_server_ts(1)
+            .build()
+            .expect("builds")
+            .event_id
         };
         assert_ne!(build("join"), build("leave"));
     }
@@ -752,14 +909,18 @@ mod tests {
         // `prev_state_events` list must round-trip onto both `raw` and the
         // `Event` struct.
         let ps = vec![eid("$ps1:d"), eid("$ps2:d")];
-        let ev = EventBuilder::new(user("@a:d"), "m.room.member".to_owned())
-            .room_id(room("!r:d"))
-            .state_key("@a:d".to_owned())
-            .content(json!({ "membership": "join" }))
-            .prev_state_events(ps.clone())
-            .origin_server_ts(1)
-            .build()
-            .expect("builds");
+        let ev = EventBuilder::new(
+            user("@a:d"),
+            "m.room.member".to_owned(),
+            base_version().clone(),
+        )
+        .room_id(room("!r:d"))
+        .state_key("@a:d".to_owned())
+        .content(json!({ "membership": "join" }))
+        .prev_state_events(ps.clone())
+        .origin_server_ts(1)
+        .build()
+        .expect("builds");
         assert_eq!(ev.prev_state_events, ps);
         let raw: serde_json::Value = serde_json::from_str(ev.raw.get()).unwrap();
         let raw_ps: Vec<&str> = raw["prev_state_events"]
@@ -771,14 +932,18 @@ mod tests {
         assert_eq!(raw_ps, vec!["$ps1:d", "$ps2:d"]);
 
         // Differential coverage: changing prev_state_events changes event_id.
-        let other = EventBuilder::new(user("@a:d"), "m.room.member".to_owned())
-            .room_id(room("!r:d"))
-            .state_key("@a:d".to_owned())
-            .content(json!({ "membership": "join" }))
-            .prev_state_events(vec![eid("$other:d")])
-            .origin_server_ts(1)
-            .build()
-            .expect("builds");
+        let other = EventBuilder::new(
+            user("@a:d"),
+            "m.room.member".to_owned(),
+            base_version().clone(),
+        )
+        .room_id(room("!r:d"))
+        .state_key("@a:d".to_owned())
+        .content(json!({ "membership": "join" }))
+        .prev_state_events(vec![eid("$other:d")])
+        .origin_server_ts(1)
+        .build()
+        .expect("builds");
         assert_ne!(ev.event_id, other.event_id);
     }
 
@@ -787,14 +952,18 @@ mod tests {
         // Happy-path complement to `build_rejects_non_object_unsigned`. The
         // `unsigned` field is the sliding-sync invite-state carrier and must
         // round-trip onto `raw` when set.
-        let ev = EventBuilder::new(user("@a:d"), "m.room.member".to_owned())
-            .room_id(room("!r:d"))
-            .state_key("@b:d".to_owned())
-            .content(json!({ "membership": "invite" }))
-            .unsigned(json!({ "invite_room_state": [] }))
-            .origin_server_ts(1)
-            .build()
-            .expect("builds");
+        let ev = EventBuilder::new(
+            user("@a:d"),
+            "m.room.member".to_owned(),
+            base_version().clone(),
+        )
+        .room_id(room("!r:d"))
+        .state_key("@b:d".to_owned())
+        .content(json!({ "membership": "invite" }))
+        .unsigned(json!({ "invite_room_state": [] }))
+        .origin_server_ts(1)
+        .build()
+        .expect("builds");
         let raw: serde_json::Value = serde_json::from_str(ev.raw.get()).unwrap();
         assert_eq!(
             raw["unsigned"]["invite_room_state"]
@@ -807,13 +976,17 @@ mod tests {
     #[test]
     fn build_attaches_caller_supplied_auth_events_to_struct_only() {
         let auth_ids = vec![eid("$auth1:d"), eid("$auth2:d")];
-        let ev = EventBuilder::new(user("@a:d"), "m.room.message".to_owned())
-            .room_id(room("!r:d"))
-            .content(json!({}))
-            .auth_events(auth_ids.clone())
-            .origin_server_ts(1)
-            .build()
-            .expect("builds");
+        let ev = EventBuilder::new(
+            user("@a:d"),
+            "m.room.message".to_owned(),
+            base_version().clone(),
+        )
+        .room_id(room("!r:d"))
+        .content(json!({}))
+        .auth_events(auth_ids.clone())
+        .origin_server_ts(1)
+        .build()
+        .expect("builds");
         assert_eq!(ev.auth_events, auth_ids);
         // Wire bytes must NOT contain auth_events (MSC4242).
         let raw: serde_json::Value = serde_json::from_str(ev.raw.get()).unwrap();
@@ -824,22 +997,30 @@ mod tests {
 
     #[test]
     fn build_rejects_non_create_without_room_id() {
-        let err = EventBuilder::new(user("@a:d"), "m.room.message".to_owned())
-            .content(json!({}))
-            .origin_server_ts(1)
-            .build()
-            .expect_err("missing room_id");
+        let err = EventBuilder::new(
+            user("@a:d"),
+            "m.room.message".to_owned(),
+            base_version().clone(),
+        )
+        .content(json!({}))
+        .origin_server_ts(1)
+        .build()
+        .expect_err("missing room_id");
         assert!(matches!(err, FormatError::MissingField("room_id")));
     }
 
     #[test]
     fn build_rejects_non_object_content() {
-        let err = EventBuilder::new(user("@a:d"), "m.room.message".to_owned())
-            .room_id(room("!r:d"))
-            .content("not an object")
-            .origin_server_ts(1)
-            .build()
-            .expect_err("non-object content");
+        let err = EventBuilder::new(
+            user("@a:d"),
+            "m.room.message".to_owned(),
+            base_version().clone(),
+        )
+        .room_id(room("!r:d"))
+        .content("not an object")
+        .origin_server_ts(1)
+        .build()
+        .expect_err("non-object content");
         assert!(matches!(
             err,
             FormatError::InvalidFieldType {
@@ -851,13 +1032,17 @@ mod tests {
 
     #[test]
     fn build_rejects_non_object_unsigned() {
-        let err = EventBuilder::new(user("@a:d"), "m.room.message".to_owned())
-            .room_id(room("!r:d"))
-            .content(json!({}))
-            .unsigned("oops")
-            .origin_server_ts(1)
-            .build()
-            .expect_err("non-object unsigned");
+        let err = EventBuilder::new(
+            user("@a:d"),
+            "m.room.message".to_owned(),
+            base_version().clone(),
+        )
+        .room_id(room("!r:d"))
+        .content(json!({}))
+        .unsigned("oops")
+        .origin_server_ts(1)
+        .build()
+        .expect_err("non-object unsigned");
         assert!(matches!(
             err,
             FormatError::InvalidFieldType {
@@ -873,13 +1058,17 @@ mod tests {
         // — e.g. a create event with `prev_events` set passes the skeleton
         // checks but trips v12 rule 1.1. The `FormatError` bubbles up so the
         // caller sees the specific rule that fired.
-        let err = EventBuilder::new(user("@a:d"), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(json!({ "room_version": crate::ROOM_VERSION_ID }))
-            .prev_events(vec![eid("$bogus:d")])
-            .origin_server_ts(1)
-            .build()
-            .expect_err("create with prev_events must surface as FormatError");
+        let err = EventBuilder::new(
+            user("@a:d"),
+            "m.room.create".to_owned(),
+            base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": crate::ROOM_VERSION_ID }))
+        .prev_events(vec![eid("$bogus:d")])
+        .origin_server_ts(1)
+        .build()
+        .expect_err("create with prev_events must surface as FormatError");
         assert!(
             matches!(err, FormatError::CreateHasPrevEvents),
             "expected CreateHasPrevEvents, got: {err:?}"
@@ -891,12 +1080,16 @@ mod tests {
         // Local-send path of the S-S §"Size limits" whole-PDU check: an
         // oversized event surfaces from `build()` (via validate_pdu) so the
         // C-S handler can 400 it. Boundary precision lives in validate.rs.
-        let err = EventBuilder::new(user("@a:d"), "m.room.message".to_owned())
-            .room_id(room("!r:d"))
-            .content(json!({ "body": "a".repeat(70_000) }))
-            .origin_server_ts(1)
-            .build()
-            .expect_err("oversized event must not build");
+        let err = EventBuilder::new(
+            user("@a:d"),
+            "m.room.message".to_owned(),
+            base_version().clone(),
+        )
+        .room_id(room("!r:d"))
+        .content(json!({ "body": "a".repeat(70_000) }))
+        .origin_server_ts(1)
+        .build()
+        .expect_err("oversized event must not build");
         assert!(matches!(err, FormatError::EventTooLarge));
     }
 
@@ -904,14 +1097,18 @@ mod tests {
 
     #[test]
     fn from_wire_round_trips_builder_output() {
-        let built = EventBuilder::new(user("@a:d"), "m.room.message".to_owned())
-            .room_id(room("!r:d"))
-            .content(json!({ "body": "hi" }))
-            .origin_server_ts(42)
-            .build()
-            .expect("builds");
+        let built = EventBuilder::new(
+            user("@a:d"),
+            "m.room.message".to_owned(),
+            base_version().clone(),
+        )
+        .room_id(room("!r:d"))
+        .content(json!({ "body": "hi" }))
+        .origin_server_ts(42)
+        .build()
+        .expect("builds");
 
-        let parsed = from_wire(built.raw.clone(), Vec::new())
+        let parsed = from_wire(built.raw.clone(), Vec::new(), base_version())
             .expect("from_wire")
             .admit_on_faith()
             .into_event();
@@ -925,14 +1122,18 @@ mod tests {
 
     #[test]
     fn from_wire_round_trips_create_event_with_derived_room_id() {
-        let built = EventBuilder::new(user("@a:d"), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(json!({ "room_version": crate::ROOM_VERSION_ID }))
-            .origin_server_ts(42)
-            .build()
-            .expect("create");
+        let built = EventBuilder::new(
+            user("@a:d"),
+            "m.room.create".to_owned(),
+            base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": crate::ROOM_VERSION_ID }))
+        .origin_server_ts(42)
+        .build()
+        .expect("create");
 
-        let parsed = from_wire(built.raw.clone(), Vec::new())
+        let parsed = from_wire(built.raw.clone(), Vec::new(), base_version())
             .expect("from_wire")
             .admit_on_faith()
             .into_event();
@@ -966,6 +1167,7 @@ mod tests {
         let wire = from_wire(
             RawValue::from_string(raw.to_string()).expect("valid JSON"),
             Vec::new(),
+            base_version(),
         )
         .expect("parseable PDU must not be dropped at the wire edge")
         .admit_on_faith();
@@ -997,6 +1199,7 @@ mod tests {
         let err = from_wire(
             RawValue::from_string(raw.to_string()).expect("valid JSON"),
             Vec::new(),
+            base_version(),
         )
         .expect_err("drop-class defect must not construct an event");
         assert!(matches!(err, FormatError::TooManyPrevEvents));
@@ -1004,15 +1207,19 @@ mod tests {
 
     #[test]
     fn from_wire_attaches_caller_supplied_auth_events() {
-        let built = EventBuilder::new(user("@a:d"), "m.room.message".to_owned())
-            .room_id(room("!r:d"))
-            .content(json!({}))
-            .origin_server_ts(1)
-            .build()
-            .expect("builds");
+        let built = EventBuilder::new(
+            user("@a:d"),
+            "m.room.message".to_owned(),
+            base_version().clone(),
+        )
+        .room_id(room("!r:d"))
+        .content(json!({}))
+        .origin_server_ts(1)
+        .build()
+        .expect("builds");
 
         let auth = vec![eid("$x:d"), eid("$y:d")];
-        let parsed = from_wire(built.raw.clone(), auth.clone())
+        let parsed = from_wire(built.raw.clone(), auth.clone(), base_version())
             .expect("from_wire")
             .admit_on_faith()
             .into_event();
@@ -1022,7 +1229,7 @@ mod tests {
     #[test]
     fn from_wire_rejects_non_object_root() {
         let raw = to_raw_value(&json!([1, 2, 3])).unwrap();
-        let err = from_wire(raw, Vec::new()).expect_err("array root");
+        let err = from_wire(raw, Vec::new(), base_version()).expect_err("array root");
         assert!(matches!(
             err,
             FormatError::InvalidFieldType {
@@ -1038,19 +1245,23 @@ mod tests {
         // Tamper with `hashes.sha256` on a builder-produced event and verify
         // from_wire returns the redacted form (content collapsed to {}) while
         // keeping the SAME event_id (which is computed over the redacted form).
-        let built = EventBuilder::new(user("@a:d"), "m.room.message".to_owned())
-            .room_id(room("!r:d"))
-            .content(json!({ "msgtype": "m.text", "body": "secret" }))
-            .origin_server_ts(1)
-            .build()
-            .expect("builds");
+        let built = EventBuilder::new(
+            user("@a:d"),
+            "m.room.message".to_owned(),
+            base_version().clone(),
+        )
+        .room_id(room("!r:d"))
+        .content(json!({ "msgtype": "m.text", "body": "secret" }))
+        .origin_server_ts(1)
+        .build()
+        .expect("builds");
 
         // Tamper: rewrite `hashes.sha256` to a junk value so verification fails.
         let mut raw_obj: serde_json::Value = serde_json::from_str(built.raw.get()).unwrap();
         raw_obj["hashes"]["sha256"] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         let tampered_raw = serde_json::value::to_raw_value(&raw_obj).expect("raw");
 
-        let parsed = from_wire(tampered_raw, Vec::new())
+        let parsed = from_wire(tampered_raw, Vec::new(), base_version())
             .expect("from_wire")
             .admit_on_faith()
             .into_event();
@@ -1077,13 +1288,17 @@ mod tests {
     fn from_wire_accepts_event_with_matching_content_hash() {
         // Builder produces events with a valid content hash; from_wire must
         // accept them as-is (no redaction).
-        let built = EventBuilder::new(user("@a:d"), "m.room.message".to_owned())
-            .room_id(room("!r:d"))
-            .content(json!({ "msgtype": "m.text", "body": "preserved" }))
-            .origin_server_ts(1)
-            .build()
-            .expect("builds");
-        let parsed = from_wire(built.raw.clone(), Vec::new())
+        let built = EventBuilder::new(
+            user("@a:d"),
+            "m.room.message".to_owned(),
+            base_version().clone(),
+        )
+        .room_id(room("!r:d"))
+        .content(json!({ "msgtype": "m.text", "body": "preserved" }))
+        .origin_server_ts(1)
+        .build()
+        .expect("builds");
+        let parsed = from_wire(built.raw.clone(), Vec::new(), base_version())
             .expect("from_wire")
             .admit_on_faith()
             .into_event();
@@ -1098,16 +1313,20 @@ mod tests {
     /// mesh; the divergence documented on `from_wire` is what prevents it.
     #[test]
     fn from_wire_keeps_content_when_hashes_absent() {
-        let built = EventBuilder::new(user("@a:d"), "m.room.message".to_owned())
-            .room_id(room("!r:d"))
-            .content(json!({ "msgtype": "m.text", "body": "preserved" }))
-            .origin_server_ts(1)
-            .build()
-            .expect("builds");
+        let built = EventBuilder::new(
+            user("@a:d"),
+            "m.room.message".to_owned(),
+            base_version().clone(),
+        )
+        .room_id(room("!r:d"))
+        .content(json!({ "msgtype": "m.text", "body": "preserved" }))
+        .origin_server_ts(1)
+        .build()
+        .expect("builds");
         let raw_json: serde_json::Value = serde_json::from_str(built.raw.get()).unwrap();
         assert!(raw_json.get("hashes").is_none(), "precondition: no hashes");
 
-        let parsed = from_wire(built.raw.clone(), Vec::new())
+        let parsed = from_wire(built.raw.clone(), Vec::new(), base_version())
             .expect("from_wire")
             .admit_on_faith()
             .into_event();
@@ -1133,7 +1352,7 @@ mod tests {
             "hashes": {},
         }))
         .unwrap();
-        let parsed = from_wire(raw, Vec::new())
+        let parsed = from_wire(raw, Vec::new(), base_version())
             .expect("from_wire")
             .admit_on_faith()
             .into_event();
@@ -1158,8 +1377,299 @@ mod tests {
             "content": {}, "origin_server_ts": 1
         }))
         .unwrap();
-        let err = from_wire(raw, Vec::new()).expect_err("missing type");
+        let err = from_wire(raw, Vec::new(), base_version()).expect_err("missing type");
         assert!(matches!(err, FormatError::MissingField("type")));
+    }
+
+    // ---------- pluggable event-id scheme ----------
+
+    /// A scheme with a deliberately different id *shape* to the reference
+    /// hash: it stamps the authoring clock reading into `id_ts` and names the
+    /// event after it, so ids are short, decimal and time-ordered rather than
+    /// 43 chars of base64.
+    ///
+    /// The clock is injected so the test is deterministic. What matters is
+    /// that `stamp` supplies an input `derive` then reads back out of the
+    /// bytes — the same two halves any non-hash scheme uses.
+    #[derive(Debug)]
+    struct TimestampIds(i64);
+
+    impl crate::event_id::EventIdScheme for TimestampIds {
+        fn stamp(&self, obj: &mut CanonicalJsonObject) -> Result<(), EventIdError> {
+            obj.insert(
+                "id_ts".to_owned(),
+                CanonicalJsonValue::Integer(self.0.try_into().map_err(|_| {
+                    EventIdError::Scheme("clock reading out of canonical range".to_owned())
+                })?),
+            );
+            Ok(())
+        }
+
+        fn derive(
+            &self,
+            obj: &CanonicalJsonObject,
+            _version: &RoomVersion,
+        ) -> Result<OwnedEventId, EventIdError> {
+            let Some(CanonicalJsonValue::Integer(ts)) = obj.get("id_ts") else {
+                return Err(EventIdError::Scheme("no id_ts".to_owned()));
+            };
+            OwnedEventId::try_from(format!("${}", i64::from(*ts)))
+                .map_err(|e| EventIdError::Scheme(e.to_string()))
+        }
+    }
+
+    /// A room version named by [`TimestampIds`] off the given clock reading.
+    /// `id_ts` is the id's only input, so the version must keep it through
+    /// redaction — that is what `extra_redaction_keys` is for.
+    fn timestamp_version(clock: i64) -> std::sync::Arc<RoomVersion> {
+        std::sync::Arc::new(RoomVersion {
+            id: "org.matrix.neutrino.test.ts",
+            rules: ruma::room_version_rules::RoomVersionRules::V12,
+            ids: std::sync::Arc::new(TimestampIds(clock)),
+            extra_redaction_keys: &["prev_state_events", "id_ts"],
+        })
+    }
+
+    fn timestamp_ids() -> std::sync::Arc<RoomVersion> {
+        timestamp_version(1_700_000_000)
+    }
+
+    // ---------- room-version resolution keys ----------
+
+    /// A normal event is named by its room's version, so the only key it
+    /// offers is `room_id` — the caller looks that up in the store.
+    #[test]
+    fn version_keys_of_a_normal_event_are_its_room_id() {
+        let built = EventBuilder::new(
+            user("@a:d"),
+            "m.room.message".to_owned(),
+            base_version().clone(),
+        )
+        .room_id(room("!r:d"))
+        .content(json!({ "msgtype": "m.text", "body": "hi" }))
+        .origin_server_ts(1)
+        .build()
+        .expect("builds");
+
+        let keys = room_version_keys(&built.raw);
+        assert_eq!(keys.room_id.as_deref(), Some(room("!r:d").as_ref()));
+        assert_eq!(keys.declared, None);
+    }
+
+    /// A create carries no `room_id` at all under v12 (the room id is derived
+    /// from its own event id), so its `content.room_version` is the only thing
+    /// that can name it — the one self-describing case.
+    #[test]
+    fn version_keys_of_a_create_are_its_declared_version() {
+        let built = EventBuilder::new(
+            user("@a:d"),
+            "m.room.create".to_owned(),
+            base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": crate::ROOM_VERSION_ID }))
+        .origin_server_ts(1)
+        .build()
+        .expect("builds");
+
+        let keys = room_version_keys(&built.raw);
+        assert_eq!(keys.room_id, None, "a v12 create carries no room_id");
+        assert_eq!(keys.declared.as_deref(), Some(crate::ROOM_VERSION_ID));
+    }
+
+    /// Only a create may declare a version. Without the `type` gate any event
+    /// could volunteer a `content.room_version` and hand the caller two
+    /// contradictory answers — a `room_id` saying "look me up" and a declared
+    /// string saying "name me this way".
+    #[test]
+    fn only_a_create_may_declare_a_version() {
+        // A message whose content happens to carry a `room_version` key: its
+        // content is its own business and says nothing about naming.
+        let built = EventBuilder::new(
+            user("@a:d"),
+            "m.room.message".to_owned(),
+            base_version().clone(),
+        )
+        .room_id(room("!r:d"))
+        .content(json!({ "msgtype": "m.text", "body": "hi", "room_version": "n" }))
+        .origin_server_ts(1)
+        .build()
+        .expect("builds");
+        let keys = room_version_keys(&built.raw);
+        assert_eq!(keys.room_id.as_deref(), Some(room("!r:d").as_ref()));
+        assert_eq!(keys.declared, None, "a non-create declares nothing");
+
+        // Same for a *state* event of another type, and for hand-rolled bytes
+        // that carry both fields — the pair can never both be populated.
+        let raw = RawValue::from_string(
+            json!({
+                "type": "m.room.power_levels",
+                "room_id": "!r:d",
+                "state_key": "",
+                "content": { "room_version": "n" },
+            })
+            .to_string(),
+        )
+        .expect("raw");
+        let keys = room_version_keys(&raw);
+        assert_eq!(keys.room_id.as_deref(), Some(room("!r:d").as_ref()));
+        assert_eq!(keys.declared, None);
+    }
+
+    /// A `type`-less event declares nothing either: `type` is what makes a
+    /// create a create, and `from_wire` rejects its absence once the event is
+    /// named (`MissingField("type")`).
+    #[test]
+    fn version_keys_of_a_typeless_event_declare_nothing() {
+        let raw = RawValue::from_string(
+            json!({ "room_id": "!r:d", "content": { "room_version": "n" } }).to_string(),
+        )
+        .expect("raw");
+        let keys = room_version_keys(&raw);
+        assert_eq!(keys.room_id.as_deref(), Some(room("!r:d").as_ref()));
+        assert_eq!(keys.declared, None);
+    }
+
+    /// Malformed bytes yield no keys rather than an error: rejecting them is
+    /// `from_wire`'s job, which runs once the version is resolved. Two
+    /// rejections of the same bytes could otherwise disagree.
+    #[test]
+    fn version_keys_of_unparseable_bytes_are_empty() {
+        let raw = RawValue::from_string("[1,2,3]".to_owned()).expect("raw");
+        let keys = room_version_keys(&raw);
+        assert_eq!(keys.room_id, None);
+        assert_eq!(keys.declared, None);
+
+        // A non-string `content.room_version` on a create is likewise not a
+        // version claim; `check_create` is what rejects it, under the resolved
+        // version (the base, since nothing was declared).
+        let raw = RawValue::from_string(
+            json!({ "type": "m.room.create", "content": { "room_version": 12 } }).to_string(),
+        )
+        .expect("raw");
+        assert_eq!(room_version_keys(&raw).declared, None);
+    }
+
+    /// The seam's whole point: an id minted by a non-default scheme must be
+    /// re-derivable by a *receiver* from the wire bytes alone, with no side
+    /// table and nothing transmitted alongside the event.
+    #[test]
+    fn custom_scheme_id_round_trips_through_from_wire() {
+        let built = EventBuilder::new(user("@a:d"), "m.room.message".to_owned(), timestamp_ids())
+            .room_id(room("!r:d"))
+            .content(json!({ "msgtype": "m.text", "body": "hi" }))
+            .origin_server_ts(1)
+            .build()
+            .expect("builds");
+
+        // Not the reference-hash shape: this is the point of the seam.
+        assert_eq!(built.event_id.as_str(), "$1700000000");
+
+        // The stamped input rides `raw` — that is what makes the id derivable.
+        let raw_json: serde_json::Value = serde_json::from_str(built.raw.get()).unwrap();
+        assert_eq!(raw_json["id_ts"], json!(1_700_000_000));
+
+        // A receiver holding its *own* instance of the scheme — a different
+        // clock, so it could never guess the id — still derives the same one,
+        // because it reads the answer out of the event.
+        let receiver = timestamp_version(999);
+        let parsed = from_wire(built.raw.clone(), Vec::new(), &receiver)
+            .expect("from_wire")
+            .admit_on_faith();
+        assert_eq!(parsed.event().event_id, built.event_id);
+    }
+
+    /// `stamp` must run before the content hash, or a signed deployment would
+    /// emit a `hashes.sha256` that does not cover the id's own inputs — and
+    /// `from_wire` would then redact the event as hash-mismatched.
+    #[test]
+    fn stamped_fields_are_covered_by_the_content_hash() {
+        let (signer, sender) = node_signer_and_user();
+        let built = EventBuilder::new(sender, "m.room.message".to_owned(), timestamp_ids())
+            .room_id(room("!r:d"))
+            .content(json!({ "msgtype": "m.text", "body": "hi" }))
+            .origin_server_ts(1)
+            .signer(Some(signer))
+            .build()
+            .expect("builds");
+
+        let CanonicalJsonValue::Object(obj) =
+            serde_json::from_str::<CanonicalJsonValue>(built.raw.get()).expect("canonical")
+        else {
+            panic!("expected object");
+        };
+        assert!(obj.contains_key("id_ts"), "id_ts must ride the wire");
+        assert_eq!(
+            check_content_hash(&obj),
+            ContentHashCheck::Matches,
+            "the emitted content hash must cover the stamped `id_ts`"
+        );
+    }
+
+    /// Receipt-check 3 redacts a content-hash-mismatched event and carries on
+    /// with it, so a scheme's inputs must survive redaction — otherwise the
+    /// bytes we persist can no longer re-derive the id we just assigned, and
+    /// the event dies at the next hop that re-reads it.
+    #[test]
+    fn extra_redaction_keys_survive_the_hash_mismatch_redaction() {
+        let (signer, sender) = node_signer_and_user();
+        let built = EventBuilder::new(sender, "m.room.message".to_owned(), timestamp_ids())
+            .room_id(room("!r:d"))
+            .content(json!({ "msgtype": "m.text", "body": "hi" }))
+            .origin_server_ts(1)
+            .signer(Some(signer))
+            .build()
+            .expect("builds");
+
+        // Tamper with `content` so the emitted content hash no longer matches,
+        // driving `from_wire` down the redaction path.
+        let mut raw_json: serde_json::Value = serde_json::from_str(built.raw.get()).unwrap();
+        raw_json["content"]["body"] = json!("tampered");
+        let tampered = RawValue::from_string(raw_json.to_string()).expect("raw");
+
+        let version = timestamp_ids();
+        let parsed = from_wire(tampered, Vec::new(), &version)
+            .expect("from_wire")
+            .admit_on_faith();
+        let event = parsed.event();
+        assert_eq!(event.event_id, built.event_id, "the id must be unchanged");
+
+        // The persisted bytes were replaced by the redacted form — and can
+        // still re-derive the id, which is the property under test.
+        let CanonicalJsonValue::Object(redacted) =
+            serde_json::from_str::<CanonicalJsonValue>(event.raw.get()).expect("canonical")
+        else {
+            panic!("expected object");
+        };
+        let redelivered = version
+            .event_id(&redacted)
+            .expect("redacted bytes still name the event");
+        assert_eq!(redelivered, built.event_id);
+    }
+
+    /// A scheme whose inputs are missing is drop-class, not a panic and not a
+    /// silent fallback: an event nobody can name must not enter the system.
+    #[test]
+    fn scheme_failure_on_inbound_bytes_is_a_drop_class_format_error() {
+        // Built under the default scheme, so `raw` carries no `id_ts`.
+        let built = EventBuilder::new(
+            user("@a:d"),
+            "m.room.message".to_owned(),
+            base_version().clone(),
+        )
+        .room_id(room("!r:d"))
+        .content(json!({}))
+        .origin_server_ts(1)
+        .build()
+        .expect("builds");
+
+        let err = from_wire(built.raw, Vec::new(), &timestamp_ids())
+            .expect_err("scheme cannot name this event");
+        assert!(
+            matches!(err, FormatError::EventId(_)),
+            "expected FormatError::EventId, got {err:?}"
+        );
+        assert_eq!(semantic_verdict(&err), SemanticVerdict::Drop);
     }
 
     // ---------- signing ----------
@@ -1191,7 +1701,7 @@ mod tests {
     #[tokio::test]
     async fn build_with_signer_round_trips_through_verify() {
         let (signer, sender) = node_signer_and_user();
-        let signed = EventBuilder::new(sender, "m.room.message".to_owned())
+        let signed = EventBuilder::new(sender, "m.room.message".to_owned(), base_version().clone())
             .room_id(room("!r:d"))
             .content(json!({ "msgtype": "m.text", "body": "signed" }))
             .origin_server_ts(1)
@@ -1207,7 +1717,8 @@ mod tests {
         );
 
         // …and admits through the signature-verifying ingress.
-        let unverified = from_wire(signed.raw.clone(), Vec::new()).expect("from_wire");
+        let unverified =
+            from_wire(signed.raw.clone(), Vec::new(), base_version()).expect("from_wire");
         let wire = unverified
             .verify(&crate::sign::NodeIdKeyResolver)
             .await
@@ -1220,13 +1731,14 @@ mod tests {
     #[tokio::test]
     async fn unsigned_event_fails_signed_admission() {
         let (_, sender) = node_signer_and_user();
-        let built = EventBuilder::new(sender, "m.room.message".to_owned())
+        let built = EventBuilder::new(sender, "m.room.message".to_owned(), base_version().clone())
             .room_id(room("!r:d"))
             .content(json!({ "body": "unsigned" }))
             .origin_server_ts(1)
             .build()
             .expect("builds");
-        let unverified = from_wire(built.raw.clone(), Vec::new()).expect("from_wire");
+        let unverified =
+            from_wire(built.raw.clone(), Vec::new(), base_version()).expect("from_wire");
         let err = unverified
             .verify(&crate::sign::NodeIdKeyResolver)
             .await

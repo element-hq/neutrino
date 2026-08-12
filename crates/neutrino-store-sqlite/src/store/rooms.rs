@@ -5,7 +5,6 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{OptionalExtension, params};
-use neutrino_event::ROOM_VERSION_ID;
 use neutrino_store::{Event, RoomStore, StorageError};
 use ruma::{OwnedEventId, RoomId, RoomVersionId};
 use serde_json::Value;
@@ -42,32 +41,24 @@ impl RoomStore for SqliteStore {
         }
 
         // Pull `content.room_version` out of the create event JSON before
-        // crossing the closure boundary. Caller-supplied JSON, so a
-        // missing/malformed field is `InvalidInput`. We compare against
-        // `ROOM_VERSION_ID` (the unstable MSC4242 prefix) directly — going
-        // through `RoomVersionId::from_str` would not have caught the
-        // off-by-one between MSC4242's `"org.matrix.msc4242.12"` and ruma's
-        // bare-`"12"` `V12` variant, because ruma silently maps unknown
-        // strings into `RoomVersionId::Custom(...)` rather than erroring.
+        // crossing the closure boundary — it is the room's version, stored
+        // verbatim. Caller-supplied JSON, so a missing/malformed field is
+        // `InvalidInput`.
+        //
+        // Not checked against a list of known versions here: the registry
+        // (`RoomVersions`) is the authority on which versions this build
+        // speaks, and it has already been consulted — an event can only be
+        // named under a version the registry resolved, and `validate_pdu`'s
+        // create check pins `content.room_version` to that same version. A
+        // store that refused anything else would have to be taught every new
+        // version, and it is legitimate for one store to hold rooms of several.
         let parsed: Value = serde_json::from_str(create_event.raw.get())
             .map_err(|e| Error::InvalidInput(format!("create_event json: {e}")))?;
-        let room_version_str = parsed
+        let room_version = parsed
             .pointer("/content/room_version")
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                Error::InvalidInput("create_event missing content.room_version".into())
-            })?;
-
-        // Reject at the create-room boundary rather than letting an
-        // unsupported version land in the DB and surprise downstream code
-        // that assumes the MSC4242-on-v12 state-resolution / auth rules.
-        // Relax this gate if we ever broaden the target.
-        if room_version_str != ROOM_VERSION_ID {
-            return Err(Error::InvalidInput(format!(
-                "unsupported room_version {room_version_str:?}; only {ROOM_VERSION_ID} is supported"
-            ))
-            .into());
-        }
+            .ok_or_else(|| Error::InvalidInput("create_event missing content.room_version".into()))?
+            .to_owned();
 
         // v12 m.room.create is the genesis event — it has no parents.
         // A create event that declares `prev_events` or `prev_state_events`
@@ -108,11 +99,12 @@ impl RoomStore for SqliteStore {
             //    `room_id REFERENCES rooms(room_id)` FK would reject the
             //    create event otherwise. `create_event.room_id` resolves
             //    through `EventRow: Deref<Target = Event>`.
-            //    Version is checked == ROOM_VERSION_ID above; stored
-            //    verbatim so a future column query can grep for it.
+            //    The version is stored verbatim: it is what every peer sees in
+            //    `content.room_version`, and what `get_room_version` hands back
+            //    to the registry to recover the room's rules.
             tx.execute(
                 "INSERT INTO rooms (room_id, room_version) VALUES (?, ?)",
-                params![create_event.room_id.as_str(), ROOM_VERSION_ID],
+                params![create_event.room_id.as_str(), room_version],
             )?;
 
             // 2. Write the create event itself, and seed the temporal
@@ -317,16 +309,21 @@ mod tests {
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
 
-    // content.room_version parses as a valid identifier but isn't
-    // the MSC4242 unstable v12. Out of scope for now (CLAUDE.md: only
-    // MSC4242-on-v12 targeted) — relax if we ever broaden the target.
-    // Covers both the stable `"12"` (which ruma's RoomVersionId::V12
-    // would match but we do not) and an older numbered version.
+    // The store is NOT the authority on which room versions this build
+    // speaks — `neutrino_event::RoomVersions` is, and it has already been
+    // consulted by the time an event can be named at all. So any non-empty
+    // version is stored verbatim and round-trips: one store may hold rooms of
+    // several versions (a medium that declares its own still reads rooms
+    // created before the cut-over), and teaching the storage layer every
+    // version would be a second, drifting authority.
+    //
+    // (Was `create_room_rejects_non_v12_room_version`, which pinned the
+    // opposite: the store refusing anything but `ROOM_VERSION_ID`.)
     #[tokio::test]
-    async fn create_room_rejects_non_v12_room_version() {
-        let store = store().await;
-        for version in ["11", "12"] {
-            let bad = make_event(
+    async fn create_room_stores_any_non_empty_room_version_verbatim() {
+        for version in ["11", "12", "n"] {
+            let store = store().await;
+            let ce = make_event(
                 *ALICE_ROOM_ID,
                 *ALICE_USER_ID,
                 "m.room.create",
@@ -336,10 +333,15 @@ mod tests {
                 &[],
                 &[],
             );
-            let result = store.create_room(&bad, &[]).await;
-            assert!(
-                matches!(result, Err(StorageError::InvalidInput(_))),
-                "expected InvalidInput for room_version={version:?}, got {result:?}"
+            store
+                .create_room(&ce, &[])
+                .await
+                .unwrap_or_else(|e| panic!("create_room for room_version={version:?}: {e:?}"));
+            let got = store.get_room_version(*ALICE_ROOM_ID).await.unwrap();
+            assert_eq!(
+                got,
+                Some(RoomVersionId::from_str(version).unwrap()),
+                "room_version={version:?} must round-trip verbatim"
             );
         }
     }

@@ -10,12 +10,12 @@ pub use neutrino_lb::{
     CBOR_CONTENT_FORMAT, CaptureControl, CodecError, DatagramLink, LinkAddr, LinkCodec, LinkPacing,
     LinkProfile, WireRequest, WireResponse,
 };
+pub use neutrino_store_sqlite::SqliteStore;
 
 use std::future::Future;
 use std::pin::Pin;
 
 use neutrino_store::IdentityStore;
-use neutrino_store_sqlite::SqliteStore;
 use rand::RngCore;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -29,9 +29,50 @@ use tokio_util::sync::CancellationToken;
 /// `trusted_network` config; the capability is only consumed when the app
 /// opts into signed mode. Wire-level facts (MTU, connection authentication)
 /// ride [`DatagramLink::profile`].
+#[non_exhaustive]
 pub struct FederationLink {
     pub link: std::sync::Arc<dyn DatagramLink>,
     pub key_resolver: Option<Arc<dyn neutrino_event::KeyResolver>>,
+    /// The room version this medium brings: understood in addition to the
+    /// built-in base version, and what new local rooms are created under.
+    /// `None` = the base version only.
+    ///
+    /// A hard cut-over by construction: a build either makes rooms of this
+    /// version or it doesn't. Rooms created before the cut-over stay readable
+    /// (the base stays in the registry), but a peer that lacks this version
+    /// refuses this build's new rooms — that is the intended failure, and the
+    /// reason the version string travels in every create event.
+    pub room_version: Option<neutrino_event::RoomVersion>,
+}
+
+impl FederationLink {
+    /// A link declaring no optional capabilities. Media should build through
+    /// this and the `with_*` setters rather than a struct literal, so a new
+    /// capability is an additive change here instead of a compile break in
+    /// every out-of-tree medium.
+    pub fn new(link: std::sync::Arc<dyn DatagramLink>) -> Self {
+        Self {
+            link,
+            key_resolver: None,
+            room_version: None,
+        }
+    }
+
+    /// Nominate how `(server_name, key_id)` resolves to a verify key in this
+    /// medium's namespace. See [`FederationLink::key_resolver`].
+    #[must_use]
+    pub fn with_key_resolver(mut self, resolver: Arc<dyn neutrino_event::KeyResolver>) -> Self {
+        self.key_resolver = Some(resolver);
+        self
+    }
+
+    /// Declare the room version this medium brings. See
+    /// [`FederationLink::room_version`].
+    #[must_use]
+    pub fn with_room_version(mut self, version: neutrino_event::RoomVersion) -> Self {
+        self.room_version = Some(version);
+        self
+    }
 }
 
 /// Result of building the federation datagram link from the node secret.
@@ -100,8 +141,25 @@ pub fn init_tracing(log_dir: Option<&std::path::Path>) {
     platform::init_tracing(log_dir);
 }
 
+/// Open the homeserver's store for a `Config` — the one constructor, so every
+/// caller applies the same config-derived settings.
+///
+/// Separate from [`entrypoint`] (which takes the handle) so a host that needs
+/// the store itself opens it once and injects it.
+pub async fn open_store(config: &Config) -> Result<Arc<SqliteStore>, neutrino_store::StorageError> {
+    Ok(Arc::new(
+        SqliteStore::open_in_dir(&config.storage_dir)
+            .await?
+            .client_hides_soft_failed(config.enable_soft_failure),
+    ))
+}
+
 pub async fn entrypoint(
     mut config: Config,
+    // The store, opened by the caller via [`open_store`]. Injected rather than
+    // opened here so a composing host can hold the same handle and read from it
+    // while the server runs.
+    store: Arc<SqliteStore>,
     commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
     // Published once identity resolution completes so an embedding host (the
     // ffi/Android layer) can read the server's resolved federation name (its node
@@ -125,14 +183,9 @@ pub async fn entrypoint(
     init_tracing(config.log_dir.as_deref());
     let discovery = discovery.unwrap_or_else(|| Arc::new(DiscoveryRegistry::new()));
 
-    // Open the store once, here, and resolve the server's stable identity from
-    // it before anything reads `config`. The same handle is threaded into the
-    // homeserver (`serve`) so the database is opened exactly once.
-    let store = Arc::new(
-        SqliteStore::open_in_dir(&config.storage_dir)
-            .await?
-            .client_hides_soft_failed(config.enable_soft_failure),
-    );
+    // Resolve the server's stable identity from the store before anything reads
+    // `config`. The same handle is threaded into the homeserver (`serve`), so
+    // the database is opened exactly once per process.
     let secret = resolve_server_identity(&mut config, &store).await?;
 
     // The local display name, sourced from the store (the client sets it via
@@ -174,9 +227,13 @@ pub async fn entrypoint(
     // The factory's error is `Send + Sync` (so it can cross the ffi task
     // boundary); widen it to this function's plain `Box<dyn Error>` on the way
     // out, since the two boxed-trait-object types don't auto-convert via `?`.
-    let (link, key_resolver) = match link_factory {
+    let (link, key_resolver, medium_version) = match link_factory {
         Some(factory) => {
-            let FederationLink { link, key_resolver } = factory(LinkContext {
+            let FederationLink {
+                link,
+                key_resolver,
+                room_version,
+            } = factory(LinkContext {
                 secret,
                 display_name: display_name_rx,
                 discovery: discovery.clone(),
@@ -184,11 +241,11 @@ pub async fn entrypoint(
             })
             .await
             .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-            (Some(link), key_resolver)
+            (Some(link), key_resolver, room_version)
         }
         // No injected medium: plain UDP, which authenticates nothing and has
         // no key-resolution namespace of its own.
-        None => (None, None),
+        None => (None, None, None),
     };
 
     // Compose the deployment's security configuration from its two
@@ -209,6 +266,19 @@ pub async fn entrypoint(
     };
     tracing::info!(?security_config, "federation security");
     let security = event_security(&security_config, key_resolver, &secret, &config.server_name)?;
+    // The room versions this build understands: the built-in base, plus the
+    // medium's if it declared one (which is then what new rooms are created
+    // under). Composed once, here, and read per room thereafter — a room's
+    // version comes off `rooms.room_version`, never from this process's config.
+    let versions = Arc::new(neutrino_event::RoomVersions::new(medium_version)?);
+    tracing::info!(
+        supported = ?versions.ids().collect::<Vec<_>>(),
+        new_rooms = versions.default_for_new_rooms().id,
+        "room versions",
+    );
+    // The deployment's two event-level facts, composed once and threaded as one
+    // value from here down (see `EventPolicy`).
+    let policy = neutrino_event::EventPolicy::new(security, versions);
 
     // A store's events belong to exactly one trust domain: unsigned events
     // can never serve a signed deployment (nothing to verify) and vice versa.
@@ -292,7 +362,7 @@ pub async fn entrypoint(
                 cmd_rx,
                 discovery,
                 Some(display_name_tx),
-                security,
+                policy,
             );
             tokio::pin!(lb, hs);
             tokio::select! {
@@ -334,7 +404,7 @@ pub async fn entrypoint(
                 cmd_rx,
                 discovery,
                 Some(display_name_tx),
-                security,
+                policy,
             )
             .await?
         }

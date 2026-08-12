@@ -139,7 +139,7 @@ mod tests {
     use std::sync::Arc;
 
     use neutrino_event::Event;
-    use neutrino_event::event_id::compute_event_id;
+    use neutrino_event::event_id::base_version_event_id;
     use neutrino_store::{InviteStore, Membership};
     use neutrino_store_sqlite::SqliteStore;
     use ruma::{RoomId, UserId, room_id, user_id};
@@ -188,7 +188,7 @@ mod tests {
             ]}
         });
         let raw = serde_json::value::to_raw_value(&body).unwrap();
-        let event_id = compute_event_id(&raw).unwrap();
+        let event_id = base_version_event_id(&raw).unwrap();
         let content = serde_json::value::to_raw_value(body.get("content").unwrap()).unwrap();
         Event {
             event_id,

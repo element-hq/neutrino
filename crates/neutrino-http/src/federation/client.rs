@@ -339,7 +339,7 @@ impl FederationClient {
         dest: &ServerName,
         room_id: &RoomId,
         user_id: &UserId,
-        ver: &str,
+        vers: &[&str],
     ) -> Result<MakeJoinResponse, FederationClientError> {
         info!(target: "neutrino_http", %dest, %room_id, %user_id, "outbound GET /_matrix/federation/v1/make_join");
         let mut url = reqwest::Url::parse(&format!(
@@ -351,7 +351,12 @@ impl FederationClient {
             .map_err(|()| FederationClientError::InvalidUrl)?
             .push(room_id.as_str())
             .push(user_id.as_str());
-        url.query_pairs_mut().append_pair("ver", ver);
+        // Repeated `ver` — the spec's shape. Every version we understand is
+        // offered, not just the one we create rooms under: a room created
+        // before a medium's cut-over is still joinable.
+        for ver in vers {
+            url.query_pairs_mut().append_pair("ver", ver);
+        }
 
         let resp = self
             .http
@@ -454,7 +459,7 @@ impl FederationClient {
         dest: &ServerName,
         room_id: &RoomId,
         user_id: &UserId,
-        ver: &str,
+        vers: &[&str],
     ) -> Result<MakeLeaveResponse, FederationClientError> {
         info!(target: "neutrino_http", %dest, %room_id, %user_id, "outbound GET /_matrix/federation/v1/make_leave");
         let mut url = reqwest::Url::parse(&format!(
@@ -466,7 +471,10 @@ impl FederationClient {
             .map_err(|()| FederationClientError::InvalidUrl)?
             .push(room_id.as_str())
             .push(user_id.as_str());
-        url.query_pairs_mut().append_pair("ver", ver);
+        // Repeated `ver` — see `make_join`.
+        for ver in vers {
+            url.query_pairs_mut().append_pair("ver", ver);
+        }
 
         let resp = self
             .http

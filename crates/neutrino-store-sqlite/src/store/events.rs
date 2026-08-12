@@ -864,11 +864,9 @@ mod tests {
     }
 
     // Helper: write a hand-rolled `Event` via the raw `write_into_tx`
-    // path, bypassing the `debug_assert_event_id_matches_raw` check in
-    // `EventRow::from`. These tests intentionally use malformed/mismatched
-    // raw bytes whose `compute_event_id` wouldn't agree with the column
-    // event_id; the debug_assert would mask the storage-layer validation
-    // we want to pin.
+    // path. These tests intentionally use malformed/mismatched raw bytes
+    // whose id wouldn't agree with the column event_id — that disagreement
+    // is what the storage-layer validation under test has to catch.
     async fn write_event_directly(
         s: &SqliteStore,
         ev: &neutrino_event::Event,

@@ -14,7 +14,7 @@ use axum::{
 };
 use neutrino_ctl::{Command, Config, DEFAULT_DISPLAY_NAME, DiscoveryRegistry};
 use neutrino_event::event_builder::EventBuilder;
-use neutrino_event::{Event, EventSecurity, FormatError, ROOM_VERSION_ID};
+use neutrino_event::{Event, EventPolicy, FormatError};
 use neutrino_room::CoreError;
 use neutrino_room::provider::InMemoryStateProvider;
 use neutrino_room::room_core::{Effect, RoomCore};
@@ -84,10 +84,10 @@ struct App {
     /// /profile/.../displayname`), so the BLE transport can re-advertise it.
     /// `None` off the embedded path (dev binary / tests): nothing re-advertises.
     display_name_tx: Option<watch::Sender<String>>,
-    /// The deployment's event-security policy (`sign_messages` composed at
-    /// the composition root): one value carrying both the ingress admission
-    /// mode and the signer for locally-authored events.
-    security: EventSecurity,
+    /// The deployment's event policy (composed at the composition root): one
+    /// value carrying the ingress admission mode, the signer for
+    /// locally-authored events, and the room versions this build speaks.
+    policy: EventPolicy,
     config: Config,
     /// Latching cancellation signal shared with long-polls and the outbound
     /// federation sender. Fired once by [`AppState::begin_shutdown`]; after
@@ -233,27 +233,27 @@ impl AppState {
             config,
             store,
             Arc::new(DiscoveryRegistry::new()),
-            EventSecurity::TrustedNetwork,
+            EventPolicy::trusted_network(),
         )
     }
 
     /// Like [`AppState::from_store`] but with a caller-owned discovery registry
-    /// and security policy. The production path ([`serve`]) injects the
+    /// and event policy. The production path ([`serve`]) injects the
     /// registry the host holds a write handle to (so its BLE-discovery callback
     /// and the router read the same set); [`from_store`] passes a fresh empty
-    /// one (and [`EventSecurity::TrustedNetwork`]) for tests/the dev binary.
+    /// one (and [`EventPolicy::trusted_network()`]) for tests/the dev binary.
     pub(crate) fn from_store_with_discovery(
         config: Config,
         store: Arc<SqliteStore>,
         discovery: Arc<DiscoveryRegistry>,
-        security: EventSecurity,
+        policy: EventPolicy,
     ) -> Self {
         let client = Arc::new(FederationClient::new(
             config.server_name.clone(),
             config.federation_proxy.as_deref(),
         ));
         let fetcher: Arc<dyn MissingEventsFetcher> = Arc::new(ReqwestFetcher::new(client));
-        Self::from_store_with_fetcher(config, store, fetcher, discovery, security)
+        Self::from_store_with_fetcher(config, store, fetcher, discovery, policy)
     }
 
     /// Like [`AppState::from_store`] but with an explicit gap-fill `fetcher`
@@ -265,7 +265,7 @@ impl AppState {
         store: Arc<SqliteStore>,
         fetcher: Arc<dyn MissingEventsFetcher>,
         discovery: Arc<DiscoveryRegistry>,
-        security: EventSecurity,
+        policy: EventPolicy,
     ) -> Self {
         let shutdown = CancellationToken::new();
         let mut sync_state = SyncState::new(store.clone(), shutdown.clone());
@@ -274,7 +274,7 @@ impl AppState {
         let room_registry = Arc::new(RoomRegistry::new(
             store.clone(),
             config.server_name.clone(),
-            security.signer().cloned(),
+            policy.clone(),
         ));
         // Spawn the inbound staging worker bound to this store/registry/fetcher.
         // It runs wherever the router does (production `serve` and the e2e
@@ -284,7 +284,7 @@ impl AppState {
             store.clone(),
             room_registry.clone(),
             fetcher.clone(),
-            security.clone(),
+            policy.clone(),
         );
         // Receivers are taken later via `subscribe_kick` (one per destination
         // task); the initial receiver is dropped — `send_modify` notifies any
@@ -306,7 +306,7 @@ impl AppState {
             keys: None,
             discovery,
             display_name_tx: None,
-            security,
+            policy,
             config,
             shutdown,
             kick_backoff,
@@ -335,16 +335,16 @@ impl AppState {
         lock_app(self).discovery.clone()
     }
 
-    /// The deployment-wide event-security policy, shared by every
-    /// federation-ingress path and every event-authoring site.
-    fn security(&self) -> EventSecurity {
-        lock_app(self).security.clone()
+    /// The deployment-wide event policy, shared by every federation-ingress
+    /// path and every event-authoring site.
+    fn policy(&self) -> EventPolicy {
+        lock_app(self).policy.clone()
     }
 
     /// The local event signer (`None` on a trusted network) — derived from
     /// the same policy value the ingress admission uses.
     fn signer(&self) -> Option<Arc<neutrino_event::EventSigner>> {
-        lock_app(self).security.signer().cloned()
+        lock_app(self).policy.signer().cloned()
     }
 
     /// The shared `get_missing_events` fetcher, for the outbound sender pool's
@@ -427,16 +427,17 @@ pub async fn serve(
     // Publishes the local display name on change so the BLE transport can
     // re-advertise. `None` off the embedded path (no BLE advert to update).
     display_name_tx: Option<watch::Sender<String>>,
-    // The event-security policy, composed by the composition root from the
-    // app's `trusted_network` config: one value carrying both the ingress
-    // admission mode and the signer for locally-authored events.
-    security: EventSecurity,
+    // The event policy, composed by the composition root from the app's
+    // `trusted_network` config and the medium's declared room version: one
+    // value carrying the ingress admission mode, the local signer, and the
+    // room versions this build speaks.
+    policy: EventPolicy,
 ) -> Result<(), StartupError> {
     // The caller (the entrypoint) opens the store, resolves the server identity
     // from it, and hands the live handle in — so we build state around it rather
     // than re-opening the same DB.
     AppState::validate_config(&config)?;
-    let state = AppState::from_store_with_discovery(config, store, discovery, security);
+    let state = AppState::from_store_with_discovery(config, store, discovery, policy);
     lock_app(&state).display_name_tx = display_name_tx;
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
@@ -453,7 +454,7 @@ pub async fn serve(
         state.subscribe_shutdown(),
         state.subscribe_kick(),
         state.fetcher(),
-        state.security(),
+        state.policy(),
         state.worker_poke(),
     );
     let router = build_router(&state);
@@ -542,7 +543,7 @@ pub(crate) fn router_with_store_and_fetcher(
         store,
         fetcher,
         Arc::new(DiscoveryRegistry::new()),
-        EventSecurity::TrustedNetwork,
+        EventPolicy::trusted_network(),
     );
     build_router(&state)
 }
@@ -794,10 +795,7 @@ async fn versions() -> Json<Value> {
 async fn server_keys(state: State<AppState>) -> axum::response::Response {
     let (signer, server_name) = {
         let app = lock_app(&state.0);
-        (
-            app.security.signer().cloned(),
-            app.config.server_name.clone(),
-        )
+        (app.policy.signer().cloned(), app.config.server_name.clone())
     };
     let Some(signer) = signer else {
         return error_response(
@@ -1484,12 +1482,12 @@ async fn create_room(
     AuthUser(sender): AuthUser,
     body: Json<Value>,
 ) -> axum::response::Response {
-    let (store, own_server, signer) = {
+    let (store, own_server, policy) = {
         let app = lock_app(&state.0);
         (
             app.store.clone(),
             app.config.server_name.clone(),
-            app.security.signer().cloned(),
+            app.policy.clone(),
         )
     };
 
@@ -1502,7 +1500,7 @@ async fn create_room(
     // the batch; remote invitees are federated separately below.
     let display_name = local_display_name(&store).await;
     let (create, initial) =
-        match build_initial_events(&sender, &body.0, &own_server, &display_name, signer) {
+        match build_initial_events(&sender, &body.0, &own_server, &display_name, &policy) {
             Ok(batch) => batch,
             Err(e) => {
                 return error_response(
@@ -1616,16 +1614,21 @@ fn build_initial_events(
     body: &Value,
     own_server: &str,
     display_name: &str,
-    signer: Option<Arc<neutrino_event::EventSigner>>,
+    policy: &neutrino_event::EventPolicy,
 ) -> Result<(Event, Vec<Event>), CreateRoomError> {
+    // The version this room is created under — the medium's if it declared one,
+    // else the base. It is stamped into `content.room_version` (which is how
+    // every peer learns it) and names every event below.
+    let version = policy.versions.default_for_new_rooms().clone();
+
     // create is special: no parents, room_id derived from its own event_id.
-    let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
+    let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned(), version.clone())
         .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .signer(signer.clone())
+        .content(json!({ "room_version": version.id }))
+        .signer(policy.signer().cloned())
         .build()?;
 
-    let mut room = RoomCore::new(create.room_id.clone());
+    let mut room = RoomCore::new(create.room_id.clone(), version);
     let mut provider = InMemoryStateProvider::new();
     room.apply_pdu(create.clone(), &provider)?;
     provider.insert(Arc::new(create.clone()));
@@ -1638,7 +1641,7 @@ fn build_initial_events(
                 event_type.to_owned(),
                 Some(state_key.to_owned()),
                 content,
-                signer.clone(),
+                policy.signer(),
             )?;
             // apply_pdu is the sole authority for `auth_events`, stamping them
             // onto the event it hands back via `Persist` — persist *that*, not
@@ -1970,7 +1973,12 @@ fn room_actor_response(e: RoomActorError) -> axum::response::Response {
         RoomActorError::Apply(_) | RoomActorError::Rejected => {
             (StatusCode::FORBIDDEN, "M_FORBIDDEN")
         }
-        RoomActorError::Storage(_) | RoomActorError::NotApplied | RoomActorError::ActorGone => {
+        RoomActorError::Storage(_)
+        | RoomActorError::NotApplied
+        | RoomActorError::ActorGone
+        // A room on our own disk whose version this build cannot speak: a
+        // server-side condition, not something the client got wrong.
+        | RoomActorError::UnsupportedRoomVersion(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN")
         }
     };
@@ -2003,9 +2011,9 @@ async fn default_fallback() -> (StatusCode, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Command, Config, ControlFlow, DiscoveryRegistry, Event, EventSecurity,
-        OwnedUserId, SqliteStore, StatusCode, TcpListener, Value, build_initial_events,
-        build_router, dispatch, handle, invite_targets, join_rule_for, mpsc,
+        AppState, Command, Config, ControlFlow, DiscoveryRegistry, Event, EventPolicy, OwnedUserId,
+        SqliteStore, StatusCode, TcpListener, Value, build_initial_events, build_router, dispatch,
+        handle, invite_targets, join_rule_for, mpsc,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -2086,10 +2094,13 @@ mod tests {
             test_config(&tmp),
             store,
             Arc::new(DiscoveryRegistry::new()),
-            EventSecurity::Signed {
-                signer: Arc::new(signer),
-                resolver: Arc::new(neutrino_event::NodeIdKeyResolver),
-            },
+            EventPolicy::new(
+                neutrino_event::EventSecurity::Signed {
+                    signer: Arc::new(signer),
+                    resolver: Arc::new(neutrino_event::NodeIdKeyResolver),
+                },
+                Arc::new(neutrino_event::RoomVersions::base_only()),
+            ),
         );
         let response = build_router(&state)
             .oneshot(request())
@@ -2452,21 +2463,29 @@ mod tests {
         );
         // Build a minimal room so we can persist a message event.
         let sender: ruma::OwnedUserId = "@alice:127.0.0.1".parse().expect("user id");
-        let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(serde_json::json!({ "room_version": ROOM_VERSION_ID }))
-            .build()
-            .expect("build create");
+        let create = EventBuilder::new(
+            sender.clone(),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(serde_json::json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
         let room_id = create.room_id.clone();
         store.create_room(&create, &[]).await.expect("create_room");
         // Persist a message event to the dead peer's outbox — this is what makes
         // the sender supervisor spawn a per-destination task that keeps retrying.
-        let msg = EventBuilder::new(sender, "m.room.message".to_owned())
-            .room_id(room_id)
-            .content(serde_json::json!({ "msgtype": "m.text", "body": "hi" }))
-            .prev_events(vec![create.event_id])
-            .build()
-            .expect("build msg");
+        let msg = EventBuilder::new(
+            sender,
+            "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id)
+        .content(serde_json::json!({ "msgtype": "m.text", "body": "hi" }))
+        .prev_events(vec![create.event_id])
+        .build()
+        .expect("build msg");
         store
             .persist_event(&msg, &[&*dead_peer])
             .await
@@ -2481,7 +2500,7 @@ mod tests {
             rx,
             Arc::new(super::DiscoveryRegistry::new()),
             None,
-            EventSecurity::TrustedNetwork,
+            EventPolicy::trusted_network(),
         ));
 
         // Give the sender supervisor a moment to discover the dead peer and
@@ -2560,8 +2579,14 @@ mod tests {
             "is_direct": true,
             "invite": ["@bob:127.0.0.1", "@carol:remote.example"],
         });
-        let (_create, initial) = build_initial_events(&sender, &body, "127.0.0.1", "Alice", None)
-            .expect("build initial events");
+        let (_create, initial) = build_initial_events(
+            &sender,
+            &body,
+            "127.0.0.1",
+            "Alice",
+            &EventPolicy::trusted_network(),
+        )
+        .expect("build initial events");
 
         // The creator's own join carries the server-wide display name.
         let join = initial

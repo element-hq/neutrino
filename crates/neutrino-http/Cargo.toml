@@ -54,6 +54,9 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
+# Test fixtures assemble `Event`s by hand and need `base_version_event_id` to
+# give them an id that matches their bytes.
+neutrino-event = { path = "../neutrino-event", features = ["test-support"] }
 # Required only for the `tests/e2e_sliding_sync.rs` integration tests so they
 # can drive the router via `Router::oneshot(req)`. Same major version that
 # `tower-http` already pulls in transitively, so no extra build cost.

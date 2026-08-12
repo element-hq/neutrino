@@ -9,7 +9,7 @@
 //! [`persist_historical_event`](neutrino_store::EventStore::persist_historical_event))
 //! with the outbound [`FederationClient::backfill`] client call.
 
-use neutrino_event::EventSecurity;
+use neutrino_event::EventPolicy;
 use neutrino_store::{DagStore, EventStore, StateStore};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::RoomId;
@@ -30,7 +30,7 @@ const MAX_SEEDS: usize = 5;
 pub(crate) async fn backfill_once(
     store: &SqliteStore,
     client: &FederationClient,
-    security: &EventSecurity,
+    policy: &EventPolicy,
     own_server: &str,
     room_id: &RoomId,
     limit: u32,
@@ -58,7 +58,7 @@ pub(crate) async fn backfill_once(
     // move on to the next.
     for dest in dests {
         match client.backfill(&dest, room_id, &seeds, limit).await {
-            Ok(pdus) => return persist_pdus(store, security, room_id, pdus, limit).await,
+            Ok(pdus) => return persist_pdus(store, policy, room_id, pdus, limit).await,
             Err(e) => {
                 info!(target: "neutrino_http", %dest, %room_id, error = %e, "backfill: peer failed, trying next");
             }
@@ -78,11 +78,20 @@ pub(crate) async fn backfill_once(
 /// return more — `.take(limit)` bounds how many we persist regardless.
 async fn persist_pdus(
     store: &SqliteStore,
-    security: &EventSecurity,
+    policy: &EventPolicy,
     room_id: &RoomId,
     pdus: Vec<Box<serde_json::value::RawValue>>,
     limit: u32,
 ) -> usize {
+    // One lookup for the whole response: every PDU in it belongs to `room_id`
+    // (foreign-room ones are dropped below), so they share its version.
+    let version = match neutrino_engine::room_version(store, &policy.versions, room_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(target: "neutrino_http", %room_id, error = %e, "backfill: cannot name events in this room, dropping response");
+            return 0;
+        }
+    };
     let mut persisted = 0usize;
     for raw in pdus.into_iter().take(limit as usize) {
         // `from_wire` derives the id from the reference hash; an unparseable
@@ -91,7 +100,7 @@ async fn persist_pdus(
         // must carry the verdict so a descendant's reference check
         // cascade-rejects, and so the malformed content can never surface as
         // an accepted row (clients filter rejected; state-res excludes it).
-        let event = match security.admit_wire(raw).await {
+        let event = match policy.admit_wire(raw, &version).await {
             Ok(neutrino_event::Wire::Valid(ev)) => ev,
             Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
                 warn!(target: "neutrino_http", %room_id, event_id = %ev.event_id, %defect, "backfill: serving malformed PDU as rejected");
@@ -164,11 +173,15 @@ mod tests {
     }
 
     fn create_event(sender: &OwnedUserId) -> Event {
-        EventBuilder::new(sender.clone(), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(json!({ "room_version": ROOM_VERSION_ID }))
-            .build()
-            .expect("build create")
+        EventBuilder::new(
+            sender.clone(),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create")
     }
 
     fn member_join(
@@ -176,14 +189,18 @@ mod tests {
         create_id: &ruma::EventId,
         sender: &OwnedUserId,
     ) -> Event {
-        EventBuilder::new(sender.clone(), "m.room.member".to_owned())
-            .room_id(room_id.clone())
-            .state_key(sender.as_str().to_owned())
-            .content(json!({ "membership": "join" }))
-            .prev_events(vec![create_id.to_owned()])
-            .prev_state_events(vec![create_id.to_owned()])
-            .build()
-            .expect("build join")
+        EventBuilder::new(
+            sender.clone(),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key(sender.as_str().to_owned())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create_id.to_owned()])
+        .prev_state_events(vec![create_id.to_owned()])
+        .build()
+        .expect("build join")
     }
 
     /// Create a room joined by `members`, then persist a message whose
@@ -206,14 +223,18 @@ mod tests {
             store.persist_event(&mj, &[]).await.expect("persist member");
         }
         // A message dangling onto a parent we don't hold → backward extremity.
-        let dangling = EventBuilder::new(creator.clone(), "m.room.message".to_owned())
-            .room_id(room_id.clone())
-            .content(json!({ "msgtype": "m.text", "body": "tip" }))
-            .prev_events(vec![
-                event_id!("$unheld_parent:remote.example.org").to_owned(),
-            ])
-            .build()
-            .expect("build dangling");
+        let dangling = EventBuilder::new(
+            creator.clone(),
+            "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .content(json!({ "msgtype": "m.text", "body": "tip" }))
+        .prev_events(vec![
+            event_id!("$unheld_parent:remote.example.org").to_owned(),
+        ])
+        .build()
+        .expect("build dangling");
         store
             .persist_historical_event(&dangling)
             .await
@@ -233,16 +254,20 @@ mod tests {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         body.hash(&mut hasher);
-        EventBuilder::new(alice(), "m.room.message".to_owned())
-            .room_id(room_id.clone())
-            .content(json!({ "msgtype": "m.text", "body": body }))
-            .prev_events(vec![event_id!("$ghost:remote.example.org").to_owned()])
-            .origin_server_ts(1_700_000_000_000 + hasher.finish() % 1_000_000)
-            .build()
-            .expect("build pdu")
-            .raw
-            .get()
-            .to_owned()
+        EventBuilder::new(
+            alice(),
+            "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .content(json!({ "msgtype": "m.text", "body": body }))
+        .prev_events(vec![event_id!("$ghost:remote.example.org").to_owned()])
+        .origin_server_ts(1_700_000_000_000 + hasher.finish() % 1_000_000)
+        .build()
+        .expect("build pdu")
+        .raw
+        .get()
+        .to_owned()
     }
 
     /// A `/backfill` peer stub with interior-mutable state, so a test can mount
@@ -308,7 +333,7 @@ mod tests {
         let n = backfill_once(
             &store,
             &client,
-            &EventSecurity::TrustedNetwork,
+            &EventPolicy::trusted_network(),
             OWN,
             &room_id,
             10,
@@ -333,7 +358,7 @@ mod tests {
         let n = backfill_once(
             &store,
             &client,
-            &EventSecurity::TrustedNetwork,
+            &EventPolicy::trusted_network(),
             OWN,
             &room_id,
             10,
@@ -356,7 +381,7 @@ mod tests {
         let n = backfill_once(
             &store,
             &client,
-            &EventSecurity::TrustedNetwork,
+            &EventPolicy::trusted_network(),
             OWN,
             &room_id,
             10,
@@ -395,6 +420,7 @@ mod tests {
         let bad_id = from_wire(
             serde_json::value::RawValue::from_string(bad_raw.clone()).expect("valid JSON"),
             Vec::new(),
+            neutrino_event::base_version(),
         )
         .expect("parseable")
         .admit_on_faith()
@@ -406,7 +432,7 @@ mod tests {
         let n = backfill_once(
             &store,
             &client,
-            &EventSecurity::TrustedNetwork,
+            &EventPolicy::trusted_network(),
             OWN,
             &room_id,
             10,
@@ -437,7 +463,7 @@ mod tests {
         let n = backfill_once(
             &store,
             &client,
-            &EventSecurity::TrustedNetwork,
+            &EventPolicy::trusted_network(),
             OWN,
             &room_id,
             3,
@@ -469,7 +495,7 @@ mod tests {
         let n = backfill_once(
             &store,
             &client,
-            &EventSecurity::TrustedNetwork,
+            &EventPolicy::trusted_network(),
             OWN,
             &room_id,
             10,
@@ -492,6 +518,7 @@ mod tests {
         let held: Event = from_wire(
             serde_json::value::RawValue::from_string(held_raw.clone()).unwrap(),
             Vec::new(),
+            neutrino_event::base_version(),
         )
         .expect("parse held")
         .admit_on_faith()
@@ -507,7 +534,7 @@ mod tests {
         let n = backfill_once(
             &store,
             &client,
-            &EventSecurity::TrustedNetwork,
+            &EventPolicy::trusted_network(),
             OWN,
             &room_id,
             10,
@@ -541,6 +568,7 @@ mod tests {
         let held: Event = from_wire(
             serde_json::value::RawValue::from_string(held_raw.clone()).unwrap(),
             Vec::new(),
+            neutrino_event::base_version(),
         )
         .expect("parse held")
         .admit_on_faith()
@@ -566,7 +594,7 @@ mod tests {
         let n = backfill_once(
             &store,
             &client,
-            &EventSecurity::TrustedNetwork,
+            &EventPolicy::trusted_network(),
             OWN,
             &room_id,
             10,
@@ -612,7 +640,7 @@ mod tests {
         let n = backfill_once(
             &store,
             &client,
-            &EventSecurity::TrustedNetwork,
+            &EventPolicy::trusted_network(),
             OWN,
             &room_id,
             10,

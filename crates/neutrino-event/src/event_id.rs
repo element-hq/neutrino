@@ -1,14 +1,19 @@
-//! Hashing and event-id derivation for v12 / MSC4242.
+//! Hashing and event-id derivation.
 //!
 //! Used by:
-//! - `EventBuilder` in `neutrino-state::event_builder` (server-authored events)
-//! - `Event::from_wire` here in `neutrino-common::event` (federation receive)
+//! - [`EventBuilder`](crate::event_builder::EventBuilder) (server-authored
+//!   events)
+//! - [`from_wire`](crate::event_builder::from_wire) (federation receive)
 //!
 //! Layered as:
 //! - **Internal primitives** — `canonical`, `sha256`, two base64 flavours,
 //!   `redact_for_hash`.
 //! - **Public spec functions** — `content_hash`, `reference_hash`,
 //!   `event_id_from_hash`, `room_id_from_create`.
+//!
+//! Which redaction keep-list and which derivation apply is a property of the
+//! room's version, so the functions here take a [`RoomVersion`] rather than
+//! hardcoding v12 — see `room_version.rs`.
 //!
 //! See `event-id-design.md` for the full flow.
 
@@ -17,10 +22,11 @@ use base64::engine::general_purpose;
 use ruma::canonical_json::{
     CanonicalJsonObject, CanonicalJsonValue, RedactionError, redact_in_place,
 };
-use ruma::room_version_rules::RoomVersionRules;
 use ruma::{EventId, OwnedEventId, OwnedRoomId};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+use crate::room_version::RoomVersion;
 
 /// Serialise a canonical-JSON object to its canonical byte representation.
 ///
@@ -61,24 +67,37 @@ pub(crate) fn b64_url_unpadded(bytes: &[u8]) -> String {
     general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// Redaction for reference-hash computation, with the MSC4242 carve-out.
+/// Redaction for reference-hash computation, under one room version's rules.
 ///
-/// Runs ruma's `redact_in_place` against the v12 redaction rules (== v11),
-/// but preserves `prev_state_events` across the call. MSC4242 adds
-/// `prev_state_events` as a state-DAG parentage field that must be covered
-/// by the reference hash, but the v11/v12 spec redaction keep-list doesn't
-/// (yet) mention it. Save → redact → restore is the minimal divergence
+/// Runs ruma's `redact_in_place` against the version's redaction rules, but
+/// preserves the version's [`extra_redaction_keys`] across the call — the keys
+/// that must survive redaction even though ruma's keep-list doesn't mention
+/// them. For every version this repo speaks that includes MSC4242's
+/// `prev_state_events`, a state-DAG parentage field that must be covered by
+/// the reference hash; a stamping [`EventIdScheme`] adds its own identity
+/// fields there too. Save → redact → restore is the minimal divergence
 /// pending the MSC landing in the spec.
 ///
 /// See `event-id-design.md` §"ruma redaction wrapper".
 ///
-/// On error: `prev_state_events` is restored before returning, so the caller
-/// sees the input in its original shape regardless of outcome.
-pub(crate) fn redact_for_hash(obj: &mut CanonicalJsonObject) -> Result<(), RedactionError> {
-    let saved_prev_state = obj.remove("prev_state_events");
-    let result = redact_in_place(obj, &RoomVersionRules::V12.redaction, None);
-    if let Some(v) = saved_prev_state {
-        obj.insert("prev_state_events".to_owned(), v);
+/// On error the saved keys are restored before returning, so the caller sees
+/// the input in its original shape regardless of outcome.
+///
+/// [`extra_redaction_keys`]: RoomVersion::extra_redaction_keys
+pub(crate) fn redact_for_hash(
+    obj: &mut CanonicalJsonObject,
+    version: &RoomVersion,
+) -> Result<(), RedactionError> {
+    // Only the keys actually present are touched; a version with nothing to
+    // preserve (or an event carrying none of them) allocates nothing.
+    let saved: Vec<(&'static str, CanonicalJsonValue)> = version
+        .extra_redaction_keys
+        .iter()
+        .filter_map(|k| obj.remove(*k).map(|v| (*k, v)))
+        .collect();
+    let result = redact_in_place(obj, &version.rules.redaction, None);
+    for (k, v) in saved {
+        obj.insert(k.to_owned(), v);
     }
     result
 }
@@ -101,25 +120,32 @@ pub fn content_hash(obj: &CanonicalJsonObject) -> [u8; 32] {
 ///
 /// Spec: <https://spec.matrix.org/v1.18/server-server-api/#calculating-the-reference-hash-for-an-event>.
 /// Runs [`redact_to_canonical_bytes`] and SHA-256s the result.
-pub fn reference_hash(obj: &CanonicalJsonObject) -> Result<[u8; 32], RedactionError> {
-    Ok(sha256(&redact_to_canonical_bytes(obj)?))
+pub fn reference_hash(
+    obj: &CanonicalJsonObject,
+    version: &RoomVersion,
+) -> Result<[u8; 32], RedactionError> {
+    Ok(sha256(&redact_to_canonical_bytes(obj, version)?))
 }
 
-/// Apply V12 redaction (with the MSC4242 `prev_state_events` carve-out),
-/// strip `signatures` and `unsigned`, and return the canonical-JSON bytes.
+/// Apply the room version's redaction rules (keeping its
+/// [`extra_redaction_keys`](RoomVersion::extra_redaction_keys)), strip
+/// `signatures` and `unsigned`, and return the canonical-JSON bytes.
 ///
-/// Used both as an internal step of [`reference_hash`] and exposed for
-/// from-wire callers that need the redacted form on content-hash mismatch
-/// (Matrix S2S §"Validating hashes and signatures on received events":
-/// "If the content hashes are not present, or do not match the supplied
-/// content, then the receiving server must redact the event before
-/// accepting it").
+/// Used as an internal step of [`reference_hash`], as the byte string a
+/// signature covers, and by from-wire callers that need the redacted form on
+/// content-hash mismatch (Matrix S2S §"Validating hashes and signatures on
+/// received events": "If the content hashes are not present, or do not match
+/// the supplied content, then the receiving server must redact the event
+/// before accepting it").
 ///
 /// Returns `RedactionError` only if the input violates ruma's redaction
 /// preconditions (non-object `content`/`hashes`/`signatures`, missing `type`).
-pub fn redact_to_canonical_bytes(obj: &CanonicalJsonObject) -> Result<Vec<u8>, RedactionError> {
+pub fn redact_to_canonical_bytes(
+    obj: &CanonicalJsonObject,
+    version: &RoomVersion,
+) -> Result<Vec<u8>, RedactionError> {
     let mut clone = obj.clone();
-    redact_for_hash(&mut clone)?;
+    redact_for_hash(&mut clone, version)?;
     clone.remove("signatures");
     clone.remove("unsigned");
     Ok(canonical(&clone))
@@ -174,40 +200,114 @@ pub fn event_id_from_hash(hash: &[u8; 32]) -> OwnedEventId {
     OwnedEventId::try_from(s).expect("'$' + 43 url-safe-b64 chars is a valid event_id")
 }
 
-/// Compute an event's event_id directly from its canonical wire bytes.
+/// **Test fixtures only**: an event's id under the base room version, from its
+/// canonical wire bytes.
 ///
-/// Convenience wrapper around `reference_hash` + `event_id_from_hash` for
-/// callers that hold the `raw` bytes and don't want to parse them into a
-/// `CanonicalJsonObject` themselves. Used by `EventStore::persist_event`'s
-/// debug-build round-trip check and by test helpers that need a hash-correct
-/// event_id without depending on `neutrino-state::EventBuilder`.
-///
-/// Returns the same errors `reference_hash` would for malformed input:
-/// non-object root, missing `type`, non-object `content`/`hashes`/`signatures`.
-pub fn compute_event_id(raw: &serde_json::value::RawValue) -> Result<OwnedEventId, ComputeIdError> {
-    let parsed: CanonicalJsonValue = serde_json::from_str(raw.get())?;
+/// Production code cannot name an event this way, and is not able to reach this
+/// function: an event is named under the version of the room it belongs to
+/// ([`RoomVersion::event_id`]), which raw bytes alone cannot say. It exists for
+/// fixtures that hand-assemble an [`Event`](crate::Event) instead of going
+/// through [`EventBuilder`](crate::event_builder::EventBuilder) and still want
+/// an id that matches their bytes, so it is gated behind the `test-support`
+/// feature (enabled as a dev-dependency by the crates whose tests need it).
+#[cfg(any(test, feature = "test-support"))]
+pub fn base_version_event_id(
+    raw: &serde_json::value::RawValue,
+) -> Result<OwnedEventId, EventIdError> {
+    let parsed: CanonicalJsonValue = serde_json::from_str(raw.get())
+        .map_err(|e| EventIdError::Scheme(format!("raw is not valid JSON: {e}")))?;
     let CanonicalJsonValue::Object(obj) = parsed else {
-        return Err(ComputeIdError::NonObjectRoot);
+        return Err(EventIdError::Scheme(
+            "raw JSON root is not an object".to_owned(),
+        ));
     };
-    let rh = reference_hash(&obj).map_err(ComputeIdError::Redaction)?;
-    Ok(event_id_from_hash(&rh))
+    crate::room_version::base_version().event_id(&obj)
 }
 
-/// Failure modes for [`compute_event_id`].
+/// How event ids are derived from event bytes.
+///
+/// v12 mandates the reference hash ([`ReferenceHashIds`], the base version's
+/// scheme and the only one in this repository). The trait exists so another
+/// room version can name events more cheaply — which version a room uses is
+/// agreed mesh-wide because it rides in the create event, so this is a
+/// [`RoomVersion`] field and never a per-deployment setting.
+///
+/// The load-bearing invariant is that an id stays a pure function of the event's
+/// canonical bytes: nothing transmits an id, every receiver recomputes the same
+/// one, and no side table exists. That is why the outbound and inbound halves
+/// are split — [`stamp`](Self::stamp) may *add* the inputs an id is derived
+/// from, but only [`derive`](Self::derive) turns bytes into an id, and both the
+/// authoring and the receiving side call it.
+pub trait EventIdScheme: Send + Sync + std::fmt::Debug {
+    /// Outbound only: stamp any identity-bearing fields this scheme needs into
+    /// `obj`. Runs *before* the content hash and the signature are computed, so
+    /// both cover whatever is inserted. Default: insert nothing.
+    fn stamp(&self, obj: &mut CanonicalJsonObject) -> Result<(), EventIdError> {
+        let _ = obj;
+        Ok(())
+    }
+
+    /// The event's id, from its canonical object alone. Pure — no side effects,
+    /// no I/O, no dependence on room state or on what the receiver has seen.
+    /// Reached through [`RoomVersion::event_id`], which is what supplies
+    /// `version`: a scheme that reads the version's redaction rules (the
+    /// reference hash does) gets the rules of the room the event is *in*, not
+    /// of whichever version happens to hold this scheme.
+    ///
+    /// Three further obligations the reference hash meets for free, and which
+    /// an implementor MUST uphold because subsystems depend on them:
+    ///
+    /// - **Redaction-invariant.** Receipt-check 3 redacts an event whose
+    ///   content hash does not match and carries on with it, so the id must be
+    ///   the same before and after. This is what the version's
+    ///   [`extra_redaction_keys`](RoomVersion::extra_redaction_keys) exist to
+    ///   guarantee: whatever `derive` reads must be listed there, or redaction
+    ///   strips it.
+    /// - **Signature-invariant.** A resident co-signing a join/leave/invite
+    ///   must not rename the event, so `derive` must ignore `signatures`
+    ///   (and `unsigned`, which is likewise not covered).
+    /// - **Collision-free.** Two distinct events must never derive the same id.
+    ///   Stores dedupe by id, so a reused id is a silent substitution: the
+    ///   second event is discarded as a duplicate of the first. `invite`'s
+    ///   response check also accepts the invitee's event on id equality alone.
+    ///   A counter-based scheme satisfies this only if a counter value is never
+    ///   reused for the life of the store.
+    fn derive(
+        &self,
+        obj: &CanonicalJsonObject,
+        version: &RoomVersion,
+    ) -> Result<OwnedEventId, EventIdError>;
+}
+
+/// Failure modes for an [`EventIdScheme`].
 #[derive(Debug, Error)]
-pub enum ComputeIdError {
-    /// `raw` isn't valid JSON.
-    #[error("raw is not valid JSON: {0}")]
-    Parse(#[from] serde_json::Error),
-
-    /// `raw` is valid JSON but the root value isn't an object.
-    #[error("raw JSON root is not an object")]
-    NonObjectRoot,
-
-    /// `reference_hash`'s redaction preconditions weren't met
-    /// (missing `type`, non-object `content`/`hashes`/`signatures`).
+pub enum EventIdError {
+    /// The object violates ruma's redaction preconditions (missing `type`,
+    /// non-object `content`/`hashes`/`signatures`) — only the reference-hash
+    /// scheme can raise this.
     #[error("redaction precondition failed: {0}")]
     Redaction(RedactionError),
+
+    /// The scheme's own inputs are missing or malformed on this event.
+    #[error("event id scheme: {0}")]
+    Scheme(String),
+}
+
+/// The v12 scheme: `event_id = "$" + b64url(reference_hash(event))`.
+///
+/// Stamps nothing — the id is already a function of the bytes as they stand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReferenceHashIds;
+
+impl EventIdScheme for ReferenceHashIds {
+    fn derive(
+        &self,
+        obj: &CanonicalJsonObject,
+        version: &RoomVersion,
+    ) -> Result<OwnedEventId, EventIdError> {
+        let rh = reference_hash(obj, version).map_err(EventIdError::Redaction)?;
+        Ok(event_id_from_hash(&rh))
+    }
 }
 
 /// Derive a room_id from a create event's event_id.
@@ -227,6 +327,7 @@ pub fn room_id_from_create(create_event_id: &EventId) -> OwnedRoomId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::room_version::base_version;
     use ruma::canonical_json::CanonicalJsonValue;
     use serde_json::json;
 
@@ -294,7 +395,7 @@ mod tests {
             "origin_server_ts": 1000,
             "unsigned": { "age": 5 }
         }));
-        redact_for_hash(&mut o).expect("redaction succeeds");
+        redact_for_hash(&mut o, base_version()).expect("redaction succeeds");
 
         // prev_state_events survives.
         assert_eq!(
@@ -324,7 +425,7 @@ mod tests {
             "prev_events": [],
             "origin_server_ts": 1000
         }));
-        redact_for_hash(&mut o).expect("redaction succeeds");
+        redact_for_hash(&mut o, base_version()).expect("redaction succeeds");
         assert!(!o.contains_key("prev_state_events"));
     }
 
@@ -411,7 +512,7 @@ mod tests {
             "content": {}, "origin_server_ts": 1,
             "prev_events": [], "auth_events": []
         }));
-        let h_base = reference_hash(&base).expect("redacts");
+        let h_base = reference_hash(&base, base_version()).expect("redacts");
 
         let with_strippable = obj(json!({
             "type": "m.room.message", "sender": "@a:d", "room_id": "!r:d",
@@ -420,7 +521,10 @@ mod tests {
             "unsigned": { "age": 42 },
             "signatures": { "d": { "ed25519:a": "sig" } }
         }));
-        assert_eq!(h_base, reference_hash(&with_strippable).expect("redacts"));
+        assert_eq!(
+            h_base,
+            reference_hash(&with_strippable, base_version()).expect("redacts")
+        );
     }
 
     #[test]
@@ -439,8 +543,8 @@ mod tests {
             "prev_events": [], "prev_state_events": ["$ps_b:d"]
         }));
         assert_ne!(
-            reference_hash(&a).expect("redacts"),
-            reference_hash(&b).expect("redacts"),
+            reference_hash(&a, base_version()).expect("redacts"),
+            reference_hash(&b, base_version()).expect("redacts"),
         );
     }
 
@@ -454,7 +558,8 @@ mod tests {
             "content": {}, "origin_server_ts": 1,
             "prev_events": []
         }));
-        let err = reference_hash(&o).expect_err("missing `type` must trip redaction");
+        let err =
+            reference_hash(&o, base_version()).expect_err("missing `type` must trip redaction");
         assert!(
             matches!(err, RedactionError::MissingField { ref path } if path == "type"),
             "expected MissingField {{ path: \"type\" }}, got {err:?}",
@@ -471,7 +576,7 @@ mod tests {
             "prev_events": [], "auth_events": []
         }));
         let c = content_hash(&o);
-        let r = reference_hash(&o).expect("redacts");
+        let r = reference_hash(&o, base_version()).expect("redacts");
         assert_ne!(c, r);
     }
 
@@ -494,6 +599,19 @@ mod tests {
         assert_eq!(id.as_str(), "$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
     }
 
+    /// A pluggable [`EventIdScheme`] can mint ids that are neither 43 chars
+    /// nor base64, and `room_id_from_create` turns any of them into a room id
+    /// by sigil swap — so if ruma rejected such a shape, the swap would panic
+    /// on every create. Uses a short id containing `_`, the character most
+    /// likely to be refused by a stricter parser.
+    #[test]
+    fn short_non_base64_id_parses_as_event_id_and_room_id() {
+        let id = OwnedEventId::try_from("$1700000000000_3").expect("short event id parses");
+        assert_eq!(id.as_str(), "$1700000000000_3");
+        let room_id = room_id_from_create(&id);
+        assert_eq!(room_id.as_str(), "!1700000000000_3");
+    }
+
     #[test]
     fn room_id_from_create_sigil_swap() {
         let hash = [0xab_u8; 32];
@@ -506,8 +624,8 @@ mod tests {
 
     /// Hand-authored v12 reference-hash vector with independent verification.
     ///
-    /// **Keep this test even though `compute_event_id_matches_real_matrix_org_event`
-    /// and `compute_event_id_matches_real_msc4242_event` below also exercise
+    /// **Keep this test even though `base_version_event_id_matches_real_matrix_org_event`
+    /// and `base_version_event_id_matches_real_msc4242_event` below also exercise
     /// the same pipeline against real homeserver outputs.** The hand-traced
     /// `EXPECTED_POST_REDACTION` literal is the only place where the
     /// post-redaction canonical bytes are spelled out in human-readable form,
@@ -562,7 +680,7 @@ mod tests {
         // is the MSC4242 carve-out — V11 alone would have stripped it).
         const EXPECTED_POST_REDACTION: &[u8] = br#"{"content":{},"hashes":{"sha256":"Y29udGVudGhhc2g"},"origin_server_ts":1700000000000,"prev_events":["$prev:example.org"],"prev_state_events":["$ps:example.org"],"room_id":"!room:example.org","sender":"@alice:example.org","type":"m.room.message"}"#;
 
-        let h = reference_hash(&input).expect("redacts");
+        let h = reference_hash(&input, base_version()).expect("redacts");
 
         // Independent cross-check: SHA-256 over the human-readable expected
         // bytes must equal our reference_hash output. If our redaction step
@@ -586,7 +704,7 @@ mod tests {
     /// If this drifts, either ruma's `redact_in_place` changed or our
     /// canonical encoding broke — both would be regressions.
     #[test]
-    fn compute_event_id_matches_real_matrix_org_event() {
+    fn base_version_event_id_matches_real_matrix_org_event() {
         let raw_json = r#"{
   "auth_events": [
     "$Fw7pQdLu79h74bsZabn1UKXoXo7-q5M-cOwQxQxfh2c",
@@ -619,7 +737,7 @@ mod tests {
   }
 }"#;
         let raw = serde_json::value::RawValue::from_string(raw_json.to_owned()).expect("raw");
-        let id = compute_event_id(&raw).expect("computes");
+        let id = base_version_event_id(&raw).expect("computes");
         assert_eq!(id.as_str(), "$KXQOIuyr9pVHI6YAqMtwYCJbeh8-KtZbl8XCDHA53qY");
     }
 
@@ -629,10 +747,10 @@ mod tests {
     /// so it exercises **the MSC4242 carve-out path itself**: without our
     /// save/restore of `prev_state_events` across V11 redaction, the field
     /// would be stripped and the resulting event_id would differ.
-    /// Complements `compute_event_id_matches_real_matrix_org_event` which
+    /// Complements `base_version_event_id_matches_real_matrix_org_event` which
     /// only exercised stock V11 redaction.
     #[test]
-    fn compute_event_id_matches_real_msc4242_event() {
+    fn base_version_event_id_matches_real_msc4242_event() {
         let raw_json = r#"{
   "prev_events": [
     "$zo_-jrWvI_eBqBktaYF2uIZ4pS2hngkQ4J9wWm37w0g"
@@ -681,7 +799,7 @@ mod tests {
   }
 }"#;
         let raw = serde_json::value::RawValue::from_string(raw_json.to_owned()).expect("raw");
-        let id = compute_event_id(&raw).expect("computes");
+        let id = base_version_event_id(&raw).expect("computes");
         assert_eq!(id.as_str(), "$B551KEsRXrNE3knHLSP-QszuqJYSjasJECVcmP1JIkI");
     }
 }

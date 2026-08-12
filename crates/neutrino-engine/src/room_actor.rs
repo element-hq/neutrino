@@ -51,6 +51,11 @@ const ACTOR_INBOX: usize = 32;
 pub enum RoomActorError {
     #[error("no such room")]
     UnknownRoom,
+    /// The room exists on disk but its `rooms.room_version` is one this build
+    /// does not speak — a peer's medium declared a version we lack. Its events
+    /// cannot be named, so the room cannot be served at all.
+    #[error("unsupported room version {0}")]
+    UnsupportedRoomVersion(String),
     #[error("building event: {0}")]
     Build(#[from] FormatError),
     #[error("event rejected: {0}")]
@@ -73,6 +78,20 @@ pub enum RoomActorError {
     /// The actor task is gone (channel closed) — it panicked or was dropped.
     #[error("room actor unavailable")]
     ActorGone,
+}
+
+/// Preserve the retryable/terminal distinction across the boundary: a storage
+/// fault stays a `Storage` error (transient, 500), an unknown room stays a 404,
+/// and a version this build cannot speak is its own verdict.
+impl From<crate::util::VersionError> for RoomActorError {
+    fn from(e: crate::util::VersionError) -> Self {
+        use crate::util::VersionError;
+        match e {
+            VersionError::UnknownRoom => Self::UnknownRoom,
+            VersionError::Unsupported(v) => Self::UnsupportedRoomVersion(v),
+            VersionError::Fault(e) => Self::Storage(e),
+        }
+    }
 }
 
 /// A command processed by a room actor.
@@ -135,10 +154,10 @@ struct RoomActor<S> {
     /// set so we never federate an event back to ourselves. Held as a `String`
     /// (the config form) since it's only ever compared by value.
     own_server: String,
-    /// Signs every locally-built event when the deployment is
-    /// signed deployments; `None` on a trusted network (events then MUST NOT
-    /// carry signatures). Handed to `RoomCore::build_local_event`.
-    signer: Option<Arc<neutrino_event::EventSigner>>,
+    /// The deployment's event policy: how locally-built events are signed
+    /// (never, on a trusted network) and how their ids are derived. Handed to
+    /// `RoomCore::build_local_event`.
+    policy: neutrino_event::EventPolicy,
 }
 
 impl<S: StorageBackend + WithStateProvider + 'static> RoomActor<S> {
@@ -197,7 +216,7 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomActor<S> {
             event_type,
             state_key,
             content,
-            self.signer.clone(),
+            self.policy.signer(),
         )?;
         Ok(Arc::new(event))
     }
@@ -367,7 +386,7 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomActor<S> {
             event_type,
             state_key,
             content,
-            self.signer.clone(),
+            self.policy.signer(),
         )?;
 
         let (next, effects) = self.run_apply("local", event).await?;
@@ -610,21 +629,17 @@ pub struct RoomRegistry<S> {
     /// This homeserver's own name, handed to each spawned actor so it can
     /// exclude itself from outbound federation destinations.
     own_server: String,
-    /// Cloned into every spawned actor — see `RoomActor::signer`.
-    signer: Option<Arc<neutrino_event::EventSigner>>,
+    /// Cloned into every spawned actor — see `RoomActor::policy`.
+    policy: neutrino_event::EventPolicy,
     actors: Mutex<HashMap<OwnedRoomId, mpsc::Sender<Command>>>,
 }
 
 impl<S: StorageBackend + WithStateProvider + 'static> RoomRegistry<S> {
-    pub fn new(
-        store: Arc<S>,
-        own_server: String,
-        signer: Option<Arc<neutrino_event::EventSigner>>,
-    ) -> Self {
+    pub fn new(store: Arc<S>, own_server: String, policy: neutrino_event::EventPolicy) -> Self {
         Self {
             store,
             own_server,
-            signer,
+            policy,
             actors: Mutex::new(HashMap::new()),
         }
     }
@@ -742,7 +757,18 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomRegistry<S> {
             .into_iter()
             .map(|(key, ev)| (key, Arc::new(ev)))
             .collect();
-        let room = RoomCore::hydrate(room_id.to_owned(), timeline_fes, state_fes, current_state);
+        // The room's version, from `rooms.room_version`. Every event this actor
+        // names, validates or signs uses it, so it is resolved once here and
+        // held by the `RoomCore` rather than passed down each call.
+        let version =
+            crate::util::room_version(self.store.as_ref(), &self.policy.versions, room_id).await?;
+        let room = RoomCore::hydrate(
+            room_id.to_owned(),
+            version,
+            timeline_fes,
+            state_fes,
+            current_state,
+        );
 
         // Insert under the lock, re-checking so a racing bootstrap doesn't
         // spawn a second actor for the same room (the loser discards `room`).
@@ -756,7 +782,7 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomRegistry<S> {
                 room,
                 store: self.store.clone(),
                 own_server: self.own_server.clone(),
-                signer: self.signer.clone(),
+                policy: self.policy.clone(),
             }
             .run(rx),
         );
@@ -798,14 +824,22 @@ mod tests {
     ) {
         let store = Arc::new(SqliteStore::open_in_memory().await.expect("open store"));
         let alice: OwnedUserId = ALICE.parse().expect("alice");
-        let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(json!({ "room_version": ROOM_VERSION_ID }))
-            .build()
-            .expect("build create");
+        let create = EventBuilder::new(
+            alice.clone(),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
         let room_id = create.room_id.clone();
         store.create_room(&create, &[]).await.expect("create_room");
-        let registry = RoomRegistry::new(store.clone(), "example.org".to_owned(), None);
+        let registry = RoomRegistry::new(
+            store.clone(),
+            "example.org".to_owned(),
+            neutrino_event::EventPolicy::trusted_network(),
+        );
         (registry, store, room_id, alice)
     }
 
@@ -1005,15 +1039,23 @@ mod tests {
     ) {
         let store = Arc::new(SqliteStore::open_in_memory().await.expect("open store"));
         let alice: OwnedUserId = ALICE.parse().expect("alice");
-        let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(json!({ "room_version": ROOM_VERSION_ID }))
-            .build()
-            .expect("build create");
+        let create = EventBuilder::new(
+            alice.clone(),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
         let room_id = create.room_id.clone();
         let create_id = create.event_id.clone();
         store.create_room(&create, &[]).await.expect("create_room");
-        let registry = RoomRegistry::new(store.clone(), "example.org".to_owned(), None);
+        let registry = RoomRegistry::new(
+            store.clone(),
+            "example.org".to_owned(),
+            neutrino_event::EventPolicy::trusted_network(),
+        );
         (registry, store, room_id, alice, create_id)
     }
 
@@ -1023,14 +1065,18 @@ mod tests {
         // auth_events on the wire — apply_pdu computes them).
         let (registry, store, room_id, alice, create_id) = setup_with_create_id().await;
 
-        let join = EventBuilder::new(alice.clone(), "m.room.member".to_owned())
-            .room_id(room_id.clone())
-            .state_key(alice.to_string())
-            .content(json!({ "membership": "join" }))
-            .prev_events(vec![create_id.clone()])
-            .prev_state_events(vec![create_id])
-            .build()
-            .expect("build join pdu");
+        let join = EventBuilder::new(
+            alice.clone(),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key(alice.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create_id.clone()])
+        .prev_state_events(vec![create_id])
+        .build()
+        .expect("build join pdu");
         let join_id = join.event_id.clone();
 
         registry
@@ -1068,14 +1114,18 @@ mod tests {
             .expect("alice join");
 
         let bob: OwnedUserId = BOB.parse().unwrap();
-        let bob_join = EventBuilder::new(bob.clone(), "m.room.member".to_owned())
-            .room_id(room_id.clone())
-            .state_key(bob.to_string())
-            .content(json!({ "membership": "join" }))
-            .prev_events(vec![alice_join.event_id.clone()])
-            .prev_state_events(vec![alice_join.event_id.clone()])
-            .build()
-            .expect("build bob join pdu");
+        let bob_join = EventBuilder::new(
+            bob.clone(),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key(bob.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![alice_join.event_id.clone()])
+        .prev_state_events(vec![alice_join.event_id.clone()])
+        .build()
+        .expect("build bob join pdu");
         let bob_join_id = bob_join.event_id.clone();
 
         let (timeline_before, state_before) =
@@ -1140,14 +1190,18 @@ mod tests {
             .expect("alice opens public");
 
         let zara: OwnedUserId = ZARA.parse().unwrap();
-        let zara_join = EventBuilder::new(zara.clone(), "m.room.member".to_owned())
-            .room_id(room_id.clone())
-            .state_key(zara.to_string())
-            .content(json!({ "membership": "join" }))
-            .prev_events(vec![rules.event_id.clone()])
-            .prev_state_events(vec![rules.event_id.clone()])
-            .build()
-            .expect("build zara join pdu");
+        let zara_join = EventBuilder::new(
+            zara.clone(),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key(zara.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![rules.event_id.clone()])
+        .prev_state_events(vec![rules.event_id.clone()])
+        .build()
+        .expect("build zara join pdu");
         let zara_join_id = zara_join.event_id.clone();
         registry
             .apply_pdu(&room_id, zara_join)
@@ -1327,14 +1381,18 @@ mod tests {
         }
 
         let zara: OwnedUserId = ZARA.parse().unwrap();
-        let zara_join = EventBuilder::new(zara.clone(), "m.room.member".to_owned())
-            .room_id(room_id.clone())
-            .state_key(zara.to_string())
-            .content(json!({ "membership": "join" }))
-            .prev_events(vec![rules.event_id.clone()])
-            .prev_state_events(vec![rules.event_id.clone()])
-            .build()
-            .expect("build zara join pdu");
+        let zara_join = EventBuilder::new(
+            zara.clone(),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key(zara.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![rules.event_id.clone()])
+        .prev_state_events(vec![rules.event_id.clone()])
+        .build()
+        .expect("build zara join pdu");
         registry
             .apply_pdu(&room_id, zara_join)
             .await

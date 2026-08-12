@@ -48,7 +48,7 @@
 -- amended in place (same policy as the `events.rejected` column).
 CREATE TABLE rooms (
     room_id        TEXT NOT NULL PRIMARY KEY,
-    room_version   TEXT NOT NULL CHECK (room_version = 'org.matrix.msc4242.12'),
+    room_version   TEXT NOT NULL CHECK (room_version <> ''),
     forward_extremities            TEXT NOT NULL DEFAULT '[]',
     state_dag_forward_extremities  TEXT NOT NULL DEFAULT '[]'
 ) STRICT, WITHOUT ROWID;
@@ -379,9 +379,14 @@ CREATE INDEX ix_staged_events_room ON staged_events(room_id);
 -- `staged_events.room_id`). No `user_version` bump (additive, no live data —
 -- same policy as the staged_events / FE columns). Surfaces only via the sync
 -- invite path, which unions `invited_oob_rooms(user)` into the room list.
+-- `event_id` is stored, not recomputed on read: the id is known at write time,
+-- and re-deriving it needs the room's version, which for an out-of-band invite
+-- is a room we do not host and therefore have no `rooms` row for. Storing it
+-- also saves a parse + hash per read.
 CREATE TABLE oob_invites (
     room_id    TEXT NOT NULL,
     state_key  TEXT NOT NULL,
+    event_id   TEXT NOT NULL,
     json       TEXT NOT NULL,
     PRIMARY KEY (room_id, state_key)
 ) STRICT, WITHOUT ROWID;

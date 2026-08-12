@@ -24,4 +24,6 @@ pub use ports::{
     TransportError,
 };
 pub use room_actor::{RoomActorError, RoomRegistry};
-pub use util::{MAX_PDUS_PER_TXN, TxnIdGen, stage_and_poke};
+pub use util::{
+    MAX_PDUS_PER_TXN, TxnIdGen, VersionError, room_version, room_version_for_wire, stage_and_poke,
+};

@@ -26,8 +26,9 @@ use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+use crate::Event;
 use crate::event_id::canonical;
-use crate::{Event, ROOM_VERSION_ID};
+use crate::room_version::RoomVersion;
 
 const MAX_PREV_EVENTS: usize = 20;
 const MAX_PREV_STATE_EVENTS: usize = 20;
@@ -165,6 +166,14 @@ pub enum FormatError {
     /// detail from `verify_event_signature`.
     #[error("signature check failed: {0}")]
     SignatureCheck(String),
+
+    /// The room version's [`EventIdScheme`](crate::event_id::EventIdScheme)
+    /// could not derive an id for this event: the fields its derivation reads
+    /// are absent or malformed. Never raised by the base version's reference-hash
+    /// scheme, whose only failure mode is a redaction precondition (already
+    /// covered by `MissingField` / `InvalidFieldType`).
+    #[error("cannot derive event id: {0}")]
+    EventId(String),
 }
 
 /// What a [`validate_pdu`] failure means for a federation PDU, mirroring the
@@ -229,7 +238,10 @@ pub fn semantic_verdict(err: &FormatError) -> SemanticVerdict {
         // S-S receipt-check "Passes signature checks, otherwise it is
         // dropped": provenance failure means the event never enters the
         // system (unlike hash mismatch, which redacts and continues).
-        | FormatError::SignatureCheck(_) => Drop,
+        | FormatError::SignatureCheck(_)
+        // An event whose id cannot be derived cannot be named, stored or
+        // referenced, so it never enters the system.
+        | FormatError::EventId(_) => Drop,
 
         // State-independent auth rules: the spec says reject.
         FormatError::StateKeyAtSignSenderMismatch
@@ -419,7 +431,7 @@ pub fn parse_event(
 /// inspect it. parse_event guarantees content is an object, but the
 /// re-parse means a caller that hand-constructed an `Event` with a
 /// non-object content still gets a typed error here rather than a panic.
-pub fn validate_pdu(event: &Event) -> Result<(), FormatError> {
+pub fn validate_pdu(event: &Event, version: &RoomVersion) -> Result<(), FormatError> {
     // S-S API §"Size limits" — first, mirroring synapse's
     // `check_state_independent_auth_rules` ordering. The whole-PDU limit is
     // measured on the canonical JSON encoding of the wire bytes (`Event.raw`);
@@ -494,7 +506,7 @@ pub fn validate_pdu(event: &Event) -> Result<(), FormatError> {
 
     // Per-type content checks.
     match event.event_type.as_str() {
-        "m.room.create" => check_create(&content_as_object(&event.content)?)?,
+        "m.room.create" => check_create(&content_as_object(&event.content)?, version)?,
         "m.room.member" => check_member(
             &content_as_object(&event.content)?,
             event.state_key.as_deref(),
@@ -590,17 +602,20 @@ fn derive_create_room_id(event_id: &OwnedEventId) -> Result<OwnedRoomId, FormatE
         })
 }
 
-fn check_create(content: &Map<String, Value>) -> Result<(), FormatError> {
+fn check_create(content: &Map<String, Value>, version: &RoomVersion) -> Result<(), FormatError> {
     // v12 rule 1.3: "If `content.room_version` is present and is not a
-    // recognised version, reject." We accept exactly the MSC4242 unstable
-    // identifier — see `ROOM_VERSION_ID` for why we don't compare against
-    // ruma's `RoomVersionId::V12`.
+    // recognised version, reject." The caller resolved `version` — from this
+    // very field, for an inbound create — so this is the consistency check
+    // that the room the event claims to create is the room it is being named
+    // as part of. A locally-built create whose content declares a different
+    // version than it is built under fails here rather than being persisted
+    // under a name nobody else will derive.
     if let Some(v) = content.get("room_version") {
         let s = v.as_str().ok_or(FormatError::InvalidFieldType {
             field: "content.room_version",
             expected: "string",
         })?;
-        if s != ROOM_VERSION_ID {
+        if s != version.id {
             return Err(FormatError::UnrecognisedRoomVersion(s.to_owned()));
         }
     }
@@ -687,6 +702,8 @@ fn check_power_levels(content: &Map<String, Value>) -> Result<(), FormatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ROOM_VERSION_ID;
+    use crate::room_version::base_version;
     use serde_json::json;
 
     fn raw(v: Value) -> Box<RawValue> {
@@ -763,7 +780,7 @@ mod tests {
         .expect("parses");
         assert!(
             !matches!(
-                validate_pdu(&event),
+                validate_pdu(&event, base_version()),
                 Err(FormatError::StateKeyAtSignSenderMismatch)
             ),
             "rule 9 must not evaluate for third_party_invite"
@@ -779,7 +796,7 @@ mod tests {
         )
         .expect("parses");
         assert!(matches!(
-            validate_pdu(&event),
+            validate_pdu(&event, base_version()),
             Err(FormatError::StateKeyAtSignSenderMismatch)
         ));
     }
@@ -857,7 +874,7 @@ mod tests {
         );
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::TooManyPrevEvents)
         ));
     }
@@ -872,7 +889,7 @@ mod tests {
         );
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::TooManyPrevStateEvents)
         ));
     }
@@ -884,7 +901,7 @@ mod tests {
         v["prev_events"] = json!(["$prev:example.org"]);
         let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::CreateHasPrevEvents)
         ));
     }
@@ -895,7 +912,7 @@ mod tests {
         v["prev_state_events"] = json!(["$prev:example.org"]);
         let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::CreateHasPrevStateEvents)
         ));
     }
@@ -909,7 +926,7 @@ mod tests {
         v["state_key"] = json!("@evil:example.org");
         let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::CreateBadStateKey)
         ));
     }
@@ -920,7 +937,7 @@ mod tests {
         v.as_object_mut().expect("obj").remove("state_key");
         let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::CreateBadStateKey)
         ));
     }
@@ -943,7 +960,7 @@ mod tests {
         v["content"] = json!({ "room_version": "11" });
         let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::UnrecognisedRoomVersion(_))
         ));
     }
@@ -955,7 +972,7 @@ mod tests {
         let mut v = base_create();
         v["content"] = json!({});
         let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
-        validate_pdu(&ev).expect("absent room_version is permitted");
+        validate_pdu(&ev, base_version()).expect("absent room_version is permitted");
     }
 
     // ---------- additional_creators (validate_pdu) ----------
@@ -966,7 +983,7 @@ mod tests {
             json!({ "room_version": ROOM_VERSION_ID, "additional_creators": "@bob:example.org" });
         let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::InvalidAdditionalCreators)
         ));
     }
@@ -978,7 +995,7 @@ mod tests {
             json!({ "room_version": ROOM_VERSION_ID, "additional_creators": ["not-a-user-id"] });
         let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::InvalidAdditionalCreators)
         ));
     }
@@ -991,7 +1008,7 @@ mod tests {
             "additional_creators": ["@bob:example.org", "@carol:example.org"]
         });
         let ev = parse_event(raw(v), eid("$create:example.org"), vec![]).expect("wire ok");
-        validate_pdu(&ev).expect("valid additional_creators");
+        validate_pdu(&ev, base_version()).expect("valid additional_creators");
     }
 
     // ---------- m.room.member missing parts (validate_pdu) ----------
@@ -1003,7 +1020,7 @@ mod tests {
         // state_key absent
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::MemberMissingStateKey)
         ));
     }
@@ -1016,7 +1033,7 @@ mod tests {
         v["content"] = json!({});
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::MemberMissingMembership)
         ));
     }
@@ -1030,7 +1047,7 @@ mod tests {
         // sender = @alice — mismatch
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::StateKeyAtSignSenderMismatch)
         ));
     }
@@ -1041,7 +1058,7 @@ mod tests {
         v["type"] = json!("m.something");
         v["state_key"] = json!("@alice:example.org");
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
-        validate_pdu(&ev).expect("state_key matches sender");
+        validate_pdu(&ev, base_version()).expect("state_key matches sender");
     }
 
     #[test]
@@ -1050,7 +1067,7 @@ mod tests {
         v["type"] = json!("m.room.topic");
         v["state_key"] = json!("");
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
-        validate_pdu(&ev).expect("empty state_key ok");
+        validate_pdu(&ev, base_version()).expect("empty state_key ok");
     }
 
     #[test]
@@ -1063,7 +1080,8 @@ mod tests {
         v["state_key"] = json!("@bob:example.org");
         v["content"] = json!({ "membership": "invite" });
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
-        validate_pdu(&ev).expect("m.room.member with different state_key/sender is valid");
+        validate_pdu(&ev, base_version())
+            .expect("m.room.member with different state_key/sender is valid");
     }
 
     // ---------- power_levels content (validate_pdu) ----------
@@ -1075,7 +1093,7 @@ mod tests {
         v["content"] = json!({ "users_default": "high" });
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::PowerLevelsBadIntField("users_default"))
         ));
     }
@@ -1088,7 +1106,7 @@ mod tests {
         v["content"] = json!({ "events": { "m.room.name": "yes" } });
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::PowerLevelsBadObjectField("events"))
         ));
     }
@@ -1101,7 +1119,7 @@ mod tests {
         v["content"] = json!({ "users": { "not-a-user-id": 50 } });
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::PowerLevelsBadUsers)
         ));
     }
@@ -1114,7 +1132,7 @@ mod tests {
         v["content"] = json!({ "users": { "@alice:example.org": "boss" } });
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::PowerLevelsBadUsers)
         ));
     }
@@ -1137,7 +1155,7 @@ mod tests {
             "notifications": { "room": 50 }
         });
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
-        validate_pdu(&ev).expect("valid power_levels");
+        validate_pdu(&ev, base_version()).expect("valid power_levels");
     }
 
     // ---------- malformed IDs ----------
@@ -1341,14 +1359,18 @@ mod tests {
     fn validate_pdu_accepts_event_at_exactly_max_pdu_bytes() {
         let v = event_with_canonical_size(65536);
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
-        validate_pdu(&ev).expect("event at exactly 65536 canonical bytes is accepted");
+        validate_pdu(&ev, base_version())
+            .expect("event at exactly 65536 canonical bytes is accepted");
     }
 
     #[test]
     fn validate_pdu_rejects_event_one_byte_over_max_pdu_bytes() {
         let v = event_with_canonical_size(65537);
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
-        assert!(matches!(validate_pdu(&ev), Err(FormatError::EventTooLarge)));
+        assert!(matches!(
+            validate_pdu(&ev, base_version()),
+            Err(FormatError::EventTooLarge)
+        ));
     }
 
     #[test]
@@ -1356,7 +1378,7 @@ mod tests {
         let mut v = base_event();
         v["type"] = json!("a".repeat(255));
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
-        validate_pdu(&ev).expect("255-byte type is accepted");
+        validate_pdu(&ev, base_version()).expect("255-byte type is accepted");
     }
 
     #[test]
@@ -1365,7 +1387,7 @@ mod tests {
         v["type"] = json!("a".repeat(256));
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::FieldTooLong("type"))
         ));
     }
@@ -1376,7 +1398,7 @@ mod tests {
         v["type"] = json!("m.room.topic");
         v["state_key"] = json!("s".repeat(255));
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
-        validate_pdu(&ev).expect("255-byte state_key is accepted");
+        validate_pdu(&ev, base_version()).expect("255-byte state_key is accepted");
     }
 
     #[test]
@@ -1386,7 +1408,7 @@ mod tests {
         v["state_key"] = json!("s".repeat(256));
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::FieldTooLong("state_key"))
         ));
     }
@@ -1401,7 +1423,7 @@ mod tests {
         v["type"] = json!("é".repeat(128));
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
         assert!(matches!(
-            validate_pdu(&ev),
+            validate_pdu(&ev, base_version()),
             Err(FormatError::FieldTooLong("type"))
         ));
 
@@ -1409,7 +1431,7 @@ mod tests {
         let mut v = base_event();
         v["type"] = json!(format!("{}a", "é".repeat(127)));
         let ev = parse_event(raw(v), eid("$e:example.org"), vec![]).expect("wire ok");
-        validate_pdu(&ev).expect("255-byte multibyte type is accepted");
+        validate_pdu(&ev, base_version()).expect("255-byte multibyte type is accepted");
     }
 
     // ---------- signatures field is ignored ----------

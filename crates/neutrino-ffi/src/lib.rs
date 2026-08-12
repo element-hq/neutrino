@@ -266,7 +266,7 @@ impl NeutrinoHandle {
 /// immediate; only a runaway closure can delay this thread's exit.
 #[uniffi::export]
 pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
-    start_with(config, None)
+    start_with(config, None, None)
 }
 
 /// The composition seam for out-of-tree federation media. Same as [`start`]
@@ -279,6 +279,7 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
 /// contract an injected medium must uphold.
 pub fn start_with(
     config: NeutrinoConfig,
+    store: Option<std::sync::Arc<neutrino_main::SqliteStore>>,
     link_factory: Option<neutrino_main::FederationLinkFactory>,
 ) -> NeutrinoHandle {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -336,8 +337,22 @@ pub fn start_with(
             // The command receiver is threaded into the server; a `Shutdown`
             // command (or every `NeutrinoHandle` being dropped, which closes the
             // channel) drives `serve`'s graceful shutdown and returns here.
+            // The caller's handle if it opened one (it may need to read the
+            // same store), else ours. Either way exactly one open per process.
+            let store = match store {
+                Some(store) => store,
+                None => match neutrino_main::open_store(&config).await {
+                    Ok(store) => store,
+                    Err(e) => {
+                        tracing::error!(error = %e, "neutrino: failed to open the store");
+                        let _ = error_tx.send(Some(e.to_string()));
+                        return;
+                    }
+                },
+            };
             if let Err(e) = neutrino_main::entrypoint(
                 config,
+                store,
                 rx,
                 Some(handoff_tx),
                 link_factory,

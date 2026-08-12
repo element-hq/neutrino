@@ -59,7 +59,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use neutrino_event::{EventSecurity, now_ms};
+use neutrino_event::{EventPolicy, now_ms};
 
 use crate::ports::{FederationTransport, ForwardExtremities, MissingEventsFetcher, TransportError};
 use crate::reconcile;
@@ -77,8 +77,10 @@ struct SenderCtx<S> {
     /// a peer advertises on a transaction *response*. Shared with the inbound
     /// worker/handler (see `AppState`).
     fetcher: Arc<dyn MissingEventsFetcher>,
-    /// Deployment-wide security policy from the medium's declared link trust.
-    security: EventSecurity,
+    /// Deployment-wide event policy: the security posture composed from the
+    /// medium's declared link trust, and the room versions this build speaks
+    /// (each room's own version is read from the store, per room).
+    policy: EventPolicy,
     /// Poke the inbound worker after reconciliation stages fetched events.
     worker_poke: mpsc::Sender<OwnedRoomId>,
 }
@@ -94,7 +96,7 @@ impl<S> Clone for SenderCtx<S> {
             idgen: self.idgen.clone(),
             send_slots: self.send_slots.clone(),
             fetcher: self.fetcher.clone(),
-            security: self.security.clone(),
+            policy: self.policy.clone(),
             worker_poke: self.worker_poke.clone(),
         }
     }
@@ -116,7 +118,7 @@ pub fn spawn<S: StorageBackend + 'static>(
     shutdown: CancellationToken,
     kick_rx: watch::Receiver<()>,
     fetcher: Arc<dyn MissingEventsFetcher>,
-    security: EventSecurity,
+    policy: EventPolicy,
     worker_poke: mpsc::Sender<OwnedRoomId>,
 ) -> JoinHandle<()> {
     let watch_rx = store.subscribe();
@@ -133,7 +135,7 @@ pub fn spawn<S: StorageBackend + 'static>(
         idgen,
         send_slots,
         fetcher,
-        security,
+        policy,
         worker_poke,
     };
     tokio::spawn(supervise(
@@ -606,14 +608,14 @@ fn spawn_reconcile<S: StorageBackend + 'static>(
     for (room, heads) in peer_fes {
         let store = ctx.store.clone();
         let fetcher = ctx.fetcher.clone();
-        let security = ctx.security.clone();
+        let policy = ctx.policy.clone();
         let worker_poke = ctx.worker_poke.clone();
         let dest = dest.to_owned();
         tokio::spawn(async move {
             reconcile::reconcile_room(
                 &*store,
                 &*fetcher,
-                &security,
+                &policy,
                 &worker_poke,
                 &dest,
                 &room,
@@ -780,33 +782,45 @@ mod tests {
         let store = Arc::new(SqliteStore::open_in_dir(tempfile.path()).await.unwrap());
         let sender: OwnedUserId = "@alice:local.test".parse().unwrap();
 
-        let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(json!({ "room_version": ROOM_VERSION_ID }))
-            .build()
-            .unwrap();
+        let create = EventBuilder::new(
+            sender.clone(),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .unwrap();
         let room_id = create.room_id.clone();
         let create_id = create.event_id.clone();
-        let join = EventBuilder::new(sender.clone(), "m.room.member".to_owned())
-            .room_id(room_id.clone())
-            .state_key(sender.as_str().to_owned())
-            .content(json!({ "membership": "join" }))
-            .prev_events(vec![create_id.clone()])
-            .prev_state_events(vec![create_id.clone()])
-            .build()
-            .unwrap();
+        let join = EventBuilder::new(
+            sender.clone(),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key(sender.as_str().to_owned())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create_id.clone()])
+        .prev_state_events(vec![create_id.clone()])
+        .build()
+        .unwrap();
         let mut prev = join.event_id.clone();
         store.create_room(&create, &[join]).await.unwrap();
 
         let mut ids = Vec::with_capacity(n);
         for i in 0..n {
-            let ev = EventBuilder::new(sender.clone(), "m.room.message".to_owned())
-                .room_id(room_id.clone())
-                .content(json!({ "msgtype": "m.text", "body": format!("msg {i}") }))
-                .prev_events(vec![prev.clone()])
-                .origin_server_ts(1_700_000_000_000 + i as u64)
-                .build()
-                .unwrap();
+            let ev = EventBuilder::new(
+                sender.clone(),
+                "m.room.message".to_owned(),
+                neutrino_event::base_version().clone(),
+            )
+            .room_id(room_id.clone())
+            .content(json!({ "msgtype": "m.text", "body": format!("msg {i}") }))
+            .prev_events(vec![prev.clone()])
+            .origin_server_ts(1_700_000_000_000 + i as u64)
+            .build()
+            .unwrap();
             store.persist_event(&ev, &[dest]).await.unwrap();
             prev = ev.event_id.clone();
             ids.push(ev.event_id);
@@ -841,13 +855,17 @@ mod tests {
         let alice: OwnedUserId = "@alice:local.test".parse().unwrap();
         let (timeline, state) = store.forward_extremities(room).await.unwrap().unwrap();
         let prev = timeline.iter().next().expect("room has a head").clone();
-        let msg = EventBuilder::new(alice, "m.room.message".to_owned())
-            .room_id(room.to_owned())
-            .content(json!({ "msgtype": "m.text", "body": "advertise-me" }))
-            .prev_events(vec![prev])
-            .origin_server_ts(1_700_000_000_123)
-            .build()
-            .unwrap();
+        let msg = EventBuilder::new(
+            alice,
+            "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room.to_owned())
+        .content(json!({ "msgtype": "m.text", "body": "advertise-me" }))
+        .prev_events(vec![prev])
+        .origin_server_ts(1_700_000_000_123)
+        .build()
+        .unwrap();
         let new_timeline: BTreeSet<OwnedEventId> = [msg.event_id.clone()].into_iter().collect();
         store
             .persist_resolved_event(&msg, &new_timeline, &state, &BTreeMap::new(), &[], &[dest])
@@ -874,14 +892,18 @@ mod tests {
         use neutrino_store::RoomStore;
         let alice: OwnedUserId = "@alice:local.test".parse().unwrap();
         let (timeline, state) = store.forward_extremities(room).await.unwrap().unwrap();
-        EventBuilder::new(alice, "m.room.message".to_owned())
-            .room_id(room.to_owned())
-            .content(json!({ "msgtype": "m.text", "body": body }))
-            .prev_events(timeline.iter().cloned().collect())
-            .prev_state_events(state.iter().cloned().collect())
-            .origin_server_ts(ts)
-            .build()
-            .unwrap()
+        EventBuilder::new(
+            alice,
+            "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room.to_owned())
+        .content(json!({ "msgtype": "m.text", "body": body }))
+        .prev_events(timeline.iter().cloned().collect())
+        .prev_state_events(state.iter().cloned().collect())
+        .origin_server_ts(ts)
+        .build()
+        .unwrap()
     }
 
     /// Commit `event` with `heads` as the room's timeline head-set (state heads
@@ -929,7 +951,7 @@ mod tests {
             idgen: Arc::new(TxnIdGen::new(now_ms())),
             send_slots: Arc::new(Semaphore::new(1)),
             fetcher: null_fetcher(),
-            security: EventSecurity::TrustedNetwork,
+            policy: EventPolicy::trusted_network(),
             worker_poke: null_poke(),
         }
     }
@@ -969,7 +991,7 @@ mod tests {
             no_shutdown(),
             no_kick(),
             null_fetcher(),
-            EventSecurity::TrustedNetwork,
+            EventPolicy::trusted_network(),
             null_poke(),
         ));
         wait_drained(&store, &dest).await;
@@ -1006,7 +1028,7 @@ mod tests {
             no_shutdown(),
             no_kick(),
             null_fetcher(),
-            EventSecurity::TrustedNetwork,
+            EventPolicy::trusted_network(),
             null_poke(),
         ));
         wait_drained(&store, &dest).await;
@@ -1039,7 +1061,7 @@ mod tests {
             no_shutdown(),
             no_kick(),
             null_fetcher(),
-            EventSecurity::TrustedNetwork,
+            EventPolicy::trusted_network(),
             null_poke(),
         ));
         wait_drained(&store, &dest).await; // dropped → outbox empties
@@ -1063,7 +1085,7 @@ mod tests {
             no_shutdown(),
             no_kick(),
             null_fetcher(),
-            EventSecurity::TrustedNetwork,
+            EventPolicy::trusted_network(),
             null_poke(),
         ));
         wait_drained(&store, &dest).await;
@@ -1090,12 +1112,16 @@ mod tests {
         let (store, _tmp, room_id, _ids) = store_with_outbox(&healthy, 2).await;
         let sender: OwnedUserId = "@alice:local.test".parse().unwrap();
         // Add a message destined for the dead peer too.
-        let ev = EventBuilder::new(sender, "m.room.message".to_owned())
-            .room_id(room_id)
-            .content(json!({ "msgtype": "m.text", "body": "to-dead" }))
-            .origin_server_ts(1_800_000_000_000)
-            .build()
-            .unwrap();
+        let ev = EventBuilder::new(
+            sender,
+            "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id)
+        .content(json!({ "msgtype": "m.text", "body": "to-dead" }))
+        .origin_server_ts(1_800_000_000_000)
+        .build()
+        .unwrap();
         store.persist_event(&ev, &[&dead]).await.unwrap();
 
         drop(spawn(
@@ -1106,7 +1132,7 @@ mod tests {
             no_shutdown(),
             no_kick(),
             null_fetcher(),
-            EventSecurity::TrustedNetwork,
+            EventPolicy::trusted_network(),
             null_poke(),
         ));
 
@@ -1138,7 +1164,7 @@ mod tests {
             no_shutdown(),
             no_kick(),
             null_fetcher(),
-            EventSecurity::TrustedNetwork,
+            EventPolicy::trusted_network(),
             null_poke(),
         ));
         // Give the supervisor a moment to reach its idle `changed()` await.
@@ -1146,12 +1172,16 @@ mod tests {
 
         // A later persist must wake the supervisor and spawn the task.
         let sender: OwnedUserId = "@alice:local.test".parse().unwrap();
-        let ev = EventBuilder::new(sender, "m.room.message".to_owned())
-            .room_id(room_id)
-            .content(json!({ "msgtype": "m.text", "body": "later" }))
-            .origin_server_ts(1_900_000_000_000)
-            .build()
-            .unwrap();
+        let ev = EventBuilder::new(
+            sender,
+            "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id)
+        .content(json!({ "msgtype": "m.text", "body": "later" }))
+        .origin_server_ts(1_900_000_000_000)
+        .build()
+        .unwrap();
         store.persist_event(&ev, &[&dest]).await.unwrap();
 
         wait_drained(&store, &dest).await;
@@ -1181,7 +1211,7 @@ mod tests {
             no_shutdown(),
             no_kick(),
             null_fetcher(),
-            EventSecurity::TrustedNetwork,
+            EventPolicy::trusted_network(),
             null_poke(),
         ));
         wait_adv_drained(&store, &dest).await;
@@ -1218,7 +1248,7 @@ mod tests {
             no_shutdown(),
             no_kick(),
             null_fetcher(),
-            EventSecurity::TrustedNetwork,
+            EventPolicy::trusted_network(),
             null_poke(),
         ));
         wait_drained(&store, &dest).await;
@@ -1613,7 +1643,7 @@ mod tests {
             shutdown.clone(),
             no_kick(),
             null_fetcher(),
-            EventSecurity::TrustedNetwork,
+            EventPolicy::trusted_network(),
             null_poke(),
         );
 
@@ -1649,7 +1679,7 @@ mod tests {
             no_shutdown(),
             no_kick(),
             null_fetcher(),
-            EventSecurity::TrustedNetwork,
+            EventPolicy::trusted_network(),
             null_poke(),
         ));
 

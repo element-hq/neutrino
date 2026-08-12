@@ -1,8 +1,8 @@
 //! Test fixtures for integration tests. Mirrors `src/tests.rs` —
 //! integration tests are a separate crate and can't see `pub(crate)` items.
 //!
-//! Helpers compute the event_id via [`compute_event_id`] so events round-trip
-//! through `EventStore::persist_event`'s debug-build hash check.
+//! Helpers name events via [`base_version_event_id`], so a fixture's
+//! `event_id` matches its own bytes as a real event's does.
 //! Callers must capture the returned event's `event_id` if they need it for
 //! assertions — there is no caller-supplied id parameter.
 //!
@@ -16,7 +16,7 @@
 use lazy_static::lazy_static;
 use neutrino_event::Event;
 use neutrino_event::ROOM_VERSION_ID;
-use neutrino_event::event_id::compute_event_id;
+use neutrino_event::event_id::base_version_event_id;
 use neutrino_store_sqlite::SqliteStore;
 use ruma::{EventId, OwnedEventId, RoomId, UserId, room_id, user_id};
 use serde_json::{Value, json, value::RawValue};
@@ -103,7 +103,7 @@ pub fn make_event(
 
     let json_str = serde_json::to_string(&Value::Object(obj)).unwrap();
     let raw = RawValue::from_string(json_str).unwrap();
-    let event_id = compute_event_id(&raw).expect("test fixture must compute event_id");
+    let event_id = base_version_event_id(&raw).expect("test fixture must compute event_id");
     let content_raw = serde_json::value::to_raw_value(&content).unwrap();
 
     let prev_events_owned: Vec<OwnedEventId> =

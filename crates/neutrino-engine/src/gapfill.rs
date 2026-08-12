@@ -16,11 +16,12 @@
 //! ancestry and freshly-received PDUs flow through the *same* loop, so there is
 //! no separate "promote" step.
 
-use neutrino_event::{Event, EventSecurity};
+use neutrino_event::{Event, EventPolicy};
 use neutrino_store::StorageBackend;
 use ruma::{EventId, OwnedEventId, RoomId, ServerName};
 
 use crate::ports::{MissingEventsFetcher, MissingEventsQuery};
+use crate::util::room_version;
 
 /// Initial `limit` for the first gap-fill request; doubled each round (MSC4242
 /// recommends exponentially increasing the limit until all ancestry is seen).
@@ -59,9 +60,15 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
     origin: &ServerName,
     event: &Event,
     fetcher: &F,
-    security: &EventSecurity,
+    policy: &EventPolicy,
 ) -> Result<bool, String> {
     let room_id = &event.room_id;
+    // The version every fetched ancestor is named under. The caller treats an
+    // `Err` here as retryable, which is right for a storage fault; a terminal
+    // failure means the worker is about to drop these rows anyway.
+    let version = room_version(store, &policy.versions, room_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let earliest = state_dag_boundary(store, room_id).await;
     let mut limit = INITIAL_GAPFILL_LIMIT;
     // Whether any round staged a new event. `false` at a grounded exit means the
@@ -121,7 +128,7 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
         // below correctly declares the gap unfillable.
         let mut staged_new = 0usize;
         for raw in fetched {
-            if let Ok(wire) = security.admit_wire(raw).await {
+            if let Ok(wire) = policy.admit_wire(raw, &version).await {
                 if let neutrino_event::Wire::Rejected(ev, defect) = &wire {
                     tracing::warn!(event_id = %ev.event_id, %defect, "gapfill: staging malformed ancestor as rejected");
                 }

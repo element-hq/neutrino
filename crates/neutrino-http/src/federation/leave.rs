@@ -27,7 +27,6 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use neutrino_event::ROOM_VERSION_ID;
 use neutrino_store::InviteStore;
 use ruma::{OwnedUserId, RoomId, ServerName, UserId};
 use serde_json::json;
@@ -46,11 +45,11 @@ pub(crate) async fn reject_invite(
     room_id: &RoomId,
     invite: neutrino_event::Event,
 ) -> Response {
-    let (store, signer, own_server, federation_proxy) = {
+    let (store, policy, own_server, federation_proxy) = {
         let app = lock_app(state);
         (
             app.store.clone(),
-            app.security.signer().cloned(),
+            app.policy.clone(),
             app.config.server_name.clone(),
             app.config.federation_proxy.clone(),
         )
@@ -65,7 +64,7 @@ pub(crate) async fn reject_invite(
     if let Err(e) = try_federated_leave(
         &own_server,
         federation_proxy.as_deref(),
-        signer,
+        &policy,
         &dest,
         room_id,
         &user,
@@ -94,25 +93,33 @@ pub(crate) async fn reject_invite(
 async fn try_federated_leave(
     own_server: &str,
     proxy: Option<&str>,
-    signer: Option<std::sync::Arc<neutrino_event::EventSigner>>,
+    policy: &neutrino_event::EventPolicy,
     dest: &ServerName,
     room_id: &RoomId,
     user: &UserId,
     display_name: &str,
 ) -> Result<(), String> {
     let client = FederationClient::new(own_server.to_owned(), proxy);
+    let offered: Vec<&str> = policy.versions.ids().collect();
     let template = client
-        .make_leave(dest, room_id, user, ROOM_VERSION_ID)
+        .make_leave(dest, room_id, user, &offered)
         .await
         .map_err(|e| format!("make_leave request failed: {e}"))?;
-    if template.room_version != ROOM_VERSION_ID {
-        return Err(format!(
-            "resident room version {} is unsupported",
-            template.room_version
-        ));
-    }
+    // The room's version, as the resident states it — the leave we build is
+    // named under it.
+    let version = policy
+        .versions
+        .get(&template.room_version)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "resident room version {} is unsupported",
+                template.room_version
+            )
+        })?;
     let leave = complete_membership_template(
-        signer,
+        policy,
+        &version,
         &template.event,
         room_id,
         user,
@@ -146,31 +153,46 @@ mod tests {
         // message event for a *different* user, with arbitrary content. Built
         // via EventBuilder so it is a well-formed, parseable PDU (a hostile
         // server would hand back something valid-on-the-wire).
-        let foreign_room = EventBuilder::new(attacker.clone(), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(json!({ "room_version": neutrino_event::ROOM_VERSION_ID }))
-            .build()
-            .unwrap();
+        let foreign_room = EventBuilder::new(
+            attacker.clone(),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": neutrino_event::ROOM_VERSION_ID }))
+        .build()
+        .unwrap();
         let foreign_room_id = foreign_room.room_id.clone();
         // state_key is a non-`@` key: an `@`-prefixed state_key must already
         // equal the sender (a build-time format rule), so member-event state_key
         // forgery is impossible anyway — the vector this test pins is type +
         // content echoing.
-        let hostile_event = EventBuilder::new(attacker, "m.room.message".to_owned())
-            .room_id(foreign_room_id.clone())
-            .state_key("forged-key".to_owned())
-            .content(json!({ "body": "forged", "membership": "ban" }))
-            .prev_events(vec![foreign_room.event_id.clone()])
-            .prev_state_events(vec![foreign_room.event_id.clone()])
-            .build()
-            .unwrap();
+        let hostile_event = EventBuilder::new(
+            attacker,
+            "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(foreign_room_id.clone())
+        .state_key("forged-key".to_owned())
+        .content(json!({ "body": "forged", "membership": "ban" }))
+        .prev_events(vec![foreign_room.event_id.clone()])
+        .prev_state_events(vec![foreign_room.event_id.clone()])
+        .build()
+        .unwrap();
         let hostile = hostile_event.raw;
 
         // The leave we build must target our own room + our own user.
         let room_id = ruma::RoomId::parse("!room:resident.example").unwrap();
-        let event =
-            complete_membership_template(None, &hostile, &room_id, &our_user, "leave", "Neo")
-                .expect("template completes");
+        let event = complete_membership_template(
+            &neutrino_event::EventPolicy::trusted_network(),
+            neutrino_event::base_version(),
+            &hostile,
+            &room_id,
+            &our_user,
+            "leave",
+            "Neo",
+        )
+        .expect("template completes");
         let v: Value = serde_json::from_str(event.raw.get()).unwrap();
         assert_eq!(v["type"], "m.room.member", "type must be ours");
         assert_eq!(v["sender"], our_user.as_str(), "sender must be our user");

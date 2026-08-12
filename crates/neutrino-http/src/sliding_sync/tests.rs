@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use neutrino_event::ROOM_VERSION_ID;
-use neutrino_event::event_id::compute_event_id;
+use neutrino_event::event_id::base_version_event_id;
 use neutrino_store::{Event, EventStore, InviteStore, RoomStore};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5::{Request, request};
@@ -92,9 +92,9 @@ async fn fresh_store() -> (Arc<SqliteStore>, TempDir) {
 /// escape hatch when tests need to set `unsigned.invite_room_state` or
 /// otherwise control the full body.
 ///
-/// The `event_id` is computed from the canonical bytes of `json` via
-/// [`compute_event_id`], matching `EventStore::persist_event`'s debug-build
-/// hash check. Callers that need to refer to the resulting
+/// The `event_id` is derived from the canonical bytes of `json` via
+/// [`base_version_event_id`], so a fixture's id matches its own bytes as a
+/// real event's does. Callers that need to refer to the resulting
 /// event_id capture it from the returned `Event`.
 fn build_stored_event(
     room_id: &RoomId,
@@ -105,7 +105,7 @@ fn build_stored_event(
     json: Value,
 ) -> Event {
     let raw = serde_json::value::to_raw_value(&json).expect("to_raw_value");
-    let event_id = compute_event_id(&raw).expect("test fixture must compute event_id");
+    let event_id = base_version_event_id(&raw).expect("test fixture must compute event_id");
     // Extract `content` to the canonical position; default `{}` if the
     // caller-supplied JSON doesn't include one (a small handful of
     // sliding-sync tests synthesise minimal fixtures).
@@ -134,7 +134,7 @@ fn build_stored_event(
 /// Build a `Event` whose `json` field is a flat object with the
 /// standard PDU keys. Tests pass `content` separately so they don't have
 /// to construct the wrapper themselves. The returned event's `event_id`
-/// is derived from the canonical bytes via [`compute_event_id`].
+/// is derived from the canonical bytes via [`base_version_event_id`].
 fn make_event(
     room_id: &RoomId,
     event_type: &str,
@@ -164,7 +164,7 @@ fn make_event(
 /// Same as `make_event` but the caller supplies the full JSON body — used
 /// when a test needs `unsigned.invite_room_state` or other top-level keys
 /// the standard wrapper doesn't expose. The returned event's `event_id`
-/// is derived from the canonical bytes via [`compute_event_id`].
+/// is derived from the canonical bytes via [`base_version_event_id`].
 fn make_event_from_json(
     room_id: &RoomId,
     event_type: &str,

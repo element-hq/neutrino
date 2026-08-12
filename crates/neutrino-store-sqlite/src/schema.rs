@@ -4,21 +4,33 @@ use crate::error::Error;
 
 const SCHEMA_SQL: &str = include_str!("schema.sql");
 
-/// Version-gate the database against the bundled V1 schema. Authoritative
+/// The schema version this build expects. Bumped whenever `schema.sql` changes
+/// shape, so a store written by an older build is refused at open (loudly, and
+/// before any query hits a column that does not exist) rather than breaking
+/// mid-request. One constant so the stamp and the gate cannot drift.
+pub(crate) const SCHEMA_VERSION: i64 = 2;
+
+/// Version-gate the database against the bundled schema. Authoritative
 /// open-time check per design doc §2 "Open path: version gate & schema bundle".
 ///
-/// | `user_version` | Action                                              |
-/// |----------------|-----------------------------------------------------|
-/// | `0`            | Fresh DB. Apply `journal_mode = WAL`, then run the  |
-/// |                | schema bundle + `user_version = 1` inside one txn.  |
-/// | `1`            | Already at current schema. Skip the bundle.         |
-/// | other          | Unknown version. Refuse to open — defensive bail.   |
+/// | `user_version`     | Action                                          |
+/// |--------------------|-------------------------------------------------|
+/// | `0`                | Fresh DB. Apply `journal_mode = WAL`, then run  |
+/// |                    | the schema bundle + version stamp in one txn.   |
+/// | `SCHEMA_VERSION`   | Already at current schema. Skip the bundle.     |
+/// | other              | Refuse to open — defensive bail.                |
 ///
-/// Atomicity: the schema DDL and the `user_version = 1` stamp run inside
+/// There is deliberately **no migration path**: a store written by an older
+/// schema is refused, not upgraded, and the fix is to delete it. Every
+/// deployment is under our control, so a wipe is cheaper than carrying
+/// migration code for versions no one is running.
+///
+/// Atomicity: the schema DDL and the version stamp run inside
 /// the same transaction, so a mid-bundle failure rolls both back. The
 /// next open sees `user_version = 0` and re-runs the (non-`IF NOT
 /// EXISTS`) bundle, which either succeeds or fails loudly on a
-/// colliding pre-existing table.
+/// colliding pre-existing table. Migrations are likewise one transaction
+/// each, so a failure leaves the old version stamped and retryable.
 ///
 /// `journal_mode = WAL` cannot be inside the transaction — SQLite
 /// forbids journal-mode changes while a transaction is open — so it
@@ -37,11 +49,11 @@ pub(crate) fn ensure_schema(conn: &mut Connection) -> Result<(), Error> {
             // DDL + version stamp atomic.
             let tx = conn.transaction()?;
             tx.execute_batch(SCHEMA_SQL)?;
-            tx.execute_batch("PRAGMA user_version = 1")?;
+            tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
             tx.commit()?;
             Ok(())
         }
-        1 => Ok(()),
+        v if v == SCHEMA_VERSION => Ok(()),
         other => Err(Error::Internal(format!("unknown schema version: {other}"))),
     }
 }
@@ -127,7 +139,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("schema_test.db");
 
-        // First open installs the schema, leaving user_version = 1.
+        // First open installs the schema at the current version.
         {
             let _ = SqliteStore::open(&path).await.expect("first open");
         }
@@ -157,7 +169,7 @@ mod tests {
     /// `user_version` is still `0` afterwards — the transaction rolled
     /// back the version stamp along with everything else, so a
     /// follow-up open re-enters the `0 => …` arm instead of
-    /// short-circuiting on the `1 => Ok(())` arm with a partial schema.
+    /// short-circuiting on the current-version arm with a partial schema.
     #[tokio::test]
     async fn ensure_schema_rolls_back_on_mid_bundle_failure() {
         // TempDir (not NamedTempFile): these tests raw-open the DB file to

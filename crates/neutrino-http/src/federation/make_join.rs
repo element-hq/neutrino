@@ -21,7 +21,6 @@ use axum::{
     extract::{Path, RawQuery, State},
     http::HeaderMap,
 };
-use neutrino_event::ROOM_VERSION_ID;
 use neutrino_store::{RoomStore, StateStore};
 use ruma::{OwnedRoomId, OwnedUserId};
 use serde::Serialize;
@@ -81,13 +80,14 @@ pub(crate) async fn handle(
         ));
     }
 
-    // (2) — room must exist and be our version.
-    if store.get_room_version(&room_id).await?.is_none() {
-        return Err(FedError::RoomNotFound);
-    }
-    if !ver_includes_ours(raw_query.as_deref()) {
+    // (2) — room must exist, and the requester must offer its version.
+    let room_version = store
+        .get_room_version(&room_id)
+        .await?
+        .ok_or(FedError::RoomNotFound)?;
+    if !ver_includes(raw_query.as_deref(), room_version.as_str()) {
         return Err(FedError::IncompatibleRoomVersion(
-            ROOM_VERSION_ID.to_owned(),
+            room_version.as_str().to_owned(),
         ));
     }
 
@@ -108,21 +108,22 @@ pub(crate) async fn handle(
 
     Ok(Json(ResponseBody {
         event: template.raw.clone(),
-        room_version: ROOM_VERSION_ID.to_owned(),
+        room_version: room_version.as_str().to_owned(),
     }))
 }
 
-/// True if the requester's repeated `?ver=` query includes our room version.
-/// A wholly-absent `ver` defaults to `["1"]` per spec, which never matches our
-/// `org.matrix.msc4242.12`, so an absent `ver` is (correctly) incompatible.
+/// True if the requester's repeated `?ver=` query includes `want` — the version
+/// of the room being joined/left, which is the only version its template can be
+/// built under. A wholly-absent `ver` defaults to `["1"]` per spec, which never
+/// matches any version we host, so an absent `ver` is (correctly) incompatible.
 /// Shared with `make_leave` (same spec-mandated `ver` negotiation).
-pub(crate) fn ver_includes_ours(raw: Option<&str>) -> bool {
+pub(crate) fn ver_includes(raw: Option<&str>, want: &str) -> bool {
     let Some(raw) = raw else {
         return false;
     };
     raw.split('&').any(|pair| {
         let (key, val) = pair.split_once('=').unwrap_or((pair, ""));
-        key == "ver" && val == ROOM_VERSION_ID
+        key == "ver" && val == want
     })
 }
 

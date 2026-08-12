@@ -104,7 +104,7 @@ async fn backfill_and_reread(
     store: &neutrino_store_sqlite::SqliteStore,
     own_server: &str,
     client: &FederationClient,
-    security: &neutrino_event::EventSecurity,
+    policy: &neutrino_event::EventPolicy,
     rid: &ruma::RoomId,
     read: (
         Option<PaginationToken>,
@@ -120,7 +120,7 @@ async fn backfill_and_reread(
     let n = crate::federation::backfill_out::backfill_once(
         store,
         client,
-        security,
+        policy,
         own_server,
         rid,
         limit as u32,
@@ -194,13 +194,13 @@ pub(crate) async fn get_messages(
     // the shared outbound `FederationClient` that `App` builds once at startup —
     // so a backward-underflow backfill round reuses its connection pool rather
     // than constructing a client per back-page.
-    let (store, own_server, fed_client, security) = {
+    let (store, own_server, fed_client, policy) = {
         let app = lock_app(&state.0);
         (
             app.store.clone(),
             app.config.server_name.clone(),
             app.fed_client.clone(),
-            app.security.clone(),
+            app.policy.clone(),
         )
     };
 
@@ -256,7 +256,7 @@ pub(crate) async fn get_messages(
                 &store,
                 &own_server,
                 &fed_client,
-                &security,
+                &policy,
                 &rid,
                 (from_again, to_again, dir, limit),
                 (events, next),
@@ -307,27 +307,39 @@ mod tests {
     /// message, so the test can pin that the no-op re-read returns the SAME page.
     async fn room_with_extremity_no_peer(store: &SqliteStore) -> (ruma::OwnedRoomId, OwnedEventId) {
         let creator: OwnedUserId = format!("@alice:{OWN}").parse().unwrap();
-        let create = EventBuilder::new(creator.clone(), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(json!({ "room_version": ROOM_VERSION_ID }))
-            .build()
-            .expect("build create");
+        let create = EventBuilder::new(
+            creator.clone(),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
         let room_id = create.room_id.clone();
-        let join = EventBuilder::new(creator.clone(), "m.room.member".to_owned())
-            .room_id(room_id.clone())
-            .state_key(creator.as_str().to_owned())
-            .content(json!({ "membership": "join" }))
-            .prev_events(vec![create.event_id.clone()])
-            .prev_state_events(vec![create.event_id.clone()])
-            .build()
-            .expect("build join");
+        let join = EventBuilder::new(
+            creator.clone(),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key(creator.as_str().to_owned())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create.event_id.clone()])
+        .prev_state_events(vec![create.event_id.clone()])
+        .build()
+        .expect("build join");
         store.create_room(&create, &[join]).await.expect("create");
-        let dangling = EventBuilder::new(creator, "m.room.message".to_owned())
-            .room_id(room_id.clone())
-            .content(json!({ "msgtype": "m.text", "body": "tip" }))
-            .prev_events(vec![event_id!("$unheld:remote.example.org").to_owned()])
-            .build()
-            .expect("build dangling");
+        let dangling = EventBuilder::new(
+            creator,
+            "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .content(json!({ "msgtype": "m.text", "body": "tip" }))
+        .prev_events(vec![event_id!("$unheld:remote.example.org").to_owned()])
+        .build()
+        .expect("build dangling");
         let tip_id = dangling.event_id.clone();
         store
             .persist_historical_event(&dangling)
@@ -384,7 +396,7 @@ mod tests {
             &store,
             OWN,
             &client,
-            &neutrino_event::EventSecurity::TrustedNetwork,
+            &neutrino_event::EventPolicy::trusted_network(),
             &rid,
             (Some(head), None, Direction::Backward, 100),
             (orig_events, orig_next.clone()),

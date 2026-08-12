@@ -160,12 +160,12 @@ pub fn strip_state_event(raw: &Raw<AnySyncStateEvent>) -> Raw<AnyStrippedStateEv
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_id::compute_event_id;
+    use crate::event_id::base_version_event_id;
     use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
     use serde_json::json;
 
     /// Build a test `Event` with the supplied raw JSON. event_id is derived
-    /// from `compute_event_id` to keep tests honest with the production
+    /// from `base_version_event_id` to keep tests honest with the production
     /// invariant. For create events the caller passes `is_create=true` and
     /// we mint a `room_id` from the event_id (sigil swap), matching the
     /// production builder.
@@ -176,7 +176,7 @@ mod tests {
         raw_json: Value,
     ) -> Event {
         let raw = to_raw_value(&raw_json).expect("raw");
-        let event_id = compute_event_id(&raw).expect("compute_event_id");
+        let event_id = base_version_event_id(&raw).expect("event id");
         let content_value = raw_json
             .get("content")
             .cloned()
