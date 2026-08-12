@@ -62,6 +62,35 @@ style
 - keep functions short. if a handler is over ~40 lines, split it.
 - keep types simple, or name them - no `Option<(String, u64, Vec<u8>, &’src PhantomData<Box<dyn Trait>>)>
 
+## comment rules
+
+Comments are expensive. They diverge from the code, they mislead, they have a cost. Keep them precise, concise and minimal.
+For example, when describing a room version field, prefer:
+
+> /// The version of the room this state machine is tracking
+
+over:
+
+> /// The version of the room this state machine is tracking — how its events are named, redacted and signed.
+
+because the version may add extra responsibilities not tracked in the "how".
+
+Similarly, when modifying code, do not explain _transitions_, just explain the _current final state_. For example:
+
+```
+    -    room_version   TEXT NOT NULL CHECK (room_version = 'org.matrix.msc4242.12'),
++    -- The room's version, verbatim from the create event's
++    -- `content.room_version`. Not pinned to one value: the registry
++    -- (`neutrino_event::RoomVersions`) is the authority on which versions this
++    -- build speaks, and one store may legitimately hold rooms of several (a
++    -- medium that declares its own version still reads rooms created before
++    -- the cut-over). The only structural requirement is that it is non-empty.
++    room_version   TEXT NOT NULL CHECK (room_version <> ''),
+```
+
+This entire comment is redundant because it is explaining the _transition_ from a fixed static version to multiple versions.
+The correct comment is no comment at all: the SQL column is self-explanatory.
+
 ## testing
 
 Look at any relevant unit tests in the Synapse repository https://github.com/element-hq/synapse/tree/develop/tests and port over ONLY relevant tests to Rust.
