@@ -2,11 +2,7 @@
 
 The project is a minimal rust-based Matrix homeserver which will be embedded into an Android device using UniFFI. The server is only capable of sending and receiving message / state events, meaning this project only implements a subset of the Matrix specification. The specification targeted is https://spec.matrix.org/v1.18/ - strictly only the Client-Server API and Server-Server API.
 
-The server only targets room version 12, along with MSC4242: State DAGs https://github.com/matrix-org/matrix-spec-proposals/pull/4242 . This means the Server-Server API does not need to implement /event_auth, /state or /state_ids. EDUs and End-to-End encryption are NOT implemented, but MUST be stubbed out at the HTTP handler layer to ensure the client application functions correctly. Ruma https://github.com/ruma/ruma MUST be used. The homeserver will be running in a trusted network. This means events MUST NOT have signatures and signature checks should not be run, which means servers DO NOT need a server signing key. The Client-Server API is never exposed on the network, it’s entirely embedded in the mobile device. As such, there is no need to make the Client-Server API performant or have any kind of access control. Registration and Login should be stubbed out.
-
-see PLAN.md for current status and task breakdown.
-read PLAN.md at the start of every session before doing anything else. 
-
+The server only targets room version 12, along with MSC4242: State DAGs https://github.com/matrix-org/matrix-spec-proposals/pull/4242 . This means the Server-Server API does not need to implement /event_auth, /state or /state_ids. EDUs and End-to-End encryption are NOT implemented, but MUST be stubbed out at the HTTP handler layer to ensure the client application functions correctly. Ruma https://github.com/ruma/ruma MUST be used. The homeserver will be running in either a trusted or untrusted network. The Client-Server API is never exposed on the network, it’s entirely embedded in the mobile device. As such, there is no need to make the Client-Server API performant or have any kind of access control. Registration and Login should be stubbed out.
 
 ## stack
 - axum (routing + handlers)
@@ -16,33 +12,44 @@ read PLAN.md at the start of every session before doing anything else.
 - uuid (id generation)
 - Ruma for Matrix types
 - tracing + tracing-subscriber (logging)
-## crate structure - keep big dependencies separate (namely UniFFI) to improve compile times and avoid rebuilds, etc.
-Crates are organised by scope, narrowest first: `event` = everything event-scoped, `room` = everything single-room-scoped, `engine` = everything multi-room-scoped. `ctl` is the orthogonal server-wide control plane. The dependency stack is a clean gradient: ctl/event (base, no internal deps) → room → engine → http → main → ffi/neutrino.
 
-neutrino-ctl - server control plane: `Config` (+ `from_env`) and `Command` (host-pushed control). Zero dependencies; base sibling of neutrino-event.
-neutrino-event - everything event-scoped: the canonical `Event` PDU, content/reference hashing + event-id derivation, event→ruma views, wire-format parsing + provider-free semantic validation (`parse_event`/`validate_pdu`), the server-side `EventBuilder` + inbound `from_wire`, and `FormatError`. No internal deps. `ROOM_VERSION_ID` and the shared `now_ms()` clock util also live here.
-neutrino-room - everything single-room-scoped: v12 auth rules, state resolution (state-res), provider-backed reference validation (`validate_references`), `RoomCore` (per-room state machine), and the `StateProvider` read trait. Depends on neutrino-event.
-neutrino-engine - everything multi-room-scoped: the room runtime. `RoomRegistry` + per-room actor, inbound worker + outbound sender, anti-entropy reconcile + state-DAG gapfill, and the federation transport ports (`FederationTransport`, `MissingEventsFetcher`) so the engine never names reqwest.
-neutrino-store - storage trait (`StorageBackend` + the fine-grained per-area store traits, `WithStateProvider`).
-neutrino-store-sqlite - SQLite implementation of the storage traits (`SqliteStore`) + the SQLite-backed `StateProvider`.
-neutrino-http - top-level router + C-S and S-S handlers, could potentially be split into c2s and s2s APIs in the future (the `federation/` subtree is already a self-contained S-S unit).
-neutrino-main - server entrypoint, common between neutrino and neutrino-ffi; composes the stack and re-exports `Config`/`Command` from neutrino-ctl.
-neutrino-ffi - UniFFI binding layer, calls into neutrino-main and neutrino-lb
-neutrino - local development binary
-neutrino-lb - Low-bandwidth bidirectional proxy - translates server-to-server HTTP + JSON requests into CoAP + CBOR (CBOR could be done in HTTP layer?) - see MSC3079 https://github.com/matrix-org/matrix-spec-proposals/blob/kegan/low-bandwidth/proposals/3079-low-bandwidth-csapi.md 
+## crate structure
+Crates are organised by scope, narrowest first: 
+ - `neutrino-ctl` is the orthogonal server-wide control plane: config, host-pushed commands
+ - `neutrino-event` = everything event-scoped: canonical JSON, wire format parsing, event builder, etc
+ - `neutrino-room` = everything single-room-scoped: auth rules, state resolution, etc
+ - `neutrino-engine` = everything multi-room-scoped: registry, per-room actor, inbound/outbound workers, anti-entropy reconciliation, gapfilling
+ - `neutrino-store` - storage trait (`StorageBackend` + the fine-grained per-area store traits, `WithStateProvider`).
+ - `neutrino-store-sqlite` - SQLite implementation of the storage traits (`SqliteStore`) + the SQLite-backed `StateProvider`.
+ - `neutrino-http` - top-level router + C-S and S-S handlers
+ - `neutrino-main` - shared server entrypoint, common between neutrino and neutrino-ffi; composes the stack and re-exports `Config`/`Command` from neutrino-ctl.
+ - `neutrino-ffi` - UniFFI binding layer, calls into neutrino-main and neutrino-lb
+ - `neutrino` - local development binary
+ - `neutrino-lb` - Low-bandwidth bidirectional proxy - translates server-to-server HTTP + JSON requests into CoAP + CBOR
+
+The dependency stack is a clean gradient: ctl/event (base, no internal deps) → room → engine → http → main → ffi/neutrino.
 
 ## coding rules
+
+Before writing any code but AFTER understanding the problem, stop at the first rung that holds:
+
+1. Does this need to be built at all? (YAGNI)
+2. Does it already exist in this codebase? Reuse the helper, util, or pattern that's already here, don't re-write it.
+3. Does the standard library already do this? Use it.
+4. Does a native platform feature cover it? Use it.
+5. Does an already-installed dependency solve it? Use it.
+6. Can this be one line? Make it one line.
+7. Only then: write the minimum code that works.
+
 errors
 - all errors use thiserror. no anyhow.
 - all handlers return Result<Json<T>, AppError>
 - AppError variants: NotFound, BadRequest, Internal. map to 404, 400, 500.
 - never use .unwrap() or .expect() in handler or storage code.
--	 potentially `#![deny(clippy::unwrap_used)] in handler crate to enforce this
 
 storage
 - handlers never touch store directly. always go through StorageBackend trait.
 - sqlite layer implemented in neutrino-store-sqlite
-- do not introduce any other database dependency without explicitly being asked to.
 
 async
 - no blocking calls inside async fns. use tokio::task::spawn if needed.
@@ -55,6 +62,35 @@ style
 - keep functions short. if a handler is over ~40 lines, split it.
 - keep types simple, or name them - no `Option<(String, u64, Vec<u8>, &’src PhantomData<Box<dyn Trait>>)>
 
+## comment rules
+
+Comments are expensive. They diverge from the code, they mislead, they have a cost. Keep them precise, concise and minimal.
+For example, when describing a room version field, prefer:
+
+> /// The version of the room this state machine is tracking
+
+over:
+
+> /// The version of the room this state machine is tracking — how its events are named, redacted and signed.
+
+because the version may add extra responsibilities not tracked in the "how".
+
+Similarly, when modifying code, do not explain _transitions_, just explain the _current final state_. For example:
+
+```
+    -    room_version   TEXT NOT NULL CHECK (room_version = 'org.matrix.msc4242.12'),
++    -- The room's version, verbatim from the create event's
++    -- `content.room_version`. Not pinned to one value: the registry
++    -- (`neutrino_event::RoomVersions`) is the authority on which versions this
++    -- build speaks, and one store may legitimately hold rooms of several (a
++    -- medium that declares its own version still reads rooms created before
++    -- the cut-over). The only structural requirement is that it is non-empty.
++    room_version   TEXT NOT NULL CHECK (room_version <> ''),
+```
+
+This entire comment is redundant because it is explaining the _transition_ from a fixed static version to multiple versions.
+The correct comment is no comment at all: the SQL column is self-explanatory.
+
 ## testing
 
 Look at any relevant unit tests in the Synapse repository https://github.com/element-hq/synapse/tree/develop/tests and port over ONLY relevant tests to Rust.
@@ -66,12 +102,10 @@ If there are no relevant tests in either repository, ask for suggestions.
 ## what not to do
 - do not add dependencies to Cargo.toml without asking first
 - do not modify main.rs router wiring unless the task explicitly requires it
-- do not implement pagination, auth, or rate limiting — see PLAN.md non-goals
 - do not create new files outside the module structure above without asking
 - do not refactor working code that is not part of the current task
 - do not modify CLAUDE.md
-- do not erase lines in LOG.md
-- do not delete tests. Ask before modifying tests.
+- ask before modifying tests.
 
 ## before starting any non-trivial task
 
@@ -95,21 +129,10 @@ After the scan, decide strategy:
 - 2+ units, coupled (changes ripple between them): sequential, but commit
   to an order before starting the first one.
 
-For mechanical rewrites across many call sites (>20), write a Python rewriter
-with `find_matching_paren` + arg-aware splitting, designed up-front for
-trailing commas, inline comments, and multi-line calls. Half-baked scripts that
-need 3 iterations cost more than 5 extra min of robust design.
-
 ## before declaring code done
 
-after the test suite passes, before saying "done", spend 60 seconds auditing the design:
-
-- every new struct field: is it derivable from another field? if yes, drop it
-- every new method that wraps/adapts existing code: does inner have an optimised version i'm bypassing? if yes, swap-in-the-override-case and delegate
-- every "i know this is slower but…" comment in the diff: turn it into a question — is the slow version actually necessary, or am i avoiding 30 more seconds of thought?
-- every helper with a _with_X, _for_new_Y, _lazy_Z suffix: am i papering over a design hole? could a wrapper / different abstraction collapse the variant?
-- the diff summary: any new struct that grew past one field, any new fn over ~30 lines — what would i delete if i had to halve the diff?
-- this is not "is the code correct" — cargo test does that. this is "is the code actually good".
+- Deletion over addition. The best code is the code never written.
+- Trivial one-liners need no test.
 
 ## before finishing any task
 1. cargo fmt
@@ -117,7 +140,6 @@ after the test suite passes, before saying "done", spend 60 seconds auditing the
 3. cargo test
 4. update the status checkboxes in PLAN.md
 5. if a decision was made, append it to the decisions log in PLAN.md
-6. Append a 2-line summary of your change to LOG.md 
 
 ## asking for clarification
 if a task is ambiguous or conflicts with these rules, stop and ask.
@@ -125,12 +147,13 @@ do not make assumptions about intent and proceed silently.
 one clarifying question is better than a wrong implementation.
 
 ## Reviewing the git diff
-When asked to "review the current git diff" (or "review the diff" / "review my changes" / "review this branch"), ALWAYS delegate to fresh-context subagents. Do NOT review inline, and do NOT use the `/code-review` or `/security-review` skills for this — those run in the main session's context, and the whole point is fresh eyes with no knowledge of the implementation discussion.
+When asked to "review the current git diff" (or "review the diff" / "review my changes" / "review this branch"), ALWAYS delegate to fresh-context subagents.
 
 Procedure:
 
-- In a SINGLE message, spawn three general-purpose subagents in parallel (one Agent tool block each):
+- Spawn 5 general-purpose subagents in parallel (one Agent tool block each):
      - code review — correctness bugs + reuse / simplification / efficiency. Prefix findings REVIEW*.
+
      - security review — auth, input validation, state-res / auth-rule soundness, anything that could mask a security-relevant bug.
        Prefix findings SEC*.
 
@@ -169,19 +192,8 @@ Procedure:
        Ask "is there existing infrastructure this mechanism should use?", not only "is this code duplicated?".
        Prefix these ARCH-MECH*. Project rule: derive. If none, SAY SO.
 
-- Give every subagent: the scope (`git diff HEAD` unless told otherwise — they run it themselves), the "Code Review" rubric below, and these constraints: report EVERY finding numbered (with subagent prefix) with confidence (low/medium/high/certain) + severity (nit/minor/major/critical); read surrounding source to verify claims; do NOT edit files; return findings as the final message.
+- Give every subagent: the scope (`git diff HEAD` unless told otherwise — they run it themselves), the "Code Review" rubric above, and these constraints: report EVERY finding numbered (with subagent prefix) with confidence (low/medium/high/certain) + severity (nit/minor/major/critical); read surrounding source to verify claims; do NOT edit files; return findings as the final message.
 - On return, synthesize: filter/rank, drop false positives (state WHY), present the merged list. Do NOT apply any fix without asking first.
-
-## Code Review
-
-Report every issue you find, including ones you are uncertain about or consider low-severity.
-Do not filter for importance or confidence at this stage - a separate verification step will do that.
-Your goal here is coverage: it is better to surface a finding that later gets filtered out than to silently drop a real bug.
-For each finding, include your confidence level (low, medium, high, certain) and an estimated severity (nit, minor, major, critical) so a downstream filter can rank them.
-Number each issue (I1, I2, I3, ...) so they can be referred to downstream.
-
-Reviewing code may be supplied via patch/diff files.
-
 
 ## rust-analyzer (LSP)
 For non-trivial work, prefer the `mcp__rust-analyzer__*` tools over manual
@@ -214,13 +226,6 @@ Workspace-wide builds are 5-10× slower; reserve them for: final verification
 before declaring a task done, cross-crate refactors where one crate's
 signature change ripples through another, or when explicitly asked for a
 "full check".
-
-## Parallelisation
-When a task fans out across independent crates / modules (e.g., updating
-test fixtures in each of `neutrino-room`, `neutrino-http`,
-`neutrino-store-sqlite`), run subagents in parallel — single message,
-multiple `Agent` tool calls. Sequential subagents on independent work
-costs ~3-4× wall-clock for no benefit.
 
 ## Scope triage before refactors
 Any task that touches multiple call sites: first action is `references`
