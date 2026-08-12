@@ -289,23 +289,31 @@ async fn build_seeded_router(
     let sender = peer_user();
 
     // create event
-    let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build create");
+    let create = EventBuilder::new(
+        sender.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
     let room_id = create.room_id.clone();
     let create_id = create.event_id.clone();
 
     // self-join referencing the create event
-    let join = EventBuilder::new(sender.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(sender.as_str().to_owned())
-        .content(json!({ "membership": "join" }))
-        .prev_events(vec![create_id.clone()])
-        .prev_state_events(vec![create_id.clone()])
-        .build()
-        .expect("build join");
+    let join = EventBuilder::new(
+        sender.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(sender.as_str().to_owned())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create_id.clone()])
+    .prev_state_events(vec![create_id.clone()])
+    .build()
+    .expect("build join");
     let join_id = join.event_id.clone();
 
     store
@@ -317,13 +325,17 @@ async fn build_seeded_router(
     let mut prev = join_id;
     let mut ids = Vec::with_capacity(n_messages);
     for i in 0..n_messages {
-        let ev = EventBuilder::new(sender.clone(), "m.room.message".to_owned())
-            .room_id(room_id.clone())
-            .content(json!({ "msgtype": "m.text", "body": format!("msg {i}") }))
-            .prev_events(vec![prev.clone()])
-            .origin_server_ts(1_700_000_000_000 + i as u64)
-            .build()
-            .expect("build msg");
+        let ev = EventBuilder::new(
+            sender.clone(),
+            "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .content(json!({ "msgtype": "m.text", "body": format!("msg {i}") }))
+        .prev_events(vec![prev.clone()])
+        .origin_server_ts(1_700_000_000_000 + i as u64)
+        .build()
+        .expect("build msg");
         let id = ev.event_id.clone();
         store
             .persist_historical_event(&ev)
@@ -348,22 +360,30 @@ async fn create_joined_room_in(
     sender: &OwnedUserId,
     ts: u64,
 ) -> (OwnedRoomId, OwnedEventId) {
-    let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .origin_server_ts(ts)
-        .build()
-        .expect("build create");
+    let create = EventBuilder::new(
+        sender.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .origin_server_ts(ts)
+    .build()
+    .expect("build create");
     let room_id = create.room_id.clone();
     let create_id = create.event_id.clone();
-    let join = EventBuilder::new(sender.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(sender.as_str().to_owned())
-        .content(json!({ "membership": "join" }))
-        .prev_events(vec![create_id.clone()])
-        .prev_state_events(vec![create_id.clone()])
-        .build()
-        .expect("build join");
+    let join = EventBuilder::new(
+        sender.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(sender.as_str().to_owned())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create_id.clone()])
+    .prev_state_events(vec![create_id.clone()])
+    .build()
+    .expect("build join");
     let join_id = join.event_id.clone();
     store
         .create_room(&create, &[join])
@@ -1323,20 +1343,28 @@ async fn build_router_with_invisible_chain()
     let (store, tempfile) = fresh_store().await;
     let sender = peer_user();
 
-    let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build create");
+    let create = EventBuilder::new(
+        sender.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
     let room_id = create.room_id.clone();
-    let join = EventBuilder::new(sender.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(sender.as_str().to_owned())
-        .content(json!({ "membership": "join" }))
-        .prev_events(vec![create.event_id.clone()])
-        .prev_state_events(vec![create.event_id.clone()])
-        .build()
-        .expect("build join");
+    let join = EventBuilder::new(
+        sender.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(sender.as_str().to_owned())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create.event_id.clone()])
+    .prev_state_events(vec![create.event_id.clone()])
+    .build()
+    .expect("build join");
     let mut prev = join.event_id.clone();
     store
         .create_room(&create, &[join])
@@ -1345,13 +1373,17 @@ async fn build_router_with_invisible_chain()
 
     let mut ids = Vec::with_capacity(4);
     for (i, body) in ["a", "b-rejected", "c-soft", "d"].iter().enumerate() {
-        let mut ev = EventBuilder::new(sender.clone(), "m.room.message".to_owned())
-            .room_id(room_id.clone())
-            .content(json!({ "msgtype": "m.text", "body": body }))
-            .prev_events(vec![prev.clone()])
-            .origin_server_ts(1_700_000_000_000 + i as u64)
-            .build()
-            .expect("build msg");
+        let mut ev = EventBuilder::new(
+            sender.clone(),
+            "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .content(json!({ "msgtype": "m.text", "body": body }))
+        .prev_events(vec![prev.clone()])
+        .origin_server_ts(1_700_000_000_000 + i as u64)
+        .build()
+        .expect("build msg");
         ev.rejected = *body == "b-rejected";
         ev.soft_failed = *body == "c-soft";
         store
@@ -1600,21 +1632,29 @@ async fn seed_joined_room_with_fetcher(
 ) {
     let (store, tempfile) = fresh_store().await;
     let alice = alice();
-    let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build create");
+    let create = EventBuilder::new(
+        alice.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
     let room_id = create.room_id.clone();
     let create_id = create.event_id.clone();
-    let join = EventBuilder::new(alice.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(alice.as_str().to_owned())
-        .content(json!({ "membership": "join" }))
-        .prev_events(vec![create_id.clone()])
-        .prev_state_events(vec![create_id.clone()])
-        .build()
-        .expect("build join");
+    let join = EventBuilder::new(
+        alice.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(alice.as_str().to_owned())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create_id.clone()])
+    .prev_state_events(vec![create_id.clone()])
+    .build()
+    .expect("build join");
     let join_id = join.event_id.clone();
     store
         .create_room(&create, &[join])
@@ -1632,14 +1672,18 @@ fn message_on(
     body: &str,
     ts: u64,
 ) -> neutrino_event::Event {
-    EventBuilder::new(sender.clone(), "m.room.message".to_owned())
-        .room_id(room_id.clone())
-        .content(json!({ "msgtype": "m.text", "body": body }))
-        .prev_events(vec![head.clone()])
-        .prev_state_events(vec![head.clone()])
-        .origin_server_ts(ts)
-        .build()
-        .expect("build message")
+    EventBuilder::new(
+        sender.clone(),
+        "m.room.message".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .content(json!({ "msgtype": "m.text", "body": body }))
+    .prev_events(vec![head.clone()])
+    .prev_state_events(vec![head.clone()])
+    .origin_server_ts(ts)
+    .build()
+    .expect("build message")
 }
 
 /// Build an `m.room.topic` *state* PDU sitting on `head` (both DAGs). Used as
@@ -1652,15 +1696,19 @@ fn topic_on(
     topic: &str,
     ts: u64,
 ) -> neutrino_event::Event {
-    EventBuilder::new(sender.clone(), "m.room.topic".to_owned())
-        .room_id(room_id.clone())
-        .state_key(String::new())
-        .content(json!({ "topic": topic }))
-        .prev_events(vec![head.clone()])
-        .prev_state_events(vec![head.clone()])
-        .origin_server_ts(ts)
-        .build()
-        .expect("build topic")
+    EventBuilder::new(
+        sender.clone(),
+        "m.room.topic".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(String::new())
+    .content(json!({ "topic": topic }))
+    .prev_events(vec![head.clone()])
+    .prev_state_events(vec![head.clone()])
+    .origin_server_ts(ts)
+    .build()
+    .expect("build topic")
 }
 
 // ── async-worker poll helpers ────────────────────────────────────────────────
@@ -1775,14 +1823,18 @@ async fn send_persists_rejected_pdu_as_success_result() {
     // point of view the PDU was processed → empty (error-free) result.
     let (app, store, room_id, _alice, join_id, _tempfile) = seed_joined_room().await;
     let bob: OwnedUserId = "@bob:remote.example.org".parse().unwrap();
-    let bob_join = EventBuilder::new(bob.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(bob.as_str().to_owned())
-        .content(json!({ "membership": "join" }))
-        .prev_events(vec![join_id.clone()])
-        .prev_state_events(vec![join_id.clone()])
-        .build()
-        .expect("build bob join");
+    let bob_join = EventBuilder::new(
+        bob.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(bob.as_str().to_owned())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![join_id.clone()])
+    .prev_state_events(vec![join_id.clone()])
+    .build()
+    .expect("build bob join");
     let bob_join_id = bob_join.event_id.clone();
 
     let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&bob_join])).await;
@@ -2183,14 +2235,18 @@ async fn send_toposorts_out_of_order_batch() {
     // `second` chains the timeline off `first` but its state head stays the
     // join (messages don't move the state DAG), so `prev_state_events` points
     // at `join_id`, not at the `first` message.
-    let second = EventBuilder::new(alice.clone(), "m.room.message".to_owned())
-        .room_id(room_id.clone())
-        .content(json!({ "msgtype": "m.text", "body": "second" }))
-        .prev_events(vec![first.event_id.clone()])
-        .prev_state_events(vec![join_id.clone()])
-        .origin_server_ts(1_700_000_002_000)
-        .build()
-        .expect("build second");
+    let second = EventBuilder::new(
+        alice.clone(),
+        "m.room.message".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .content(json!({ "msgtype": "m.text", "body": "second" }))
+    .prev_events(vec![first.event_id.clone()])
+    .prev_state_events(vec![join_id.clone()])
+    .origin_server_ts(1_700_000_002_000)
+    .build()
+    .expect("build second");
     let (first_id, second_id) = (first.event_id.clone(), second.event_id.clone());
 
     // child (second) listed before parent (first). The worker integrates the
@@ -2229,24 +2285,32 @@ async fn send_handles_duplicate_pdu_in_batch() {
     // distinct events are accepted.
     let (store, _tempfile) = fresh_store().await;
     let alice = alice();
-    let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build create");
+    let create = EventBuilder::new(
+        alice.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
     let room_id = create.room_id.clone();
     let create_id = create.event_id.clone();
     store.create_room(&create, &[]).await.expect("create_room");
     let app = router_with_store(config(), store.clone());
 
-    let join = EventBuilder::new(alice.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(alice.as_str().to_owned())
-        .content(json!({ "membership": "join" }))
-        .prev_events(vec![create_id.clone()])
-        .prev_state_events(vec![create_id.clone()])
-        .build()
-        .expect("build join");
+    let join = EventBuilder::new(
+        alice.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(alice.as_str().to_owned())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create_id.clone()])
+    .prev_state_events(vec![create_id.clone()])
+    .build()
+    .expect("build join");
     let join_id = join.event_id.clone();
     let msg = message_on(&alice, &room_id, &join_id, "after join", 1_700_000_002_000);
     let msg_id = msg.event_id.clone();
@@ -2400,21 +2464,29 @@ async fn worker_drains_rows_staged_before_startup() {
     // room up with no poke from the handler.
     let (store, _tempfile) = fresh_store().await;
     let alice = alice();
-    let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build create");
+    let create = EventBuilder::new(
+        alice.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
     let room_id = create.room_id.clone();
     let create_id = create.event_id.clone();
-    let join = EventBuilder::new(alice.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(alice.as_str().to_owned())
-        .content(json!({ "membership": "join" }))
-        .prev_events(vec![create_id.clone()])
-        .prev_state_events(vec![create_id.clone()])
-        .build()
-        .expect("build join");
+    let join = EventBuilder::new(
+        alice.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(alice.as_str().to_owned())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create_id.clone()])
+    .prev_state_events(vec![create_id.clone()])
+    .build()
+    .expect("build join");
     let join_id = join.event_id.clone();
     store
         .create_room(&create, &[join])
@@ -2509,11 +2581,15 @@ async fn send_drops_pdu_for_unknown_room() {
     let (app, store, _room_id, alice, _join_id, _tempfile) = seed_joined_room().await;
 
     // A standalone room id we never register, plus a message that references it.
-    let other_create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build create");
+    let other_create = EventBuilder::new(
+        alice.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
     let other_room = other_create.room_id.clone();
     let msg = message_on(
         &alice,
@@ -2555,28 +2631,40 @@ async fn reconcile_converges_on_advertised_head() {
     let (store, _tempfile) = fresh_store().await;
     let alice = alice();
     let peer = peer_user();
-    let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build create");
+    let create = EventBuilder::new(
+        alice.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
     let room_id = create.room_id.clone();
-    let alice_join = EventBuilder::new(alice.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(alice.to_string())
-        .content(json!({ "membership": "join" }))
-        .prev_events(vec![create.event_id.clone()])
-        .prev_state_events(vec![create.event_id.clone()])
-        .build()
-        .expect("build alice join");
-    let peer_join = EventBuilder::new(peer.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(peer.to_string())
-        .content(json!({ "membership": "join" }))
-        .prev_events(vec![alice_join.event_id.clone()])
-        .prev_state_events(vec![alice_join.event_id.clone()])
-        .build()
-        .expect("build peer join");
+    let alice_join = EventBuilder::new(
+        alice.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(alice.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create.event_id.clone()])
+    .prev_state_events(vec![create.event_id.clone()])
+    .build()
+    .expect("build alice join");
+    let peer_join = EventBuilder::new(
+        peer.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(peer.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![alice_join.event_id.clone()])
+    .prev_state_events(vec![alice_join.event_id.clone()])
+    .build()
+    .expect("build peer join");
     let head = peer_join.event_id.clone();
     store
         .create_room(&create, &[alice_join, peer_join])
@@ -2683,14 +2771,18 @@ fn message_on_split(
     body: &str,
     ts: u64,
 ) -> neutrino_event::Event {
-    EventBuilder::new(sender.clone(), "m.room.message".to_owned())
-        .room_id(room_id.clone())
-        .content(json!({ "msgtype": "m.text", "body": body }))
-        .prev_events(vec![prev.clone()])
-        .prev_state_events(vec![prev_state.clone()])
-        .origin_server_ts(ts)
-        .build()
-        .expect("build message")
+    EventBuilder::new(
+        sender.clone(),
+        "m.room.message".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .content(json!({ "msgtype": "m.text", "body": body }))
+    .prev_events(vec![prev.clone()])
+    .prev_state_events(vec![prev_state.clone()])
+    .origin_server_ts(ts)
+    .build()
+    .expect("build message")
 }
 
 #[tokio::test]
@@ -2859,24 +2951,32 @@ async fn seed_room(
 ) {
     let (store, tempfile) = fresh_store().await;
     let creator = alice();
-    let create = EventBuilder::new(creator, "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build create");
+    let create = EventBuilder::new(
+        creator,
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
     let room_id = create.room_id.clone();
     let mut head = create.event_id.clone();
     let mut events = Vec::new();
     for (sender, ty, state_key, content) in initial {
         let sender: OwnedUserId = sender.parse().expect("sender");
-        let ev = EventBuilder::new(sender, (*ty).to_owned())
-            .room_id(room_id.clone())
-            .state_key((*state_key).to_owned())
-            .content(content.clone())
-            .prev_events(vec![head.clone()])
-            .prev_state_events(vec![head.clone()])
-            .build()
-            .expect("build initial state event");
+        let ev = EventBuilder::new(
+            sender,
+            (*ty).to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key((*state_key).to_owned())
+        .content(content.clone())
+        .prev_events(vec![head.clone()])
+        .prev_state_events(vec![head.clone()])
+        .build()
+        .expect("build initial state event");
         head = ev.event_id.clone();
         events.push(ev);
     }
@@ -2917,14 +3017,18 @@ async fn seed_public_room() -> (
 /// (as the joining server would after `make_join`).
 fn remote_join(room_id: &RoomId, head: &OwnedEventId, user: &str) -> neutrino_event::Event {
     let user: OwnedUserId = user.parse().expect("user");
-    EventBuilder::new(user.clone(), "m.room.member".to_owned())
-        .room_id(room_id.to_owned())
-        .state_key(user.to_string())
-        .content(json!({ "membership": "join" }))
-        .prev_events(vec![head.clone()])
-        .prev_state_events(vec![head.clone()])
-        .build()
-        .expect("build remote join")
+    EventBuilder::new(
+        user.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.to_owned())
+    .state_key(user.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![head.clone()])
+    .prev_state_events(vec![head.clone()])
+    .build()
+    .expect("build remote join")
 }
 
 /// A parseable `m.room.member` PDU that `from_wire` classifies as
@@ -3296,14 +3400,18 @@ async fn make_join_then_send_join_round_trips() {
     let prev_events = id_list(&template["prev_events"]);
     let prev_state = id_list(&template["prev_state_events"]);
     let zara: OwnedUserId = ZARA.parse().unwrap();
-    let join = EventBuilder::new(zara.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(zara.to_string())
-        .content(json!({ "membership": "join" }))
-        .prev_events(prev_events)
-        .prev_state_events(prev_state)
-        .build()
-        .expect("complete the template");
+    let join = EventBuilder::new(
+        zara.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(zara.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(prev_events)
+    .prev_state_events(prev_state)
+    .build()
+    .expect("complete the template");
     let join_id = join.event_id.clone();
 
     let (status, body) =
@@ -3445,11 +3553,15 @@ async fn room_scoped_join_uses_pending_invite_server() {
     // Plant a pending OOB invite for @bob:a.example whose inviter lives on B,
     // so the inviter's server resolves to the live resident.
     let inviter: OwnedUserId = format!("@alice:{b_server}").parse().unwrap();
-    let throwaway = EventBuilder::new(inviter.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build throwaway create for a valid prev id");
+    let throwaway = EventBuilder::new(
+        inviter.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build throwaway create for a valid prev id");
     let invite = member_pdu(
         &inviter,
         "@bob:a.example",
@@ -3527,11 +3639,15 @@ async fn join_tries_hint_before_invite_fallback() {
 
     // Pending invite whose sender lives on the live resident B.
     let inviter: OwnedUserId = format!("@alice:{b_server}").parse().unwrap();
-    let throwaway = EventBuilder::new(inviter.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build throwaway create");
+    let throwaway = EventBuilder::new(
+        inviter.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build throwaway create");
     let invite = member_pdu(
         &inviter,
         "@bob:a.example",
@@ -3597,11 +3713,15 @@ async fn hosted_room_with_live_local_member_and_pending_invite_does_not_federate
     // the local path and join (200) without any outbound request.
     let dead = crate::federation::test_support::dead_peer().await;
     let inviter: OwnedUserId = format!("@alice:{dead}").parse().unwrap();
-    let throwaway = EventBuilder::new(inviter.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build throwaway create");
+    let throwaway = EventBuilder::new(
+        inviter.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build throwaway create");
     let invite = member_pdu(
         &inviter,
         "@bob:a.example",
@@ -3635,46 +3755,66 @@ async fn rejoining_hosted_room_with_no_local_members_resyncs_from_resident() {
     // current state — not build on the stale local heads. The resident's state
     // carries an m.room.name A never saw; after the re-join it must appear.
     let alice = alice(); // @alice:example.org — a *remote* member from A's view
-    let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .unwrap();
+    let create = EventBuilder::new(
+        alice.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .unwrap();
     let room_id = create.room_id.clone();
-    let alice_join = EventBuilder::new(alice.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(alice.to_string())
-        .content(json!({ "membership": "join" }))
-        .prev_events(vec![create.event_id.clone()])
-        .prev_state_events(vec![create.event_id.clone()])
-        .build()
-        .unwrap();
-    let rules = EventBuilder::new(alice.clone(), "m.room.join_rules".to_owned())
-        .room_id(room_id.clone())
-        .state_key(String::new())
-        .content(json!({ "join_rule": "public" }))
-        .prev_events(vec![alice_join.event_id.clone()])
-        .prev_state_events(vec![alice_join.event_id.clone()])
-        .build()
-        .unwrap();
+    let alice_join = EventBuilder::new(
+        alice.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(alice.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create.event_id.clone()])
+    .prev_state_events(vec![create.event_id.clone()])
+    .build()
+    .unwrap();
+    let rules = EventBuilder::new(
+        alice.clone(),
+        "m.room.join_rules".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(String::new())
+    .content(json!({ "join_rule": "public" }))
+    .prev_events(vec![alice_join.event_id.clone()])
+    .prev_state_events(vec![alice_join.event_id.clone()])
+    .build()
+    .unwrap();
     // The state event A is missing while away.
-    let name = EventBuilder::new(alice.clone(), "m.room.name".to_owned())
-        .room_id(room_id.clone())
-        .state_key(String::new())
-        .content(json!({ "name": "synced-from-resident" }))
-        .prev_events(vec![rules.event_id.clone()])
-        .prev_state_events(vec![rules.event_id.clone()])
-        .build()
-        .unwrap();
+    let name = EventBuilder::new(
+        alice.clone(),
+        "m.room.name".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(String::new())
+    .content(json!({ "name": "synced-from-resident" }))
+    .prev_events(vec![rules.event_id.clone()])
+    .prev_state_events(vec![rules.event_id.clone()])
+    .build()
+    .unwrap();
     let bob: OwnedUserId = "@bob:a.example".parse().unwrap();
-    let bob_join = EventBuilder::new(bob.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(bob.to_string())
-        .content(json!({ "membership": "join" }))
-        .prev_events(vec![name.event_id.clone()])
-        .prev_state_events(vec![name.event_id.clone()])
-        .build()
-        .unwrap();
+    let bob_join = EventBuilder::new(
+        bob.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(bob.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![name.event_id.clone()])
+    .prev_state_events(vec![name.event_id.clone()])
+    .build()
+    .unwrap();
 
     // Resident hands back current state including the name A never saw.
     let mj = json!({ "event": raw_to_value(&bob_join), "room_version": ROOM_VERSION_ID });
@@ -3850,14 +3990,18 @@ async fn make_join_with_our_version_among_several_succeeds() {
 async fn send_join_non_join_membership_returns_400() {
     let (router, _store, room_id, head, _tempfile) = seed_public_room().await;
     let zara: OwnedUserId = ZARA.parse().unwrap();
-    let leave = EventBuilder::new(zara.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(zara.to_string())
-        .content(json!({ "membership": "leave" }))
-        .prev_events(vec![head.clone()])
-        .prev_state_events(vec![head])
-        .build()
-        .unwrap();
+    let leave = EventBuilder::new(
+        zara.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(zara.to_string())
+    .content(json!({ "membership": "leave" }))
+    .prev_events(vec![head.clone()])
+    .prev_state_events(vec![head])
+    .build()
+    .unwrap();
     let (status, body) = put_event(
         &router,
         &send_join_path(&room_id, &leave.event_id),
@@ -3873,14 +4017,18 @@ async fn send_join_state_key_not_sender_returns_400() {
     let (router, _store, room_id, head, _tempfile) = seed_public_room().await;
     let zara: OwnedUserId = ZARA.parse().unwrap();
     // sender = zara, but state_key = a different user.
-    let bad = EventBuilder::new(zara, "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key("@someone:other.example".to_owned())
-        .content(json!({ "membership": "join" }))
-        .prev_events(vec![head.clone()])
-        .prev_state_events(vec![head])
-        .build()
-        .unwrap();
+    let bad = EventBuilder::new(
+        zara,
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key("@someone:other.example".to_owned())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![head.clone()])
+    .prev_state_events(vec![head])
+    .build()
+    .unwrap();
     let (status, body) = put_event(
         &router,
         &send_join_path(&room_id, &bad.event_id),
@@ -3997,27 +4145,39 @@ async fn federated_join_times_out_when_state_never_grounds() {
     // never ground it → the CSAPI join times out with 504, but the room shell
     // is registered and our membership never appears.
     let alice = alice();
-    let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .unwrap();
+    let create = EventBuilder::new(
+        alice.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .unwrap();
     let room_id = create.room_id.clone();
-    let ghost = EventBuilder::new(alice, "m.room.message".to_owned())
-        .room_id(room_id.clone())
-        .content(json!({ "body": "ghost" }))
-        .prev_events(vec![create.event_id.clone()])
-        .build()
-        .unwrap();
+    let ghost = EventBuilder::new(
+        alice,
+        "m.room.message".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .content(json!({ "body": "ghost" }))
+    .prev_events(vec![create.event_id.clone()])
+    .build()
+    .unwrap();
     let zara: OwnedUserId = ZARA.parse().unwrap();
-    let template = EventBuilder::new(zara.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(zara.to_string())
-        .content(json!({ "membership": "join" }))
-        .prev_events(vec![create.event_id.clone()])
-        .prev_state_events(vec![ghost.event_id.clone()])
-        .build()
-        .unwrap();
+    let template = EventBuilder::new(
+        zara.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(zara.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create.event_id.clone()])
+    .prev_state_events(vec![ghost.event_id.clone()])
+    .build()
+    .unwrap();
     let mj = json!({ "event": raw_to_value(&template), "room_version": ROOM_VERSION_ID });
     let sj = json!({
         "state_dag": [raw_to_value(&create), raw_to_value(&template)],
@@ -4053,21 +4213,29 @@ async fn federated_join_missing_create_in_response_fails_without_registering() {
     // send_join response omits the create event → ingest can't register the room
     // → the handshake fails (no candidate succeeds → 502) and nothing is created.
     let alice = alice();
-    let create = EventBuilder::new(alice, "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .unwrap();
+    let create = EventBuilder::new(
+        alice,
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .unwrap();
     let room_id = create.room_id.clone();
     let zara: OwnedUserId = ZARA.parse().unwrap();
-    let template = EventBuilder::new(zara.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(zara.to_string())
-        .content(json!({ "membership": "join" }))
-        .prev_events(vec![create.event_id.clone()])
-        .prev_state_events(vec![create.event_id.clone()])
-        .build()
-        .unwrap();
+    let template = EventBuilder::new(
+        zara.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(zara.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create.event_id.clone()])
+    .prev_state_events(vec![create.event_id.clone()])
+    .build()
+    .unwrap();
     let mj = json!({ "event": raw_to_value(&template), "room_version": ROOM_VERSION_ID });
     // No create anywhere in the response.
     let sj = json!({ "state_dag": [], "timeline": [], "event": raw_to_value(&template) });
@@ -4105,27 +4273,39 @@ async fn federated_join_retry_reattaches_to_inflight_dance() {
     // flight for its full ingest wait, so the retry deterministically lands
     // while it is still running.
     let alice = alice();
-    let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .unwrap();
+    let create = EventBuilder::new(
+        alice.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .unwrap();
     let room_id = create.room_id.clone();
-    let ghost = EventBuilder::new(alice, "m.room.message".to_owned())
-        .room_id(room_id.clone())
-        .content(json!({ "body": "ghost" }))
-        .prev_events(vec![create.event_id.clone()])
-        .build()
-        .unwrap();
+    let ghost = EventBuilder::new(
+        alice,
+        "m.room.message".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .content(json!({ "body": "ghost" }))
+    .prev_events(vec![create.event_id.clone()])
+    .build()
+    .unwrap();
     let zara: OwnedUserId = ZARA.parse().unwrap();
-    let template = EventBuilder::new(zara.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(zara.to_string())
-        .content(json!({ "membership": "join" }))
-        .prev_events(vec![create.event_id.clone()])
-        .prev_state_events(vec![ghost.event_id.clone()])
-        .build()
-        .unwrap();
+    let template = EventBuilder::new(
+        zara.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(zara.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create.event_id.clone()])
+    .prev_state_events(vec![ghost.event_id.clone()])
+    .build()
+    .unwrap();
     let mj = json!({ "event": raw_to_value(&template), "room_version": ROOM_VERSION_ID });
     let sj = json!({
         "state_dag": [raw_to_value(&create), raw_to_value(&template)],
@@ -4236,14 +4416,18 @@ fn member_pdu(
     membership: &str,
     prevs: &[OwnedEventId],
 ) -> neutrino_event::Event {
-    EventBuilder::new(sender.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(target.to_owned())
-        .content(json!({ "membership": membership }))
-        .prev_events(prevs.to_vec())
-        .prev_state_events(prevs.to_vec())
-        .build()
-        .expect("build member event")
+    EventBuilder::new(
+        sender.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(target.to_owned())
+    .content(json!({ "membership": membership }))
+    .prev_events(prevs.to_vec())
+    .prev_state_events(prevs.to_vec())
+    .build()
+    .expect("build member event")
 }
 
 /// An out-of-band invite for a room we don't host is stored as a stub
@@ -4258,11 +4442,15 @@ async fn invite_oob_stores_stub_and_returns_event() {
 
     // A throwaway create only to source a valid room id + a syntactically-valid
     // prev event id; the room is NOT created in our store (out-of-band).
-    let create = EventBuilder::new(bob.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build create");
+    let create = EventBuilder::new(
+        bob.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
     let room_id = create.room_id.clone();
     let invite = member_pdu(
         &bob,
@@ -4364,11 +4552,15 @@ async fn invite_rejects_non_local_invitee() {
     let (store, _tempfile) = fresh_store().await;
     let router = router_with_store(config(), store.clone());
     let bob = inviter();
-    let create = EventBuilder::new(bob.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build create");
+    let create = EventBuilder::new(
+        bob.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
     let room_id = create.room_id.clone();
     // Invitee on a different server.
     let invite = member_pdu(
@@ -4410,11 +4602,15 @@ async fn invite_rejects_non_invite_membership() {
     let (store, _tempfile) = fresh_store().await;
     let router = router_with_store(config(), store);
     let bob = inviter();
-    let create = EventBuilder::new(bob.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build create");
+    let create = EventBuilder::new(
+        bob.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
     let room_id = create.room_id.clone();
     // A leave (kick-shaped: sender != target) is structurally valid but not an
     // invite.
@@ -4446,11 +4642,15 @@ async fn invite_wire_rejected_returns_400() {
     let (store, _tempfile) = fresh_store().await;
     let router = router_with_store(config(), store);
     let bob = inviter();
-    let create = EventBuilder::new(bob.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build create");
+    let create = EventBuilder::new(
+        bob.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
     let room_id = create.room_id.clone();
     let body = json!({
         "event": rejected_member_json(&room_id, &create.event_id, bob.as_str()),
@@ -4476,11 +4676,15 @@ async fn invite_accepts_placeholder_path_segments() {
     let (store, _tempfile) = fresh_store().await;
     let router = router_with_store(config(), store);
     let bob = inviter();
-    let create = EventBuilder::new(bob.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build create");
+    let create = EventBuilder::new(
+        bob.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
     let room_id = create.room_id.clone();
     let invite = member_pdu(
         &bob,
@@ -4694,11 +4898,15 @@ async fn outbound_invite_peer_returns_wrong_event_persists_nothing() {
     let (a_app, a_store, room_id, _alice, _join, _tempfile) = seed_joined_room().await;
 
     // A valid but unrelated event the stub will echo instead of our candidate.
-    let other_create = EventBuilder::new(inviter(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build a different event");
+    let other_create = EventBuilder::new(
+        inviter(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build a different event");
     let bogus = json!({ "event": raw_to_value(&other_create) });
 
     let stub = axum::Router::new().route(
@@ -4776,14 +4984,18 @@ fn send_leave_path(room_id: &RoomId, event_id: &OwnedEventId) -> String {
 /// A completed remote `m.room.member`/`leave` (self-leave) referencing `head`.
 fn remote_leave(room_id: &RoomId, head: &OwnedEventId, user: &str) -> neutrino_event::Event {
     let user: OwnedUserId = user.parse().expect("user");
-    EventBuilder::new(user.clone(), "m.room.member".to_owned())
-        .room_id(room_id.to_owned())
-        .state_key(user.to_string())
-        .content(json!({ "membership": "leave" }))
-        .prev_events(vec![head.clone()])
-        .prev_state_events(vec![head.clone()])
-        .build()
-        .expect("build remote leave")
+    EventBuilder::new(
+        user.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.to_owned())
+    .state_key(user.to_string())
+    .content(json!({ "membership": "leave" }))
+    .prev_events(vec![head.clone()])
+    .prev_state_events(vec![head.clone()])
+    .build()
+    .expect("build remote leave")
 }
 
 // --- make_leave (inbound) ----------------------------------------------
@@ -4963,14 +5175,18 @@ async fn send_leave_state_key_not_sender_returns_400() {
     // a self-leave, so it must refuse this; a kick rides /send instead.
     let (router, _store, room_id, head, _tempfile) = seed_room_with_invited_zara().await;
     let zara: OwnedUserId = ZARA.parse().unwrap();
-    let leave = EventBuilder::new(zara.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(YAN.to_owned())
-        .content(json!({ "membership": "leave" }))
-        .prev_events(vec![head.clone()])
-        .prev_state_events(vec![head.clone()])
-        .build()
-        .expect("build mismatched leave");
+    let leave = EventBuilder::new(
+        zara.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(YAN.to_owned())
+    .content(json!({ "membership": "leave" }))
+    .prev_events(vec![head.clone()])
+    .prev_state_events(vec![head.clone()])
+    .build()
+    .expect("build mismatched leave");
     let id = leave.event_id.clone();
     let (status, body) = put_event(&router, &send_leave_path(&room_id, &id), leave.raw.get()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
@@ -5082,28 +5298,40 @@ async fn serve_resident_with_invite(
     let bob: OwnedUserId = format!("@bob:{name}").parse().unwrap();
     let (store, tempfile) = fresh_store().await;
 
-    let create = EventBuilder::new(bob.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build create");
+    let create = EventBuilder::new(
+        bob.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
     let room_id = create.room_id.clone();
-    let bob_join = EventBuilder::new(bob.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(bob.to_string())
-        .content(json!({ "membership": "join" }))
-        .prev_events(vec![create.event_id.clone()])
-        .prev_state_events(vec![create.event_id.clone()])
-        .build()
-        .expect("build bob join");
-    let invite = EventBuilder::new(bob.clone(), "m.room.member".to_owned())
-        .room_id(room_id.clone())
-        .state_key(invitee.to_owned())
-        .content(json!({ "membership": "invite" }))
-        .prev_events(vec![bob_join.event_id.clone()])
-        .prev_state_events(vec![bob_join.event_id.clone()])
-        .build()
-        .expect("build invite");
+    let bob_join = EventBuilder::new(
+        bob.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(bob.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create.event_id.clone()])
+    .prev_state_events(vec![create.event_id.clone()])
+    .build()
+    .expect("build bob join");
+    let invite = EventBuilder::new(
+        bob.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(invitee.to_owned())
+    .content(json!({ "membership": "invite" }))
+    .prev_events(vec![bob_join.event_id.clone()])
+    .prev_state_events(vec![bob_join.event_id.clone()])
+    .build()
+    .expect("build invite");
     store
         .create_room(&create, &[bob_join, invite.clone()])
         .await
@@ -5165,11 +5393,15 @@ async fn outbound_reject_invite_unreachable_server_still_removes_stub() {
     let alice = alice();
 
     let dead_bob: OwnedUserId = format!("@bob:{dead}").parse().unwrap();
-    let create = EventBuilder::new(dead_bob.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build create");
+    let create = EventBuilder::new(
+        dead_bob.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
     let room_id = create.room_id.clone();
     let invite = member_pdu(
         &dead_bob,
@@ -5207,11 +5439,15 @@ async fn reject_then_reinvite_resurrects_stub() {
     let alice = alice();
 
     let dead_bob: OwnedUserId = format!("@bob:{dead}").parse().unwrap();
-    let create = EventBuilder::new(dead_bob.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build create");
+    let create = EventBuilder::new(
+        dead_bob.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
     let room_id = create.room_id.clone();
     let invite = member_pdu(
         &dead_bob,
@@ -5430,11 +5666,15 @@ async fn invite_oob_rejects_forged_sender() {
     let invited = alice(); // local
 
     // Throwaway create → a valid room id we never register (out-of-band).
-    let create = EventBuilder::new(forger.clone(), "m.room.create".to_owned())
-        .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
-        .build()
-        .expect("build create");
+    let create = EventBuilder::new(
+        forger.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
     let room_id = create.room_id.clone();
     let invite = member_pdu(
         &forger,

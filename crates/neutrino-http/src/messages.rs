@@ -307,27 +307,39 @@ mod tests {
     /// message, so the test can pin that the no-op re-read returns the SAME page.
     async fn room_with_extremity_no_peer(store: &SqliteStore) -> (ruma::OwnedRoomId, OwnedEventId) {
         let creator: OwnedUserId = format!("@alice:{OWN}").parse().unwrap();
-        let create = EventBuilder::new(creator.clone(), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(json!({ "room_version": ROOM_VERSION_ID }))
-            .build()
-            .expect("build create");
+        let create = EventBuilder::new(
+            creator.clone(),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
         let room_id = create.room_id.clone();
-        let join = EventBuilder::new(creator.clone(), "m.room.member".to_owned())
-            .room_id(room_id.clone())
-            .state_key(creator.as_str().to_owned())
-            .content(json!({ "membership": "join" }))
-            .prev_events(vec![create.event_id.clone()])
-            .prev_state_events(vec![create.event_id.clone()])
-            .build()
-            .expect("build join");
+        let join = EventBuilder::new(
+            creator.clone(),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key(creator.as_str().to_owned())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create.event_id.clone()])
+        .prev_state_events(vec![create.event_id.clone()])
+        .build()
+        .expect("build join");
         store.create_room(&create, &[join]).await.expect("create");
-        let dangling = EventBuilder::new(creator, "m.room.message".to_owned())
-            .room_id(room_id.clone())
-            .content(json!({ "msgtype": "m.text", "body": "tip" }))
-            .prev_events(vec![event_id!("$unheld:remote.example.org").to_owned()])
-            .build()
-            .expect("build dangling");
+        let dangling = EventBuilder::new(
+            creator,
+            "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .content(json!({ "msgtype": "m.text", "body": "tip" }))
+        .prev_events(vec![event_id!("$unheld:remote.example.org").to_owned()])
+        .build()
+        .expect("build dangling");
         let tip_id = dangling.event_id.clone();
         store
             .persist_historical_event(&dangling)

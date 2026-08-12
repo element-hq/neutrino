@@ -4,8 +4,8 @@
 //! stubs out — they are deserialized for shape validation and dropped). Each
 //! PDU is a fully-formed v12 event; we parse it via
 //! [`neutrino_event::event_builder::from_wire`] (which derives the event_id
-//! under the deployment's `EventIdScheme`, verifies/redacts on content-hash
-//! mismatch, and runs the format + semantic validators).
+//! under the room's version, verifies/redacts on content-hash mismatch, and
+//! runs the format + semantic validators).
 //!
 //! ## Stage-then-async
 //!

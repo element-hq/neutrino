@@ -199,10 +199,9 @@ mod tests {
     async fn store_with_room(version: &std::sync::Arc<RoomVersion>) -> (SqliteStore, OwnedRoomId) {
         let store = SqliteStore::open_in_memory().await.expect("open store");
         let alice: OwnedUserId = "@alice:example.org".parse().expect("alice");
-        let create = EventBuilder::new(alice, "m.room.create".to_owned())
+        let create = EventBuilder::new(alice, "m.room.create".to_owned(), version.clone())
             .state_key(String::new())
             .content(json!({ "room_version": version.id }))
-            .version(Some(version.clone()))
             .build()
             .expect("build create");
         let room_id = create.room_id.clone();
@@ -271,10 +270,9 @@ mod tests {
         // A base-version room in the same store.
         let alice: OwnedUserId = "@alice:example.org".parse().expect("alice");
         let base = neutrino_event::base_version();
-        let create = EventBuilder::new(alice, "m.room.create".to_owned())
+        let create = EventBuilder::new(alice, "m.room.create".to_owned(), base.clone())
             .state_key(String::new())
             .content(json!({ "room_version": base.id }))
-            .version(Some(base.clone()))
             .build()
             .expect("build create");
         let base_room = create.room_id.clone();

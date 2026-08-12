@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2024"
 license.workspace = true
 
+[features]
+# Exposes `event_id::base_version_event_id`, for test fixtures in other crates
+# that hand-assemble an `Event` and need an id matching its bytes. Enabled as a
+# dev-dependency only, so production builds cannot name an event without a room
+# version.
+test-support = []
+
 [dependencies]
 base64 = "0.22.1"
 # Event signing/verification (PeerAuthenticated links). Same version as

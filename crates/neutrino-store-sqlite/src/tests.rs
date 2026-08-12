@@ -1,7 +1,7 @@
 //! Shared test fixtures for in-crate unit tests.
 //!
-//! Helpers compute the event_id via [`compute_event_id`] so events round-trip
-//! through `EventStore::persist_event`'s debug-build hash check.
+//! Helpers name events via [`base_version_event_id`], so a fixture's
+//! `event_id` matches its own bytes as a real event's does.
 //! Callers must capture the returned event's `event_id` if they need it for
 //! assertions — there is no caller-supplied id parameter.
 //!
@@ -15,7 +15,7 @@ use deadpool_sqlite::rusqlite::params;
 use lazy_static::lazy_static;
 use neutrino_event::Event;
 use neutrino_event::ROOM_VERSION_ID;
-use neutrino_event::event_id::compute_event_id;
+use neutrino_event::event_id::base_version_event_id;
 use ruma::{EventId, OwnedEventId, RoomId, UserId, room_id, user_id};
 use serde_json::{Value, json, value::RawValue};
 
@@ -112,7 +112,7 @@ pub(crate) fn make_event(
 
     let json_str = serde_json::to_string(&Value::Object(obj)).unwrap();
     let raw = RawValue::from_string(json_str).unwrap();
-    let event_id = compute_event_id(&raw).expect("test fixture must compute event_id");
+    let event_id = base_version_event_id(&raw).expect("test fixture must compute event_id");
     let content_raw = serde_json::value::to_raw_value(&content).unwrap();
 
     let prev_events_owned: Vec<OwnedEventId> =
@@ -139,10 +139,10 @@ pub(crate) fn make_event(
 
 /// Construct an `Event` with caller-supplied raw JSON and a caller-supplied
 /// event_id. Used by tests that need to exercise the deserializer error path
-/// — the raw bytes are intentionally malformed, so `compute_event_id` would
+/// — the raw bytes are intentionally malformed, so `base_version_event_id` would
 /// fail and isn't called.
 ///
-/// This is the **one** helper that bypasses [`compute_event_id`]; tests that
+/// This is the **one** helper that bypasses [`base_version_event_id`]; tests that
 /// use it persist the result via `write_into_tx` directly, never through
 /// `persist_event`'s debug-asserted entry point.
 pub(crate) fn make_event_with_raw_json(

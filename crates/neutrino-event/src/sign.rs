@@ -826,14 +826,18 @@ mod tests {
         let sender: ruma::OwnedUserId = format!("@n:{}", origin.server_name())
             .parse()
             .expect("valid user id");
-        let mut event = crate::event_builder::EventBuilder::new(sender, "m.room.member".to_owned())
-            .room_id("!r:d".parse().expect("room id"))
-            .state_key(format!("@n:{}", origin.server_name()))
-            .content(json!({ "membership": "join" }))
-            .origin_server_ts(1)
-            .signer(Some(std::sync::Arc::new(node_signer(7))))
-            .build()
-            .expect("builds");
+        let mut event = crate::event_builder::EventBuilder::new(
+            sender,
+            "m.room.member".to_owned(),
+            base_version().clone(),
+        )
+        .room_id("!r:d".parse().expect("room id"))
+        .state_key(format!("@n:{}", origin.server_name()))
+        .content(json!({ "membership": "join" }))
+        .origin_server_ts(1)
+        .signer(Some(std::sync::Arc::new(node_signer(7))))
+        .build()
+        .expect("builds");
         let id_before = event.event_id.clone();
 
         resident
@@ -858,7 +862,7 @@ mod tests {
         .await
         .expect("resident signature present in the regenerated raw");
         // The regenerated raw still derives the same id (canonical bytes).
-        let recomputed = crate::event_id::compute_event_id(&event.raw).expect("recompute");
+        let recomputed = crate::event_id::base_version_event_id(&event.raw).expect("recompute");
         assert_eq!(recomputed, id_before);
     }
 

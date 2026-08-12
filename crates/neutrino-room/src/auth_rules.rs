@@ -1005,12 +1005,16 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
-        let ev = EventBuilder::new(creator.parse().expect("sender"), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(content)
-            .origin_server_ts(next_ts())
-            .build()
-            .expect("valid create");
+        let ev = EventBuilder::new(
+            creator.parse().expect("sender"),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(content)
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid create");
         Arc::new(ev)
     }
 
@@ -1025,23 +1029,31 @@ mod tests {
         for (k, v) in extra_content.as_object().cloned().unwrap_or_default() {
             content[k] = v;
         }
-        let ev = EventBuilder::new(sender.parse().expect("sender"), "m.room.member".to_owned())
-            .room_id(room.to_owned())
-            .state_key(target.to_owned())
-            .content(content)
-            .origin_server_ts(next_ts())
-            .build()
-            .expect("valid member");
+        let ev = EventBuilder::new(
+            sender.parse().expect("sender"),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room.to_owned())
+        .state_key(target.to_owned())
+        .content(content)
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid member");
         Arc::new(ev)
     }
 
     fn message_event(room: &RoomId, sender: &str) -> Arc<Event> {
-        let ev = EventBuilder::new(sender.parse().expect("sender"), "m.room.message".to_owned())
-            .room_id(room.to_owned())
-            .content(json!({ "msgtype": "m.text", "body": "hi" }))
-            .origin_server_ts(next_ts())
-            .build()
-            .expect("valid message");
+        let ev = EventBuilder::new(
+            sender.parse().expect("sender"),
+            "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room.to_owned())
+        .content(json!({ "msgtype": "m.text", "body": "hi" }))
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid message");
         Arc::new(ev)
     }
 
@@ -1052,13 +1064,17 @@ mod tests {
         sender: &str,
         content: Value,
     ) -> Arc<Event> {
-        let ev = EventBuilder::new(sender.parse().expect("sender"), event_type.to_owned())
-            .room_id(room.to_owned())
-            .state_key(state_key.to_owned())
-            .content(content)
-            .origin_server_ts(next_ts())
-            .build()
-            .expect("valid state event");
+        let ev = EventBuilder::new(
+            sender.parse().expect("sender"),
+            event_type.to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room.to_owned())
+        .state_key(state_key.to_owned())
+        .content(content)
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid state event");
         Arc::new(ev)
     }
 
@@ -1146,6 +1162,7 @@ mod tests {
             EventBuilder::new(
                 "@alice:example.org".parse().expect("sender"),
                 "m.room.create".to_owned(),
+                neutrino_event::base_version().clone(),
             )
             .state_key(String::new())
             .content(json!({ "room_version": ROOM_VERSION_ID, "m.federate": false }))
@@ -1172,6 +1189,7 @@ mod tests {
             EventBuilder::new(
                 "@alice:example.org".parse().expect("sender"),
                 "m.room.create".to_owned(),
+                neutrino_event::base_version().clone(),
             )
             .state_key(String::new())
             .content(json!({ "room_version": ROOM_VERSION_ID, "m.federate": false }))
@@ -1213,6 +1231,7 @@ mod tests {
             EventBuilder::new(
                 "@alice:example.org".parse().expect("sender"),
                 "m.room.member".to_owned(),
+                neutrino_event::base_version().clone(),
             )
             .room_id(create.room_id.clone())
             .state_key("@alice:example.org".to_owned())

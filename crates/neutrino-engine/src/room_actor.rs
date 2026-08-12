@@ -211,9 +211,13 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomActor<S> {
         state_key: Option<String>,
         content: Value,
     ) -> Result<Arc<Event>, RoomActorError> {
-        let event =
-            self.room
-                .build_local_event(sender, event_type, state_key, content, &self.policy)?;
+        let event = self.room.build_local_event(
+            sender,
+            event_type,
+            state_key,
+            content,
+            self.policy.signer(),
+        )?;
         Ok(Arc::new(event))
     }
 
@@ -377,9 +381,13 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomActor<S> {
         // Build the event on the room's current heads — the state machine owns
         // the builder (`RoomCore::build_local_event`) so the actor and the
         // createRoom batch share one construction path.
-        let event =
-            self.room
-                .build_local_event(sender, event_type, state_key, content, &self.policy)?;
+        let event = self.room.build_local_event(
+            sender,
+            event_type,
+            state_key,
+            content,
+            self.policy.signer(),
+        )?;
 
         let (next, effects) = self.run_apply("local", event).await?;
 
@@ -816,11 +824,15 @@ mod tests {
     ) {
         let store = Arc::new(SqliteStore::open_in_memory().await.expect("open store"));
         let alice: OwnedUserId = ALICE.parse().expect("alice");
-        let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(json!({ "room_version": ROOM_VERSION_ID }))
-            .build()
-            .expect("build create");
+        let create = EventBuilder::new(
+            alice.clone(),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
         let room_id = create.room_id.clone();
         store.create_room(&create, &[]).await.expect("create_room");
         let registry = RoomRegistry::new(
@@ -1027,11 +1039,15 @@ mod tests {
     ) {
         let store = Arc::new(SqliteStore::open_in_memory().await.expect("open store"));
         let alice: OwnedUserId = ALICE.parse().expect("alice");
-        let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(json!({ "room_version": ROOM_VERSION_ID }))
-            .build()
-            .expect("build create");
+        let create = EventBuilder::new(
+            alice.clone(),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
         let room_id = create.room_id.clone();
         let create_id = create.event_id.clone();
         store.create_room(&create, &[]).await.expect("create_room");
@@ -1049,14 +1065,18 @@ mod tests {
         // auth_events on the wire — apply_pdu computes them).
         let (registry, store, room_id, alice, create_id) = setup_with_create_id().await;
 
-        let join = EventBuilder::new(alice.clone(), "m.room.member".to_owned())
-            .room_id(room_id.clone())
-            .state_key(alice.to_string())
-            .content(json!({ "membership": "join" }))
-            .prev_events(vec![create_id.clone()])
-            .prev_state_events(vec![create_id])
-            .build()
-            .expect("build join pdu");
+        let join = EventBuilder::new(
+            alice.clone(),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key(alice.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create_id.clone()])
+        .prev_state_events(vec![create_id])
+        .build()
+        .expect("build join pdu");
         let join_id = join.event_id.clone();
 
         registry
@@ -1094,14 +1114,18 @@ mod tests {
             .expect("alice join");
 
         let bob: OwnedUserId = BOB.parse().unwrap();
-        let bob_join = EventBuilder::new(bob.clone(), "m.room.member".to_owned())
-            .room_id(room_id.clone())
-            .state_key(bob.to_string())
-            .content(json!({ "membership": "join" }))
-            .prev_events(vec![alice_join.event_id.clone()])
-            .prev_state_events(vec![alice_join.event_id.clone()])
-            .build()
-            .expect("build bob join pdu");
+        let bob_join = EventBuilder::new(
+            bob.clone(),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key(bob.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![alice_join.event_id.clone()])
+        .prev_state_events(vec![alice_join.event_id.clone()])
+        .build()
+        .expect("build bob join pdu");
         let bob_join_id = bob_join.event_id.clone();
 
         let (timeline_before, state_before) =
@@ -1166,14 +1190,18 @@ mod tests {
             .expect("alice opens public");
 
         let zara: OwnedUserId = ZARA.parse().unwrap();
-        let zara_join = EventBuilder::new(zara.clone(), "m.room.member".to_owned())
-            .room_id(room_id.clone())
-            .state_key(zara.to_string())
-            .content(json!({ "membership": "join" }))
-            .prev_events(vec![rules.event_id.clone()])
-            .prev_state_events(vec![rules.event_id.clone()])
-            .build()
-            .expect("build zara join pdu");
+        let zara_join = EventBuilder::new(
+            zara.clone(),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key(zara.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![rules.event_id.clone()])
+        .prev_state_events(vec![rules.event_id.clone()])
+        .build()
+        .expect("build zara join pdu");
         let zara_join_id = zara_join.event_id.clone();
         registry
             .apply_pdu(&room_id, zara_join)
@@ -1353,14 +1381,18 @@ mod tests {
         }
 
         let zara: OwnedUserId = ZARA.parse().unwrap();
-        let zara_join = EventBuilder::new(zara.clone(), "m.room.member".to_owned())
-            .room_id(room_id.clone())
-            .state_key(zara.to_string())
-            .content(json!({ "membership": "join" }))
-            .prev_events(vec![rules.event_id.clone()])
-            .prev_state_events(vec![rules.event_id.clone()])
-            .build()
-            .expect("build zara join pdu");
+        let zara_join = EventBuilder::new(
+            zara.clone(),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key(zara.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![rules.event_id.clone()])
+        .prev_state_events(vec![rules.event_id.clone()])
+        .build()
+        .expect("build zara join pdu");
         registry
             .apply_pdu(&room_id, zara_join)
             .await

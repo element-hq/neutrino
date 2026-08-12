@@ -153,24 +153,32 @@ mod tests {
         // message event for a *different* user, with arbitrary content. Built
         // via EventBuilder so it is a well-formed, parseable PDU (a hostile
         // server would hand back something valid-on-the-wire).
-        let foreign_room = EventBuilder::new(attacker.clone(), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(json!({ "room_version": neutrino_event::ROOM_VERSION_ID }))
-            .build()
-            .unwrap();
+        let foreign_room = EventBuilder::new(
+            attacker.clone(),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": neutrino_event::ROOM_VERSION_ID }))
+        .build()
+        .unwrap();
         let foreign_room_id = foreign_room.room_id.clone();
         // state_key is a non-`@` key: an `@`-prefixed state_key must already
         // equal the sender (a build-time format rule), so member-event state_key
         // forgery is impossible anyway — the vector this test pins is type +
         // content echoing.
-        let hostile_event = EventBuilder::new(attacker, "m.room.message".to_owned())
-            .room_id(foreign_room_id.clone())
-            .state_key("forged-key".to_owned())
-            .content(json!({ "body": "forged", "membership": "ban" }))
-            .prev_events(vec![foreign_room.event_id.clone()])
-            .prev_state_events(vec![foreign_room.event_id.clone()])
-            .build()
-            .unwrap();
+        let hostile_event = EventBuilder::new(
+            attacker,
+            "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(foreign_room_id.clone())
+        .state_key("forged-key".to_owned())
+        .content(json!({ "body": "forged", "membership": "ban" }))
+        .prev_events(vec![foreign_room.event_id.clone()])
+        .prev_state_events(vec![foreign_room.event_id.clone()])
+        .build()
+        .unwrap();
         let hostile = hostile_event.raw;
 
         // The leave we build must target our own room + our own user.

@@ -167,9 +167,9 @@ pub enum FormatError {
     #[error("signature check failed: {0}")]
     SignatureCheck(String),
 
-    /// The deployment's [`EventIdScheme`](crate::event_id::EventIdScheme)
+    /// The room version's [`EventIdScheme`](crate::event_id::EventIdScheme)
     /// could not derive an id for this event: the fields its derivation reads
-    /// are absent or malformed. Never raised by the default reference-hash
+    /// are absent or malformed. Never raised by the base version's reference-hash
     /// scheme, whose only failure mode is a redaction precondition (already
     /// covered by `MissingField` / `InvalidFieldType`).
     #[error("cannot derive event id: {0}")]

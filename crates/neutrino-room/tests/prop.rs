@@ -142,14 +142,18 @@ fn arb_message_event() -> impl Strategy<Value = Event> {
     )
         .prop_filter_map("valid message", |(sender, prevs, prev_states, ts)| {
             let sender: OwnedUserId = sender.parse().ok()?;
-            EventBuilder::new(sender, "m.room.message".to_owned())
-                .room_id(room_id!("!room:example.org").to_owned())
-                .content(json!({ "msgtype": "m.text", "body": "hi" }))
-                .prev_events(prevs)
-                .prev_state_events(prev_states)
-                .origin_server_ts(ts)
-                .build()
-                .ok()
+            EventBuilder::new(
+                sender,
+                "m.room.message".to_owned(),
+                neutrino_event::base_version().clone(),
+            )
+            .room_id(room_id!("!room:example.org").to_owned())
+            .content(json!({ "msgtype": "m.text", "body": "hi" }))
+            .prev_events(prevs)
+            .prev_state_events(prev_states)
+            .origin_server_ts(ts)
+            .build()
+            .ok()
         })
 }
 
@@ -178,15 +182,19 @@ fn arb_member_event() -> impl Strategy<Value = Event> {
             "valid member",
             |(sender, target, membership, prevs, prev_states, ts)| {
                 let sender: OwnedUserId = sender.parse().ok()?;
-                EventBuilder::new(sender, "m.room.member".to_owned())
-                    .room_id(room_id!("!room:example.org").to_owned())
-                    .state_key(target)
-                    .content(json!({ "membership": membership }))
-                    .prev_events(prevs)
-                    .prev_state_events(prev_states)
-                    .origin_server_ts(ts)
-                    .build()
-                    .ok()
+                EventBuilder::new(
+                    sender,
+                    "m.room.member".to_owned(),
+                    neutrino_event::base_version().clone(),
+                )
+                .room_id(room_id!("!room:example.org").to_owned())
+                .state_key(target)
+                .content(json!({ "membership": membership }))
+                .prev_events(prevs)
+                .prev_state_events(prev_states)
+                .origin_server_ts(ts)
+                .build()
+                .ok()
             },
         )
 }
@@ -198,12 +206,16 @@ fn arb_create_event() -> impl Strategy<Value = Event> {
         "valid create",
         |(sender, ts)| {
             let sender: OwnedUserId = sender.parse().ok()?;
-            EventBuilder::new(sender, "m.room.create".to_owned())
-                .state_key(String::new())
-                .content(json!({ "room_version": ROOM_VERSION_ID }))
-                .origin_server_ts(ts)
-                .build()
-                .ok()
+            EventBuilder::new(
+                sender,
+                "m.room.create".to_owned(),
+                neutrino_event::base_version().clone(),
+            )
+            .state_key(String::new())
+            .content(json!({ "room_version": ROOM_VERSION_ID }))
+            .origin_server_ts(ts)
+            .build()
+            .ok()
         },
     )
 }
@@ -300,12 +312,16 @@ fn arb_state_with_create()
     )
         .prop_filter_map("valid create + state", |(sender_str, ts, events)| {
             let sender: OwnedUserId = sender_str.parse().ok()?;
-            let create_event = EventBuilder::new(sender, "m.room.create".to_owned())
-                .state_key(String::new())
-                .content(json!({ "room_version": ROOM_VERSION_ID }))
-                .origin_server_ts(ts)
-                .build()
-                .ok()?;
+            let create_event = EventBuilder::new(
+                sender,
+                "m.room.create".to_owned(),
+                neutrino_event::base_version().clone(),
+            )
+            .state_key(String::new())
+            .content(json!({ "room_version": ROOM_VERSION_ID }))
+            .origin_server_ts(ts)
+            .build()
+            .ok()?;
             let create_id = create_event.event_id.clone();
             let creator_uid = create_event.sender.clone();
             let create = Arc::new(create_event);
@@ -354,7 +370,7 @@ proptest! {
         join_ts in 1u64..1_000_000_000_000_000u64,
     ) {
         let room_id = room_id_from_create(&create_id);
-        let join = EventBuilder::new(creator_uid.clone(), "m.room.member".to_owned())
+        let join = EventBuilder::new(creator_uid.clone(), "m.room.member".to_owned(), neutrino_event::base_version().clone())
             .room_id(room_id)
             .state_key(creator_uid.as_str().to_owned())
             .content(json!({ "membership": "join" }))
@@ -387,6 +403,7 @@ fn seed_placeholder_create(provider: &mut InMemoryStateProvider) {
             .parse::<OwnedUserId>()
             .expect("user id"),
         "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
     )
     .state_key(String::new())
     .content(json!({ "room_version": ROOM_VERSION_ID }))
@@ -409,6 +426,7 @@ fn placeholder_arc_event(ts: u64, auth_events: Vec<OwnedEventId>) -> Arc<Event> 
                 .parse::<OwnedUserId>()
                 .expect("user id"),
             "m.room.placeholder".to_owned(),
+            neutrino_event::base_version().clone(),
         )
         .room_id(room_id!("!room:example.org").to_owned())
         .state_key(String::new())
@@ -987,6 +1005,7 @@ fn prop_build_create(creator: &str, additional_creators: &[String], federate: bo
     EventBuilder::new(
         creator.parse::<OwnedUserId>().expect("creator user id"),
         "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
     )
     .state_key(String::new())
     .content(content)
@@ -999,6 +1018,7 @@ fn prop_build_msg(room_id: &RoomId, sender: &str, auth: Vec<OwnedEventId>) -> Ev
     EventBuilder::new(
         sender.parse::<OwnedUserId>().expect("sender user id"),
         "m.room.message".to_owned(),
+        neutrino_event::base_version().clone(),
     )
     .room_id(room_id.to_owned())
     .content(json!({ "msgtype": "m.text", "body": "hi" }))
@@ -1012,6 +1032,7 @@ fn prop_build_pl(room_id: &RoomId, sender: &str, content: Value, auth: Vec<Owned
     EventBuilder::new(
         sender.parse::<OwnedUserId>().expect("sender user id"),
         "m.room.power_levels".to_owned(),
+        neutrino_event::base_version().clone(),
     )
     .room_id(room_id.to_owned())
     .state_key(String::new())
@@ -1308,6 +1329,7 @@ fn build_create() -> Event {
     EventBuilder::new(
         FORK_MERGE_SENDER.parse().expect("user"),
         "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
     )
     .state_key(String::new())
     .content(json!({ "room_version": ROOM_VERSION_ID }))
@@ -1788,6 +1810,7 @@ fn adv_state_event(
     EventBuilder::new(
         sender.parse().expect("valid user id"),
         event_type.to_owned(),
+        neutrino_event::base_version().clone(),
     )
     .room_id(room.to_owned())
     .state_key(state_key.to_owned())
@@ -1809,6 +1832,7 @@ fn adv_message_event(
     EventBuilder::new(
         sender.parse().expect("valid user id"),
         "m.room.message".to_owned(),
+        neutrino_event::base_version().clone(),
     )
     .room_id(room.to_owned())
     .content(json!({ "msgtype": "m.text", "body": format!("m{ts}") }))

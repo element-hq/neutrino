@@ -45,9 +45,9 @@ pub(crate) const EVENT_COLUMNS_PREFIXED: &str = "e.event_id, e.room_id, e.event_
 /// No id round-trip check on the way in: an `Event` can only be built by
 /// `EventBuilder::build` or `from_wire`, both of which derive the id from the
 /// same canonical bytes a check here would re-read, so it verified the
-/// deriving code against itself. Re-deriving also needs the deployment's
-/// `EventIdScheme`, which storage would have to be told about purely for an
-/// assertion.
+/// deriving code against itself. Re-deriving also needs the room's version
+/// (ids are derived under it), which storage would have to look up purely for
+/// an assertion.
 pub(crate) struct EventRow<'a>(pub Cow<'a, Event>);
 
 impl Deref for EventRow<'_> {

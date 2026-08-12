@@ -200,54 +200,28 @@ pub fn event_id_from_hash(hash: &[u8; 32]) -> OwnedEventId {
     OwnedEventId::try_from(s).expect("'$' + 43 url-safe-b64 chars is a valid event_id")
 }
 
-/// Compute an event's event_id **under the base room version** directly from
-/// its canonical wire bytes.
+/// **Test fixtures only**: an event's id under the base room version, from its
+/// canonical wire bytes.
 ///
-/// Convenience wrapper for callers that hold the `raw` bytes and don't want to
-/// parse them into a `CanonicalJsonObject` themselves: test fixtures that need
-/// a hash-correct event_id without depending on
-/// [`EventBuilder`](crate::event_builder::EventBuilder), and debug-build
-/// round-trip checks. Anything naming an event in a *room* must go through
-/// that room's version instead ([`RoomVersion::event_id`]) — only the base
-/// version's derivation is available here, because raw bytes alone don't say
-/// which room version they belong to.
-///
-/// Returns the same errors `reference_hash` would for malformed input:
-/// non-object root, missing `type`, non-object `content`/`hashes`/`signatures`.
-pub fn compute_event_id(raw: &serde_json::value::RawValue) -> Result<OwnedEventId, ComputeIdError> {
-    let parsed: CanonicalJsonValue = serde_json::from_str(raw.get())?;
+/// Production code cannot name an event this way, and is not able to reach this
+/// function: an event is named under the version of the room it belongs to
+/// ([`RoomVersion::event_id`]), which raw bytes alone cannot say. It exists for
+/// fixtures that hand-assemble an [`Event`](crate::Event) instead of going
+/// through [`EventBuilder`](crate::event_builder::EventBuilder) and still want
+/// an id that matches their bytes, so it is gated behind the `test-support`
+/// feature (enabled as a dev-dependency by the crates whose tests need it).
+#[cfg(any(test, feature = "test-support"))]
+pub fn base_version_event_id(
+    raw: &serde_json::value::RawValue,
+) -> Result<OwnedEventId, EventIdError> {
+    let parsed: CanonicalJsonValue = serde_json::from_str(raw.get())
+        .map_err(|e| EventIdError::Scheme(format!("raw is not valid JSON: {e}")))?;
     let CanonicalJsonValue::Object(obj) = parsed else {
-        return Err(ComputeIdError::NonObjectRoot);
+        return Err(EventIdError::Scheme(
+            "raw JSON root is not an object".to_owned(),
+        ));
     };
-    // Delegates to the version rather than restating `reference_hash` +
-    // `event_id_from_hash`, so there is one expression of the derivation.
-    crate::room_version::base_version()
-        .event_id(&obj)
-        .map_err(|e| match e {
-            EventIdError::Redaction(r) => ComputeIdError::Redaction(r),
-            EventIdError::Scheme(m) => ComputeIdError::Scheme(m),
-        })
-}
-
-/// Failure modes for [`compute_event_id`].
-#[derive(Debug, Error)]
-pub enum ComputeIdError {
-    /// `raw` isn't valid JSON.
-    #[error("raw is not valid JSON: {0}")]
-    Parse(#[from] serde_json::Error),
-
-    /// `raw` is valid JSON but the root value isn't an object.
-    #[error("raw JSON root is not an object")]
-    NonObjectRoot,
-
-    /// `reference_hash`'s redaction preconditions weren't met
-    /// (missing `type`, non-object `content`/`hashes`/`signatures`).
-    #[error("redaction precondition failed: {0}")]
-    Redaction(RedactionError),
-
-    /// A non-default scheme could not name this event.
-    #[error("event id scheme: {0}")]
-    Scheme(String),
+    crate::room_version::base_version().event_id(&obj)
 }
 
 /// How event ids are derived from event bytes.
@@ -650,8 +624,8 @@ mod tests {
 
     /// Hand-authored v12 reference-hash vector with independent verification.
     ///
-    /// **Keep this test even though `compute_event_id_matches_real_matrix_org_event`
-    /// and `compute_event_id_matches_real_msc4242_event` below also exercise
+    /// **Keep this test even though `base_version_event_id_matches_real_matrix_org_event`
+    /// and `base_version_event_id_matches_real_msc4242_event` below also exercise
     /// the same pipeline against real homeserver outputs.** The hand-traced
     /// `EXPECTED_POST_REDACTION` literal is the only place where the
     /// post-redaction canonical bytes are spelled out in human-readable form,
@@ -730,7 +704,7 @@ mod tests {
     /// If this drifts, either ruma's `redact_in_place` changed or our
     /// canonical encoding broke — both would be regressions.
     #[test]
-    fn compute_event_id_matches_real_matrix_org_event() {
+    fn base_version_event_id_matches_real_matrix_org_event() {
         let raw_json = r#"{
   "auth_events": [
     "$Fw7pQdLu79h74bsZabn1UKXoXo7-q5M-cOwQxQxfh2c",
@@ -763,7 +737,7 @@ mod tests {
   }
 }"#;
         let raw = serde_json::value::RawValue::from_string(raw_json.to_owned()).expect("raw");
-        let id = compute_event_id(&raw).expect("computes");
+        let id = base_version_event_id(&raw).expect("computes");
         assert_eq!(id.as_str(), "$KXQOIuyr9pVHI6YAqMtwYCJbeh8-KtZbl8XCDHA53qY");
     }
 
@@ -773,10 +747,10 @@ mod tests {
     /// so it exercises **the MSC4242 carve-out path itself**: without our
     /// save/restore of `prev_state_events` across V11 redaction, the field
     /// would be stripped and the resulting event_id would differ.
-    /// Complements `compute_event_id_matches_real_matrix_org_event` which
+    /// Complements `base_version_event_id_matches_real_matrix_org_event` which
     /// only exercised stock V11 redaction.
     #[test]
-    fn compute_event_id_matches_real_msc4242_event() {
+    fn base_version_event_id_matches_real_msc4242_event() {
         let raw_json = r#"{
   "prev_events": [
     "$zo_-jrWvI_eBqBktaYF2uIZ4pS2hngkQ4J9wWm37w0g"
@@ -825,7 +799,7 @@ mod tests {
   }
 }"#;
         let raw = serde_json::value::RawValue::from_string(raw_json.to_owned()).expect("raw");
-        let id = compute_event_id(&raw).expect("computes");
+        let id = base_version_event_id(&raw).expect("computes");
         assert_eq!(id.as_str(), "$B551KEsRXrNE3knHLSP-QszuqJYSjasJECVcmP1JIkI");
     }
 }

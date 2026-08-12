@@ -125,22 +125,30 @@ mod tests {
     /// Build a default-shape `m.room.message` event with a chosen sender —
     /// the auth_event tests only consult `event_type` and `sender` here.
     fn message_from(sender: &str) -> Event {
-        EventBuilder::new(sender.parse().expect("sender"), "m.room.message".to_owned())
-            .room_id(room_id!("!room:example.org").to_owned())
-            .content(json!({ "msgtype": "m.text", "body": "hi" }))
-            .origin_server_ts(next_ts())
-            .build()
-            .expect("valid message")
+        EventBuilder::new(
+            sender.parse().expect("sender"),
+            "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id!("!room:example.org").to_owned())
+        .content(json!({ "msgtype": "m.text", "body": "hi" }))
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid message")
     }
 
     fn member(sender: &str, target: &str, content: Value) -> Event {
-        EventBuilder::new(sender.parse().expect("sender"), "m.room.member".to_owned())
-            .room_id(room_id!("!room:example.org").to_owned())
-            .state_key(target.to_owned())
-            .content(content)
-            .origin_server_ts(next_ts())
-            .build()
-            .expect("valid member")
+        EventBuilder::new(
+            sender.parse().expect("sender"),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id!("!room:example.org").to_owned())
+        .state_key(target.to_owned())
+        .content(content)
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid member")
     }
 
     /// Build a state map from `(type, state_key, event_id)` triples.
@@ -163,6 +171,7 @@ mod tests {
         let ev = EventBuilder::new(
             "@alice:example.org".parse().expect("user id"),
             "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
         )
         .state_key(String::new())
         .content(json!({ "room_version": ROOM_VERSION_ID }))

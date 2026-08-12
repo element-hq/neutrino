@@ -86,7 +86,7 @@ struct App {
     display_name_tx: Option<watch::Sender<String>>,
     /// The deployment's event policy (composed at the composition root): one
     /// value carrying the ingress admission mode, the signer for
-    /// locally-authored events, and the event-id scheme.
+    /// locally-authored events, and the room versions this build speaks.
     policy: EventPolicy,
     config: Config,
     /// Latching cancellation signal shared with long-polls and the outbound
@@ -428,9 +428,9 @@ pub async fn serve(
     // re-advertise. `None` off the embedded path (no BLE advert to update).
     display_name_tx: Option<watch::Sender<String>>,
     // The event policy, composed by the composition root from the app's
-    // `trusted_network` config and the medium's nominated id scheme: one value
-    // carrying the ingress admission mode, the local signer, and how event ids
-    // are derived.
+    // `trusted_network` config and the medium's declared room version: one
+    // value carrying the ingress admission mode, the local signer, and the
+    // room versions this build speaks.
     policy: EventPolicy,
 ) -> Result<(), StartupError> {
     // The caller (the entrypoint) opens the store, resolves the server identity
@@ -1622,11 +1622,10 @@ fn build_initial_events(
     let version = policy.versions.default_for_new_rooms().clone();
 
     // create is special: no parents, room_id derived from its own event_id.
-    let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
+    let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned(), version.clone())
         .state_key(String::new())
         .content(json!({ "room_version": version.id }))
         .signer(policy.signer().cloned())
-        .version(Some(version.clone()))
         .build()?;
 
     let mut room = RoomCore::new(create.room_id.clone(), version);
@@ -1642,7 +1641,7 @@ fn build_initial_events(
                 event_type.to_owned(),
                 Some(state_key.to_owned()),
                 content,
-                policy,
+                policy.signer(),
             )?;
             // apply_pdu is the sole authority for `auth_events`, stamping them
             // onto the event it hands back via `Persist` — persist *that*, not
@@ -2464,21 +2463,29 @@ mod tests {
         );
         // Build a minimal room so we can persist a message event.
         let sender: ruma::OwnedUserId = "@alice:127.0.0.1".parse().expect("user id");
-        let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(serde_json::json!({ "room_version": ROOM_VERSION_ID }))
-            .build()
-            .expect("build create");
+        let create = EventBuilder::new(
+            sender.clone(),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(serde_json::json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
         let room_id = create.room_id.clone();
         store.create_room(&create, &[]).await.expect("create_room");
         // Persist a message event to the dead peer's outbox — this is what makes
         // the sender supervisor spawn a per-destination task that keeps retrying.
-        let msg = EventBuilder::new(sender, "m.room.message".to_owned())
-            .room_id(room_id)
-            .content(serde_json::json!({ "msgtype": "m.text", "body": "hi" }))
-            .prev_events(vec![create.event_id])
-            .build()
-            .expect("build msg");
+        let msg = EventBuilder::new(
+            sender,
+            "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id)
+        .content(serde_json::json!({ "msgtype": "m.text", "body": "hi" }))
+        .prev_events(vec![create.event_id])
+        .build()
+        .expect("build msg");
         store
             .persist_event(&msg, &[&*dead_peer])
             .await

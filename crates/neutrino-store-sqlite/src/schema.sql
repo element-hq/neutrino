@@ -380,9 +380,9 @@ CREATE INDEX ix_staged_events_room ON staged_events(room_id);
 -- same policy as the staged_events / FE columns). Surfaces only via the sync
 -- invite path, which unions `invited_oob_rooms(user)` into the room list.
 -- `event_id` is stored, not recomputed on read: the id is known at write time,
--- and re-deriving it would mean teaching the storage layer which
--- `EventIdScheme` the deployment runs — the only place it would have needed to
--- know. Storing it also saves a parse + hash per read.
+-- and re-deriving it needs the room's version, which for an out-of-band invite
+-- is a room we do not host and therefore have no `rooms` row for. Storing it
+-- also saves a parse + hash per read.
 CREATE TABLE oob_invites (
     room_id    TEXT NOT NULL,
     state_key  TEXT NOT NULL,

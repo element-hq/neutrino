@@ -173,11 +173,15 @@ mod tests {
     }
 
     fn create_event(sender: &OwnedUserId) -> Event {
-        EventBuilder::new(sender.clone(), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(json!({ "room_version": ROOM_VERSION_ID }))
-            .build()
-            .expect("build create")
+        EventBuilder::new(
+            sender.clone(),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create")
     }
 
     fn member_join(
@@ -185,14 +189,18 @@ mod tests {
         create_id: &ruma::EventId,
         sender: &OwnedUserId,
     ) -> Event {
-        EventBuilder::new(sender.clone(), "m.room.member".to_owned())
-            .room_id(room_id.clone())
-            .state_key(sender.as_str().to_owned())
-            .content(json!({ "membership": "join" }))
-            .prev_events(vec![create_id.to_owned()])
-            .prev_state_events(vec![create_id.to_owned()])
-            .build()
-            .expect("build join")
+        EventBuilder::new(
+            sender.clone(),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key(sender.as_str().to_owned())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create_id.to_owned()])
+        .prev_state_events(vec![create_id.to_owned()])
+        .build()
+        .expect("build join")
     }
 
     /// Create a room joined by `members`, then persist a message whose
@@ -215,14 +223,18 @@ mod tests {
             store.persist_event(&mj, &[]).await.expect("persist member");
         }
         // A message dangling onto a parent we don't hold → backward extremity.
-        let dangling = EventBuilder::new(creator.clone(), "m.room.message".to_owned())
-            .room_id(room_id.clone())
-            .content(json!({ "msgtype": "m.text", "body": "tip" }))
-            .prev_events(vec![
-                event_id!("$unheld_parent:remote.example.org").to_owned(),
-            ])
-            .build()
-            .expect("build dangling");
+        let dangling = EventBuilder::new(
+            creator.clone(),
+            "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .content(json!({ "msgtype": "m.text", "body": "tip" }))
+        .prev_events(vec![
+            event_id!("$unheld_parent:remote.example.org").to_owned(),
+        ])
+        .build()
+        .expect("build dangling");
         store
             .persist_historical_event(&dangling)
             .await
@@ -242,16 +254,20 @@ mod tests {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         body.hash(&mut hasher);
-        EventBuilder::new(alice(), "m.room.message".to_owned())
-            .room_id(room_id.clone())
-            .content(json!({ "msgtype": "m.text", "body": body }))
-            .prev_events(vec![event_id!("$ghost:remote.example.org").to_owned()])
-            .origin_server_ts(1_700_000_000_000 + hasher.finish() % 1_000_000)
-            .build()
-            .expect("build pdu")
-            .raw
-            .get()
-            .to_owned()
+        EventBuilder::new(
+            alice(),
+            "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .content(json!({ "msgtype": "m.text", "body": body }))
+        .prev_events(vec![event_id!("$ghost:remote.example.org").to_owned()])
+        .origin_server_ts(1_700_000_000_000 + hasher.finish() % 1_000_000)
+        .build()
+        .expect("build pdu")
+        .raw
+        .get()
+        .to_owned()
     }
 
     /// A `/backfill` peer stub with interior-mutable state, so a test can mount

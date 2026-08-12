@@ -254,24 +254,26 @@ impl RoomCore {
     /// [`apply_pdu`](Self::apply_pdu) (or to persist as part of an initial
     /// batch) — `auth_events` are deliberately left empty here; `apply_pdu`
     /// computes and stamps them as the sole authority (see its docs).
+    ///
+    /// `signer` is `None` on a trusted network (events MUST NOT carry
+    /// signatures there); the room's version comes from the core itself.
     pub fn build_local_event(
         &self,
         sender: OwnedUserId,
         event_type: String,
         state_key: Option<String>,
         content: Value,
-        policy: &neutrino_event::EventPolicy,
+        signer: Option<&Arc<neutrino_event::EventSigner>>,
     ) -> Result<Event, FormatError> {
         let prev_events: Vec<OwnedEventId> = self.forward_extremities.iter().cloned().collect();
         let prev_state_events: Vec<OwnedEventId> =
             self.state_forward_extremities.iter().cloned().collect();
-        let mut builder = EventBuilder::new(sender, event_type)
+        let mut builder = EventBuilder::new(sender, event_type, self.version.clone())
             .room_id(self.room_id.clone())
             .content(content)
             .prev_events(prev_events)
             .prev_state_events(prev_state_events)
-            .signer(policy.signer().cloned())
-            .version(Some(self.version.clone()));
+            .signer(signer.cloned());
         if let Some(sk) = state_key {
             builder = builder.state_key(sk);
         }
@@ -617,12 +619,16 @@ mod tests {
         if !federate {
             content["m.federate"] = json!(false);
         }
-        EventBuilder::new(creator.parse().expect("user"), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(content)
-            .origin_server_ts(next_ts())
-            .build()
-            .expect("valid create")
+        EventBuilder::new(
+            creator.parse().expect("user"),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(content)
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid create")
     }
 
     /// Build an `m.room.member` event. `prev_state_events` and `auth_events`
@@ -638,16 +644,20 @@ mod tests {
         prev_state: Vec<OwnedEventId>,
         room: &ruma::RoomId,
     ) -> Event {
-        EventBuilder::new(sender.parse().expect("user"), "m.room.member".to_owned())
-            .room_id(room.to_owned())
-            .state_key(target.to_owned())
-            .content(json!({ "membership": membership }))
-            .auth_events(prev_state.clone())
-            .prev_events(prev_state.clone())
-            .prev_state_events(prev_state)
-            .origin_server_ts(next_ts())
-            .build()
-            .expect("valid member")
+        EventBuilder::new(
+            sender.parse().expect("user"),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room.to_owned())
+        .state_key(target.to_owned())
+        .content(json!({ "membership": membership }))
+        .auth_events(prev_state.clone())
+        .prev_events(prev_state.clone())
+        .prev_state_events(prev_state)
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid member")
     }
 
     /// Build an `m.room.power_levels` event.
@@ -660,6 +670,7 @@ mod tests {
         EventBuilder::new(
             sender.parse().expect("user"),
             "m.room.power_levels".to_owned(),
+            neutrino_event::base_version().clone(),
         )
         .room_id(room.to_owned())
         .state_key(String::new())
@@ -708,6 +719,7 @@ mod tests {
         EventBuilder::new(
             "@alice:example.org".parse().expect("user"),
             "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
         )
         .room_id(room.to_owned())
         .state_key("@alice:example.org".to_owned())
@@ -843,6 +855,7 @@ mod tests {
         let msg = EventBuilder::new(
             "@alice:example.org".parse().expect("user"),
             "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
         )
         .room_id(room_id.clone())
         .content(json!({ "msgtype": "m.text", "body": "hi" }))
@@ -914,6 +927,7 @@ mod tests {
         let bob_topic = EventBuilder::new(
             "@bob:example.org".parse().expect("user"),
             "m.room.topic".to_owned(),
+            neutrino_event::base_version().clone(),
         )
         .room_id(room_id)
         .state_key(String::new())
@@ -1038,6 +1052,7 @@ mod tests {
         let msg = EventBuilder::new(
             "@alice:example.org".parse().expect("user"),
             "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
         )
         .room_id(room_id)
         .content(json!({ "msgtype": "m.text", "body": "hi" }))
@@ -1075,6 +1090,7 @@ mod tests {
             EventBuilder::new(
                 "@alice:example.org".parse().expect("user"),
                 "m.room.message".to_owned(),
+                neutrino_event::base_version().clone(),
             )
             .room_id(room_id)
             .content(json!({ "msgtype": "m.text", "body": "hi" }))
@@ -1165,6 +1181,7 @@ mod tests {
         let msg = EventBuilder::new(
             "@alice:example.org".parse().expect("user"),
             "m.room.message".to_owned(),
+            neutrino_event::base_version().clone(),
         )
         .room_id(room_id)
         .content(json!({ "msgtype": "m.text", "body": "hi" }))
@@ -1450,6 +1467,7 @@ mod tests {
         EventBuilder::new(
             "@alice:example.org".parse().expect("user"),
             "m.room.topic".to_owned(),
+            neutrino_event::base_version().clone(),
         )
         .room_id(room.to_owned())
         .state_key(String::new())
@@ -1762,6 +1780,7 @@ mod tests {
         let mut big = EventBuilder::new(
             "@alice:example.org".parse().expect("user"),
             "m.example.big".to_owned(),
+            neutrino_event::base_version().clone(),
         )
         .room_id(room_id.clone())
         .state_key("x".to_owned())
@@ -1820,7 +1839,7 @@ mod tests {
                 "m.room.message".to_owned(),
                 None,
                 json!({ "msgtype": "m.text", "body": "hi" }),
-                &neutrino_event::EventPolicy::trusted_network(),
+                None,
             )
             .expect("build");
         assert!(

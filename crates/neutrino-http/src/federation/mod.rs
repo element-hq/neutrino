@@ -296,14 +296,13 @@ pub(crate) fn complete_membership_template(
     // join/leave), so it carries the server-wide display name.
     let mut content = json!({ "membership": membership });
     crate::set_member_displayname(&mut content, display_name);
-    match EventBuilder::new(user.to_owned(), "m.room.member".to_owned())
+    match EventBuilder::new(user.to_owned(), "m.room.member".to_owned(), version.clone())
         .room_id(room_id.to_owned())
         .state_key(user.to_string())
         .content(content)
         .prev_events(parsed.prev_events)
         .prev_state_events(parsed.prev_state_events)
         .signer(policy.signer().cloned())
-        .version(Some(version.clone()))
         .build()
     {
         Ok(event) => Some(event),

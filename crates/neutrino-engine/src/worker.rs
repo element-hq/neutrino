@@ -81,7 +81,8 @@ struct WorkerCtx<S> {
     registry: Arc<RoomRegistry<S>>,
     fetcher: Arc<dyn MissingEventsFetcher>,
     /// Deployment-wide event policy: the security posture composed from the
-    /// medium's declared link trust, and the medium's nominated id scheme.
+    /// medium's declared link trust, and the room versions this build speaks
+    /// (each room's own version is read from the store, per room).
     policy: EventPolicy,
     /// Backoff floor; [`BACKOFF_BASE`] in production, near-zero in tests so the
     /// retry path runs without real delays.
@@ -512,20 +513,28 @@ mod tests {
     /// returned oldest-first; `create` is the grounded root, not part of a batch.
     fn chain() -> (Event, Event, Event) {
         let alice: OwnedUserId = "@alice:example.org".parse().unwrap();
-        let create = EventBuilder::new(alice.clone(), "m.room.create".to_owned())
-            .state_key(String::new())
-            .content(json!({ "room_version": ROOM_VERSION_ID }))
-            .build()
-            .unwrap();
+        let create = EventBuilder::new(
+            alice.clone(),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .unwrap();
         let room_id = create.room_id.clone();
         let on = |prev: &Event, body: &str| {
-            EventBuilder::new(alice.clone(), "m.room.message".to_owned())
-                .room_id(room_id.clone())
-                .content(json!({ "msgtype": "m.text", "body": body }))
-                .prev_events(vec![prev.event_id.clone()])
-                .prev_state_events(vec![prev.event_id.clone()])
-                .build()
-                .unwrap()
+            EventBuilder::new(
+                alice.clone(),
+                "m.room.message".to_owned(),
+                neutrino_event::base_version().clone(),
+            )
+            .room_id(room_id.clone())
+            .content(json!({ "msgtype": "m.text", "body": body }))
+            .prev_events(vec![prev.event_id.clone()])
+            .prev_state_events(vec![prev.event_id.clone()])
+            .build()
+            .unwrap()
         };
         let a = on(&create, "a");
         let b = on(&a, "b");

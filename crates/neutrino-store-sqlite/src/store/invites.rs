@@ -88,8 +88,8 @@ impl InviteStore for SqliteStore {
             // receipt, so a parse failure here is DB corruption ⇒ Internal.
             //
             // The id is read, never recomputed: it was derived under the
-            // deployment's `EventIdScheme` when the invite arrived, and storage
-            // has no business knowing what that scheme is.
+            // room's version when the invite arrived, and this is a room we do
+            // not host — there is no `rooms` row to recover that version from.
             let event_id = OwnedEventId::try_from(event_id).map_err(|e| {
                 Error::Internal(format!("malformed event_id in oob_invites row: {e}"))
             })?;
@@ -139,7 +139,7 @@ impl InviteStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use neutrino_event::Event;
-    use neutrino_event::event_id::compute_event_id;
+    use neutrino_event::event_id::base_version_event_id;
     use neutrino_store::InviteStore;
     use ruma::{RoomId, UserId, room_id, user_id};
     use serde_json::value::RawValue;
@@ -176,7 +176,7 @@ mod tests {
             }
         });
         let raw = RawValue::from_string(serde_json::to_string(&body).unwrap()).unwrap();
-        let event_id = compute_event_id(&raw).expect("fixture computes event_id");
+        let event_id = base_version_event_id(&raw).expect("fixture computes event_id");
         let content = serde_json::value::to_raw_value(body.get("content").unwrap()).unwrap();
         Event {
             event_id,
