@@ -10,12 +10,12 @@ pub use neutrino_lb::{
     CBOR_CONTENT_FORMAT, CaptureControl, CodecError, DatagramLink, LinkAddr, LinkCodec, LinkPacing,
     LinkProfile, WireRequest, WireResponse,
 };
+pub use neutrino_store_sqlite::SqliteStore;
 
 use std::future::Future;
 use std::pin::Pin;
 
 use neutrino_store::IdentityStore;
-use neutrino_store_sqlite::SqliteStore;
 use rand::RngCore;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -120,16 +120,6 @@ pub struct LinkContext {
     /// [`Command::KickBackoff`] when a peer (re)appears so destinations that
     /// backed off while that peer was unreachable retry promptly.
     pub commands: tokio::sync::mpsc::UnboundedSender<Command>,
-    /// The homeserver's store, already open — the same handle the server itself
-    /// uses ([`open_store`], injected into [`entrypoint`]).
-    ///
-    /// A medium that declares a [`FederationLink::room_version`] whose id scheme
-    /// stamps identity fields needs somewhere to keep them (a per-install id, a
-    /// counter high-water resumed at boot). It reads and writes them here rather
-    /// than opening a second connection to the same file — one process, one open
-    /// database — and it has the handle *before* it must construct the version,
-    /// because the store is opened before the link factory runs.
-    pub store: Arc<SqliteStore>,
 }
 
 /// Builds the federation datagram link once the node secret is resolved. The
@@ -167,11 +157,8 @@ pub async fn open_store(config: &Config) -> Result<Arc<SqliteStore>, neutrino_st
 pub async fn entrypoint(
     mut config: Config,
     // The store, opened by the caller via [`open_store`]. Injected rather than
-    // opened here so a composing host — a medium's own entrypoint, which
-    // already supplies the `Config` the store is derived from — can hold the
-    // same handle and read from it (a room-version scheme's persistent state,
-    // say) while the server runs. One process, one open database: pass the
-    // handle, never a second `open_store` on the same directory.
+    // opened here so a composing host can hold the same handle and read from it
+    // while the server runs.
     store: Arc<SqliteStore>,
     commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
     // Published once identity resolution completes so an embedding host (the
@@ -251,7 +238,6 @@ pub async fn entrypoint(
                 display_name: display_name_rx,
                 discovery: discovery.clone(),
                 commands: cmd_tx,
-                store: store.clone(),
             })
             .await
             .map_err(|e| -> Box<dyn std::error::Error> { e })?;
