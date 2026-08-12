@@ -266,7 +266,7 @@ impl NeutrinoHandle {
 /// immediate; only a runaway closure can delay this thread's exit.
 #[uniffi::export]
 pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
-    start_with(config, None, None)
+    start_with(config, None, None, None)
 }
 
 /// The composition seam for out-of-tree federation media. Same as [`start`]
@@ -277,8 +277,16 @@ pub fn start(config: NeutrinoConfig) -> NeutrinoHandle {
 /// uniffi-exported — the factory is a Rust trait-object seam and cannot (and
 /// need not) cross the FFI. See `LinkContext` in neutrino-main for the
 /// contract an injected medium must uphold.
+///
+/// `runtime` and `store` exist for a medium whose own entrypoint is sync (a
+/// uniffi export) and which needs the store handle before this call — for
+/// instance to give a room version somewhere to keep its state. Opening a store
+/// is async, so such a caller builds the runtime, opens the store on it, and
+/// passes both in: one runtime and one store for the process, not two of each.
+/// `None` leaves both to us, which is what an in-tree build passes.
 pub fn start_with(
     config: NeutrinoConfig,
+    runtime: Option<tokio::runtime::Runtime>,
     store: Option<std::sync::Arc<neutrino_main::SqliteStore>>,
     link_factory: Option<neutrino_main::FederationLinkFactory>,
 ) -> NeutrinoHandle {
@@ -314,20 +322,25 @@ pub fn start_with(
     let discovery_for_server = std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new());
     let discovery_for_handle = discovery_for_server.clone();
     std::thread::spawn(move || {
-        // Neutrino owns its runtime. current_thread = parity with the previous
+        // The caller's runtime if it built one (it had to, to open the store it
+        // passed), else ours. current_thread = parity with the previous
         // async-compat global (also current_thread); all DB work is offloaded to
         // the blocking pool, so the executor is I/O-bound. enable_all() = I/O +
-        // time drivers (TcpListener, reqwest, tokio::time).
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .thread_name("neutrino")
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                tracing::error!(error = %e, "neutrino: failed to build the server runtime");
-                return;
-            }
+        // time drivers (TcpListener, reqwest, tokio::time). A `Runtime` is
+        // `Send`, so one built on the caller's thread drives fine here.
+        let rt = match runtime {
+            Some(rt) => rt,
+            None => match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .thread_name("neutrino")
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!(error = %e, "neutrino: failed to build the server runtime");
+                    return;
+                }
+            },
         };
         rt.block_on(async {
             // Loudly surface any stall of this single-threaded executor (a task
