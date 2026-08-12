@@ -106,7 +106,7 @@ impl EventSigner {
     /// `version` supplies the redaction rules the signed byte string is
     /// computed under, including the keys that survive redaction — so the
     /// signature covers the event's own name (see
-    /// [`RoomVersion::extra_redaction_keys`]).
+    /// [`RoomVersion::redaction_keys`]).
     pub fn sign_event(
         &self,
         obj: &mut CanonicalJsonObject,

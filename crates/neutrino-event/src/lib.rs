@@ -7,7 +7,11 @@ pub mod sign;
 pub mod validate;
 pub use event::Event;
 pub use event_builder::{RoomVersionKeys, UnverifiedWire, Wire, room_version_keys};
-pub use room_version::{RegistryError, RoomVersion, RoomVersions, base_version};
+pub use room_version::{RedactionKeys, RegistryError, RoomVersion, RoomVersions, base_version};
+/// Re-exported so a downstream crate implementing an
+/// [`EventIdScheme`](event_id::EventIdScheme) names the same ruma types these
+/// APIs do, rather than pinning its own copy.
+pub use ruma;
 pub use sign::{
     CoSignError, EventPolicy, EventSecurity, EventSigner, KeyResolveError, KeyResolver,
     NodeIdKeyResolver, SIGNING_KEY_ID, VerifyError, verify_event_signature, verify_event_signed_by,

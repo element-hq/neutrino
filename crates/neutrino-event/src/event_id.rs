@@ -69,21 +69,16 @@ pub(crate) fn b64_url_unpadded(bytes: &[u8]) -> String {
 
 /// Redaction for reference-hash computation, under one room version's rules.
 ///
-/// Runs ruma's `redact_in_place` against the version's redaction rules, but
-/// preserves the version's [`extra_redaction_keys`] across the call — the keys
-/// that must survive redaction even though ruma's keep-list doesn't mention
-/// them. For every version this repo speaks that includes MSC4242's
-/// `prev_state_events`, a state-DAG parentage field that must be covered by
-/// the reference hash; a stamping [`EventIdScheme`] adds its own identity
-/// fields there too. Save → redact → restore is the minimal divergence
-/// pending the MSC landing in the spec.
+/// Runs ruma's `redact_in_place` against the version's redaction rules and
+/// applies its [`RedactionKeys`](crate::room_version::RedactionKeys): `added`
+/// are preserved across the call (ruma's keep-list does not mention them —
+/// MSC4242's `prev_state_events`, and whatever a stamping [`EventIdScheme`]
+/// writes), `removed` are stripped after it.
 ///
 /// See `event-id-design.md` §"ruma redaction wrapper".
 ///
 /// On error the saved keys are restored before returning, so the caller sees
 /// the input in its original shape regardless of outcome.
-///
-/// [`extra_redaction_keys`]: RoomVersion::extra_redaction_keys
 pub(crate) fn redact_for_hash(
     obj: &mut CanonicalJsonObject,
     version: &RoomVersion,
@@ -91,7 +86,8 @@ pub(crate) fn redact_for_hash(
     // Only the keys actually present are touched; a version with nothing to
     // preserve (or an event carrying none of them) allocates nothing.
     let saved: Vec<(&'static str, CanonicalJsonValue)> = version
-        .extra_redaction_keys
+        .redaction_keys
+        .added
         .iter()
         .filter_map(|k| obj.remove(*k).map(|v| (*k, v)))
         .collect();
@@ -99,7 +95,11 @@ pub(crate) fn redact_for_hash(
     for (k, v) in saved {
         obj.insert(k.to_owned(), v);
     }
-    result
+    result?;
+    for k in version.redaction_keys.removed {
+        obj.remove(*k);
+    }
+    Ok(())
 }
 
 /// Content hash of an unhashed event object.
@@ -128,7 +128,7 @@ pub fn reference_hash(
 }
 
 /// Apply the room version's redaction rules (keeping its
-/// [`extra_redaction_keys`](RoomVersion::extra_redaction_keys)), strip
+/// [`RedactionKeys`](crate::room_version::RedactionKeys)), strip
 /// `signatures` and `unsigned`, and return the canonical-JSON bytes.
 ///
 /// Used as an internal step of [`reference_hash`], as the byte string a
@@ -260,9 +260,9 @@ pub trait EventIdScheme: Send + Sync + std::fmt::Debug {
     /// - **Redaction-invariant.** Receipt-check 3 redacts an event whose
     ///   content hash does not match and carries on with it, so the id must be
     ///   the same before and after. This is what the version's
-    ///   [`extra_redaction_keys`](RoomVersion::extra_redaction_keys) exist to
-    ///   guarantee: whatever `derive` reads must be listed there, or redaction
-    ///   strips it.
+    ///   [`RedactionKeys::added`](crate::room_version::RedactionKeys::added)
+    ///   exists to guarantee: whatever `derive` reads must be listed there, or
+    ///   redaction strips it.
     /// - **Signature-invariant.** A resident co-signing a join/leave/invite
     ///   must not rename the event, so `derive` must ignore `signatures`
     ///   (and `unsigned`, which is likewise not covered).
@@ -410,6 +410,41 @@ mod tests {
         assert_eq!(
             o.get("content"),
             Some(&CanonicalJsonValue::Object(CanonicalJsonObject::new()))
+        );
+    }
+
+    #[test]
+    fn redact_for_hash_strips_the_versions_removed_keys() {
+        // `sender` is in ruma's keep-list, so only `removed` can take it out.
+        let version = RoomVersion {
+            id: "org.matrix.neutrino.test.nosender",
+            rules: ruma::room_version_rules::RoomVersionRules::V12,
+            ids: std::sync::Arc::new(ReferenceHashIds),
+            redaction_keys: crate::room_version::RedactionKeys {
+                added: &["prev_state_events"],
+                removed: &["sender"],
+            },
+        };
+        let event = |sender: &str| {
+            obj(json!({
+                "type": "m.room.message",
+                "sender": sender,
+                "room_id": "!r:example.org",
+                "content": { "body": "hi" },
+                "prev_events": [],
+                "origin_server_ts": 1000
+            }))
+        };
+
+        let mut o = event("@a:example.org");
+        redact_for_hash(&mut o, &version).expect("redaction succeeds");
+        assert!(!o.contains_key("sender"));
+
+        // A removed key is outside the event's name, which is what lets a wire
+        // format omit it and rebuild it on receipt.
+        assert_eq!(
+            reference_hash(&event("@a:example.org"), &version).expect("hash"),
+            reference_hash(&event("@b:example.org"), &version).expect("hash"),
         );
     }
 

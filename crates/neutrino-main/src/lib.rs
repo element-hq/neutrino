@@ -5,12 +5,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 pub use neutrino_ctl::{Command, Config, DiscoveredPeer, DiscoveryRegistry};
-pub use neutrino_event::{KeyResolver, NodeIdKeyResolver};
+pub use neutrino_event::event_id::{EventIdError, EventIdScheme};
+pub use neutrino_event::{KeyResolver, NodeIdKeyResolver, RedactionKeys, RoomVersion, ruma};
 pub use neutrino_lb::{
     CBOR_CONTENT_FORMAT, CaptureControl, CodecError, DatagramLink, LinkAddr, LinkCodec, LinkPacing,
     LinkProfile, WireRequest, WireResponse,
 };
-pub use neutrino_store_sqlite::SqliteStore;
+pub use neutrino_store_sqlite::{Error as SqliteError, SqliteStore, rusqlite};
 
 use std::future::Future;
 use std::pin::Pin;
