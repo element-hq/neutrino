@@ -8,7 +8,7 @@ const SCHEMA_SQL: &str = include_str!("schema.sql");
 /// shape, so a store written by an older build is refused at open (loudly, and
 /// before any query hits a column that does not exist) rather than breaking
 /// mid-request. One constant so the stamp and the gate cannot drift.
-pub(crate) const SCHEMA_VERSION: i64 = 2;
+pub(crate) const SCHEMA_VERSION: i64 = 3;
 
 /// Version-gate the database against the bundled schema. Authoritative
 /// open-time check per design doc §2 "Open path: version gate & schema bundle".

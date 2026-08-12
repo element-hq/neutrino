@@ -23,14 +23,13 @@ use axum::{
     extract::{Path, RawQuery, State},
     http::HeaderMap,
 };
-use neutrino_event::ROOM_VERSION_ID;
 use neutrino_store::RoomStore;
 use ruma::{OwnedRoomId, OwnedUserId};
 use serde::Serialize;
 use serde_json::json;
 use serde_json::value::RawValue as RawJsonValue;
 
-use crate::federation::make_join::{map_build_err, ver_includes_ours};
+use crate::federation::make_join::{map_build_err, ver_includes};
 use crate::federation::{FedError, auth};
 use crate::{AppState, lock_app};
 
@@ -80,12 +79,14 @@ pub(crate) async fn handle(
         ));
     }
 
-    if store.get_room_version(&room_id).await?.is_none() {
-        return Err(FedError::RoomNotFound);
-    }
-    if !ver_includes_ours(raw_query.as_deref()) {
+    // The room must exist, and the requester must offer its version.
+    let room_version = store
+        .get_room_version(&room_id)
+        .await?
+        .ok_or(FedError::RoomNotFound)?;
+    if !ver_includes(raw_query.as_deref(), room_version.as_str()) {
         return Err(FedError::IncompatibleRoomVersion(
-            ROOM_VERSION_ID.to_owned(),
+            room_version.as_str().to_owned(),
         ));
     }
 
@@ -102,6 +103,6 @@ pub(crate) async fn handle(
 
     Ok(Json(ResponseBody {
         event: template.raw.clone(),
-        room_version: ROOM_VERSION_ID.to_owned(),
+        room_version: room_version.as_str().to_owned(),
     }))
 }

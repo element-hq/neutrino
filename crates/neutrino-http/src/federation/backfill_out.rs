@@ -83,6 +83,13 @@ async fn persist_pdus(
     pdus: Vec<Box<serde_json::value::RawValue>>,
     limit: u32,
 ) -> usize {
+    // One lookup for the whole response: every PDU in it belongs to `room_id`
+    // (foreign-room ones are dropped below), so they share its version.
+    let Some(version) = neutrino_engine::room_version(store, &policy.versions, room_id).await
+    else {
+        warn!(target: "neutrino_http", %room_id, "backfill: cannot name events in this room, dropping response");
+        return 0;
+    };
     let mut persisted = 0usize;
     for raw in pdus.into_iter().take(limit as usize) {
         // `from_wire` derives the id from the reference hash; an unparseable
@@ -91,7 +98,7 @@ async fn persist_pdus(
         // must carry the verdict so a descendant's reference check
         // cascade-rejects, and so the malformed content can never surface as
         // an accepted row (clients filter rejected; state-res excludes it).
-        let event = match policy.admit_wire(raw).await {
+        let event = match policy.admit_wire(raw, &version).await {
             Ok(neutrino_event::Wire::Valid(ev)) => ev,
             Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
                 warn!(target: "neutrino_http", %room_id, event_id = %ev.event_id, %defect, "backfill: serving malformed PDU as rejected");
@@ -395,7 +402,7 @@ mod tests {
         let bad_id = from_wire(
             serde_json::value::RawValue::from_string(bad_raw.clone()).expect("valid JSON"),
             Vec::new(),
-            &neutrino_event::event_id::REFERENCE_HASH_IDS,
+            neutrino_event::base_version(),
         )
         .expect("parseable")
         .admit_on_faith()
@@ -493,7 +500,7 @@ mod tests {
         let held: Event = from_wire(
             serde_json::value::RawValue::from_string(held_raw.clone()).unwrap(),
             Vec::new(),
-            &neutrino_event::event_id::REFERENCE_HASH_IDS,
+            neutrino_event::base_version(),
         )
         .expect("parse held")
         .admit_on_faith()
@@ -543,7 +550,7 @@ mod tests {
         let held: Event = from_wire(
             serde_json::value::RawValue::from_string(held_raw.clone()).unwrap(),
             Vec::new(),
-            &neutrino_event::event_id::REFERENCE_HASH_IDS,
+            neutrino_event::base_version(),
         )
         .expect("parse held")
         .admit_on_faith()

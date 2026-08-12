@@ -102,7 +102,7 @@ async fn start_signed_node(
             None,
             EventPolicy::new(
                 neutrino_event::EventSecurity::Signed { signer, resolver },
-                None,
+                std::sync::Arc::new(neutrino_event::RoomVersions::base_only()),
             ),
         )
         .await;
@@ -384,12 +384,13 @@ async fn stub_invite_handler(
             let mut ev = neutrino_event::event_builder::from_wire(
                 raw,
                 Vec::new(),
-                &neutrino_event::event_id::REFERENCE_HASH_IDS,
+                neutrino_event::base_version(),
             )
             .expect("candidate parses")
             .admit_on_faith()
             .into_event();
-            s.co_sign(&mut ev, &[]).expect("stub co-signs");
+            s.co_sign(&mut ev, neutrino_event::base_version())
+                .expect("stub co-signs");
             serde_json::from_str(ev.raw.get()).expect("co-signed raw is JSON")
         }
     };

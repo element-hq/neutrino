@@ -35,7 +35,9 @@
 //! omits it); when a peer does send one it is cross-checked against the header
 //! origin and a mismatch is rejected.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use axum::{
     Json,
@@ -186,6 +188,12 @@ pub(crate) async fn handle(
     // failure — it would fail identically on every resend, so it must not block
     // recording.
     let mut all_staged = true;
+    // One version lookup per distinct room in the transaction, not per PDU: a
+    // transaction commonly carries several events for one room. `None` is
+    // cached too — a room we cannot name events in stays undecidable for the
+    // whole transaction, and re-reading the store per PDU would not change it.
+    let mut versions: HashMap<Option<OwnedRoomId>, Option<Arc<neutrino_event::RoomVersion>>> =
+        HashMap::new();
     for raw in body.pdus {
         // Parse only — signatures are NOT verified here. The inbound worker
         // (`parse_or_drop` → `apply_pdu`) is the sole authority on the
@@ -198,12 +206,26 @@ pub(crate) async fn handle(
         // Drop-class PDUs (`Err`) are unkeyable and never enter the system;
         // `Wire::Rejected` ones are staged like any other — the worker persists
         // them rejected (the cascade terminator).
-        let event = match neutrino_event::event_builder::from_wire(
-            raw,
-            Vec::new(),
-            policy.ids.as_ref(),
-        )
-        .map(|uw| uw.admit_on_faith())
+        // A PDU can only be named under its room's version, so resolve that
+        // first: the room it claims (the common case) or, for a create, the
+        // version the create declares. Unresolvable ⇒ drop, exactly as an
+        // unparseable PDU is dropped — we are not in that room, or we do not
+        // speak its version, and guessing a version would invent a different
+        // event.
+        let keys = neutrino_event::room_version_keys(&raw);
+        let version = match versions.entry(keys.room_id.clone()) {
+            Entry::Occupied(e) => e.get().clone(),
+            Entry::Vacant(e) => e
+                .insert(
+                    neutrino_engine::room_version_for_wire(&*store, &policy.versions, &raw).await,
+                )
+                .clone(),
+        };
+        let Some(version) = version else {
+            continue;
+        };
+        let event = match neutrino_event::event_builder::from_wire(raw, Vec::new(), &version)
+            .map(|uw| uw.admit_on_faith())
         {
             Ok(neutrino_event::Wire::Valid(ev)) => ev,
             Ok(neutrino_event::Wire::Rejected(ev, defect)) => {

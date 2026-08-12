@@ -336,8 +336,19 @@ pub fn start_with(
             // The command receiver is threaded into the server; a `Shutdown`
             // command (or every `NeutrinoHandle` being dropped, which closes the
             // channel) drives `serve`'s graceful shutdown and returns here.
+            // The store is opened here rather than inside `entrypoint` so a
+            // composing medium can hold the same handle (see `open_store`).
+            let store = match neutrino_main::open_store(&config).await {
+                Ok(store) => store,
+                Err(e) => {
+                    tracing::error!(error = %e, "neutrino: failed to open the store");
+                    let _ = error_tx.send(Some(e.to_string()));
+                    return;
+                }
+            };
             if let Err(e) = neutrino_main::entrypoint(
                 config,
+                store,
                 rx,
                 Some(handoff_tx),
                 link_factory,

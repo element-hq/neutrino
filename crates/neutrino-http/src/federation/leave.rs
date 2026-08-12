@@ -27,7 +27,6 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use neutrino_event::ROOM_VERSION_ID;
 use neutrino_store::InviteStore;
 use ruma::{OwnedUserId, RoomId, ServerName, UserId};
 use serde_json::json;
@@ -101,18 +100,26 @@ async fn try_federated_leave(
     display_name: &str,
 ) -> Result<(), String> {
     let client = FederationClient::new(own_server.to_owned(), proxy);
+    let offered: Vec<&str> = policy.versions.ids().collect();
     let template = client
-        .make_leave(dest, room_id, user, ROOM_VERSION_ID)
+        .make_leave(dest, room_id, user, &offered)
         .await
         .map_err(|e| format!("make_leave request failed: {e}"))?;
-    if template.room_version != ROOM_VERSION_ID {
-        return Err(format!(
-            "resident room version {} is unsupported",
-            template.room_version
-        ));
-    }
+    // The room's version, as the resident states it — the leave we build is
+    // named under it.
+    let version = policy
+        .versions
+        .get(&template.room_version)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "resident room version {} is unsupported",
+                template.room_version
+            )
+        })?;
     let leave = complete_membership_template(
         policy,
+        &version,
         &template.event,
         room_id,
         user,
@@ -170,6 +177,7 @@ mod tests {
         let room_id = ruma::RoomId::parse("!room:resident.example").unwrap();
         let event = complete_membership_template(
             &neutrino_event::EventPolicy::trusted_network(),
+            neutrino_event::base_version(),
             &hostile,
             &room_id,
             &our_user,

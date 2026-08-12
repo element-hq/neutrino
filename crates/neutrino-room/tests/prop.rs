@@ -1912,7 +1912,7 @@ struct AdvCtx {
 impl AdvCtx {
     fn new(room_id: OwnedRoomId) -> Self {
         AdvCtx {
-            room: RoomCore::new(room_id.clone()),
+            room: RoomCore::new(room_id.clone(), neutrino_event::base_version().clone()),
             room_id,
             provider: InMemoryStateProvider::new(),
             events: Vec::new(),
@@ -2163,7 +2163,7 @@ struct AdvOutcome {
 /// (an invariant that holds regardless of verdict: a rejected event emits no
 /// delta, so it cannot perturb the fold).
 fn apply_adv_dag(dag: &Dag, order: &[usize]) -> Result<AdvOutcome, TestCaseError> {
-    let mut room = RoomCore::new(dag.room_id.clone());
+    let mut room = RoomCore::new(dag.room_id.clone(), neutrino_event::base_version().clone());
     let mut provider = InMemoryStateProvider::new();
     let mut verdict_of: HashMap<&str, Verdict> = HashMap::new();
     let mut accumulated: StateMap<OwnedEventId> = StateMap::new();
@@ -2530,7 +2530,7 @@ proptest! {
     ) {
         let dag = build_adv_dag(ops);
         let n = dag.events.len();
-        let mut room = RoomCore::new(dag.room_id.clone());
+        let mut room = RoomCore::new(dag.room_id.clone(), neutrino_event::base_version().clone());
         let mut provider = InMemoryStateProvider::new();
         // Full apply in build order (a valid topological order by construction).
         for event in &dag.events {

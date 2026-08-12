@@ -65,7 +65,7 @@ use tracing::{debug, error, info, warn};
 use crate::gapfill::fill_state_ancestry;
 use crate::ports::MissingEventsFetcher;
 use crate::room_actor::{RoomActorError, RoomRegistry};
-use crate::util::{BACKOFF_BASE, jitter, next_backoff};
+use crate::util::{BACKOFF_BASE, jitter, next_backoff, room_version};
 
 /// Buffer for the in-process poke channel. A poke is just a room id; the
 /// supervisor coalesces duplicates (re-reading the room's staged rows each
@@ -252,12 +252,24 @@ async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
             continue;
         }
 
+        // The room's version names every row below. Resolved once per round,
+        // not per PDU. Absent means a storage fault or a room row we can't
+        // interpret: leave the rows staged and retry — dropping them here would
+        // lose events a later round could still apply (a `/send`-staged PDU was
+        // already parsed under this version at ingress, so an unsupported
+        // version cannot be the reason).
+        let Some(version) = room_version(ctx.store.as_ref(), &ctx.policy.versions, &room).await
+        else {
+            sleep_or_poke(ctx.backoff_base, &notify).await;
+            continue;
+        };
+
         // Apply parents before children that are staged together. A row that
         // fails admission here is dropped: for `/send`-staged rows this is the
         // real signature/parse gate (they were staged on faith and deferred it
         // here); for rows staged after an earlier admit it is defensive.
         // Unstage rather than spin forever.
-        for staged in toposort(parse_or_drop(&ctx, &eligible).await) {
+        for staged in toposort(parse_or_drop(&ctx, &eligible, &version).await) {
             process_one(&ctx, &room, staged, &mut backoff).await;
         }
     }
@@ -273,10 +285,11 @@ async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
 async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
     ctx: &WorkerCtx<S>,
     eligible: &[StagedPdu],
+    version: &Arc<neutrino_event::RoomVersion>,
 ) -> Vec<Staged> {
     let mut out = Vec::with_capacity(eligible.len());
     for p in eligible {
-        match ctx.policy.admit_wire(p.raw.clone()).await {
+        match ctx.policy.admit_wire(p.raw.clone(), version).await {
             // Both variants proceed: a `Wire::Rejected` event carries
             // `rejected = true` and `apply_pdu` short-circuits it to a
             // rejected persist (the cascade terminator).

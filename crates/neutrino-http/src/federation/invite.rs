@@ -36,7 +36,6 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use neutrino_event::ROOM_VERSION_ID;
 use neutrino_store::{InviteStore, RoomStore, StateStore};
 use ruma::events::AnyStrippedStateEvent;
 use ruma::serde::Raw;
@@ -85,12 +84,25 @@ pub(crate) async fn handle(
         .map_err(|_| FedError::BadRequest("body is not the v2 invite envelope"))?
         .0;
 
-    // Version negotiation: we only host v12 + MSC4242.
-    if body.room_version != ROOM_VERSION_ID {
-        return Err(FedError::IncompatibleRoomVersion(
-            ROOM_VERSION_ID.to_owned(),
-        ));
-    }
+    // Version negotiation: the envelope states the room's version, and we can
+    // only name (or render) an invite to a room whose version we speak. An
+    // out-of-band invite has no room state here, so the envelope is the only
+    // source — which is why the version rides the v2 envelope at all.
+    let version = state
+        .policy()
+        .versions
+        .get(&body.room_version)
+        .cloned()
+        .ok_or_else(|| {
+            FedError::IncompatibleRoomVersion(
+                state
+                    .policy()
+                    .versions
+                    .default_for_new_rooms()
+                    .id
+                    .to_owned(),
+            )
+        })?;
 
     // Merge the envelope's `invite_room_state` into the event's `unsigned` (the
     // sync invite path reads it from there). `unsigned` is outside the reference
@@ -103,7 +115,7 @@ pub(crate) async fn handle(
     // for a condemned invite — the hosted branch would just persist a
     // rejected row nobody reads, and the OOB branch must never surface an
     // invalid stub to sync.
-    let event = match state.policy().admit_wire(raw).await {
+    let event = match state.policy().admit_wire(raw, &version).await {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
         Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
             tracing::warn!(event_id = %ev.event_id, %defect, "invite: refusing Wire::Rejected invite");
@@ -162,7 +174,7 @@ pub(crate) async fn handle(
     // stage / OOB stub) and the response copy the inviter persists and fans
     // out. No-op on a trusted network. Event id unchanged.
     let mut event = event;
-    co_sign_if_signed(&state, &mut event)?;
+    co_sign_if_signed(&state, &mut event, &version)?;
 
     // Keep the wire bytes for the response before either path moves `event`.
     let event_raw = event.raw.clone();
@@ -270,6 +282,17 @@ pub(crate) async fn federated_invite(
     //    carries no server) as the v2 envelope: the bare candidate event +
     //    room_version + stripped `invite_room_state` (the peer merges the latter
     //    into the event's `unsigned` for its sync to render).
+    // The room's version: it goes on the wire in the v2 envelope, and it names
+    // the event the invitee hands back. The candidate above was built under it
+    // too (the room actor holds it).
+    let Some(version) = neutrino_engine::room_version(&*store, &policy.versions, room_id).await
+    else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            "room is of an unsupported room version",
+        );
+    };
     let irs = build_invite_room_state(&*store, room_id, &sender).await;
     let client = FederationClient::new(own_server, federation_proxy.as_deref());
     let returned = match client
@@ -278,7 +301,7 @@ pub(crate) async fn federated_invite(
             room_id,
             &candidate.event_id,
             &candidate.raw,
-            ROOM_VERSION_ID,
+            version.id,
             &irs,
         )
         .await
@@ -313,7 +336,7 @@ pub(crate) async fn federated_invite(
     //    the peer returned *our* event (same reference hash) — it can't swap in a
     //    different one. `unsigned.invite_room_state` rides along harmlessly (it
     //    is outside the hash and never read for a remote member).
-    let returned_event = match policy.admit_wire(returned).await {
+    let returned_event = match policy.admit_wire(returned, &version).await {
         // `Wire::Valid` with our reference hash: byte-identical to what we
         // sent (a `Rejected` variant with the same id is impossible — our
         // candidate came from `EventBuilder`, which validates).
@@ -348,7 +371,7 @@ pub(crate) async fn federated_invite(
             &returned_event,
             target.server_name().as_str(),
             resolver.as_ref(),
-            policy.ids.identity_fields(),
+            &version,
         )
         .await
     {

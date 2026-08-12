@@ -32,7 +32,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use neutrino_event::{EventPolicy, ROOM_VERSION_ID};
+use neutrino_event::EventPolicy;
 use neutrino_store::{InviteStore, RoomStore, StagingStore, StateStore, StreamPos};
 use ruma::{OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId};
 use serde_json::json;
@@ -362,16 +362,24 @@ async fn try_join_via(
     user: &UserId,
     display_name: &str,
 ) -> Result<(), JoinFailure> {
+    // Offer every version we understand; the resident answers with the room's.
+    let offered: Vec<&str> = policy.versions.ids().collect();
     let template = client
-        .make_join(dest, room_id, user, ROOM_VERSION_ID)
+        .make_join(dest, room_id, user, &offered)
         .await
         .map_err(|e| from_client_err(e, "make_join request failed"))?;
-    if template.room_version != ROOM_VERSION_ID {
-        return Err(gateway("resident room version is unsupported"));
-    }
+    // The room's version, as the resident states it — everything from here on
+    // (the join we build, and every event in the send_join response) is named
+    // under it.
+    let version = policy
+        .versions
+        .get(&template.room_version)
+        .cloned()
+        .ok_or_else(|| gateway("resident room version is unsupported"))?;
 
     let join = crate::federation::complete_membership_template(
         policy,
+        &version,
         &template.event,
         room_id,
         user,
@@ -386,7 +394,7 @@ async fn try_join_via(
         .await
         .map_err(|e| from_client_err(e, "send_join request failed"))?;
 
-    ingest_state_dag(store, worker_poke, policy, dest, room_id, resp)
+    ingest_state_dag(store, worker_poke, policy, &version, dest, room_id, resp)
         .await
         .map_err(gateway)
 }
@@ -394,10 +402,12 @@ async fn try_join_via(
 /// Ingest a `send_join` response: register the room from its create event (if
 /// new), then stage every returned event for the worker to apply. The create
 /// is staged too — it re-applies as an idempotent no-op.
+#[allow(clippy::too_many_arguments)]
 async fn ingest_state_dag(
     store: &(impl RoomStore + StagingStore),
     worker_poke: &mpsc::Sender<OwnedRoomId>,
     policy: &EventPolicy,
+    version: &std::sync::Arc<neutrino_event::RoomVersion>,
     origin: &ServerName,
     room_id: &RoomId,
     resp: SendJoinResponse,
@@ -409,7 +419,7 @@ async fn ingest_state_dag(
         .chain(resp.timeline)
         .chain(std::iter::once(resp.event))
     {
-        match policy.admit_wire(raw).await {
+        match policy.admit_wire(raw, version).await {
             Ok(neutrino_event::Wire::Valid(ev)) => events.push(ev),
             // Rejected events are staged too — they persist as rejected rows
             // so references to them cascade-reject instead of gapfilling.

@@ -47,7 +47,8 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use ruma::canonical_json::{CanonicalJsonObject, CanonicalJsonValue, RedactionError};
 use thiserror::Error;
 
-use crate::event_id::{EventIdScheme, b64_unpadded, canonical, redact_to_canonical_bytes};
+use crate::event_id::{b64_unpadded, canonical, redact_to_canonical_bytes};
+use crate::room_version::{RoomVersion, RoomVersions};
 
 /// The fixed key id this server signs under. No rotation mechanics: the
 /// signing key is the node identity secret, so the key lives exactly as long
@@ -102,15 +103,16 @@ impl EventSigner {
     ///
     /// Errors only if the event violates redaction preconditions (missing
     /// `type`, non-object `content`/`hashes`/`signatures`).
-    /// `identity_fields` are the active [`EventIdScheme`]'s inputs; they are
-    /// kept in the signed byte string so the signature covers the event's own
-    /// name. See [`EventIdScheme::identity_fields`].
+    /// `version` supplies the redaction rules the signed byte string is
+    /// computed under, including the keys that survive redaction — so the
+    /// signature covers the event's own name (see
+    /// [`RoomVersion::extra_redaction_keys`]).
     pub fn sign_event(
         &self,
         obj: &mut CanonicalJsonObject,
-        identity_fields: &[&str],
+        version: &RoomVersion,
     ) -> Result<(), RedactionError> {
-        let bytes = redact_to_canonical_bytes(obj, identity_fields)?;
+        let bytes = redact_to_canonical_bytes(obj, version)?;
         self.attach(obj, self.sign_bytes(&bytes));
         Ok(())
     }
@@ -138,13 +140,13 @@ impl EventSigner {
     pub fn co_sign(
         &self,
         event: &mut crate::Event,
-        identity_fields: &[&str],
+        version: &RoomVersion,
     ) -> Result<(), CoSignError> {
         let parsed: CanonicalJsonValue = serde_json::from_str(event.raw.get())?;
         let CanonicalJsonValue::Object(mut obj) = parsed else {
             return Err(CoSignError::NonObjectRoot);
         };
-        self.sign_event(&mut obj, identity_fields)?;
+        self.sign_event(&mut obj, version)?;
         let bytes = canonical(&obj);
         let s = String::from_utf8(bytes).expect("canonical JSON is valid UTF-8");
         event.raw = serde_json::value::RawValue::from_string(s)
@@ -253,7 +255,7 @@ pub async fn verify_event_signed_by(
     event: &crate::Event,
     origin: &str,
     resolver: &dyn KeyResolver,
-    identity_fields: &[&str],
+    version: &RoomVersion,
 ) -> Result<(), VerifyError> {
     let parsed: CanonicalJsonValue =
         serde_json::from_str(event.raw.get()).map_err(|e| VerifyError::NoValidSignature {
@@ -266,7 +268,7 @@ pub async fn verify_event_signed_by(
             detail: "event raw root is not an object".to_owned(),
         });
     };
-    verify_event_signature(&obj, origin, resolver, identity_fields).await
+    verify_event_signature(&obj, origin, resolver, version).await
 }
 
 /// Key-resolution failure, produced by a [`KeyResolver`].
@@ -341,53 +343,59 @@ impl EventSecurity {
 
 /// The two event-level facts a deployment owns, composed once at the
 /// composition root and threaded as one value: how provenance is established
-/// ([`EventSecurity`]) and how ids are derived ([`EventIdScheme`]).
+/// ([`EventSecurity`]) and which room versions this build understands
+/// ([`RoomVersions`]).
 ///
 /// They are independent — every combination is a real deployment — so this is
 /// a carrier, not a policy enum. It exists because the one place that needs
 /// both at once is the parse+admit seam ([`admit_wire`](Self::admit_wire)),
 /// and because threading two parameters through the same dozen signatures
 /// would be twice the churn for the same fact.
+///
+/// Note what is *not* here: how ids are derived. That is a property of each
+/// room's version, recovered from `rooms.room_version`, not a process-wide
+/// setting — see [`RoomVersion`].
 #[derive(Clone, Debug)]
 pub struct EventPolicy {
     pub security: EventSecurity,
-    pub ids: std::sync::Arc<dyn EventIdScheme>,
+    pub versions: std::sync::Arc<RoomVersions>,
 }
 
 impl EventPolicy {
-    /// Compose from the deployment's two facts. `ids: None` selects the v12
-    /// reference hash — the spec's scheme and the only one in this repository.
-    pub fn new(security: EventSecurity, ids: Option<std::sync::Arc<dyn EventIdScheme>>) -> Self {
-        Self {
-            security,
-            ids: ids.unwrap_or_else(|| std::sync::Arc::new(crate::event_id::ReferenceHashIds)),
-        }
+    /// Compose from the deployment's two facts.
+    pub fn new(security: EventSecurity, versions: std::sync::Arc<RoomVersions>) -> Self {
+        Self { security, versions }
     }
 
-    /// A trusted-network policy on the default id scheme — the shape almost
-    /// every test wants.
+    /// A trusted-network policy understanding only the base room version — the
+    /// shape almost every test wants.
     pub fn trusted_network() -> Self {
-        Self::new(EventSecurity::TrustedNetwork, None)
+        Self::new(
+            EventSecurity::TrustedNetwork,
+            std::sync::Arc::new(RoomVersions::base_only()),
+        )
     }
 
-    /// Parse wire bytes and admit the result under this policy in one step:
-    /// [`from_wire`](crate::event_builder::from_wire) (id derivation,
-    /// content-hash verify/redact, format + semantic classification) composed
-    /// with [`admit`](EventSecurity::admit) (signature check under `Signed`,
-    /// on faith under `TrustedNetwork`). The single parse+admit seam for
-    /// inbound federation bytes — the HTTP handlers and the engine
-    /// worker/reconcile/gapfill all funnel through here so the contract can't
-    /// drift between crates.
+    /// Parse wire bytes from a room of `version` and admit the result under
+    /// this policy in one step: [`from_wire`](crate::event_builder::from_wire)
+    /// (id derivation, content-hash verify/redact, format + semantic
+    /// classification) composed with [`admit`](EventSecurity::admit)
+    /// (signature check under `Signed`, on faith under `TrustedNetwork`). The
+    /// single parse+admit seam for inbound federation bytes — the HTTP
+    /// handlers and the engine worker/reconcile/gapfill all funnel through
+    /// here so the contract can't drift between crates.
+    ///
+    /// The caller resolves `version`, because naming an event requires knowing
+    /// its room and this crate cannot read the store: room-scoped ingress
+    /// paths already hold it, the `make_*`/`invite`/`send_join` envelopes carry
+    /// it on the wire, and `/send` resolves it per PDU.
     pub async fn admit_wire(
         &self,
         raw: Box<serde_json::value::RawValue>,
+        version: &std::sync::Arc<RoomVersion>,
     ) -> Result<crate::Wire, crate::FormatError> {
         self.security
-            .admit(crate::event_builder::from_wire(
-                raw,
-                Vec::new(),
-                self.ids.as_ref(),
-            )?)
+            .admit(crate::event_builder::from_wire(raw, Vec::new(), version)?)
             .await
     }
 
@@ -449,9 +457,9 @@ pub async fn verify_event_signature(
     obj: &CanonicalJsonObject,
     origin: &str,
     resolver: &dyn KeyResolver,
-    identity_fields: &[&str],
+    version: &RoomVersion,
 ) -> Result<(), VerifyError> {
-    let bytes = redact_to_canonical_bytes(obj, identity_fields)?;
+    let bytes = redact_to_canonical_bytes(obj, version)?;
     let entries = origin_signature_entries(obj, origin)?;
 
     let mut failures = Vec::new();
@@ -519,6 +527,7 @@ fn verify_one(bytes: &[u8], key: &[u8; 32], sig_b64: &str) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::room_version::base_version;
     use ruma::canonical_json::redact_in_place;
     use ruma::room_version_rules::RoomVersionRules;
     use serde_json::json;
@@ -663,10 +672,17 @@ mod tests {
     async fn sign_then_verify_round_trips_via_node_id_resolver() {
         let signer = node_signer(7);
         let mut event = v12_event();
-        signer.sign_event(&mut event, &[]).expect("signs");
-        verify_event_signature(&event, signer.server_name(), &NodeIdKeyResolver, &[])
-            .await
-            .expect("verifies");
+        signer
+            .sign_event(&mut event, base_version())
+            .expect("signs");
+        verify_event_signature(
+            &event,
+            signer.server_name(),
+            &NodeIdKeyResolver,
+            base_version(),
+        )
+        .await
+        .expect("verifies");
     }
 
     #[tokio::test]
@@ -674,7 +690,9 @@ mod tests {
         let signer = node_signer(7);
         let imposter = node_signer(8); // different key, different name
         let mut event = v12_event();
-        signer.sign_event(&mut event, &[]).expect("signs");
+        signer
+            .sign_event(&mut event, base_version())
+            .expect("signs");
         // Claim the imposter's name signed it: resolver derives the imposter
         // key from the name, under which the signature must not verify.
         let CanonicalJsonValue::Object(sigs) = event.remove("signatures").unwrap() else {
@@ -685,9 +703,14 @@ mod tests {
         forged.insert(imposter.server_name().to_owned(), by_signer);
         event.insert("signatures".to_owned(), CanonicalJsonValue::Object(forged));
 
-        let err = verify_event_signature(&event, imposter.server_name(), &NodeIdKeyResolver, &[])
-            .await
-            .expect_err("must not verify");
+        let err = verify_event_signature(
+            &event,
+            imposter.server_name(),
+            &NodeIdKeyResolver,
+            base_version(),
+        )
+        .await
+        .expect_err("must not verify");
         assert!(matches!(err, VerifyError::NoValidSignature { .. }), "{err}");
     }
 
@@ -695,11 +718,18 @@ mod tests {
     async fn verify_fails_when_origin_absent_from_signatures() {
         let signer = node_signer(7);
         let mut event = v12_event();
-        signer.sign_event(&mut event, &[]).expect("signs");
+        signer
+            .sign_event(&mut event, base_version())
+            .expect("signs");
         let other = node_signer(9);
-        let err = verify_event_signature(&event, other.server_name(), &NodeIdKeyResolver, &[])
-            .await
-            .expect_err("origin never signed");
+        let err = verify_event_signature(
+            &event,
+            other.server_name(),
+            &NodeIdKeyResolver,
+            base_version(),
+        )
+        .await
+        .expect_err("origin never signed");
         assert!(
             matches!(err, VerifyError::NoSignatureForOrigin { .. }),
             "{err}"
@@ -715,7 +745,9 @@ mod tests {
     async fn signature_covers_redacted_form_only() {
         let signer = node_signer(7);
         let mut event = v12_event();
-        signer.sign_event(&mut event, &[]).expect("signs");
+        signer
+            .sign_event(&mut event, base_version())
+            .expect("signs");
 
         // Tamper with redactable content → signature still verifies.
         let mut tampered_content = event.clone();
@@ -729,7 +761,7 @@ mod tests {
             &tampered_content,
             signer.server_name(),
             &NodeIdKeyResolver,
-            &[],
+            base_version(),
         )
         .await
         .expect("redactable tampering is invisible to the signature");
@@ -744,7 +776,7 @@ mod tests {
             &tampered_sender,
             signer.server_name(),
             &NodeIdKeyResolver,
-            &[],
+            base_version(),
         )
         .await
         .expect_err("protected-field tampering must break the signature");
@@ -758,17 +790,29 @@ mod tests {
         let origin = node_signer(7);
         let resident = node_signer(8);
         let mut event = v12_event();
-        origin.sign_event(&mut event, &[]).expect("origin signs");
+        origin
+            .sign_event(&mut event, base_version())
+            .expect("origin signs");
         resident
-            .sign_event(&mut event, &[])
+            .sign_event(&mut event, base_version())
             .expect("resident co-signs");
 
-        verify_event_signature(&event, origin.server_name(), &NodeIdKeyResolver, &[])
-            .await
-            .expect("origin signature survives co-signing");
-        verify_event_signature(&event, resident.server_name(), &NodeIdKeyResolver, &[])
-            .await
-            .expect("resident signature verifies");
+        verify_event_signature(
+            &event,
+            origin.server_name(),
+            &NodeIdKeyResolver,
+            base_version(),
+        )
+        .await
+        .expect("origin signature survives co-signing");
+        verify_event_signature(
+            &event,
+            resident.server_name(),
+            &NodeIdKeyResolver,
+            base_version(),
+        )
+        .await
+        .expect("resident signature verifies");
     }
 
     /// Handler-level co-sign: a full `Event` built+signed by the origin is
@@ -792,15 +836,27 @@ mod tests {
             .expect("builds");
         let id_before = event.event_id.clone();
 
-        resident.co_sign(&mut event, &[]).expect("co-signs");
+        resident
+            .co_sign(&mut event, base_version())
+            .expect("co-signs");
 
         assert_eq!(event.event_id, id_before, "co-sign must not change the id");
-        verify_event_signed_by(&event, origin.server_name(), &NodeIdKeyResolver, &[])
-            .await
-            .expect("origin signature survives in the regenerated raw");
-        verify_event_signed_by(&event, resident.server_name(), &NodeIdKeyResolver, &[])
-            .await
-            .expect("resident signature present in the regenerated raw");
+        verify_event_signed_by(
+            &event,
+            origin.server_name(),
+            &NodeIdKeyResolver,
+            base_version(),
+        )
+        .await
+        .expect("origin signature survives in the regenerated raw");
+        verify_event_signed_by(
+            &event,
+            resident.server_name(),
+            &NodeIdKeyResolver,
+            base_version(),
+        )
+        .await
+        .expect("resident signature present in the regenerated raw");
         // The regenerated raw still derives the same id (canonical bytes).
         let recomputed = crate::event_id::compute_event_id(&event.raw).expect("recompute");
         assert_eq!(recomputed, id_before);

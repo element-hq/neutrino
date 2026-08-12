@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::ports::{ForwardExtremities, MissingEventsFetcher, MissingEventsQuery};
+use crate::util::room_version;
 
 /// Whether `server` has a joined member in `room_id`. A store-backed predicate
 /// (not an `X-Matrix` check): the advertised heads a peer sends are
@@ -153,6 +154,12 @@ pub async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
     let Ok(Some((our_timeline, our_state))) = store.forward_extremities(room_id).await else {
         return;
     };
+    // The version every fetched event is named under. Resolved once for both
+    // DAG walks; absent means we cannot name this room's events, so there is
+    // nothing useful to fetch.
+    let Some(version) = room_version(store, &policy.versions, room_id).await else {
+        return;
+    };
     let our_timeline: Vec<OwnedEventId> = our_timeline.into_iter().collect();
     let our_state: Vec<OwnedEventId> = our_state.into_iter().collect();
 
@@ -176,6 +183,7 @@ pub async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
         store,
         fetcher,
         policy,
+        &version,
         peer,
         room_id,
         &advertised.state,
@@ -189,6 +197,7 @@ pub async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
             store,
             fetcher,
             policy,
+            &version,
             peer,
             room_id,
             &advertised.timeline,
@@ -224,6 +233,7 @@ async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
     store: &impl StorageBackend,
     fetcher: &F,
     policy: &EventPolicy,
+    version: &std::sync::Arc<neutrino_event::RoomVersion>,
     peer: &ServerName,
     room_id: &RoomId,
     heads: &[OwnedEventId],
@@ -290,7 +300,7 @@ async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
         // Rejected wire events are staged too (the worker persists them
         // rejected; cascade termination needs the row); drop-class events
         // (`Err`) never enter the system.
-        let Ok(wire) = policy.admit_wire(raw).await else {
+        let Ok(wire) = policy.admit_wire(raw, version).await else {
             continue;
         };
         if let neutrino_event::Wire::Rejected(rej, defect) = &wire {

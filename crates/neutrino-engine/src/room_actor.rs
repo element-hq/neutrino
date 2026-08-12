@@ -51,6 +51,11 @@ const ACTOR_INBOX: usize = 32;
 pub enum RoomActorError {
     #[error("no such room")]
     UnknownRoom,
+    /// The room exists on disk but its `rooms.room_version` is one this build
+    /// does not speak — a peer's medium declared a version we lack. Its events
+    /// cannot be named, so the room cannot be served at all.
+    #[error("unsupported room version")]
+    UnsupportedRoomVersion,
     #[error("building event: {0}")]
     Build(#[from] FormatError),
     #[error("event rejected: {0}")]
@@ -730,7 +735,20 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomRegistry<S> {
             .into_iter()
             .map(|(key, ev)| (key, Arc::new(ev)))
             .collect();
-        let room = RoomCore::hydrate(room_id.to_owned(), timeline_fes, state_fes, current_state);
+        // The room's version, from `rooms.room_version`. Every event this actor
+        // names, validates or signs uses it, so it is resolved once here and
+        // held by the `RoomCore` rather than passed down each call.
+        let version =
+            crate::util::room_version(self.store.as_ref(), &self.policy.versions, room_id)
+                .await
+                .ok_or(RoomActorError::UnsupportedRoomVersion)?;
+        let room = RoomCore::hydrate(
+            room_id.to_owned(),
+            version,
+            timeline_fes,
+            state_fes,
+            current_state,
+        );
 
         // Insert under the lock, re-checking so a racing bootstrap doesn't
         // spawn a second actor for the same room (the loser discards `room`).

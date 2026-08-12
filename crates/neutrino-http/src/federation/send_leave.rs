@@ -36,11 +36,22 @@ pub(crate) async fn handle(
         .map_err(|_| FedError::BadRequest("body is not valid JSON"))?
         .0;
 
+    // The leave is named under the version of the room it leaves, so the
+    // version is resolved from that room before the event can be parsed. The
+    // `{roomId}` path segment is not trusted for this (ignored by contract);
+    // the room the event itself claims is.
+    let version = {
+        let store = lock_app(&state).store.clone();
+        neutrino_engine::room_version_for_wire(store.as_ref(), &state.policy().versions, &raw)
+            .await
+            .ok_or(FedError::RoomNotFound)?
+    };
+
     // Parse + compute the event id from the reference hash. `auth_events`
     // start empty — apply_pdu is their sole authority. Resident membership
     // follows the *local* reject policy (refused, never persisted), so a
     // `Wire::Rejected` leave is a 400 like any other malformed event.
-    let event = match state.policy().admit_wire(raw).await {
+    let event = match state.policy().admit_wire(raw, &version).await {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
         Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
             tracing::warn!(event_id = %ev.event_id, %defect, "send_leave: refusing Wire::Rejected leave");
@@ -86,7 +97,7 @@ pub(crate) async fn handle(
     // keeps its singly-signed copy — fine, both verify by their sender's-server
     // signature. No-op on a trusted network. Event id unchanged.
     let mut event = event;
-    co_sign_if_signed(&state, &mut event)?;
+    co_sign_if_signed(&state, &mut event, &version)?;
 
     // Apply through the resident path: accept ⇒ persisted + fanned out; reject
     // ⇒ 403; idempotent re-send ⇒ Ok. (`apply_resident` enqueues the fan-out.)

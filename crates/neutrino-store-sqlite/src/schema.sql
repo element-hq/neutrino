@@ -48,7 +48,7 @@
 -- amended in place (same policy as the `events.rejected` column).
 CREATE TABLE rooms (
     room_id        TEXT NOT NULL PRIMARY KEY,
-    room_version   TEXT NOT NULL CHECK (room_version = 'org.matrix.msc4242.12'),
+    room_version   TEXT NOT NULL CHECK (room_version <> ''),
     forward_extremities            TEXT NOT NULL DEFAULT '[]',
     state_dag_forward_extremities  TEXT NOT NULL DEFAULT '[]'
 ) STRICT, WITHOUT ROWID;

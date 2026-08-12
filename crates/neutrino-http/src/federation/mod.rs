@@ -196,6 +196,12 @@ pub(crate) fn map_apply_err(err: neutrino_engine::RoomActorError) -> FedError {
         RoomActorError::NotApplied | RoomActorError::ActorGone => {
             FedError::Internal("apply did not produce a result")
         }
+        // Our own store holds a room whose version this build cannot speak, so
+        // we cannot name its events. Not the peer's fault: a 500, not an
+        // incompatible-version 400.
+        RoomActorError::UnsupportedRoomVersion => {
+            FedError::Internal("room is of an unsupported room version")
+        }
     }
 }
 
@@ -210,10 +216,11 @@ pub(crate) fn map_apply_err(err: neutrino_engine::RoomActorError) -> FedError {
 pub(crate) fn co_sign_if_signed(
     state: &crate::AppState,
     event: &mut neutrino_event::Event,
+    version: &neutrino_event::RoomVersion,
 ) -> Result<(), FedError> {
     if let Some(signer) = state.signer() {
         signer
-            .co_sign(event, state.policy().ids.identity_fields())
+            .co_sign(event, version)
             .map_err(|_| FedError::BadRequest("event cannot be co-signed"))?;
     }
     Ok(())
@@ -235,6 +242,7 @@ pub(crate) fn co_sign_if_signed(
 /// the invariant. `None` if the template is unparseable.
 pub(crate) fn complete_membership_template(
     policy: &neutrino_event::EventPolicy,
+    version: &std::sync::Arc<neutrino_event::RoomVersion>,
     template: &serde_json::value::RawValue,
     room_id: &ruma::RoomId,
     user: &ruma::UserId,
@@ -251,12 +259,8 @@ pub(crate) fn complete_membership_template(
     // rebuilt below, re-validated by `EventBuilder::build`, and auth-checked
     // by the resident), so a `Wire::Rejected` template is as usable as a
     // valid one.
-    let parsed = match neutrino_event::event_builder::from_wire(
-        raw,
-        Vec::new(),
-        policy.ids.as_ref(),
-    )
-    .map(|uw| uw.admit_on_faith())
+    let parsed = match neutrino_event::event_builder::from_wire(raw, Vec::new(), version)
+        .map(|uw| uw.admit_on_faith())
     {
         Ok(neutrino_event::Wire::Valid(ev)) => ev,
         Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
@@ -281,7 +285,7 @@ pub(crate) fn complete_membership_template(
         .prev_events(parsed.prev_events)
         .prev_state_events(parsed.prev_state_events)
         .signer(policy.signer().cloned())
-        .ids(Some(policy.ids.clone()))
+        .version(Some(version.clone()))
         .build()
     {
         Ok(event) => Some(event),

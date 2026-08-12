@@ -16,6 +16,7 @@
 //!    `prev_state_events` arrays yield distinct reference hashes. The
 //!    existing case test only proves the property for one pair.
 
+use neutrino_event::base_version;
 use neutrino_event::event_id::{content_hash, reference_hash};
 use proptest::prelude::*;
 use ruma::canonical_json::{CanonicalJsonObject, CanonicalJsonValue};
@@ -125,12 +126,12 @@ proptest! {
         signatures in arb_json_value(),
     ) {
         let base = base_message();
-        let h_base = reference_hash(&obj(base.clone())).expect("redacts");
+        let h_base = reference_hash(&obj(base.clone()), base_version()).expect("redacts");
 
         let mut with_overlays = base.as_object().expect("object").clone();
         with_overlays.insert("unsigned".to_owned(), unsigned);
         with_overlays.insert("signatures".to_owned(), signatures);
-        let h_overlaid = reference_hash(&obj(Value::Object(with_overlays))).expect("redacts");
+        let h_overlaid = reference_hash(&obj(Value::Object(with_overlays)), base_version()).expect("redacts");
 
         prop_assert_eq!(h_base, h_overlaid);
     }
@@ -160,8 +161,8 @@ proptest! {
             Value::Array(list_b.into_iter().map(Value::String).collect()),
         );
 
-        let h_a = reference_hash(&obj(a)).expect("redacts");
-        let h_b = reference_hash(&obj(b)).expect("redacts");
+        let h_a = reference_hash(&obj(a), base_version()).expect("redacts");
+        let h_b = reference_hash(&obj(b), base_version()).expect("redacts");
 
         prop_assert_ne!(h_a, h_b);
     }

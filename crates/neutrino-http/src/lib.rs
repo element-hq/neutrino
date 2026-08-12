@@ -14,7 +14,7 @@ use axum::{
 };
 use neutrino_ctl::{Command, Config, DEFAULT_DISPLAY_NAME, DiscoveryRegistry};
 use neutrino_event::event_builder::EventBuilder;
-use neutrino_event::{Event, EventPolicy, FormatError, ROOM_VERSION_ID};
+use neutrino_event::{Event, EventPolicy, FormatError};
 use neutrino_room::CoreError;
 use neutrino_room::provider::InMemoryStateProvider;
 use neutrino_room::room_core::{Effect, RoomCore};
@@ -1616,15 +1616,20 @@ fn build_initial_events(
     display_name: &str,
     policy: &neutrino_event::EventPolicy,
 ) -> Result<(Event, Vec<Event>), CreateRoomError> {
+    // The version this room is created under — the medium's if it declared one,
+    // else the base. It is stamped into `content.room_version` (which is how
+    // every peer learns it) and names every event below.
+    let version = policy.versions.default_for_new_rooms().clone();
+
     // create is special: no parents, room_id derived from its own event_id.
     let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned())
         .state_key(String::new())
-        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .content(json!({ "room_version": version.id }))
         .signer(policy.signer().cloned())
-        .ids(Some(policy.ids.clone()))
+        .version(Some(version.clone()))
         .build()?;
 
-    let mut room = RoomCore::new(create.room_id.clone());
+    let mut room = RoomCore::new(create.room_id.clone(), version);
     let mut provider = InMemoryStateProvider::new();
     room.apply_pdu(create.clone(), &provider)?;
     provider.insert(Arc::new(create.clone()));
@@ -1969,7 +1974,12 @@ fn room_actor_response(e: RoomActorError) -> axum::response::Response {
         RoomActorError::Apply(_) | RoomActorError::Rejected => {
             (StatusCode::FORBIDDEN, "M_FORBIDDEN")
         }
-        RoomActorError::Storage(_) | RoomActorError::NotApplied | RoomActorError::ActorGone => {
+        RoomActorError::Storage(_)
+        | RoomActorError::NotApplied
+        | RoomActorError::ActorGone
+        // A room on our own disk whose version this build cannot speak: a
+        // server-side condition, not something the client got wrong.
+        | RoomActorError::UnsupportedRoomVersion => {
             (StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN")
         }
     };
@@ -2090,7 +2100,7 @@ mod tests {
                     signer: Arc::new(signer),
                     resolver: Arc::new(neutrino_event::NodeIdKeyResolver),
                 },
-                None,
+                Arc::new(neutrino_event::RoomVersions::base_only()),
             ),
         );
         let response = build_router(&state)
