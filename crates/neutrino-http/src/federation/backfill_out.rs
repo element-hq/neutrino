@@ -85,10 +85,12 @@ async fn persist_pdus(
 ) -> usize {
     // One lookup for the whole response: every PDU in it belongs to `room_id`
     // (foreign-room ones are dropped below), so they share its version.
-    let Some(version) = neutrino_engine::room_version(store, &policy.versions, room_id).await
-    else {
-        warn!(target: "neutrino_http", %room_id, "backfill: cannot name events in this room, dropping response");
-        return 0;
+    let version = match neutrino_engine::room_version(store, &policy.versions, room_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(target: "neutrino_http", %room_id, error = %e, "backfill: cannot name events in this room, dropping response");
+            return 0;
+        }
     };
     let mut persisted = 0usize;
     for raw in pdus.into_iter().take(limit as usize) {

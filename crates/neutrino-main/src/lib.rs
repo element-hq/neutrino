@@ -120,6 +120,16 @@ pub struct LinkContext {
     /// [`Command::KickBackoff`] when a peer (re)appears so destinations that
     /// backed off while that peer was unreachable retry promptly.
     pub commands: tokio::sync::mpsc::UnboundedSender<Command>,
+    /// The homeserver's store, already open — the same handle the server itself
+    /// uses ([`open_store`], injected into [`entrypoint`]).
+    ///
+    /// A medium that declares a [`FederationLink::room_version`] whose id scheme
+    /// stamps identity fields needs somewhere to keep them (a per-install id, a
+    /// counter high-water resumed at boot). It reads and writes them here rather
+    /// than opening a second connection to the same file — one process, one open
+    /// database — and it has the handle *before* it must construct the version,
+    /// because the store is opened before the link factory runs.
+    pub store: Arc<SqliteStore>,
 }
 
 /// Builds the federation datagram link once the node secret is resolved. The
@@ -241,6 +251,7 @@ pub async fn entrypoint(
                 display_name: display_name_rx,
                 discovery: discovery.clone(),
                 commands: cmd_tx,
+                store: store.clone(),
             })
             .await
             .map_err(|e| -> Box<dyn std::error::Error> { e })?;

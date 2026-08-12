@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 
 use neutrino_event::{Event, EventPolicy};
 use neutrino_store::{StagedPdu, StorageBackend, WithStateProvider};
-use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, RoomId};
+use ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomId};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -253,15 +253,31 @@ async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
         }
 
         // The room's version names every row below. Resolved once per round,
-        // not per PDU. Absent means a storage fault or a room row we can't
-        // interpret: leave the rows staged and retry — dropping them here would
-        // lose events a later round could still apply (a `/send`-staged PDU was
-        // already parsed under this version at ingress, so an unsupported
-        // version cannot be the reason).
-        let Some(version) = room_version(ctx.store.as_ref(), &ctx.policy.versions, &room).await
-        else {
-            sleep_or_poke(ctx.backoff_base, &notify).await;
-            continue;
+        // not per PDU.
+        let version = match room_version(ctx.store.as_ref(), &ctx.policy.versions, &room).await {
+            Ok(v) => v,
+            // Retryable (a storage fault): leave the rows staged. Dropping here
+            // would lose events the next round could still apply.
+            Err(e) if e.is_retryable() => {
+                warn!(%room, error = %e, "cannot name this room's events yet; leaving rows staged");
+                sleep_or_poke(ctx.backoff_base, &notify).await;
+                continue;
+            }
+            // Terminal: no row for this room, or a version this build cannot
+            // speak. These rows can never be applied, so drop them — the same
+            // verdict `process_one` reaches for `UnknownRoom`, and for the same
+            // reason: retrying forever would let an unauthenticated peer
+            // accumulate un-drainable staged rows and a permanent per-room task
+            // by naming rooms we are not in.
+            Err(e) => {
+                let ids: Vec<&EventId> = eligible.iter().map(|p| p.event_id.as_ref()).collect();
+                warn!(%room, error = %e, count = ids.len(), "dropping staged PDUs we can never name");
+                if let Err(e) = ctx.store.unstage_events(&ids).await {
+                    error!(%room, error = %e, "unstaging unnameable PDUs");
+                }
+                backoff.clear();
+                continue;
+            }
         };
 
         // Apply parents before children that are staged together. A row that

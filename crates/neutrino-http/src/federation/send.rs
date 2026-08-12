@@ -35,7 +35,6 @@
 //! omits it); when a peer does send one it is cross-checked against the header
 //! origin and a mismatch is rejected.
 
-use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -189,9 +188,11 @@ pub(crate) async fn handle(
     // recording.
     let mut all_staged = true;
     // One version lookup per distinct room in the transaction, not per PDU: a
-    // transaction commonly carries several events for one room. `None` is
-    // cached too — a room we cannot name events in stays undecidable for the
-    // whole transaction, and re-reading the store per PDU would not change it.
+    // transaction commonly carries several events for one room. Only *decided*
+    // outcomes are cached (a resolved version, or `None` for a terminal refusal
+    // that no retry can change); a storage fault is deliberately not cached, so
+    // it neither poisons the rest of the transaction nor is mistaken for a
+    // refusal.
     let mut versions: HashMap<Option<OwnedRoomId>, Option<Arc<neutrino_event::RoomVersion>>> =
         HashMap::new();
     for raw in body.pdus {
@@ -208,18 +209,37 @@ pub(crate) async fn handle(
         // them rejected (the cascade terminator).
         // A PDU can only be named under its room's version, so resolve that
         // first: the room it claims (the common case) or, for a create, the
-        // version the create declares. Unresolvable ⇒ drop, exactly as an
-        // unparseable PDU is dropped — we are not in that room, or we do not
-        // speak its version, and guessing a version would invent a different
-        // event.
+        // version the create declares.
+        //
+        // A *terminal* refusal (we are not in that room, or we do not speak its
+        // version) is a drop, exactly as an unparseable PDU is dropped — guessing
+        // a version would invent a different event. A *storage fault* is not:
+        // the version is on disk and a resend can succeed, so the PDU is left
+        // unstaged AND the transaction is left unrecorded (`all_staged = false`),
+        // which is what makes the peer resend it. Dropping on a fault would lose
+        // the event for good, since the txn-dedup would swallow the resend.
         let keys = neutrino_event::room_version_keys(&raw);
-        let version = match versions.entry(keys.room_id.clone()) {
-            Entry::Occupied(e) => e.get().clone(),
-            Entry::Vacant(e) => e
-                .insert(
-                    neutrino_engine::room_version_for_wire(&*store, &policy.versions, &raw).await,
-                )
-                .clone(),
+        let cached = versions.get(&keys.room_id).cloned();
+        let version = match cached {
+            Some(decided) => decided,
+            None => match neutrino_engine::room_version_for_wire(&*store, &policy.versions, &raw)
+                .await
+            {
+                Ok(v) => {
+                    versions.insert(keys.room_id.clone(), Some(v.clone()));
+                    Some(v)
+                }
+                Err(e) if e.is_retryable() => {
+                    warn!(room_id = ?keys.room_id, error = %e, "/send: cannot name this room's events; leaving the transaction unrecorded so the peer resends");
+                    all_staged = false;
+                    continue;
+                }
+                Err(e) => {
+                    warn!(room_id = ?keys.room_id, error = %e, "/send: dropping PDU we can never name");
+                    versions.insert(keys.room_id.clone(), None);
+                    None
+                }
+            },
         };
         let Some(version) = version else {
             continue;

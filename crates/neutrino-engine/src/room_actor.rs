@@ -54,8 +54,8 @@ pub enum RoomActorError {
     /// The room exists on disk but its `rooms.room_version` is one this build
     /// does not speak — a peer's medium declared a version we lack. Its events
     /// cannot be named, so the room cannot be served at all.
-    #[error("unsupported room version")]
-    UnsupportedRoomVersion,
+    #[error("unsupported room version {0}")]
+    UnsupportedRoomVersion(String),
     #[error("building event: {0}")]
     Build(#[from] FormatError),
     #[error("event rejected: {0}")]
@@ -78,6 +78,20 @@ pub enum RoomActorError {
     /// The actor task is gone (channel closed) — it panicked or was dropped.
     #[error("room actor unavailable")]
     ActorGone,
+}
+
+/// Preserve the retryable/terminal distinction across the boundary: a storage
+/// fault stays a `Storage` error (transient, 500), an unknown room stays a 404,
+/// and a version this build cannot speak is its own verdict.
+impl From<crate::util::VersionError> for RoomActorError {
+    fn from(e: crate::util::VersionError) -> Self {
+        use crate::util::VersionError;
+        match e {
+            VersionError::UnknownRoom => Self::UnknownRoom,
+            VersionError::Unsupported(v) => Self::UnsupportedRoomVersion(v),
+            VersionError::Fault(e) => Self::Storage(e),
+        }
+    }
 }
 
 /// A command processed by a room actor.
@@ -739,9 +753,7 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomRegistry<S> {
         // names, validates or signs uses it, so it is resolved once here and
         // held by the `RoomCore` rather than passed down each call.
         let version =
-            crate::util::room_version(self.store.as_ref(), &self.policy.versions, room_id)
-                .await
-                .ok_or(RoomActorError::UnsupportedRoomVersion)?;
+            crate::util::room_version(self.store.as_ref(), &self.policy.versions, room_id).await?;
         let room = RoomCore::hydrate(
             room_id.to_owned(),
             version,

@@ -113,6 +113,24 @@ pub(crate) enum FedError {
     Storage(#[from] StorageError),
 }
 
+/// A version we could not resolve, told apart by whether a retry can help: a
+/// storage fault is ours to own (500, the peer should retry), a room we are not
+/// in is a 404, and a version this build cannot speak is a 500 — not the peer's
+/// fault either, and not an `M_INCOMPATIBLE_ROOM_VERSION`, which means the
+/// *requester* lacks the version.
+impl From<neutrino_engine::VersionError> for FedError {
+    fn from(e: neutrino_engine::VersionError) -> Self {
+        use neutrino_engine::VersionError;
+        match e {
+            VersionError::UnknownRoom => FedError::RoomNotFound,
+            VersionError::Unsupported(_) => {
+                FedError::Internal("room is of an unsupported room version")
+            }
+            VersionError::Fault(e) => FedError::Storage(e),
+        }
+    }
+}
+
 impl IntoResponse for FedError {
     fn into_response(self) -> Response {
         // `M_INCOMPATIBLE_ROOM_VERSION` carries an extra `room_version` field
@@ -199,7 +217,7 @@ pub(crate) fn map_apply_err(err: neutrino_engine::RoomActorError) -> FedError {
         // Our own store holds a room whose version this build cannot speak, so
         // we cannot name its events. Not the peer's fault: a 500, not an
         // incompatible-version 400.
-        RoomActorError::UnsupportedRoomVersion => {
+        RoomActorError::UnsupportedRoomVersion(_) => {
             FedError::Internal("room is of an unsupported room version")
         }
     }

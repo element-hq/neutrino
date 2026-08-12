@@ -157,8 +157,12 @@ pub async fn reconcile_room<F: MissingEventsFetcher + ?Sized>(
     // The version every fetched event is named under. Resolved once for both
     // DAG walks; absent means we cannot name this room's events, so there is
     // nothing useful to fetch.
-    let Some(version) = room_version(store, &policy.versions, room_id).await else {
-        return;
+    let version = match room_version(store, &policy.versions, room_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(%peer, %room_id, error = %e, "reconcile: cannot name this room's events");
+            return;
+        }
     };
     let our_timeline: Vec<OwnedEventId> = our_timeline.into_iter().collect();
     let our_state: Vec<OwnedEventId> = our_state.into_iter().collect();

@@ -79,8 +79,7 @@ pub(crate) async fn handle(
     // ignored by contract); the room the event itself claims is.
     let version =
         neutrino_engine::room_version_for_wire(store.as_ref(), &state.policy().versions, &raw)
-            .await
-            .ok_or(FedError::RoomNotFound)?;
+            .await?;
 
     // Parse + compute the event id from the reference hash. `auth_events`
     // start empty — apply_pdu is their sole authority. Resident membership

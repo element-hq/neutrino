@@ -1979,7 +1979,7 @@ fn room_actor_response(e: RoomActorError) -> axum::response::Response {
         | RoomActorError::ActorGone
         // A room on our own disk whose version this build cannot speak: a
         // server-side condition, not something the client got wrong.
-        | RoomActorError::UnsupportedRoomVersion => {
+        | RoomActorError::UnsupportedRoomVersion(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN")
         }
     };

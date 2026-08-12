@@ -285,13 +285,18 @@ pub(crate) async fn federated_invite(
     // The room's version: it goes on the wire in the v2 envelope, and it names
     // the event the invitee hands back. The candidate above was built under it
     // too (the room actor holds it).
-    let Some(version) = neutrino_engine::room_version(&*store, &policy.versions, room_id).await
-    else {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "M_UNKNOWN",
-            "room is of an unsupported room version",
-        );
+    let version = match neutrino_engine::room_version(&*store, &policy.versions, room_id).await {
+        Ok(v) => v,
+        Err(neutrino_engine::VersionError::UnknownRoom) => {
+            return error_response(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Not a known room");
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            );
+        }
     };
     let irs = build_invite_room_state(&*store, room_id, &sender).await;
     let client = FederationClient::new(own_server, federation_proxy.as_deref());

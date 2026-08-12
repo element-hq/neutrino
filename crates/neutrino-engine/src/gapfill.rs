@@ -63,12 +63,12 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
     policy: &EventPolicy,
 ) -> Result<bool, String> {
     let room_id = &event.room_id;
-    // The version every fetched ancestor is named under. This room is ours (the
-    // event being grounded reached the worker), so an unresolvable version is a
-    // transient storage fault: retryable, not a permanent verdict.
+    // The version every fetched ancestor is named under. The caller treats an
+    // `Err` here as retryable, which is right for a storage fault; a terminal
+    // failure means the worker is about to drop these rows anyway.
     let version = room_version(store, &policy.versions, room_id)
         .await
-        .ok_or_else(|| format!("no usable room version for {room_id}"))?;
+        .map_err(|e| e.to_string())?;
     let earliest = state_dag_boundary(store, room_id).await;
     let mut limit = INITIAL_GAPFILL_LIMIT;
     // Whether any round staged a new event. `false` at a grounded exit means the

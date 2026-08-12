@@ -43,8 +43,7 @@ pub(crate) async fn handle(
     let version = {
         let store = lock_app(&state).store.clone();
         neutrino_engine::room_version_for_wire(store.as_ref(), &state.policy().versions, &raw)
-            .await
-            .ok_or(FedError::RoomNotFound)?
+            .await?
     };
 
     // Parse + compute the event id from the reference hash. `auth_events`
