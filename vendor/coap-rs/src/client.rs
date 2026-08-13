@@ -867,7 +867,27 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
                 .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
             self.transport.transport.send(&req_bytes).await?;
             drop(miss_rx);
-            None
+            // A one-block request has no burst for the 4.08 missing-block
+            // mechanism to recover: a lost PDU leaves the server with no transfer
+            // to report gaps in, so the exchange stalls until the caller's own
+            // timeout. Resend on the ladder the burst path already recovers with
+            // (`QBlockReceiver::poll_recovery`: `non_receive_timeout * 2^retry`,
+            // `non_max_retransmit` rounds). The PDU is byte-identical, message id
+            // and token included, so a server that already answered sees a
+            // duplicate rather than a second request. Aborted on return, so a
+            // resend never outlives the exchange it belongs to.
+            let transport = self.transport.transport.clone();
+            let config = self.qblock_config.clone();
+            Some(AbortOnDrop(tokio::spawn(async move {
+                let mut wait = config.non_receive_timeout;
+                for _ in 0..config.non_max_retransmit {
+                    tokio::time::sleep(wait).await;
+                    if transport.send(&req_bytes).await.is_err() {
+                        break;
+                    }
+                    wait = wait.saturating_mul(2);
+                }
+            })))
         };
 
         let receiver = QBlockReceiver::new(
@@ -2855,5 +2875,76 @@ mod test {
             .unwrap();
 
         assert_eq!(resp.message.payload, body);
+    }
+
+    /// Silently swallows the first `drop_first` datagrams, then behaves as a
+    /// plain UDP transport — a lossy link rather than a failing socket, since
+    /// `send` still reports success and nothing above learns the PDU vanished.
+    #[cfg(feature = "q-block")]
+    struct LossyUdp {
+        udp: UdpTransport,
+        drop_first: u32,
+        sent: AtomicU32,
+    }
+
+    #[cfg(feature = "q-block")]
+    #[async_trait]
+    impl ClientTransport for LossyUdp {
+        async fn recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, Option<SocketAddr>)> {
+            self.udp.recv(buf).await
+        }
+
+        async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.sent.fetch_add(1, Ordering::Relaxed) < self.drop_first {
+                return Ok(buf.len());
+            }
+            self.udp.send(buf).await
+        }
+    }
+
+    /// A lost single-PDU request must be resent. The one-block path sends no
+    /// Q-Block1 burst, so the 4.08 missing-block mechanism has no transfer to
+    /// recover and the exchange would otherwise hang to the caller's timeout —
+    /// and a small federation request is exactly this shape, so it is the common
+    /// case rather than an edge one.
+    #[cfg(feature = "q-block")]
+    #[tokio::test]
+    async fn send_qblock_resends_a_lost_single_pdu_request() {
+        use crate::qblock::QBlockConfig;
+
+        let server_port = spawn_server("127.0.0.1:0", |mut req| async {
+            req.response.as_mut().unwrap().message.payload = b"Rust".to_vec();
+            req
+        })
+        .recv()
+        .await
+        .unwrap();
+
+        let peer_addr = lookup_host(format!("127.0.0.1:{server_port}"))
+            .await
+            .unwrap()
+            .next()
+            .unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut client = CoAPClient::from_transport(LossyUdp {
+            udp: UdpTransport { socket, peer_addr },
+            drop_first: 1,
+            sent: 0.into(),
+        });
+        client.set_qblock_config(QBlockConfig {
+            non_receive_timeout: Duration::from_millis(100),
+            ..Default::default()
+        });
+        client.set_block1_size(64);
+
+        let resp = time::timeout(
+            Duration::from_secs(5),
+            client.send_qblock(RequestBuilder::new("/Rust", Method::Get).build()),
+        )
+        .await
+        .expect("the lost single-PDU request was never resent")
+        .unwrap();
+
+        assert_eq!(resp.message.payload, b"Rust".to_vec());
     }
 }

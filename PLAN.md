@@ -49,7 +49,8 @@ Three wire transports, selected by `LbConfig.wire: WireKind`:
   headers + exact HTTP status as CoAP options; tunable via
   `Coap { block1_size, max_message_size }`.
 - `CoapQBlock` — RFC 9177 NON-mode robust transfer (burst + 4.08 missing-block
-  recovery); the **`neutrino-main` default**. Reuses the `Coap` message mapping;
+  recovery; a one-block request, having no burst for 4.08 to reach, resends on
+  the same ladder); the **`neutrino-main` default**. Reuses the `Coap` mapping;
   tuned via `CoapQBlock { block1_size, qblock: QBlockTuning }` (RFC 9177 §6.2).
 
 `WireKind::coap_qblock_for_profile` sizes that tuning from everything the medium

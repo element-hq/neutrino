@@ -1602,6 +1602,47 @@ mod loss_tests {
         );
         token.cancel();
     }
+
+    // The single-datagram twin of the case above. A one-block request sends no
+    // burst, so the 4.08 mechanism has no transfer to recover and only
+    // `send_qblock`'s resend ladder can save it. A small `/send` is exactly this
+    // shape, so the common federation transaction rides on that ladder.
+    #[tokio::test]
+    async fn qblock_survives_a_dropped_single_datagram_request() {
+        let qcfg = coap::qblock::QBlockConfig {
+            non_timeout: Duration::from_millis(50),
+            non_receive_timeout: Duration::from_millis(100),
+            assume_peer_block_size: Some(64),
+            ..Default::default()
+        };
+        let (relay_addr, token, dropped) =
+            spawn_qblock_server_and_relay(vec![1], qcfg.clone()).await;
+
+        let req_body = b"{}".to_vec();
+        let client = CoapWireClient::with_qblock(Some(64), qcfg);
+        let resp = tokio::time::timeout(
+            Duration::from_secs(15),
+            client.send(WireRequest {
+                dest: relay_addr.to_string(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![],
+                body: req_body.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("single-datagram send must complete within the bound")
+        .expect("single-datagram send must recover from the dropped request datagram");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, req_body);
+        assert!(
+            dropped.load(Ordering::SeqCst) >= 1,
+            "relay never dropped the targeted datagram — the resend was not exercised"
+        );
+        token.cancel();
+    }
 }
 
 #[cfg(test)]
