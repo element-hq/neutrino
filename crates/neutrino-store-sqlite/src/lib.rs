@@ -39,12 +39,12 @@ mod row;
 mod schema;
 mod store;
 
+pub use crate::error::Error;
 pub use crate::store::SqliteStateProvider;
+pub use deadpool_sqlite::rusqlite;
 
 #[cfg(test)]
 mod tests;
-
-use crate::error::Error;
 
 /// SQLite-backed `StorageBackend`.
 ///
@@ -342,7 +342,7 @@ impl SqliteStore {
     /// `PRAGMA query_only = ON` on every connection — this is the
     /// enforcement primitive that catches a method silently bypassing
     /// the writer-serialisation point.
-    pub(crate) async fn run_read<F, T>(&self, f: F) -> Result<T, StorageError>
+    pub async fn run_read<F, T>(&self, f: F) -> Result<T, StorageError>
     where
         F: FnOnce(&mut Connection) -> Result<T, Error> + Send + 'static,
         T: Send + 'static,
@@ -363,7 +363,7 @@ impl SqliteStore {
     /// the await. The timeout covers the *entire* call — both the FIFO
     /// queue wait and the blocking closure — so a writer queued behind
     /// a hung one will also surface a timeout rather than wait forever.
-    pub(crate) async fn run_write<F, T>(&self, f: F) -> Result<T, StorageError>
+    pub async fn run_write<F, T>(&self, f: F) -> Result<T, StorageError>
     where
         F: FnOnce(&mut Connection) -> Result<T, Error> + Send + 'static,
         T: Send + 'static,

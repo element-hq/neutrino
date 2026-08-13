@@ -47,16 +47,28 @@ pub struct RoomVersion {
     /// [`rules`](Self::rules).
     pub ids: Arc<dyn EventIdScheme>,
 
+    /// This version's divergence from ruma's redaction keep-list.
+    pub redaction_keys: RedactionKeys,
+}
+
+/// A room version's divergence from ruma's redaction keep-list.
+#[derive(Debug)]
+pub struct RedactionKeys {
     /// Top-level keys that survive redaction beyond ruma's keep-list.
     ///
     /// Two things end up here. MSC4242's `prev_state_events` — every version
     /// this repo speaks must list it, since the state-DAG parentage field has
     /// to be covered by the reference hash but the v11/v12 keep-list doesn't
     /// (yet) mention it. And the identity-bearing fields a stamping
-    /// [`ids`](Self::ids) scheme writes, which must survive redaction or the
-    /// event would change its name when redacted (receipt-check 3 redacts a
+    /// [`ids`](RoomVersion::ids) scheme writes, which must survive redaction or
+    /// the event would change its name when redacted (receipt-check 3 redacts a
     /// content-hash mismatch and carries on with the result).
-    pub extra_redaction_keys: &'static [&'static str],
+    pub added: &'static [&'static str],
+
+    /// Top-level keys stripped despite ruma's keep-list. Such a key is covered
+    /// by neither the event's name nor a signature, so a wire format may omit
+    /// it and rebuild it on receipt.
+    pub removed: &'static [&'static str],
 }
 
 impl RoomVersion {
@@ -89,7 +101,10 @@ static BASE: LazyLock<Arc<RoomVersion>> = LazyLock::new(|| {
         id: crate::ROOM_VERSION_ID,
         rules: RoomVersionRules::V12,
         ids: Arc::new(ReferenceHashIds),
-        extra_redaction_keys: &["prev_state_events"],
+        redaction_keys: RedactionKeys {
+            added: &["prev_state_events"],
+            removed: &[],
+        },
     })
 });
 
@@ -206,7 +221,10 @@ mod tests {
             id,
             rules: RoomVersionRules::V12,
             ids: Arc::new(StubIds),
-            extra_redaction_keys: &["prev_state_events", "seq"],
+            redaction_keys: RedactionKeys {
+                added: &["prev_state_events", "seq"],
+                removed: &[],
+            },
         }
     }
 
@@ -243,6 +261,7 @@ mod tests {
 
     #[test]
     fn base_version_declares_the_msc4242_carve_out() {
-        assert_eq!(base_version().extra_redaction_keys, ["prev_state_events"]);
+        assert_eq!(base_version().redaction_keys.added, ["prev_state_events"]);
+        assert!(base_version().redaction_keys.removed.is_empty());
     }
 }

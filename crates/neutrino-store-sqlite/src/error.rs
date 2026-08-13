@@ -3,17 +3,19 @@ use neutrino_store::StorageError;
 use rusqlite::ErrorCode;
 use thiserror::Error;
 
-/// Internal error type. Aggregates every error source the SQLite backend can
-/// observe (driver, pool, JSON crack). The single `From<Error> for
-/// StorageError` impl in this file is the canonical mapping point — design
-/// doc §3, the "single point of variant-selection".
+/// Aggregates every error source the SQLite backend can observe (driver, pool,
+/// JSON crack), and the error type a closure handed to
+/// [`SqliteStore::run_read`](crate::SqliteStore::run_read) /
+/// [`run_write`](crate::SqliteStore::run_write) returns. The single
+/// `From<Error> for StorageError` impl in this file is the canonical mapping
+/// point — design doc §3, the "single point of variant-selection".
 ///
 /// Orphan rule: `StorageError` lives in `neutrino-store`, which does not (and
 /// must not) depend on `rusqlite`/`deadpool`. We can't write
 /// `From<rusqlite::Error> for StorageError` there, so this local enum is the
 /// only place those `From` impls can live.
 #[derive(Debug, Error)]
-pub(crate) enum Error {
+pub enum Error {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
 
