@@ -11,6 +11,7 @@ pub use neutrino_lb::{
     CBOR_CONTENT_FORMAT, CaptureControl, CodecError, DatagramLink, LinkAddr, LinkCodec, LinkPacing,
     LinkProfile, WireRequest, WireResponse,
 };
+pub use neutrino_store::StorageError;
 pub use neutrino_store_sqlite::{Error as SqliteError, SqliteStore, rusqlite};
 
 use std::future::Future;

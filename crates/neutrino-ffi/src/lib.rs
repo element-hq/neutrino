@@ -8,7 +8,7 @@ mod watchdog;
 /// crate-structure rule in CLAUDE.md. Fields are required unless marked with a
 /// `uniffi` default; the dev binary's defaults live in
 /// `Config::default`/`from_env`.
-#[derive(uniffi::Record)]
+#[derive(uniffi::Record, Clone)]
 pub struct NeutrinoConfig {
     pub bind_addr: String,
     pub localpart: String,
