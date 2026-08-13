@@ -191,7 +191,10 @@ mod tests {
             id: "org.matrix.neutrino.test.other",
             rules: ruma::room_version_rules::RoomVersionRules::V12,
             ids: std::sync::Arc::new(neutrino_event::event_id::ReferenceHashIds),
-            extra_redaction_keys: &["prev_state_events"],
+            redaction_keys: neutrino_event::room_version::RedactionKeys {
+                added: &["prev_state_events"],
+                removed: &[],
+            },
         }
     }
 

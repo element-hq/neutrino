@@ -371,7 +371,7 @@ pub fn from_wire(
     // An event with no `hashes` at all is taken as-is: that is what a
     // trusted-network peer emits (see `EventBuilder::build`), and redacting
     // every such event would empty every message in the mesh.
-    // The version's `extra_redaction_keys` are kept, so the redacted bytes can
+    // The version's `redaction_keys.added` survive, so the redacted bytes can
     // still re-derive this event's id — receipt-check 3 redacts and carries on,
     // so the id must survive it.
     //
@@ -1420,13 +1420,16 @@ mod tests {
 
     /// A room version named by [`TimestampIds`] off the given clock reading.
     /// `id_ts` is the id's only input, so the version must keep it through
-    /// redaction — that is what `extra_redaction_keys` is for.
+    /// redaction — that is what `RedactionKeys::added` is for.
     fn timestamp_version(clock: i64) -> std::sync::Arc<RoomVersion> {
         std::sync::Arc::new(RoomVersion {
             id: "org.matrix.neutrino.test.ts",
             rules: ruma::room_version_rules::RoomVersionRules::V12,
             ids: std::sync::Arc::new(TimestampIds(clock)),
-            extra_redaction_keys: &["prev_state_events", "id_ts"],
+            redaction_keys: crate::RedactionKeys {
+                added: &["prev_state_events", "id_ts"],
+                removed: &[],
+            },
         })
     }
 
