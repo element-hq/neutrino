@@ -111,8 +111,10 @@ impl QBlockTuning {
     ///   as loss. Sized to that pause plus a full queueing bound, which is
     ///   the longest a block can legitimately still be in flight.
     ///
-    /// Left alone: `non_max_retransmit` (recovery rounds are a loss-tolerance
-    /// choice, not a timing one) and the CON-mode fields the NON path ignores.
+    /// Left alone: `non_max_retransmit` (a loss-tolerance choice) and the CON-mode
+    /// fields the NON path ignores. Note it does carry timing weight in one place:
+    /// with `non_receive_timeout` it sizes how long a single-datagram request
+    /// waits for any answer before failing over to a fresh-token retry.
     pub fn for_pacing(pacing: LinkPacing) -> Self {
         let interval = pacing.datagram_interval.max(Duration::from_millis(1));
         // How many datagrams can clear the queue inside its own bound — and

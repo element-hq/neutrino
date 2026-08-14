@@ -836,8 +836,7 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
         // Send the request: Q-Block1 burst if the body needs more than one block,
         // else a single PDU.
         let body = std::mem::take(&mut request.message.payload);
-        let mut probe = false;
-        let _drive_guard = if body.len() > block_size {
+        let drive_guard = if body.len() > block_size {
             let mut template = request.message.clone();
             template.payload.clear();
             let seed = token
@@ -868,12 +867,6 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
                 .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
             self.transport.transport.send(&req_bytes).await?;
             drop(miss_rx);
-            // A one-block request has no burst for the 4.08 missing-block
-            // mechanism to recover, so its loss is only visible as silence. Hand
-            // the PDU to the receiver as its probe: recovery then re-sends it on
-            // the same ladder it uses for missing blocks, and stops the moment a
-            // block arrives.
-            probe = true;
             None
         };
 
@@ -883,8 +876,12 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
             self.max_total_message_size.unwrap_or(usize::MAX),
             self.qblock_config.clone(),
         );
-        if probe {
-            receiver = receiver.with_request_probe();
+        if drive_guard.is_none() {
+            // The whole request went in one datagram, so it had no burst for the
+            // peer's 4.08 to recover and its loss is only visible as silence.
+            // Give up on the head timeout and let the caller retry with a fresh
+            // token, instead of waiting out its whole request timeout.
+            receiver = receiver.expire_when_nothing_arrives();
         }
         // Race the Q-Block2 reassembly against a plain single-PDU response: a
         // large reply completes via `drive_receive`, a small one via `plain_rx`.
@@ -2865,76 +2862,5 @@ mod test {
             .unwrap();
 
         assert_eq!(resp.message.payload, body);
-    }
-
-    /// Silently swallows the first `drop_first` datagrams, then behaves as a
-    /// plain UDP transport — a lossy link rather than a failing socket, since
-    /// `send` still reports success and nothing above learns the PDU vanished.
-    #[cfg(feature = "q-block")]
-    struct LossyUdp {
-        udp: UdpTransport,
-        drop_first: u32,
-        sent: AtomicU32,
-    }
-
-    #[cfg(feature = "q-block")]
-    #[async_trait]
-    impl ClientTransport for LossyUdp {
-        async fn recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, Option<SocketAddr>)> {
-            self.udp.recv(buf).await
-        }
-
-        async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
-            if self.sent.fetch_add(1, Ordering::Relaxed) < self.drop_first {
-                return Ok(buf.len());
-            }
-            self.udp.send(buf).await
-        }
-    }
-
-    /// A lost single-PDU request must be resent. The one-block path sends no
-    /// Q-Block1 burst, so the 4.08 missing-block mechanism has no transfer to
-    /// recover and the exchange would otherwise hang to the caller's timeout —
-    /// and a small federation request is exactly this shape, so it is the common
-    /// case rather than an edge one.
-    #[cfg(feature = "q-block")]
-    #[tokio::test]
-    async fn send_qblock_resends_a_lost_single_pdu_request() {
-        use crate::qblock::QBlockConfig;
-
-        let server_port = spawn_server("127.0.0.1:0", |mut req| async {
-            req.response.as_mut().unwrap().message.payload = b"Rust".to_vec();
-            req
-        })
-        .recv()
-        .await
-        .unwrap();
-
-        let peer_addr = lookup_host(format!("127.0.0.1:{server_port}"))
-            .await
-            .unwrap()
-            .next()
-            .unwrap();
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let mut client = CoAPClient::from_transport(LossyUdp {
-            udp: UdpTransport { socket, peer_addr },
-            drop_first: 1,
-            sent: 0.into(),
-        });
-        client.set_qblock_config(QBlockConfig {
-            non_receive_timeout: Duration::from_millis(100),
-            ..Default::default()
-        });
-        client.set_block1_size(64);
-
-        let resp = time::timeout(
-            Duration::from_secs(5),
-            client.send_qblock(RequestBuilder::new("/Rust", Method::Get).build()),
-        )
-        .await
-        .expect("the lost single-PDU request was never resent")
-        .unwrap();
-
-        assert_eq!(resp.message.payload, b"Rust".to_vec());
     }
 }

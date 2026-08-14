@@ -49,11 +49,12 @@ Three wire transports, selected by `LbConfig.wire: WireKind`:
   headers + exact HTTP status as CoAP options; tunable via
   `Coap { block1_size, max_message_size }`.
 - `CoapQBlock` — RFC 9177 NON-mode robust transfer (burst + 4.08 missing-block
-  recovery; a one-block request, having no burst for 4.08 to reach, is re-sent by
-  the receiver's request probe until its first response block arrives, and the
-  peer drops a probe for a request it is still answering); the **`neutrino-main`
-  default**. Reuses the `Coap` mapping;
+  recovery); the **`neutrino-main` default**. Reuses the `Coap` message mapping;
   tuned via `CoapQBlock { block1_size, qblock: QBlockTuning }` (RFC 9177 §6.2).
+  A one-block request has no burst for a 4.08 to reach, so its loss is only
+  visible as silence: the exchange gives up once no response block has arrived in
+  `non_receive_timeout × (non_max_retransmit + 1)` and the caller retries under a
+  fresh token.
 
 `WireKind::coap_qblock_for_profile` sizes that tuning from everything the medium
 declares, not just its MTU. A medium that *meters* its sends declares
@@ -175,6 +176,11 @@ Deferred follow-ups (write-ups, not done):
   allocation, but the RFC 7959 CON path still relies on the post-reassembly cap —
   coap-lite's accumulator isn't externally bounded mid-transfer. Acceptable under
   the trusted-network assumption.
+- Q-Block final-block validation: a More-unset block is bounded only by
+  `max_body_len`, so one forged datagram can end a reassembly short (or, sent
+  first, be the whole body). The size a peer already advertised in `Size1`/`Size2`
+  is parsed but never compared against the assembled length. Only the non-final
+  case is checked today.
 - Upstream the fork changes (`Server::*_with_config`, q-block API, DoS knobs) so
   the `[patch.crates-io]` git pins can drop.
 - SLIP / serial-link framing on the CoAP/UDP transport — the physical link.
