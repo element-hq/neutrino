@@ -836,6 +836,7 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
         // Send the request: Q-Block1 burst if the body needs more than one block,
         // else a single PDU.
         let body = std::mem::take(&mut request.message.payload);
+        let mut probe = false;
         let _drive_guard = if body.len() > block_size {
             let mut template = request.message.clone();
             template.payload.clear();
@@ -868,34 +869,23 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
             self.transport.transport.send(&req_bytes).await?;
             drop(miss_rx);
             // A one-block request has no burst for the 4.08 missing-block
-            // mechanism to recover: a lost PDU leaves the server with no transfer
-            // to report gaps in, so the exchange stalls until the caller's own
-            // timeout. Resend on the ladder the burst path already recovers with
-            // (`QBlockReceiver::poll_recovery`: `non_receive_timeout * 2^retry`,
-            // `non_max_retransmit` rounds). The PDU is byte-identical, message id
-            // and token included, so a server that already answered sees a
-            // duplicate rather than a second request. Aborted on return, so a
-            // resend never outlives the exchange it belongs to.
-            let transport = self.transport.transport.clone();
-            let config = self.qblock_config.clone();
-            Some(AbortOnDrop(tokio::spawn(async move {
-                let mut wait = config.non_receive_timeout;
-                for _ in 0..config.non_max_retransmit {
-                    tokio::time::sleep(wait).await;
-                    if transport.send(&req_bytes).await.is_err() {
-                        break;
-                    }
-                    wait = wait.saturating_mul(2);
-                }
-            })))
+            // mechanism to recover, so its loss is only visible as silence. Hand
+            // the PDU to the receiver as its probe: recovery then re-sends it on
+            // the same ladder it uses for missing blocks, and stops the moment a
+            // block arrives.
+            probe = true;
+            None
         };
 
-        let receiver = QBlockReceiver::new(
+        let mut receiver = QBlockReceiver::new(
             CoapOption::QBlock2,
             request.message.clone(),
             self.max_total_message_size.unwrap_or(usize::MAX),
             self.qblock_config.clone(),
         );
+        if probe {
+            receiver = receiver.with_request_probe();
+        }
         // Race the Q-Block2 reassembly against a plain single-PDU response: a
         // large reply completes via `drive_receive`, a small one via `plain_rx`.
         // `biased` takes a ready plain response before polling the reassembler;

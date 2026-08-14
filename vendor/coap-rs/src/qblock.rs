@@ -359,6 +359,9 @@ pub struct QBlockReceiver {
     /// request (method/uri/token, no block option); for Q-Block1 a base whose
     /// token is echoed into the 4.08.
     recovery_template: Packet,
+    /// Whether to re-send `recovery_template` while no block has arrived (see
+    /// [`with_request_probe`](Self::with_request_probe)).
+    probe_with_request: bool,
     /// Upper bound on the reassembled body, to cap buffer growth from a block
     /// claiming a wild offset (mirrors coap-lite's uncommitted-reserve guard).
     max_body_len: usize,
@@ -370,8 +373,8 @@ pub struct QBlockReceiver {
 pub enum RecoveryOutcome {
     /// Nothing due yet; poll again after this long.
     Wait(Duration),
-    /// Send this missing-block request PDU (a retry has been counted). The
-    /// caller resets its since-activity timer after sending.
+    /// Send this recovery PDU (a retry has been counted). The caller resets its
+    /// since-activity timer after sending.
     Resend(Packet),
     /// `NON_MAX_RETRANSMIT` rounds exhausted; abandon the partial body.
     Expired,
@@ -398,9 +401,25 @@ impl QBlockReceiver {
             szx: None,
             retry: 0,
             recovery_template,
+            probe_with_request: false,
             max_body_len,
             config,
         }
+    }
+
+    /// Re-send the recovery template verbatim while no block has arrived yet.
+    /// Until the first block the block size is unknown, so no missing-block
+    /// request can be built and a lost *request* is invisible to recovery: the
+    /// peer has no transfer to report gaps in, and the transfer stalls to
+    /// `non_partial_timeout`.
+    ///
+    /// Valid only when the template is the complete request, i.e. a request whose
+    /// whole body fitted one datagram — the probe is that request, byte for byte.
+    /// A Q-Block1 burst recovers via 4.08 instead, and its template holds no
+    /// payload to re-send.
+    pub fn with_request_probe(mut self) -> Self {
+        self.probe_with_request = true;
+        self
     }
 
     /// The set of received blocks (for recovery: [`RangeSet::missing`]).
@@ -577,7 +596,14 @@ impl QBlockReceiver {
     /// `MAX_PAYLOADS` so it stays small), or `None` if nothing is missing /
     /// the body length isn't yet known.
     fn build_recovery_request(&self) -> Option<Packet> {
-        let szx = self.szx?;
+        // Nothing received yet, so there are no block numbers to ask for: probe
+        // by re-sending the request itself. `szx` is set by the first block and
+        // never cleared, so this happens only at the head of a transfer.
+        let Some(szx) = self.szx else {
+            return self
+                .probe_with_request
+                .then(|| self.recovery_template.clone());
+        };
         let block_size = 1usize << (szx + 4);
         let final_block = self.final_block(block_size)?;
         let mut missing = self.rec_blocks.missing(final_block);
@@ -1529,6 +1555,148 @@ mod tests {
             "a stalled partial transfer must be abandoned at non_partial_timeout"
         );
         drop(tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_probe_resends_the_request_until_the_retry_cap() {
+        // Nothing ever arrives, so the block size stays unknown and no
+        // missing-block request can be built: the probe is the only recovery
+        // available. It rides the same ladder — `non_receive_timeout << retry`,
+        // reset on each send, so cumulatively 1/3/7/15 × NRT — and then expires.
+        let cfg = QBlockConfig {
+            non_receive_timeout: Duration::from_secs(1),
+            non_max_retransmit: 4,
+            non_partial_timeout: Duration::from_secs(120),
+            ..Default::default()
+        };
+        let request = request_template();
+        // Kept alive across the await: a closed channel would end the transfer
+        // for the wrong reason.
+        let (_tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let sink = RecordingSink::default();
+        let receiver = QBlockReceiver::new(CoapOption::QBlock2, request.clone(), 1 << 20, cfg)
+            .with_request_probe();
+
+        let start = Instant::now();
+        assert_eq!(drive_receive(receiver, rx, &sink).await.unwrap(), None);
+
+        let sent = sink.sent.lock().unwrap();
+        let offsets: Vec<u64> = sent
+            .iter()
+            .map(|(_, at)| at.duration_since(start).as_secs())
+            .collect();
+        assert_eq!(
+            offsets,
+            vec![1, 3, 7, 15],
+            "the probe must follow the recovery ladder"
+        );
+        let expected = request.to_bytes().unwrap();
+        assert!(
+            sent.iter().all(|(pdu, _)| *pdu == expected),
+            "each probe must be the request byte for byte, message id and token included"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn probe_stops_once_a_block_has_arrived() {
+        // The gate this whole mechanism turns on: once any block lands, `szx` is
+        // known and recovery must ask for the gaps, never re-send the request —
+        // which would re-run the peer's handler and open a second transfer under
+        // the same token. Blocks 1 and 2 arrive first so recovery is genuinely
+        // active (for the missing block 0) while the assertion runs.
+        let cfg = QBlockConfig {
+            non_receive_timeout: Duration::from_secs(1),
+            non_partial_timeout: Duration::from_secs(120),
+            ..Default::default()
+        };
+        let request = request_template();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let sink = RecordingSink::default();
+        let receiver = QBlockReceiver::new(CoapOption::QBlock2, request.clone(), 1 << 20, cfg)
+            .with_request_probe();
+
+        let feed = async {
+            for (num, more, byte) in [(1u16, true, 1u8), (2, false, 2)] {
+                let pdu = block_pkt(num, more, 0, vec![byte; 16]).to_bytes().unwrap();
+                tx.send(pdu).await.unwrap();
+            }
+            // Several recovery rounds' worth, then the gap is filled.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let pdu = block_pkt(0, true, 0, vec![0u8; 16]).to_bytes().unwrap();
+            tx.send(pdu).await.unwrap();
+        };
+        let (got, ()) = tokio::join!(drive_receive(receiver, rx, &sink), feed);
+
+        let body: Vec<u8> = [0u8, 1, 2].iter().flat_map(|b| [*b; 16]).collect();
+        assert_eq!(got.unwrap().map(|(b, _carrier)| b), Some(body));
+
+        let sent = sink.sent.lock().unwrap();
+        assert!(
+            !sent.is_empty(),
+            "recovery must have asked for the missing block"
+        );
+        let request_bytes = request.to_bytes().unwrap();
+        for (pdu, _) in sent.iter() {
+            assert_ne!(
+                *pdu, request_bytes,
+                "the request must never be re-sent once a block has arrived"
+            );
+            assert_eq!(
+                qblock2_nums(&Packet::from_bytes(pdu).unwrap()),
+                vec![0],
+                "recovery must ask for the block that is missing"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn probe_never_fires_mid_transfer_with_the_body_length_unknown() {
+        // One non-final block, no Size2: the length is unknown, so no
+        // missing-block request can be built either — the case where a probe
+        // guarded by "can't build a recovery request" rather than by "nothing has
+        // arrived" would fire mid-transfer, re-running the peer's handler while
+        // its response is still coming in. Nothing may be sent at all.
+        let cfg = QBlockConfig {
+            non_receive_timeout: Duration::from_secs(1),
+            non_partial_timeout: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let request = request_template();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        tx.send(block_pkt(0, true, 0, vec![7u8; 16]).to_bytes().unwrap())
+            .await
+            .unwrap();
+        let sink = RecordingSink::default();
+        let receiver = QBlockReceiver::new(CoapOption::QBlock2, request.clone(), 1 << 20, cfg)
+            .with_request_probe();
+
+        // `tx` stays alive, so only the partial-timeout can end this.
+        assert_eq!(drive_receive(receiver, rx, &sink).await.unwrap(), None);
+        assert!(
+            sink.sent.lock().unwrap().is_empty(),
+            "a transfer in progress must never be probed"
+        );
+        drop(tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_a_probe_a_silent_transfer_sends_nothing() {
+        // The Q-Block1 burst path sets no probe: a lost request block is
+        // recovered by the peer's 4.08, and its recovery template holds no body
+        // to re-send. Such a receiver must stay silent.
+        let cfg = QBlockConfig {
+            non_receive_timeout: Duration::from_secs(1),
+            non_partial_timeout: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let (_tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let sink = RecordingSink::default();
+        let receiver = QBlockReceiver::new(CoapOption::QBlock2, request_template(), 1 << 20, cfg);
+
+        let start = Instant::now();
+        assert_eq!(drive_receive(receiver, rx, &sink).await.unwrap(), None);
+        assert!(sink.sent.lock().unwrap().is_empty());
+        assert_eq!(start.elapsed().as_secs(), 10);
     }
 
     #[tokio::test(start_paused = true)]

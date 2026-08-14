@@ -1380,11 +1380,21 @@ mod loss_tests {
     // whose 1-based arrival index is in `drop_to_server` — modelling a lossy radio
     // link. A dropped CON forces coap-rs to retransmit (5 retries × 2s), so the
     // transfer must still complete. Runs until `token` fires.
+    /// Client→server datagram counters kept by [`run_lossy_relay`], so a test can
+    /// prove both that the loss was injected and that the sender recovered from it.
+    #[derive(Clone, Default)]
+    struct RelayCounts {
+        /// Datagrams the relay saw, forwarded or dropped.
+        seen: Arc<AtomicUsize>,
+        /// Datagrams the relay dropped.
+        dropped: Arc<AtomicUsize>,
+    }
+
     async fn run_lossy_relay(
         front: UdpSocket,
         server: SocketAddr,
         drop_to_server: Vec<usize>,
-        dropped: Arc<AtomicUsize>,
+        counts: RelayCounts,
         token: CancellationToken,
     ) {
         let back = UdpSocket::bind("127.0.0.1:0")
@@ -1401,9 +1411,10 @@ mod loss_tests {
                     let Ok((n, src)) = r else { return };
                     client_addr = Some(src);
                     to_server_seen += 1;
+                    counts.seen.fetch_add(1, Ordering::SeqCst);
                     if drop_to_server.contains(&to_server_seen) {
                         // drop this datagram; the sender must retransmit/recover.
-                        dropped.fetch_add(1, Ordering::SeqCst);
+                        counts.dropped.fetch_add(1, Ordering::SeqCst);
                         continue;
                     }
                     let _ = back.send_to(&from_client[..n], server).await;
@@ -1437,12 +1448,12 @@ mod loss_tests {
             .expect("relay front bind");
         let front_addr = front.local_addr().unwrap();
         let relay_token = token.clone();
-        // CON callers don't assert drop counts; discard the counter.
+        // CON callers don't assert datagram counts; discard them.
         tokio::spawn(run_lossy_relay(
             front,
             server_addr,
             drop_to_server,
-            Arc::new(AtomicUsize::new(0)),
+            RelayCounts::default(),
             relay_token,
         ));
 
@@ -1517,7 +1528,7 @@ mod loss_tests {
     async fn spawn_qblock_server_and_relay(
         drop_to_server: Vec<usize>,
         server_qcfg: coap::qblock::QBlockConfig,
-    ) -> (SocketAddr, CancellationToken, Arc<AtomicUsize>) {
+    ) -> (SocketAddr, CancellationToken, RelayCounts) {
         let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let server_addr: SocketAddr = probe.local_addr().unwrap();
         drop(probe);
@@ -1535,20 +1546,20 @@ mod loss_tests {
             .expect("relay front bind");
         let front_addr = front.local_addr().unwrap();
         let relay_token = token.clone();
-        // Returned so the test can assert the targeted datagram was actually
-        // dropped — otherwise a framing change could make "recovery" a vacuous
-        // lossless pass.
-        let dropped = Arc::new(AtomicUsize::new(0));
+        // Returned so a test can assert the targeted datagram was actually dropped
+        // *and* that the sender put a further datagram on the wire — otherwise a
+        // framing change could make "recovery" a vacuous lossless pass.
+        let counts = RelayCounts::default();
         tokio::spawn(run_lossy_relay(
             front,
             server_addr,
             drop_to_server,
-            dropped.clone(),
+            counts.clone(),
             relay_token,
         ));
 
         tokio::time::sleep(Duration::from_millis(50)).await;
-        (front_addr, token, dropped)
+        (front_addr, token, counts)
     }
 
     // A datagram dropped mid Q-Block burst must be recovered by the 4.08
@@ -1568,7 +1579,7 @@ mod loss_tests {
             assume_peer_block_size: Some(64),
             ..Default::default()
         };
-        let (relay_addr, token, dropped) =
+        let (relay_addr, token, counts) =
             spawn_qblock_server_and_relay(vec![3], qcfg.clone()).await;
 
         let req_body: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
@@ -1596,17 +1607,18 @@ mod loss_tests {
         // The body matching is only meaningful if a datagram was actually
         // dropped: in NON mode there is no CON retransmit, so reassembling an
         // intact body *after a confirmed drop* is Q-Block's 4.08 recovery at work.
-        assert!(
-            dropped.load(Ordering::SeqCst) >= 1,
+        assert_eq!(
+            counts.dropped.load(Ordering::SeqCst),
+            1,
             "relay never dropped the targeted datagram — recovery was not exercised"
         );
         token.cancel();
     }
 
     // The single-datagram twin of the case above. A one-block request sends no
-    // burst, so the 4.08 mechanism has no transfer to recover and only
-    // `send_qblock`'s resend ladder can save it. A small `/send` is exactly this
-    // shape, so the common federation transaction rides on that ladder.
+    // burst, so the 4.08 mechanism has no transfer to recover and only the
+    // receiver's request probe can save it. A small `/send` is exactly this shape,
+    // so the common federation transaction rides on that probe.
     #[tokio::test]
     async fn qblock_survives_a_dropped_single_datagram_request() {
         let qcfg = coap::qblock::QBlockConfig {
@@ -1615,7 +1627,7 @@ mod loss_tests {
             assume_peer_block_size: Some(64),
             ..Default::default()
         };
-        let (relay_addr, token, dropped) =
+        let (relay_addr, token, counts) =
             spawn_qblock_server_and_relay(vec![1], qcfg.clone()).await;
 
         let req_body = b"{}".to_vec();
@@ -1637,9 +1649,18 @@ mod loss_tests {
 
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, req_body);
+        assert_eq!(
+            counts.dropped.load(Ordering::SeqCst),
+            1,
+            "relay never dropped the targeted datagram"
+        );
+        // The load-bearing assertion: with the only request datagram dropped, the
+        // response can only have come from a *second* one. `dropped >= 1` cannot
+        // fail at drop index 1 — the client always sends once — so it proves the
+        // relay is wired, not that the probe fired.
         assert!(
-            dropped.load(Ordering::SeqCst) >= 1,
-            "relay never dropped the targeted datagram — the resend was not exercised"
+            counts.seen.load(Ordering::SeqCst) >= 2,
+            "the request was never re-sent — recovery did not happen"
         );
         token.cancel();
     }

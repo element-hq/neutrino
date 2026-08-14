@@ -29,7 +29,7 @@ use crate::qblock::{
 #[cfg(feature = "q-block")]
 use coap_lite::{block_handler::BlockValue, MessageType};
 #[cfg(feature = "q-block")]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug)]
 pub enum CoAPServerError {
@@ -430,6 +430,35 @@ struct QBlockServerState {
     max_transfers: usize,
     sends: Mutex<HashMap<Vec<u8>, mpsc::Sender<Vec<u32>>>>,
     recvs: Mutex<HashMap<Vec<u8>, QBlockRecv>>,
+    /// Requests being answered right now, keyed by `(peer, token)`. A duplicate
+    /// arriving while its original is still in flight is dropped (RFC 7252 §4.5
+    /// permits ignoring a duplicate): a client probing for a lost request
+    /// re-sends it verbatim, and dispatching it again would run the handler a
+    /// second time and give the second response the first's token, colliding in
+    /// `sends` and stripping the inter-burst pacing off both transfers.
+    ///
+    /// A `std` mutex, not tokio's: the critical sections are a hash insert and
+    /// remove with no await between, and [`InflightGuard`] releases on drop.
+    inflight: std::sync::Mutex<HashSet<(SocketAddr, Vec<u8>)>>,
+}
+
+/// Holds one `(peer, token)` in [`QBlockServerState::inflight`] for as long as
+/// that request is being answered. A value rather than a scope guard because the
+/// response can outlive its dispatch: a Q-Block2 burst is driven by a spawned
+/// task, which takes ownership of the guard for the life of the transfer.
+#[cfg(feature = "q-block")]
+struct InflightGuard {
+    state: Arc<QBlockServerState>,
+    key: (SocketAddr, Vec<u8>),
+}
+
+#[cfg(feature = "q-block")]
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut inflight) = self.state.inflight.lock() {
+            inflight.remove(&self.key);
+        }
+    }
 }
 
 /// The Request-Tag (RFC 9175, option 292) carried by `packet`, used to correlate
@@ -459,7 +488,22 @@ impl QBlockServerState {
             max_transfers,
             sends: Mutex::new(HashMap::new()),
             recvs: Mutex::new(HashMap::new()),
+            inflight: std::sync::Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Claims `(source, token)` for the request about to be dispatched, or
+    /// returns `None` if it is already being answered — i.e. this packet is a
+    /// duplicate and must not be processed.
+    fn begin(self: &Arc<Self>, source: SocketAddr, token: Vec<u8>) -> Option<InflightGuard> {
+        let key = (source, token);
+        if !self.inflight.lock().ok()?.insert(key.clone()) {
+            return None;
+        }
+        Some(InflightGuard {
+            state: self.clone(),
+            key,
+        })
     }
 
     /// If `packet` is a missing-block request for an in-flight Q-Block2 send
@@ -495,6 +539,7 @@ impl QBlockServerState {
         self: &Arc<Self>,
         request: &CoapRequest<SocketAddr>,
         respond: Arc<dyn Responder>,
+        inflight: &mut Option<InflightGuard>,
     ) -> bool {
         let szx = match request
             .message
@@ -550,9 +595,14 @@ impl QBlockServerState {
         let linger = self.config.non_receive_timeout * (self.config.non_max_retransmit + 2);
         let sink = ResponderSink(respond);
         let state = self.clone();
+        // The burst outlives this call, so the in-flight claim travels with it: a
+        // probe arriving before the client has seen its first block must not
+        // start a second transfer under the same token.
+        let inflight = inflight.take();
         tokio::spawn(async move {
             let _ = drive_send(sender, &sink, rx, linger).await;
             state.sends.lock().await.remove(&token);
+            drop(inflight);
         });
         true
     }
@@ -701,6 +751,19 @@ impl Server {
                 if self.qblock.try_route_missing(&packet).await {
                     continue;
                 }
+                // Drop a re-send of a request we are still answering; see
+                // `QBlockServerState::inflight`.
+                #[cfg(feature = "q-block")]
+                let inflight = match self
+                    .qblock
+                    .begin(respond.address(), packet.get_token().to_vec())
+                {
+                    Some(guard) => guard,
+                    None => {
+                        debug!("dropping duplicate of an in-flight request");
+                        continue;
+                    }
+                };
                 let mut request = Box::new(CoapRequest::<SocketAddr>::from_packet(
                     packet,
                     respond.address(),
@@ -725,6 +788,8 @@ impl Server {
                                 qblock_clone,
                                 request,
                                 respond,
+                                #[cfg(feature = "q-block")]
+                                Some(inflight),
                             )
                             .await;
                         });
@@ -763,13 +828,17 @@ impl Server {
         qblock: Arc<QBlockServerState>,
         mut request: Box<CoapRequest<SocketAddr>>,
         respond: Arc<dyn Responder>,
+        mut inflight: Option<InflightGuard>,
     ) {
         request = handler.handle_request(request).await;
         // Stream a large response via Q-Block2 if the client asked for it (or
         // `assume_peer_block_size` says it can take one). Runs before
         // `intercept_response` so the RFC 7959 BlockHandler never sees a
         // response the Q-Block path is fragmenting.
-        if qblock.maybe_serve(&request, respond.clone()).await {
+        if qblock
+            .maybe_serve(&request, respond.clone(), &mut inflight)
+            .await
+        {
             return;
         }
         coap_state
@@ -842,8 +911,17 @@ impl Server {
             if let Ok(Some((body, mut carrier))) = drive_receive(receiver, rx, &sink).await {
                 carrier.payload = body;
                 let request = Box::new(CoapRequest::from_packet(carrier, src));
-                Self::dispatch_and_respond(handler, coap_state, qblock.clone(), request, respond)
-                    .await;
+                // No in-flight claim: a Q-Block1 request is deduplicated by its
+                // Request-Tag in `recvs`, and repeated blocks are idempotent.
+                Self::dispatch_and_respond(
+                    handler,
+                    coap_state,
+                    qblock.clone(),
+                    request,
+                    respond,
+                    None,
+                )
+                .await;
             }
             qblock.recvs.lock().await.remove(&rtag);
         });
@@ -1637,7 +1715,7 @@ pub mod test {
                 addr: request.source.unwrap(),
             });
             let state = serve_state(Some(16));
-            assert!(state.maybe_serve(&request, respond).await);
+            assert!(state.maybe_serve(&request, respond, &mut None).await);
             assert_eq!(reassemble(&mut rx, 4, 0).await, body);
         }
 
@@ -1651,7 +1729,7 @@ pub mod test {
                 addr: request.source.unwrap(),
             });
             let state = serve_state(None);
-            assert!(!state.maybe_serve(&request, respond).await);
+            assert!(!state.maybe_serve(&request, respond, &mut None).await);
             assert!(rx.try_recv().is_err(), "nothing may be sent");
         }
 
@@ -1667,7 +1745,7 @@ pub mod test {
                 addr: request.source.unwrap(),
             });
             let state = serve_state(Some(16));
-            assert!(state.maybe_serve(&request, respond).await);
+            assert!(state.maybe_serve(&request, respond, &mut None).await);
             assert_eq!(reassemble(&mut rx, 2, 1).await, body);
         }
     }
@@ -1815,6 +1893,101 @@ pub mod test {
             assert!(
                 bodies.lock().unwrap().is_empty(),
                 "a Q-Block1 body exceeding max_body_len must not be dispatched"
+            );
+        }
+    }
+
+    #[cfg(feature = "q-block")]
+    mod qblock_dedup_tests {
+        use super::*;
+        use coap_lite::MessageClass;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// One serialized plain NON GET, so two sends are byte-identical — the
+        /// shape a client's single-datagram request probe puts on the wire.
+        fn get_pdu(token: &[u8]) -> Vec<u8> {
+            let mut p = Packet::new();
+            p.header.set_type(MessageType::NonConfirmable);
+            p.header.code = MessageClass::Request(RequestType::Get);
+            p.header.message_id = 0x1234;
+            p.set_token(token.to_vec());
+            p.add_option(CoapOption::UriPath, b"r".to_vec());
+            p.to_bytes().unwrap()
+        }
+
+        /// A loopback server whose handler counts dispatches and stays busy for
+        /// `busy`, holding each request in flight while the duplicate arrives.
+        async fn spawn_counting_server(busy: Duration) -> (SocketAddr, Arc<AtomicUsize>) {
+            let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = sock.local_addr().unwrap();
+            let mut server =
+                Server::from_listeners(vec![Box::new(UdpCoapListener::from_socket(sock))]);
+            server.set_qblock_config(QBlockConfig::default());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls_h = calls.clone();
+            tokio::spawn(async move {
+                let _ = server
+                    .run(move |req: Box<CoapRequest<SocketAddr>>| {
+                        let calls = calls_h.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(busy).await;
+                            req
+                        }
+                    })
+                    .await;
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            (addr, calls)
+        }
+
+        // A probe that lands while its original is still being answered must be
+        // dropped: the handler is a federation call, and running it twice gives
+        // two responses the same token (which then collide in `sends` and lose
+        // their pacing).
+        #[tokio::test]
+        async fn duplicate_of_an_inflight_request_is_dropped() {
+            let (addr, calls) = spawn_counting_server(Duration::from_millis(300)).await;
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let pdu = get_pdu(b"\x11");
+
+            client.send_to(&pdu, addr).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            client.send_to(&pdu, addr).await.unwrap();
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "the duplicate must not reach the handler"
+            );
+
+            let mut buf = [0u8; 1024];
+            client.try_recv(&mut buf).expect("the original is answered");
+            assert!(
+                client.try_recv(&mut buf).is_err(),
+                "only one response may be sent"
+            );
+        }
+
+        // The claim is released when the answer is sent, so a later request
+        // reusing the token is dispatched normally — a leak here would wedge
+        // that token for the life of the server.
+        #[tokio::test]
+        async fn the_claim_is_released_once_the_request_is_answered() {
+            let (addr, calls) = spawn_counting_server(Duration::from_millis(10)).await;
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let pdu = get_pdu(b"\x22");
+
+            for _ in 0..2 {
+                client.send_to(&pdu, addr).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "a request arriving after the previous answer must be dispatched"
             );
         }
     }
