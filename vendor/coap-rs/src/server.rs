@@ -430,26 +430,47 @@ struct QBlockServerState {
     max_transfers: usize,
     sends: Mutex<HashMap<Vec<u8>, mpsc::Sender<Vec<u32>>>>,
     recvs: Mutex<HashMap<Vec<u8>, QBlockRecv>>,
-    /// Requests being answered right now, keyed by `(peer, token)`. A duplicate
-    /// arriving while its original is still in flight is dropped (RFC 7252 §4.5
-    /// permits ignoring a duplicate): a client probing for a lost request
-    /// re-sends it verbatim, and dispatching it again would run the handler a
-    /// second time and give the second response the first's token, colliding in
-    /// `sends` and stripping the inter-burst pacing off both transfers.
+    /// Messages being answered right now. A duplicate arriving while its original
+    /// is still in flight is dropped (RFC 7252 §4.5 permits ignoring a
+    /// duplicate): a client probing for a lost request re-sends it verbatim, and
+    /// dispatching it again would run the handler a second time and give the
+    /// second response the first's token, colliding in `sends` and stripping the
+    /// inter-burst pacing off both transfers.
+    ///
+    /// A claim outlives the burst it belongs to, ending only when `drive_send`
+    /// returns — i.e. after the post-burst recovery linger, not at the last
+    /// block. That is deliberate and load-bearing: while a transfer lingers, a
+    /// second one for the same token would overwrite its `sends` entry, and the
+    /// superseded task's exit then unregisters its successor. Narrowing this
+    /// claim to end-of-burst requires fixing that first.
     ///
     /// A `std` mutex, not tokio's: the critical sections are a hash insert and
     /// remove with no await between, and [`InflightGuard`] releases on drop.
-    inflight: std::sync::Mutex<HashSet<(SocketAddr, Vec<u8>)>>,
+    inflight: std::sync::Mutex<HashSet<MessageKey>>,
 }
 
-/// Holds one `(peer, token)` in [`QBlockServerState::inflight`] for as long as
+/// Identifies one inbound message for duplicate detection. RFC 7252 §4.5 keys a
+/// duplicate on `(source endpoint, Message ID)` — the Message ID is per *message*
+/// and counter-derived, so a retransmission matches while a fresh request never
+/// does. The token is folded in as well: it costs one field and stops a peer
+/// whose Message ID counter is re-seeded (a fresh client for the same peer) from
+/// aliasing a live claim. A probe matches on all three, so nothing is missed.
+#[cfg(feature = "q-block")]
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MessageKey {
+    peer: SocketAddr,
+    message_id: u16,
+    token: Vec<u8>,
+}
+
+/// Holds one [`MessageKey`] in [`QBlockServerState::inflight`] for as long as
 /// that request is being answered. A value rather than a scope guard because the
 /// response can outlive its dispatch: a Q-Block2 burst is driven by a spawned
 /// task, which takes ownership of the guard for the life of the transfer.
 #[cfg(feature = "q-block")]
 struct InflightGuard {
     state: Arc<QBlockServerState>,
-    key: (SocketAddr, Vec<u8>),
+    key: MessageKey,
 }
 
 #[cfg(feature = "q-block")]
@@ -492,11 +513,15 @@ impl QBlockServerState {
         }
     }
 
-    /// Claims `(source, token)` for the request about to be dispatched, or
-    /// returns `None` if it is already being answered — i.e. this packet is a
-    /// duplicate and must not be processed.
-    fn begin(self: &Arc<Self>, source: SocketAddr, token: Vec<u8>) -> Option<InflightGuard> {
-        let key = (source, token);
+    /// Claims the message about to be dispatched, or returns `None` if it is
+    /// already being answered — i.e. this packet is a duplicate and must not be
+    /// processed.
+    fn begin(self: &Arc<Self>, peer: SocketAddr, packet: &Packet) -> Option<InflightGuard> {
+        let key = MessageKey {
+            peer,
+            message_id: packet.header.message_id,
+            token: packet.get_token().to_vec(),
+        };
         if !self.inflight.lock().ok()?.insert(key.clone()) {
             return None;
         }
@@ -754,10 +779,7 @@ impl Server {
                 // Drop a re-send of a request we are still answering; see
                 // `QBlockServerState::inflight`.
                 #[cfg(feature = "q-block")]
-                let inflight = match self
-                    .qblock
-                    .begin(respond.address(), packet.get_token().to_vec())
-                {
+                let inflight = match self.qblock.begin(respond.address(), &packet) {
                     Some(guard) => guard,
                     None => {
                         debug!("dropping duplicate of an in-flight request");
@@ -1903,13 +1925,14 @@ pub mod test {
         use coap_lite::MessageClass;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        /// One serialized plain NON GET, so two sends are byte-identical — the
-        /// shape a client's single-datagram request probe puts on the wire.
-        fn get_pdu(token: &[u8]) -> Vec<u8> {
+        /// One serialized plain NON GET, so two sends with the same `message_id`
+        /// are byte-identical — the shape a client's single-datagram request probe
+        /// puts on the wire.
+        fn get_pdu(token: &[u8], message_id: u16) -> Vec<u8> {
             let mut p = Packet::new();
             p.header.set_type(MessageType::NonConfirmable);
             p.header.code = MessageClass::Request(RequestType::Get);
-            p.header.message_id = 0x1234;
+            p.header.message_id = message_id;
             p.set_token(token.to_vec());
             p.add_option(CoapOption::UriPath, b"r".to_vec());
             p.to_bytes().unwrap()
@@ -1949,7 +1972,7 @@ pub mod test {
         async fn duplicate_of_an_inflight_request_is_dropped() {
             let (addr, calls) = spawn_counting_server(Duration::from_millis(300)).await;
             let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let pdu = get_pdu(b"\x11");
+            let pdu = get_pdu(b"\x11", 0x1234);
 
             client.send_to(&pdu, addr).await.unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1977,7 +2000,7 @@ pub mod test {
         async fn the_claim_is_released_once_the_request_is_answered() {
             let (addr, calls) = spawn_counting_server(Duration::from_millis(10)).await;
             let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let pdu = get_pdu(b"\x22");
+            let pdu = get_pdu(b"\x22", 0x1234);
 
             for _ in 0..2 {
                 client.send_to(&pdu, addr).await.unwrap();
@@ -1988,6 +2011,34 @@ pub mod test {
                 calls.load(Ordering::SeqCst),
                 2,
                 "a request arriving after the previous answer must be dispatched"
+            );
+        }
+
+        // Only a *retransmission* is a duplicate. Two distinct requests that
+        // happen to share a token — the client draws it from 16 bits of
+        // randomness, so a repeat within one claim's lifetime is expected — differ
+        // in Message ID, and both must be answered. Keying the claim on the token
+        // alone silently drops the second.
+        #[tokio::test]
+        async fn distinct_message_ids_sharing_a_token_are_both_dispatched() {
+            let (addr, calls) = spawn_counting_server(Duration::from_millis(300)).await;
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+            client
+                .send_to(&get_pdu(b"\x33", 0x1000), addr)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            client
+                .send_to(&get_pdu(b"\x33", 0x1001), addr)
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "a fresh request must not be mistaken for a retransmission"
             );
         }
     }

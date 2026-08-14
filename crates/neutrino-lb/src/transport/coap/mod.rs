@@ -1375,11 +1375,6 @@ mod loss_tests {
         }
     }
 
-    // A deterministic lossy UDP relay sitting between the client and `server`. It
-    // forwards datagrams both ways but silently drops the client→server datagrams
-    // whose 1-based arrival index is in `drop_to_server` — modelling a lossy radio
-    // link. A dropped CON forces coap-rs to retransmit (5 retries × 2s), so the
-    // transfer must still complete. Runs until `token` fires.
     /// Client→server datagram counters kept by [`run_lossy_relay`], so a test can
     /// prove both that the loss was injected and that the sender recovered from it.
     #[derive(Clone, Default)]
@@ -1390,6 +1385,11 @@ mod loss_tests {
         dropped: Arc<AtomicUsize>,
     }
 
+    // A deterministic lossy UDP relay sitting between the client and `server`. It
+    // forwards datagrams both ways but silently drops the client→server datagrams
+    // whose 1-based arrival index is in `drop_to_server` — modelling a lossy radio
+    // link. A dropped CON forces coap-rs to retransmit (5 retries × 2s), so the
+    // transfer must still complete. Runs until `token` fires.
     async fn run_lossy_relay(
         front: UdpSocket,
         server: SocketAddr,
