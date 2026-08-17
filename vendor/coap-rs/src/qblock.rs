@@ -22,6 +22,7 @@ use coap_lite::block_handler::BlockValue;
 use coap_lite::option_value::{OptionValueU16, OptionValueU32};
 use coap_lite::qblock::{missing_blocks, RangeSet};
 use coap_lite::{CoapOption, ContentFormat, MessageClass, MessageType, Packet, ResponseType};
+use log::debug;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -408,15 +409,15 @@ impl QBlockReceiver {
         }
     }
 
-    /// Abandon the transfer if no block has arrived within
-    /// [`head_timeout`](Self::head_timeout), rather than holding it to
-    /// `non_partial_timeout`.
+    /// Abandon the transfer if no block has been recorded within the head timeout
+    /// (`NON_RECEIVE_TIMEOUT × (NON_MAX_RETRANSMIT + 1)`), rather than holding it
+    /// to `non_partial_timeout`. This bounds how long the *peer* has to answer as
+    /// well as how long a lost request stays invisible — from here both are the
+    /// same silence.
     ///
-    /// Valid only when the request this is the response to fitted a single
-    /// datagram. That request had no burst for the peer's 4.08 to recover, so its
-    /// loss is only visible as silence and only a fresh request can recover it. A
-    /// multi-block request is still being uploaded while this receiver waits —
-    /// timing it against silence would abandon a transfer that is progressing.
+    /// Valid only once the peer has everything it needs to reply: a request that
+    /// fitted one datagram, or a receive whose first block already arrived. While
+    /// a multi-block request uploads, silence is not evidence of anything.
     pub fn expire_when_nothing_arrives(mut self) -> Self {
         self.expire_when_nothing_arrives = true;
         self
@@ -460,8 +461,15 @@ impl QBlockReceiver {
         };
 
         // A non-final block that does not fill its block would leave a hole in the
-        // reassembled body; reject before anything is latched from it.
+        // reassembled body; reject before anything is latched from it. Logged: no
+        // conforming peer sends one, and every symptom of it is silence.
         if block.more && pdu.payload.len() != block.size() {
+            debug!(
+                "q-block: dropping non-final block {} carrying {} of {} bytes",
+                block.num,
+                pdu.payload.len(),
+                block.size()
+            );
             return Ok(BlockOutcome::Dropped);
         }
 
@@ -584,7 +592,7 @@ impl QBlockReceiver {
 
     /// The absolute hold time for a partially-received body
     /// (`NON_PARTIAL_TIMEOUT`, RFC 9177 §6.2). A transfer that has not completed
-    /// within this — measured from its first block, independent of per-block
+    /// within this — measured from its start, independent of per-block
     /// activity — is abandoned, so a peer that dribbles one block per
     /// `NON_RECEIVE_TIMEOUT` (resetting the recovery backoff each time) cannot
     /// pin the reassembly buffer indefinitely.
@@ -592,16 +600,14 @@ impl QBlockReceiver {
         self.config.non_partial_timeout
     }
 
-    /// How long to wait for the transfer's *first* block, when opted into by
-    /// [`expire_when_nothing_arrives`](Self::expire_when_nothing_arrives). Until a
-    /// block arrives no block number is known, so a missing-block request cannot
-    /// name anything: either the block comes or the transfer is abandoned.
+    /// How long to wait for the transfer's *first* block, for a receiver that
+    /// opted in: until one arrives no block number is known, so a missing-block
+    /// request cannot name anything and only the block itself can help.
     ///
-    /// Not an RFC 9177 quantity — the RFC's receiver timers all presuppose a
-    /// partial body. One `NON_RECEIVE_TIMEOUT` per recovery round the ladder would
-    /// have run, flat rather than doubling, because nothing is being transmitted
-    /// and so there is nothing to back off from.
-    pub fn head_timeout(&self) -> Duration {
+    /// Not an RFC 9177 quantity — its receiver timers all presuppose a partial
+    /// body. One `NON_RECEIVE_TIMEOUT` per round the ladder would have run, flat
+    /// rather than doubling: nothing is sent, so there is nothing to back off.
+    fn head_timeout(&self) -> Duration {
         self.config
             .non_receive_timeout
             .saturating_mul(self.config.non_max_retransmit.saturating_add(1))
@@ -667,7 +673,7 @@ impl QBlockReceiver {
     /// freshly-built request (counting the retry), and finally [`Expired`] once
     /// `NON_MAX_RETRANSMIT` rounds are spent — or, for a receiver that opted into
     /// [`expire_when_nothing_arrives`](Self::expire_when_nothing_arrives) and has
-    /// received nothing, once [`head_timeout`](Self::head_timeout) has.
+    /// received nothing, once its head timeout has.
     ///
     /// [`Resend`]: RecoveryOutcome::Resend
     pub fn poll_recovery(&mut self, since_activity: Duration) -> RecoveryOutcome {
@@ -863,6 +869,10 @@ pub async fn drive_send<S: BlockSink + ?Sized>(
         }
         sender.drain_burst(sink).await?;
 
+        // RFC 9177 §7.2: a delay of NON_TIMEOUT_RANDOM separates every
+        // MAX_PAYLOADS_SET of a body — a set of recovered blocks included, and
+        // however fast the peer asks for them.
+        let next_burst = Instant::now() + sender.inter_burst_delay();
         if sender.is_done() {
             match tokio::time::timeout(linger, missing_rx.recv()).await {
                 Ok(Some(blocks)) => sender.refill(&blocks),
@@ -870,22 +880,17 @@ pub async fn drive_send<S: BlockSink + ?Sized>(
                 Ok(None) | Err(_) => break,
             }
         } else {
-            // RFC 9177 §7.2: every MAX_PAYLOADS_SET is paced, so absorb refills
-            // while waiting rather than bursting the moment one lands.
-            let next_burst = Instant::now() + sender.inter_burst_delay();
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep_until(next_burst) => break,
-                    m = missing_rx.recv() => match m {
-                        Some(blocks) => sender.refill(&blocks),
-                        None => {
-                            tokio::time::sleep_until(next_burst).await;
-                            break;
-                        }
-                    },
+            // Absorb refills while waiting rather than bursting the moment one
+            // lands: a closed channel yields from `recv` instantly and forever, so
+            // racing the two would drop the pacing entirely.
+            let _ = tokio::time::timeout_at(next_burst, async {
+                while let Some(blocks) = missing_rx.recv().await {
+                    sender.refill(&blocks);
                 }
-            }
+            })
+            .await;
         }
+        tokio::time::sleep_until(next_burst).await;
     }
     Ok(())
 }
@@ -1276,10 +1281,10 @@ mod tests {
 
     #[test]
     fn a_short_non_final_block_is_dropped_before_anything_is_latched() {
-        // 8 bytes in a 16-byte non-final block: accepting it would leave 8 zero
-        // bytes in the middle of the reassembled body, and the transfer would
-        // still complete — silent corruption. Nothing may be taken from it, not
-        // even its block size, which every later block is then checked against.
+        // 8 bytes in a 16-byte non-final block: accepting it leaves 8 zero bytes
+        // mid-body and the transfer still completes — silent corruption. Nothing
+        // may be taken from it, its block size (checked against later blocks) least
+        // of all.
         let mut rx = receiver();
         assert_eq!(
             rx.accept(&block_pkt(0, true, 0, vec![7u8; 8])).unwrap(),
@@ -1606,6 +1611,42 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_recovery_burst_is_paced_like_any_other() {
+        // The body is out, so every further burst is recovery at a rate the peer
+        // sets: unpaced, one small request buys a whole MAX_PAYLOADS_SET back.
+        let body: Vec<u8> = (0..5u16).flat_map(|i| [i as u8; 16]).collect();
+        let sink = RecordingSink::default();
+        let (req_tx, req_rx) = mpsc::channel::<Vec<u32>>(4);
+        let cfg = QBlockConfig {
+            non_timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+        // Just after the body drains, so the request lands in the linger and not
+        // in the pre-burst drain.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            let _ = req_tx.send(vec![0]).await;
+        });
+
+        drive_send(
+            sender(body, 0, cfg.clone()),
+            &sink,
+            req_rx,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+        let sent = sink.sent.lock().unwrap();
+        assert_eq!(sent.len(), 6, "the body plus the one recovered block");
+        let gap = sent[5].1 - sent[4].1;
+        assert!(
+            gap >= cfg.non_timeout && gap < cfg.non_timeout.mul_f64(1.5),
+            "the recovery burst was not paced: {gap:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn drive_receive_assembles_body_without_recovery() {
         let body: Vec<u8> = (0..25u16).flat_map(|i| [i as u8; 16]).collect();
         let pdus = drain_all(&mut sender(body.clone(), 0, QBlockConfig::default())).await;
@@ -1656,10 +1697,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn nothing_arriving_expires_the_transfer_at_the_head_timeout() {
-        // The request itself was lost, so no response block ever comes. Recovery
-        // cannot act — a missing-block request has no block number to name — so the
-        // transfer must give up on the head timeout instead of holding its caller
-        // for the partial timeout. Only a fresh request can recover this.
+        // The request was lost, so no response block ever comes and recovery has
+        // no block number to name. Give up on the head timeout rather than hold the
+        // caller for the partial timeout; only a fresh request recovers this.
         let cfg = QBlockConfig {
             non_receive_timeout: Duration::from_secs(4),
             non_max_retransmit: 4,
@@ -1685,11 +1725,40 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_block_arriving_inside_the_head_timeout_keeps_the_transfer() {
+        // The opposite boundary: the deadline must not clip a peer that answers
+        // late but in time — an expiry that fires early looks like a lost request.
+        let cfg = QBlockConfig {
+            non_receive_timeout: Duration::from_secs(1),
+            non_max_retransmit: 4, // head timeout = 5 s
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        tokio::spawn(async move {
+            // Non-final, so the transfer carries on afterwards on the ordinary
+            // ladder — the shape every Q-Block1 upload takes on the server.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let b0 = block_pkt(0, true, 0, vec![7u8; 16]).to_bytes().unwrap();
+            let _ = tx.send(b0).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let b1 = block_pkt(1, false, 0, vec![9u8; 16]).to_bytes().unwrap();
+            let _ = tx.send(b1).await;
+        });
+        let receiver = QBlockReceiver::new(CoapOption::QBlock2, request_template(), 1 << 20, cfg)
+            .expire_when_nothing_arrives();
+
+        let got = drive_receive(receiver, rx, &RecordingSink::default())
+            .await
+            .unwrap();
+        let mut body = vec![7u8; 16];
+        body.extend_from_slice(&[9u8; 16]);
+        assert_eq!(got.map(|(body, _)| body), Some(body));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_receiver_that_did_not_opt_in_waits_out_the_partial_timeout() {
-        // The other half of the gate. A receiver whose request went as a Q-Block1
-        // burst is still waiting for an upload to finish and for the peer's own
-        // 4.08 recovery; silence is not evidence its exchange is dead, so it must
-        // keep the pre-existing partial-timeout behaviour.
+        // The other half of the gate: a receiver still waiting on an upload keeps
+        // the pre-existing partial-timeout behaviour.
         let cfg = QBlockConfig {
             non_receive_timeout: Duration::from_secs(4),
             non_partial_timeout: Duration::from_secs(30),
@@ -1702,6 +1771,7 @@ mod tests {
         let start = Instant::now();
         assert_eq!(drive_receive(receiver, rx, &req_sink).await.unwrap(), None);
         assert_eq!(start.elapsed(), Duration::from_secs(30));
+        assert!(req_sink.sent.lock().unwrap().is_empty());
         drop(tx);
     }
 
@@ -1737,14 +1807,13 @@ mod tests {
         .await;
 
         let sent = req_sink.sent.lock().unwrap();
-        let Some((first, at)) = sent.first() else {
-            panic!("the gap was never asked for");
-        };
-        // On time, not merely eventually: the duplicates arrive every 500 ms, so a
-        // timer they could still partly reset would push this out.
-        assert_eq!(*at - start, Duration::from_secs(1));
+        let at: Vec<Duration> = sent.iter().map(|(_, t)| *t - start).collect();
+        // On the ladder, not merely eventually: duplicates arrive every 500 ms, so
+        // a timer they reset would hold the first round off, and a *retry count*
+        // they reset would repeat it at 1 s forever instead of backing off to 3 s.
+        assert_eq!(at, vec![Duration::from_secs(1), Duration::from_secs(3)]);
         assert_eq!(
-            qblock2_nums(&Packet::from_bytes(first).unwrap()),
+            qblock2_nums(&Packet::from_bytes(&sent[0].0).unwrap()),
             vec![1],
             "recovery must ask for the block that is missing"
         );

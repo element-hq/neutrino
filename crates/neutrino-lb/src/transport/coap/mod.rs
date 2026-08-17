@@ -1620,17 +1620,22 @@ mod loss_tests {
         let (relay_addr, token, _) = spawn_qblock_server_and_relay(vec![], qcfg.clone()).await;
 
         let client = CoapWireClient::with_qblock(Some(64), qcfg);
-        let resp = client
-            .send(WireRequest {
+        // Bounded, so a regression fails here rather than stalling to the 60 s
+        // request timeout.
+        let resp = tokio::time::timeout(
+            Duration::from_secs(20),
+            client.send(WireRequest {
                 dest: relay_addr.to_string(),
                 method: Method::PUT,
                 path: "/_matrix/federation/v1/send/txn1".to_owned(),
                 headers: vec![],
                 body: req_body.clone(),
                 ..Default::default()
-            })
-            .await
-            .expect("a still-uploading request must not be abandoned");
+            }),
+        )
+        .await
+        .expect("the exchange must finish well inside the request timeout")
+        .expect("a still-uploading request must not be abandoned");
 
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, req_body);
@@ -1670,9 +1675,9 @@ mod loss_tests {
             client.send(request()).await.is_err(),
             "the only request datagram was dropped, so nothing can have answered it"
         );
-        // The head timeout is 100 ms × (4 + 1); the window is wide enough for a
-        // loaded CI box but far from both an instant failure (some other error)
-        // and the 60 s request timeout.
+        // Liveness, not the formula (pinned exactly by the coap-rs unit test): far
+        // from an instant failure for some other reason, and far from the 60 s
+        // request timeout, with room for a loaded CI box in between.
         assert!(
             (Duration::from_millis(300)..Duration::from_secs(2)).contains(&start.elapsed()),
             "gave up after {:?}, which is not the head timeout",

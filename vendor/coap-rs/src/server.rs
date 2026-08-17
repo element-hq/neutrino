@@ -832,12 +832,17 @@ impl Server {
             if !rtag.is_empty() {
                 tmpl.add_option(CoapOption::Unknown(292), rtag.clone());
             }
+            // This transfer exists because a block arrived, so the peer is already
+            // sending: if nothing is ever recorded, every block it sent was
+            // rejected and there is nothing to wait for. Release the slot and the
+            // source binding on the head timeout rather than the partial timeout.
             let receiver = QBlockReceiver::new(
                 CoapOption::QBlock1,
                 tmpl,
                 qblock.max_body_len,
                 qblock.config.clone(),
-            );
+            )
+            .expire_when_nothing_arrives();
             let sink = ResponderSink(respond.clone());
             if let Ok(Some((body, mut carrier))) = drive_receive(receiver, rx, &sink).await {
                 carrier.payload = body;
@@ -1792,6 +1797,51 @@ pub mod test {
             assert!(
                 bodies.lock().unwrap().is_empty(),
                 "a transfer opened past the concurrency cap must not be dispatched"
+            );
+        }
+
+        // A malformed opening block is rejected, so its transfer records nothing —
+        // but the transfer still exists, holding a slot and its source binding. It
+        // must be released on the head timeout, not held for the whole partial
+        // timeout: otherwise one bad datagram costs a slot for minutes.
+        #[tokio::test]
+        async fn a_transfer_whose_opening_block_was_rejected_releases_its_slot() {
+            let cfg = QBlockConfig {
+                non_receive_timeout: Duration::from_millis(100),
+                non_max_retransmit: 4, // head timeout = 500 ms
+                non_partial_timeout: Duration::from_secs(10),
+                ..Default::default()
+            };
+            let (addr, bodies) = spawn_recording_server(move |s| {
+                s.set_qblock_config(cfg);
+                s.set_qblock_max_transfers(1);
+            })
+            .await;
+
+            // 8 bytes in a 16-byte non-final block: dropped, nothing recorded.
+            let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            a.send_to(&q1_block(b"A", b"\x01", 0, true, vec![0u8; 8]), addr)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(800)).await;
+
+            // The one slot must be free again by now.
+            let body: Vec<u8> = (0..16u8).collect();
+            let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            b.send_to(&q1_block(b"B", b"\x02", 0, false, body.clone()), addr)
+                .await
+                .unwrap();
+
+            for _ in 0..50 {
+                if !bodies.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(
+                *bodies.lock().unwrap(),
+                vec![body],
+                "the rejected transfer was still holding the only slot"
             );
         }
 

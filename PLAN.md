@@ -52,9 +52,10 @@ Three wire transports, selected by `LbConfig.wire: WireKind`:
   recovery); the **`neutrino-main` default**. Reuses the `Coap` message mapping;
   tuned via `CoapQBlock { block1_size, qblock: QBlockTuning }` (RFC 9177 §6.2).
   A one-block request has no burst for a 4.08 to reach, so its loss is only
-  visible as silence: the exchange gives up once no response block has arrived in
-  `non_receive_timeout × (non_max_retransmit + 1)` and the caller retries under a
-  fresh token.
+  visible as silence: the exchange gives up after
+  `non_receive_timeout × (non_max_retransmit + 1)` with no response block and the
+  caller retries under a fresh token. That bound is ours, not the RFC's, and it is
+  equally all the time a peer gets to *answer* — the two look the same from here.
 
 `WireKind::coap_qblock_for_profile` sizes that tuning from everything the medium
 declares, not just its MTU. A medium that *meters* its sends declares
@@ -178,9 +179,8 @@ Deferred follow-ups (write-ups, not done):
   the trusted-network assumption.
 - Q-Block final-block validation: a More-unset block is bounded only by
   `max_body_len`, so one forged datagram can end a reassembly short (or, sent
-  first, be the whole body). The size a peer already advertised in `Size1`/`Size2`
-  is parsed but never compared against the assembled length. Only the non-final
-  case is checked today.
+  first, be the whole body). `Size1`/`Size2` is parsed but never checked against
+  the assembled length. Only the non-final case is validated today.
 - Upstream the fork changes (`Server::*_with_config`, q-block API, DoS knobs) so
   the `[patch.crates-io]` git pins can drop.
 - SLIP / serial-link framing on the CoAP/UDP transport — the physical link.
