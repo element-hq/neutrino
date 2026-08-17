@@ -52,10 +52,17 @@ Three wire transports, selected by `LbConfig.wire: WireKind`:
   recovery); the **`neutrino-main` default**. Reuses the `Coap` message mapping;
   tuned via `CoapQBlock { block1_size, qblock: QBlockTuning }` (RFC 9177 §6.2).
   A one-block request has no burst for a 4.08 to reach, so its loss is only
-  visible as silence: the exchange gives up after
-  `non_receive_timeout × (non_max_retransmit + 1)` with no response block and the
-  caller retries under a fresh token. That bound is ours, not the RFC's, and it is
-  equally all the time a peer gets to *answer* — the two look the same from here.
+  visible as silence: the exchange gives up after one `non_receive_timeout` with no
+  response block and the caller retries under a fresh token. That bound is ours,
+  not the RFC's, and it is equally all the time a peer gets to *answer* — the two
+  look the same from here. One `non_receive_timeout` because a metered medium
+  already sizes it as a full round trip (inter-burst pause + queueing bound), and
+  because the recovery ladder's further rounds exist to buy retransmissions, of
+  which there are none here. The armed set is every request whose body fits one
+  block — on a compressing medium that includes the typical short `/send`, and all
+  of them are safe to re-send (`/send` under its own txn id, the rest are GETs).
+  Widen the MTU and heavier endpoints join that set: re-check the bound covers
+  their answer time, rather than scaling it by a loss knob.
 
 `WireKind::coap_qblock_for_profile` sizes that tuning from everything the medium
 declares, not just its MTU. A medium that *meters* its sends declares

@@ -1802,13 +1802,12 @@ pub mod test {
 
         // A malformed opening block is rejected, so its transfer records nothing —
         // but the transfer still exists, holding a slot and its source binding. It
-        // must be released on the head timeout, not held for the whole partial
-        // timeout: otherwise one bad datagram costs a slot for minutes.
+        // must be released one `non_receive_timeout` later, not held for the whole
+        // partial timeout: otherwise one bad datagram costs a slot for minutes.
         #[tokio::test]
         async fn a_transfer_whose_opening_block_was_rejected_releases_its_slot() {
             let cfg = QBlockConfig {
                 non_receive_timeout: Duration::from_millis(100),
-                non_max_retransmit: 4, // head timeout = 500 ms
                 non_partial_timeout: Duration::from_secs(10),
                 ..Default::default()
             };

@@ -409,11 +409,11 @@ impl QBlockReceiver {
         }
     }
 
-    /// Abandon the transfer if no block has been recorded within the head timeout
-    /// (`NON_RECEIVE_TIMEOUT × (NON_MAX_RETRANSMIT + 1)`), rather than holding it
-    /// to `non_partial_timeout`. This bounds how long the *peer* has to answer as
-    /// well as how long a lost request stays invisible — from here both are the
-    /// same silence.
+    /// Abandon the transfer if no block has been recorded within one
+    /// `NON_RECEIVE_TIMEOUT` — the interval in which a block should have arrived —
+    /// rather than holding it to `non_partial_timeout`. This bounds how long the
+    /// *peer* has to answer as well as how long a lost request stays invisible —
+    /// from here both are the same silence.
     ///
     /// Valid only once the peer has everything it needs to reply: a request that
     /// fitted one datagram, or a receive whose first block already arrived. While
@@ -600,19 +600,6 @@ impl QBlockReceiver {
         self.config.non_partial_timeout
     }
 
-    /// How long to wait for the transfer's *first* block, for a receiver that
-    /// opted in: until one arrives no block number is known, so a missing-block
-    /// request cannot name anything and only the block itself can help.
-    ///
-    /// Not an RFC 9177 quantity — its receiver timers all presuppose a partial
-    /// body. One `NON_RECEIVE_TIMEOUT` per round the ladder would have run, flat
-    /// rather than doubling: nothing is sent, so there is nothing to back off.
-    fn head_timeout(&self) -> Duration {
-        self.config
-            .non_receive_timeout
-            .saturating_mul(self.config.non_max_retransmit.saturating_add(1))
-    }
-
     /// The highest block number the body spans (final block index), derived
     /// from the More-unset block if seen, else the advertised Size. `None` if
     /// neither is known (can't safely bound the request).
@@ -673,14 +660,17 @@ impl QBlockReceiver {
     /// freshly-built request (counting the retry), and finally [`Expired`] once
     /// `NON_MAX_RETRANSMIT` rounds are spent — or, for a receiver that opted into
     /// [`expire_when_nothing_arrives`](Self::expire_when_nothing_arrives) and has
-    /// received nothing, once its head timeout has.
+    /// received nothing, once one `NON_RECEIVE_TIMEOUT` has passed.
     ///
     /// [`Resend`]: RecoveryOutcome::Resend
     pub fn poll_recovery(&mut self, since_activity: Duration) -> RecoveryOutcome {
         // No block means no block number to ask for, so the ladder below cannot
-        // make progress and would hold the transfer to the partial timeout.
+        // make progress and would hold the transfer to the partial timeout. One
+        // `NON_RECEIVE_TIMEOUT` is the whole bound: the ladder's further rounds
+        // buy retransmissions, and there is nothing here to retransmit. Not an
+        // RFC 9177 quantity — its receiver timers all presuppose a partial body.
         if self.expire_when_nothing_arrives && self.rec_blocks.is_empty() {
-            let head = self.head_timeout();
+            let head = self.config.non_receive_timeout;
             return if since_activity < head {
                 RecoveryOutcome::Wait(head - since_activity)
             } else {
@@ -1698,8 +1688,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn nothing_arriving_expires_the_transfer_at_the_head_timeout() {
         // The request was lost, so no response block ever comes and recovery has
-        // no block number to name. Give up on the head timeout rather than hold the
-        // caller for the partial timeout; only a fresh request recovers this.
+        // no block number to name. Give up after one `non_receive_timeout` rather
+        // than hold the caller for the partial timeout; only a fresh request
+        // recovers this. `non_max_retransmit` is pinned non-zero deliberately: it
+        // is a loss-tolerance knob and must not scale this bound.
         let cfg = QBlockConfig {
             non_receive_timeout: Duration::from_secs(4),
             non_max_retransmit: 4,
@@ -1716,7 +1708,7 @@ mod tests {
         let start = Instant::now();
         let got = drive_receive(receiver, rx, &req_sink).await.unwrap();
         assert_eq!(got, None);
-        assert_eq!(start.elapsed(), Duration::from_secs(20));
+        assert_eq!(start.elapsed(), Duration::from_secs(4));
         assert!(
             req_sink.sent.lock().unwrap().is_empty(),
             "there is no block to ask for, so nothing may go on the wire"
@@ -1729,8 +1721,7 @@ mod tests {
         // The opposite boundary: the deadline must not clip a peer that answers
         // late but in time — an expiry that fires early looks like a lost request.
         let cfg = QBlockConfig {
-            non_receive_timeout: Duration::from_secs(1),
-            non_max_retransmit: 4, // head timeout = 5 s
+            non_receive_timeout: Duration::from_secs(4),
             ..Default::default()
         };
         let (tx, rx) = mpsc::channel::<Vec<u8>>(8);

@@ -1614,8 +1614,8 @@ mod loss_tests {
             assume_peer_block_size: Some(64),
             ..Default::default()
         };
-        // 256 blocks of 64 B = 26 paced bursts ≈ 2.6 s of upload, against a head
-        // timeout of 200 ms × (4 + 1) = 1 s.
+        // 256 blocks of 64 B = 26 paced bursts ≈ 2.6 s of upload, against a
+        // first-block deadline of one `non_receive_timeout` = 200 ms.
         let req_body: Vec<u8> = (0..16384).map(|i| (i % 251) as u8).collect();
         let (relay_addr, token, _) = spawn_qblock_server_and_relay(vec![], qcfg.clone()).await;
 
@@ -1645,14 +1645,14 @@ mod loss_tests {
     // The single-datagram twin of the case above, and the shape of an ordinary
     // `/send`. One block means no burst, so the 4.08 mechanism has no transfer to
     // recover and the loss is only visible as silence. The exchange must give up
-    // on the Q-Block head timeout — `non_receive_timeout * (non_max_retransmit +
-    // 1)`, 500 ms here — instead of holding the caller to the 60 s request
-    // timeout, and the caller's retry (a fresh token) must then get through.
+    // after one `non_receive_timeout` — 500 ms here — instead of holding the caller
+    // to the 60 s request timeout, and the caller's retry (a fresh token) must then
+    // get through.
     #[tokio::test]
     async fn a_dropped_single_datagram_request_fails_fast_and_the_retry_succeeds() {
         let qcfg = coap::qblock::QBlockConfig {
             non_timeout: Duration::from_millis(50),
-            non_receive_timeout: Duration::from_millis(100),
+            non_receive_timeout: Duration::from_millis(500),
             assume_peer_block_size: Some(64),
             ..Default::default()
         };
@@ -1680,7 +1680,7 @@ mod loss_tests {
         // request timeout, with room for a loaded CI box in between.
         assert!(
             (Duration::from_millis(300)..Duration::from_secs(2)).contains(&start.elapsed()),
-            "gave up after {:?}, which is not the head timeout",
+            "gave up after {:?}, which is not the first-block deadline",
             start.elapsed()
         );
         assert_eq!(
