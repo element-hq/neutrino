@@ -836,7 +836,8 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
         // Send the request: Q-Block1 burst if the body needs more than one block,
         // else a single PDU.
         let body = std::mem::take(&mut request.message.payload);
-        let _drive_guard = if body.len() > block_size {
+        let single_datagram = body.len() <= block_size;
+        let _drive_guard = if !single_datagram {
             let mut template = request.message.clone();
             template.payload.clear();
             let seed = token
@@ -870,12 +871,23 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
             None
         };
 
-        let receiver = QBlockReceiver::new(
+        let mut receiver = QBlockReceiver::new(
             CoapOption::QBlock2,
             request.message.clone(),
             self.max_total_message_size.unwrap_or(usize::MAX),
             self.qblock_config.clone(),
         );
+        if single_datagram {
+            // The whole request went in one datagram, so it had no burst for the
+            // peer's 4.08 to recover and its loss is only visible as silence.
+            // Give up on the head timeout so the caller can re-send under a fresh
+            // token, instead of waiting out its whole request timeout.
+            //
+            // Silence is also what a peer that is merely slow looks like, and from
+            // here the two are the same: this bounds the peer's answering time as
+            // well as the request's loss.
+            receiver = receiver.expire_when_nothing_arrives();
+        }
         // Race the Q-Block2 reassembly against a plain single-PDU response: a
         // large reply completes via `drive_receive`, a small one via `plain_rx`.
         // `biased` takes a ready plain response before polling the reassembler;

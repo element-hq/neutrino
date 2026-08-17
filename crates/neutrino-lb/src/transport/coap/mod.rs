@@ -1602,6 +1602,101 @@ mod loss_tests {
         );
         token.cancel();
     }
+
+    // A request that spans many blocks takes real time to upload, and its first
+    // response block cannot arrive until the last request block has. Nothing may
+    // give up on the response while the request is still going out.
+    #[tokio::test]
+    async fn a_long_uploading_request_is_not_abandoned_before_its_response() {
+        let qcfg = coap::qblock::QBlockConfig {
+            non_timeout: Duration::from_millis(100),
+            non_receive_timeout: Duration::from_millis(200),
+            assume_peer_block_size: Some(64),
+            ..Default::default()
+        };
+        // 256 blocks of 64 B = 26 paced bursts ≈ 2.6 s of upload, against a
+        // first-block deadline of one `non_receive_timeout` = 200 ms.
+        let req_body: Vec<u8> = (0..16384).map(|i| (i % 251) as u8).collect();
+        let (relay_addr, token, _) = spawn_qblock_server_and_relay(vec![], qcfg.clone()).await;
+
+        let client = CoapWireClient::with_qblock(Some(64), qcfg);
+        // Bounded, so a regression fails here rather than stalling to the 60 s
+        // request timeout.
+        let resp = tokio::time::timeout(
+            Duration::from_secs(20),
+            client.send(WireRequest {
+                dest: relay_addr.to_string(),
+                method: Method::PUT,
+                path: "/_matrix/federation/v1/send/txn1".to_owned(),
+                headers: vec![],
+                body: req_body.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("the exchange must finish well inside the request timeout")
+        .expect("a still-uploading request must not be abandoned");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, req_body);
+        token.cancel();
+    }
+
+    // The single-datagram twin of the case above, and the shape of an ordinary
+    // `/send`. One block means no burst, so the 4.08 mechanism has no transfer to
+    // recover and the loss is only visible as silence. The exchange must give up
+    // after one `non_receive_timeout` — 500 ms here — instead of holding the caller
+    // to the 60 s request timeout, and the caller's retry (a fresh token) must then
+    // get through.
+    #[tokio::test]
+    async fn a_dropped_single_datagram_request_fails_fast_and_the_retry_succeeds() {
+        let qcfg = coap::qblock::QBlockConfig {
+            non_timeout: Duration::from_millis(50),
+            non_receive_timeout: Duration::from_millis(500),
+            assume_peer_block_size: Some(64),
+            ..Default::default()
+        };
+        let (relay_addr, token, dropped) =
+            spawn_qblock_server_and_relay(vec![1], qcfg.clone()).await;
+
+        let req_body = b"{}".to_vec();
+        let client = CoapWireClient::with_qblock(Some(64), qcfg);
+        let request = || WireRequest {
+            dest: relay_addr.to_string(),
+            method: Method::PUT,
+            path: "/_matrix/federation/v1/send/txn1".to_owned(),
+            headers: vec![],
+            body: req_body.clone(),
+            ..Default::default()
+        };
+
+        let start = std::time::Instant::now();
+        assert!(
+            client.send(request()).await.is_err(),
+            "the only request datagram was dropped, so nothing can have answered it"
+        );
+        // Liveness, not the formula (pinned exactly by the coap-rs unit test): far
+        // from an instant failure for some other reason, and far from the 60 s
+        // request timeout, with room for a loaded CI box in between.
+        assert!(
+            (Duration::from_millis(300)..Duration::from_secs(2)).contains(&start.elapsed()),
+            "gave up after {:?}, which is not the first-block deadline",
+            start.elapsed()
+        );
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            1,
+            "relay never dropped the targeted datagram"
+        );
+
+        let resp = client
+            .send(request())
+            .await
+            .expect("the retry must succeed");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, req_body);
+        token.cancel();
+    }
 }
 
 #[cfg(test)]

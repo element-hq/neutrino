@@ -51,6 +51,18 @@ Three wire transports, selected by `LbConfig.wire: WireKind`:
 - `CoapQBlock` — RFC 9177 NON-mode robust transfer (burst + 4.08 missing-block
   recovery); the **`neutrino-main` default**. Reuses the `Coap` message mapping;
   tuned via `CoapQBlock { block1_size, qblock: QBlockTuning }` (RFC 9177 §6.2).
+  A one-block request has no burst for a 4.08 to reach, so its loss is only
+  visible as silence: the exchange gives up after one `non_receive_timeout` with no
+  response block and the caller retries under a fresh token. That bound is ours,
+  not the RFC's, and it is equally all the time a peer gets to *answer* — the two
+  look the same from here. One `non_receive_timeout` because a metered medium
+  already sizes it as a full round trip (inter-burst pause + queueing bound), and
+  because the recovery ladder's further rounds exist to buy retransmissions, of
+  which there are none here. The armed set is every request whose body fits one
+  block — on a compressing medium that includes the typical short `/send`, and all
+  of them are safe to re-send (`/send` under its own txn id, the rest are GETs).
+  Widen the MTU and heavier endpoints join that set: re-check the bound covers
+  their answer time, rather than scaling it by a loss knob.
 
 `WireKind::coap_qblock_for_profile` sizes that tuning from everything the medium
 declares, not just its MTU. A medium that *meters* its sends declares
@@ -172,6 +184,10 @@ Deferred follow-ups (write-ups, not done):
   allocation, but the RFC 7959 CON path still relies on the post-reassembly cap —
   coap-lite's accumulator isn't externally bounded mid-transfer. Acceptable under
   the trusted-network assumption.
+- Q-Block final-block validation: a More-unset block is bounded only by
+  `max_body_len`, so one forged datagram can end a reassembly short (or, sent
+  first, be the whole body). `Size1`/`Size2` is parsed but never checked against
+  the assembled length. Only the non-final case is validated today.
 - Upstream the fork changes (`Server::*_with_config`, q-block API, DoS knobs) so
   the `[patch.crates-io]` git pins can drop.
 - SLIP / serial-link framing on the CoAP/UDP transport — the physical link.
