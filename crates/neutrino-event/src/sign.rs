@@ -132,6 +132,38 @@ impl EventSigner {
         b64_unpadded(&self.key.sign(bytes).to_bytes())
     }
 
+    /// Sign a federation request (S2S "Request authentication"): the
+    /// unpadded-base64 signature over the canonical
+    /// `{method, uri, origin, destination, content}` object, `content` being
+    /// the request's JSON body when it has one. The caller assembles the
+    /// `X-Matrix` header.
+    pub fn sign_request(
+        &self,
+        method: &str,
+        uri: &str,
+        destination: &str,
+        content: Option<CanonicalJsonValue>,
+    ) -> String {
+        let mut obj = CanonicalJsonObject::new();
+        obj.insert(
+            "method".to_owned(),
+            CanonicalJsonValue::String(method.to_owned()),
+        );
+        obj.insert("uri".to_owned(), CanonicalJsonValue::String(uri.to_owned()));
+        obj.insert(
+            "origin".to_owned(),
+            CanonicalJsonValue::String(self.server_name.clone()),
+        );
+        obj.insert(
+            "destination".to_owned(),
+            CanonicalJsonValue::String(destination.to_owned()),
+        );
+        if let Some(content) = content {
+            obj.insert("content".to_owned(), content);
+        }
+        self.sign_bytes(&canonical(&obj))
+    }
+
     /// Co-sign an already-constructed [`Event`](crate::Event): add this
     /// server's signature beside whatever signatures the event already
     /// carries, regenerating `raw`. The event id is untouched (signatures are
@@ -269,6 +301,46 @@ pub async fn verify_event_signed_by(
         });
     };
     verify_event_signature(&obj, origin, resolver, version).await
+}
+
+/// Check a `/_matrix/key/v2/server` response from `server_name` and return
+/// the verify key it publishes under `key_id`: the response must name that
+/// server, carry the key, and be self-signed with it (S2S "Retrieving server
+/// keys"). The string error is the caller's [`KeyResolveError::reason`].
+pub fn verify_key_response(
+    obj: &CanonicalJsonObject,
+    server_name: &str,
+    key_id: &str,
+) -> Result<[u8; 32], String> {
+    match obj.get("server_name") {
+        Some(CanonicalJsonValue::String(name)) if name == server_name => {}
+        _ => return Err("response does not name the requested server".to_owned()),
+    }
+    let Some(CanonicalJsonValue::Object(keys)) = obj.get("verify_keys") else {
+        return Err("no verify_keys object".to_owned());
+    };
+    let Some(CanonicalJsonValue::Object(entry)) = keys.get(key_id) else {
+        return Err(format!("no verify_keys entry for {key_id}"));
+    };
+    let Some(CanonicalJsonValue::String(key_b64)) = entry.get("key") else {
+        return Err(format!("verify_keys.{key_id}.key is not a string"));
+    };
+    let key: [u8; 32] = b64_decode(key_b64)
+        .map_err(|e| format!("key is not unpadded base64: {e}"))?
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("key is {} bytes, want 32", v.len()))?;
+    let Some(CanonicalJsonValue::Object(signatures)) = obj.get("signatures") else {
+        return Err("response is not signed".to_owned());
+    };
+    let Some(CanonicalJsonValue::Object(by_server)) = signatures.get(server_name) else {
+        return Err("response is not signed by the requested server".to_owned());
+    };
+    let Some(CanonicalJsonValue::String(sig)) = by_server.get(key_id) else {
+        return Err(format!("response is not signed with {key_id}"));
+    };
+    verify_one(&signable_json_bytes(obj), &key, sig)
+        .map_err(|why| format!("self-signature: {why}"))?;
+    Ok(key)
 }
 
 /// Key-resolution failure, produced by a [`KeyResolver`].
@@ -896,5 +968,72 @@ mod tests {
     fn node_signer_name_is_hex_public_key() {
         let signer = node_signer(7);
         assert_eq!(signer.server_name(), hex_of(&signer.public_key()));
+    }
+
+    // Request signing covers `{method, uri, origin, destination, content}`
+    // in canonical form; any of them changing changes the signature.
+    #[test]
+    fn sign_request_covers_the_canonical_request_object() {
+        let signer = spec_signer();
+        let content = CanonicalJsonValue::Object(obj(json!({ "pdus": [] })));
+        let uri = "/_matrix/federation/v1/send/1";
+        let sig = signer.sign_request("PUT", uri, "peer", Some(content.clone()));
+        let expected = obj(json!({
+            "method": "PUT",
+            "uri": uri,
+            "origin": "domain",
+            "destination": "peer",
+            "content": { "pdus": [] },
+        }));
+        verify_one(&canonical(&expected), &signer.public_key(), &sig).expect("verifies");
+        let other = signer.sign_request("PUT", "/x", "peer", Some(content));
+        assert_ne!(sig, other);
+        // No body: no `content` key at all (not `null`).
+        let bare = signer.sign_request("GET", "/x", "peer", None);
+        let expected = obj(json!({
+            "method": "GET",
+            "uri": "/x",
+            "origin": "domain",
+            "destination": "peer",
+        }));
+        verify_one(&canonical(&expected), &signer.public_key(), &bare).expect("verifies");
+    }
+
+    fn key_response(signer: &EventSigner, server_name: &str) -> CanonicalJsonObject {
+        let mut o = obj(json!({
+            "server_name": server_name,
+            "valid_until_ts": 1,
+            "verify_keys": { SIGNING_KEY_ID: { "key": b64_unpadded(&signer.public_key()) } },
+            "old_verify_keys": {},
+        }));
+        signer.sign_json(&mut o);
+        o
+    }
+
+    #[test]
+    fn verify_key_response_returns_the_self_signed_key() {
+        let signer = spec_signer();
+        let key = verify_key_response(&key_response(&signer, "domain"), "domain", SIGNING_KEY_ID)
+            .expect("valid response");
+        assert_eq!(key, signer.public_key());
+    }
+
+    #[test]
+    fn verify_key_response_rejects_wrong_server_key_id_and_tampering() {
+        let signer = spec_signer();
+        let good = key_response(&signer, "domain");
+        assert!(verify_key_response(&good, "other", SIGNING_KEY_ID).is_err());
+        assert!(verify_key_response(&good, "domain", "ed25519:2").is_err());
+        // A response naming another server fails the name check even if signed.
+        let impostor = key_response(&signer, "impostor");
+        assert!(verify_key_response(&impostor, "domain", SIGNING_KEY_ID).is_err());
+        // Tampered field: the self-signature no longer covers the bytes.
+        let mut tampered = good.clone();
+        tampered.insert(
+            "valid_until_ts".to_owned(),
+            CanonicalJsonValue::Integer(2.into()),
+        );
+        let err = verify_key_response(&tampered, "domain", SIGNING_KEY_ID).unwrap_err();
+        assert!(err.contains("self-signature"), "{err}");
     }
 }

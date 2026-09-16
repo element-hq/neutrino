@@ -99,7 +99,8 @@ async fn try_federated_leave(
     user: &UserId,
     display_name: &str,
 ) -> Result<(), String> {
-    let client = FederationClient::new(own_server.to_owned(), proxy);
+    let client =
+        FederationClient::new(own_server.to_owned(), proxy).with_signer(policy.signer().cloned());
     let offered: Vec<&str> = policy.versions.ids().collect();
     let template = client
         .make_leave(dest, room_id, user, &offered)

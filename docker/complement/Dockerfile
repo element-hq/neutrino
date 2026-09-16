@@ -46,7 +46,17 @@ COPY vendor/coap-rs ./vendor/coap-rs
 COPY vendor/coap-lite ./vendor/coap-lite
 RUN cargo build --release --bin neutrino --features multi-user-shim
 
-# Runtime: nginx sidecar terminates TLS on 8448 and proxies plain HTTP on 8008.
+# Outbound federation egress (see egress/main.go): neutrino's federation
+# client is plaintext http:// with no TLS backend, so the entrypoint routes it
+# through this proxy, which re-issues each request over HTTPS verified against
+# the complement CA. Dependency-free Go, static binary.
+FROM golang:1-bookworm AS egress
+WORKDIR /src
+COPY docker/complement/egress ./
+RUN CGO_ENABLED=0 go build -trimpath -o /neutrino-egress .
+
+# Runtime: nginx terminates TLS on 8448 and proxies plain HTTP on 8008; the
+# egress handles the outbound side.
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
@@ -54,15 +64,24 @@ RUN apt-get update \
         nginx \
         openssl \
         gettext-base \
-        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/neutrino /usr/local/bin/neutrino
+COPY --from=egress /neutrino-egress /usr/local/bin/neutrino-egress
 COPY docker/complement/conf/nginx.conf.template /etc/neutrino/nginx.conf.template
 COPY docker/complement/conf/entrypoint.sh /entrypoint.sh
 
-RUN mkdir -p /etc/neutrino \
+RUN mkdir -p /etc/neutrino /data \
     && chmod +x /entrypoint.sh
+
+# Overridable (Complement forwards host env under COMPLEMENT_SHARE_ENV_PREFIX).
+# Signed mode: events carry hashes + signatures and requests a signed X-Matrix,
+# which Complement's gomatrixserverlib requires. Jitter is the pre-drain delay
+# on the outbound sender: the 30s production default would stall every
+# federated send past Complement's sync timeouts.
+ENV NEUTRINO_TRUSTED_NETWORK=0 \
+    NEUTRINO_STORAGE_DIR=/data \
+    NEUTRINO_STARTUP_JITTER_MS=0
 
 EXPOSE 8008 8448
 

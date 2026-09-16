@@ -49,11 +49,13 @@ pub struct Config {
     /// The server creates this directory if missing, but not its parents —
     /// those are the caller's responsibility (see `SqliteStore::open_in_dir`).
     pub storage_dir: PathBuf,
-    /// Outbound federation proxy URL (the `neutrino-lb` egress). **Internal /
-    /// derived — not operator-set.** `neutrino-main` fills this in when it runs
-    /// the in-process sidecar (see `lb_federation_port`), pointing it at the
-    /// loopback egress it allocates; `neutrino-http` reads it to route outbound
-    /// federation through the egress. `None` = direct federation (the default).
+    /// Outbound federation proxy URL; `neutrino-http` routes every outbound
+    /// federation request through it (the destination rides in the URL host,
+    /// `~`-suffixed). `neutrino-main` overrides it with the loopback egress it
+    /// allocates when it runs the in-process sidecar (see `lb_federation_port`);
+    /// otherwise `NEUTRINO_FEDERATION_PROXY` names an external egress (the
+    /// Complement image's TLS-upgrading proxy). `None` = direct federation
+    /// (the default).
     pub federation_proxy: Option<String>,
     /// When set, `neutrino-main` runs a `neutrino-lb` sidecar **in-process**
     /// alongside the homeserver (the embedded-on-mobile target), with the CoAP
@@ -143,9 +145,7 @@ impl Config {
                     .as_deref(),
             ),
             storage_dir: storage_dir_from(std::env::var("NEUTRINO_STORAGE_DIR").ok().as_deref()),
-            // `federation_proxy` is internal/derived (set by neutrino-main when
-            // the in-process sidecar runs), not an environment knob.
-            federation_proxy: None,
+            federation_proxy: std::env::var("NEUTRINO_FEDERATION_PROXY").ok(),
             lb_federation_port: std::env::var("NEUTRINO_LB_FEDERATION_PORT")
                 .ok()
                 .and_then(|s| s.parse::<u16>().ok()),

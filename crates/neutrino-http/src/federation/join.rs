@@ -148,7 +148,8 @@ async fn run_join_dance(
             app.config.federation_proxy.clone(),
         )
     };
-    let client = FederationClient::new(own_server, federation_proxy.as_deref());
+    let client = FederationClient::new(own_server, federation_proxy.as_deref())
+        .with_signer(policy.signer().cloned());
     let display_name = crate::local_display_name(&store).await;
 
     // Subscribe to the persist watch *before* staging anything (subscribe-

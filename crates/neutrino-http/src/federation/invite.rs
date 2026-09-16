@@ -299,7 +299,8 @@ pub(crate) async fn federated_invite(
         }
     };
     let irs = build_invite_room_state(&*store, room_id, &sender).await;
-    let client = FederationClient::new(own_server, federation_proxy.as_deref());
+    let client = FederationClient::new(own_server, federation_proxy.as_deref())
+        .with_signer(policy.signer().cloned());
     let returned = match client
         .invite(
             target.server_name(),

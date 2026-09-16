@@ -43,6 +43,7 @@ mod sliding_sync;
 mod multi_user;
 
 use federation::client::{FederationClient, ReqwestFetcher};
+pub use federation::keys::HttpKeyResolver;
 use neutrino_engine::{MissingEventsFetcher, RoomActorError, RoomRegistry};
 use sliding_sync::{SyncError, SyncState};
 
@@ -248,10 +249,13 @@ impl AppState {
         discovery: Arc<DiscoveryRegistry>,
         policy: EventPolicy,
     ) -> Self {
-        let client = Arc::new(FederationClient::new(
-            config.server_name.clone(),
-            config.federation_proxy.as_deref(),
-        ));
+        let client = Arc::new(
+            FederationClient::new(
+                config.server_name.clone(),
+                config.federation_proxy.as_deref(),
+            )
+            .with_signer(policy.signer().cloned()),
+        );
         let fetcher: Arc<dyn MissingEventsFetcher> = Arc::new(ReqwestFetcher::new(client));
         Self::from_store_with_fetcher(config, store, fetcher, discovery, policy)
     }
@@ -292,10 +296,13 @@ impl AppState {
         let (kick_backoff, _) = watch::channel(());
         // Outbound federation client, built once here and shared (rather than
         // rebuilt per back-page in `messages.rs`'s backfill path).
-        let fed_client = Arc::new(FederationClient::new(
-            config.server_name.clone(),
-            config.federation_proxy.as_deref(),
-        ));
+        let fed_client = Arc::new(
+            FederationClient::new(
+                config.server_name.clone(),
+                config.federation_proxy.as_deref(),
+            )
+            .with_signer(policy.signer().cloned()),
+        );
         let app = App {
             store,
             room_registry,
@@ -442,10 +449,10 @@ pub async fn serve(
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
     // enumeration resumes delivery of anything left undelivered.
-    let transport = Arc::new(FederationClient::new(
-        state.server_name(),
-        state.federation_proxy().as_deref(),
-    ));
+    let transport = Arc::new(
+        FederationClient::new(state.server_name(), state.federation_proxy().as_deref())
+            .with_signer(state.signer()),
+    );
     let sender_task = neutrino_engine::sender::spawn(
         state.store(),
         transport,

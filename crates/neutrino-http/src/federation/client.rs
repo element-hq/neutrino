@@ -6,8 +6,9 @@
 //!
 //! - **Resolution** is `http://{server_name}` — raw IP:port, no TLS, no
 //!   `.well-known` / SRV lookup.
-//! - **X-Matrix header sent** (network-attested origin + destination, no
-//!   key/sig — see [`crate::federation::auth`]); no request signing.
+//! - **X-Matrix header sent** with origin + destination (network-attested —
+//!   see [`crate::federation::auth`]); `key`/`sig` are added only on a signed
+//!   deployment (S2S "Request authentication").
 //! - PDUs are opaque `RawValue`s on the wire, never re-parsed here.
 //!
 //! Consumed by the per-destination sender pool (`federation::sender`).
@@ -17,7 +18,9 @@ use std::time::Duration;
 
 use std::collections::BTreeMap;
 
-use reqwest::Client;
+use neutrino_event::{EventSigner, SIGNING_KEY_ID};
+use reqwest::{Client, Method, Url};
+use ruma::canonical_json::{CanonicalJsonObject, CanonicalJsonValue};
 use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId, ServerName, UserId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -59,6 +62,10 @@ pub(crate) enum FederationClientError {
     /// surfaced rather than panicked on.
     #[error("could not build federation URL")]
     InvalidUrl,
+    /// A JSON body (ours to sign, or a peer's key response) is not canonical
+    /// JSON — floats, or a peer answering with a non-object.
+    #[error("non-canonical JSON: {0}")]
+    Json(String),
 }
 
 /// reqwest-backed client for outbound federation requests.
@@ -69,6 +76,9 @@ pub(crate) struct FederationClient {
     /// Whether outbound requests route through the `neutrino-lb` egress proxy.
     /// Decides what goes in the request URL's authority (see [`Self::url_authority`]).
     proxied: bool,
+    /// This deployment's signer; `Some` only in signed mode, where every
+    /// request's `X-Matrix` header carries `key`/`sig`.
+    signer: Option<Arc<EventSigner>>,
 }
 
 /// Sentinel appended to the URL host on the proxied path, stripped by the
@@ -139,7 +149,15 @@ impl FederationClient {
             http,
             origin,
             proxied,
+            signer: None,
         }
+    }
+
+    /// Sign outbound requests with `signer` (the deployment's event signer;
+    /// `None` on a trusted network leaves the header unsigned).
+    pub(crate) fn with_signer(mut self, signer: Option<Arc<EventSigner>>) -> Self {
+        self.signer = signer;
+        self
     }
 
     /// The authority for a request URL. Proxied: the destination with
@@ -159,16 +177,86 @@ impl FederationClient {
         }
     }
 
-    /// The `Authorization: X-Matrix origin="…",destination="…"` header value for
-    /// an outbound request to `dest`. No `key`/`sig`: we have no signing key, so
-    /// this is a network-attested identity, not a signature (see
-    /// [`crate::federation::auth`]). Server names contain no `"`/`,`, so the
-    /// values need no escaping.
-    fn x_matrix(&self, dest: &ServerName) -> String {
-        format!(
+    /// A request to `dest` carrying `Authorization: X-Matrix …` and, when
+    /// given, `body` as JSON.
+    fn request<B: Serialize>(
+        &self,
+        method: Method,
+        url: Url,
+        dest: &ServerName,
+        body: Option<&B>,
+    ) -> Result<reqwest::RequestBuilder, FederationClientError> {
+        let auth = self.x_matrix(&method, &url, dest, body)?;
+        let req = self
+            .http
+            .request(method, url)
+            .header(reqwest::header::AUTHORIZATION, auth);
+        Ok(match body {
+            Some(body) => req.json(body),
+            None => req,
+        })
+    }
+
+    /// The `Authorization: X-Matrix` header value for a request to `dest`:
+    /// `origin` + `destination` always (a network-attested identity — see
+    /// [`crate::federation::auth`]), plus `key` + `sig` on a signed
+    /// deployment, covering `{method, uri, origin, destination, content}`
+    /// with `content` = `body`. The body is serialised to a value here only
+    /// for signing; the wire bytes are its own serialisation, which
+    /// canonicalises to the same thing. Server names contain no `"`/`,`, so
+    /// the values need no escaping.
+    fn x_matrix<B: Serialize>(
+        &self,
+        method: &Method,
+        url: &Url,
+        dest: &ServerName,
+        body: Option<&B>,
+    ) -> Result<String, FederationClientError> {
+        let header = format!(
             "X-Matrix origin=\"{}\",destination=\"{}\"",
             self.origin, dest
-        )
+        );
+        let Some(signer) = &self.signer else {
+            return Ok(header);
+        };
+        let content = body
+            .map(|b| {
+                serde_json::to_value(b)
+                    .map_err(|e| e.to_string())
+                    .and_then(|v| CanonicalJsonValue::try_from(v).map_err(|e| e.to_string()))
+            })
+            .transpose()
+            .map_err(FederationClientError::Json)?;
+        let uri = match url.query() {
+            Some(query) => format!("{}?{query}", url.path()),
+            None => url.path().to_owned(),
+        };
+        let sig = signer.sign_request(method.as_str(), &uri, dest.as_str(), content);
+        Ok(format!("{header},key=\"{SIGNING_KEY_ID}\",sig=\"{sig}\""))
+    }
+
+    /// `GET http://{dest}/_matrix/key/v2/server` — the peer's published signing
+    /// keys, as the raw signed object (checked by the caller via
+    /// [`neutrino_event::verify_key_response`]). Unauthenticated, per spec: no
+    /// `X-Matrix` — resolving a key is a prerequisite of verifying anything.
+    pub(crate) async fn server_keys(
+        &self,
+        dest: &ServerName,
+    ) -> Result<CanonicalJsonObject, FederationClientError> {
+        info!(target: "neutrino_http", %dest, "outbound GET /_matrix/key/v2/server");
+        let url = format!("http://{}/_matrix/key/v2/server", self.url_authority(dest));
+        let resp = self.http.get(&url).send().await?;
+        if !resp.status().is_success() {
+            return Err(non_2xx_error(resp, dest, "GET /key/v2/server").await);
+        }
+        let value = parse_2xx::<Value>(resp, dest, "GET /key/v2/server").await?;
+        match CanonicalJsonValue::try_from(value) {
+            Ok(CanonicalJsonValue::Object(obj)) => Ok(obj),
+            Ok(_) => Err(FederationClientError::Json(
+                "key response is not an object".to_owned(),
+            )),
+            Err(e) => Err(FederationClientError::Json(e.to_string())),
+        }
     }
 
     /// `PUT http://{dest}/_matrix/federation/v1/send/{txn_id}` carrying `pdus`
@@ -189,20 +277,18 @@ impl FederationClient {
     ) -> Result<BTreeMap<OwnedRoomId, ForwardExtremities>, FederationClientError> {
         // `txn_id` is locally generated (`{u64}-{u64}`) and `dest` is a
         // validated `ServerName`, so neither needs escaping in the path.
-        let url = format!(
+        let url = Url::parse(&format!(
             "http://{}/_matrix/federation/v1/send/{txn_id}",
             self.url_authority(dest)
-        );
+        ))
+        .map_err(|_| FederationClientError::InvalidUrl)?;
         let body = TransactionRequest {
             pdus,
             edus: &[],
             forward_extremities,
         };
         let resp = self
-            .http
-            .put(&url)
-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
-            .json(&body)
+            .request(Method::PUT, url, dest, Some(&body))?
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -246,7 +332,7 @@ impl FederationClient {
         // segment, so a trailing slash would yield an empty segment + double
         // slash (`…/get_missing_events//{room}`).
         info!(target: "neutrino_http", %dest, %room_id, limit, state_dag, include_latest_events, "outbound POST /_matrix/federation/v1/get_missing_events");
-        let mut url = reqwest::Url::parse(&format!(
+        let mut url = Url::parse(&format!(
             "http://{}/_matrix/federation/v1/get_missing_events",
             self.url_authority(dest)
         ))
@@ -263,10 +349,7 @@ impl FederationClient {
             include_latest_events,
         };
         let resp = self
-            .http
-            .post(url)
-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
-            .json(&body)
+            .request(Method::POST, url, dest, Some(&body))?
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -298,7 +381,7 @@ impl FederationClient {
         // URL-validated. No trailing slash on the base (`push` appends a
         // segment).
         info!(target: "neutrino_http", %dest, %room_id, limit, seeds = seeds.len(), "outbound GET /_matrix/federation/v1/backfill");
-        let mut url = reqwest::Url::parse(&format!(
+        let mut url = Url::parse(&format!(
             "http://{}/_matrix/federation/v1/backfill",
             self.url_authority(dest)
         ))
@@ -315,9 +398,7 @@ impl FederationClient {
         }
 
         let resp = self
-            .http
-            .get(url)
-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .request(Method::GET, url, dest, None::<&Value>)?
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -342,7 +423,7 @@ impl FederationClient {
         vers: &[&str],
     ) -> Result<MakeJoinResponse, FederationClientError> {
         info!(target: "neutrino_http", %dest, %room_id, %user_id, "outbound GET /_matrix/federation/v1/make_join");
-        let mut url = reqwest::Url::parse(&format!(
+        let mut url = Url::parse(&format!(
             "http://{}/_matrix/federation/v1/make_join",
             self.url_authority(dest)
         ))
@@ -359,9 +440,7 @@ impl FederationClient {
         }
 
         let resp = self
-            .http
-            .get(url)
-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .request(Method::GET, url, dest, None::<&Value>)?
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -381,7 +460,7 @@ impl FederationClient {
         event: &RawJsonValue,
     ) -> Result<SendJoinResponse, FederationClientError> {
         info!(target: "neutrino_http", %dest, %room_id, %event_id, "outbound PUT /_matrix/federation/v2/send_join");
-        let mut url = reqwest::Url::parse(&format!(
+        let mut url = Url::parse(&format!(
             "http://{}/_matrix/federation/v2/send_join",
             self.url_authority(dest)
         ))
@@ -392,10 +471,7 @@ impl FederationClient {
             .push(event_id.as_str());
 
         let resp = self
-            .http
-            .put(url)
-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
-            .json(&event)
+            .request(Method::PUT, url, dest, Some(&event))?
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -420,7 +496,7 @@ impl FederationClient {
         invite_room_state: &[Value],
     ) -> Result<InviteResponse, FederationClientError> {
         info!(target: "neutrino_http", %dest, %room_id, %event_id, "outbound PUT /_matrix/federation/v2/invite");
-        let mut url = reqwest::Url::parse(&format!(
+        let mut url = Url::parse(&format!(
             "http://{}/_matrix/federation/v2/invite",
             self.url_authority(dest)
         ))
@@ -436,10 +512,7 @@ impl FederationClient {
             invite_room_state,
         };
         let resp = self
-            .http
-            .put(url)
-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
-            .json(&body)
+            .request(Method::PUT, url, dest, Some(&body))?
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -462,7 +535,7 @@ impl FederationClient {
         vers: &[&str],
     ) -> Result<MakeLeaveResponse, FederationClientError> {
         info!(target: "neutrino_http", %dest, %room_id, %user_id, "outbound GET /_matrix/federation/v1/make_leave");
-        let mut url = reqwest::Url::parse(&format!(
+        let mut url = Url::parse(&format!(
             "http://{}/_matrix/federation/v1/make_leave",
             self.url_authority(dest)
         ))
@@ -477,9 +550,7 @@ impl FederationClient {
         }
 
         let resp = self
-            .http
-            .get(url)
-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .request(Method::GET, url, dest, None::<&Value>)?
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -500,7 +571,7 @@ impl FederationClient {
         event: &RawJsonValue,
     ) -> Result<(), FederationClientError> {
         info!(target: "neutrino_http", %dest, %room_id, %event_id, "outbound PUT /_matrix/federation/v2/send_leave");
-        let mut url = reqwest::Url::parse(&format!(
+        let mut url = Url::parse(&format!(
             "http://{}/_matrix/federation/v2/send_leave",
             self.url_authority(dest)
         ))
@@ -511,10 +582,7 @@ impl FederationClient {
             .push(event_id.as_str());
 
         let resp = self
-            .http
-            .put(url)
-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
-            .json(&event)
+            .request(Method::PUT, url, dest, Some(&event))?
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -776,13 +844,13 @@ mod tests {
     // suffixed all-digit name where the bare one is rewritten or rejected.
     #[test]
     fn sentinel_defeats_whatwg_ipv4_reinterpretation() {
-        let mangled = reqwest::Url::parse("http://0104/x").unwrap();
+        let mangled = Url::parse("http://0104/x").unwrap();
         assert_eq!(mangled.host_str(), Some("0.0.0.68"), "the bug");
-        let kept = reqwest::Url::parse("http://0104~/x").unwrap();
+        let kept = Url::parse("http://0104~/x").unwrap();
         assert_eq!(kept.host_str(), Some("0104~"), "the fix");
-        assert!(reqwest::Url::parse("http://0189/x").is_err());
+        assert!(Url::parse("http://0189/x").is_err());
         assert_eq!(
-            reqwest::Url::parse("http://0189~/x").unwrap().host_str(),
+            Url::parse("http://0189~/x").unwrap().host_str(),
             Some("0189~")
         );
     }
@@ -824,6 +892,69 @@ mod tests {
         // `TransactionRequest`). Every byte counts on a low-bandwidth link.
         let keys: Vec<&String> = body.as_object().expect("object body").keys().collect();
         assert_eq!(keys, vec!["pdus"], "trimmed payload: {body}");
+    }
+
+    // Signed mode: the header gains `key`/`sig`, the signature being over the
+    // canonical `{method, uri, origin, destination, content}` — recomputed
+    // here from what the stub received. Trusted mode sends exactly the old
+    // two-field header.
+    #[tokio::test]
+    async fn x_matrix_is_signed_only_with_a_signer() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = seen.clone();
+        let app = Router::new().route(
+            "/_matrix/federation/v1/send/{txn}",
+            put(move |headers: axum::http::HeaderMap| {
+                let cap = cap.clone();
+                async move {
+                    let auth = headers[reqwest::header::AUTHORIZATION]
+                        .to_str()
+                        .unwrap()
+                        .to_owned();
+                    cap.lock().unwrap().push(auth);
+                    Json(json!({}))
+                }
+            }),
+        );
+        let dest = spawn_stub(app).await;
+        let pdu = raw(r#"{"n":1}"#);
+
+        let unsigned = FederationClient::new("local.test".to_owned(), None);
+        unsigned
+            .send_transaction(&dest, "t1", std::slice::from_ref(&pdu), &BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            format!("X-Matrix origin=\"local.test\",destination=\"{dest}\"")
+        );
+
+        let signer = Arc::new(EventSigner::new(&[9u8; 32], "local.test"));
+        let signed =
+            FederationClient::new("local.test".to_owned(), None).with_signer(Some(signer.clone()));
+        signed
+            .send_transaction(&dest, "t2", std::slice::from_ref(&pdu), &BTreeMap::new())
+            .await
+            .unwrap();
+        let header = seen.lock().unwrap()[1].clone();
+        let body = serde_json::to_value(TransactionRequest {
+            pdus: std::slice::from_ref(&pdu),
+            edus: &[],
+            forward_extremities: &BTreeMap::new(),
+        })
+        .unwrap();
+        let expected_sig = signer.sign_request(
+            "PUT",
+            "/_matrix/federation/v1/send/t2",
+            dest.as_str(),
+            Some(CanonicalJsonValue::try_from(body).unwrap()),
+        );
+        assert_eq!(
+            header,
+            format!(
+                "X-Matrix origin=\"local.test\",destination=\"{dest}\",key=\"{SIGNING_KEY_ID}\",sig=\"{expected_sig}\""
+            )
+        );
     }
 
     #[tokio::test]

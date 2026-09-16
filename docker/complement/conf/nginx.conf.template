@@ -33,8 +33,7 @@ http {
         }
     }
 
-    # TLS for federation traffic. Federation is out of scope for now, but
-    # complement still expects 8448 to be reachable.
+    # Inbound federation: TLS terminated here, plain HTTP on to neutrino.
     server {
         listen 8448 ssl default_server;
         listen [::]:8448 ssl default_server;

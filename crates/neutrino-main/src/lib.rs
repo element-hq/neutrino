@@ -267,20 +267,6 @@ pub async fn entrypoint(
         sign_messages: !config.trusted_network,
     };
     tracing::info!(?security_config, "federation security");
-    let security = event_security(&security_config, key_resolver, &secret, &config.server_name)?;
-    // The room versions this build understands: the built-in base, plus the
-    // medium's if it declared one (which is then what new rooms are created
-    // under). Composed once, here, and read per room thereafter — a room's
-    // version comes off `rooms.room_version`, never from this process's config.
-    let versions = Arc::new(neutrino_event::RoomVersions::new(medium_version)?);
-    tracing::info!(
-        supported = ?versions.ids().collect::<Vec<_>>(),
-        new_rooms = versions.default_for_new_rooms().id,
-        "room versions",
-    );
-    // The deployment's two event-level facts, composed once and threaded as one
-    // value from here down (see `EventPolicy`).
-    let policy = neutrino_event::EventPolicy::new(security, versions);
 
     // A store's events belong to exactly one trust domain: unsigned events
     // can never serve a signed deployment (nothing to verify) and vice versa.
@@ -338,6 +324,31 @@ pub async fn entrypoint(
         }
         None => None,
     };
+
+    // Signed mode needs a key namespace. A medium may declare one; otherwise
+    // named peers publish theirs at `/_matrix/key/v2/server`, fetched over the
+    // route outbound federation takes — so composed here, once
+    // `federation_proxy` is final.
+    let key_resolver = key_resolver.or_else(|| {
+        security_config.sign_messages.then(|| {
+            Arc::new(neutrino_http::HttpKeyResolver::new(&config))
+                as Arc<dyn neutrino_event::KeyResolver>
+        })
+    });
+    let security = event_security(&security_config, key_resolver, &secret, &config.server_name)?;
+    // The room versions this build understands: the built-in base, plus the
+    // medium's if it declared one (which is then what new rooms are created
+    // under). Composed once, here, and read per room thereafter — a room's
+    // version comes off `rooms.room_version`, never from this process's config.
+    let versions = Arc::new(neutrino_event::RoomVersions::new(medium_version)?);
+    tracing::info!(
+        supported = ?versions.ids().collect::<Vec<_>>(),
+        new_rooms = versions.default_for_new_rooms().id,
+        "room versions",
+    );
+    // The deployment's two event-level facts, composed once and threaded as one
+    // value from here down (see `EventPolicy`).
+    let policy = neutrino_event::EventPolicy::new(security, versions);
 
     // Bind through `canonical_loopback` so a `localhost` bind lands on IPv4
     // deterministically — the same family the ingress upstream targets. Binding
