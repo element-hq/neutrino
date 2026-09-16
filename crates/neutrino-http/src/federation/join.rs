@@ -33,7 +33,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use neutrino_event::EventPolicy;
-use neutrino_store::{InviteStore, RoomStore, StagingStore, StateStore, StreamPos};
+use neutrino_store::{
+    Membership, OobMembershipStore, RoomStore, StagingStore, StateStore, StreamPos,
+};
 use ruma::{OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId};
 use serde_json::json;
 use tokio::sync::{mpsc, watch};
@@ -183,7 +185,7 @@ async fn run_join_dance(
                 // peers see `leave`. Best-effort: a stale stub is otherwise
                 // superseded by the joined state in sync, so a removal
                 // fault must not fail an already-successful join.
-                if let Err(e) = store.remove_invite(room_id, &user).await {
+                if let Err(e) = store.remove_oob_membership(room_id, &user).await {
                     warn!(%room_id, %user, error = %e, "failed to clear invite stub after federated join");
                 }
                 return Ok(());
@@ -283,14 +285,14 @@ pub(crate) async fn federated_join_if_remote(
     // A pending OOB invite supplies the inviter's server as a fallback candidate
     // (the client cannot supply a `via` for a v12 room id). A storage fault is a
     // 500, not silently mistaken for "no invite" — which would 404 a joinable room.
-    match store.get_invite(room_id, user).await {
-        Ok(Some(invite)) => {
-            let inviter = invite.sender.server_name().to_owned();
+    match store.get_oob_membership(room_id, user).await {
+        Ok(Some(oob)) if oob.membership == Membership::Invite => {
+            let inviter = oob.event.sender.server_name().to_owned();
             if !candidates.contains(&inviter) {
                 candidates.push(inviter);
             }
         }
-        Ok(None) => {}
+        Ok(Some(_)) | Ok(None) => {}
         Err(e) => {
             return Some(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,

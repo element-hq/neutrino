@@ -667,48 +667,67 @@ pub trait FederationInbox: Send + Sync {
 /// folded into `current_state` / `rooms_with_membership`. On accept (the room
 /// enters normal joined state) or reject (membership → leave) the stub is
 /// removed.
+/// The latest out-of-band `m.room.member` event a peer handed us for a local
+/// user in a room this server is not in — an invite, or the leave / ban that
+/// ended it — with the room version it was named under (there is no `rooms`
+/// row to recover it from).
+#[derive(Debug, Clone)]
+pub struct OobMembership {
+    pub event: Event,
+    pub membership: Membership,
+    pub room_version: String,
+}
+
 #[async_trait]
-pub trait InviteStore: Send + Sync {
-    /// Pre:  `event` is an `m.room.member` event with `content.membership =
-    ///       "invite"`, `state_key == user_id`, and `room_id == room_id`; its
-    ///       `raw` is the canonical wire form (round-trips its `event_id`) and
-    ///       carries `unsigned.invite_room_state`.
-    /// Post: records the invite keyed by `(room_id, user_id)`, **replacing**
-    ///       any prior invite for the same pair — latest invite wins (a peer
-    ///       may re-invite after a decline; the most recent stripped state is
-    ///       the one to render). Does NOT advance the persist watch (an OOB
-    ///       invite is not a room event; it surfaces only via the sync invite
-    ///       path).
-    async fn put_invite(
+pub trait OobMembershipStore: Send + Sync {
+    /// Pre:  `event` is an `m.room.member` event with `state_key == user_id`,
+    ///       `room_id == room_id` and `content.membership` one of `invite`,
+    ///       `leave`, `ban`; its `raw` is the canonical wire form (round-trips
+    ///       its `event_id`) and, for an invite, carries
+    ///       `unsigned.invite_room_state`.
+    /// Post: records the membership keyed by `(room_id, user_id)`, **replacing**
+    ///       any prior row for the same pair — latest wins (an invite after a
+    ///       decline, a leave after an invite). Does NOT advance the persist
+    ///       watch (an out-of-band event is not a room event; it surfaces only
+    ///       via the sync out-of-band path). `InvalidInput` if `membership` is
+    ///       not one of the three.
+    async fn put_oob_membership(
         &self,
         room_id: &RoomId,
         user_id: &UserId,
         event: &Event,
+        room_version: &str,
     ) -> Result<(), StorageError>;
 
     /// Pre:  none.
-    /// Post: returns the stored invite `m.room.member` event for
-    ///       `(room_id, user_id)`, or `None` if none is held. The returned
-    ///       `Event` round-trips the stored wire bytes (including
-    ///       `unsigned.invite_room_state`).
-    async fn get_invite(
+    /// Post: returns the stored membership for `(room_id, user_id)`, or `None`
+    ///       if none is held. The `Event` round-trips the stored wire bytes
+    ///       (including `unsigned.invite_room_state`).
+    async fn get_oob_membership(
         &self,
         room_id: &RoomId,
         user_id: &UserId,
-    ) -> Result<Option<Event>, StorageError>;
+    ) -> Result<Option<OobMembership>, StorageError>;
 
     /// Pre:  none.
-    /// Post: deletes the invite for `(room_id, user_id)` if present;
-    ///       idempotent (a missing pair is a no-op). Called when the invite is
-    ///       accepted or rejected.
-    async fn remove_invite(&self, room_id: &RoomId, user_id: &UserId) -> Result<(), StorageError>;
+    /// Post: deletes the row for `(room_id, user_id)` if present; idempotent (a
+    ///       missing pair is a no-op). Called when the user joins the room for
+    ///       real — in-room state supersedes the stub.
+    async fn remove_oob_membership(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+    ) -> Result<(), StorageError>;
 
     /// Pre:  none.
-    /// Post: returns the `room_id` of every room in which `user_id` currently
-    ///       holds an out-of-band invite. Sync unions these into its room list
-    ///       (as membership = invite), separately from `rooms_with_membership`
-    ///       since OOB invites live in a different table and carry no auth.
-    async fn invited_oob_rooms(&self, user_id: &UserId) -> Result<Vec<OwnedRoomId>, StorageError>;
+    /// Post: returns `(room_id, membership)` for every out-of-band membership
+    ///       `user_id` holds. Sync unions these into its room list, separately
+    ///       from `rooms_with_membership` since they live in a different table
+    ///       and carry no auth.
+    async fn oob_memberships(
+        &self,
+        user_id: &UserId,
+    ) -> Result<Vec<(OwnedRoomId, Membership)>, StorageError>;
 }
 
 /// The server's persistent identity facts: the opaque 32-byte node secret and
@@ -770,7 +789,7 @@ pub trait StorageBackend:
     + FederationInbox
     + DeliveryStore
     + StagingStore
-    + InviteStore
+    + OobMembershipStore
     + IdentityStore
 {
 }
@@ -784,7 +803,7 @@ impl<T> StorageBackend for T where
         + FederationInbox
         + DeliveryStore
         + StagingStore
-        + InviteStore
+        + OobMembershipStore
         + IdentityStore
 {
 }

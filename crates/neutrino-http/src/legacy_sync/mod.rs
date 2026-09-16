@@ -104,11 +104,12 @@ pub(crate) async fn handle(
 /// `Membership` variant and collect into a `BTreeMap` for O(log n)
 /// lookup by `translate_response`'s bucketing loop.
 ///
-/// Out-of-band invites (federated invites for rooms we don't host, stored
-/// outside `current_state`) are unioned in as `Invite` so `translate_response`
-/// buckets those rooms into `rooms.invite` explicitly rather than via its
-/// missing-from-map `invite_state` fallback (which warns). In-room membership
-/// wins on overlap (`or_insert` keeps the `rooms_with_membership` value).
+/// Out-of-band memberships (invites, and the leaves/bans that ended them, for
+/// rooms this server is not in — stored outside `current_state`) are unioned
+/// in with their own membership so `translate_response` buckets those rooms
+/// explicitly rather than via its missing-from-map `invite_state` fallback
+/// (which warns). In-room membership wins on overlap (`or_insert` keeps the
+/// `rooms_with_membership` value).
 async fn fetch_memberships<S: StorageBackend>(
     sync_state: &SyncState<S>,
     user_id: &OwnedUserId,
@@ -127,8 +128,8 @@ async fn fetch_memberships<S: StorageBackend>(
         .rooms_with_membership(user_id, &all)
         .await?;
     let mut map: BTreeMap<OwnedRoomId, Membership> = rows.into_iter().collect();
-    for room_id in sync_state.store.invited_oob_rooms(user_id).await? {
-        map.entry(room_id).or_insert(Membership::Invite);
+    for (room_id, membership) in sync_state.store.oob_memberships(user_id).await? {
+        map.entry(room_id).or_insert(membership);
     }
     Ok(map)
 }
@@ -140,7 +141,7 @@ mod tests {
 
     use neutrino_event::Event;
     use neutrino_event::event_id::base_version_event_id;
-    use neutrino_store::{InviteStore, Membership};
+    use neutrino_store::{Membership, OobMembershipStore};
     use neutrino_store_sqlite::SqliteStore;
     use ruma::{RoomId, UserId, room_id, user_id};
     use serde_json::{Value, json};
@@ -167,8 +168,8 @@ mod tests {
 
     /// An out-of-band invite `m.room.member` event (with stripped
     /// `unsigned.invite_room_state`) as it arrives over `/invite/v2`. Built by
-    /// hand so the raw carries `unsigned` verbatim — `put_invite` stores it and
-    /// `get_invite` hydrates it through `EventRow` without redaction.
+    /// hand so the raw carries `unsigned` verbatim — `put_oob_membership` stores it and
+    /// `get_oob_membership` hydrates it through `EventRow` without redaction.
     fn oob_invite(room: &RoomId, invited: &UserId, inviter: &UserId, name: &str) -> Event {
         let body: Value = json!({
             "room_id": room.as_str(),
@@ -218,7 +219,12 @@ mod tests {
         let inviter = user_id!("@bob:other.example.org");
         let room = room_id!("!remote:other.example.org");
         store
-            .put_invite(room, user, &oob_invite(room, user, inviter, "Remote Room"))
+            .put_oob_membership(
+                room,
+                user,
+                &oob_invite(room, user, inviter, "Remote Room"),
+                neutrino_event::ROOM_VERSION_ID,
+            )
             .await
             .unwrap();
 

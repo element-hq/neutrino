@@ -224,6 +224,22 @@ pub(crate) fn map_apply_err(err: neutrino_engine::RoomActorError) -> FedError {
     }
 }
 
+/// Whether any of this server's users is currently joined to `room_id` — the
+/// out-of-band predicate. A membership event for a local user in a room this
+/// server is not in cannot be applied against room state we may still hold: a
+/// stale copy from an earlier membership is not the room's current state.
+pub(crate) async fn server_in_room(
+    store: &impl neutrino_store::StateStore,
+    room_id: &ruma::RoomId,
+    own_server: &str,
+) -> Result<bool, neutrino_store::StorageError> {
+    Ok(store
+        .joined_members(room_id)
+        .await?
+        .keys()
+        .any(|user| user.server_name().as_str() == own_server))
+}
+
 /// Co-sign a locally-committed federation event with this server's signature
 /// when the deployment is signed — the resident/invitee side of the
 /// `send_join` / `send_leave` / `invite` round-trips, so the copy we persist +
@@ -269,30 +285,22 @@ pub(crate) fn complete_membership_template(
     display_name: &str,
 ) -> Option<neutrino_event::Event> {
     use neutrino_event::event_builder::EventBuilder;
-    let raw = serde_json::value::RawValue::from_string(template.get().to_owned()).ok()?;
-    // Deliberately NOT `EventSecurity::admit`: a make_* template is a protoevent
-    // authored by the *resident* with OUR user as `sender`, so it can never
-    // carry a valid sender's-server signature — a signed deployment would
-    // refuse every template. That is safe precisely because nothing here is
-    // trusted: only the DAG pointers are taken (never echoed — the event is
-    // rebuilt below, re-validated by `EventBuilder::build`, and auth-checked
-    // by the resident), so a `Wire::Rejected` template is as usable as a
-    // valid one.
-    let parsed = match neutrino_event::event_builder::from_wire(raw, Vec::new(), version)
-        .map(|uw| uw.admit_on_faith())
-    {
-        Ok(neutrino_event::Wire::Valid(ev)) => ev,
-        Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
-            // Usable (only the pointers are taken), but log it: the resident
-            // server handed us a malformed make_* template.
-            tracing::warn!(target: "neutrino_http", %room_id, %user, membership, %defect, "membership template from resident server is Wire::Rejected (rebuilding from its DAG pointers)");
-            ev
-        }
-        Err(e) => {
-            tracing::warn!(target: "neutrino_http", %room_id, %user, membership, error = %e, "could not parse the membership template from the resident server");
-            return None;
-        }
-    };
+    // A make_* template is a protoevent, not a PDU: the resident authors it
+    // with OUR user as `sender`, so it can carry no valid signature, and it
+    // need not carry `origin_server_ts` / `hashes` / `depth` at all
+    // (gomatrixserverlib's template has none of them). So it is neither
+    // admitted nor parsed as an event — only its two DAG-pointer arrays are
+    // read. That is safe precisely because nothing here is trusted: the event
+    // is rebuilt below, re-validated by `EventBuilder::build`, and
+    // auth-checked by the resident.
+    let (prev_events, prev_state_events) =
+        match neutrino_event::validate::parse_template_dag_pointers(template) {
+            Ok(pointers) => pointers,
+            Err(e) => {
+                tracing::warn!(target: "neutrino_http", %room_id, %user, membership, error = %e, "could not parse the membership template from the resident server");
+                return None;
+            }
+        };
     // `user` is always our own local user here (we are completing our own
     // join/leave), so it carries the server-wide display name.
     let mut content = json!({ "membership": membership });
@@ -301,8 +309,8 @@ pub(crate) fn complete_membership_template(
         .room_id(room_id.to_owned())
         .state_key(user.to_string())
         .content(content)
-        .prev_events(parsed.prev_events)
-        .prev_state_events(parsed.prev_state_events)
+        .prev_events(prev_events)
+        .prev_state_events(prev_state_events)
         .signer(policy.signer().cloned())
         .build()
     {

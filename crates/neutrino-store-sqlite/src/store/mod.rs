@@ -6,7 +6,7 @@ mod deliveries;
 mod events;
 mod identity;
 mod inbox;
-mod invites;
+mod oob_memberships;
 mod outbox;
 mod rooms;
 mod staging;

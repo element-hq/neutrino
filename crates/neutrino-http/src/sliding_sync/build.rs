@@ -14,6 +14,12 @@ use serde_json::value::RawValue;
 use super::conn::{Conn, ListCfg, RoomSent, SubCfg};
 use super::{SyncError, SyncState, receipts};
 
+/// One room's contribution to a response: the room, the state events it
+/// emitted (recorded on the connection so they are not re-sent) and the
+/// `(type, state_key)` pairs whose state was deleted. `None` = nothing new for
+/// this room.
+type BuiltRoom = Option<(response::Room, Vec<Event>, Vec<(String, String)>)>;
+
 /// How many globally-new events we drain from the store per sync request.
 /// Mobile-scale: the embedded server processes events at modest rates, and a
 /// short-polling client requests every few seconds, so 1000 events per
@@ -349,12 +355,15 @@ async fn candidate_rooms<S: StorageBackend>(
         });
     }
 
-    // Union in out-of-band invites (federated invites for rooms we don't host,
-    // stored outside `current_state`). These are always included (MSC4186:
-    // invited rooms always shown). Skip any that in-room state already covers —
-    // a real membership supersedes a stale stub.
-    for room_id in state.store.invited_oob_rooms(user_id).await? {
+    // Union in out-of-band memberships (invites, and the leaves/bans that ended
+    // them, for rooms this server is not in — stored outside `current_state`).
+    // Skip any that in-room state already covers — a real membership supersedes
+    // a stale stub.
+    for (room_id, membership) in state.store.oob_memberships(user_id).await? {
         if in_room.contains(&room_id) {
+            continue;
+        }
+        if !include_oob_per_msc4186(state, user_id, &room_id, membership, conn).await? {
             continue;
         }
         let bump_stamp = bump_stamp_for_invited(state, &room_id, user_id).await?;
@@ -390,6 +399,27 @@ async fn include_room_per_msc4186<S: StorageBackend>(
             Ok(kicked || conn.sent.contains_key(room_id))
         }
         Membership::Ban => Ok(conn.sent.contains_key(room_id)),
+    }
+}
+
+/// [`include_room_per_msc4186`] for an out-of-band membership, whose only
+/// member event is the stub: a leave is a kick iff someone else sent it.
+async fn include_oob_per_msc4186<S: StorageBackend>(
+    state: &SyncState<S>,
+    user_id: &UserId,
+    room_id: &RoomId,
+    membership: Membership,
+    conn: &Conn,
+) -> Result<bool, SyncError> {
+    match membership {
+        Membership::Leave => {
+            let kicked = member_event(state, user_id, room_id)
+                .await?
+                .is_some_and(|ev| ev.sender.as_str() != user_id.as_str());
+            Ok(kicked || conn.sent.contains_key(room_id))
+        }
+        Membership::Ban => Ok(conn.sent.contains_key(room_id)),
+        Membership::Join | Membership::Invite | Membership::Knock => Ok(true),
     }
 }
 
@@ -592,11 +622,14 @@ async fn build_room<S: StorageBackend>(
     is_initial_sync: bool,
     room_delta: &[Event],
     sent_snapshot: Option<&RoomSent>,
-) -> Result<Option<(response::Room, Vec<Event>, Vec<(String, String)>)>, SyncError> {
+) -> Result<BuiltRoom, SyncError> {
     let invited = is_invited(state, user_id, room_id).await?;
 
     if invited {
         return build_invite_room(state, user_id, room_id, cfg, is_initial_for_room).await;
+    }
+    if let Some(left) = oob_left(state, user_id, room_id).await? {
+        return build_oob_left_room(left, cfg, sent_snapshot);
     }
 
     // Invite→join transition: the room's only prior emission was `invite_state`,
@@ -696,13 +729,62 @@ async fn build_room<S: StorageBackend>(
     Ok(Some((room, state_events, deleted_state_keys)))
 }
 
+/// The user's out-of-band leave or ban in a room we hold no in-room membership
+/// for: an invite this server rejected, or one the inviter rescinded.
+async fn oob_left<S: StorageBackend>(
+    state: &SyncState<S>,
+    user_id: &UserId,
+    room_id: &RoomId,
+) -> Result<Option<Event>, SyncError> {
+    if state
+        .store
+        .current_state_event(room_id, "m.room.member", user_id.as_str())
+        .await?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    Ok(state
+        .store
+        .get_oob_membership(room_id, user_id)
+        .await?
+        .filter(|m| matches!(m.membership, Membership::Leave | Membership::Ban))
+        .map(|m| m.event))
+}
+
+/// An out-of-band leave/ban has no timeline here: the member event itself is
+/// the whole update, emitted once (tracked through `required_state_keys` like
+/// any state event) as both timeline and state so either legacy `rooms.leave`
+/// shape carries it.
+fn build_oob_left_room(
+    left: Event,
+    cfg: &CombinedCfg,
+    sent: Option<&RoomSent>,
+) -> Result<BuiltRoom, SyncError> {
+    let key = (
+        left.event_type.clone(),
+        left.state_key.clone().unwrap_or_default(),
+    );
+    if sent.and_then(|s| s.required_state_keys.get(&key)) == Some(&left.event_id) {
+        return Ok(None);
+    }
+    let mut room = response::Room::new();
+    room.initial = Some(true);
+    room.timeline = vec![(&left).into()];
+    room.required_state = vec![(&left).try_into()?];
+    if cfg.bump_stamp > 0 {
+        room.bump_stamp = UInt::try_from(cfg.bump_stamp).ok();
+    }
+    Ok(Some((room, vec![left], Vec::new())))
+}
+
 /// The user's `m.room.member` event for the room, sourced from in-room current
-/// state if we host the room, else from the out-of-band invite store (a
-/// federated invite for a room we hold no state for — no create event, no auth
-/// chain, so it never entered `current_state`). In-room state takes precedence:
-/// if we host the room, its authed membership is authoritative over any stale
-/// OOB stub (and the two should not coexist in practice — accepting an invite
-/// removes the stub).
+/// state if we host the room, else from the out-of-band membership store (a
+/// federated invite, or the leave/ban that ended it, for a room we hold no
+/// state for — no create event, no auth chain, so it never entered
+/// `current_state`). In-room state takes precedence: if we host the room, its
+/// authed membership is authoritative over any stale OOB stub (and the two
+/// should not coexist in practice — accepting an invite removes the stub).
 async fn member_event<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
@@ -715,7 +797,11 @@ async fn member_event<S: StorageBackend>(
     {
         return Ok(Some(ev));
     }
-    Ok(state.store.get_invite(room_id, user_id).await?)
+    Ok(state
+        .store
+        .get_oob_membership(room_id, user_id)
+        .await?
+        .map(|m| m.event))
 }
 
 /// Whether `user_id`'s current `m.room.member` event in `room_id` is `invite`
@@ -761,7 +847,7 @@ async fn build_invite_room<S: StorageBackend>(
     room_id: &OwnedRoomId,
     cfg: &CombinedCfg,
     is_initial_for_room: bool,
-) -> Result<Option<(response::Room, Vec<Event>, Vec<(String, String)>)>, SyncError> {
+) -> Result<BuiltRoom, SyncError> {
     if !is_initial_for_room {
         // The invite_room_state is fixed at invite time and doesn't change
         // until accept/reject (which would move the room out of

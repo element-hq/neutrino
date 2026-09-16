@@ -4,15 +4,16 @@
 //! A remote resident server invites one of our local users to a room. The
 //! request body is the **v2 envelope** `{ event, room_version, invite_room_state }`
 //! (the v2 endpoint wraps the PDU; v1's bare event is not accepted). The invite
-//! is **out-of-band membership**: in the common case we hold no state for the
-//! room (no `m.room.create`, no auth chain), so the event cannot go through
-//! `apply_pdu` (there is nothing to auth it against). Two dispositions:
+//! is **out-of-band membership**: in the common case this server is not in the
+//! room — no state at all, or stale state from an earlier membership — so the
+//! event cannot go through `apply_pdu` (there is nothing current to auth it
+//! against). Two dispositions, keyed on [`server_in_room`]:
 //!
-//! - **Room we do NOT host** (the common case): merge the envelope's
+//! - **Server not in the room** (the common case): merge the envelope's
 //!   `invite_room_state` into the event's `unsigned`, then store it via
-//!   [`InviteStore::put_invite`]. That stripped state is what sync renders the
-//!   room from.
-//! - **Room we already host** (the inviting server may not realise we're
+//!   [`OobMembershipStore::put_oob_membership`]. That stripped state is what
+//!   sync renders the room from.
+//! - **Server in the room** (the inviting server may not realise we're
 //!   resident — *not* an error): stage the event
 //!   and let the per-room worker integrate it through `apply_pdu` like any
 //!   inbound PDU (auth + state-res + persist), so it becomes normal
@@ -36,7 +37,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use neutrino_store::{InviteStore, RoomStore, StateStore};
+use neutrino_store::{OobMembershipStore, StateStore};
 use ruma::events::AnyStrippedStateEvent;
 use ruma::serde::Raw;
 use ruma::{OwnedUserId, RoomId, UserId};
@@ -46,7 +47,7 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::federation::client::{FederationClient, FederationClientError};
-use crate::federation::{FedError, auth, co_sign_if_signed};
+use crate::federation::{FedError, auth, co_sign_if_signed, server_in_room};
 use crate::{AppState, error_response, lock_app};
 use neutrino_engine::{RoomActorError, stage_and_poke};
 
@@ -179,8 +180,8 @@ pub(crate) async fn handle(
     // Keep the wire bytes for the response before either path moves `event`.
     let event_raw = event.raw.clone();
 
-    if store.room_exists(&room_id).await? {
-        // We host the room: integrate the invite as a normal inbound PDU. The
+    if server_in_room(&*store, &room_id, &our_server).await? {
+        // We are in the room: integrate the invite as a normal inbound PDU. The
         // worker auth-checks + state-resolves + persists it (gap-filling its
         // ancestry if needed), so it lands in `current_state`. Origin = the
         // invite's sender domain (the worker's gap-fill fetch target).
@@ -205,7 +206,9 @@ pub(crate) async fn handle(
         }
         // Store the stub so sync can surface the invite from its
         // `unsigned.invite_room_state`.
-        store.put_invite(&room_id, &invited, &event).await?;
+        store
+            .put_oob_membership(&room_id, &invited, &event, version.id)
+            .await?;
     }
 
     Ok(Json(ResponseBody { event: event_raw }))

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use neutrino_event::ROOM_VERSION_ID;
 use neutrino_event::event_id::base_version_event_id;
-use neutrino_store::{Event, EventStore, InviteStore, RoomStore};
+use neutrino_store::{Event, EventStore, OobMembershipStore, RoomStore};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5::{Request, request};
 use ruma::events::StateEventType;
@@ -1125,12 +1125,12 @@ fn oob_invite_event(
     )
 }
 
-/// An out-of-band federated invite (no room state — stored via `InviteStore`,
+/// An out-of-band federated invite (no room state — stored via `OobMembershipStore`,
 /// not `current_state`) must surface in sliding sync exactly like an in-room
 /// invite: the room appears, carries `invite_state` (stripped state from the
 /// invite's `unsigned.invite_room_state`), and its name lifts to the top level.
-/// This is the OOB-invite read-path: `candidate_rooms` unions `invited_oob_rooms` and
-/// `build_invite_room` sources the event from `get_invite`.
+/// This is the OOB-invite read-path: `candidate_rooms` unions `oob_memberships` and
+/// `build_invite_room` sources the event from `get_oob_membership`.
 #[tokio::test]
 async fn oob_invite_surfaces_in_sliding_sync() {
     let (store, _tmp) = fresh_store().await;
@@ -1140,7 +1140,10 @@ async fn oob_invite_surfaces_in_sliding_sync() {
     let room = room_id!("!remote:other.example.org");
 
     let invite_event = oob_invite_event(room, user, inviter, "Remote Room", 80);
-    store.put_invite(room, user, &invite_event).await.unwrap();
+    store
+        .put_oob_membership(room, user, &invite_event, neutrino_event::ROOM_VERSION_ID)
+        .await
+        .unwrap();
 
     let state = SyncState::new(store, no_shutdown());
     let mut req = Request::new();
@@ -1180,10 +1183,97 @@ async fn oob_invite_surfaces_in_sliding_sync() {
     );
 }
 
+/// Rejecting (or having rescinded) an out-of-band invite leaves the user's
+/// leave event as the room's out-of-band membership. The room then surfaces
+/// once more — the leave as its whole timeline and state, so a legacy client
+/// sees it under `rooms.leave` — and not again after that.
+#[tokio::test]
+async fn oob_leave_surfaces_once_after_the_invite() {
+    let (store, _tmp) = fresh_store().await;
+    let user = user_id!("@alice:example.org");
+    let inviter = user_id!("@bob:other.example.org");
+    let room = room_id!("!remote:other.example.org");
+    store
+        .put_oob_membership(
+            room,
+            user,
+            &oob_invite_event(room, user, inviter, "Remote Room", 80),
+            neutrino_event::ROOM_VERSION_ID,
+        )
+        .await
+        .unwrap();
+
+    let state = SyncState::new(store.clone(), no_shutdown());
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let mut req = Request::new();
+    req.lists = lists.clone();
+    let resp1 = handle(&state, user, req).await.unwrap();
+    assert!(
+        resp1.rooms[room].invite_state.is_some(),
+        "first emission is the invite"
+    );
+
+    // The user declines: the completed leave (a real PDU: `hashes`, DAG
+    // pointers) replaces the invite stub.
+    let leave = make_event_from_json(
+        room,
+        "m.room.member",
+        Some(user.as_str()),
+        user,
+        90,
+        serde_json::json!({
+            "room_id": room.as_str(),
+            "type": "m.room.member",
+            "state_key": user.as_str(),
+            "sender": user.as_str(),
+            "origin_server_ts": 90,
+            "content": {"membership": "leave"},
+            "hashes": {"sha256": "abcDEF0123456789"},
+            "prev_events": [],
+            "prev_state_events": [],
+        }),
+    );
+    store
+        .put_oob_membership(room, user, &leave, neutrino_event::ROOM_VERSION_ID)
+        .await
+        .unwrap();
+
+    let mut req2 = Request::new();
+    req2.pos = Some(resp1.pos.clone());
+    req2.lists = lists.clone();
+    let resp2 = handle(&state, user, req2).await.unwrap();
+    let left = resp2
+        .rooms
+        .get(room)
+        .expect("the left room is emitted once more");
+    assert!(left.invite_state.is_none(), "no longer an invite");
+    assert_eq!(left.timeline.len(), 1, "the leave is the whole timeline");
+    let ev = left.timeline[0]
+        .get_field::<String>("event_id")
+        .unwrap()
+        .unwrap();
+    assert_eq!(ev, leave.event_id.as_str());
+    assert_eq!(
+        left.required_state.len(),
+        1,
+        "and the whole state, for the legacy `rooms.leave.state` shape"
+    );
+
+    let mut req3 = Request::new();
+    req3.pos = Some(resp2.pos.clone());
+    req3.lists = lists;
+    let resp3 = handle(&state, user, req3).await.unwrap();
+    assert!(
+        !resp3.rooms.contains_key(room),
+        "an already-emitted out-of-band leave is not re-sent"
+    );
+}
+
 /// In-room membership must win over a stale out-of-band invite stub for the
 /// same `(room, user)`. This pins the precedence the dedup logic depends on:
 /// `candidate_rooms` skips an OOB room already in `rooms_with_membership`, and
-/// `member_event` consults `current_state` before `get_invite`. Without that
+/// `member_event` consults `current_state` before `get_oob_membership`. Without that
 /// precedence the joined room would be mis-rendered as an invite.
 #[tokio::test]
 async fn in_room_membership_wins_over_oob_invite_stub() {
@@ -1196,7 +1286,10 @@ async fn in_room_membership_wins_over_oob_invite_stub() {
     setup_joined_room(&store, room, user).await;
     // … yet a stale OOB invite stub for the same (room, user) also exists.
     let stub = oob_invite_event(room, user, inviter, "Stale Invite", 50);
-    store.put_invite(room, user, &stub).await.unwrap();
+    store
+        .put_oob_membership(room, user, &stub, neutrino_event::ROOM_VERSION_ID)
+        .await
+        .unwrap();
 
     let state = SyncState::new(store, no_shutdown());
     let mut req = Request::new();
@@ -1229,18 +1322,20 @@ async fn oob_invites_rank_by_member_event_ts() {
     let newer = room_id!("!z-newer:other.example.org");
     let older = room_id!("!a-older:other.example.org");
     store
-        .put_invite(
+        .put_oob_membership(
             newer,
             user,
             &oob_invite_event(newer, user, inviter, "Newer", 900),
+            neutrino_event::ROOM_VERSION_ID,
         )
         .await
         .unwrap();
     store
-        .put_invite(
+        .put_oob_membership(
             older,
             user,
             &oob_invite_event(older, user, inviter, "Older", 100),
+            neutrino_event::ROOM_VERSION_ID,
         )
         .await
         .unwrap();
@@ -1781,9 +1876,9 @@ async fn long_poll_wakes_on_new_event() {
     );
 }
 
-/// An inbound out-of-band federated invite (`InviteStore::put_invite`) must
-/// wake an in-flight long-poll, not leave it parked until timeout: `put_invite`
-/// writes the `oob_invites` table and bumps the stream-watch, so the federation
+/// An inbound out-of-band federated invite (`OobMembershipStore::put_oob_membership`) must
+/// wake an in-flight long-poll, not leave it parked until timeout: `put_oob_membership`
+/// writes the `oob_memberships` table and bumps the stream-watch, so the federation
 /// `PUT /invite` wakes the invitee's open `/sync` immediately rather than only
 /// on its next poll. Mirrors `long_poll_wakes_on_new_event`, but the wake is
 /// driven by an invite rather than a room event.
@@ -1814,7 +1909,12 @@ async fn long_poll_wakes_on_oob_invite() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let invite = oob_invite_event(&waker_room, &waker_user, &waker_inviter, "Remote Room", 200);
         store_for_task
-            .put_invite(&waker_room, &waker_user, &invite)
+            .put_oob_membership(
+                &waker_room,
+                &waker_user,
+                &invite,
+                neutrino_event::ROOM_VERSION_ID,
+            )
             .await
             .unwrap();
     });

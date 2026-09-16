@@ -28,7 +28,8 @@ use neutrino_ctl::Config;
 use neutrino_event::ROOM_VERSION_ID;
 use neutrino_event::event_builder::EventBuilder;
 use neutrino_store::{
-    EventStore, FederationOutbox, InviteStore, RoomStore, StagingStore, StateStore,
+    EventStore, FederationOutbox, Membership, OobMembershipStore, RoomStore, StagingStore,
+    StateStore,
 };
 use neutrino_store_sqlite::SqliteStore;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, ServerName};
@@ -3570,7 +3571,10 @@ async fn room_scoped_join_uses_pending_invite_server() {
         std::slice::from_ref(&throwaway.event_id),
     );
     let bob: OwnedUserId = "@bob:a.example".parse().unwrap();
-    a_store.put_invite(&room_id, &bob, &invite).await.unwrap();
+    a_store
+        .put_oob_membership(&room_id, &bob, &invite, neutrino_event::ROOM_VERSION_ID)
+        .await
+        .unwrap();
 
     // Room-scoped join with NO `server_name` — the SDK's invite-accept path.
     let path = format!("/_matrix/client/v3/rooms/{room_id}/join");
@@ -3656,7 +3660,10 @@ async fn join_tries_hint_before_invite_fallback() {
         std::slice::from_ref(&throwaway.event_id),
     );
     let bob: OwnedUserId = "@bob:a.example".parse().unwrap();
-    a_store.put_invite(&room_id, &bob, &invite).await.unwrap();
+    a_store
+        .put_oob_membership(&room_id, &bob, &invite, neutrino_event::ROOM_VERSION_ID)
+        .await
+        .unwrap();
 
     // `via` lists a dead hint (transport failure, skipped) then the live decoy
     // (contacted, refuses) ahead of the invite server — so the join can only
@@ -3730,7 +3737,10 @@ async fn hosted_room_with_live_local_member_and_pending_invite_does_not_federate
         std::slice::from_ref(&throwaway.event_id),
     );
     let bob: OwnedUserId = "@bob:a.example".parse().unwrap();
-    store.put_invite(&room_id, &bob, &invite).await.unwrap();
+    store
+        .put_oob_membership(&room_id, &bob, &invite, neutrino_event::ROOM_VERSION_ID)
+        .await
+        .unwrap();
 
     let path = format!("/_matrix/client/v3/rooms/{room_id}/join");
     let (status, body) = post_json(&router, &path, &json!({})).await;
@@ -4482,12 +4492,12 @@ async fn invite_oob_stores_stub_and_returns_event() {
 
     // Stub stored, retrievable, and `unsigned.invite_room_state` preserved.
     let stored = store
-        .get_invite(&room_id, &invited)
+        .get_oob_membership(&room_id, &invited)
         .await
         .unwrap()
         .expect("OOB invite stub stored");
-    assert_eq!(stored.event_id, invite_id);
-    let v: Value = serde_json::from_str(stored.raw.get()).unwrap();
+    assert_eq!(stored.event.event_id, invite_id);
+    let v: Value = serde_json::from_str(stored.event.raw.get()).unwrap();
     assert_eq!(
         v.pointer("/unsigned/invite_room_state/0/content/name")
             .and_then(|n| n.as_str()),
@@ -4540,7 +4550,11 @@ async fn invite_for_hosted_room_applies_via_worker_not_oob_stub() {
         .expect("carol now has a member event in current state");
     assert_eq!(member.content_str("membership").as_deref(), Some("invite"));
     assert!(
-        store.get_invite(&room_id, &carol).await.unwrap().is_none(),
+        store
+            .get_oob_membership(&room_id, &carol)
+            .await
+            .unwrap()
+            .is_none(),
         "a hosted-room invite must NOT be stored as an out-of-band stub"
     );
 }
@@ -4586,7 +4600,7 @@ async fn invite_rejects_non_local_invitee() {
     // Nothing stored.
     assert!(
         store
-            .get_invite(
+            .get_oob_membership(
                 &room_id,
                 &"@dave:other.example.org".parse::<OwnedUserId>().unwrap()
             )
@@ -4757,11 +4771,11 @@ async fn outbound_invite_federates_then_persists() {
     // B stored the OOB stub (it doesn't host the room) with our stripped
     // invite_room_state (the round-trip through B's real /invite/v2).
     let stub = b_store
-        .get_invite(&room_id, &dave_uid)
+        .get_oob_membership(&room_id, &dave_uid)
         .await
         .unwrap()
         .expect("B stored the OOB invite stub");
-    let v: Value = serde_json::from_str(stub.raw.get()).unwrap();
+    let v: Value = serde_json::from_str(stub.event.raw.get()).unwrap();
     let types: Vec<&str> = v
         .pointer("/unsigned/invite_room_state")
         .and_then(|a| a.as_array())
@@ -4884,7 +4898,11 @@ async fn invite_for_hosted_room_unauthorised_inviter_is_rejected() {
     );
     // …and a hosted-room invite is NEVER parked as an out-of-band stub.
     assert!(
-        store.get_invite(&room_id, &carol).await.unwrap().is_none(),
+        store
+            .get_oob_membership(&room_id, &carol)
+            .await
+            .unwrap()
+            .is_none(),
         "hosted-room invite must not fall back to an OOB stub"
     );
 }
@@ -5344,7 +5362,7 @@ async fn serve_resident_with_invite(
 }
 
 #[tokio::test]
-async fn outbound_reject_invite_federates_leave_and_removes_stub() {
+async fn outbound_reject_invite_federates_leave_and_records_it() {
     // B hosts the room and invited our local alice. A holds only the OOB stub.
     let alice = alice();
     let (_b_name, b_store, room_id, invite, _b_tempfile) =
@@ -5352,7 +5370,10 @@ async fn outbound_reject_invite_federates_leave_and_removes_stub() {
 
     let (a_store, _a_temp) = fresh_store().await;
     let a_router = router_with_store(config(), a_store.clone());
-    a_store.put_invite(&room_id, &alice, &invite).await.unwrap();
+    a_store
+        .put_oob_membership(&room_id, &alice, &invite, neutrino_event::ROOM_VERSION_ID)
+        .await
+        .unwrap();
 
     let (status, body) = post_json(
         &a_router,
@@ -5362,15 +5383,6 @@ async fn outbound_reject_invite_federates_leave_and_removes_stub() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
 
-    // A's stub is gone (declined).
-    assert!(
-        a_store
-            .get_invite(&room_id, &alice)
-            .await
-            .unwrap()
-            .is_none(),
-        "the OOB invite stub must be removed on reject"
-    );
     // B applied the leave: alice is now `leave` in B's current state.
     let member = b_store
         .current_state_event(&room_id, "m.room.member", alice.as_str())
@@ -5381,6 +5393,129 @@ async fn outbound_reject_invite_federates_leave_and_removes_stub() {
         membership_str(&member).as_deref(),
         Some("leave"),
         "B must record alice's leave via the handshake"
+    );
+    // A's stub is now that same leave (declined, and visible as such to sync).
+    let stub = a_store
+        .get_oob_membership(&room_id, &alice)
+        .await
+        .unwrap()
+        .expect("the completed leave replaces the OOB invite stub");
+    assert_eq!(stub.membership, Membership::Leave);
+    assert_eq!(stub.event.event_id, member.event_id);
+    assert_eq!(stub.event.sender, alice);
+}
+
+/// An invite for a room we hold *stale* state for — a local user joined and
+/// left earlier — is out-of-band like any other: this server is not in the
+/// room, so there is nothing current to auth it against. Staging it would
+/// send the worker gap-filling ancestry the resident refuses to a non-member.
+#[tokio::test]
+async fn invite_for_room_we_left_is_stored_out_of_band() {
+    let (app, store, room_id, head, _tempfile) = seed_room(&[
+        (
+            ALICE,
+            "m.room.member",
+            ALICE,
+            json!({ "membership": "join" }),
+        ),
+        (
+            ALICE,
+            "m.room.member",
+            ALICE,
+            json!({ "membership": "leave" }),
+        ),
+    ])
+    .await;
+    let carol: OwnedUserId = "@carol:example.org".parse().unwrap();
+    let invite = member_pdu(
+        &inviter(),
+        carol.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&head),
+    );
+
+    let (status, body) = put_json(
+        &app,
+        &invite_path(room_id.as_str(), invite.event_id.as_str()),
+        &invite_body(&invite, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    let stub = store
+        .get_oob_membership(&room_id, &carol)
+        .await
+        .unwrap()
+        .expect("invite into a room we are no longer in is an out-of-band stub");
+    assert_eq!(stub.membership, Membership::Invite);
+    assert_eq!(stub.event.event_id, invite.event_id);
+    assert_eq!(stub.room_version, ROOM_VERSION_ID);
+    assert!(
+        store
+            .current_state_event(&room_id, "m.room.member", carol.as_str())
+            .await
+            .unwrap()
+            .is_none(),
+        "not applied to the stale room state"
+    );
+}
+
+/// The inviter rescinding an out-of-band invite: its kick arrives as a PDU in a
+/// `/send` transaction for a room we hold no state for. It is named under the
+/// stub's room version and stored over the stub, not staged.
+#[tokio::test]
+async fn send_leave_for_oob_invited_user_replaces_the_stub() {
+    let (store, _tempfile) = fresh_store().await;
+    let app = router_with_store(config(), store.clone());
+    let bob = inviter();
+    let alice = alice();
+    // A throwaway create only to source a valid room id + a syntactically-valid
+    // prev event id; the room is NOT created in our store (out-of-band).
+    let throwaway = EventBuilder::new(
+        bob.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build throwaway create");
+    let room_id = throwaway.room_id.clone();
+    let invite = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&throwaway.event_id),
+    );
+    store
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID)
+        .await
+        .unwrap();
+    let kick = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "leave",
+        std::slice::from_ref(&invite.event_id),
+    );
+
+    let (status, body) = put_json(&app, &send_path("rescind-1"), &txn(&[&kick])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(body["pdus"][kick.event_id.as_str()], json!({}));
+
+    let stub = store
+        .get_oob_membership(&room_id, &alice)
+        .await
+        .unwrap()
+        .expect("the kick replaces the invite stub");
+    assert_eq!(stub.membership, Membership::Leave);
+    assert_eq!(stub.event.event_id, kick.event_id);
+    assert_eq!(stub.event.sender, bob);
+    assert!(
+        !store.room_exists(&room_id).await.unwrap(),
+        "nothing was staged or applied: we are still not in the room"
     );
 }
 
@@ -5410,7 +5545,10 @@ async fn outbound_reject_invite_unreachable_server_still_removes_stub() {
         "invite",
         std::slice::from_ref(&create.event_id),
     );
-    a_store.put_invite(&room_id, &alice, &invite).await.unwrap();
+    a_store
+        .put_oob_membership(&room_id, &alice, &invite, neutrino_event::ROOM_VERSION_ID)
+        .await
+        .unwrap();
 
     let (status, body) = post_json(
         &a_router,
@@ -5421,7 +5559,7 @@ async fn outbound_reject_invite_unreachable_server_still_removes_stub() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert!(
         a_store
-            .get_invite(&room_id, &alice)
+            .get_oob_membership(&room_id, &alice)
             .await
             .unwrap()
             .is_none(),
@@ -5474,7 +5612,7 @@ async fn reject_then_reinvite_resurrects_stub() {
     assert_eq!(s, StatusCode::OK);
     assert!(
         a_store
-            .get_invite(&room_id, &alice)
+            .get_oob_membership(&room_id, &alice)
             .await
             .unwrap()
             .is_some()
@@ -5489,7 +5627,7 @@ async fn reject_then_reinvite_resurrects_stub() {
     assert_eq!(s, StatusCode::OK);
     assert!(
         a_store
-            .get_invite(&room_id, &alice)
+            .get_oob_membership(&room_id, &alice)
             .await
             .unwrap()
             .is_none()
@@ -5507,7 +5645,7 @@ async fn reject_then_reinvite_resurrects_stub() {
     assert_eq!(s, StatusCode::OK);
     assert!(
         a_store
-            .get_invite(&room_id, &alice)
+            .get_oob_membership(&room_id, &alice)
             .await
             .unwrap()
             .is_some(),
@@ -5704,7 +5842,7 @@ async fn invite_oob_rejects_forged_sender() {
     // Nothing stored.
     assert!(
         store
-            .get_invite(&room_id, &invited)
+            .get_oob_membership(&room_id, &invited)
             .await
             .unwrap()
             .is_none(),
@@ -5728,7 +5866,7 @@ async fn invite_oob_rejects_forged_sender() {
     );
     assert!(
         store
-            .get_invite(&room_id, &invited)
+            .get_oob_membership(&room_id, &invited)
             .await
             .unwrap()
             .is_some(),
