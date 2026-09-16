@@ -235,7 +235,8 @@ Intentional gaps in the sliding-sync implementation — see `MSC4186-gaps.md`:
 - avatar carry-over onto membership events (displayname is done: the server-wide
   name from the `IdentityStore` is embedded into every local-user member event —
   createRoom join + local invites, `change_membership` join/leave/invite/kick/ban,
-  and completed federated join/leave templates)
+  completed federated join/leave templates — and a `PUT …/displayname` re-emits
+  the member event in every joined room)
 
 ### Server-Server follow-ons
 

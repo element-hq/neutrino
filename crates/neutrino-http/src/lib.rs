@@ -1397,21 +1397,29 @@ struct SetDisplayNameRequest {
 
 /// `PUT /_matrix/client/v3/profile/{user_id}/displayname`
 /// (https://spec.matrix.org/v1.18/client-server-api/#put_matrixclientv3profileuseriddisplayname).
-/// Persists the local user's display name in the [`IdentityStore`]. The embedded
-/// server is single-user, so the path `user_id` is the local user by
-/// construction; the name is stored verbatim.
+/// Persists the local user's display name in the [`IdentityStore`] (the
+/// embedded server is single-user, so the name is server-wide) and re-emits
+/// the user's `m.room.member` in every room they are joined to, as the spec
+/// asks of servers.
 async fn put_display_name(
     state: State<AppState>,
-    axum::extract::Path(_user_id): axum::extract::Path<String>,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
     Json(req): Json<SetDisplayNameRequest>,
 ) -> axum::response::Response {
+    let user: OwnedUserId = match user_id.parse() {
+        Ok(u) => u,
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", &e.to_string());
+        }
+    };
     let store = lock_app(&state.0).store.clone();
     match store.set_display_name(&req.displayname).await {
         Ok(()) => {
             // Signal the BLE transport (if any) to re-advertise the new name.
             if let Some(tx) = &lock_app(&state.0).display_name_tx {
-                let _ = tx.send(req.displayname);
+                let _ = tx.send(req.displayname.clone());
             }
+            propagate_display_name(&state.0, &user, &req.displayname).await;
             Json(json!({})).into_response()
         }
         Err(e) => error_response(
@@ -1419,6 +1427,51 @@ async fn put_display_name(
             "M_UNKNOWN",
             &e.to_string(),
         ),
+    }
+}
+
+/// Carry a changed display name into every room `user` is joined to: the
+/// current member event, `displayname` swapped, sent through the room actor
+/// as a fresh join. Per-room failures are logged, not surfaced — the name is
+/// already stored, and a room that cannot take the event now picks the name
+/// up on the user's next membership event, as before.
+async fn propagate_display_name(state: &AppState, user: &OwnedUserId, name: &str) {
+    let (store, registry) = {
+        let app = lock_app(state);
+        (app.store.clone(), app.room_registry.clone())
+    };
+    let rooms = match store.joined_rooms(user).await {
+        Ok(rooms) => rooms,
+        Err(e) => {
+            warn!(%user, error = %e, "display name: could not list joined rooms");
+            return;
+        }
+    };
+    for room_id in rooms {
+        let current = store
+            .current_state_event(&room_id, "m.room.member", user.as_str())
+            .await;
+        let mut content = match current {
+            Ok(Some(ev)) => serde_json::from_str(ev.content.get()).unwrap_or(json!({})),
+            Ok(None) => continue,
+            Err(e) => {
+                warn!(%room_id, %user, error = %e, "display name: could not read member event");
+                continue;
+            }
+        };
+        set_member_displayname(&mut content, name);
+        if let Err(e) = registry
+            .send_event(
+                &room_id,
+                user.clone(),
+                "m.room.member".to_owned(),
+                Some(user.to_string()),
+                content,
+            )
+            .await
+        {
+            warn!(%room_id, %user, error = %e, "display name: could not re-emit member event");
+        }
     }
 }
 
