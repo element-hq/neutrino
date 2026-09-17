@@ -14,7 +14,7 @@ use axum::{
 };
 use neutrino_ctl::{Command, Config, DEFAULT_DISPLAY_NAME, DiscoveryRegistry};
 use neutrino_event::event_builder::EventBuilder;
-use neutrino_event::{Event, EventPolicy, FormatError};
+use neutrino_event::{Event, EventPolicy, FormatError, RoomVersion};
 use neutrino_room::CoreError;
 use neutrino_room::provider::InMemoryStateProvider;
 use neutrino_room::room_core::{Effect, RoomCore};
@@ -1684,7 +1684,7 @@ fn build_initial_events(
     // create is special: no parents, room_id derived from its own event_id.
     let create = EventBuilder::new(sender.clone(), "m.room.create".to_owned(), version.clone())
         .state_key(String::new())
-        .content(json!({ "room_version": version.id }))
+        .content(create_content(sender, body, &version))
         .signer(policy.signer().cloned())
         .build()?;
 
@@ -1758,10 +1758,36 @@ fn build_initial_events(
     Ok((create, initial))
 }
 
+/// The `m.room.create` content for a new room: `room_version`, plus — under
+/// the `trusted_private_chat` preset — every `invite` target as an
+/// `additional_creators` entry (MSC4289). That is how the preset's "invitees
+/// share the creator's power" is expressed in a v12-family room, and it is
+/// what Synapse does: creators hold implicit infinite power, which a numeric
+/// `users` entry cannot express, and a `users` entry would break the moment an
+/// invitee replaces the power-levels event without re-listing themselves. The
+/// creator is never listed (`invite_targets` drops them) and the list is
+/// deduplicated, since rule 1.4 only demands valid user ids.
+fn create_content(sender: &OwnedUserId, body: &Value, version: &RoomVersion) -> Value {
+    let mut content = json!({ "room_version": version.id });
+    if body.pointer("/preset").and_then(Value::as_str) == Some("trusted_private_chat") {
+        let mut creators: Vec<String> = invite_targets(sender, body)
+            .into_iter()
+            .map(|u| u.to_string())
+            .collect();
+        creators.sort();
+        creators.dedup();
+        if !creators.is_empty() {
+            content["additional_creators"] = json!(creators);
+        }
+    }
+    content
+}
+
 /// Spec-default `m.room.power_levels` content for a new room. Room v12 makes
-/// the creator implicitly all-powerful (and rule 10.4 forbids naming a creator
-/// in `users`), so `users` is left empty rather than pinning the creator at a
-/// numeric level.
+/// the creator(s) implicitly all-powerful (and rule 10.4 forbids naming a
+/// creator in `users`), so `users` is left empty rather than pinning anyone at
+/// a numeric level — `trusted_private_chat` invitees included, who are
+/// creators via [`create_content`].
 fn default_power_levels() -> Value {
     json!({
         "ban": 50,
@@ -1789,9 +1815,8 @@ fn default_power_levels() -> Value {
 /// An explicit `preset` wins; otherwise it's derived from `visibility`
 /// (`public` ⇒ `public_chat`, else `private_chat`). Only `public_chat` opens
 /// the room (`public`); `private_chat` / `trusted_private_chat` (and any
-/// unrecognised preset) stay invite-only. The `trusted_private_chat`
-/// invitee-power bump is not modelled, though the `invite` list itself is
-/// honoured by [`build_initial_events`].
+/// unrecognised preset) stay invite-only. `trusted_private_chat`'s invitee
+/// power bump lives in [`create_content`] (`additional_creators`).
 fn join_rule_for(body: &Value) -> &'static str {
     let is_public = match body.pointer("/preset").and_then(Value::as_str) {
         Some(preset) => preset == "public_chat",
@@ -2072,8 +2097,8 @@ async fn default_fallback() -> (StatusCode, &'static str) {
 mod tests {
     use super::{
         AppState, Command, Config, ControlFlow, DiscoveryRegistry, Event, EventPolicy, OwnedUserId,
-        SqliteStore, StatusCode, TcpListener, Value, build_initial_events, build_router, dispatch,
-        handle, invite_targets, join_rule_for, mpsc,
+        SqliteStore, StatusCode, TcpListener, Value, build_initial_events, build_router,
+        create_content, dispatch, handle, invite_targets, join_rule_for, mpsc,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -2627,6 +2652,79 @@ mod tests {
             .map(|u| u.to_string())
             .collect();
         assert_eq!(targets, ["@bob:127.0.0.1", "@carol:remote.example"]);
+    }
+
+    #[test]
+    fn create_content_trusted_private_chat_makes_invitees_additional_creators() {
+        let sender: OwnedUserId = "@alice:127.0.0.1".parse().expect("user id");
+        let version = neutrino_event::room_version::base_version();
+        let invite = json!([
+            "@carol:remote.example",
+            "@bob:127.0.0.1",
+            "@alice:127.0.0.1", // creator: never an additional creator
+            "@bob:127.0.0.1",   // duplicate
+        ]);
+
+        let content = create_content(
+            &sender,
+            &json!({ "preset": "trusted_private_chat", "invite": invite }),
+            version,
+        );
+        assert_eq!(content["room_version"], version.id);
+        assert_eq!(
+            content["additional_creators"],
+            json!(["@bob:127.0.0.1", "@carol:remote.example"])
+        );
+
+        // Any other preset (or none), or the preset with nobody invited: the
+        // field is absent, not an empty array.
+        for body in [
+            json!({ "preset": "private_chat", "invite": invite }),
+            json!({ "invite": invite }),
+            json!({ "preset": "trusted_private_chat" }),
+            json!({ "preset": "trusted_private_chat", "invite": ["@alice:127.0.0.1"] }),
+        ] {
+            let content = create_content(&sender, &body, version);
+            assert!(content.get("additional_creators").is_none(), "{body}");
+            assert_eq!(content["room_version"], version.id);
+        }
+    }
+
+    #[test]
+    fn build_initial_events_trusted_private_chat_create_carries_creators() {
+        // The create event must pass validation (rule 1.4) and the rest of the
+        // batch must still auth against it, with `users` left empty — a remote
+        // invitee is a creator before their invite is even delivered.
+        let sender: OwnedUserId = "@alice:127.0.0.1".parse().expect("user id");
+        let body = json!({
+            "preset": "trusted_private_chat",
+            "invite": ["@bob:remote.example"],
+        });
+        let (create, initial) = build_initial_events(
+            &sender,
+            &body,
+            "127.0.0.1",
+            "Alice",
+            &EventPolicy::trusted_network(),
+        )
+        .expect("build initial events");
+        let create_content: serde_json::Value =
+            serde_json::from_str(create.content.get()).expect("create content");
+        assert_eq!(
+            create_content["additional_creators"],
+            json!(["@bob:remote.example"])
+        );
+        let pl = initial
+            .iter()
+            .find(|e| e.event_type == "m.room.power_levels")
+            .expect("power_levels present");
+        let pl_content: serde_json::Value =
+            serde_json::from_str(pl.content.get()).expect("pl content");
+        assert_eq!(
+            pl_content["users"],
+            json!({}),
+            "creators are never in users"
+        );
     }
 
     #[test]
