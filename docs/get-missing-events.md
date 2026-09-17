@@ -105,7 +105,11 @@ response types, matching the existing `client-api-s` usage).
    The trait contract (Synapse-style, post the 2026-05-28 relaxation):
    BFS over `prev_events` starting from the *parents* of each
    `latest` event, skipping any event in `earliest ∪ latest`, return
-   up to `limit` events in walker order. **The events in `latest`
+   up to `limit` events in walker order. With `org.matrix.msc4242.state_dag`
+   the walk is instead breadth-first over `prev_state_events`: shortest hop
+   first, siblings by ascending `event_id`, rejected events neither returned
+   nor expanded (a rejected `latest` seeds nothing), soft-failed events
+   included. **The events in `latest`
    themselves are never in the result** — they are the boundary the
    requester already has. The events in `earliest` are likewise
    never returned. This matches Synapse's

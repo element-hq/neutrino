@@ -145,8 +145,8 @@ pub(crate) struct ResponseBody {
 /// 4. Drop `_min_depth` (wire field `min_depth`) on the floor — Neutrino
 ///    has no depth column. See `RequestBody._min_depth` doc.
 /// 5. Call `DagStore::missing_events`.
-/// 6. Build response from `Event.raw` verbatim (no enrichment), reversed to
-///    oldest-first.
+/// 6. Build response from `Event.raw` verbatim (no enrichment): the timeline
+///    walk reversed to oldest-first, the state-DAG walk in its hop order.
 /// 7. Storage errors → 500 M_UNKNOWN via `FedError::Storage`.
 pub(crate) async fn handle(
     State(state): State<AppState>,
@@ -215,14 +215,19 @@ pub(crate) async fn handle(
         .missing_events(&room_id, &latest, &earliest, limit, body.state_dag.0)
         .await?;
 
-    // (6) — wire bytes verbatim, oldest-first. `missing_events` walks back
-    // from `latest`, so it yields newest-first; reverse to the topological
-    // (oldest-first) order federation receivers expect — matches Synapse,
-    // which reverses its walk before responding. The reference hash that
-    // produced each event_id was computed over `event.raw`, so peers MUST
-    // receive those exact bytes for the event_id to round-trip.
+    // (6) — wire bytes verbatim. The timeline walk yields newest-first and is
+    // reversed to the topological (oldest-first) order federation receivers
+    // expect — matches Synapse, which reverses its walk before responding. The
+    // MSC4242 state-DAG walk is already in its mandated order (nearest hop
+    // first) and is sent as is. The reference hash that produced each event_id
+    // was computed over `event.raw`, so peers MUST receive those exact bytes
+    // for the event_id to round-trip.
     let mut seen: HashSet<OwnedEventId> = ancestors.iter().map(|e| e.event_id.clone()).collect();
-    let mut events: Vec<Box<RawJsonValue>> = ancestors.into_iter().rev().map(|e| e.raw).collect();
+    let mut events: Vec<Box<RawJsonValue>> = if body.state_dag.0 {
+        ancestors.into_iter().map(|e| e.raw).collect()
+    } else {
+        ancestors.into_iter().rev().map(|e| e.raw).collect()
+    };
 
     // (6b) — anti-entropy: when `include_latest_events` is set, append any
     // `latest_events` we hold. They are the newest events, so they follow their

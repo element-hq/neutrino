@@ -239,6 +239,61 @@ fn walk_prev_events(
     Ok(results)
 }
 
+/// MSC4242 `/get_missing_events` state-DAG walk: breadth-first over
+/// `prev_state` edges from `latest`, each event placed at its shortest hop,
+/// hops ascending (nearest first), siblings within a hop by ascending
+/// `event_id`. `earliest ∪ latest` are neither returned nor expanded. Rejected
+/// events are neither returned nor expanded, and a rejected `latest` seeds
+/// nothing: the state DAG a peer may learn from us is the one we accepted.
+/// Soft-failed events are ordinary members of it. Scoped to `room_id`
+/// (`hydrate_pdu` drops cross-room ids). Mirrors Synapse's
+/// `get_missing_events_state_dag`.
+fn walk_state_dag(
+    conn: &Connection,
+    room_id: &RoomId,
+    latest: Vec<OwnedEventId>,
+    earliest: Vec<OwnedEventId>,
+    limit: usize,
+) -> Result<Vec<Event>, Error> {
+    let mut seen: HashSet<OwnedEventId> = earliest.into_iter().collect();
+    seen.extend(latest.iter().cloned());
+    let mut frontier: Vec<OwnedEventId> = Vec::new();
+    for id in latest {
+        if hydrate_pdu(conn, &id, room_id)?.is_some_and(|ev| !ev.rejected) {
+            frontier.push(id);
+        }
+    }
+    frontier.sort();
+
+    let mut results: Vec<Event> = Vec::new();
+    while !frontier.is_empty() && results.len() < limit {
+        let mut hop: Vec<OwnedEventId> = Vec::new();
+        for id in &frontier {
+            for parent in fetch_edges(conn, id, "prev_state")? {
+                if seen.insert(parent.clone()) {
+                    hop.push(parent);
+                }
+            }
+        }
+        hop.sort();
+        frontier.clear();
+        for id in hop {
+            if results.len() >= limit {
+                break;
+            }
+            let Some(pdu) = hydrate_pdu(conn, &id, room_id)? else {
+                continue;
+            };
+            if pdu.rejected {
+                continue;
+            }
+            frontier.push(id);
+            results.push(pdu);
+        }
+    }
+    Ok(results)
+}
+
 /// IN-clause chunk size used by [`validate_events_exist`]. Stays well below
 /// `SQLITE_LIMIT_VARIABLE_NUMBER` on every SQLite build (the default is
 /// 999 pre-3.32, 32766 since), and small enough that the prepared-
@@ -375,11 +430,13 @@ impl DagStore for SqliteStore {
             // storage/databases/main/event_federation.py and
             // docs/get-missing-events.md.
             //
-            // `state_dag` (MSC4242) selects the edge kind: the timeline DAG
-            // (`prev`) or the state DAG (`prev_state`). Both the initial
-            // frontier (parents-of-`latest`) and the walk itself follow the
-            // same edge kind.
-            let edge_type = if state_dag { "prev_state" } else { "prev" };
+            // The MSC4242 state-DAG walk (`state_dag`) has its own ordering
+            // and rejection rules — see `walk_state_dag`. Below is the
+            // timeline-DAG walk over `prev` edges.
+            if state_dag {
+                return walk_state_dag(conn, &room_id, latest, earliest, limit);
+            }
+            let edge_type = "prev";
             let mut initial_frontier: Vec<OwnedEventId> = Vec::new();
             for id in &latest {
                 for parent in fetch_edges(conn, id, edge_type)? {
@@ -1520,5 +1577,109 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+    // MSC4242 state-DAG walk (Complement GME03): BFS by hop with siblings in
+    // ascending event_id, nearest hop first; soft-failed events are members of
+    // the DAG, rejected events are neither returned nor expanded, and a
+    // rejected seed yields nothing.
+    //
+    //            join
+    //          /      \
+    //   charlie_name   doris_join
+    //   (rejected)     /        \
+    //       |        ban       doris_name (soft-failed)
+    //   bob_profile     \       /
+    //   (rejected)        topic
+    //          \          /
+    //           bob_name (rejected)
+    #[tokio::test]
+    async fn missing_events_state_dag_orders_by_hop_and_hides_rejected() {
+        use crate::tests::{make_event, store_with_room_and_create};
+        let (s, create) = store_with_room_and_create().await;
+        let state = |body: &str, ts: u64, parents: &[&EventId]| {
+            make_event(
+                *ALICE_ROOM_ID,
+                *ALICE_USER_ID,
+                "m.room.topic",
+                Some(""),
+                serde_json::json!({ "k": body }),
+                ts,
+                parents,
+                parents,
+            )
+        };
+        let join = state("join", 1, &[&create.event_id]);
+        let mut charlie_name = state("charlie", 2, &[&join.event_id]);
+        charlie_name.rejected = true;
+        let doris_join = state("join", 3, &[&join.event_id]);
+        let mut bob_profile = state("bob", 4, &[&charlie_name.event_id]);
+        bob_profile.rejected = true;
+        let ban = state("ban", 5, &[&doris_join.event_id]);
+        let mut doris_name = state("doris", 6, &[&doris_join.event_id]);
+        doris_name.soft_failed = true;
+        let topic = state("t", 7, &[&ban.event_id, &doris_name.event_id]);
+        let mut bob_name = state("bob", 8, &[&bob_profile.event_id, &topic.event_id]);
+        bob_name.rejected = true;
+        for ev in [
+            &join,
+            &charlie_name,
+            &doris_join,
+            &bob_profile,
+            &ban,
+            &doris_name,
+            &topic,
+            &bob_name,
+        ] {
+            s.persist_event(ev, &[]).await.unwrap();
+        }
+        let ids = |events: Vec<Event>| -> Vec<OwnedEventId> {
+            events.into_iter().map(|e| e.event_id).collect()
+        };
+
+        // Hop 1 = topic's parents in id order (one of them soft-failed), hop 2,
+        // hop 3; `limit` truncates the ordered list.
+        let mut hop1 = vec![ban.event_id.clone(), doris_name.event_id.clone()];
+        hop1.sort();
+        let got = ids(s
+            .missing_events(*ALICE_ROOM_ID, &[&topic.event_id], &[], 4, true)
+            .await
+            .unwrap());
+        let mut want = hop1.clone();
+        want.extend([doris_join.event_id.clone(), join.event_id.clone()]);
+        assert_eq!(got, want);
+        let got = ids(s
+            .missing_events(*ALICE_ROOM_ID, &[&topic.event_id], &[], 1, true)
+            .await
+            .unwrap());
+        assert_eq!(got, hop1[..1].to_vec(), "limit truncates the hop order");
+
+        // `earliest` is neither returned nor walked through.
+        let got = ids(s
+            .missing_events(
+                *ALICE_ROOM_ID,
+                &[&topic.event_id],
+                &[&doris_join.event_id],
+                10,
+                true,
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            got, hop1,
+            "the walk stops at doris_join, so join is unreachable"
+        );
+
+        // A rejected seed, directly or via the cascade, yields nothing.
+        for seed in [&charlie_name, &bob_profile, &bob_name] {
+            let got = s
+                .missing_events(*ALICE_ROOM_ID, &[&seed.event_id], &[], 10, true)
+                .await
+                .unwrap();
+            assert!(
+                got.is_empty(),
+                "rejected seed {} must yield nothing",
+                seed.event_id
+            );
+        }
     }
 }

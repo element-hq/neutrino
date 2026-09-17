@@ -371,10 +371,13 @@ pub trait DagStore: Send + Sync {
     ///       walk terminates at the boundary rather than leaking PDUs from
     ///       another room. Mirrors Synapse's `_get_missing_events`.
     ///
-    /// `state_dag` selects which edge kind to walk (MSC4242 `/get_missing_events`
-    /// `state_dag` flag): `false` walks `prev_events` (timeline DAG), `true`
-    /// walks `prev_state_events` (the state DAG — the ancestry that
-    /// `RoomCore::apply_pdu` requires to auth a PDU).
+    /// `state_dag` selects the walk (MSC4242 `/get_missing_events` flag).
+    /// `false` is the timeline walk described above over `prev_events`. `true`
+    /// walks `prev_state_events` (the ancestry `RoomCore::apply_pdu` needs to
+    /// auth a PDU) breadth-first: each event at its shortest hop from `latest`,
+    /// hops ascending, siblings by ascending `event_id`. Rejected events are
+    /// neither returned nor expanded and a rejected `latest` seeds nothing;
+    /// soft-failed events are returned like any other.
     async fn missing_events(
         &self,
         room_id: &RoomId,

@@ -1457,6 +1457,108 @@ async fn get_missing_events_serves_rejected_and_soft_failed_events() {
     );
 }
 
+// MSC4242 state-DAG walk over HTTP: the response keeps the walk's nearest-hop-
+// first order (no oldest-first reversal, unlike the timeline walk), includes
+// soft-failed events, and hides rejected ones without walking through them.
+// Chain: join(held) ← b ← c(soft-failed) ← d, all state events.
+#[tokio::test]
+async fn get_missing_events_state_dag_is_hop_ordered_and_hides_rejected() {
+    async fn chain(
+        b_rejected: bool,
+    ) -> (
+        axum::Router,
+        OwnedRoomId,
+        Vec<neutrino_event::Event>,
+        TempDir,
+    ) {
+        let (store, tempfile) = fresh_store().await;
+        let peer = peer_user();
+        let create = EventBuilder::new(
+            peer.clone(),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+        let room_id = create.room_id.clone();
+        let join = EventBuilder::new(
+            peer.clone(),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key(peer.as_str().to_owned())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create.event_id.clone()])
+        .prev_state_events(vec![create.event_id.clone()])
+        .build()
+        .expect("build join");
+        let join_id = join.event_id.clone();
+        store
+            .create_room(&create, &[join])
+            .await
+            .expect("create_room");
+        let mut b = topic_on(&peer, &room_id, &join_id, "b", 1_700_000_001_000);
+        b.rejected = b_rejected;
+        let mut c = topic_on(&peer, &room_id, &b.event_id, "c", 1_700_000_002_000);
+        c.soft_failed = true;
+        let d = topic_on(&peer, &room_id, &c.event_id, "d", 1_700_000_003_000);
+        for ev in [&b, &c, &d] {
+            store.persist_historical_event(ev).await.unwrap();
+        }
+        (
+            router_with_store(config(), store),
+            room_id,
+            vec![b, c, d],
+            tempfile,
+        )
+    }
+    async fn topics(app: &axum::Router, room_id: &RoomId, latest: &str) -> Vec<String> {
+        let (status, body) = post_json(
+            app,
+            &fed_path(room_id.as_str()),
+            &json!({
+                "earliest_events": [],
+                "latest_events": [latest],
+                "limit": 10,
+                crate::federation::get_missing_events::STATE_DAG_KEY: true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body = {body}");
+        body["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .map(|p| {
+                p.pointer("/content/topic")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<non-topic>")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    let (app, room_id, evs, _tempfile) = chain(false).await;
+    let got = topics(&app, &room_id, evs[2].event_id.as_str()).await;
+    assert_eq!(
+        &got[..2],
+        ["c", "b"],
+        "nearest hop first, soft-failed c included; then join and create"
+    );
+    assert_eq!(got.len(), 4, "c, b, join, create");
+
+    let (app, room_id, evs, _tempfile) = chain(true).await;
+    let got = topics(&app, &room_id, evs[2].event_id.as_str()).await;
+    assert_eq!(
+        got,
+        ["c"],
+        "rejected b is neither returned nor walked through"
+    );
+}
+
 // Unknown room → 404 M_NOT_FOUND (spec-required), not a 500 or the
 // bare-text fallback.
 #[tokio::test]
