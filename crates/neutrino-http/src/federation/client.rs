@@ -33,7 +33,7 @@ use neutrino_engine::{
     TransportError,
 };
 
-use crate::federation::get_missing_events;
+use crate::federation::get_missing_events::{self, StateDagFlag};
 
 /// Connection-establishment timeout for a federation request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -345,7 +345,7 @@ impl FederationClient {
             earliest_events: earliest,
             latest_events: latest,
             limit,
-            state_dag,
+            state_dag: StateDagFlag(state_dag),
             include_latest_events,
         };
         let resp = self
@@ -786,7 +786,8 @@ struct MissingEventsRequest<'a> {
     earliest_events: &'a [OwnedEventId],
     latest_events: &'a [OwnedEventId],
     limit: u32,
-    state_dag: bool,
+    #[serde(flatten)]
+    state_dag: StateDagFlag,
     /// Anti-entropy: ask the peer to also return the `latest_events` it holds.
     include_latest_events: bool,
 }
@@ -1225,7 +1226,7 @@ mod tests {
             earliest_events: &earliest,
             latest_events: &latest,
             limit: 7,
-            state_dag: true,
+            state_dag: StateDagFlag(true),
             include_latest_events: true,
         };
         let req_json = serde_json::to_value(&req).unwrap();

@@ -5873,3 +5873,18 @@ async fn invite_oob_rejects_forged_sender() {
         "honest OOB invite stub must be stored"
     );
 }
+
+/// The low-bandwidth key table must code the MSC4242 request flag under the
+/// same literal as `STATE_DAG_KEY`, or the flag goes over CoAP as a string
+/// key. Flip both together when the MSC stabilises.
+#[test]
+fn state_dag_key_is_lb_coded() {
+    let json =
+        serde_json::to_vec(&serde_json::json!({ super::get_missing_events::STATE_DAG_KEY: true }))
+            .unwrap();
+    // CBOR: map(1), uint 139, true.
+    assert_eq!(
+        neutrino_lb::codec::json_to_cbor(&json).unwrap(),
+        [0xA1, 0x18, 0x8B, 0xF5]
+    );
+}
