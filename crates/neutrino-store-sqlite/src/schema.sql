@@ -338,6 +338,18 @@ CREATE INDEX ix_deliveries_pos ON deliveries(delivery_pos);
 -- re-asks when it needs to fill a deeper gap. Per-row, not per-room, since
 -- different peers can send events into the same room.
 --
+-- `fetched_for` records *why* a row is here. NULL = the PDU arrived in its
+-- own right (`/send`, join ingest, anti-entropy) and is a gap-fill *root*: the
+-- worker applies it and, if its state ancestry is missing, walks the peer for
+-- it. Non-NULL = the row is ancestry fetched on behalf of the root PDU named
+-- here. Fetched rows are never gap-fill roots themselves — a partially
+-- fetched, ungrounded ancestry must not be promoted into independent PDUs
+-- that each re-walk the peer — and they live and die with their root: kept
+-- across a transient peer failure (so the root's retry resumes from the
+-- staged frontier instead of refetching), deleted with the root when its gap
+-- is unfillable or it is otherwise dropped. A fetched row that later arrives
+-- in its own right is promoted (`fetched_for` cleared).
+--
 -- No FK on `room_id` (a holding pen, not history — same posture as the
 -- FK-free `event_edges.parent_event_id`). No `user_version` bump: additive,
 -- no live data, no migration framework yet (same policy as the `events`
@@ -346,13 +358,15 @@ CREATE INDEX ix_deliveries_pos ON deliveries(delivery_pos);
 -- sender), so a restart re-drains everything; presence = pending, absence =
 -- processed.
 CREATE TABLE staged_events (
-    event_id  TEXT NOT NULL PRIMARY KEY,
-    room_id   TEXT NOT NULL,
-    origin    TEXT NOT NULL,
-    json      TEXT NOT NULL
+    event_id    TEXT NOT NULL PRIMARY KEY,
+    room_id     TEXT NOT NULL,
+    origin      TEXT NOT NULL,
+    json        TEXT NOT NULL,
+    fetched_for TEXT
 ) STRICT, WITHOUT ROWID;
 
 CREATE INDEX ix_staged_events_room ON staged_events(room_id);
+CREATE INDEX ix_staged_events_fetched_for ON staged_events(room_id, fetched_for);
 
 -- ----------------------------------------------------------------------------
 -- oob_memberships — OobMembershipStore

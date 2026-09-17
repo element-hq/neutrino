@@ -428,6 +428,11 @@ pub struct StagedPdu {
     pub event_id: OwnedEventId,
     pub origin: OwnedServerName,
     pub raw: Box<RawJsonValue>,
+    /// `None` — arrived in its own right; a gap-fill root. `Some(root)` — state
+    /// ancestry fetched on behalf of the staged root PDU `root`; never a
+    /// gap-fill root itself, and unstaged along with `root`
+    /// ([`StagingStore::unstage_with_fetched`]).
+    pub fetched_for: Option<OwnedEventId>,
 }
 
 /// Pre-auth staging of inbound federation PDUs and the ancestry fetched while
@@ -444,23 +449,29 @@ pub trait StagingStore: Send + Sync {
     /// Pre:  `raw` is the canonical post-`from_wire` bytes whose reference hash
     ///       is `event_id` (so id ↔ bytes round-trip), `room_id` matches, and
     ///       `origin` is the server it arrived from (or was fetched from).
-    /// Post: `(event_id, room_id, origin, raw)` is recorded in the staging
-    ///       area; idempotent — re-staging the same id is a no-op (a peer may
-    ///       resend, and gap-fill may re-fetch, the same event). Does NOT
-    ///       advance the `subscribe` watch (staged events are invisible).
+    ///       `fetched_for` is `None` for a PDU staged in its own right (a
+    ///       gap-fill root) or `Some(root)` for ancestry fetched while
+    ///       gap-filling the staged root PDU `root`.
+    /// Post: `(event_id, room_id, origin, raw, fetched_for)` is recorded in the
+    ///       staging area; idempotent — re-staging the same id is a no-op (a
+    ///       peer may resend, and gap-fill may re-fetch, the same event), except
+    ///       that re-staging a fetched row with `fetched_for = None` *promotes*
+    ///       it to a root (the event has now arrived in its own right). Does
+    ///       NOT advance the `subscribe` watch (staged events are invisible).
     ///       Returns `true` if a new row was inserted, `false` if the id was
-    ///       already staged (an ignored duplicate) — the gap-fill loop uses
-    ///       this to tell "fetched new ancestry" from "peer re-sent what we
-    ///       already hold". Staging is deliberately *unbounded*: grounding an
-    ///       event requires fetching its entire state-DAG ancestry back to
-    ///       `m.room.create`, however deep (inherent to MSC4242 / auth-chain
-    ///       CRDTs), and the mesh is trusted.
+    ///       already staged or committed (a promotion also returns `false`) —
+    ///       the gap-fill loop uses this to tell "fetched new ancestry" from
+    ///       "peer re-sent what we already hold". Staging is deliberately
+    ///       *unbounded*: grounding an event requires fetching its entire
+    ///       state-DAG ancestry back to `m.room.create`, however deep (inherent
+    ///       to MSC4242 / auth-chain CRDTs), and the mesh is trusted.
     async fn stage_pdu(
         &self,
         origin: &ServerName,
         room_id: &RoomId,
         event_id: &EventId,
         raw: &RawJsonValue,
+        fetched_for: Option<&EventId>,
     ) -> Result<bool, StorageError>;
 
     /// Pre:  none.
@@ -492,6 +503,18 @@ pub trait StagingStore: Send + Sync {
     /// Post: deletes the matching staged rows; idempotent — ids not present are
     ///       ignored. Called once a staged PDU has been durably applied.
     async fn unstage_events(&self, event_ids: &[&EventId]) -> Result<(), StorageError>;
+
+    /// Pre:  none (`root` need not be staged).
+    /// Post: deletes the staged row `root` and, in the same write, every row
+    ///       in `room_id` with `fetched_for = root` — the ancestry fetched on
+    ///       its behalf, which has no reason to exist once the root is gone
+    ///       (applied, rejected, or dropped). Idempotent; a no-op for a
+    ///       `root` that is not staged and has no fetched rows.
+    async fn unstage_with_fetched(
+        &self,
+        room_id: &RoomId,
+        root: &EventId,
+    ) -> Result<(), StorageError>;
 }
 
 #[async_trait]

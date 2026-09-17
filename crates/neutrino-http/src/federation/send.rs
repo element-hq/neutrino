@@ -354,8 +354,10 @@ pub(crate) async fn handle(
             continue;
         }
         let id = event.event_id.to_string();
+        // `None`: a `/send` PDU is staged in its own right — a gap-fill root
+        // (and, if we only held it as fetched ancestry so far, this promotes it).
         let result = match store
-            .stage_pdu(&origin, &event.room_id, &event.event_id, &event.raw)
+            .stage_pdu(&origin, &event.room_id, &event.event_id, &event.raw, None)
             .await
         {
             // Staged (newly, or already present from an earlier delivery) — in

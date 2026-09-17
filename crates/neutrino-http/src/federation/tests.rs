@@ -43,7 +43,7 @@ use neutrino_engine::{MissingEventsFetcher, MissingEventsQuery, TransportError};
 
 /// The arguments one `fetch` call was made with, recorded so a test can assert
 /// the gap-fill loop targets the right frontier / boundary / limit.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct FetchCall {
     latest: Vec<OwnedEventId>,
     earliest: Vec<OwnedEventId>,
@@ -71,6 +71,9 @@ enum StubOutcome {
     Sequence(std::collections::VecDeque<Vec<String>>),
     /// `Err(Status(code))` — a peer HTTP failure.
     Error(u16),
+    /// `Ok(batch)` per call, popped front-first; exhausted ⇒ `Err(Status(code))`.
+    /// Drives a gap-fill that stages some ancestry and then hits a peer failure.
+    SequenceThenError(std::collections::VecDeque<Vec<String>>, u16),
 }
 
 impl StubFetcher {
@@ -104,6 +107,13 @@ impl StubFetcher {
     fn set_sequence(&self, batches: Vec<Vec<&neutrino_event::Event>>) {
         let q = batches.iter().map(|b| Self::raws_of(b)).collect();
         *self.outcome.lock().unwrap() = StubOutcome::Sequence(q);
+    }
+
+    /// Like [`set_sequence`](Self::set_sequence), but once the batches run out
+    /// every further `fetch` fails with HTTP `code`.
+    fn set_sequence_then_error(&self, batches: Vec<Vec<&neutrino_event::Event>>, code: u16) {
+        let q = batches.iter().map(|b| Self::raws_of(b)).collect();
+        *self.outcome.lock().unwrap() = StubOutcome::SequenceThenError(q, code);
     }
 
     fn calls(&self) -> Vec<FetchCall> {
@@ -140,6 +150,10 @@ impl MissingEventsFetcher for StubFetcher {
                 Ok(batches.pop_front().map(|b| rebuild(&b)).unwrap_or_default())
             }
             StubOutcome::Error(code) => Err(TransportError::Status(*code)),
+            StubOutcome::SequenceThenError(batches, code) => match batches.pop_front() {
+                Some(b) => Ok(rebuild(&b)),
+                None => Err(TransportError::Status(*code)),
+            },
         }
     }
 }
@@ -1718,7 +1732,7 @@ async fn seed_joined_room() -> (
     TempDir,
 ) {
     // Default to a no-progress fetcher: the in-order tests never trigger
-    // gap-fill, and the one that does (`send_unfillable_ancestry_stays_unapplied`) wants
+    // gap-fill, and the one that does (`send_unfillable_ancestry_is_rejected`) wants
     // exactly "the peer has nothing" — deterministic, no network.
     seed_joined_room_with_fetcher(StubFetcher::no_progress()).await
 }
@@ -1886,13 +1900,35 @@ async fn wait_staging_empty(store: &SqliteStore, room_id: &RoomId) {
 /// Poll until the stub fetcher has recorded at least one call — i.e. the worker
 /// reached the gap-fill for a PDU with missing ancestry.
 async fn wait_fetch_attempted(fetcher: &StubFetcher) {
+    wait_fetch_count(fetcher, 1).await;
+}
+
+/// Poll until the stub fetcher has recorded at least `n` calls.
+async fn wait_fetch_count(fetcher: &StubFetcher, n: usize) {
     for _ in 0..500 {
-        if fetcher.call_count() >= 1 {
+        if fetcher.call_count() >= n {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("fetcher was never called within timeout");
+    panic!("fetcher was not called {n} times within timeout");
+}
+
+/// Poll until the room's staged rows are exactly `expected` (any order).
+async fn wait_staged_exactly(store: &SqliteStore, room_id: &RoomId, expected: &[&ruma::EventId]) {
+    let want: std::collections::BTreeSet<OwnedEventId> =
+        expected.iter().map(|e| (*e).to_owned()).collect();
+    for _ in 0..500 {
+        if let Ok(rows) = store.staged_for_room(room_id).await {
+            let got: std::collections::BTreeSet<OwnedEventId> =
+                rows.into_iter().map(|p| p.event_id).collect();
+            if got == want {
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("staging for {room_id} did not settle to {want:?} within timeout");
 }
 
 #[tokio::test]
@@ -1964,11 +2000,12 @@ async fn send_persists_rejected_pdu_as_success_result() {
 }
 
 #[tokio::test]
-async fn send_unfillable_ancestry_stays_unapplied() {
+async fn send_unfillable_ancestry_is_rejected() {
     // A PDU referencing a parent we don't have, and the peer (a no-progress
     // fetcher) returns nothing → the gap is unfillable. `/send` still 200s
-    // (staged); the worker tries the gap-fill, fails, backs off, and the PDU is
-    // never committed (left durably staged for a later retry/restart).
+    // (staged); the worker tries the gap-fill, fails, and *rejects* the PDU
+    // (MSC4242: a server that cannot supply a path to create SHOULD have its
+    // `/send` rejected) — it is unstaged, never committed, and never retried.
     let fetcher = StubFetcher::no_progress();
     let (app, store, room_id, alice, join_id, _tempfile) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
@@ -1991,16 +2028,17 @@ async fn send_unfillable_ancestry_stays_unapplied() {
         "staging succeeds even when the eventual gap-fill won't; body = {body}"
     );
 
-    // The worker reaches the gap-fill (fetcher called) but can't ground the
-    // ancestry, so the child is never committed.
+    // The worker reaches the gap-fill (fetcher called), can't ground the
+    // ancestry, and drops the child: staging drains without it committing.
     wait_fetch_attempted(&fetcher).await;
+    wait_staging_empty(&store, &room_id).await;
     assert!(
         store
             .get_events(&[child_id.as_ref()])
             .await
             .unwrap()
             .is_empty(),
-        "child must not be committed while its ancestry is unfillable"
+        "child must not be committed when its ancestry is unfillable"
     );
 }
 
@@ -2176,8 +2214,8 @@ async fn send_gapfill_fetch_targets_frontier_and_state_boundary() {
 
     let _ = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
 
-    // The gap is unfillable (no-progress peer), so the worker backs off and
-    // retries — pin the *first* round's arguments rather than the call count.
+    // The gap is unfillable (no-progress peer), so the worker rejects the PDU
+    // after this one round — pin the *first* round's arguments.
     wait_fetch_attempted(&fetcher).await;
     let calls = fetcher.calls();
     assert!(
@@ -2425,6 +2463,190 @@ async fn send_fetcher_failure_leaves_pdu_unapplied() {
             .unwrap()
             .is_empty(),
         "child must not be persisted on fetch failure"
+    );
+    // A peer failure says nothing about the DAG, so the PDU is *not* rejected:
+    // it stays staged (backing off) for a later retry — unlike an unfillable
+    // gap, which drops it.
+    let staged: Vec<OwnedEventId> = store
+        .staged_for_room(&room_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.event_id)
+        .collect();
+    assert_eq!(
+        staged,
+        vec![child_id],
+        "child stays staged across a transient peer failure"
+    );
+}
+
+#[tokio::test]
+async fn send_unfillable_gapfill_drops_root_with_fetched_ancestry() {
+    // The Complement GME05 shape. child → orphan → grandorphan → join, where the
+    // peer supplies `orphan` in the timeline round and then nothing for the
+    // state walk (grandorphan is never delivered), so the gap is unfillable.
+    // `orphan` is staged as ancestry *fetched for* `child`, never a gap-fill
+    // root of its own — so it must not be drained as if it had arrived via
+    // `/send` and start a `latest=[orphan]` timeline round against the peer. On
+    // the unfillable verdict `child` is rejected and `orphan` goes with it:
+    // staging drains, nothing commits, and the peer sees exactly the two rounds
+    // rooted at `child`.
+    let fetcher = StubFetcher::no_progress();
+    let (app, store, room_id, alice, join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let grandorphan = topic_on(
+        &alice,
+        &room_id,
+        &join_id,
+        "never delivered",
+        1_700_000_001_000,
+    );
+    let orphan = topic_on(
+        &alice,
+        &room_id,
+        &grandorphan.event_id,
+        "delivered then rolled back",
+        1_700_000_002_000,
+    );
+    let child = message_on(
+        &alice,
+        &room_id,
+        &orphan.event_id,
+        "child",
+        1_700_000_003_000,
+    );
+    let orphan_id = orphan.event_id.clone();
+    let child_id = child.event_id.clone();
+    // Round 1 (timeline, latest=[child]) yields orphan; the state walk then gets
+    // nothing → unfillable.
+    fetcher.set_sequence(vec![vec![&orphan]]);
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    wait_staging_empty(&store, &room_id).await;
+    assert!(
+        store
+            .get_events(&[orphan_id.as_ref(), child_id.as_ref()])
+            .await
+            .unwrap()
+            .is_empty(),
+        "neither the child nor the rolled-back orphan may commit"
+    );
+    // Staging is empty and the worker has parked, so the call log is final.
+    let calls = fetcher.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "one timeline round + one state round, both rooted at child: {calls:?}"
+    );
+    assert!(!calls[0].state_dag);
+    assert_eq!(
+        calls[0].latest,
+        vec![child_id.clone()],
+        "timeline round walks from the received PDU"
+    );
+    assert!(calls[1].state_dag);
+    assert_eq!(
+        calls[1].latest,
+        vec![orphan_id.clone()],
+        "state round walks from the staged frontier"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| !c.state_dag && c.latest == vec![orphan_id.clone()]),
+        "the fetched orphan must never become its own gap-fill root: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn send_transient_gapfill_failure_keeps_fetched_ancestry_and_resumes() {
+    // Same DAG as the unfillable case, but the state walk fails with a peer
+    // error after the timeline round staged `orphan`. Transient ⇒ the child is
+    // kept (backing off) rather than rejected, and the fetched `orphan` is kept
+    // too, tagged `fetched_for = child` — so it is neither drained as an
+    // independent gap-fill root nor refetched: the retry's `ancestry_gap` sees
+    // it staged and resumes the state walk from the frontier below it.
+    let fetcher = StubFetcher::no_progress();
+    let (app, store, room_id, alice, join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let grandorphan = topic_on(
+        &alice,
+        &room_id,
+        &join_id,
+        "never delivered",
+        1_700_000_001_000,
+    );
+    let orphan = topic_on(
+        &alice,
+        &room_id,
+        &grandorphan.event_id,
+        "delivered then rolled back",
+        1_700_000_002_000,
+    );
+    let child = message_on(
+        &alice,
+        &room_id,
+        &orphan.event_id,
+        "child",
+        1_700_000_003_000,
+    );
+    let orphan_id = orphan.event_id.clone();
+    let child_id = child.event_id.clone();
+    fetcher.set_sequence_then_error(vec![vec![&orphan]], 502);
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    // After the failed state round both rows stay staged: the child (backing
+    // off) and the orphan fetched for it.
+    wait_fetch_count(&fetcher, 2).await;
+    wait_staged_exactly(&store, &room_id, &[child_id.as_ref(), orphan_id.as_ref()]).await;
+    let rows = store.staged_for_room(&room_id).await.unwrap();
+    let orphan_row = rows.iter().find(|p| p.event_id == orphan_id).unwrap();
+    assert_eq!(
+        orphan_row.fetched_for.as_ref(),
+        Some(&child_id),
+        "the orphan is tagged as ancestry fetched for the child"
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|p| p.event_id == child_id)
+            .unwrap()
+            .fetched_for,
+        None,
+        "the /send PDU is a root"
+    );
+    assert!(
+        store
+            .get_events(&[orphan_id.as_ref(), child_id.as_ref()])
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing commits on a transient failure"
+    );
+
+    // The child's backoff expires and it retries. Its timeline parent (orphan)
+    // is now held (staged), so no timeline round; the state walk resumes from
+    // the staged frontier — a *state* round with `latest=[orphan]`.
+    wait_fetch_count(&fetcher, 3).await;
+    let calls = fetcher.calls();
+    assert!(!calls[0].state_dag);
+    assert_eq!(calls[0].latest, vec![child_id.clone()]);
+    assert!(calls[1].state_dag);
+    assert_eq!(calls[1].latest, vec![orphan_id.clone()]);
+    assert!(
+        calls[2].state_dag,
+        "the retry resumes the state walk, no timeline refetch: {calls:?}"
+    );
+    assert_eq!(calls[2].latest, vec![orphan_id.clone()]);
+    assert!(
+        !calls
+            .iter()
+            .any(|c| !c.state_dag && c.latest == vec![orphan_id.clone()]),
+        "the fetched orphan must never become its own gap-fill root: {calls:?}"
     );
 }
 
@@ -2708,7 +2930,7 @@ async fn worker_drains_rows_staged_before_startup() {
     let origin: &ServerName = "remote.example.org".try_into().unwrap();
     assert!(
         store
-            .stage_pdu(origin, &room_id, &msg.event_id, &msg.raw)
+            .stage_pdu(origin, &room_id, &msg.event_id, &msg.raw, None)
             .await
             .unwrap()
     );
@@ -2722,10 +2944,11 @@ async fn worker_drains_rows_staged_before_startup() {
 
 #[tokio::test]
 async fn worker_wedged_pdu_does_not_block_sibling() {
-    // One PDU has unfillable ancestry (it backs off forever); an independent,
+    // One PDU has missing ancestry and the peer keeps failing (a transient
+    // error, so it backs off rather than being rejected); an independent,
     // directly-appliable PDU in the same room must still be processed. Proves a
     // backing-off event is skipped, not head-of-line blocking.
-    let fetcher = StubFetcher::no_progress();
+    let fetcher = StubFetcher::erroring(502);
     let (app, store, room_id, alice, join_id, _tempfile) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
 
@@ -2764,7 +2987,7 @@ async fn worker_wedged_pdu_does_not_block_sibling() {
     assert_eq!(status, StatusCode::OK);
     wait_committed(&store, healthy2_id.as_ref()).await;
 
-    // The wedged PDU is still uncommitted (its ancestry is permanently unfillable).
+    // The wedged PDU is still uncommitted (the peer never answered).
     assert!(
         store
             .get_events(&[wedged_id.as_ref()])

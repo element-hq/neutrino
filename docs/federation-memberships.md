@@ -77,7 +77,7 @@ IP:port, no `.well-known` / SRV / TLS — `federation::client`).
 |---|---|---|
 | `RoomCore::apply_pdu` — single ingest path; DROP/RETRY/REJECT disposition; computes `auth_events`; idempotent persisted-check | `crates/neutrino-state/src/room_core.rs` | every inbound membership apply |
 | `RoomRegistry` / `RoomActor` — per-room serialised actor; `Command::Send` (local build+apply+persist+enqueue), `Command::ApplyPdu` (received PDU, persists rejects, `&[]` destinations) | `crates/neutrino-http/src/room_actor.rs` | apply + distribution |
-| Staging table + `StagingStore` (`staged_events(event_id PK, room_id, json, origin)`; `stage_pdu` / `staged_rooms` / `staged_for_room` / `ancestry_gap` / `unstage_events`) | `crates/neutrino-store-sqlite/src/store/staging.rs` | **join ingest** + gap-fill |
+| Staging table + `StagingStore` (`staged_events(event_id PK, room_id, json, origin, fetched_for)`; `stage_pdu` / `staged_rooms` / `staged_for_room` / `ancestry_gap` / `unstage_events` / `unstage_with_fetched`) | `crates/neutrino-store-sqlite/src/store/staging.rs` | **join ingest** + gap-fill |
 | Per-room **drain worker** (toposort → `apply_pdu` → `fill_state_ancestry` on retryable → in-memory backoff; supervisor enumerates `staged_rooms()` on startup + in-process `mpsc<RoomId>` poke) | `crates/neutrino-http/src/federation/worker.rs` | join ingest drains here |
 | Shared gap-fill (`fill_state_ancestry` / `fill_timeline_parents` / `boundaries` / `MissingEventsFetcher`) | `crates/neutrino-http/src/federation/gapfill.rs` | join ingest gap-fill |
 | `FederationClient` (`send_transaction`, `get_missing_events`) + `ReqwestFetcher` + resolver + `TxnIdGen` + `FederationClientError` | `crates/neutrino-http/src/federation/client.rs` | **outbound handshakes** (extend with make/send_join, invite, make/send_leave) |
@@ -224,7 +224,7 @@ CSAPI entry: `POST /_matrix/client/v3/join/{roomIdOrAlias}` (and room-scoped
 | make_join 404 / 403 / version mismatch | map to CSAPI 404 / 403 / 400; iterate to next `server_name` on 403/transport |
 | All candidate servers unreachable | CSAPI 5xx / error; client retries |
 | Room isn't our version | hard 400 `M_INCOMPATIBLE_ROOM_VERSION` (we only do v12+MSC4242) |
-| `state_dag` incomplete (a path to create is missing) | drain's `fill_state_ancestry` gap-fills (bounded by being grounded); genuinely unfillable → worker backs off, CSAPI times out, nothing half-committed |
+| `state_dag` incomplete (a path to create is missing) | drain's `fill_state_ancestry` gap-fills (bounded by being grounded); genuinely unfillable (peer answered, no path to create) → worker rejects/unstages the PDU together with the ancestry fetched for it (`staged_events.fetched_for`); peer unreachable → worker backs off, fetched ancestry kept so the retry resumes from the staged frontier. Either way CSAPI times out, nothing half-committed |
 | Ingest takes minutes (huge room) | drain keeps working; CSAPI times out gracefully; join completes on a later sync |
 | Crash mid-ingest | `staged_rooms()` resumes; mid-event re-apply is an idempotent no-op |
 | Banned between make_join & send_join (inbound) | `apply_pdu` REJECT → 403, nothing persisted |

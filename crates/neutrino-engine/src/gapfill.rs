@@ -53,32 +53,63 @@ const INITIAL_GAPFILL_LIMIT: u32 = 10;
 /// *already* grounded on entry and nothing was fetched: the triggering
 /// `apply_pdu` was retryable for a reason other than a real state-DAG gap (a
 /// transient state-res / storage fault, or a not-yet-known room), so the worker
-/// must back off rather than spin. Returns `Err(reason)` on a terminal failure
-/// for *this* attempt: the peer has nothing new (an empty result, or a round
-/// that re-sends only events we already hold — both "unfillable"), a peer
-/// transport/HTTP failure, or a storage fault. In every non-`Ok(true)` case the
-/// worker backs the PDU off; staged ancestry from a partial round is durable, so
-/// a later retry resumes from it.
+/// must back off rather than spin. Returns `Err` on a failure of *this*
+/// attempt, classified for the worker ([`GapFillError`]):
+/// [`Unfillable`](GapFillError::Unfillable) when the peer answered but cannot
+/// supply a path to `m.room.create` (an empty result, or a round that re-sends
+/// only events we already hold) — the PDU is rejected, per MSC4242's "SHOULD
+/// reject the `/send`"; [`Transient`](GapFillError::Transient) on a peer
+/// transport/HTTP failure or a storage fault — the PDU backs off and retries.
+///
+/// Every ancestor this stages is tagged `fetched_for = event` (see
+/// `staged_events.fetched_for`), so the worker never treats it as a gap-fill
+/// root of its own — a partially-fetched, ungrounded ancestry must not be
+/// promoted into independent PDUs that each re-walk the peer. Fetched rows
+/// live and die with `event`: on `Transient` they stay staged, so the retry's
+/// `ancestry_gap` resumes from the staged frontier rather than refetching; on
+/// `Unfillable` the worker deletes them together with `event`
+/// (`StagingStore::unstage_with_fetched`).
 ///
 /// The loop is **unbounded** in rounds: grounding requires the *whole* state-DAG
 /// ancestry to `m.room.create`, however deep (inherent to MSC4242 — like
 /// fetching a full auth chain), so a real chain is walked to completion. It can
 /// only stop early by *grounding* or by the peer running out of new events; a
 /// trusted peer never feeds an infinite distinct chain.
+/// Why a [`fill_state_ancestry`] attempt failed, and hence what the worker does
+/// with the PDU: reject it, or back it off and retry.
+#[derive(Debug)]
+pub(crate) enum GapFillError {
+    /// The peer answered, but cannot supply a path from the PDU's
+    /// `prev_state_events` to `m.room.create`. The PDU can never be authorised
+    /// from this peer; MSC4242 says to reject it.
+    Unfillable(String),
+    /// Reaching the peer failed (transport / non-2xx), or our own storage
+    /// faulted. Says nothing about the DAG; retry later.
+    Transient(String),
+}
+
+impl std::fmt::Display for GapFillError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unfillable(reason) => write!(f, "gap unfillable: {reason}"),
+            Self::Transient(reason) => write!(f, "transient: {reason}"),
+        }
+    }
+}
+
 pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
     store: &impl StorageBackend,
     origin: &ServerName,
     event: &Event,
     fetcher: &F,
     policy: &EventPolicy,
-) -> Result<bool, String> {
+) -> Result<bool, GapFillError> {
     let room_id = &event.room_id;
-    // The version every fetched ancestor is named under. The caller treats an
-    // `Err` here as retryable, which is right for a storage fault; a terminal
-    // failure means the worker is about to drop these rows anyway.
+    // The version every fetched ancestor is named under. A failure here is a
+    // storage fault (or a not-yet-known room), so it is transient.
     let version = room_version(store, &policy.versions, room_id)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| GapFillError::Transient(e.to_string()))?;
     let (timeline_boundary, earliest) = boundaries(store, room_id).await;
     let mut limit = INITIAL_GAPFILL_LIMIT;
     // Whether any round staged a new event. `false` at a grounded exit means the
@@ -100,7 +131,7 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
         let gap = store
             .ancestry_gap(room_id, &heads)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| GapFillError::Transient(e.to_string()))?;
         if gap.missing.is_empty() {
             return Ok(made_progress);
         }
@@ -131,21 +162,26 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
             .await
         {
             Ok(fetched) if fetched.is_empty() => {
-                return Err("missing ancestry, gap unfillable: peer returned no events".to_owned());
+                return Err(GapFillError::Unfillable(
+                    "peer returned no events".to_owned(),
+                ));
             }
             Ok(fetched) => fetched,
-            Err(e) => return Err(format!("peer fetch failed: {e}")),
+            Err(e) => return Err(GapFillError::Transient(format!("peer fetch failed: {e}"))),
         };
 
-        let staged_new = stage_fetched(store, policy, &version, origin, room_id, fetched).await?;
+        let staged_new = stage_fetched(store, policy, &version, origin, event, fetched)
+            .await
+            .map_err(GapFillError::Transient)?;
 
         // No-progress guard (the loop's only non-grounding terminator besides an
         // empty fetch): a round that staged nothing new means the peer re-sent
-        // only what we already hold, so it can't ground this gap. Bail; the PDU
-        // backs off and a later retry (or a peer that has more) resumes from the
-        // durable staged prefix.
+        // only what we already hold, so it can't ground this gap. Bail; the
+        // worker rejects the PDU and deletes the ancestry fetched for it.
         if staged_new == 0 {
-            return Err("missing ancestry, gap unfillable: peer returned no new events".to_owned());
+            return Err(GapFillError::Unfillable(
+                "peer returned no new events".to_owned(),
+            ));
         }
         made_progress = true;
         limit = limit.saturating_mul(2);
@@ -199,7 +235,7 @@ async fn fill_timeline_parents<F: MissingEventsFetcher + ?Sized>(
             return false;
         }
     };
-    match stage_fetched(store, policy, version, origin, room_id, fetched).await {
+    match stage_fetched(store, policy, version, origin, event, fetched).await {
         Ok(staged_new) => staged_new > 0,
         Err(e) => {
             tracing::warn!(%room_id, error = %e, "gapfill: staging timeline ancestry failed; continuing with the state walk");
@@ -208,7 +244,8 @@ async fn fill_timeline_parents<F: MissingEventsFetcher + ?Sized>(
     }
 }
 
-/// Stage a peer's `get_missing_events` answer, returning how many rows were new.
+/// Stage a peer's `get_missing_events` answer on behalf of `root` (each row
+/// tagged `fetched_for = root`), returning how many rows were new.
 ///
 /// Each event is staged under its *computed* id (`from_wire` derives it from
 /// the reference hash and yields canonical bytes, so id ↔ bytes round-trip). An
@@ -229,9 +266,10 @@ async fn stage_fetched(
     policy: &EventPolicy,
     version: &std::sync::Arc<neutrino_event::RoomVersion>,
     origin: &ServerName,
-    room_id: &RoomId,
+    root: &Event,
     fetched: Vec<Box<serde_json::value::RawValue>>,
 ) -> Result<usize, String> {
+    let room_id = &root.room_id;
     let mut staged_new = 0usize;
     for raw in fetched {
         let Ok(wire) = policy.admit_wire(raw, version).await else {
@@ -245,7 +283,13 @@ async fn stage_fetched(
             continue;
         }
         if store
-            .stage_pdu(origin, room_id, &ancestor.event_id, &ancestor.raw)
+            .stage_pdu(
+                origin,
+                room_id,
+                &ancestor.event_id,
+                &ancestor.raw,
+                Some(&root.event_id),
+            )
             .await
             .map_err(|e| e.to_string())?
         {
