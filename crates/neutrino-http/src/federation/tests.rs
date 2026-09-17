@@ -48,6 +48,7 @@ struct FetchCall {
     latest: Vec<OwnedEventId>,
     earliest: Vec<OwnedEventId>,
     limit: u32,
+    state_dag: bool,
 }
 
 /// Deterministic gap-fill [`MissingEventsFetcher`] for the inbound `/send`
@@ -124,6 +125,7 @@ impl MissingEventsFetcher for StubFetcher {
             latest: q.latest.to_vec(),
             earliest: q.earliest.to_vec(),
             limit: q.limit,
+            state_dag: q.state_dag,
         });
         let rebuild = |jsons: &[String]| {
             jsons
@@ -2053,16 +2055,18 @@ async fn send_gapfills_missing_ancestry_then_accepts() {
 async fn send_gapfill_fetch_targets_frontier_and_state_boundary() {
     // Pin the outbound fetch arguments: `latest` is the triggering event (the
     // walk-from point), `earliest` is the room's *state-DAG* forward extremity
-    // (not the timeline one — the `state_dag_boundary`), and
-    // the first round uses the initial limit. A no-progress fetcher records one
-    // call; the resulting unfillable error is irrelevant here.
+    // (not the timeline one), and the first round uses the initial limit. The
+    // child's timeline parent is held, so no timeline round precedes the state
+    // walk. A no-progress fetcher records one call; the resulting unfillable
+    // error is irrelevant here.
     let fetcher = StubFetcher::no_progress();
     let (app, _store, room_id, alice, join_id, _tempfile) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
     let orphan = topic_on(&alice, &room_id, &join_id, "x", 1_700_000_002_000);
-    let child = message_on(
+    let child = message_on_split(
         &alice,
         &room_id,
+        &join_id,
         &orphan.event_id,
         "child",
         1_700_000_003_000,
@@ -2074,6 +2078,10 @@ async fn send_gapfill_fetch_targets_frontier_and_state_boundary() {
     // retries — pin the *first* round's arguments rather than the call count.
     wait_fetch_attempted(&fetcher).await;
     let calls = fetcher.calls();
+    assert!(
+        calls[0].state_dag,
+        "the gap-fill walk is over the state DAG"
+    );
     assert_eq!(
         calls[0].latest,
         vec![child.event_id.clone()],
@@ -2092,15 +2100,23 @@ async fn send_gapfill_fetch_targets_frontier_and_state_boundary() {
 
 #[tokio::test]
 async fn send_gapfills_over_multiple_rounds() {
-    // The peer dribbles ancestry one event per round: child→A→B→join(held).
+    // The peer dribbles state ancestry one event per round: child→A→B→join(held).
     // Round 1 fetches A, round 2 fetches B; the loop must double the limit and
-    // carry the staged frontier in `latest` so it doesn't re-request A.
+    // carry the staged frontier in `latest` so it doesn't re-request A. The
+    // child's timeline parent is held, so every round is a state-DAG round.
     let fetcher = StubFetcher::no_progress();
     let (app, store, room_id, alice, join_id, _tempfile) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
     let b = topic_on(&alice, &room_id, &join_id, "b", 1_700_000_002_000);
     let a = topic_on(&alice, &room_id, &b.event_id, "a", 1_700_000_003_000);
-    let child = message_on(&alice, &room_id, &a.event_id, "child", 1_700_000_004_000);
+    let child = message_on_split(
+        &alice,
+        &room_id,
+        &join_id,
+        &a.event_id,
+        "child",
+        1_700_000_004_000,
+    );
     let child_id = child.event_id.clone();
     // Newest-first dribble: A (child's parent) then B (A's parent).
     fetcher.set_sequence(vec![vec![&a], vec![&b]]);
@@ -2134,6 +2150,88 @@ async fn send_gapfills_over_multiple_rounds() {
         .unwrap();
     assert_eq!(committed.len(), 3, "B + A + child all committed");
     assert!(committed.iter().all(|e| !e.rejected));
+}
+
+#[tokio::test]
+async fn send_gapfill_walks_timeline_parent_before_state_dag() {
+    // The child's `prev_events` and `prev_state_events` both name an event we
+    // lack. One timeline-DAG round (`state_dag: false`, `latest` = the child,
+    // `earliest` = the timeline head) runs first. The peer answers with the
+    // parent, whose own state ancestry is grounded, so no state-DAG round
+    // follows and both events commit.
+    let fetcher = StubFetcher::no_progress();
+    let (app, store, room_id, alice, join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let orphan = topic_on(&alice, &room_id, &join_id, "x", 1_700_000_002_000);
+    let child = message_on(
+        &alice,
+        &room_id,
+        &orphan.event_id,
+        "child",
+        1_700_000_003_000,
+    );
+    fetcher.set_sequence(vec![vec![&orphan]]);
+
+    let _ = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
+
+    wait_committed(&store, child.event_id.as_ref()).await;
+    let calls = fetcher.calls();
+    assert_eq!(calls.len(), 1, "one timeline round grounded everything");
+    assert!(
+        !calls[0].state_dag,
+        "the first round walks the timeline DAG"
+    );
+    assert_eq!(calls[0].latest, vec![child.event_id.clone()]);
+    assert_eq!(
+        calls[0].earliest,
+        vec![join_id.clone()],
+        "earliest is the timeline forward extremity"
+    );
+    assert_eq!(
+        calls[0].limit, 10,
+        "the timeline round is bounded at the initial limit"
+    );
+    let committed = store
+        .get_events(&[orphan.event_id.as_ref(), child.event_id.as_ref()])
+        .await
+        .unwrap();
+    assert_eq!(committed.len(), 2, "parent + child committed");
+    assert!(committed.iter().all(|e| !e.rejected));
+}
+
+#[tokio::test]
+async fn send_gapfill_timeline_round_is_best_effort() {
+    // The peer has nothing for the timeline round; the state-DAG walk still
+    // runs, fetches the parent, and grounds the child.
+    let fetcher = StubFetcher::no_progress();
+    let (app, store, room_id, alice, join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let orphan = topic_on(&alice, &room_id, &join_id, "x", 1_700_000_002_000);
+    let child = message_on(
+        &alice,
+        &room_id,
+        &orphan.event_id,
+        "child",
+        1_700_000_003_000,
+    );
+    fetcher.set_sequence(vec![vec![], vec![&orphan]]);
+
+    let _ = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
+
+    wait_committed(&store, child.event_id.as_ref()).await;
+    let calls = fetcher.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "an empty timeline round, then one state round"
+    );
+    assert!(!calls[0].state_dag);
+    assert!(
+        calls[1].state_dag,
+        "the state-DAG walk follows the empty timeline round"
+    );
+    assert_eq!(calls[1].latest, vec![child.event_id.clone()]);
+    assert_eq!(calls[1].earliest, vec![join_id.clone()]);
 }
 
 #[tokio::test]

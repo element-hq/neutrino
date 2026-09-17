@@ -9,6 +9,13 @@
 //! stream position or surface in any read / state-res path. So fetched ancestry
 //! is parked in a pre-auth staging cache rather than persisted as history.
 //!
+//! Timeline ancestry (`prev_events`) is not needed to authorise a PDU, so it is
+//! never walked to completion here: a dangling timeline parent becomes a
+//! backward extremity for `/backfill`. But when a PDU needs gap-filling at all,
+//! one bounded timeline-DAG round runs first, so a peer that answers state-DAG
+//! walks only for events in its own timeline (the common resident) is asked
+//! about the PDU's immediate timeline parent before the state walk starts.
+//!
 //! This module owns the *fetch-into-staging* half ([`fill_state_ancestry`]).
 //! The *apply* half is the inbound worker's drain loop ([`crate::worker`]):
 //! once the gap is staged, the worker re-reads the room's staged rows,
@@ -28,7 +35,9 @@ use crate::util::room_version;
 const INITIAL_GAPFILL_LIMIT: u32 = 10;
 
 /// Fetch `event`'s missing state-DAG ancestry into the staging cache until it
-/// is grounded (every `prev_state_events` path reaches an event we hold).
+/// is grounded (every `prev_state_events` path reaches an event we hold),
+/// preceded by one bounded timeline-DAG round for a missing `prev_events`
+/// parent ([`fill_timeline_parents`]).
 ///
 /// Each round recomputes the gap over `events ∪ staged_events`; an empty
 /// `missing` frontier means done. Otherwise we ask the peer, passing
@@ -69,12 +78,21 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
     let version = room_version(store, &policy.versions, room_id)
         .await
         .map_err(|e| e.to_string())?;
-    let earliest = state_dag_boundary(store, room_id).await;
+    let (timeline_boundary, earliest) = boundaries(store, room_id).await;
     let mut limit = INITIAL_GAPFILL_LIMIT;
     // Whether any round staged a new event. `false` at a grounded exit means the
     // retryable verdict wasn't a real gap (transient fault) — the signal the
     // worker uses to back off instead of immediately retrying (which would spin).
-    let mut made_progress = false;
+    let mut made_progress = fill_timeline_parents(
+        store,
+        origin,
+        event,
+        fetcher,
+        policy,
+        &version,
+        &timeline_boundary,
+    )
+    .await;
 
     loop {
         let heads: Vec<&EventId> = event.prev_state_events.iter().map(|e| e.as_ref()).collect();
@@ -114,44 +132,7 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
             Err(e) => return Err(format!("peer fetch failed: {e}")),
         };
 
-        // Stage under each event's *computed* id (`from_wire` derives it from
-        // the reference hash and yields canonical bytes, so id ↔ bytes
-        // round-trip). An unkeyable PDU is dropped. A peer can return events for
-        // any room; only stage ones in *this* room — a foreign-room event is
-        // never reachable by this room's `ancestry_gap` walk, so staging it
-        // would be unreachable junk that nothing ever drains.
-        // Both `Wire` variants are staged: a `Rejected` ancestor is exactly
-        // the cascade terminator — the worker persists it rejected and the
-        // descendant's reference check ends via `PrevStateRejected`. A
-        // drop-class ancestor (`Err`) is never staged, so a round that
-        // fetches only those stages nothing and the no-progress terminator
-        // below correctly declares the gap unfillable.
-        let mut staged_new = 0usize;
-        for raw in fetched {
-            if let Ok(wire) = policy.admit_wire(raw, &version).await {
-                if let neutrino_event::Wire::Rejected(ev, defect) = &wire {
-                    tracing::warn!(event_id = %ev.event_id, %defect, "gapfill: staging malformed ancestor as rejected");
-                }
-                let ancestor = wire.into_event();
-                if ancestor.room_id != *room_id {
-                    continue;
-                }
-                // Stage the fetched ancestor under `origin` — the peer that
-                // referenced it, not its true author. That's deliberate: if this
-                // ancestor itself later needs gap-filling we ask the same peer
-                // (it vouched for the reference), and `origin` is otherwise
-                // unused (no signature checks in the trusted mesh). At worst a
-                // wrong peer delays grounding, which the no-progress terminator
-                // and a later redelivery resolve.
-                if store
-                    .stage_pdu(origin, room_id, &ancestor.event_id, &ancestor.raw)
-                    .await
-                    .map_err(|e| e.to_string())?
-                {
-                    staged_new += 1;
-                }
-            }
-        }
+        let staged_new = stage_fetched(store, policy, &version, origin, room_id, fetched).await?;
 
         // No-progress guard (the loop's only non-grounding terminator besides an
         // empty fetch): a round that staged nothing new means the peer re-sent
@@ -166,12 +147,121 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
     }
 }
 
-/// The room's state-DAG forward extremities — the committed bottom boundary
-/// (`earliest_events`) for a state-DAG gap-fill walk. Best-effort: empty if the
-/// room is unknown or the lookup faults.
-async fn state_dag_boundary(store: &impl StorageBackend, room_id: &RoomId) -> Vec<OwnedEventId> {
+/// One bounded timeline-DAG round: if any of `event.prev_events` is held
+/// nowhere (neither committed nor staged), ask the peer once for `event`'s
+/// timeline ancestry at the initial limit and stage what comes back. Never
+/// recursive — the timeline parents are not needed to authorise `event`, so a
+/// peer failure or an empty answer just skips the round. Returns whether it
+/// staged anything new.
+async fn fill_timeline_parents<F: MissingEventsFetcher + ?Sized>(
+    store: &impl StorageBackend,
+    origin: &ServerName,
+    event: &Event,
+    fetcher: &F,
+    policy: &EventPolicy,
+    version: &std::sync::Arc<neutrino_event::RoomVersion>,
+    timeline_boundary: &[OwnedEventId],
+) -> bool {
+    let room_id = &event.room_id;
+    // `ancestry_gap` classifies its heads too: a head in neither table is in
+    // `missing`. Only the heads matter here, not what lies below a staged one.
+    let heads: Vec<&EventId> = event.prev_events.iter().map(|e| e.as_ref()).collect();
+    let parent_missing = match store.ancestry_gap(room_id, &heads).await {
+        Ok(gap) => event.prev_events.iter().any(|p| gap.missing.contains(p)),
+        Err(e) => {
+            tracing::warn!(%room_id, error = %e, "gapfill: timeline parent lookup failed");
+            false
+        }
+    };
+    if !parent_missing {
+        return false;
+    }
+    let fetched = match fetcher
+        .fetch(MissingEventsQuery {
+            origin,
+            room_id,
+            latest: std::slice::from_ref(&event.event_id),
+            earliest: timeline_boundary,
+            limit: INITIAL_GAPFILL_LIMIT,
+            state_dag: false,
+            include_latest_events: false,
+        })
+        .await
+    {
+        Ok(fetched) => fetched,
+        Err(e) => {
+            tracing::warn!(%room_id, error = %e, "gapfill: timeline round failed; continuing with the state walk");
+            return false;
+        }
+    };
+    match stage_fetched(store, policy, version, origin, room_id, fetched).await {
+        Ok(staged_new) => staged_new > 0,
+        Err(e) => {
+            tracing::warn!(%room_id, error = %e, "gapfill: staging timeline ancestry failed; continuing with the state walk");
+            false
+        }
+    }
+}
+
+/// Stage a peer's `get_missing_events` answer, returning how many rows were new.
+///
+/// Each event is staged under its *computed* id (`from_wire` derives it from
+/// the reference hash and yields canonical bytes, so id ↔ bytes round-trip). An
+/// unkeyable PDU is dropped. A peer can return events for any room; only ones
+/// in *this* room are staged — a foreign-room event is never reachable by this
+/// room's `ancestry_gap` walk, so staging it would be unreachable junk that
+/// nothing ever drains. Both `Wire` variants are staged: a `Rejected` ancestor
+/// is exactly the cascade terminator — the worker persists it rejected and the
+/// descendant's reference check ends via `PrevStateRejected`. A drop-class
+/// ancestor (`Err`) is never staged, so a round that fetches only those stages
+/// nothing and the caller's no-progress terminator declares the gap unfillable.
+/// Rows are staged under `origin` — the peer that referenced them, not their
+/// true author — so if an ancestor itself later needs gap-filling we ask the
+/// same peer (it vouched for the reference); `origin` is otherwise unused in
+/// the trusted mesh.
+async fn stage_fetched(
+    store: &impl StorageBackend,
+    policy: &EventPolicy,
+    version: &std::sync::Arc<neutrino_event::RoomVersion>,
+    origin: &ServerName,
+    room_id: &RoomId,
+    fetched: Vec<Box<serde_json::value::RawValue>>,
+) -> Result<usize, String> {
+    let mut staged_new = 0usize;
+    for raw in fetched {
+        let Ok(wire) = policy.admit_wire(raw, version).await else {
+            continue;
+        };
+        if let neutrino_event::Wire::Rejected(ev, defect) = &wire {
+            tracing::warn!(event_id = %ev.event_id, %defect, "gapfill: staging malformed ancestor as rejected");
+        }
+        let ancestor = wire.into_event();
+        if ancestor.room_id != *room_id {
+            continue;
+        }
+        if store
+            .stage_pdu(origin, room_id, &ancestor.event_id, &ancestor.raw)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            staged_new += 1;
+        }
+    }
+    Ok(staged_new)
+}
+
+/// The room's `(timeline, state)` forward extremities — the committed bottom
+/// boundaries (`earliest_events`) for the timeline round and the state-DAG walk
+/// respectively. Best-effort: both empty if the room is unknown or the lookup
+/// faults.
+async fn boundaries(
+    store: &impl StorageBackend,
+    room_id: &RoomId,
+) -> (Vec<OwnedEventId>, Vec<OwnedEventId>) {
     match store.forward_extremities(room_id).await {
-        Ok(Some((_timeline, state))) => state.into_iter().collect(),
-        _ => Vec::new(),
+        Ok(Some((timeline, state))) => {
+            (timeline.into_iter().collect(), state.into_iter().collect())
+        }
+        _ => (Vec::new(), Vec::new()),
     }
 }
