@@ -5505,7 +5505,9 @@ async fn seed_room_with_invited_zara() -> (
 }
 
 fn make_leave_path(room_id: &RoomId, user: &str) -> String {
-    format!("/_matrix/federation/v1/make_leave/{room_id}/{user}?ver={ROOM_VERSION_ID}")
+    // No `?ver=`: the spec defines none for make_leave, and real requesters
+    // (gomatrixserverlib, Synapse) send none.
+    format!("/_matrix/federation/v1/make_leave/{room_id}/{user}")
 }
 
 fn send_leave_path(room_id: &RoomId, event_id: &OwnedEventId) -> String {
@@ -5566,22 +5568,22 @@ async fn make_leave_unknown_room_returns_404() {
 }
 
 #[tokio::test]
-async fn make_leave_incompatible_version_returns_400() {
-    // make_leave negotiates the room version like make_join: a `ver` that does
-    // not include ours — or an absent `ver` (which defaults to `[1]`) — yields
-    // 400 M_INCOMPATIBLE_ROOM_VERSION with our `room_version` in the body.
+async fn make_leave_ignores_ver_query() {
+    // The spec defines no `ver` query for make_leave (unlike make_join), and
+    // real requesters (gomatrixserverlib, Synapse) send none. A missing or even
+    // mismatching `ver` must not gate the template: the requester learns the
+    // version from `room_version` in the response.
     let (router, _store, room_id, _head, _tempfile) = seed_room_with_invited_zara().await;
 
-    let path = format!("/_matrix/federation/v1/make_leave/{room_id}/{ZARA}?ver=1");
-    let (status, body) = get(&router, &path).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
-    assert_eq!(body["errcode"], "M_INCOMPATIBLE_ROOM_VERSION");
-    assert_eq!(body["room_version"], ROOM_VERSION_ID);
-
-    let path = format!("/_matrix/federation/v1/make_leave/{room_id}/{ZARA}");
-    let (status, body) = get(&router, &path).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
-    assert_eq!(body["errcode"], "M_INCOMPATIBLE_ROOM_VERSION");
+    for path in [
+        format!("/_matrix/federation/v1/make_leave/{room_id}/{ZARA}"),
+        format!("/_matrix/federation/v1/make_leave/{room_id}/{ZARA}?ver=1"),
+    ] {
+        let (status, body) = get(&router, &path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body:?}");
+        assert_eq!(body["room_version"], ROOM_VERSION_ID, "{path}");
+        assert_eq!(body["event"]["content"]["membership"], "leave", "{path}");
+    }
 }
 
 // --- send_leave (inbound) ----------------------------------------------
