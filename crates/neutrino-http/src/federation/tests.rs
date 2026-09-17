@@ -2102,8 +2102,9 @@ async fn send_gapfill_fetch_targets_frontier_and_state_boundary() {
 async fn send_gapfills_over_multiple_rounds() {
     // The peer dribbles state ancestry one event per round: child→A→B→join(held).
     // Round 1 fetches A, round 2 fetches B; the loop must double the limit and
-    // carry the staged frontier in `latest` so it doesn't re-request A. The
-    // child's timeline parent is held, so every round is a state-DAG round.
+    // name only the frontier (A) in `latest` — not the child above it — so the
+    // peer resumes below A instead of re-sending it. The child's timeline
+    // parent is held, so every round is a state-DAG round.
     let fetcher = StubFetcher::no_progress();
     let (app, store, room_id, alice, join_id, _tempfile) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
@@ -2138,9 +2139,10 @@ async fn send_gapfills_over_multiple_rounds() {
     assert_eq!(calls.len(), 2, "two gap-fill rounds");
     assert_eq!(calls[0].limit, 10);
     assert_eq!(calls[1].limit, 20, "limit doubles each round");
-    assert!(
-        calls[1].latest.contains(&a.event_id),
-        "round 2 carries the staged frontier (A) in `latest` so the peer skips it"
+    assert_eq!(
+        calls[1].latest,
+        vec![a.event_id.clone()],
+        "round 2 names exactly the frontier (A), not the child above it"
     );
 
     // All of A, B, child committed and not rejected.

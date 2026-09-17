@@ -40,11 +40,12 @@ const INITIAL_GAPFILL_LIMIT: u32 = 10;
 /// parent ([`fill_timeline_parents`]).
 ///
 /// Each round recomputes the gap over `events ∪ staged_events`; an empty
-/// `missing` frontier means done. Otherwise we ask the peer, passing
-/// `latest = event + the staged frontier` (so the peer walks down *through*
-/// what we've cached without re-sending it) and `earliest = our state-DAG
-/// forward extremities` (the committed bottom boundary). The newly fetched
-/// events are staged, not applied — the worker's drain loop applies them.
+/// `missing` set means done. Otherwise we ask the peer, passing `latest = the
+/// frontier` (the staged events, and `event` itself, whose parents are
+/// missing) and `earliest = our state-DAG forward extremities` (the committed
+/// bottom boundary), so each round fetches only the events directly below what
+/// we hold. The newly fetched events are staged, not applied — the worker's
+/// drain loop applies them.
 ///
 /// Returns `Ok(true)` once the ancestry is fully staged *and this call staged at
 /// least one new event* — i.e. it made progress, so the worker should re-drain
@@ -104,12 +105,16 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
             return Ok(made_progress);
         }
 
-        // `latest` = the event plus the staged boundary. The peer excludes
-        // these from its result but walks *through* them, so it returns only
-        // the frontier below our cache — the "ask for 1-4, not 5-99" property.
-        let mut latest = Vec::with_capacity(gap.staged.len() + 1);
-        latest.push(event.event_id.clone());
-        latest.extend(gap.staged);
+        // `event` is not a walk head (the walk starts at its parents), so it
+        // joins the frontier itself when one of those parents is missing.
+        let mut latest = gap.frontier;
+        if event
+            .prev_state_events
+            .iter()
+            .any(|p| gap.missing.contains(p))
+        {
+            latest.push(event.event_id.clone());
+        }
 
         let fetched = match fetcher
             .fetch(MissingEventsQuery {

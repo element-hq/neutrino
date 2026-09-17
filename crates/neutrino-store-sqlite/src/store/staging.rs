@@ -130,7 +130,8 @@ impl StagingStore for SqliteStore {
             // ours). `UNION` (not `UNION ALL`) dedups, so diamonds and cycles
             // in the DAG terminate. For each reached id, classify it: staged
             // (cache hit, to promote), committed (grounded boundary, ignore),
-            // or neither (the still-missing frontier to fetch).
+            // or neither (the still-missing frontier to fetch). A staged row
+            // with a parent in neither table is on the frontier.
             let mut stmt = conn.prepare(
                 "WITH RECURSIVE walk(event_id) AS ( \
                      SELECT je.value FROM json_each(?1) AS je \
@@ -146,7 +147,14 @@ impl StagingStore for SqliteStore {
                      EXISTS(SELECT 1 FROM staged_events s2 \
                             WHERE s2.event_id = w.event_id AND s2.room_id = ?2), \
                      EXISTS(SELECT 1 FROM events e \
-                            WHERE e.event_id = w.event_id AND e.room_id = ?2) \
+                            WHERE e.event_id = w.event_id AND e.room_id = ?2), \
+                     EXISTS(SELECT 1 FROM staged_events s3 \
+                            JOIN json_each(s3.json, '$.prev_state_events') AS p \
+                            WHERE s3.event_id = w.event_id AND s3.room_id = ?2 \
+                              AND NOT EXISTS(SELECT 1 FROM staged_events sp \
+                                             WHERE sp.event_id = p.value AND sp.room_id = ?2) \
+                              AND NOT EXISTS(SELECT 1 FROM events ep \
+                                             WHERE ep.event_id = p.value AND ep.room_id = ?2)) \
                  FROM walk w",
             )?;
             let rows = stmt.query_map(params![heads_json, room_id], |row| {
@@ -154,15 +162,19 @@ impl StagingStore for SqliteStore {
                     row.get::<_, String>(0)?,
                     row.get::<_, bool>(1)?,
                     row.get::<_, bool>(2)?,
+                    row.get::<_, bool>(3)?,
                 ))
             })?;
 
             let mut gap = AncestryGap::default();
             for r in rows {
-                let (id, is_staged, is_committed) = r?;
+                let (id, is_staged, is_committed, parent_missing) = r?;
                 let id = OwnedEventId::try_from(id)
                     .map_err(|e| Error::Internal(format!("malformed staged event_id: {e}")))?;
                 if is_staged {
+                    if parent_missing {
+                        gap.frontier.push(id.clone());
+                    }
                     gap.staged.push(id);
                 } else if !is_committed {
                     gap.missing.push(id);
@@ -262,6 +274,11 @@ mod tests {
             .unwrap();
         assert_eq!(gap.missing, vec![b.event_id.clone()]);
         assert_eq!(gap.staged, vec![c.event_id.clone()]);
+        assert_eq!(
+            gap.frontier,
+            vec![c.event_id.clone()],
+            "C's parent is missing"
+        );
 
         // Stage B too. Now the frontier recedes to A (B's parent).
         s.stage_pdu(origin(), *ALICE_ROOM_ID, &b.event_id, &b.raw)
@@ -277,6 +294,11 @@ mod tests {
         let mut want = vec![b.event_id.clone(), c.event_id.clone()];
         want.sort();
         assert_eq!(staged, want);
+        assert_eq!(
+            gap.frontier,
+            vec![b.event_id.clone()],
+            "only B has a missing parent; C's parent B is staged"
+        );
 
         // Commit A. Its parent is create (committed) ⇒ nothing missing; the
         // staged subgraph {B, C} is now fully grounded and promotable.
@@ -287,6 +309,10 @@ mod tests {
             .unwrap();
         assert!(gap.missing.is_empty(), "grounded once A is committed");
         assert_eq!(gap.staged.len(), 2);
+        assert!(
+            gap.frontier.is_empty(),
+            "no staged event has a missing parent"
+        );
     }
 
     #[tokio::test]

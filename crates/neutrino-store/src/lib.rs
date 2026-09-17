@@ -408,9 +408,13 @@ pub struct AncestryGap {
     pub missing: Vec<OwnedEventId>,
     /// Staged event ids reachable from the query heads via `prev_state_events`
     /// (a staged head counts itself) — the cached ancestry the worker drains
-    /// once `missing` is empty, and the boundary to exclude from the next peer
-    /// fetch so we re-request only the frontier. Unordered.
+    /// once `missing` is empty. Unordered.
     pub staged: Vec<OwnedEventId>,
+    /// The subset of `staged` with at least one `prev_state_events` entry in
+    /// `missing` — the backward extremities of the staged subgraph, i.e. the
+    /// `latest_events` a peer fetch walks back from. Empty iff `missing` is
+    /// empty or every missing id is a query head. Unordered.
+    pub frontier: Vec<OwnedEventId>,
 }
 
 /// One staged PDU as returned by [`StagingStore::staged_for_room`]: the raw
@@ -472,8 +476,9 @@ pub trait StagingStore: Send + Sync {
     /// Post: walks `prev_state_events` back from `heads` through staged events
     ///       (a committed `events` row is a grounded boundary and is not
     ///       expanded), returning an [`AncestryGap`]: `missing` = reachable ids
-    ///       in neither table, `staged` = reachable ids currently staged. The
-    ///       walk is scoped to `room_id`.
+    ///       in neither table, `staged` = reachable ids currently staged,
+    ///       `frontier` = staged ids with a parent in `missing`. The walk is
+    ///       scoped to `room_id`.
     async fn ancestry_gap(
         &self,
         room_id: &RoomId,
