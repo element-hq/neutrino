@@ -27,7 +27,7 @@ use neutrino_event::{Event, EventPolicy};
 use neutrino_store::StorageBackend;
 use ruma::{EventId, OwnedEventId, RoomId, ServerName};
 
-use crate::ports::{MissingEventsFetcher, MissingEventsQuery};
+use crate::ports::{MissingEventsFetcher, MissingEventsQuery, TransportError};
 use crate::util::room_version;
 
 /// Initial `limit` for the first gap-fill request; doubled each round (MSC4242
@@ -80,10 +80,10 @@ const INITIAL_GAPFILL_LIMIT: u32 = 10;
 #[derive(Debug)]
 pub(crate) enum GapFillError {
     /// The peer answered, but cannot supply a path from the PDU's
-    /// `prev_state_events` to `m.room.create`. The PDU can never be authorised
-    /// from this peer; MSC4242 says to reject it.
+    /// `prev_state_events` to `m.room.create` — nothing new, or a 4xx refusal.
+    /// The PDU can never be authorised from this peer; MSC4242 says to reject it.
     Unfillable(String),
-    /// Reaching the peer failed (transport / non-2xx), or our own storage
+    /// Reaching the peer failed (transport / 5xx), or our own storage
     /// faulted. Says nothing about the DAG; retry later.
     Transient(String),
 }
@@ -167,6 +167,11 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
                 ));
             }
             Ok(fetched) => fetched,
+            // A 4xx is the peer's final word for this request (no such room,
+            // endpoint unsupported): nothing a retry can change.
+            Err(e @ TransportError::Status(400..=499)) => {
+                return Err(GapFillError::Unfillable(format!("peer refused: {e}")));
+            }
             Err(e) => return Err(GapFillError::Transient(format!("peer fetch failed: {e}"))),
         };
 

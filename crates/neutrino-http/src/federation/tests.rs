@@ -4533,14 +4533,16 @@ fn parse_server_names_lowercase_colon_and_drops_garbage() {
 /// send_join returns `send_join_body`, get_missing_events returns no events.
 /// Lets a test drive the outbound ingest path against deliberately broken state.
 fn stub_resident(make_join_body: Value, send_join_body: Value) -> axum::Router {
-    stub_resident_counting(make_join_body, send_join_body).0
+    stub_resident_counting(make_join_body, send_join_body, std::time::Duration::ZERO).0
 }
 
 /// As [`stub_resident`], also returning a counter of make_join hits so a test
-/// can assert how many join handshakes actually ran.
+/// can assert how many join handshakes actually ran, and holding the send_join
+/// response for `send_join_delay` (a slow link) before answering.
 fn stub_resident_counting(
     make_join_body: Value,
     send_join_body: Value,
+    send_join_delay: std::time::Duration,
 ) -> (axum::Router, Arc<std::sync::atomic::AtomicUsize>) {
     use axum::routing::{get as rget, post as rpost, put as rput};
     let mj = Arc::new(make_join_body);
@@ -4563,7 +4565,10 @@ fn stub_resident_counting(
             "/_matrix/federation/v2/send_join/{room}/{event}",
             rput(move || {
                 let sj = sj.clone();
-                async move { axum::Json((*sj).clone()) }
+                async move {
+                    tokio::time::sleep(send_join_delay).await;
+                    axum::Json((*sj).clone())
+                }
             }),
         )
         .route(
@@ -4574,11 +4579,12 @@ fn stub_resident_counting(
 }
 
 #[tokio::test]
-async fn federated_join_times_out_when_state_never_grounds() {
-    // The resident hands back a join whose prev_state references a "ghost" event
-    // nobody has (and get_missing_events returns nothing), so the worker can
-    // never ground it → the CSAPI join times out with 504, but the room shell
-    // is registered and our membership never appears.
+async fn federated_join_dangling_state_dag_reference_fails_without_registering() {
+    // SJ02A/B: the resident hands back a join whose prev_state references a
+    // "ghost" event that is neither in the response nor held by us. MSC4242
+    // makes the send_join response the *entire* state DAG, so this is a
+    // malformed response: 502 at ingest, nothing staged, room not registered —
+    // not a 20 s wait on gap-fills the resident cannot serve.
     let alice = alice();
     let create = EventBuilder::new(
         alice.clone(),
@@ -4631,9 +4637,90 @@ async fn federated_join_times_out_when_state_never_grounds() {
         std::time::Duration::from_millis(800),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
-    // Room shell registered (create grounded), but the join never landed.
-    assert!(a_store.room_exists(&room_id).await.unwrap());
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        !a_store.room_exists(&room_id).await.unwrap(),
+        "a non-closed state DAG must not register the room"
+    );
+    assert!(
+        a_store.staged_for_room(&room_id).await.unwrap().is_empty(),
+        "nothing is staged from a malformed response"
+    );
+}
+
+#[tokio::test]
+async fn federated_join_rejected_by_cascade_fails_fast_with_502() {
+    // SJ02C..H: the response's state DAG is closed but our join stands on an
+    // event the worker rejects (here: a *message* named in prev_state_events,
+    // a reference rejection), so the join is persisted rejected by cascade.
+    // The dance must surface that as 502 as soon as the worker persists it,
+    // not sit out the 20 s timeout waiting for a join that will never land.
+    let alice = alice();
+    let create = EventBuilder::new(
+        alice.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .unwrap();
+    let room_id = create.room_id.clone();
+    let msg = EventBuilder::new(
+        alice,
+        "m.room.message".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .content(json!({ "body": "not a state event" }))
+    .prev_events(vec![create.event_id.clone()])
+    .prev_state_events(vec![create.event_id.clone()])
+    .build()
+    .unwrap();
+    let zara: OwnedUserId = ZARA.parse().unwrap();
+    let template = EventBuilder::new(
+        zara.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(zara.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![msg.event_id.clone()])
+    .prev_state_events(vec![msg.event_id.clone()])
+    .build()
+    .unwrap();
+    let mj = json!({ "event": raw_to_value(&template), "room_version": ROOM_VERSION_ID });
+    let sj = json!({
+        "state_dag": [raw_to_value(&create), raw_to_value(&msg), raw_to_value(&template)],
+        "timeline": [],
+        "event": raw_to_value(&template),
+    });
+    let b = crate::federation::test_support::spawn_stub(stub_resident(mj, sj)).await;
+
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_state = crate::AppState::from_store(config_for("a.example", "bob"), a_store.clone());
+    let started = std::time::Instant::now();
+    let resp = crate::federation::join::federated_join_with(
+        &a_state,
+        zara.clone(),
+        &room_id,
+        &[b],
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "a rejected join must fail fast, not wait for the timeout"
+    );
+    let join = a_store
+        .get_events(&[template.event_id.as_ref()])
+        .await
+        .unwrap()
+        .pop()
+        .expect("our join was persisted");
+    assert!(join.rejected, "persisted rejected by cascade");
     assert!(
         a_store
             .current_state_event(&room_id, "m.room.member", zara.as_str())
@@ -4703,10 +4790,10 @@ async fn federated_join_retry_reattaches_to_inflight_dance() {
     // an aborted waiter and its retry; only a /join arriving after the dance
     // resolves starts a fresh one.
     //
-    // The ghost-referencing template (as in
-    // `federated_join_times_out_when_state_never_grounds`) keeps the dance in
-    // flight for its full ingest wait, so the retry deterministically lands
-    // while it is still running.
+    // A slow send_join (the resident holds the response for 1.5 s) keeps the
+    // dance in flight, so the retry deterministically lands while it is still
+    // running. The response is the ghost-referencing DAG, so once it arrives
+    // the dance resolves to 502 at ingest.
     let alice = alice();
     let create = EventBuilder::new(
         alice.clone(),
@@ -4747,7 +4834,8 @@ async fn federated_join_retry_reattaches_to_inflight_dance() {
         "timeline": [],
         "event": raw_to_value(&template),
     });
-    let (router, make_joins) = stub_resident_counting(mj, sj);
+    let (router, make_joins) =
+        stub_resident_counting(mj, sj, std::time::Duration::from_millis(1500));
     let b = crate::federation::test_support::spawn_stub(router).await;
 
     let (a_store, _a_temp) = fresh_store().await;
@@ -4781,8 +4869,8 @@ async fn federated_join_retry_reattaches_to_inflight_dance() {
     // The client gives up (reqwest timeout drops the request future).
     waiter.abort();
 
-    // The retry re-attaches: it inherits the running dance's outcome (a 504
-    // after ITS 1500ms ingest wait — the retry's own 1ms timeout is unused)
+    // The retry re-attaches: it inherits the running dance's outcome (the 502
+    // once the slow send_join lands — the retry's own 1ms timeout is unused)
     // and the resident sees no second handshake.
     let resp = crate::federation::join::federated_join_with(
         &a_state,
@@ -4792,7 +4880,7 @@ async fn federated_join_retry_reattaches_to_inflight_dance() {
         std::time::Duration::from_millis(1),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         make_joins.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -4808,7 +4896,7 @@ async fn federated_join_retry_reattaches_to_inflight_dance() {
         std::time::Duration::from_millis(1),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         make_joins.load(std::sync::atomic::Ordering::SeqCst),
         2,
