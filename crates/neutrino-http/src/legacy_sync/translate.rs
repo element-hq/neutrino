@@ -4,7 +4,7 @@
 //!
 //! - [`parse_legacy_query`]: v3 query string → [`LegacyQuery`].
 //! - [`synthesize_v5_request`]: [`LegacyQuery`] → [`v5::Request`].
-//! - [`translate_response`]: [`v5::Response`] + membership map → v3 JSON.
+//! - [`translate_response`]: [`SyncResponse`] → v3 JSON.
 //!
 //! The handler that ties them together lives in
 //! `legacy_sync` proper; these helpers have no I/O, no awaits, and
@@ -13,9 +13,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
+use crate::sliding_sync::SyncResponse;
 use neutrino_event::event_view;
 use neutrino_store::Membership;
-use ruma::OwnedRoomId;
 use ruma::api::client::sync::sync_events::v5;
 use ruma::events::{AnyStrippedStateEvent, StateEventType};
 use ruma::serde::Raw;
@@ -172,17 +172,18 @@ const LEGACY_TIMELINE_LIMIT: u32 = 50;
 /// is `false`. `state` and `org.matrix.msc4222.state_after` are dual-emitted
 /// with identical contents — see `docs/legacy-sync-stub.md` §"Join/leave
 /// room shape" for why.
-pub fn translate_response(
-    resp: v5::Response,
-    memberships: &BTreeMap<OwnedRoomId, Membership>,
-) -> Value {
+pub fn translate_response(resp: SyncResponse) -> Value {
     let mut join = serde_json::Map::new();
     let mut invite = serde_json::Map::new();
     let mut leave = serde_json::Map::new();
     let mut knock = serde_json::Map::new();
 
-    for (room_id, room) in resp.rooms {
-        let bucket = match memberships.get(&room_id) {
+    // Each room is filed under the membership the sliding-sync builder read
+    // when it built that room, so bucket and contents come from one read. A
+    // room with no membership there (a direct subscription to a room the user
+    // is not in) is shaped by probing what the builder emitted.
+    for (room_id, room) in resp.response.rooms {
+        let bucket = match resp.memberships.get(&room_id) {
             Some(Membership::Invite) => Bucket::Invite,
             Some(Membership::Join) => Bucket::Join,
             Some(Membership::Knock) => Bucket::Knock,
@@ -218,7 +219,7 @@ pub fn translate_response(
     }
 
     json!({
-        "next_batch": resp.pos,
+        "next_batch": resp.response.pos,
         "rooms": {
             "join": Value::Object(join),
             "invite": Value::Object(invite),
@@ -491,6 +492,17 @@ mod tests {
         resp
     }
 
+    /// Pair a v5 response with the memberships the builder would have read.
+    fn with_memberships(
+        response: v5::Response,
+        memberships: BTreeMap<OwnedRoomId, Membership>,
+    ) -> SyncResponse {
+        SyncResponse {
+            response,
+            memberships,
+        }
+    }
+
     /// Build a minimal `v5::response::Room` carrying one timeline event
     /// (`type = "m.room.message"`) and one required_state event
     /// (`m.room.name`). Returns the room plus the JSON snippets so tests
@@ -537,7 +549,7 @@ mod tests {
     #[test]
     fn translate_empty_response_has_only_stubs() {
         let resp = make_response("pos1", vec![]);
-        let v = translate_response(resp, &BTreeMap::new());
+        let v = translate_response(with_memberships(resp, BTreeMap::new()));
 
         assert_eq!(v["next_batch"], "pos1");
         assert_eq!(v["rooms"]["join"], json!({}));
@@ -554,7 +566,7 @@ mod tests {
     #[test]
     fn translate_next_batch_equals_pos() {
         let resp = make_response("opaque-cursor-xyz", vec![]);
-        let v = translate_response(resp, &BTreeMap::new());
+        let v = translate_response(with_memberships(resp, BTreeMap::new()));
         assert_eq!(v["next_batch"], "opaque-cursor-xyz");
     }
 
@@ -565,7 +577,7 @@ mod tests {
         let mut memberships = BTreeMap::new();
         memberships.insert(r.clone(), Membership::Join);
 
-        let v = translate_response(resp, &memberships);
+        let v = translate_response(with_memberships(resp, memberships));
         let join = &v["rooms"]["join"];
         let room_v = &join[r.as_str()];
         assert!(!room_v.is_null(), "room landed in rooms.join");
@@ -623,7 +635,7 @@ mod tests {
         let mut memberships = BTreeMap::new();
         memberships.insert(r.clone(), Membership::Knock);
 
-        let v = translate_response(resp, &memberships);
+        let v = translate_response(with_memberships(resp, memberships));
         let room_v = &v["rooms"]["knock"][r.as_str()];
         assert!(!room_v.is_null(), "knock room landed in rooms.knock");
         assert!(
@@ -692,7 +704,7 @@ mod tests {
                 (r_invite.clone(), invite_room()),
             ],
         );
-        let v = translate_response(resp, &BTreeMap::new());
+        let v = translate_response(with_memberships(resp, BTreeMap::new()));
 
         // Knock bucket stays empty.
         assert_eq!(
@@ -715,7 +727,7 @@ mod tests {
         let mut memberships = BTreeMap::new();
         memberships.insert(r.clone(), Membership::Invite);
 
-        let v = translate_response(resp, &memberships);
+        let v = translate_response(with_memberships(resp, memberships));
         let room_v = &v["rooms"]["invite"][r.as_str()];
         assert!(!room_v.is_null(), "room landed in rooms.invite");
         assert!(v["rooms"]["join"][r.as_str()].is_null());
@@ -736,7 +748,7 @@ mod tests {
         let mut memberships = BTreeMap::new();
         memberships.insert(r.clone(), Membership::Leave);
 
-        let v = translate_response(resp, &memberships);
+        let v = translate_response(with_memberships(resp, memberships));
         assert!(!v["rooms"]["leave"][r.as_str()].is_null());
         assert!(v["rooms"]["join"][r.as_str()].is_null());
         assert!(v["rooms"]["invite"][r.as_str()].is_null());
@@ -749,7 +761,7 @@ mod tests {
         let mut memberships = BTreeMap::new();
         memberships.insert(r.clone(), Membership::Ban);
 
-        let v = translate_response(resp, &memberships);
+        let v = translate_response(with_memberships(resp, memberships));
         assert!(!v["rooms"]["leave"][r.as_str()].is_null());
     }
 
@@ -771,7 +783,7 @@ mod tests {
         memberships.insert(r_invite.clone(), Membership::Invite);
         memberships.insert(r_leave.clone(), Membership::Leave);
 
-        let v = translate_response(resp, &memberships);
+        let v = translate_response(with_memberships(resp, memberships));
         assert!(!v["rooms"]["join"][r_join.as_str()].is_null());
         assert!(!v["rooms"]["invite"][r_invite.as_str()].is_null());
         assert!(!v["rooms"]["leave"][r_leave.as_str()].is_null());
@@ -787,7 +799,7 @@ mod tests {
         // join) rather than drop the room or panic.
         let r = room_id!("!stray:example.org").to_owned();
         let resp = make_response("p", vec![(r.clone(), joined_room())]);
-        let v = translate_response(resp, &BTreeMap::new());
+        let v = translate_response(with_memberships(resp, BTreeMap::new()));
         assert!(
             !v["rooms"]["join"][r.as_str()].is_null(),
             "missing-from-memberships room falls into join bucket",
@@ -804,7 +816,7 @@ mod tests {
         let r = room_id!("!race-invite:example.org").to_owned();
         let resp = make_response("p", vec![(r.clone(), invite_room())]);
         // Note: empty memberships map — room is missing.
-        let v = translate_response(resp, &BTreeMap::new());
+        let v = translate_response(with_memberships(resp, BTreeMap::new()));
 
         let room_v = &v["rooms"]["invite"][r.as_str()];
         assert!(
@@ -826,7 +838,7 @@ mod tests {
     fn translate_stubs_always_present_and_well_shaped() {
         // Verified against the exact shape the design doc pins down.
         let resp = make_response("p", vec![]);
-        let v = translate_response(resp, &BTreeMap::new());
+        let v = translate_response(with_memberships(resp, BTreeMap::new()));
         assert_eq!(v["presence"]["events"], json!([]));
         assert_eq!(v["account_data"]["events"], json!([]));
         assert_eq!(v["to_device"]["events"], json!([]));

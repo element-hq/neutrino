@@ -14,6 +14,7 @@
 // lands.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::sync::Arc;
@@ -21,8 +22,9 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use neutrino_event::event_view::StateEventConversionError;
-use neutrino_store::{StorageBackend, StorageError};
+use neutrino_store::{Membership, StorageBackend, StorageError};
 use ruma::OneTimeKeyAlgorithm;
+use ruma::OwnedRoomId;
 use ruma::UInt;
 use ruma::UserId;
 use ruma::api::client::sync::sync_events::v5;
@@ -124,6 +126,18 @@ impl<S> SyncState<S> {
     }
 }
 
+/// One sliding-sync response plus the membership under which each emitted
+/// room was built — read in the same pass as the room's contents, so a
+/// consumer that files rooms by membership (the legacy `/sync` translation)
+/// never disagrees with what the room carries. Rooms absent from
+/// `memberships` were emitted via a direct subscription without a known
+/// membership.
+#[derive(Debug, Clone)]
+pub struct SyncResponse {
+    pub response: v5::Response,
+    pub memberships: BTreeMap<OwnedRoomId, Membership>,
+}
+
 /// Entry point used by the axum handler and by tests.
 ///
 /// Orchestrates the boundary concerns that don't belong in
@@ -147,7 +161,7 @@ pub async fn handle<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
     req: v5::Request,
-) -> Result<v5::Response, SyncError> {
+) -> Result<SyncResponse, SyncError> {
     validate_request(&req)?;
 
     let key = ConnKey {
@@ -261,7 +275,7 @@ pub async fn handle<S: StorageBackend>(
 
     let mut final_resp = loop {
         let resp = build::build_response(state, user_id, &req, &mut conn_guard).await?;
-        if !wait_for_data || has_data(&resp) {
+        if !wait_for_data || has_data(&resp.response) {
             break resp;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -305,7 +319,7 @@ pub async fn handle<S: StorageBackend>(
         }
     };
 
-    populate_extension_stubs(&extensions_req, &mut final_resp);
+    populate_extension_stubs(&extensions_req, &mut final_resp.response);
 
     // `build_response` chose `conn.pos + 1` as the response's pos_token but
     // didn't mutate `conn.pos` — commit the advance here, once per request,

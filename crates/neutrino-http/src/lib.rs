@@ -1037,7 +1037,7 @@ async fn sync(
 
     match handled {
         Ok(Ok(resp)) => {
-            let wire = SyncResponseWire::from(resp);
+            let wire = SyncResponseWire::from(resp.response);
             info!(
                 %user_id,
                 body = %serde_json::to_string(&wire).unwrap_or_default(),

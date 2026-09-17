@@ -8,7 +8,7 @@
 //! `sliding_sync::handle`, maps errors and shapes the response.
 //! See `docs/legacy-sync-stub.md` for the design.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use axum::{
     Json,
@@ -16,13 +16,11 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use neutrino_store::{Membership, StorageBackend};
-use ruma::{OwnedRoomId, OwnedUserId};
 
 use crate::{AppState, error_response, lock_app};
 use crate::{
     legacy_sync::translate::{parse_legacy_query, synthesize_v5_request, translate_response},
-    sliding_sync::{self, SyncError, SyncState},
+    sliding_sync::{self, SyncError},
 };
 
 pub mod translate;
@@ -44,20 +42,6 @@ pub(crate) async fn handle(
     let legacy_query = parse_legacy_query(&query.0);
     let req = synthesize_v5_request(&legacy_query);
 
-    // Snapshot the user's room memberships **before** invoking sliding_sync
-    // so the bucketing reflects the same point-in-time the v5 call observes.
-    // See `docs/legacy-sync-stub.md` §"Per-room bucketing".
-    let memberships = match fetch_memberships(&sync_state, &user_id).await {
-        Ok(m) => m,
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "M_UNKNOWN",
-                &e.to_string(),
-            );
-        }
-    };
-
     // Legacy `since` tokens are durable: a client may sync from any past token
     // forever. Sliding-sync's `pos`, which we map `since` onto, is the opposite
     // — a single-cursor per-connection value that rejects anything but the
@@ -76,7 +60,7 @@ pub(crate) async fn handle(
 
     match resp {
         Ok(v5_resp) => {
-            let body = translate_response(v5_resp, &memberships);
+            let body = translate_response(v5_resp);
             (StatusCode::OK, Json(body)).into_response()
         }
         Err(SyncError::UnknownPos) => {
@@ -100,40 +84,6 @@ pub(crate) async fn handle(
     }
 }
 
-/// Query the store for the user's current memberships across every
-/// `Membership` variant and collect into a `BTreeMap` for O(log n)
-/// lookup by `translate_response`'s bucketing loop.
-///
-/// Out-of-band memberships (invites, and the leaves/bans that ended them, for
-/// rooms this server is not in — stored outside `current_state`) are unioned
-/// in with their own membership so `translate_response` buckets those rooms
-/// explicitly rather than via its missing-from-map `invite_state` fallback
-/// (which warns). In-room membership wins on overlap (`or_insert` keeps the
-/// `rooms_with_membership` value).
-async fn fetch_memberships<S: StorageBackend>(
-    sync_state: &SyncState<S>,
-    user_id: &OwnedUserId,
-) -> Result<BTreeMap<OwnedRoomId, Membership>, neutrino_store::StorageError> {
-    let all: BTreeSet<Membership> = [
-        Membership::Join,
-        Membership::Invite,
-        Membership::Knock,
-        Membership::Leave,
-        Membership::Ban,
-    ]
-    .into_iter()
-    .collect();
-    let rows = sync_state
-        .store
-        .rooms_with_membership(user_id, &all)
-        .await?;
-    let mut map: BTreeMap<OwnedRoomId, Membership> = rows.into_iter().collect();
-    for (room_id, membership) in sync_state.store.oob_memberships(user_id).await? {
-        map.entry(room_id).or_insert(membership);
-    }
-    Ok(map)
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -147,7 +97,6 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
-    use super::fetch_memberships;
     use crate::legacy_sync::translate::{
         parse_legacy_query, synthesize_v5_request, translate_response,
     };
@@ -231,16 +180,16 @@ mod tests {
         let sync_state = SyncState::new(store, no_shutdown());
         let owned_user = user.to_owned();
 
-        let memberships = fetch_memberships(&sync_state, &owned_user).await.unwrap();
+        let req = synthesize_v5_request(&parse_legacy_query(&HashMap::new()));
+        let v5 = sliding_sync::handle(&sync_state, &owned_user, req)
+            .await
+            .unwrap();
         assert_eq!(
-            memberships.get(room),
+            v5.memberships.get(room),
             Some(&Membership::Invite),
             "OOB invite classified as Invite for bucketing"
         );
-
-        let req = synthesize_v5_request(&parse_legacy_query(&HashMap::new()));
-        let v5 = sliding_sync::handle(&sync_state, user, req).await.unwrap();
-        let body = translate_response(v5, &memberships);
+        let body = translate_response(v5);
 
         let invite = body
             .pointer("/rooms/invite")
