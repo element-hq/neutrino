@@ -1354,12 +1354,13 @@ fn build_join(room: &RoomId, create_id: &OwnedEventId, ts: u64) -> Event {
 }
 
 /// The verdict `apply_pdu` reaches on an event, in build order. Drives the
-/// generalised `expected_heads` oracle: only an `Accepted` event becomes a
-/// forward extremity or drops its parents from the head-sets. A `Rejected`
-/// event mutates no head-set (apply_pdu returns before any advance); a
-/// `SoftFailed` (non-state) event is persisted but never becomes a timeline
-/// head and never drops its `prev_events` parents (synapse#5269). State events
-/// never soft-fail, so `SoftFailed` only ever tags a non-state event.
+/// generalised `expected_heads` oracle. A `Rejected` event mutates no head-set
+/// (apply_pdu returns before any advance). A `SoftFailed` event is persisted
+/// but never becomes a timeline head and never drops its `prev_events` parents
+/// (synapse#5269); a soft-failed *state* event still advances the *state*
+/// heads exactly like an accepted one (MSC4242: every non-rejected state event
+/// is a state-DAG head peers must be able to fetch). Only an `Accepted` event
+/// advances the timeline heads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
     Accepted,
@@ -1441,23 +1442,27 @@ fn random_topo_order(dag: &Dag, entropy: &[usize]) -> Vec<usize> {
 ///
 /// Verdict-aware (mirrors `apply_pdu`'s head bookkeeping exactly): a `Rejected`
 /// event mutates no head-set, so it is neither a head nor does it drop its
-/// parents; a `SoftFailed` event (non-state only) is likewise neither a timeline
-/// head nor drops its `prev_events` parents (synapse#5269 — the parents stay
-/// extremities until a *non*-soft-failed successor references them). Only an
-/// `Accepted` event is head-eligible and removes the parents it names.
+/// parents. A `SoftFailed` event is neither a timeline head nor drops its
+/// `prev_events` parents (synapse#5269 — the parents stay extremities until a
+/// *non*-soft-failed successor references them), but a soft-failed *state*
+/// event still advances the state side like an accepted one (MSC4242: soft-fail
+/// withholds it from clients and the timeline heads only — see
+/// `room_core.rs`'s module docs). So the timeline side is driven by `Accepted`
+/// alone, the state side by every non-`Rejected` state event.
 fn expected_heads(dag: &Dag) -> (BTreeSet<OwnedEventId>, BTreeSet<OwnedEventId>) {
+    let advances_timeline = |e: &Event| classify(e) == Verdict::Accepted;
+    let advances_state = |e: &Event| e.state_key.is_some() && classify(e) != Verdict::Rejected;
+
     let mut referenced_timeline: HashSet<&str> = HashSet::new();
     let mut referenced_state: HashSet<&str> = HashSet::new();
     for e in &dag.events {
-        // Only an accepted event advances the head-sets, and only an advancing
-        // event drops the parents it references.
-        if classify(e) != Verdict::Accepted {
-            continue;
+        // Only an advancing event drops the parents it references.
+        if advances_timeline(e) {
+            for p in &e.prev_events {
+                referenced_timeline.insert(p.as_str());
+            }
         }
-        for p in &e.prev_events {
-            referenced_timeline.insert(p.as_str());
-        }
-        if e.state_key.is_some() {
+        if advances_state(e) {
             for p in &e.prev_state_events {
                 referenced_state.insert(p.as_str());
             }
@@ -1466,13 +1471,10 @@ fn expected_heads(dag: &Dag) -> (BTreeSet<OwnedEventId>, BTreeSet<OwnedEventId>)
     let mut timeline_fes = BTreeSet::new();
     let mut state_fes = BTreeSet::new();
     for e in &dag.events {
-        if classify(e) != Verdict::Accepted {
-            continue;
-        }
-        if !referenced_timeline.contains(e.event_id.as_str()) {
+        if advances_timeline(e) && !referenced_timeline.contains(e.event_id.as_str()) {
             timeline_fes.insert(e.event_id.clone());
         }
-        if e.state_key.is_some() && !referenced_state.contains(e.event_id.as_str()) {
+        if advances_state(e) && !referenced_state.contains(e.event_id.as_str()) {
             state_fes.insert(e.event_id.clone());
         }
     }
@@ -2294,9 +2296,14 @@ proptest! {
         // Message-event isolation. A non-state event never touches the state
         // DAG or current_state: it appears in neither current_state nor the state
         // forward extremities. Equivalently, every timeline FE that is not also a
-        // state FE is a message (a state head a later message referenced in
-        // `prev_events` drops out of the timeline heads but stays a state head —
-        // the reverse direction, which is not a message).
+        // state FE is a message — with one carve-out: a state head superseded on
+        // the *state* side only, by a soft-failed state event (which advances the
+        // state heads but not the timeline heads). The generator gives a state
+        // event identical `prev_events` / `prev_state_events`, so an *accepted*
+        // successor drops its parent from both head-sets at once; only a
+        // soft-failed one can strand it. (A state head a later message
+        // referenced in `prev_events` drops out of the timeline heads but stays
+        // a state head — the reverse direction, which is not a message.)
         let message_ids: HashSet<&str> = dag
             .events
             .iter()
@@ -2315,10 +2322,18 @@ proptest! {
                 "message event {id} leaked into the state forward extremities"
             );
         }
+        let stranded_by_soft_fail = |id: &OwnedEventId| {
+            dag.events.iter().any(|e| {
+                e.state_key.is_some()
+                    && classify(e) == Verdict::SoftFailed
+                    && e.prev_state_events.contains(id)
+            })
+        };
         for id in replay.timeline_fes.difference(&replay.state_fes) {
             prop_assert!(
-                message_ids.contains(id.as_str()),
-                "timeline FE {id} diverges from the state FEs but is not a message"
+                message_ids.contains(id.as_str()) || stranded_by_soft_fail(id),
+                "timeline FE {id} diverges from the state FEs but is neither a message \
+                 nor a state head superseded only by a soft-failed state event"
             );
         }
         // (Rejection isolation — a rejected event never reaching current_state —
@@ -2390,8 +2405,9 @@ fn adv_generator_coverage_corpus() {
                 .iter()
                 .any(|p| rejected_ids.contains(p.as_str()))
         });
-        // Require the soft-failed event to be a message (non-state) — production
-        // only soft-fails non-state events, so this also documents the bucket.
+        // Count only soft-failed *messages* here: state events can soft-fail
+        // too (a stale-state member event after a ban), but the corpus floor
+        // pins the scripted message bucket specifically.
         let saw_soft_fail = dag
             .events
             .iter()
@@ -2442,9 +2458,9 @@ proptest! {
     /// Order-independence of the order-invariant quantities, plus
     /// rejection determinism. `current_state`, the state forward extremities,
     /// and each event's *reject-or-not* verdict are pure functions of the DAG:
-    /// state events never soft-fail, and a reject depends only on
-    /// `prev_state_events` ancestry — so all three must be identical across
-    /// every topological application order. Applied in build order (baseline)
+    /// a state event advances the state heads whether or not it soft-fails,
+    /// and a reject depends only on `prev_state_events` ancestry — so all three
+    /// must be identical across every topological application order. Applied in build order (baseline)
     /// plus 2–4 random topo orders.
     ///
     /// The timeline forward extremities and the `SoftFailed`-vs-`Accepted`
