@@ -228,7 +228,7 @@ async fn setup_room(store: &SqliteStore, room_id: &RoomId, creator: &UserId) {
 
 /// Open `room_id` and immediately add a `member=join` event for `user` —
 /// what most tests want: a room the test user is joined to.
-async fn setup_joined_room(store: &SqliteStore, room_id: &RoomId, user: &UserId) {
+pub(super) async fn setup_joined_room(store: &SqliteStore, room_id: &RoomId, user: &UserId) {
     let create = create_event_for(room_id, user);
     let join = make_event(
         room_id,
@@ -1275,6 +1275,83 @@ async fn oob_leave_surfaces_once_after_the_invite() {
 /// `candidate_rooms` skips an OOB room already in `rooms_with_membership`, and
 /// `member_event` consults `current_state` before `get_oob_membership`. Without that
 /// precedence the joined room would be mis-rendered as an invite.
+#[tokio::test]
+async fn re_invite_after_rejection_is_emitted_on_the_same_connection() {
+    // invite → reject → invite again, all on one connection. The second invite
+    // is a new member event and must reach the client; an emission rule of
+    // "only if the room was never emitted on this connection" would drop it.
+    let (store, _tmp) = fresh_store().await;
+    let user = user_id!("@alice:example.org");
+    let inviter = user_id!("@bob:other.example.org");
+    let room = room_id!("!remote:other.example.org");
+    let put = |ev: Event| {
+        let store = store.clone();
+        async move {
+            store
+                .put_oob_membership(room, user, &ev, neutrino_event::ROOM_VERSION_ID)
+                .await
+                .unwrap();
+        }
+    };
+    put(oob_invite_event(room, user, inviter, "Remote Room", 80)).await;
+
+    let state = SyncState::new(store.clone(), no_shutdown());
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let sync = |pos: Option<String>| {
+        let lists = lists.clone();
+        let state = &state;
+        async move {
+            let mut req = Request::new();
+            req.pos = pos;
+            req.lists = lists;
+            handle(state, user, req).await.unwrap().response
+        }
+    };
+
+    let resp1 = sync(None).await;
+    assert!(resp1.rooms[room].invite_state.is_some(), "first invite");
+
+    // Same invite, next sync: not re-sent.
+    let resp2 = sync(Some(resp1.pos.clone())).await;
+    assert!(
+        !resp2.rooms.contains_key(room),
+        "an unchanged invite is not retransmitted"
+    );
+
+    // Rejected: the leave replaces the stub and is emitted once.
+    put(make_event_from_json(
+        room,
+        "m.room.member",
+        Some(user.as_str()),
+        user,
+        90,
+        serde_json::json!({
+            "room_id": room.as_str(),
+            "type": "m.room.member",
+            "state_key": user.as_str(),
+            "sender": user.as_str(),
+            "origin_server_ts": 90,
+            "content": {"membership": "leave"},
+            "hashes": {"sha256": "abcDEF0123456789"},
+            "prev_events": [],
+            "prev_state_events": [],
+        }),
+    ))
+    .await;
+    let resp3 = sync(Some(resp2.pos.clone())).await;
+    assert!(resp3.rooms[room].invite_state.is_none(), "the leave");
+
+    // Re-invited: a new invite event, emitted as an invite again.
+    put(oob_invite_event(room, user, inviter, "Remote Room", 100)).await;
+    let resp4 = sync(Some(resp3.pos.clone())).await;
+    let again = resp4
+        .rooms
+        .get(room)
+        .expect("the re-invite is emitted on the same connection");
+    assert!(again.invite_state.is_some(), "as an invite");
+}
+
 #[tokio::test]
 async fn in_room_membership_wins_over_oob_invite_stub() {
     let (store, _tmp) = fresh_store().await;
