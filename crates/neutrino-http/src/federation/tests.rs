@@ -5945,6 +5945,65 @@ async fn send_leave_for_oob_invited_user_replaces_the_stub() {
 }
 
 #[tokio::test]
+async fn send_leave_for_oob_invited_user_not_naming_the_invite_is_ignored() {
+    // INV02-Inbound: a rescission whose `prev_state_events` do not name the
+    // invite it supersedes is dropped — the stub stays an invite, nothing is
+    // staged. The reference is the only tie to the stub (no auth events can be
+    // computed out of band); without the check a stale rescission could be
+    // replayed against a newer invite.
+    let (store, _tempfile) = fresh_store().await;
+    let app = router_with_store(config(), store.clone());
+    let bob = inviter();
+    let alice = alice();
+    let throwaway = EventBuilder::new(
+        bob.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build throwaway create");
+    let room_id = throwaway.room_id.clone();
+    let invite = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&throwaway.event_id),
+    );
+    store
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID)
+        .await
+        .unwrap();
+    // Names some other state event (here the create), not the invite.
+    let stale_kick = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "leave",
+        std::slice::from_ref(&throwaway.event_id),
+    );
+
+    let (status, body) = put_json(&app, &send_path("rescind-stale"), &txn(&[&stale_kick])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(body["pdus"][stale_kick.event_id.as_str()], json!({}));
+
+    let stub = store
+        .get_oob_membership(&room_id, &alice)
+        .await
+        .unwrap()
+        .expect("the stub survives");
+    assert_eq!(stub.membership, Membership::Invite);
+    assert_eq!(stub.event.event_id, invite.event_id);
+    assert!(
+        store.staged_for_room(&room_id).await.unwrap().is_empty(),
+        "an ignored rescission is consumed, not staged"
+    );
+    assert!(!store.room_exists(&room_id).await.unwrap());
+}
+
+#[tokio::test]
 async fn outbound_reject_invite_unreachable_server_still_removes_stub() {
     // The inviting server is dead; local rejection must proceed regardless.
     let dead = crate::federation::test_support::dead_peer().await;

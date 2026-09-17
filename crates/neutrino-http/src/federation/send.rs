@@ -114,7 +114,7 @@ pub(crate) struct ResponseBody {
 /// the stub for sync to surface. `Ok(None)` = not such a PDU (no stub for the
 /// target, another type/membership, or a sender the origin does not own) —
 /// stage it like any other. `Ok(Some(id))` = consumed, whether stored or
-/// dropped as malformed.
+/// dropped (malformed, or not naming the stub it supersedes).
 async fn apply_oob_membership(
     store: &impl OobMembershipStore,
     policy: &EventPolicy,
@@ -168,6 +168,15 @@ async fn apply_oob_membership(
     // only anchor: the rescinding server must be the one delivering it.
     if event.sender.server_name() != origin || event.room_id != room_id {
         return Ok(None);
+    }
+    // MSC4242 out-of-band events: the update MUST name the membership it
+    // supersedes in `prev_state_events` — the only tie between this event and
+    // the stub, since we cannot compute its auth events. Without it a stale
+    // rescission could be replayed to cancel a newer invite. Consumed, not
+    // staged: it is addressed to a stub, so there is nothing else to do with it.
+    if !event.prev_state_events.contains(&stub.event.event_id) {
+        warn!(event_id = %event.event_id, stub = %stub.event.event_id, "/send: dropping out-of-band membership that does not name the membership it supersedes");
+        return Ok(Some(event.event_id));
     }
     store
         .put_oob_membership(room_id, &user, &event, &stub.room_version)
