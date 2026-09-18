@@ -84,6 +84,7 @@ fn body_reason(body: Option<&Value>) -> Option<String> {
 
 /// The current `content.membership` of `target` in `room`, or `None` when the
 /// user has no member event. Maps a storage failure to a ready 500 response.
+#[allow(clippy::result_large_err)] // see `parse_room`
 pub(crate) async fn current_membership(
     state: &AppState,
     room: &RoomId,
@@ -130,6 +131,7 @@ async fn require_room(state: &AppState, room: &RoomId) -> Result<(), axum::respo
 /// state_key (the user whose membership changes); `membership` is the
 /// resulting membership string; `reason`, when present, is copied into
 /// content. Returns `Ok(())` on accept, or the actor's standard error response.
+#[allow(clippy::result_large_err)] // see `parse_room`
 async fn change_membership(
     state: &AppState,
     sender: OwnedUserId,
