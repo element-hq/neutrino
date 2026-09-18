@@ -22,8 +22,10 @@
 //! for the link — so the join would never converge.
 //!
 //! The dance blocks (watching current state for our `join`) until the worker
-//! grounds the DAG, or times out — on timeout the client errors but the drain
-//! keeps running, so a later sync still shows the join.
+//! grounds the DAG, fails fast if the worker persists our join *rejected* (the
+//! resident handed us a DAG our join cannot stand on — a gateway failure), or
+//! times out — on timeout the client errors but the drain keeps running, so a
+//! later sync still shows the join.
 
 use std::time::Duration;
 
@@ -33,8 +35,12 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use neutrino_event::EventPolicy;
-use neutrino_store::{InviteStore, RoomStore, StagingStore, StateStore, StreamPos};
-use ruma::{OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId};
+use neutrino_store::{
+    EventStore, Membership, OobMembershipStore, RoomStore, StagingStore, StateStore, StreamPos,
+};
+use ruma::{
+    EventId, OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId,
+};
 use serde_json::json;
 use tokio::sync::{mpsc, watch};
 use tracing::warn;
@@ -148,7 +154,8 @@ async fn run_join_dance(
             app.config.federation_proxy.clone(),
         )
     };
-    let client = FederationClient::new(own_server, federation_proxy.as_deref());
+    let client = FederationClient::new(own_server, federation_proxy.as_deref())
+        .with_signer(policy.signer().cloned());
     let display_name = crate::local_display_name(&store).await;
 
     // Subscribe to the persist watch *before* staging anything (subscribe-
@@ -170,9 +177,10 @@ async fn run_join_dance(
         )
         .await
         {
-            Ok(()) => {
-                // Staged + worker poked; block until our join lands (or time out).
-                wait_for_join(&*store, &mut persists, room_id, &user, timeout).await?;
+            Ok(join_id) => {
+                // Staged + worker poked; block until our join lands, is
+                // rejected, or times out.
+                wait_for_join(&*store, &mut persists, room_id, &user, &join_id, timeout).await?;
                 // The join is grounded — drop any out-of-band invite stub
                 // that sourced this join. A lingering stub would make a
                 // later `/leave` route through the OOB-invite *decline*
@@ -182,7 +190,7 @@ async fn run_join_dance(
                 // peers see `leave`. Best-effort: a stale stub is otherwise
                 // superseded by the joined state in sync, so a removal
                 // fault must not fail an already-successful join.
-                if let Err(e) = store.remove_invite(room_id, &user).await {
+                if let Err(e) = store.remove_oob_membership(room_id, &user).await {
                     warn!(%room_id, %user, error = %e, "failed to clear invite stub after federated join");
                 }
                 return Ok(());
@@ -282,14 +290,14 @@ pub(crate) async fn federated_join_if_remote(
     // A pending OOB invite supplies the inviter's server as a fallback candidate
     // (the client cannot supply a `via` for a v12 room id). A storage fault is a
     // 500, not silently mistaken for "no invite" — which would 404 a joinable room.
-    match store.get_invite(room_id, user).await {
-        Ok(Some(invite)) => {
-            let inviter = invite.sender.server_name().to_owned();
+    match store.get_oob_membership(room_id, user).await {
+        Ok(Some(oob)) if oob.membership == Membership::Invite => {
+            let inviter = oob.event.sender.server_name().to_owned();
             if !candidates.contains(&inviter) {
                 candidates.push(inviter);
             }
         }
-        Ok(None) => {}
+        Ok(Some(_)) | Ok(None) => {}
         Err(e) => {
             return Some(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -354,14 +362,14 @@ fn from_client_err(e: FederationClientError, reason: &'static str) -> JoinFailur
 #[allow(clippy::too_many_arguments)]
 async fn try_join_via(
     client: &FederationClient,
-    store: &(impl RoomStore + StagingStore),
+    store: &(impl RoomStore + StagingStore + EventStore),
     worker_poke: &mpsc::Sender<OwnedRoomId>,
     policy: &EventPolicy,
     dest: &ServerName,
     room_id: &RoomId,
     user: &UserId,
     display_name: &str,
-) -> Result<(), JoinFailure> {
+) -> Result<OwnedEventId, JoinFailure> {
     // Offer every version we understand; the resident answers with the room's.
     let offered: Vec<&str> = policy.versions.ids().collect();
     let template = client
@@ -394,24 +402,29 @@ async fn try_join_via(
         .await
         .map_err(|e| from_client_err(e, "send_join request failed"))?;
 
+    // The join to wait on is the one the resident handed back and we staged
+    // (`resp.event`) — the same event as ours modulo signatures, hence the same
+    // id, when the resident behaves; watching what was actually staged keeps
+    // the rejected-join check honest if it did not.
     ingest_state_dag(store, worker_poke, policy, &version, dest, room_id, resp)
         .await
         .map_err(gateway)
 }
 
-/// Ingest a `send_join` response: register the room from its create event (if
-/// new), then stage every returned event for the worker to apply. The create
-/// is staged too — it re-applies as an idempotent no-op.
+/// Ingest a `send_join` response: check the state DAG is closed, register the
+/// room from its create event (if new), then stage every returned event for the
+/// worker to apply. The create is staged too — it re-applies as an idempotent
+/// no-op. Returns the id of the join event (`resp.event`) as staged.
 #[allow(clippy::too_many_arguments)]
 async fn ingest_state_dag(
-    store: &(impl RoomStore + StagingStore),
+    store: &(impl RoomStore + StagingStore + EventStore),
     worker_poke: &mpsc::Sender<OwnedRoomId>,
     policy: &EventPolicy,
     version: &std::sync::Arc<neutrino_event::RoomVersion>,
     origin: &ServerName,
     room_id: &RoomId,
     resp: SendJoinResponse,
-) -> Result<(), &'static str> {
+) -> Result<OwnedEventId, &'static str> {
     let mut events = Vec::new();
     for raw in resp
         .state_dag
@@ -430,6 +443,23 @@ async fn ingest_state_dag(
             Err(_) => warn!(%room_id, "dropping unparseable event in send_join response"),
         }
     }
+    // `resp.event` was chained last, so it is the last admitted event unless
+    // it was unparseable — in which case there is no join to wait on.
+    let join_id = events
+        .last()
+        .filter(|e| e.event_type == "m.room.member")
+        .map(|e| e.event_id.clone())
+        .ok_or("send_join response has no usable join event")?;
+
+    // MSC4242: the response carries the *entire* state DAG, so every
+    // `prev_state_events` reference must resolve — to an event in the response
+    // or to one we already hold (a re-join of a room we left). A dangling
+    // reference is a malformed response: fail the handshake here rather than
+    // stage a DAG the worker could only try to gap-fill from a resident that
+    // just claimed to have sent everything.
+    require_closed_state_dag(store, &events)
+        .await
+        .map_err(|e| e.unwrap_or("send_join state DAG is not closed"))?;
 
     // Register the room from its create event so the actor can bootstrap (the
     // worker drops PDUs for an unknown room). The rest is staged + auth-checked.
@@ -462,20 +492,55 @@ async fn ingest_state_dag(
     // the poke is awaited so a fresh-room ingest can't be silently dropped).
     neutrino_engine::stage_and_poke(store, worker_poke, origin, room_id, &events)
         .await
-        .map_err(|_| "could not stage room state")
+        .map_err(|_| "could not stage room state")?;
+    Ok(join_id)
 }
 
-/// Block until our `join` lands in current state, or time out. Driven by the
-/// store's persist watch rather than a fixed poll: only a persist can change
-/// current_state, so we re-read state after each persist (any room) instead of
-/// spinning. current_state stays the source of truth, so this also catches a
-/// join that lands via a concurrent path. On timeout the drain keeps running
-/// off the request path, so the client error is recoverable by a later sync.
+/// Every `prev_state_events` reference across `events` must name an event in
+/// `events` or one already committed. `Err(None)` = dangling reference;
+/// `Err(Some(msg))` = storage fault.
+async fn require_closed_state_dag(
+    store: &impl EventStore,
+    events: &[neutrino_event::Event],
+) -> Result<(), Option<&'static str>> {
+    let present: std::collections::HashSet<&EventId> =
+        events.iter().map(|e| e.event_id.as_ref()).collect();
+    let mut unresolved: Vec<&EventId> = events
+        .iter()
+        .flat_map(|e| e.prev_state_events.iter().map(AsRef::as_ref))
+        .filter(|id| !present.contains(id))
+        .collect();
+    unresolved.sort_unstable();
+    unresolved.dedup();
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+    let held = store
+        .get_events(&unresolved)
+        .await
+        .map_err(|_| Some("storage error checking the state DAG"))?;
+    if held.len() == unresolved.len() {
+        Ok(())
+    } else {
+        Err(None)
+    }
+}
+
+/// Block until our `join` lands in current state, is persisted rejected, or
+/// times out. Driven by the store's persist watch rather than a fixed poll:
+/// only a persist can change either outcome, so we re-read after each persist
+/// (any room) instead of spinning. current_state stays the source of truth for
+/// success, so this also catches a join that lands via a concurrent path. A
+/// rejected join is a gateway failure: the resident accepted it in `send_join`,
+/// so a local rejection means the DAG it handed us cannot support it. On
+/// timeout the drain keeps running off the request path, so the client error
+/// is recoverable by a later sync.
 async fn wait_for_join(
-    store: &impl StateStore,
+    store: &(impl StateStore + EventStore),
     persists: &mut watch::Receiver<StreamPos>,
     room_id: &RoomId,
     user: &UserId,
+    join_id: &EventId,
     timeout: Duration,
 ) -> Result<(), JoinFailure> {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -486,6 +551,13 @@ async fn wait_for_join(
             "timed out applying room state; the join is still being processed",
         )
     };
+    let storage = |e: neutrino_store::StorageError| {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            e.to_string(),
+        )
+    };
     loop {
         match store
             .current_state_event(room_id, "m.room.member", user.as_str())
@@ -493,13 +565,16 @@ async fn wait_for_join(
         {
             Ok(Some(ev)) if membership_is_join(&ev) => return Ok(()),
             Ok(_) => {}
-            Err(e) => {
-                return Err(failure(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "M_UNKNOWN",
-                    e.to_string(),
-                ));
-            }
+            Err(e) => return Err(storage(e)),
+        }
+        if store
+            .get_events(&[join_id])
+            .await
+            .map_err(storage)?
+            .iter()
+            .any(|ev| ev.rejected)
+        {
+            return Err(gateway("the resident's state DAG rejected our join"));
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {

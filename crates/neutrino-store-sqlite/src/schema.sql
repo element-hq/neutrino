@@ -338,6 +338,18 @@ CREATE INDEX ix_deliveries_pos ON deliveries(delivery_pos);
 -- re-asks when it needs to fill a deeper gap. Per-row, not per-room, since
 -- different peers can send events into the same room.
 --
+-- `fetched_for` records *why* a row is here. NULL = the PDU arrived in its
+-- own right (`/send`, join ingest, anti-entropy) and is a gap-fill *root*: the
+-- worker applies it and, if its state ancestry is missing, walks the peer for
+-- it. Non-NULL = the row is ancestry fetched on behalf of the root PDU named
+-- here. Fetched rows are never gap-fill roots themselves — a partially
+-- fetched, ungrounded ancestry must not be promoted into independent PDUs
+-- that each re-walk the peer — and they live and die with their root: kept
+-- across a transient peer failure (so the root's retry resumes from the
+-- staged frontier instead of refetching), deleted with the root when its gap
+-- is unfillable or it is otherwise dropped. A fetched row that later arrives
+-- in its own right is promoted (`fetched_for` cleared).
+--
 -- No FK on `room_id` (a holding pen, not history — same posture as the
 -- FK-free `event_edges.parent_event_id`). No `user_version` bump: additive,
 -- no live data, no migration framework yet (same policy as the `events`
@@ -346,53 +358,50 @@ CREATE INDEX ix_deliveries_pos ON deliveries(delivery_pos);
 -- sender), so a restart re-drains everything; presence = pending, absence =
 -- processed.
 CREATE TABLE staged_events (
-    event_id  TEXT NOT NULL PRIMARY KEY,
-    room_id   TEXT NOT NULL,
-    origin    TEXT NOT NULL,
-    json      TEXT NOT NULL
+    event_id    TEXT NOT NULL PRIMARY KEY,
+    room_id     TEXT NOT NULL,
+    origin      TEXT NOT NULL,
+    json        TEXT NOT NULL,
+    fetched_for TEXT
 ) STRICT, WITHOUT ROWID;
 
 CREATE INDEX ix_staged_events_room ON staged_events(room_id);
+CREATE INDEX ix_staged_events_fetched_for ON staged_events(room_id, fetched_for);
 
 -- ----------------------------------------------------------------------------
--- oob_invites — InviteStore
--- Out-of-band membership invites: an `m.room.member` invite for a room where
--- we host the *invitee* but hold no room state (no `m.room.create`, no auth
--- chain). Such an invite arrives via `PUT /_matrix/federation/v2/invite` and
--- CANNOT go through `RoomCore::apply_pdu` — there is no state DAG to auth it
--- against — so it lives here, outside `events` / `current_state`, and is
--- invisible to every state-res / timeline read path.
+-- oob_memberships — OobMembershipStore
+-- Out-of-band memberships: the latest `m.room.member` event a peer handed us
+-- for a local user in a room this server is not in — the invite that arrived
+-- via `PUT /_matrix/federation/v2/invite`, or the leave / ban that ended it
+-- (our own rejection, or the inviter's rescission via `/send`). None of these
+-- can go through `RoomCore::apply_pdu` — there is no state DAG here to auth
+-- them against — so they live outside `events` / `current_state`, invisible
+-- to every state-res / timeline read path, and surface only via the sync
+-- out-of-band path (`oob_memberships(user)`).
 --
--- Keyed by (room_id, state_key): for an invite member event the `state_key` is
--- the invited user, so the pair is unique. `INSERT OR REPLACE` on the PK gives
--- latest-invite-wins (a peer may re-invite after a decline; the freshest
--- stripped state is the one to render). Only the canonical invite event `json`
--- is stored — every other field (event_id, type, sender, ts, content,
--- prev_events) is derivable from it, so `get_invite` rehydrates via the
--- verbatim `compute_event_id` + `parse_event` path (mirrors how
--- `staged_events` rehydrates from `json` alone — no denormalised columns to
--- drift). Crucially it does NOT redact (unlike `from_wire`), so the inviting
--- server's `unsigned.invite_room_state` (stripped state the sync builder
--- renders the room name / inviter from) survives.
+-- Keyed by (room_id, state_key): the `state_key` is the local user, so the
+-- pair is unique and `INSERT OR REPLACE` gives latest-membership-wins. Only
+-- the canonical event `json` is stored plus what cannot be derived from it
+-- without room state: `event_id` (naming needs the room version) and
+-- `room_version` itself (what a later out-of-band event for the same room is
+-- named under). `membership` is denormalised for the per-user listing.
+-- Rehydration is `parse_event` on `json` — verbatim, NOT `from_wire`, which
+-- would redact away the inviting server's `unsigned.invite_room_state`.
 --
--- No FK on `room_id` (we don't host the room — same posture as the FK-free
--- `staged_events.room_id`). No `user_version` bump (additive, no live data —
--- same policy as the staged_events / FE columns). Surfaces only via the sync
--- invite path, which unions `invited_oob_rooms(user)` into the room list.
--- `event_id` is stored, not recomputed on read: the id is known at write time,
--- and re-deriving it needs the room's version, which for an out-of-band invite
--- is a room we do not host and therefore have no `rooms` row for. Storing it
--- also saves a parse + hash per read.
-CREATE TABLE oob_invites (
-    room_id    TEXT NOT NULL,
-    state_key  TEXT NOT NULL,
-    event_id   TEXT NOT NULL,
-    json       TEXT NOT NULL,
+-- No FK on `room_id` (we do not host the room — same posture as the FK-free
+-- `staged_events.room_id`).
+CREATE TABLE oob_memberships (
+    room_id      TEXT NOT NULL,
+    state_key    TEXT NOT NULL,
+    event_id     TEXT NOT NULL,
+    membership   TEXT NOT NULL CHECK (membership IN ('invite', 'leave', 'ban')),
+    room_version TEXT NOT NULL CHECK (room_version <> ''),
+    json         TEXT NOT NULL,
     PRIMARY KEY (room_id, state_key)
 ) STRICT, WITHOUT ROWID;
 
--- invited_oob_rooms(user): direct lookup by the invited user (state_key).
-CREATE INDEX ix_oob_invites_user ON oob_invites(state_key);
+-- oob_memberships(user): direct lookup by the local user (state_key).
+CREATE INDEX ix_oob_memberships_user ON oob_memberships(state_key);
 
 -- ----------------------------------------------------------------------------
 -- pending_advertisements — FederationOutbox (anti-entropy extension)
@@ -414,7 +423,7 @@ CREATE INDEX ix_oob_invites_user ON oob_invites(state_key);
 -- IGNORE on the PK. No FK on `room_id` (the obligation outlives nothing it must
 -- reference structurally; same FK-free posture as `staged_events.room_id`). No
 -- `user_version` bump (additive, no live data, no migration framework — same
--- policy as the staged_events / oob_invites / FE columns).
+-- policy as the staged_events / oob_memberships / FE columns).
 CREATE TABLE pending_advertisements (
     destination  TEXT NOT NULL,
     room_id      TEXT NOT NULL,

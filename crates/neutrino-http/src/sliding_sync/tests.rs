@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use neutrino_event::ROOM_VERSION_ID;
 use neutrino_event::event_id::base_version_event_id;
-use neutrino_store::{Event, EventStore, InviteStore, RoomStore};
+use neutrino_store::{Event, EventStore, OobMembershipStore, RoomStore};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5::{Request, request};
 use ruma::events::StateEventType;
@@ -15,7 +15,7 @@ use super::conn::ConnKey;
 use super::{SyncError, SyncState, handle};
 
 /// A shutdown token that never fires — for tests exercising non-shutdown paths.
-fn no_shutdown() -> tokio_util::sync::CancellationToken {
+pub(super) fn no_shutdown() -> tokio_util::sync::CancellationToken {
     tokio_util::sync::CancellationToken::new()
 }
 
@@ -78,7 +78,7 @@ async fn wait_for_in_flight_cancel_sub<S>(
 
 /// Open a fresh file-backed `SqliteStore`. The returned `TempDir` must be
 /// kept alive for the test's lifetime — its `Drop` removes the underlying file.
-async fn fresh_store() -> (Arc<SqliteStore>, TempDir) {
+pub(super) async fn fresh_store() -> (Arc<SqliteStore>, TempDir) {
     let tmp = TempDir::new().expect("create tempfile");
     let store = SqliteStore::open_in_dir(tmp.path())
         .await
@@ -165,7 +165,7 @@ fn make_event(
 /// when a test needs `unsigned.invite_room_state` or other top-level keys
 /// the standard wrapper doesn't expose. The returned event's `event_id`
 /// is derived from the canonical bytes via [`base_version_event_id`].
-fn make_event_from_json(
+pub(super) fn make_event_from_json(
     room_id: &RoomId,
     event_type: &str,
     state_key: Option<&str>,
@@ -228,7 +228,7 @@ async fn setup_room(store: &SqliteStore, room_id: &RoomId, creator: &UserId) {
 
 /// Open `room_id` and immediately add a `member=join` event for `user` —
 /// what most tests want: a room the test user is joined to.
-async fn setup_joined_room(store: &SqliteStore, room_id: &RoomId, user: &UserId) {
+pub(super) async fn setup_joined_room(store: &SqliteStore, room_id: &RoomId, user: &UserId) {
     let create = create_event_for(room_id, user);
     let join = make_event(
         room_id,
@@ -304,7 +304,7 @@ async fn initial_sync_with_no_lists_returns_empty_rooms_and_fresh_pos() {
     let user = user_id!("@alice:example.org");
 
     let req = Request::new();
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     assert!(resp.rooms.is_empty(), "no rooms when no lists or subs");
     assert!(resp.lists.is_empty(), "no list results when no lists");
@@ -353,7 +353,7 @@ async fn initial_sync_with_list_returns_joined_rooms_and_calls_storage() {
     lists.insert("all".to_string(), list_with(5, vec![]));
     req.lists = lists;
 
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     assert_eq!(resp.rooms.len(), 2, "both joined rooms returned");
     assert!(resp.rooms.contains_key(room_a));
@@ -419,7 +419,7 @@ async fn required_state_filters_current_state() {
     );
     req.lists = lists;
 
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     let room_result = resp.rooms.get(room).unwrap();
     let state_types: Vec<String> = room_result
@@ -454,7 +454,7 @@ async fn second_sync_with_correct_pos_succeeds() {
     let state = SyncState::new(store, no_shutdown());
     let user = user_id!("@alice:example.org");
 
-    let resp1 = handle(&state, user, Request::new()).await.unwrap();
+    let resp1 = handle(&state, user, Request::new()).await.unwrap().response;
     let pos1 = resp1.pos.clone();
 
     let mut req2 = Request::new();
@@ -482,7 +482,7 @@ async fn invited_rooms_are_candidates() {
     lists.insert("all".to_string(), list_with(5, vec![]));
     req.lists = lists;
 
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     let owned: OwnedRoomId = invited_room.to_owned();
     assert!(
@@ -535,7 +535,7 @@ async fn rooms_sorted_by_bump_stamp_desc() {
     lists.insert("top2".to_string(), list);
     req.lists = lists;
 
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     assert_eq!(resp.rooms.len(), 2, "exactly the top 2 returned");
     assert!(
@@ -575,7 +575,7 @@ async fn range_slicing_returns_only_requested_indexes() {
     lists.insert("slice".to_string(), list);
     req.lists = lists;
 
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     assert_eq!(resp.rooms.len(), 3, "range [2,4] is inclusive on both ends");
     assert!(resp.rooms.contains_key(&ids[7]));
@@ -605,7 +605,7 @@ async fn subscription_bypasses_list_range() {
     subs.insert(ids[2].clone(), sub);
     req.room_subscriptions = subs;
 
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     assert!(
         resp.rooms.contains_key(&ids[0]),
@@ -639,7 +639,7 @@ async fn multi_range_request_only_honours_first() {
     lists.insert("multi".to_string(), list);
     req.lists = lists;
 
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
     assert_eq!(resp.rooms.len(), 1, "only the first range applied");
     assert!(resp.rooms.contains_key(&ids[4]));
 }
@@ -666,7 +666,7 @@ async fn invited_room_bump_stamp_uses_invitee_member_event() {
     lists.insert("all".to_string(), list_with(5, vec![]));
     req.lists = lists;
 
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
     let owned: OwnedRoomId = invited.to_owned();
     let room = resp.rooms.get(&owned).expect("invited room emitted");
     assert_eq!(
@@ -692,7 +692,7 @@ async fn list_count_independent_of_range_size() {
     lists.insert("one".to_string(), list);
     req.lists = lists;
 
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     assert_eq!(resp.rooms.len(), 1);
     let list_result = resp.lists.get("one").unwrap();
@@ -728,7 +728,7 @@ async fn second_sync_returns_only_new_events() {
     lists.insert("all".to_string(), list_with(10, vec![]));
     req1.lists = lists.clone();
 
-    let resp1 = handle(&state, user, req1).await.unwrap();
+    let resp1 = handle(&state, user, req1).await.unwrap().response;
     let room1 = resp1.rooms.get(room).unwrap();
     assert!(
         !room1.timeline.is_empty(),
@@ -753,7 +753,7 @@ async fn second_sync_returns_only_new_events() {
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos.clone());
     req2.lists = lists;
-    let resp2 = handle(&state, user, req2).await.unwrap();
+    let resp2 = handle(&state, user, req2).await.unwrap().response;
 
     let room2 = resp2.rooms.get(room).unwrap();
     assert_eq!(
@@ -802,13 +802,13 @@ async fn third_sync_with_no_new_events_omits_room() {
 
     let mut req = Request::new();
     req.lists = lists.clone();
-    let resp1 = handle(&state, user, req).await.unwrap();
+    let resp1 = handle(&state, user, req).await.unwrap().response;
     assert!(resp1.rooms.contains_key(room));
 
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos);
     req2.lists = lists;
-    let resp2 = handle(&state, user, req2).await.unwrap();
+    let resp2 = handle(&state, user, req2).await.unwrap().response;
     assert!(
         !resp2.rooms.contains_key(room),
         "no-update room omitted from delta"
@@ -854,7 +854,7 @@ async fn rejected_and_soft_failed_events_hidden_from_sync() {
     // invisible event appears in the timeline.
     let mut req = Request::new();
     req.lists = lists.clone();
-    let resp1 = handle(&state, user, req).await.unwrap();
+    let resp1 = handle(&state, user, req).await.unwrap().response;
     if let Some(r) = resp1.rooms.get(room) {
         for ev in &r.timeline {
             let body = ev
@@ -882,7 +882,7 @@ async fn rejected_and_soft_failed_events_hidden_from_sync() {
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos);
     req2.lists = lists.clone();
-    let resp2 = handle(&state, user, req2).await.unwrap();
+    let resp2 = handle(&state, user, req2).await.unwrap().response;
     assert!(
         !resp2.rooms.contains_key(room),
         "a delta of purely invisible events must read as no-update"
@@ -905,7 +905,7 @@ async fn rejected_and_soft_failed_events_hidden_from_sync() {
     let mut req3 = Request::new();
     req3.pos = Some(resp2.pos);
     req3.lists = lists;
-    let resp3 = handle(&state, user, req3).await.unwrap();
+    let resp3 = handle(&state, user, req3).await.unwrap().response;
     let room3 = resp3.rooms.get(room).expect("visible event emits the room");
     assert_eq!(
         room3.timeline.len(),
@@ -944,7 +944,7 @@ async fn limited_set_when_timeline_truncated() {
     lists.insert("all".to_string(), list_with(2, vec![]));
     let mut req1 = Request::new();
     req1.lists = lists.clone();
-    let resp1 = handle(&state, user, req1).await.unwrap();
+    let resp1 = handle(&state, user, req1).await.unwrap().response;
 
     for i in 0..5 {
         seed(
@@ -964,7 +964,7 @@ async fn limited_set_when_timeline_truncated() {
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos);
     req2.lists = lists;
-    let resp2 = handle(&state, user, req2).await.unwrap();
+    let resp2 = handle(&state, user, req2).await.unwrap().response;
     let room_res = resp2.rooms.get(room).unwrap();
     assert_eq!(room_res.timeline.len(), 2, "capped at timeline_limit=2");
     assert!(
@@ -1001,7 +1001,7 @@ async fn required_state_not_re_sent_when_unchanged() {
 
     let mut req1 = Request::new();
     req1.lists = lists.clone();
-    let resp1 = handle(&state, user, req1).await.unwrap();
+    let resp1 = handle(&state, user, req1).await.unwrap().response;
     let room1 = resp1.rooms.get(room).unwrap();
     assert_eq!(room1.required_state.len(), 1, "name emitted on first sync");
 
@@ -1021,7 +1021,7 @@ async fn required_state_not_re_sent_when_unchanged() {
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos);
     req2.lists = lists;
-    let resp2 = handle(&state, user, req2).await.unwrap();
+    let resp2 = handle(&state, user, req2).await.unwrap().response;
     let room2 = resp2.rooms.get(room).unwrap();
     assert!(
         room2.required_state.is_empty(),
@@ -1125,12 +1125,12 @@ fn oob_invite_event(
     )
 }
 
-/// An out-of-band federated invite (no room state — stored via `InviteStore`,
+/// An out-of-band federated invite (no room state — stored via `OobMembershipStore`,
 /// not `current_state`) must surface in sliding sync exactly like an in-room
 /// invite: the room appears, carries `invite_state` (stripped state from the
 /// invite's `unsigned.invite_room_state`), and its name lifts to the top level.
-/// This is the OOB-invite read-path: `candidate_rooms` unions `invited_oob_rooms` and
-/// `build_invite_room` sources the event from `get_invite`.
+/// This is the OOB-invite read-path: `candidate_rooms` unions `oob_memberships` and
+/// `build_invite_room` sources the event from `get_oob_membership`.
 #[tokio::test]
 async fn oob_invite_surfaces_in_sliding_sync() {
     let (store, _tmp) = fresh_store().await;
@@ -1140,14 +1140,17 @@ async fn oob_invite_surfaces_in_sliding_sync() {
     let room = room_id!("!remote:other.example.org");
 
     let invite_event = oob_invite_event(room, user, inviter, "Remote Room", 80);
-    store.put_invite(room, user, &invite_event).await.unwrap();
+    store
+        .put_oob_membership(room, user, &invite_event, neutrino_event::ROOM_VERSION_ID)
+        .await
+        .unwrap();
 
     let state = SyncState::new(store, no_shutdown());
     let mut req = Request::new();
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
     req.lists = lists;
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     let room_res = resp
         .rooms
@@ -1180,11 +1183,175 @@ async fn oob_invite_surfaces_in_sliding_sync() {
     );
 }
 
+/// Rejecting (or having rescinded) an out-of-band invite leaves the user's
+/// leave event as the room's out-of-band membership. The room then surfaces
+/// once more — the leave as its whole timeline and state, so a legacy client
+/// sees it under `rooms.leave` — and not again after that.
+#[tokio::test]
+async fn oob_leave_surfaces_once_after_the_invite() {
+    let (store, _tmp) = fresh_store().await;
+    let user = user_id!("@alice:example.org");
+    let inviter = user_id!("@bob:other.example.org");
+    let room = room_id!("!remote:other.example.org");
+    store
+        .put_oob_membership(
+            room,
+            user,
+            &oob_invite_event(room, user, inviter, "Remote Room", 80),
+            neutrino_event::ROOM_VERSION_ID,
+        )
+        .await
+        .unwrap();
+
+    let state = SyncState::new(store.clone(), no_shutdown());
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let mut req = Request::new();
+    req.lists = lists.clone();
+    let resp1 = handle(&state, user, req).await.unwrap().response;
+    assert!(
+        resp1.rooms[room].invite_state.is_some(),
+        "first emission is the invite"
+    );
+
+    // The user declines: the completed leave (a real PDU: `hashes`, DAG
+    // pointers) replaces the invite stub.
+    let leave = make_event_from_json(
+        room,
+        "m.room.member",
+        Some(user.as_str()),
+        user,
+        90,
+        serde_json::json!({
+            "room_id": room.as_str(),
+            "type": "m.room.member",
+            "state_key": user.as_str(),
+            "sender": user.as_str(),
+            "origin_server_ts": 90,
+            "content": {"membership": "leave"},
+            "hashes": {"sha256": "abcDEF0123456789"},
+            "prev_events": [],
+            "prev_state_events": [],
+        }),
+    );
+    store
+        .put_oob_membership(room, user, &leave, neutrino_event::ROOM_VERSION_ID)
+        .await
+        .unwrap();
+
+    let mut req2 = Request::new();
+    req2.pos = Some(resp1.pos.clone());
+    req2.lists = lists.clone();
+    let resp2 = handle(&state, user, req2).await.unwrap().response;
+    let left = resp2
+        .rooms
+        .get(room)
+        .expect("the left room is emitted once more");
+    assert!(left.invite_state.is_none(), "no longer an invite");
+    assert_eq!(left.timeline.len(), 1, "the leave is the whole timeline");
+    let ev = left.timeline[0]
+        .get_field::<String>("event_id")
+        .unwrap()
+        .unwrap();
+    assert_eq!(ev, leave.event_id.as_str());
+    assert_eq!(
+        left.required_state.len(),
+        1,
+        "and the whole state, for the legacy `rooms.leave.state` shape"
+    );
+
+    let mut req3 = Request::new();
+    req3.pos = Some(resp2.pos.clone());
+    req3.lists = lists;
+    let resp3 = handle(&state, user, req3).await.unwrap().response;
+    assert!(
+        !resp3.rooms.contains_key(room),
+        "an already-emitted out-of-band leave is not re-sent"
+    );
+}
+
 /// In-room membership must win over a stale out-of-band invite stub for the
 /// same `(room, user)`. This pins the precedence the dedup logic depends on:
 /// `candidate_rooms` skips an OOB room already in `rooms_with_membership`, and
-/// `member_event` consults `current_state` before `get_invite`. Without that
+/// `member_event` consults `current_state` before `get_oob_membership`. Without that
 /// precedence the joined room would be mis-rendered as an invite.
+#[tokio::test]
+async fn re_invite_after_rejection_is_emitted_on_the_same_connection() {
+    // invite → reject → invite again, all on one connection. The second invite
+    // is a new member event and must reach the client; an emission rule of
+    // "only if the room was never emitted on this connection" would drop it.
+    let (store, _tmp) = fresh_store().await;
+    let user = user_id!("@alice:example.org");
+    let inviter = user_id!("@bob:other.example.org");
+    let room = room_id!("!remote:other.example.org");
+    let put = |ev: Event| {
+        let store = store.clone();
+        async move {
+            store
+                .put_oob_membership(room, user, &ev, neutrino_event::ROOM_VERSION_ID)
+                .await
+                .unwrap();
+        }
+    };
+    put(oob_invite_event(room, user, inviter, "Remote Room", 80)).await;
+
+    let state = SyncState::new(store.clone(), no_shutdown());
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let sync = |pos: Option<String>| {
+        let lists = lists.clone();
+        let state = &state;
+        async move {
+            let mut req = Request::new();
+            req.pos = pos;
+            req.lists = lists;
+            handle(state, user, req).await.unwrap().response
+        }
+    };
+
+    let resp1 = sync(None).await;
+    assert!(resp1.rooms[room].invite_state.is_some(), "first invite");
+
+    // Same invite, next sync: not re-sent.
+    let resp2 = sync(Some(resp1.pos.clone())).await;
+    assert!(
+        !resp2.rooms.contains_key(room),
+        "an unchanged invite is not retransmitted"
+    );
+
+    // Rejected: the leave replaces the stub and is emitted once.
+    put(make_event_from_json(
+        room,
+        "m.room.member",
+        Some(user.as_str()),
+        user,
+        90,
+        serde_json::json!({
+            "room_id": room.as_str(),
+            "type": "m.room.member",
+            "state_key": user.as_str(),
+            "sender": user.as_str(),
+            "origin_server_ts": 90,
+            "content": {"membership": "leave"},
+            "hashes": {"sha256": "abcDEF0123456789"},
+            "prev_events": [],
+            "prev_state_events": [],
+        }),
+    ))
+    .await;
+    let resp3 = sync(Some(resp2.pos.clone())).await;
+    assert!(resp3.rooms[room].invite_state.is_none(), "the leave");
+
+    // Re-invited: a new invite event, emitted as an invite again.
+    put(oob_invite_event(room, user, inviter, "Remote Room", 100)).await;
+    let resp4 = sync(Some(resp3.pos.clone())).await;
+    let again = resp4
+        .rooms
+        .get(room)
+        .expect("the re-invite is emitted on the same connection");
+    assert!(again.invite_state.is_some(), "as an invite");
+}
+
 #[tokio::test]
 async fn in_room_membership_wins_over_oob_invite_stub() {
     let (store, _tmp) = fresh_store().await;
@@ -1196,14 +1363,17 @@ async fn in_room_membership_wins_over_oob_invite_stub() {
     setup_joined_room(&store, room, user).await;
     // … yet a stale OOB invite stub for the same (room, user) also exists.
     let stub = oob_invite_event(room, user, inviter, "Stale Invite", 50);
-    store.put_invite(room, user, &stub).await.unwrap();
+    store
+        .put_oob_membership(room, user, &stub, neutrino_event::ROOM_VERSION_ID)
+        .await
+        .unwrap();
 
     let state = SyncState::new(store, no_shutdown());
     let mut req = Request::new();
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
     req.lists = lists;
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     let room_res = resp.rooms.get(room).expect("the joined room is present");
     assert!(
@@ -1229,18 +1399,20 @@ async fn oob_invites_rank_by_member_event_ts() {
     let newer = room_id!("!z-newer:other.example.org");
     let older = room_id!("!a-older:other.example.org");
     store
-        .put_invite(
+        .put_oob_membership(
             newer,
             user,
             &oob_invite_event(newer, user, inviter, "Newer", 900),
+            neutrino_event::ROOM_VERSION_ID,
         )
         .await
         .unwrap();
     store
-        .put_invite(
+        .put_oob_membership(
             older,
             user,
             &oob_invite_event(older, user, inviter, "Older", 100),
+            neutrino_event::ROOM_VERSION_ID,
         )
         .await
         .unwrap();
@@ -1254,7 +1426,7 @@ async fn oob_invites_rank_by_member_event_ts() {
     lists.insert("top".to_string(), list);
     req.lists = lists;
 
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     assert_eq!(
         resp.rooms.len(),
@@ -1335,7 +1507,7 @@ async fn invited_room_emits_invite_state() {
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
     req.lists = lists;
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     let room_res = resp.rooms.get(room).unwrap();
     assert!(
@@ -1387,7 +1559,7 @@ async fn fresh_invite_emitted_while_existing_invite_pending() {
 
     let mut req1 = Request::new();
     req1.lists = lists.clone();
-    let resp1 = handle(&state, user, req1).await.unwrap();
+    let resp1 = handle(&state, user, req1).await.unwrap().response;
     let a_first = resp1
         .rooms
         .get(room_a)
@@ -1400,7 +1572,7 @@ async fn fresh_invite_emitted_while_existing_invite_pending() {
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos);
     req2.lists = lists.clone();
-    let resp2 = handle(&state, user, req2).await.unwrap();
+    let resp2 = handle(&state, user, req2).await.unwrap().response;
     assert!(
         !resp2.rooms.contains_key(room_a),
         "A no longer in response — invite_state already delivered"
@@ -1412,7 +1584,7 @@ async fn fresh_invite_emitted_while_existing_invite_pending() {
     let mut req3 = Request::new();
     req3.pos = Some(resp2.pos);
     req3.lists = lists;
-    let resp3 = handle(&state, user, req3).await.unwrap();
+    let resp3 = handle(&state, user, req3).await.unwrap().response;
 
     let b_invite_state = resp3
         .rooms
@@ -1509,7 +1681,7 @@ async fn name_avatar_and_counts_emitted() {
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
     req.lists = lists;
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     let room_res = resp.rooms.get(room).unwrap();
     assert_eq!(room_res.name.as_deref(), Some("Alice's room"));
@@ -1601,7 +1773,7 @@ async fn e2ee_extension_echoed_when_enabled() {
 
     let mut req = Request::new();
     req.extensions.e2ee.enabled = Some(true);
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     assert!(
         !resp.extensions.e2ee.device_one_time_keys_count.is_empty(),
@@ -1623,7 +1795,7 @@ async fn to_device_extension_echoed_when_enabled() {
 
     let mut req = Request::new();
     req.extensions.to_device.enabled = Some(true);
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     let to_device = resp
         .extensions
@@ -1640,7 +1812,7 @@ async fn extensions_not_echoed_when_not_requested() {
     let state = SyncState::new(store, no_shutdown());
     let user = user_id!("@alice:example.org");
 
-    let resp = handle(&state, user, Request::new()).await.unwrap();
+    let resp = handle(&state, user, Request::new()).await.unwrap().response;
     assert!(resp.extensions.e2ee.device_one_time_keys_count.is_empty());
     assert!(resp.extensions.to_device.is_none());
 }
@@ -1659,7 +1831,7 @@ async fn initial_sync_ignores_timeout() {
     req.timeout = Some(std::time::Duration::from_secs(10));
 
     let start = std::time::Instant::now();
-    let _resp = handle(&state, user, req).await.unwrap();
+    let _resp = handle(&state, user, req).await.unwrap().response;
     assert!(
         start.elapsed() < std::time::Duration::from_millis(500),
         "initial sync should return immediately"
@@ -1691,7 +1863,7 @@ async fn long_poll_returns_empty_after_timeout() {
 
     let mut req1 = Request::new();
     req1.lists = lists.clone();
-    let resp1 = handle(&state, user, req1).await.unwrap();
+    let resp1 = handle(&state, user, req1).await.unwrap().response;
 
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos);
@@ -1699,7 +1871,7 @@ async fn long_poll_returns_empty_after_timeout() {
     req2.timeout = Some(std::time::Duration::from_millis(80));
 
     let start = std::time::Instant::now();
-    let resp2 = handle(&state, user, req2).await.unwrap();
+    let resp2 = handle(&state, user, req2).await.unwrap().response;
     let elapsed = start.elapsed();
 
     assert!(
@@ -1734,7 +1906,7 @@ async fn long_poll_wakes_on_new_event() {
 
     let mut req1 = Request::new();
     req1.lists = lists.clone();
-    let resp1 = handle(&state_arc, user, req1).await.unwrap();
+    let resp1 = handle(&state_arc, user, req1).await.unwrap().response;
 
     let store_for_task = store.clone();
     let waker_user = user.to_owned();
@@ -1761,7 +1933,7 @@ async fn long_poll_wakes_on_new_event() {
     req2.timeout = Some(std::time::Duration::from_millis(2000));
 
     let start = std::time::Instant::now();
-    let resp2 = handle(&state_arc, user, req2).await.unwrap();
+    let resp2 = handle(&state_arc, user, req2).await.unwrap().response;
     let elapsed = start.elapsed();
     waker.await.unwrap();
 
@@ -1781,9 +1953,9 @@ async fn long_poll_wakes_on_new_event() {
     );
 }
 
-/// An inbound out-of-band federated invite (`InviteStore::put_invite`) must
-/// wake an in-flight long-poll, not leave it parked until timeout: `put_invite`
-/// writes the `oob_invites` table and bumps the stream-watch, so the federation
+/// An inbound out-of-band federated invite (`OobMembershipStore::put_oob_membership`) must
+/// wake an in-flight long-poll, not leave it parked until timeout: `put_oob_membership`
+/// writes the `oob_memberships` table and bumps the stream-watch, so the federation
 /// `PUT /invite` wakes the invitee's open `/sync` immediately rather than only
 /// on its next poll. Mirrors `long_poll_wakes_on_new_event`, but the wake is
 /// driven by an invite rather than a room event.
@@ -1802,7 +1974,7 @@ async fn long_poll_wakes_on_oob_invite() {
     // Initial sync: no invite yet, so no rooms.
     let mut req1 = Request::new();
     req1.lists = lists.clone();
-    let resp1 = handle(&state_arc, user, req1).await.unwrap();
+    let resp1 = handle(&state_arc, user, req1).await.unwrap().response;
     assert!(resp1.rooms.is_empty(), "no rooms before the invite arrives");
 
     // Federation delivers the invite ~50ms into the long-poll.
@@ -1814,7 +1986,12 @@ async fn long_poll_wakes_on_oob_invite() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let invite = oob_invite_event(&waker_room, &waker_user, &waker_inviter, "Remote Room", 200);
         store_for_task
-            .put_invite(&waker_room, &waker_user, &invite)
+            .put_oob_membership(
+                &waker_room,
+                &waker_user,
+                &invite,
+                neutrino_event::ROOM_VERSION_ID,
+            )
             .await
             .unwrap();
     });
@@ -1825,7 +2002,7 @@ async fn long_poll_wakes_on_oob_invite() {
     req2.timeout = Some(std::time::Duration::from_millis(2000));
 
     let start = std::time::Instant::now();
-    let resp2 = handle(&state_arc, user, req2).await.unwrap();
+    let resp2 = handle(&state_arc, user, req2).await.unwrap().response;
     let elapsed = start.elapsed();
     waker.await.unwrap();
 
@@ -1871,18 +2048,18 @@ async fn retry_with_same_pos_returns_cached_response() {
 
     let mut req1 = Request::new();
     req1.lists = lists.clone();
-    let resp1 = handle(&state, user, req1).await.unwrap();
+    let resp1 = handle(&state, user, req1).await.unwrap().response;
 
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos.clone());
     req2.lists = lists.clone();
-    let resp2 = handle(&state, user, req2).await.unwrap();
+    let resp2 = handle(&state, user, req2).await.unwrap().response;
     let pos_after_second = resp2.pos.clone();
 
     let mut retry = Request::new();
     retry.pos = Some(resp1.pos.clone());
     retry.lists = lists;
-    let retry_resp = handle(&state, user, retry).await.unwrap();
+    let retry_resp = handle(&state, user, retry).await.unwrap().response;
 
     assert_eq!(
         retry_resp.pos, pos_after_second,
@@ -1922,12 +2099,12 @@ async fn retry_at_same_pos_with_different_body_misses_cache() {
 
     let mut req1 = Request::new();
     req1.lists = lists_a.clone();
-    let resp1 = handle(&state, user, req1).await.unwrap();
+    let resp1 = handle(&state, user, req1).await.unwrap().response;
 
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos.clone());
     req2.lists = lists_a.clone();
-    let resp2 = handle(&state, user, req2).await.unwrap();
+    let resp2 = handle(&state, user, req2).await.unwrap().response;
 
     // Retry at the *same pos as req2* but with a body-different request
     // (timeline_limit 50 vs 5). Same pos, different hash → cache misses.
@@ -1958,15 +2135,15 @@ async fn stale_pos_returns_unknown_pos_after_advancing() {
     let user = user_id!("@alice:example.org");
     let state = SyncState::new(store, no_shutdown());
 
-    let resp1 = handle(&state, user, Request::new()).await.unwrap();
+    let resp1 = handle(&state, user, Request::new()).await.unwrap().response;
 
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos.clone());
-    let resp2 = handle(&state, user, req2).await.unwrap();
+    let resp2 = handle(&state, user, req2).await.unwrap().response;
 
     let mut req3 = Request::new();
     req3.pos = Some(resp2.pos.clone());
-    let _resp3 = handle(&state, user, req3).await.unwrap();
+    let _resp3 = handle(&state, user, req3).await.unwrap().response;
 
     let mut stale = Request::new();
     stale.pos = Some(resp1.pos);
@@ -2001,12 +2178,12 @@ async fn retry_does_not_consume_pending_events() {
     lists.insert("all".to_string(), list_with(5, vec![]));
     let mut req1 = Request::new();
     req1.lists = lists.clone();
-    let resp1 = handle(&state, user, req1).await.unwrap();
+    let resp1 = handle(&state, user, req1).await.unwrap().response;
 
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos.clone());
     req2.lists = lists.clone();
-    let resp2 = handle(&state, user, req2).await.unwrap();
+    let resp2 = handle(&state, user, req2).await.unwrap().response;
 
     seed(
         &store,
@@ -2024,7 +2201,7 @@ async fn retry_does_not_consume_pending_events() {
     let mut retry = Request::new();
     retry.pos = Some(resp1.pos.clone());
     retry.lists = lists.clone();
-    let retry_resp = handle(&state, user, retry).await.unwrap();
+    let retry_resp = handle(&state, user, retry).await.unwrap().response;
     assert_eq!(
         retry_resp.rooms.get(room).map(|r| r.timeline.len()),
         resp2.rooms.get(room).map(|r| r.timeline.len()),
@@ -2034,7 +2211,7 @@ async fn retry_does_not_consume_pending_events() {
     let mut req3 = Request::new();
     req3.pos = Some(resp2.pos.clone());
     req3.lists = lists;
-    let resp3 = handle(&state, user, req3).await.unwrap();
+    let resp3 = handle(&state, user, req3).await.unwrap().response;
     assert_eq!(
         resp3.rooms.get(room).unwrap().timeline.len(),
         1,
@@ -2075,7 +2252,7 @@ async fn required_state_wildcard_matches_everything() {
     let mut req = Request::new();
     req.lists = lists;
 
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
     let types: Vec<String> = resp
         .rooms
         .get(room)
@@ -2122,7 +2299,7 @@ async fn required_state_wildcard_state_key_returns_all_keys_of_type() {
     let mut req = Request::new();
     req.lists = lists;
 
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
     let raws = &resp.rooms.get(room).unwrap().required_state;
     assert_eq!(raws.len(), 2, "both members emitted, name skipped");
     for raw in raws {
@@ -2162,7 +2339,7 @@ async fn required_state_wildcard_event_type_matches_specific_state_key() {
     let mut req = Request::new();
     req.lists = lists;
 
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
     let raws = &resp.rooms.get(room).unwrap().required_state;
     assert_eq!(raws.len(), 2, "create + name (both state_key=\"\")");
     let types: Vec<String> = raws
@@ -2203,7 +2380,7 @@ async fn initial_sync_sets_limited_true_when_room_has_more_events_than_limit() {
     lists.insert("all".to_string(), list_with(2, vec![]));
     let mut req = Request::new();
     req.lists = lists;
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     let room_res = resp.rooms.get(room).unwrap();
     assert_eq!(room_res.timeline.len(), 2);
@@ -2241,7 +2418,7 @@ async fn initial_sync_sets_limited_false_when_all_events_fit() {
     lists.insert("all".to_string(), list_with(10, vec![]));
     let mut req = Request::new();
     req.lists = lists;
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     let room_res = resp.rooms.get(room).unwrap();
     // create + join + only = 3 events. timeline_limit=10 so they all fit.
@@ -2276,7 +2453,7 @@ async fn newly_joined_room_emits_initial_snapshot_on_incremental_sync() {
     lists.insert("all".to_string(), list_with(5, vec![]));
     let mut req1 = Request::new();
     req1.lists = lists.clone();
-    let resp1 = handle(&state, user, req1).await.unwrap();
+    let resp1 = handle(&state, user, req1).await.unwrap().response;
     assert!(resp1.rooms.contains_key(existing));
     assert!(!resp1.rooms.contains_key(fresh));
 
@@ -2309,7 +2486,7 @@ async fn newly_joined_room_emits_initial_snapshot_on_incremental_sync() {
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos);
     req2.lists = lists;
-    let resp2 = handle(&state, user, req2).await.unwrap();
+    let resp2 = handle(&state, user, req2).await.unwrap().response;
 
     let fresh_room = resp2
         .rooms
@@ -2367,7 +2544,7 @@ async fn invite_then_join_re_emits_initial_snapshot_with_prev_batch() {
     lists.insert("all".to_string(), list_with(2, vec![]));
     let mut req1 = Request::new();
     req1.lists = lists.clone();
-    let resp1 = handle(&state, user, req1).await.unwrap();
+    let resp1 = handle(&state, user, req1).await.unwrap().response;
     assert!(
         resp1
             .rooms
@@ -2384,7 +2561,7 @@ async fn invite_then_join_re_emits_initial_snapshot_with_prev_batch() {
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos);
     req2.lists = lists;
-    let resp2 = handle(&state, user, req2).await.unwrap();
+    let resp2 = handle(&state, user, req2).await.unwrap().response;
 
     let room_res = resp2
         .rooms
@@ -2416,7 +2593,7 @@ async fn empty_room_still_emitted_on_initial_sync() {
     lists.insert("all".to_string(), list_with(5, vec![]));
     let mut req = Request::new();
     req.lists = lists;
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     let room_res = resp
         .rooms
@@ -2452,7 +2629,7 @@ async fn name_change_propagates_on_incremental_sync() {
     );
     let mut req1 = Request::new();
     req1.lists = lists.clone();
-    let resp1 = handle(&state, user, req1).await.unwrap();
+    let resp1 = handle(&state, user, req1).await.unwrap().response;
     assert_eq!(
         resp1.rooms.get(room).unwrap().name.as_deref(),
         Some("Old Name")
@@ -2474,7 +2651,7 @@ async fn name_change_propagates_on_incremental_sync() {
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos);
     req2.lists = lists;
-    let resp2 = handle(&state, user, req2).await.unwrap();
+    let resp2 = handle(&state, user, req2).await.unwrap().response;
     let room_res = resp2
         .rooms
         .get(room)
@@ -2535,7 +2712,7 @@ async fn invited_room_emits_name_and_avatar_from_stripped_state() {
     lists.insert("all".to_string(), list_with(5, vec![]));
     let mut req = Request::new();
     req.lists = lists;
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     let room_res = resp.rooms.get(room).unwrap();
     assert_eq!(room_res.name.as_deref(), Some("Bob's Place"));
@@ -2568,7 +2745,7 @@ async fn knocked_room_appears_in_candidates() {
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
     req.lists = lists;
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     assert!(
         resp.rooms.contains_key(room),
@@ -2594,7 +2771,7 @@ async fn kicked_room_appears_in_candidates_even_on_fresh_connection() {
     let mut lists = BTreeMap::new();
     lists.insert("all".to_string(), list_with(5, vec![]));
     req.lists = lists;
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req).await.unwrap().response;
 
     assert!(
         resp.rooms.contains_key(room),
@@ -2615,7 +2792,7 @@ async fn self_left_room_only_appears_if_previously_emitted() {
     lists.insert("all".to_string(), list_with(5, vec![]));
     let mut req1 = Request::new();
     req1.lists = lists.clone();
-    let resp1 = handle(&state, user, req1).await.unwrap();
+    let resp1 = handle(&state, user, req1).await.unwrap().response;
     assert!(resp1.rooms.contains_key(room), "join is included initially");
 
     // Step 2: user self-leaves. They should still see the room because the
@@ -2624,7 +2801,7 @@ async fn self_left_room_only_appears_if_previously_emitted() {
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos);
     req2.lists = lists;
-    let resp2 = handle(&state, user, req2).await.unwrap();
+    let resp2 = handle(&state, user, req2).await.unwrap().response;
     assert!(
         resp2.rooms.contains_key(room),
         "self-leave keeps the room visible because it was previously emitted"
@@ -2637,7 +2814,7 @@ async fn self_left_room_only_appears_if_previously_emitted() {
     let mut lists2 = BTreeMap::new();
     lists2.insert("all".to_string(), list_with(5, vec![]));
     req3.lists = lists2;
-    let resp3 = handle(&new_state, user, req3).await.unwrap();
+    let resp3 = handle(&new_state, user, req3).await.unwrap().response;
     assert!(
         !resp3.rooms.contains_key(room),
         "fresh connection skips self-left rooms with no prior emission"
@@ -2658,7 +2835,7 @@ async fn banned_room_only_appears_if_previously_emitted() {
     lists.insert("all".to_string(), list_with(5, vec![]));
     let mut req1 = Request::new();
     req1.lists = lists.clone();
-    let resp1 = handle(&state, user, req1).await.unwrap();
+    let resp1 = handle(&state, user, req1).await.unwrap().response;
     assert!(
         !resp1.rooms.contains_key(room),
         "ban with no prior emission is not included (we can't prove previous-join)"
@@ -2680,14 +2857,14 @@ async fn banned_room_remains_visible_after_being_emitted_while_joined() {
     lists.insert("all".to_string(), list_with(5, vec![]));
     let mut req1 = Request::new();
     req1.lists = lists.clone();
-    let resp1 = handle(&state, user, req1).await.unwrap();
+    let resp1 = handle(&state, user, req1).await.unwrap().response;
     assert!(resp1.rooms.contains_key(room));
 
     seed_member(&store, room, user, banner, "ban", 200).await;
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos);
     req2.lists = lists;
-    let resp2 = handle(&state, user, req2).await.unwrap();
+    let resp2 = handle(&state, user, req2).await.unwrap().response;
     assert!(
         resp2.rooms.contains_key(room),
         "ban after a prior emission stays visible (approximates MSC4186's 'previously joined')"
@@ -2730,7 +2907,7 @@ async fn concurrent_long_poll_is_cancelled_by_newer_request() {
     let mut req1 = Request::new();
     req1.conn_id = conn_id.clone();
     req1.lists = lists.clone();
-    let resp1 = handle(&state, user, req1).await.unwrap();
+    let resp1 = handle(&state, user, req1).await.unwrap().response;
 
     // Spawn the long-poll. 10 s timeout is well past the test's deadline so
     // a "without cancellation" regression would hang the test out instead of
@@ -2759,9 +2936,9 @@ async fn concurrent_long_poll_is_cancelled_by_newer_request() {
     req_b.conn_id = conn_id.clone();
     req_b.pos = Some(resp1.pos.clone());
     req_b.lists = lists.clone();
-    let resp_b = handle(&state, user, req_b).await.unwrap();
+    let resp_b = handle(&state, user, req_b).await.unwrap().response;
 
-    let resp_a = a.await.unwrap().unwrap();
+    let resp_a = a.await.unwrap().unwrap().response;
     let elapsed = a_started.elapsed();
 
     assert!(
@@ -2805,7 +2982,7 @@ async fn initial_sync_cancels_prior_entrys_long_poll() {
     let mut req1 = Request::new();
     req1.conn_id = conn_id.clone();
     req1.lists = lists.clone();
-    let resp1 = handle(&state, user, req1).await.unwrap();
+    let resp1 = handle(&state, user, req1).await.unwrap().response;
 
     let state_a = state.clone();
     let lists_a = lists.clone();
@@ -2830,13 +3007,13 @@ async fn initial_sync_cancels_prior_entrys_long_poll() {
     let mut req_b = Request::new();
     req_b.conn_id = conn_id.clone();
     req_b.lists = lists.clone();
-    let resp_b = handle(&state, user, req_b).await.unwrap();
+    let resp_b = handle(&state, user, req_b).await.unwrap().response;
     assert!(
         resp_b.rooms.contains_key(room),
         "initial sync re-emits the joined room"
     );
 
-    let resp_a = a.await.unwrap().unwrap();
+    let resp_a = a.await.unwrap().unwrap().response;
     let elapsed = a_started.elapsed();
 
     assert!(
@@ -2876,7 +3053,7 @@ async fn concurrent_body_differing_request_gets_unknown_pos_after_cancellation()
     let mut req1 = Request::new();
     req1.conn_id = conn_id.clone();
     req1.lists = lists.clone();
-    let resp1 = handle(&state, user, req1).await.unwrap();
+    let resp1 = handle(&state, user, req1).await.unwrap().response;
 
     // A: long-poll in flight on the post-init pos.
     let state_a = state.clone();
@@ -2921,7 +3098,7 @@ async fn concurrent_body_differing_request_gets_unknown_pos_after_cancellation()
     });
 
     let result_b = b.await.unwrap();
-    let resp_a = a.await.unwrap().unwrap();
+    let resp_a = a.await.unwrap().unwrap().response;
 
     assert!(
         resp_a.rooms.is_empty(),
@@ -2962,7 +3139,7 @@ async fn initial_sync_anchors_high_water_at_store_head() {
 
     let mut req1 = Request::new();
     req1.lists = lists.clone();
-    let resp1 = handle(&state, user, req1).await.unwrap();
+    let resp1 = handle(&state, user, req1).await.unwrap().response;
     assert!(
         resp1.rooms.contains_key(room),
         "initial sync emits the room"
@@ -2971,7 +3148,7 @@ async fn initial_sync_anchors_high_water_at_store_head() {
     let mut req2 = Request::new();
     req2.pos = Some(resp1.pos);
     req2.lists = lists;
-    let resp2 = handle(&state, user, req2).await.unwrap();
+    let resp2 = handle(&state, user, req2).await.unwrap().response;
     assert!(
         !resp2.rooms.contains_key(room),
         "second sync with no new events omits room — high-water is at store head"
@@ -3068,7 +3245,8 @@ async fn delivery_mark_surfaces_as_a_receipt_for_that_servers_users() {
     lists.insert("all".to_string(), list_with(5, vec![]));
     let resp = handle(&state, alice, req_with_receipts(lists))
         .await
-        .unwrap();
+        .unwrap()
+        .response;
 
     let users = read_receipt_users(&resp, room, &event_id).expect("room has a receipt");
     assert_eq!(
@@ -3100,7 +3278,8 @@ async fn no_receipts_when_the_server_knob_is_off() {
     lists.insert("all".to_string(), list_with(5, vec![]));
     let resp = handle(&state, alice, req_with_receipts(lists))
         .await
-        .unwrap();
+        .unwrap()
+        .response;
 
     assert!(
         resp.extensions.receipts.rooms.is_empty(),
@@ -3130,7 +3309,7 @@ async fn no_receipts_when_the_client_did_not_opt_in() {
     lists.insert("all".to_string(), list_with(5, vec![]));
     let mut req = Request::new();
     req.lists = lists;
-    let resp = handle(&state, alice, req).await.unwrap();
+    let resp = handle(&state, alice, req).await.unwrap().response;
 
     assert!(
         resp.extensions.receipts.rooms.is_empty(),
@@ -3159,7 +3338,8 @@ async fn receipts_are_not_repeated_across_syncs() {
 
     let resp1 = handle(&state, alice, req_with_receipts(lists.clone()))
         .await
-        .unwrap();
+        .unwrap()
+        .response;
     assert!(
         read_receipt_users(&resp1, room, &first).is_some(),
         "initial sync carries the current marks"
@@ -3167,7 +3347,7 @@ async fn receipts_are_not_repeated_across_syncs() {
 
     let mut req2 = req_with_receipts(lists.clone());
     req2.pos = Some(resp1.pos);
-    let resp2 = handle(&state, alice, req2).await.unwrap();
+    let resp2 = handle(&state, alice, req2).await.unwrap().response;
     assert!(
         resp2.extensions.receipts.rooms.is_empty(),
         "an unchanged mark is not re-sent"
@@ -3191,7 +3371,7 @@ async fn receipts_are_not_repeated_across_syncs() {
 
     let mut req3 = req_with_receipts(lists);
     req3.pos = Some(resp2.pos);
-    let resp3 = handle(&state, alice, req3).await.unwrap();
+    let resp3 = handle(&state, alice, req3).await.unwrap().response;
     assert!(
         read_receipt_users(&resp3, room, &second.event_id).is_some(),
         "a mark that moved is sent again at its new event"
@@ -3221,7 +3401,8 @@ async fn long_poll_wakes_on_a_delivery_mark() {
     lists.insert("all".to_string(), list_with(5, vec![]));
     let resp1 = handle(&state, alice, req_with_receipts(lists.clone()))
         .await
-        .unwrap();
+        .unwrap()
+        .response;
 
     let store_for_task = store.clone();
     let mark_event = event_id.clone();
@@ -3244,7 +3425,7 @@ async fn long_poll_wakes_on_a_delivery_mark() {
     req2.timeout = Some(std::time::Duration::from_millis(2000));
 
     let start = std::time::Instant::now();
-    let resp2 = handle(&state, alice, req2).await.unwrap();
+    let resp2 = handle(&state, alice, req2).await.unwrap().response;
     let elapsed = start.elapsed();
     waker.await.unwrap();
 
@@ -3287,7 +3468,8 @@ async fn receipt_covers_every_user_of_the_acking_server_only() {
     lists.insert("all".to_string(), list_with(5, vec![]));
     let resp = handle(&state, alice, req_with_receipts(lists))
         .await
-        .unwrap();
+        .unwrap()
+        .response;
 
     let users = read_receipt_users(&resp, room, &event_id).expect("room has a receipt");
     assert_eq!(

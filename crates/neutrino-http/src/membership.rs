@@ -11,7 +11,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use neutrino_store::{InviteStore, RoomStore, StateStore};
+use neutrino_store::{Membership, OobMembershipStore, RoomStore, StateStore};
 use ruma::{OwnedUserId, RoomAliasId, RoomId, UserId};
 use serde_json::{Value, json};
 
@@ -84,6 +84,7 @@ fn body_reason(body: Option<&Value>) -> Option<String> {
 
 /// The current `content.membership` of `target` in `room`, or `None` when the
 /// user has no member event. Maps a storage failure to a ready 500 response.
+#[allow(clippy::result_large_err)] // see `parse_room`
 pub(crate) async fn current_membership(
     state: &AppState,
     room: &RoomId,
@@ -130,6 +131,7 @@ async fn require_room(state: &AppState, room: &RoomId) -> Result<(), axum::respo
 /// state_key (the user whose membership changes); `membership` is the
 /// resulting membership string; `reason`, when present, is copied into
 /// content. Returns `Ok(())` on accept, or the actor's standard error response.
+#[allow(clippy::result_large_err)] // see `parse_room`
 async fn change_membership(
     state: &AppState,
     sender: OwnedUserId,
@@ -237,18 +239,20 @@ pub(crate) async fn leave(
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    // An out-of-band invite (a room we don't host, held only as an `InviteStore`
-    // stub) is declined via the federated leave handshake + an unconditional
-    // local stub removal. Checked *before* `require_room`, which would otherwise
-    // 404 a room we have no `rooms` row for. A storage fault here is surfaced as
-    // a 500 rather than silently mistaken for "no invite" (which would 404 the
-    // room). The loaded invite is handed to `reject_invite` so it need not
-    // re-read the stub.
+    // An out-of-band invite (a room this server is not in, held only as an
+    // out-of-band stub) is declined via the federated leave handshake, the
+    // completed leave replacing the stub. Checked *before* `require_room`, which
+    // would otherwise 404 a room we have no `rooms` row for. A storage fault
+    // here is surfaced as a 500 rather than silently mistaken for "no invite"
+    // (which would 404 the room). The loaded stub is handed to `reject_invite`
+    // so it need not re-read it.
     let store = lock_app(&state.0).store.clone();
-    match store.get_invite(&room, &sender).await {
-        Ok(Some(invite)) => {
-            return crate::federation::leave::reject_invite(&state.0, sender, &room, invite).await;
+    match store.get_oob_membership(&room, &sender).await {
+        Ok(Some(oob)) if oob.membership == Membership::Invite => {
+            return crate::federation::leave::reject_invite(&state.0, sender, &room, oob).await;
         }
+        // Already left (or banned) out of band: nothing to leave.
+        Ok(Some(_)) => return (StatusCode::OK, Json(json!({}))).into_response(),
         Ok(None) => {}
         Err(e) => {
             return error_response(

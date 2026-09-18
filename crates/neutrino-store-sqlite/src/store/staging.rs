@@ -25,11 +25,13 @@ impl StagingStore for SqliteStore {
         room_id: &RoomId,
         event_id: &EventId,
         raw: &RawJsonValue,
+        fetched_for: Option<&EventId>,
     ) -> Result<bool, StorageError> {
         let origin = origin.as_str().to_owned();
         let room_id = room_id.as_str().to_owned();
         let event_id = event_id.as_str().to_owned();
         let json = raw.get().to_owned();
+        let fetched_for = fetched_for.map(|e| e.as_str().to_owned());
 
         self.run_write(move |conn| -> Result<bool, Error> {
             // `INSERT OR IGNORE … SELECT … WHERE NOT EXISTS` so the row is staged
@@ -52,11 +54,23 @@ impl StagingStore for SqliteStore {
             // however deep (inherent to MSC4242 / auth-chain CRDTs), and the mesh
             // is trusted.
             let inserted = conn.execute(
-                "INSERT OR IGNORE INTO staged_events (event_id, room_id, origin, json) \
-                 SELECT ?1, ?2, ?3, ?4 \
+                "INSERT OR IGNORE INTO staged_events (event_id, room_id, origin, json, fetched_for) \
+                 SELECT ?1, ?2, ?3, ?4, ?5 \
                  WHERE NOT EXISTS (SELECT 1 FROM events WHERE event_id = ?1)",
-                params![event_id, room_id, origin, json],
+                params![event_id, room_id, origin, json, fetched_for],
             )?;
+            // Promotion: an event we had only as fetched ancestry has now
+            // arrived in its own right, so it becomes a gap-fill root (and no
+            // longer lives or dies with the root that fetched it). The reverse
+            // never happens — a root re-fetched as someone's ancestry stays a
+            // root, since `OR IGNORE` leaves the existing row untouched.
+            if inserted == 0 && fetched_for.is_none() {
+                conn.execute(
+                    "UPDATE staged_events SET fetched_for = NULL \
+                     WHERE event_id = ?1 AND fetched_for IS NOT NULL",
+                    params![event_id],
+                )?;
+            }
             Ok(inserted == 1)
         })
         .await
@@ -80,18 +94,20 @@ impl StagingStore for SqliteStore {
     async fn staged_for_room(&self, room_id: &RoomId) -> Result<Vec<StagedPdu>, StorageError> {
         let room_id = room_id.as_str().to_owned();
         self.run_read(move |conn| -> Result<Vec<StagedPdu>, Error> {
-            let mut stmt =
-                conn.prepare("SELECT event_id, origin, json FROM staged_events WHERE room_id = ?")?;
+            let mut stmt = conn.prepare(
+                "SELECT event_id, origin, json, fetched_for FROM staged_events WHERE room_id = ?",
+            )?;
             let rows = stmt.query_map(params![room_id], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })?;
             let mut out = Vec::new();
             for r in rows {
-                let (event_id, origin, json) = r?;
+                let (event_id, origin, json, fetched_for) = r?;
                 let event_id = OwnedEventId::try_from(event_id)
                     .map_err(|e| Error::Internal(format!("malformed staged event_id: {e}")))?;
                 let origin = OwnedServerName::try_from(origin)
@@ -99,10 +115,15 @@ impl StagingStore for SqliteStore {
                 let raw = RawJsonValue::from_string(json).map_err(|e| {
                     Error::Internal(format!("malformed staged json in DB row: {e}"))
                 })?;
+                let fetched_for = fetched_for
+                    .map(OwnedEventId::try_from)
+                    .transpose()
+                    .map_err(|e| Error::Internal(format!("malformed staged fetched_for: {e}")))?;
                 out.push(StagedPdu {
                     event_id,
                     origin,
                     raw,
+                    fetched_for,
                 });
             }
             Ok(out)
@@ -130,7 +151,8 @@ impl StagingStore for SqliteStore {
             // ours). `UNION` (not `UNION ALL`) dedups, so diamonds and cycles
             // in the DAG terminate. For each reached id, classify it: staged
             // (cache hit, to promote), committed (grounded boundary, ignore),
-            // or neither (the still-missing frontier to fetch).
+            // or neither (the still-missing frontier to fetch). A staged row
+            // with a parent in neither table is on the frontier.
             let mut stmt = conn.prepare(
                 "WITH RECURSIVE walk(event_id) AS ( \
                      SELECT je.value FROM json_each(?1) AS je \
@@ -146,7 +168,14 @@ impl StagingStore for SqliteStore {
                      EXISTS(SELECT 1 FROM staged_events s2 \
                             WHERE s2.event_id = w.event_id AND s2.room_id = ?2), \
                      EXISTS(SELECT 1 FROM events e \
-                            WHERE e.event_id = w.event_id AND e.room_id = ?2) \
+                            WHERE e.event_id = w.event_id AND e.room_id = ?2), \
+                     EXISTS(SELECT 1 FROM staged_events s3 \
+                            JOIN json_each(s3.json, '$.prev_state_events') AS p \
+                            WHERE s3.event_id = w.event_id AND s3.room_id = ?2 \
+                              AND NOT EXISTS(SELECT 1 FROM staged_events sp \
+                                             WHERE sp.event_id = p.value AND sp.room_id = ?2) \
+                              AND NOT EXISTS(SELECT 1 FROM events ep \
+                                             WHERE ep.event_id = p.value AND ep.room_id = ?2)) \
                  FROM walk w",
             )?;
             let rows = stmt.query_map(params![heads_json, room_id], |row| {
@@ -154,15 +183,19 @@ impl StagingStore for SqliteStore {
                     row.get::<_, String>(0)?,
                     row.get::<_, bool>(1)?,
                     row.get::<_, bool>(2)?,
+                    row.get::<_, bool>(3)?,
                 ))
             })?;
 
             let mut gap = AncestryGap::default();
             for r in rows {
-                let (id, is_staged, is_committed) = r?;
+                let (id, is_staged, is_committed, parent_missing) = r?;
                 let id = OwnedEventId::try_from(id)
                     .map_err(|e| Error::Internal(format!("malformed staged event_id: {e}")))?;
                 if is_staged {
+                    if parent_missing {
+                        gap.frontier.push(id.clone());
+                    }
                     gap.staged.push(id);
                 } else if !is_committed {
                     gap.missing.push(id);
@@ -185,6 +218,27 @@ impl StagingStore for SqliteStore {
                 let query = format!("DELETE FROM staged_events WHERE event_id IN ({placeholders})");
                 conn.execute(&query, params_from_iter(chunk.iter()))?;
             }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn unstage_with_fetched(
+        &self,
+        room_id: &RoomId,
+        root: &EventId,
+    ) -> Result<(), StorageError> {
+        let room_id = room_id.as_str().to_owned();
+        let root = root.as_str().to_owned();
+        self.run_write(move |conn| -> Result<(), Error> {
+            // One statement, so the root and its fetched ancestry go together:
+            // a crash between two deletes would orphan fetched rows that no
+            // root will ever ground or clean up.
+            conn.execute(
+                "DELETE FROM staged_events \
+                 WHERE room_id = ?1 AND (event_id = ?2 OR fetched_for = ?2)",
+                params![room_id, root],
+            )?;
             Ok(())
         })
         .await
@@ -223,11 +277,11 @@ mod tests {
         let (s, create) = store_with_room_and_create().await;
         let a = state_event(&[create.event_id.as_ref()], 1);
 
-        s.stage_pdu(origin(), *ALICE_ROOM_ID, &a.event_id, &a.raw)
+        s.stage_pdu(origin(), *ALICE_ROOM_ID, &a.event_id, &a.raw, None)
             .await
             .unwrap();
         // Idempotent: re-staging the same id is a no-op.
-        s.stage_pdu(origin(), *ALICE_ROOM_ID, &a.event_id, &a.raw)
+        s.stage_pdu(origin(), *ALICE_ROOM_ID, &a.event_id, &a.raw, None)
             .await
             .unwrap();
 
@@ -243,6 +297,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetched_for_is_recorded_and_promoted_by_own_arrival() {
+        // root ← a (fetched for root). Staging `a` again in its own right
+        // clears the tag (promotion); re-fetching a root never demotes it.
+        let (s, create) = store_with_room_and_create().await;
+        let a = state_event(&[create.event_id.as_ref()], 1);
+        let root = state_event(&[a.event_id.as_ref()], 2);
+
+        assert!(
+            s.stage_pdu(origin(), *ALICE_ROOM_ID, &root.event_id, &root.raw, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            s.stage_pdu(
+                origin(),
+                *ALICE_ROOM_ID,
+                &a.event_id,
+                &a.raw,
+                Some(&root.event_id)
+            )
+            .await
+            .unwrap()
+        );
+        let by_id = |rows: Vec<StagedPdu>| -> std::collections::BTreeMap<OwnedEventId, Option<OwnedEventId>> {
+            rows.into_iter().map(|p| (p.event_id, p.fetched_for)).collect()
+        };
+        let rows = by_id(s.staged_for_room(*ALICE_ROOM_ID).await.unwrap());
+        assert_eq!(rows[&a.event_id], Some(root.event_id.clone()));
+        assert_eq!(rows[&root.event_id], None);
+
+        // `a` arrives in its own right: not a new row, but promoted to a root.
+        assert!(
+            !s.stage_pdu(origin(), *ALICE_ROOM_ID, &a.event_id, &a.raw, None)
+                .await
+                .unwrap()
+        );
+        let rows = by_id(s.staged_for_room(*ALICE_ROOM_ID).await.unwrap());
+        assert_eq!(
+            rows[&a.event_id], None,
+            "own arrival promotes a fetched row"
+        );
+
+        // A root re-fetched as someone else's ancestry stays a root.
+        assert!(
+            !s.stage_pdu(
+                origin(),
+                *ALICE_ROOM_ID,
+                &root.event_id,
+                &root.raw,
+                Some(&a.event_id)
+            )
+            .await
+            .unwrap()
+        );
+        let rows = by_id(s.staged_for_room(*ALICE_ROOM_ID).await.unwrap());
+        assert_eq!(rows[&root.event_id], None, "a root is never demoted");
+    }
+
+    #[tokio::test]
+    async fn unstage_with_fetched_cascades_to_fetched_rows_only() {
+        // root ← a ← b, both fetched for root; `other` is an unrelated root.
+        // Dropping `root` takes a and b, leaves `other`; idempotent on a
+        // missing root.
+        let (s, create) = store_with_room_and_create().await;
+        let b = state_event(&[create.event_id.as_ref()], 1);
+        let a = state_event(&[b.event_id.as_ref()], 2);
+        let root = state_event(&[a.event_id.as_ref()], 3);
+        let other = state_event(&[create.event_id.as_ref()], 4);
+
+        for (ev, tag) in [
+            (&root, None),
+            (&a, Some(root.event_id.as_ref())),
+            (&b, Some(root.event_id.as_ref())),
+            (&other, None),
+        ] {
+            s.stage_pdu(origin(), *ALICE_ROOM_ID, &ev.event_id, &ev.raw, tag)
+                .await
+                .unwrap();
+        }
+        assert_eq!(s.staged_for_room(*ALICE_ROOM_ID).await.unwrap().len(), 4);
+
+        s.unstage_with_fetched(*ALICE_ROOM_ID, &root.event_id)
+            .await
+            .unwrap();
+        let left: Vec<OwnedEventId> = s
+            .staged_for_room(*ALICE_ROOM_ID)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.event_id)
+            .collect();
+        assert_eq!(left, vec![other.event_id.clone()]);
+
+        // A non-root / already-gone id is a no-op, not an error.
+        s.unstage_with_fetched(*ALICE_ROOM_ID, &root.event_id)
+            .await
+            .unwrap();
+        s.unstage_with_fetched(*ALICE_ROOM_ID, &a.event_id)
+            .await
+            .unwrap();
+        assert_eq!(s.staged_for_room(*ALICE_ROOM_ID).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn ancestry_gap_classifies_missing_staged_committed() {
         // Chain: create ←(prev_state) A ← B ← C. create is committed; we stage
         // and commit the rest in stages to exercise each classification.
@@ -253,7 +411,7 @@ mod tests {
 
         // Stage C only. Walking from C's parent B: B is neither staged nor
         // committed ⇒ the missing frontier.
-        s.stage_pdu(origin(), *ALICE_ROOM_ID, &c.event_id, &c.raw)
+        s.stage_pdu(origin(), *ALICE_ROOM_ID, &c.event_id, &c.raw, None)
             .await
             .unwrap();
         let gap = s
@@ -262,9 +420,14 @@ mod tests {
             .unwrap();
         assert_eq!(gap.missing, vec![b.event_id.clone()]);
         assert_eq!(gap.staged, vec![c.event_id.clone()]);
+        assert_eq!(
+            gap.frontier,
+            vec![c.event_id.clone()],
+            "C's parent is missing"
+        );
 
         // Stage B too. Now the frontier recedes to A (B's parent).
-        s.stage_pdu(origin(), *ALICE_ROOM_ID, &b.event_id, &b.raw)
+        s.stage_pdu(origin(), *ALICE_ROOM_ID, &b.event_id, &b.raw, None)
             .await
             .unwrap();
         let gap = s
@@ -277,6 +440,11 @@ mod tests {
         let mut want = vec![b.event_id.clone(), c.event_id.clone()];
         want.sort();
         assert_eq!(staged, want);
+        assert_eq!(
+            gap.frontier,
+            vec![b.event_id.clone()],
+            "only B has a missing parent; C's parent B is staged"
+        );
 
         // Commit A. Its parent is create (committed) ⇒ nothing missing; the
         // staged subgraph {B, C} is now fully grounded and promotable.
@@ -287,6 +455,10 @@ mod tests {
             .unwrap();
         assert!(gap.missing.is_empty(), "grounded once A is committed");
         assert_eq!(gap.staged.len(), 2);
+        assert!(
+            gap.frontier.is_empty(),
+            "no staged event has a missing parent"
+        );
     }
 
     #[tokio::test]
@@ -298,10 +470,10 @@ mod tests {
         let a = state_event(&[create.event_id.as_ref()], 1); // never staged/committed
         let c = state_event(&[a.event_id.as_ref()], 2);
         let d = state_event(&[a.event_id.as_ref()], 3);
-        s.stage_pdu(origin(), *ALICE_ROOM_ID, &c.event_id, &c.raw)
+        s.stage_pdu(origin(), *ALICE_ROOM_ID, &c.event_id, &c.raw, None)
             .await
             .unwrap();
-        s.stage_pdu(origin(), *ALICE_ROOM_ID, &d.event_id, &d.raw)
+        s.stage_pdu(origin(), *ALICE_ROOM_ID, &d.event_id, &d.raw, None)
             .await
             .unwrap();
 
@@ -327,7 +499,7 @@ mod tests {
         // scoped to a different room id.
         let (s, create) = store_with_room_and_create().await;
         let a = state_event(&[create.event_id.as_ref()], 1);
-        s.stage_pdu(origin(), *ALICE_ROOM_ID, &a.event_id, &a.raw)
+        s.stage_pdu(origin(), *ALICE_ROOM_ID, &a.event_id, &a.raw, None)
             .await
             .unwrap();
 
@@ -352,10 +524,10 @@ mod tests {
         // No staged rows yet ⇒ no rooms.
         assert!(s.staged_rooms().await.unwrap().is_empty());
 
-        s.stage_pdu(origin(), *ALICE_ROOM_ID, &a.event_id, &a.raw)
+        s.stage_pdu(origin(), *ALICE_ROOM_ID, &a.event_id, &a.raw, None)
             .await
             .unwrap();
-        s.stage_pdu(origin(), *ALICE_ROOM_ID, &b.event_id, &b.raw)
+        s.stage_pdu(origin(), *ALICE_ROOM_ID, &b.event_id, &b.raw, None)
             .await
             .unwrap();
 
@@ -397,10 +569,10 @@ mod tests {
         let origin_a = server_name!("a.example.org");
         let origin_b = server_name!("b.example.org");
 
-        s.stage_pdu(origin_a, *ALICE_ROOM_ID, &x.event_id, &x.raw)
+        s.stage_pdu(origin_a, *ALICE_ROOM_ID, &x.event_id, &x.raw, None)
             .await
             .unwrap();
-        s.stage_pdu(origin_b, *ALICE_ROOM_ID, &y.event_id, &y.raw)
+        s.stage_pdu(origin_b, *ALICE_ROOM_ID, &y.event_id, &y.raw, None)
             .await
             .unwrap();
 
@@ -417,7 +589,7 @@ mod tests {
         // Re-staging X under a *different* origin is an INSERT OR IGNORE no-op:
         // the first origin wins (the event_id is content-derived, so a re-stage
         // is a genuine duplicate — we keep the original sender).
-        s.stage_pdu(origin_b, *ALICE_ROOM_ID, &x.event_id, &x.raw)
+        s.stage_pdu(origin_b, *ALICE_ROOM_ID, &x.event_id, &x.raw, None)
             .await
             .unwrap();
         let rows = s.staged_for_room(*ALICE_ROOM_ID).await.unwrap();
@@ -437,13 +609,13 @@ mod tests {
         let a = state_event(&[create.event_id.as_ref()], 1);
 
         assert!(
-            s.stage_pdu(origin(), *ALICE_ROOM_ID, &a.event_id, &a.raw)
+            s.stage_pdu(origin(), *ALICE_ROOM_ID, &a.event_id, &a.raw, None)
                 .await
                 .unwrap(),
             "first stage of an id inserts a row"
         );
         assert!(
-            !s.stage_pdu(origin(), *ALICE_ROOM_ID, &a.event_id, &a.raw)
+            !s.stage_pdu(origin(), *ALICE_ROOM_ID, &a.event_id, &a.raw, None)
                 .await
                 .unwrap(),
             "re-staging the same id is an ignored duplicate"
@@ -462,7 +634,7 @@ mod tests {
         s.persist_event(&a, &[]).await.unwrap();
 
         assert!(
-            !s.stage_pdu(origin(), *ALICE_ROOM_ID, &a.event_id, &a.raw)
+            !s.stage_pdu(origin(), *ALICE_ROOM_ID, &a.event_id, &a.raw, None)
                 .await
                 .unwrap(),
             "staging an already-committed event must report no progress"

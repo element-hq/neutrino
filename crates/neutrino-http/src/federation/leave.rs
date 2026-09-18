@@ -1,18 +1,19 @@
 //! Outbound federated invite-rejection (joining-server side).
 //!
 //! When a local user declines an **out-of-band invite** — an invite for a room
-//! we don't host, held only as an [`InviteStore`] stub with no room state — the
-//! CSAPI `/leave` handler delegates here. We:
+//! this server is not in, held only as an [`OobMembershipStore`] stub with no
+//! room state — the CSAPI `/leave` handler delegates here. We:
 //!
 //! 1. resolve the inviting server from the invite event's `sender` domain;
 //! 2. run a **best-effort** `make_leave` → complete → `send_leave` handshake to
 //!    it (so the resident records our departure); and
-//! 3. **unconditionally** remove the local invite stub.
+//! 3. record the completed leave over the invite stub — sync then shows the
+//!    room as left — or, if the handshake failed, drop the stub.
 //!
-//! Step 3 is the Synapse "local rejection" behaviour: the user stops seeing the
-//! invite even if the inviting server is unreachable, and we never block the
-//! client on the federation round-trip. The handshake failing is not an error —
-//! the invite was never real room state for us.
+//! Step 3 always succeeds locally: the user stops seeing the invite even if the
+//! inviting server is unreachable, and we never block the client on the
+//! federation round-trip. The handshake failing is not an error — the invite
+//! was never real room state for us.
 //!
 //! ## Security: complete, don't echo
 //!
@@ -27,7 +28,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use neutrino_store::InviteStore;
+use neutrino_store::{OobMembership, OobMembershipStore};
 use ruma::{OwnedUserId, RoomId, ServerName, UserId};
 use serde_json::json;
 use tracing::warn;
@@ -38,12 +39,12 @@ use crate::{AppState, error_response, lock_app};
 
 /// Reject an out-of-band invite. The caller (`membership::leave`) passes the
 /// already-loaded `invite` stub (so we don't re-read it). Always returns
-/// `200 {}` unless the local stub removal itself fails (a real storage fault).
+/// `200 {}` unless the local stub write itself fails (a real storage fault).
 pub(crate) async fn reject_invite(
     state: &AppState,
     user: OwnedUserId,
     room_id: &RoomId,
-    invite: neutrino_event::Event,
+    invite: OobMembership,
 ) -> Response {
     let (store, policy, own_server, federation_proxy) = {
         let app = lock_app(state);
@@ -57,11 +58,11 @@ pub(crate) async fn reject_invite(
 
     // Best-effort federated decline to the inviting server (the invite's sender
     // domain). Any failure (unreachable, refused, malformed template) is logged
-    // *with its underlying cause* and swallowed — the unconditional local
-    // removal below is what the client relies on.
-    let dest = invite.sender.server_name().to_owned();
+    // *with its underlying cause* and swallowed — the local write below is what
+    // the client relies on.
+    let dest = invite.event.sender.server_name().to_owned();
     let display_name = crate::local_display_name(&store).await;
-    if let Err(e) = try_federated_leave(
+    let local = match try_federated_leave(
         &own_server,
         federation_proxy.as_deref(),
         &policy,
@@ -72,12 +73,19 @@ pub(crate) async fn reject_invite(
     )
     .await
     {
-        warn!(%room_id, %dest, error = %e, "federated leave (invite reject) failed; rejecting locally anyway");
-    }
-
-    // Unconditional local rejection: drop the stub so the invite vanishes from
-    // sync. This is the part that MUST succeed for the client.
-    match store.remove_invite(room_id, &user).await {
+        // The completed leave replaces the invite: sync shows the room as left.
+        Ok(leave) => {
+            store
+                .put_oob_membership(room_id, &user, &leave, &invite.room_version)
+                .await
+        }
+        // No leave event to show; drop the stub so the invite at least vanishes.
+        Err(e) => {
+            warn!(%room_id, %dest, error = %e, "federated leave (invite reject) failed; rejecting locally anyway");
+            store.remove_oob_membership(room_id, &user).await
+        }
+    };
+    match local {
         Ok(()) => (StatusCode::OK, Json(json!({}))).into_response(),
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -88,8 +96,9 @@ pub(crate) async fn reject_invite(
 }
 
 /// Run the `make_leave` → complete → `send_leave` handshake against the inviting
-/// server. Returns a detailed reason (including the underlying transport/HTTP
-/// error) on any failure, which the caller logs before swallowing it.
+/// server, returning the completed leave the resident accepted. On failure the
+/// reason (including the underlying transport/HTTP error) is what the caller
+/// logs before swallowing it.
 async fn try_federated_leave(
     own_server: &str,
     proxy: Option<&str>,
@@ -98,8 +107,9 @@ async fn try_federated_leave(
     room_id: &RoomId,
     user: &UserId,
     display_name: &str,
-) -> Result<(), String> {
-    let client = FederationClient::new(own_server.to_owned(), proxy);
+) -> Result<neutrino_event::Event, String> {
+    let client =
+        FederationClient::new(own_server.to_owned(), proxy).with_signer(policy.signer().cloned());
     let offered: Vec<&str> = policy.versions.ids().collect();
     let template = client
         .make_leave(dest, room_id, user, &offered)
@@ -130,7 +140,8 @@ async fn try_federated_leave(
     client
         .send_leave(dest, room_id, &leave.event_id, &leave.raw)
         .await
-        .map_err(|e| format!("send_leave request failed: {e}"))
+        .map_err(|e| format!("send_leave request failed: {e}"))?;
+    Ok(leave)
 }
 
 #[cfg(test)]
@@ -232,6 +243,70 @@ mod tests {
             v["prev_state_events"],
             json!([foreign]),
             "prev_state_events must be carried from the template"
+        );
+    }
+    /// A gomatrixserverlib-shaped template (Complement's `make_join` /
+    /// `make_leave`): a bare protoevent with no `origin_server_ts`, no `hashes`,
+    /// `depth` and `unsigned` present, `auth_events` absent. Only the two DAG
+    /// pointer arrays matter; a completion that parsed the template as a full
+    /// PDU rejected it with "missing required field: origin_server_ts".
+    #[test]
+    fn complete_template_accepts_protoevent_without_pdu_fields() {
+        let our_user = ruma::OwnedUserId::try_from("@alice:us.example").unwrap();
+        let room_id = ruma::RoomId::parse("!room:resident.example").unwrap();
+        let head = "$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let state_head = "$bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let template = serde_json::value::to_raw_value(&json!({
+            "type": "m.room.member",
+            "sender": our_user.as_str(),
+            "room_id": room_id.as_str(),
+            "state_key": our_user.as_str(),
+            "content": { "membership": "join" },
+            "prev_events": [head],
+            "prev_state_events": [state_head],
+            "depth": 4,
+            "unsigned": {},
+        }))
+        .unwrap();
+        let event = complete_membership_template(
+            &neutrino_event::EventPolicy::trusted_network(),
+            neutrino_event::base_version(),
+            &template,
+            &room_id,
+            &our_user,
+            "join",
+            "",
+        )
+        .expect("protoevent template completes");
+        let v: Value = serde_json::from_str(event.raw.get()).unwrap();
+        assert_eq!(v["prev_events"], json!([head]));
+        assert_eq!(v["prev_state_events"], json!([state_head]));
+        assert_eq!(v["content"]["membership"], "join");
+        assert!(v["origin_server_ts"].is_u64(), "we stamp the timestamp");
+    }
+
+    /// Pointer arrays are still validated: a malformed event id fails the
+    /// completion rather than being carried into an event we would author.
+    #[test]
+    fn complete_template_rejects_malformed_dag_pointer() {
+        let our_user = ruma::OwnedUserId::try_from("@alice:us.example").unwrap();
+        let room_id = ruma::RoomId::parse("!room:resident.example").unwrap();
+        let template = serde_json::value::to_raw_value(&json!({
+            "prev_events": ["not-an-event-id"],
+            "prev_state_events": [],
+        }))
+        .unwrap();
+        assert!(
+            complete_membership_template(
+                &neutrino_event::EventPolicy::trusted_network(),
+                neutrino_event::base_version(),
+                &template,
+                &room_id,
+                &our_user,
+                "join",
+                "",
+            )
+            .is_none()
         );
     }
 }

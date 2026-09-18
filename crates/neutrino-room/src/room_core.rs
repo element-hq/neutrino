@@ -22,12 +22,17 @@
 //!   `prev_state_events` via `state_res::state_at_heads`.
 //! - **Step 4** (auth check against state-at-event): removed under
 //!   MSC4242 / state DAGs — step 3 subsumes it.
-//! - **Step 5** (soft-fail check against current room state): we run
-//!   `check_auth_rules` against `current_state` for **non-state events
-//!   only**. State events are not soft-failed (matches synapse's behaviour
-//!   in `_check_for_soft_fail`). A soft-failed event is still persisted
-//!   (Matrix soft-fail semantics) — the `soft_failed` flag on the persisted
-//!   `Event` lets storage keep it out of client timelines.
+//! - **Step 5** (soft-fail check against current room state): every event,
+//!   state or not, is auth-checked against `current_state` (synapse
+//!   `_check_for_soft_fail`, which has no state-event exemption). Synapse's
+//!   MSC4242 branch additionally resolves the event's own `prev_state_events`
+//!   into that basis, in case the event's state is newer than the server's
+//!   heads; here that is redundant — an event only reaches this step once its
+//!   `prev_state_events` are held, and every held, accepted state event is a
+//!   head or below one, so `current_state` already dominates the event's
+//!   state-before. A soft-failed event is still persisted (Matrix soft-fail
+//!   semantics) — the `soft_failed` flag on the persisted `Event` lets storage
+//!   keep it out of client timelines.
 //! - **Step 6** (state-set check): removed under MSC4242 / state DAGs.
 //!
 //! Local additions on top of the spec list: reference validation
@@ -49,7 +54,11 @@
 //!   (parents in `prev_state_events` removed, the new event inserted), then
 //!   recompute `current_state` by state-resolving across the new state-FE
 //!   set. Mutation is committed atomically after every fallible call has
-//!   succeeded. State events that pass auth are never soft-failed.
+//!   succeeded. This holds **even when the state event is soft-failed**: per
+//!   MSC4242 (and synapse's `_calculate_new_state_dag_extremities`) every
+//!   accepted state event is a state-DAG head, so peers filling their state
+//!   DAG from ours still see it — soft-fail only withholds it from clients
+//!   and from the timeline heads.
 //! - **non-state events** run the soft-fail check against the existing
 //!   `current_state` (which they do not change); only if the event is not
 //!   soft-failed do the timeline heads advance.
@@ -467,9 +476,26 @@ impl RoomCore {
             let new_current_ids = state_res::state_at_heads(&new_fes_slice, &wrapper, &mut cache)?;
             let new_current_events = materialize_state(&new_current_ids, &wrapper)?;
 
+            // Spec step 5: soft-fail against the current state *before* this
+            // event (synapse `_check_for_soft_fail`; no state-event exemption).
+            // The event's `prev_state_events` are held (else RETRY above) and
+            // every held accepted state event is a head or below one, so
+            // `current_state` already dominates the event's state-before —
+            // a ban that postdates the event's stale state is in it. If the
+            // event sits exactly on our heads this is the step-3 check again
+            // and passes trivially.
+            let soft_failed = check_auth_rules(&event, &self.current_state, provider).is_err();
+
             // Timeline heads advance too — a state event sits in the timeline
-            // DAG like any other event. Pure; computed before the commit.
-            let new_timeline_fes = self.next_forward_extremities(&event);
+            // DAG like any other event — unless soft-failed: a soft-failed
+            // event must not become a forward extremity nor drop the parents
+            // it references (same rule as the non-state branch below). Pure;
+            // computed before the commit.
+            let new_timeline_fes = if soft_failed {
+                self.forward_extremities.clone()
+            } else {
+                self.next_forward_extremities(&event)
+            };
 
             // Delta between the old current state and the recomputed one,
             // computed before we overwrite `self.current_state`. This is what
@@ -481,23 +507,32 @@ impl RoomCore {
             self.state_forward_extremities = new_fes;
             self.current_state = Arc::new(new_current_events);
 
-            // State events are not soft-failed (synapse parity) — `event`
-            // keeps its default `soft_failed = false`.
+            // A soft-failed state event still advanced the *state* heads and
+            // recomputed current_state above (MSC4242: it is part of the state
+            // DAG and peers must be able to fetch it), but is stamped so
+            // storage keeps it out of client timelines and the actor does not
+            // relay it. It will normally have lost state resolution to
+            // whatever made it fail (a ban), leaving the delta empty.
             //
-            // An accepted state event always advances both head-sets (it is a
-            // head of both DAGs), but it may still *lose* state resolution —
-            // a conflicting event already in the resolved set wins its
-            // (type, state_key), so current_state is unchanged and the delta
-            // is empty. In that case emit `Persist` alone: the FE advance
-            // rides on the committed RoomCore mutation, not on the effects.
+            // An accepted state event may also *lose* state resolution without
+            // soft-failing — a conflicting event already in the resolved set
+            // wins its (type, state_key), so current_state is unchanged and
+            // the delta is empty. In either case emit `Persist` alone: the FE
+            // advance rides on the committed RoomCore mutation, not on the
+            // effects.
+            if soft_failed {
+                Arc::make_mut(&mut event).soft_failed = true;
+            }
             let mut effects = vec![Effect::Persist { event }];
             if !delta.is_empty() {
                 effects.push(Effect::UpdateCurrentState(delta));
             }
             Ok(effects)
         } else {
-            // Spec step 5: soft-fail against current_state. Non-state events
-            // only. State events that pass step 3 are accepted as-is.
+            // Spec step 5: soft-fail against current_state. A non-state event's
+            // `prev_state_events` grounded below our heads (or it would be
+            // RETRY), so current_state already dominates its state-before —
+            // no need for the merged basis the state branch uses.
             let soft_failed = check_auth_rules(&event, &self.current_state, provider).is_err();
 
             // Non-state events don't touch the state DAG or current_state, but
@@ -711,6 +746,55 @@ mod tests {
             .expect("alice join");
         insert(&mut provider, join.clone());
         (room, provider, create_id, join_id, room_id)
+    }
+
+    /// Apply `event` and insert the event `apply_pdu` *returned* (with its
+    /// calculated `auth_events`) into the provider — what the real persist
+    /// layer stores. Inserting the hand-built input instead would leave the
+    /// helper's placeholder `auth_events` in the provider, and state
+    /// resolution walks those. Asserts a clean accept.
+    fn apply_clean(
+        room: &mut RoomCore,
+        provider: &mut InMemoryStateProvider,
+        event: Event,
+        what: &str,
+    ) -> OwnedEventId {
+        let effects = room.apply_pdu(event, provider).expect(what);
+        let persisted = match effects.first() {
+            Some(Effect::Persist { event }) if !event.rejected && !event.soft_failed => {
+                event.clone()
+            }
+            _ => panic!("{what}: expected a clean accept, got {effects:?}"),
+        };
+        insert(provider, persisted.clone());
+        persisted.event_id.clone()
+    }
+
+    /// Alice sets `m.room.join_rules = public` on `head` (the fixture room has
+    /// no join rules, so the default is invite-only and a stranger's join is
+    /// rejected). Applies + inserts it; returns its id, the new head.
+    fn alice_opens_room(
+        room: &mut RoomCore,
+        provider: &mut InMemoryStateProvider,
+        head: &OwnedEventId,
+        room_id: &ruma::RoomId,
+    ) -> OwnedEventId {
+        let jr = Arc::new(
+            EventBuilder::new(
+                "@alice:example.org".parse().expect("user"),
+                "m.room.join_rules".to_owned(),
+                neutrino_event::base_version().clone(),
+            )
+            .room_id(room_id.to_owned())
+            .state_key(String::new())
+            .content(json!({ "join_rule": "public" }))
+            .prev_events(vec![head.clone()])
+            .prev_state_events(vec![head.clone()])
+            .origin_server_ts(next_ts())
+            .build()
+            .expect("valid join_rules"),
+        );
+        apply_clean(room, provider, (*jr).clone(), "join rules")
     }
 
     /// Build alice's m.room.member join event, post-create, with the
@@ -1204,6 +1288,161 @@ mod tests {
             room.forward_extremities,
             [leave_id].into_iter().collect(),
             "soft-failed event must not advance the timeline head off the leave"
+        );
+    }
+
+    #[test]
+    fn apply_soft_fails_state_event_from_banned_user() {
+        // Complement SEND01B: alice bans bob; bob then sends an m.room.member
+        // state event whose `prev_state_events` predate the ban (his join), so
+        // it passes step 3 (state-before: joined) and only fails against
+        // current state. It must be soft-failed — synapse `_check_for_soft_fail`
+        // has no state-event exemption — while still advancing the state-DAG
+        // heads (MSC4242: peers can fetch it) but not the timeline heads.
+        let (mut room, mut provider, _create_id, alice_join_id, room_id) =
+            alice_creates_and_joins(true);
+        let jr_id = alice_opens_room(&mut room, &mut provider, &alice_join_id, &room_id);
+
+        let bob_join_id = apply_clean(
+            &mut room,
+            &mut provider,
+            member_event(
+                "@bob:example.org",
+                "@bob:example.org",
+                "join",
+                vec![jr_id],
+                &room_id,
+            ),
+            "bob join",
+        );
+        let ban_id = apply_clean(
+            &mut room,
+            &mut provider,
+            member_event(
+                "@alice:example.org",
+                "@bob:example.org",
+                "ban",
+                vec![bob_join_id.clone()],
+                &room_id,
+            ),
+            "alice bans bob",
+        );
+        assert_eq!(
+            room.forward_extremities,
+            [ban_id.clone()].into_iter().collect()
+        );
+        assert_eq!(
+            room.state_forward_extremities,
+            [ban_id.clone()].into_iter().collect()
+        );
+
+        // Bob's evasion attempt: prev_events after the ban, prev_state_events
+        // before it.
+        let evade = EventBuilder::new(
+            "@bob:example.org".parse().expect("user"),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key("@bob:example.org".to_owned())
+        .content(json!({ "membership": "join", "displayname": "State" }))
+        .prev_events(vec![ban_id.clone()])
+        .prev_state_events(vec![bob_join_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid member");
+        let evade_id = evade.event_id.clone();
+
+        let effects = room
+            .apply_pdu(evade, &provider)
+            .expect("evasion is accepted, not rejected");
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Persist { event }] if event.soft_failed && !event.rejected
+            ),
+            "expected a single soft-failed Persist, got {effects:?}"
+        );
+        // Timeline heads unchanged; state heads gained the event (its parent,
+        // bob's join, was not a head, so the ban stays too).
+        assert_eq!(
+            room.forward_extremities,
+            [ban_id.clone()].into_iter().collect(),
+            "soft-failed state event must not advance the timeline head"
+        );
+        assert_eq!(
+            room.state_forward_extremities,
+            [ban_id.clone(), evade_id].into_iter().collect(),
+            "soft-failed state event is still a state-DAG head"
+        );
+        // Current state still says banned: the evasion lost state resolution.
+        assert_eq!(
+            room.current_state()
+                .get(&("m.room.member".to_string(), "@bob:example.org".to_string()))
+                .map(|e| e.event_id.clone()),
+            Some(ban_id)
+        );
+    }
+
+    #[test]
+    fn apply_does_not_soft_fail_state_event_authorised_by_current_state() {
+        // Guard against over-reach: a state event that needs a power grant
+        // must not be soft-failed when that grant *is* in current state.
+        // Alice grants bob PL 50; bob's topic (state_default 50) sits on the
+        // grant and is accepted cleanly.
+        let (mut room, mut provider, _create_id, alice_join_id, room_id) =
+            alice_creates_and_joins(true);
+        let jr_id = alice_opens_room(&mut room, &mut provider, &alice_join_id, &room_id);
+        let bob_join_id = apply_clean(
+            &mut room,
+            &mut provider,
+            member_event(
+                "@bob:example.org",
+                "@bob:example.org",
+                "join",
+                vec![jr_id],
+                &room_id,
+            ),
+            "bob join",
+        );
+
+        // Alice grants bob PL 50. Applied normally so it is a head we hold.
+        let pl_id = apply_clean(
+            &mut room,
+            &mut provider,
+            EventBuilder::new(
+                "@alice:example.org".parse().expect("user"),
+                "m.room.power_levels".to_owned(),
+                neutrino_event::base_version().clone(),
+            )
+            .room_id(room_id.clone())
+            .state_key(String::new())
+            .content(json!({ "users": { "@bob:example.org": 50 }, "state_default": 50 }))
+            .prev_events(vec![bob_join_id.clone()])
+            .prev_state_events(vec![bob_join_id.clone()])
+            .origin_server_ts(next_ts())
+            .build()
+            .expect("valid pl"),
+            "pl",
+        );
+
+        let topic = EventBuilder::new(
+            "@bob:example.org".parse().expect("user"),
+            "m.room.topic".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key(String::new())
+        .content(json!({ "topic": "hi" }))
+        .prev_events(vec![pl_id.clone()])
+        .prev_state_events(vec![pl_id.clone()])
+        .origin_server_ts(next_ts())
+        .build()
+        .expect("valid topic");
+        let effects = room.apply_pdu(topic, &provider).expect("topic accepted");
+        assert!(
+            matches!(effects.first(), Some(Effect::Persist { event }) if !event.soft_failed && !event.rejected),
+            "a state event authorised by current state is not soft-failed, got {effects:?}"
         );
     }
 

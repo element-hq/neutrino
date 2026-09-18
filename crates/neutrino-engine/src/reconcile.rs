@@ -314,7 +314,12 @@ async fn fetch_unknown<F: MissingEventsFetcher + ?Sized>(
         if ev.room_id != *room_id {
             continue;
         }
-        match store.stage_pdu(peer, room_id, &ev.event_id, &ev.raw).await {
+        // Anti-entropy events are the peer's heads, staged in their own right
+        // (gap-fill roots), not ancestry fetched on some other PDU's behalf.
+        match store
+            .stage_pdu(peer, room_id, &ev.event_id, &ev.raw, None)
+            .await
+        {
             Ok(true) => staged_new.push(ev.event_id),
             Ok(false) => {}
             Err(e) => {

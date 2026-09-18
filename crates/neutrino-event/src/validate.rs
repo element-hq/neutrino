@@ -531,6 +531,22 @@ fn content_as_object(content: &RawValue) -> Result<Map<String, Value>, FormatErr
     }
 }
 
+/// The DAG pointers of a `make_join` / `make_leave` **template**: its
+/// `prev_events` and `prev_state_events`, each a well-formed array of event
+/// ids. Nothing else is read — a template is a protoevent, not a PDU, so the
+/// resident may omit `origin_server_ts`, `hashes`, `depth`, or carry fields we
+/// would reject on a real event (gomatrixserverlib emits exactly such a
+/// shape). The caller rebuilds the event around these pointers; it must never
+/// echo any other template field.
+pub fn parse_template_dag_pointers(
+    raw: &RawValue,
+) -> Result<(Vec<OwnedEventId>, Vec<OwnedEventId>), FormatError> {
+    let map: Map<String, Value> = serde_json::from_str(raw.get())?;
+    let prev_events = parse_event_id_array(&map, "prev_events")?;
+    let prev_state_events = parse_event_id_array(&map, "prev_state_events")?;
+    Ok((prev_events, prev_state_events))
+}
+
 fn required_string<'a>(
     map: &'a Map<String, Value>,
     field: &'static str,

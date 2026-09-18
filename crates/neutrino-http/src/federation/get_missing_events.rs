@@ -4,7 +4,7 @@
 //! for the design — the algorithm comments below cross-reference the seven
 //! steps from the design doc's §Handler/Algorithm.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use axum::{
     Json,
@@ -13,7 +13,9 @@ use axum::{
 };
 use neutrino_store::{DagStore, EventStore, RoomStore};
 use ruma::{OwnedEventId, OwnedRoomId};
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde_json::Value;
 use serde_json::value::RawValue as RawJsonValue;
 
 use crate::federation::{FedError, auth};
@@ -70,8 +72,8 @@ pub(crate) struct RequestBody {
     /// per the MSC, so a v1.18-shaped body omitting it keeps the timeline-DAG
     /// behaviour. This is the field our own gap-fill fetcher sets to close a
     /// received PDU's missing state ancestry.
-    #[serde(default)]
-    state_dag: bool,
+    #[serde(flatten)]
+    state_dag: StateDagFlag,
     /// Anti-entropy (forward-extremity reconciliation): when `true`, the response
     /// additionally includes any `latest_events` this server *itself holds*, not
     /// only their ancestors. The unmodified endpoint returns only ancestors of
@@ -81,6 +83,39 @@ pub(crate) struct RequestBody {
     /// in one request. Optional, default `false`.
     #[serde(default)]
     include_latest_events: bool,
+}
+
+/// Wire key of the MSC4242 `/get_missing_events` request flag. Unstable-prefixed
+/// until the MSC is merged; the stable name is `state_dag`. The low-bandwidth
+/// key table (`neutrino-lb/src/codec/keys.rs`, code 139) carries the same
+/// literal; `federation::tests::state_dag_key_is_lb_coded` pins the two.
+pub(crate) const STATE_DAG_KEY: &str = "org.matrix.msc4242.state_dag";
+
+/// The MSC4242 request flag as it appears on the wire: one
+/// `{ STATE_DAG_KEY: bool }` entry, flattened into the request body. Absent
+/// reads as `false`. A newtype because serde's `rename` takes only a literal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StateDagFlag(pub(crate) bool);
+
+impl Serialize for StateDagFlag {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(STATE_DAG_KEY, &self.0)?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for StateDagFlag {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut rest = BTreeMap::<String, Value>::deserialize(deserializer)?;
+        match rest.remove(STATE_DAG_KEY) {
+            None => Ok(Self(false)),
+            Some(Value::Bool(b)) => Ok(Self(b)),
+            Some(_) => Err(de::Error::custom(format!(
+                "`{STATE_DAG_KEY}` must be a boolean"
+            ))),
+        }
+    }
 }
 
 /// Serializable mirror of `ruma::api::federation::event::get_missing_events::v1::Response`.
@@ -110,8 +145,8 @@ pub(crate) struct ResponseBody {
 /// 4. Drop `_min_depth` (wire field `min_depth`) on the floor — Neutrino
 ///    has no depth column. See `RequestBody._min_depth` doc.
 /// 5. Call `DagStore::missing_events`.
-/// 6. Build response from `Event.raw` verbatim (no enrichment), reversed to
-///    oldest-first.
+/// 6. Build response from `Event.raw` verbatim (no enrichment): the timeline
+///    walk reversed to oldest-first, the state-DAG walk in its hop order.
 /// 7. Storage errors → 500 M_UNKNOWN via `FedError::Storage`.
 pub(crate) async fn handle(
     State(state): State<AppState>,
@@ -177,17 +212,22 @@ pub(crate) async fn handle(
     let latest: Vec<&ruma::EventId> = body.latest_events.iter().map(|id| id.as_ref()).collect();
     let earliest: Vec<&ruma::EventId> = body.earliest_events.iter().map(|id| id.as_ref()).collect();
     let ancestors = store
-        .missing_events(&room_id, &latest, &earliest, limit, body.state_dag)
+        .missing_events(&room_id, &latest, &earliest, limit, body.state_dag.0)
         .await?;
 
-    // (6) — wire bytes verbatim, oldest-first. `missing_events` walks back
-    // from `latest`, so it yields newest-first; reverse to the topological
-    // (oldest-first) order federation receivers expect — matches Synapse,
-    // which reverses its walk before responding. The reference hash that
-    // produced each event_id was computed over `event.raw`, so peers MUST
-    // receive those exact bytes for the event_id to round-trip.
+    // (6) — wire bytes verbatim. The timeline walk yields newest-first and is
+    // reversed to the topological (oldest-first) order federation receivers
+    // expect — matches Synapse, which reverses its walk before responding. The
+    // MSC4242 state-DAG walk is already in its mandated order (nearest hop
+    // first) and is sent as is. The reference hash that produced each event_id
+    // was computed over `event.raw`, so peers MUST receive those exact bytes
+    // for the event_id to round-trip.
     let mut seen: HashSet<OwnedEventId> = ancestors.iter().map(|e| e.event_id.clone()).collect();
-    let mut events: Vec<Box<RawJsonValue>> = ancestors.into_iter().rev().map(|e| e.raw).collect();
+    let mut events: Vec<Box<RawJsonValue>> = if body.state_dag.0 {
+        ancestors.into_iter().map(|e| e.raw).collect()
+    } else {
+        ancestors.into_iter().rev().map(|e| e.raw).collect()
+    };
 
     // (6b) — anti-entropy: when `include_latest_events` is set, append any
     // `latest_events` we hold. They are the newest events, so they follow their
@@ -207,4 +247,40 @@ pub(crate) async fn handle(
     }
 
     Ok(Json(ResponseBody { events }))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn body(extra: Value) -> serde_json::Result<RequestBody> {
+        let mut v = json!({ "earliest_events": [], "latest_events": ["$abc"] });
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(v)
+    }
+
+    #[test]
+    fn state_dag_flag_serializes_under_the_wire_key() {
+        assert_eq!(
+            serde_json::to_value(StateDagFlag(true)).unwrap(),
+            json!({ STATE_DAG_KEY: true })
+        );
+    }
+
+    #[test]
+    fn request_body_reads_state_dag_from_the_wire_key_only() {
+        assert!(body(json!({ STATE_DAG_KEY: true })).unwrap().state_dag.0);
+        assert!(!body(json!({})).unwrap().state_dag.0);
+        // The stable name is not the wire key yet.
+        assert!(!body(json!({ "state_dag": true })).unwrap().state_dag.0);
+    }
+
+    #[test]
+    fn request_body_rejects_non_boolean_state_dag() {
+        assert!(body(json!({ STATE_DAG_KEY: 1 })).is_err());
+    }
 }

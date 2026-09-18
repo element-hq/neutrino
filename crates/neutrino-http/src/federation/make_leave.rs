@@ -3,10 +3,12 @@
 //! a remote server to reject an invite (or otherwise depart) on behalf of one of
 //! its users.
 //!
-//! Symmetric to [`crate::federation::make_join`]: it negotiates the room version
-//! via the spec's `?ver=` query (400 `M_INCOMPATIBLE_ROOM_VERSION`, with our
-//! `room_version` in the body, when our version is not offered) and returns an
-//! `m.room.member`/`leave` template built on the room's current heads.
+//! Mostly symmetric to [`crate::federation::make_join`]: it returns an
+//! `m.room.member`/`leave` template built on the room's current heads, tagged
+//! with the room's `room_version`. Unlike make_join there is **no `?ver=`
+//! negotiation**: the spec defines no `ver` query for make_leave (a user must
+//! always be able to depart a room), so a requester that omits it — as
+//! gomatrixserverlib and Synapse do — must not be refused.
 //!
 //! Unlike make_join there is **no membership / join-rules eligibility
 //! pre-check**: the spec does not require make_leave to verify the user is in
@@ -20,7 +22,7 @@
 
 use axum::{
     Json,
-    extract::{Path, RawQuery, State},
+    extract::{Path, State},
     http::HeaderMap,
 };
 use neutrino_store::RoomStore;
@@ -29,7 +31,7 @@ use serde::Serialize;
 use serde_json::json;
 use serde_json::value::RawValue as RawJsonValue;
 
-use crate::federation::make_join::{map_build_err, ver_includes};
+use crate::federation::make_join::map_build_err;
 use crate::federation::{FedError, auth};
 use crate::{AppState, lock_app};
 
@@ -45,9 +47,7 @@ pub(crate) struct ResponseBody {
 ///
 /// 1. Parse `room_id` + `user_id` (400 JSON on a malformed id).
 /// 2. Room unknown → 404 `M_NOT_FOUND`.
-/// 3. Version negotiation: our version must appear in the requester's `?ver=`
-///    list, else 400 `M_INCOMPATIBLE_ROOM_VERSION` (same as make_join).
-/// 4. Build the `m.room.member`/`leave` template on the current heads (no
+/// 3. Build the `m.room.member`/`leave` template on the current heads (no
 ///    persist) and return it with `room_version`. No eligibility pre-check —
 ///    `send_leave`'s apply is authoritative (a user who cannot leave is refused
 ///    there).
@@ -55,7 +55,6 @@ pub(crate) async fn handle(
     State(state): State<AppState>,
     Path((room_id, user_id)): Path<(String, String)>,
     headers: HeaderMap,
-    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<ResponseBody>, FedError> {
     let room_id = OwnedRoomId::try_from(room_id.as_str())
         .map_err(|_| FedError::BadRequest("invalid room_id"))?;
@@ -79,16 +78,12 @@ pub(crate) async fn handle(
         ));
     }
 
-    // The room must exist, and the requester must offer its version.
+    // The room must exist. No `ver` negotiation on leave (see module docs);
+    // the requester learns the version from `room_version` in the response.
     let room_version = store
         .get_room_version(&room_id)
         .await?
         .ok_or(FedError::RoomNotFound)?;
-    if !ver_includes(raw_query.as_deref(), room_version.as_str()) {
-        return Err(FedError::IncompatibleRoomVersion(
-            room_version.as_str().to_owned(),
-        ));
-    }
 
     let template = registry
         .build_event(

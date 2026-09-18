@@ -34,10 +34,19 @@
 //! - **Ok** (accepted / soft-failed / rejected — federation persists rejects):
 //!   unstage it.
 //! - **Retryable** (missing `prev_state_events` ancestry): fetch the gap into
-//!   staging (`fill_state_ancestry`) — those fetched rows are the *same kind*
-//!   of staged row, so the next drain pass toposorts and applies them ahead of
-//!   this PDU. There is no separate "promote" step. On an unfillable gap / peer
-//!   failure, back the PDU off.
+//!   staging (`fill_state_ancestry`) — fetched rows are staged alongside, tagged
+//!   `fetched_for = this PDU`, so the next drain pass toposorts and applies
+//!   them ahead of it. There is no separate "promote" step. An *unfillable*
+//!   gap (the peer cannot supply a path to create) rejects the PDU: it is
+//!   unstaged together with everything fetched for it. A *transient* failure
+//!   (peer unreachable / storage fault) backs it off, fetched rows kept, so
+//!   the retry resumes from the staged frontier.
+//! - **Fetched rows are never gap-fill roots.** Only a row staged in its own
+//!   right (`fetched_for = NULL`: `/send`, join ingest, anti-entropy) walks the
+//!   peer. A fetched row whose own apply is retryable is simply left staged —
+//!   its root's next walk extends the prefix — and it is skipped while its
+//!   root is backing off. Otherwise a partially-fetched, ungrounded ancestry
+//!   would be promoted into independent PDUs that each re-walk the peer.
 //! - **Non-retryable** (malformed / misrouted — can never apply): drop it
 //!   (unstage + log).
 //! - **UnknownRoom / storage fault**: back off and retry.
@@ -62,7 +71,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::gapfill::fill_state_ancestry;
+use crate::gapfill::{GapFillError, fill_state_ancestry};
 use crate::ports::MissingEventsFetcher;
 use crate::room_actor::{RoomActorError, RoomRegistry};
 use crate::util::{BACKOFF_BASE, jitter, next_backoff, room_version};
@@ -236,10 +245,14 @@ async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
 
         // Eligible = not currently in a backoff window. A backing-off PDU is
         // skipped (left staged), never dequeued, so it can't block its siblings.
+        // A fetched row inherits its root's window: re-applying it while the
+        // root waits would fail identically (its ancestry is what the root is
+        // waiting to fetch).
         let now = Instant::now();
+        let waiting = |id: &OwnedEventId| backoff.get(id).is_some_and(|b| b.next > now);
         let eligible: Vec<StagedPdu> = rows
             .into_iter()
-            .filter(|p| backoff.get(&p.event_id).is_none_or(|b| b.next <= now))
+            .filter(|p| !waiting(&p.event_id) && !p.fetched_for.as_ref().is_some_and(waiting))
             .collect();
 
         if eligible.is_empty() {
@@ -286,7 +299,7 @@ async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
         // real signature/parse gate (they were staged on faith and deferred it
         // here); for rows staged after an earlier admit it is defensive.
         // Unstage rather than spin forever.
-        for staged in toposort(parse_or_drop(&ctx, &eligible, &version).await) {
+        for staged in toposort(parse_or_drop(&ctx, &room, &eligible, &version).await) {
             process_one(&ctx, &room, staged, &mut backoff).await;
         }
     }
@@ -301,6 +314,7 @@ async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
 /// skipped.
 async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
     ctx: &WorkerCtx<S>,
+    room: &RoomId,
     eligible: &[StagedPdu],
     version: &Arc<neutrino_event::RoomVersion>,
 ) -> Vec<Staged> {
@@ -317,6 +331,7 @@ async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
                 out.push(Staged {
                     event: wire.into_event(),
                     origin: p.origin.clone(),
+                    fetched_for: p.fetched_for.clone(),
                 });
             }
             // Failed admission: unparseable, bad content hash, or — under a
@@ -325,7 +340,7 @@ async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
             // retry, so drop it rather than spin.
             Err(e) => {
                 warn!(event_id = %p.event_id, error = %e, "dropping staged PDU that failed admission (parse / content-hash / signature)");
-                unstage(ctx, &p.event_id).await;
+                unstage(ctx, room, &p.event_id).await;
             }
         }
     }
@@ -333,10 +348,12 @@ async fn parse_or_drop<S: StorageBackend + WithStateProvider + 'static>(
 }
 
 /// One staged event paired with the server it arrived from (the gap-fill fetch
-/// target). The `Event` carries the DAG pointers `toposort` orders by.
+/// target) and, for fetched ancestry, the root PDU it was fetched for. The
+/// `Event` carries the DAG pointers `toposort` orders by.
 struct Staged {
     event: Event,
     origin: OwnedServerName,
+    fetched_for: Option<OwnedEventId>,
 }
 
 /// Integrate one staged PDU through the actor, updating `backoff` per the
@@ -352,16 +369,28 @@ async fn process_one<S: StorageBackend + WithStateProvider + 'static>(
         // Terminal: accepted, soft-failed, or rejected (federation persists
         // rejects). Either way it's integrated — drop it from staging.
         Ok(()) => {
-            unstage(ctx, &id).await;
+            unstage(ctx, room, &id).await;
             backoff.remove(&id);
         }
-        // Retryable verdict. `fill_state_ancestry` returns `Ok(true)` if it
-        // staged a real missing-ancestry gap — clear the backoff so the next
-        // pass applies the now-staged ancestry ahead of this PDU. `Ok(false)`
-        // means the ancestry was already grounded and nothing was fetched, i.e.
-        // the retryable verdict was a transient state-res / storage fault, not a
-        // gap — back off rather than spin re-applying. `Err` (unfillable / peer
-        // failure) also backs off.
+        // Retryable verdict on a *fetched* row: its own ancestry is still
+        // missing, which is the gap its root is (or will be) walking. Leave it
+        // staged, untouched — never start a second walk rooted here. It is
+        // skipped while the root backs off, and deleted with the root if the
+        // root's gap proves unfillable.
+        Err(RoomActorError::Apply(e)) if e.is_retryable() && staged.fetched_for.is_some() => {
+            debug!(%id, root = ?staged.fetched_for, "fetched ancestry still ungrounded; leaving it to its root's walk");
+        }
+        // Retryable verdict on a root. `fill_state_ancestry` returns `Ok(true)`
+        // if it staged a real missing-ancestry gap — clear the backoff so the
+        // next pass applies the now-staged ancestry ahead of this PDU.
+        // `Ok(false)` means the ancestry was already grounded and nothing was
+        // fetched, i.e. the retryable verdict was a transient state-res /
+        // storage fault, not a gap — back off rather than spin re-applying.
+        // `Err(Unfillable)` means the peer answered but has no path to create
+        // for this PDU: reject it (MSC4242 "SHOULD reject the `/send`"), taking
+        // the ancestry fetched for it along. `Err(Transient)` (peer unreachable
+        // / storage fault) backs off with that ancestry kept, so the retry
+        // resumes from the staged frontier.
         Err(RoomActorError::Apply(e)) if e.is_retryable() => {
             match fill_state_ancestry(
                 &*ctx.store,
@@ -379,8 +408,13 @@ async fn process_one<S: StorageBackend + WithStateProvider + 'static>(
                     debug!(%id, "retryable apply with no gap to fill; backing off");
                     bump_backoff(backoff, id, ctx.backoff_base);
                 }
-                Err(reason) => {
-                    warn!(%id, reason, "gap-fill failed; backing off");
+                Err(GapFillError::Unfillable(reason)) => {
+                    warn!(%id, reason, "rejecting PDU: state-DAG ancestry unfillable from peer");
+                    unstage(ctx, room, &id).await;
+                    backoff.remove(&id);
+                }
+                Err(GapFillError::Transient(reason)) => {
+                    warn!(%id, reason, "gap-fill failed transiently; backing off");
                     bump_backoff(backoff, id, ctx.backoff_base);
                 }
             }
@@ -389,7 +423,7 @@ async fn process_one<S: StorageBackend + WithStateProvider + 'static>(
         // never apply. Drop it so it neither blocks the queue nor retries.
         Err(RoomActorError::Apply(e)) => {
             warn!(%id, error = %e, "dropping un-appliable staged PDU");
-            unstage(ctx, &id).await;
+            unstage(ctx, room, &id).await;
             backoff.remove(&id);
         }
         // We have no record of this room. A federation `/send` only arrives for
@@ -400,7 +434,7 @@ async fn process_one<S: StorageBackend + WithStateProvider + 'static>(
         // permanent per-room task by naming nonexistent rooms.
         Err(RoomActorError::UnknownRoom) => {
             warn!(%id, %room, "dropping staged PDU for unknown room");
-            unstage(ctx, &id).await;
+            unstage(ctx, room, &id).await;
             backoff.remove(&id);
         }
         // Storage / actor faults: transient, back off and retry. (`Rejected`
@@ -412,13 +446,17 @@ async fn process_one<S: StorageBackend + WithStateProvider + 'static>(
     }
 }
 
-/// Delete `id` from staging, logging (not propagating) a removal fault — a
-/// surviving row is harmless (re-applied idempotently next pass).
+/// Delete `id` from staging together with any ancestry fetched on its behalf
+/// (`fetched_for = id`; a no-op for a non-root or a root with nothing fetched),
+/// so a dropped root never leaves orphaned fetched rows that nothing would
+/// ground or clean up. Logs (does not propagate) a removal fault — a surviving
+/// row is harmless (re-applied idempotently next pass).
 async fn unstage<S: StorageBackend + WithStateProvider + 'static>(
     ctx: &WorkerCtx<S>,
+    room: &RoomId,
     id: &OwnedEventId,
 ) {
-    if let Err(e) = ctx.store.unstage_events(&[id.as_ref()]).await {
+    if let Err(e) = ctx.store.unstage_with_fetched(room, id).await {
         error!(%id, error = %e, "unstaging processed PDU");
     }
 }
@@ -506,6 +544,7 @@ mod tests {
         Staged {
             event,
             origin: server_name!("example.org").to_owned(),
+            fetched_for: None,
         }
     }
 

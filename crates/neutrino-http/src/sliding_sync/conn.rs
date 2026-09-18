@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use ruma::api::client::sync::sync_events::v5;
 use ruma::api::client::sync::sync_events::v5::request;
 use ruma::events::StateEventType;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
@@ -137,7 +136,7 @@ pub struct Conn {
     ///
     /// Includes the post-processing extension stubs so the cached response
     /// matches exactly what the client got the first time, byte-for-byte.
-    pub last_response: Option<v5::Response>,
+    pub last_response: Option<super::SyncResponse>,
 }
 
 impl Conn {
