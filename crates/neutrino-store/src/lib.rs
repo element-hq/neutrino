@@ -704,6 +704,36 @@ pub struct OobMembership {
     pub event: Event,
     pub membership: Membership,
     pub room_version: String,
+    /// The `events` stream high-water mark when this row was written. Orders
+    /// the stub against the in-room `m.room.member` event for the same
+    /// (room, user) — see [`ResolvedMembership`].
+    pub learned_after: u64,
+}
+
+/// The authoritative `m.room.member` event for one (room, user), resolved
+/// across the two tables that can each hold one.
+///
+/// Both can be populated at once and **either** can be the newer fact:
+/// - the stub is newer when a peer invites a user to a room this server has
+///   left (the in-room `leave` is frozen; the invite arrives out of band), and
+/// - the in-room event is newer when the user joined for real and a stale stub
+///   was left behind.
+///
+/// Neither "in-room always wins" nor "stub always wins" is correct, and the
+/// server's current membership in the room does not decide it either — a stub
+/// written *before* the server joined outlives the join. Only an explicit
+/// order does, so `oob_memberships.learned_after` records the `events` stream
+/// high-water mark at write time and the newer row wins. Ties favour the stub:
+/// a stub recording watermark P was necessarily written after event P was
+/// already in the table.
+#[derive(Debug, Clone)]
+pub struct ResolvedMembership {
+    pub event: Event,
+    pub membership: Membership,
+    /// `true` when the winning row came from `oob_memberships` — the caller
+    /// needs this because an out-of-band membership has no room DAG behind it
+    /// (no timeline, no current state to read).
+    pub out_of_band: bool,
 }
 
 #[async_trait]
@@ -756,6 +786,29 @@ pub trait OobMembershipStore: Send + Sync {
         &self,
         user_id: &UserId,
     ) -> Result<Vec<(OwnedRoomId, Membership)>, StorageError>;
+
+    /// Pre:  none.
+    /// Post: the user's authoritative member event for `room_id` — the newer
+    ///       of the in-room current-state event and the out-of-band stub, per
+    ///       [`ResolvedMembership`]. `None` if neither table holds one. One
+    ///       round trip: the comparison happens inside a single read.
+    async fn resolved_member_event(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+    ) -> Result<Option<ResolvedMembership>, StorageError>;
+
+    /// Pre:  none.
+    /// Post: the bulk form of [`resolved_member_event`](Self::resolved_member_event):
+    ///       one `(room_id, membership, out_of_band)` per room in which
+    ///       `user_id`'s winning membership is in `memberships`. Exactly one
+    ///       row per room — the union is resolved in the store, so a caller
+    ///       cannot double-count a room held in both tables.
+    async fn resolved_memberships(
+        &self,
+        user_id: &UserId,
+        memberships: &BTreeSet<Membership>,
+    ) -> Result<Vec<(OwnedRoomId, Membership, bool)>, StorageError>;
 }
 
 /// The server's persistent identity facts: the opaque 32-byte node secret and

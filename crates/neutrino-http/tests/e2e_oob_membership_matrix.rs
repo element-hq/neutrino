@@ -61,7 +61,7 @@
 //!
 //! ```text
 //! endpoint          never            invited          joined     left
-//! /invite           200, sync=invite 200, sync=invite 200, join   200, sync=leave (F3)
+//! /invite           200, sync=invite 200, sync=invite 200, join   200, sync=invite
 //! /send rescission  200, no room     200, sync=leave  200, leave  200, leave
 //! ```
 //!
@@ -75,48 +75,37 @@
 //! of room existence, version and current DAG heads.
 //! Pinned by `make_leave_hands_out_a_template_send_leave_will_refuse`.
 //!
-//! **F2 — an out-of-band invite is invisible to the state endpoint.**
-//! `/sync` buckets it under `invite`; `GET /rooms/{id}/state/m.room.member/{u}`
-//! 404s, because an out-of-band membership has no room DAG to be state in. Two
-//! client-facing surfaces disagree about whether the user is invited.
+//! **F2 (open) — the two client surfaces disagree about membership.**
+//! `/sync` answers "what is my membership" and sees out-of-band memberships;
+//! `GET /rooms/{id}/state/m.room.member/{u}` answers "what is the room's
+//! state" and does not. For a pure out-of-band invite the state endpoint 404s
+//! (no room DAG); for an invite to a room the server has *left* it returns the
+//! stale in-room `leave` while sync correctly says `invite`. Both are
+//! defensible under their own definitions — Synapse 403s `/state` for a room
+//! you are not in — but a client reading membership through the state endpoint
+//! alone gets the wrong answer. Not fixed here.
 //! Pinned by `oob_invite_is_visible_to_sync_but_not_to_the_state_endpoint`.
 //!
-//! **F3 — a re-invite after invite → join → leave is never shown to the
-//! client.** The invite is delivered, accepted (200), stored, and A's state
-//! records it — but B's `/sync` shows the room as `leave` and never buckets it
-//! under `invite`. Confirmed on the full product path, driven entirely through
-//! both client APIs, on **both** `public_chat` and `private_chat`.
+//! **F3 (fixed) — a re-invite after invite → join → leave reaches the client.**
+//! Two tables can hold a user's membership for one room and *either* can be the
+//! newer fact: the stub is newer when a peer invites a user to a room this
+//! server has left, the in-room event is newer when the user joined for real
+//! and a stale stub was left behind. The previous rule ("in-room always wins",
+//! encoded independently in `candidate_rooms`, `member_event` and `oob_left`)
+//! got the first case wrong and silently dropped the invite.
 //!
-//! Root cause is one line: `sliding_sync/build.rs:375-377` skips an
-//! out-of-band membership whenever the user has *any* in-room membership row
-//! for that room —
+//! The server's presence in the room does not decide it either — a stub
+//! written *before* the server joined outlives the join, so once every local
+//! user leaves, that dead stub would beat the correct in-room `leave`. Only an
+//! explicit order works: `oob_memberships.learned_after` records the `events`
+//! stream high-water mark at write time, and the newer row wins (ties favour
+//! the stub). The rule lives once, in the store — `resolved_member_event` /
+//! `resolved_memberships` — because the two tables are a storage detail and
+//! only the store can compare them in one read.
 //!
-//! ```text
-//! for (room_id, membership) in state.store.oob_memberships(user_id).await? {
-//!     if in_room.contains(&room_id) { continue; }
-//! ```
-//!
-//! Its comment reads "a real membership supersedes a stale stub", but the
-//! precedence is unconditioned on recency, and here the roles are reversed:
-//! the stub is the *newer* fact and the in-room `leave` is the stale one.
-//! B holds no newer in-room membership because B is not in the room, so A
-//! sends the invite via `/invite` (the out-of-band envelope), never `/send`.
-//!
-//! The invite is not lost, only unshown — `csapi_invite_join_leave_reinvite_
-//! round_trip` discriminates the two: B's user can *decline* the invite it
-//! cannot see, and declining moves A's state `invite` → `leave`, which only a
-//! real stub-backed reject handshake can do. Joining also still works, on an
-//! invite-only room too, because A's room state holds a valid invite — so the
-//! user can act on an invite their client never showed them, if they find
-//! another way to the room.
-//!
-//! (Correcting an earlier reading of this: the invite-only case is *not*
-//! unrecoverable — the join succeeds. The defect is purely that the client is
-//! never told, which for a normal user is indistinguishable from never having
-//! been invited.)
-//!
-//! Pinned by `invite_to_a_room_the_invitee_left_is_accepted_but_not_surfaced`
-//! (raw S2S) and `csapi_invite_join_leave_reinvite_round_trip` (product path).
+//! Pinned by `invite_to_a_room_the_invitee_left_is_surfaced` (raw S2S) and
+//! `csapi_invite_join_leave_reinvite_round_trip` (product path, both presets),
+//! with the ordering rule itself covered in `neutrino-store-sqlite`.
 //!
 //! **No wedges found.** Across all 40 permutations: no 5xx, the resident could
 //! always still send into its own room, every refusal left the prior state
@@ -321,18 +310,19 @@ async fn effective_membership(
     room: &str,
     user: &OwnedUserId,
 ) -> Option<String> {
-    if let Some(m) = membership(http, node, room, user).await {
-        return Some(m);
-    }
+    // Sync first: it answers "what is my membership", which is the question
+    // here, and it is the surface that sees an out-of-band membership. The
+    // state endpoint answers "what is the room's state", which for a room the
+    // server has left is a real but stale `leave` — see F2.
     let (joined, invited, left) = sync_buckets(http, node, room).await;
     match (joined, invited, left) {
-        (true, _, _) => Some("join".to_owned()),
-        (_, true, _) => Some("invite".to_owned()),
-        (_, _, true) => Some("leave".to_owned()),
-        _ => None,
+        (true, _, _) => return Some("join".to_owned()),
+        (_, true, _) => return Some("invite".to_owned()),
+        (_, _, true) => return Some("leave".to_owned()),
+        _ => {}
     }
+    membership(http, node, room, user).await
 }
-
 /// Wait until `pred` holds over the *effective* membership `node` reports.
 async fn settle_effective(
     http: &reqwest::Client,
@@ -1254,14 +1244,13 @@ async fn oob_invite_is_visible_to_sync_but_not_to_the_state_endpoint() {
     );
 }
 
-/// FINDING (F3), raw-S2S form. An invite for a room the invitee's server has
-/// **left** is accepted with 200 but never surfaces: `build.rs:375-377` skips
-/// the out-of-band stub because an in-room membership row exists for the room,
-/// even though that row is the stale `leave` and the stub is the newer fact.
-/// See `csapi_invite_join_leave_reinvite_round_trip` for the same defect on
-/// the full product path, and the module docs for the analysis.
+/// F3, raw-S2S form: an invite for a room the invitee's server has **left**
+/// must reach the invitee. The stale in-room `leave` and the fresh stub are
+/// ordered by `oob_memberships.learned_after`, so the newer one — the invite —
+/// wins. See `csapi_invite_join_leave_reinvite_round_trip` for the product
+/// path and the module docs for the rule.
 #[tokio::test]
-async fn invite_to_a_room_the_invitee_left_is_accepted_but_not_surfaced() {
+async fn invite_to_a_room_the_invitee_left_is_surfaced() {
     let a = start_node("alice").await;
     let b = start_node("bob").await;
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1286,16 +1275,15 @@ async fn invite_to_a_room_the_invitee_left_is_accepted_but_not_surfaced() {
     .await;
     assert_eq!(status, 200, "the invite is accepted: {body}");
 
-    // ...but the invitee is still shown as having left.
+    assert_eq!(
+        settle_effective(&http, &b, &room, &b.user, |m| m == Some("invite")).await,
+        Some("invite".to_owned()),
+        "the invite is newer than the in-room leave, so it must win"
+    );
     let (_, invited, _) = sync_buckets(&http, &b, &room).await;
     assert!(
-        !invited,
-        "documenting current behaviour: the accepted invite does NOT reach \
-         the invitee's sync when a stale in-room leave outranks it"
-    );
-    assert_eq!(
-        membership(&http, &b, &room, &b.user).await.as_deref(),
-        Some("leave"),
+        invited,
+        "and it must reach the invitee's sync invite bucket"
     );
 }
 
@@ -1394,6 +1382,15 @@ async fn csapi_invite_join_leave_reinvite_round_trip() {
             seen,
             invited_bucket,
             membership(&http, &b, &room, &b.user).await,
+        );
+        assert_eq!(
+            seen.as_deref(),
+            Some("invite"),
+            "[{preset}] the re-invite must reach the client"
+        );
+        assert!(
+            invited_bucket,
+            "[{preset}] and must be bucketed under invite in /sync"
         );
 
         // The invite is not lost, only unshown: B's user can *decline* it, and

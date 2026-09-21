@@ -397,6 +397,17 @@ CREATE TABLE oob_memberships (
     membership   TEXT NOT NULL CHECK (membership IN ('invite', 'leave', 'ban')),
     room_version TEXT NOT NULL CHECK (room_version <> ''),
     json         TEXT NOT NULL,
+    -- The `events.stream_pos` high-water mark at the moment this row was
+    -- written, so an out-of-band membership can be ordered against the in-room
+    -- `m.room.member` event for the same (room, user) — both tables can hold
+    -- one, and either can be the newer fact. A watermark, not an allocation:
+    -- `MAX(events.stream_pos)` is read inside the same write transaction. The
+    -- stub is newer iff `learned_after >= events.stream_pos` of the in-room
+    -- event; a tie means the stub was written after that event was already in
+    -- the table, so ties favour the stub. Never derived from remote input or a
+    -- clock. No `user_version` bump (additive, no live data, no migration
+    -- framework — same policy as the other late tables).
+    learned_after INTEGER NOT NULL,
     PRIMARY KEY (room_id, state_key)
 ) STRICT, WITHOUT ROWID;
 

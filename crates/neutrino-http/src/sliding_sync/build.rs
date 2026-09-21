@@ -337,16 +337,27 @@ async fn candidate_rooms<S: StorageBackend>(
         Membership::Leave,
         Membership::Ban,
     ]);
+    // One row per room, with the in-room / out-of-band conflict already
+    // resolved by the store (see `ResolvedMembership`): either table can hold
+    // the newer fact, and a room present in both must not be counted twice.
     let pairs = state
         .store
-        .rooms_with_membership(user_id, &memberships)
+        .resolved_memberships(user_id, &memberships)
         .await?;
-    // Rooms we hold state for — used to skip an out-of-band invite stub that's
-    // been superseded by real in-room membership (in-room state wins).
-    let in_room: HashSet<OwnedRoomId> = pairs.iter().map(|(r, _)| r.clone()).collect();
 
     let mut ranked: Vec<RankedRoom> = Vec::with_capacity(pairs.len());
-    for (room_id, membership) in pairs {
+    for (room_id, membership, out_of_band) in pairs {
+        if out_of_band {
+            if !include_oob_per_msc4186(state, user_id, &room_id, membership, conn).await? {
+                continue;
+            }
+            ranked.push(RankedRoom {
+                bump_stamp: bump_stamp_for_invited(state, &room_id, user_id).await?,
+                room_id,
+                membership,
+            });
+            continue;
+        }
         if !include_room_per_msc4186(state, user_id, &room_id, membership, conn).await? {
             continue;
         }
@@ -360,25 +371,6 @@ async fn candidate_rooms<S: StorageBackend>(
             }
             _ => bump_stamp_for_joined(state, &room_id).await?,
         };
-        ranked.push(RankedRoom {
-            room_id,
-            bump_stamp,
-            membership,
-        });
-    }
-
-    // Union in out-of-band memberships (invites, and the leaves/bans that ended
-    // them, for rooms this server is not in — stored outside `current_state`).
-    // Skip any that in-room state already covers — a real membership supersedes
-    // a stale stub.
-    for (room_id, membership) in state.store.oob_memberships(user_id).await? {
-        if in_room.contains(&room_id) {
-            continue;
-        }
-        if !include_oob_per_msc4186(state, user_id, &room_id, membership, conn).await? {
-            continue;
-        }
-        let bump_stamp = bump_stamp_for_invited(state, &room_id, user_id).await?;
         ranked.push(RankedRoom {
             room_id,
             bump_stamp,
@@ -786,20 +778,13 @@ async fn oob_left<S: StorageBackend>(
     user_id: &UserId,
     room_id: &RoomId,
 ) -> Result<Option<Event>, SyncError> {
-    if state
-        .store
-        .current_state_event(room_id, "m.room.member", user_id.as_str())
-        .await?
-        .is_some()
-    {
-        return Ok(None);
-    }
     Ok(state
         .store
-        .get_oob_membership(room_id, user_id)
+        .resolved_member_event(room_id, user_id)
         .await?
-        .filter(|m| matches!(m.membership, Membership::Leave | Membership::Ban))
-        .map(|m| m.event))
+        .filter(|r| r.out_of_band)
+        .filter(|r| matches!(r.membership, Membership::Leave | Membership::Ban))
+        .map(|r| r.event))
 }
 
 /// An out-of-band leave/ban has no timeline here: the member event itself is
@@ -840,18 +825,11 @@ async fn member_event<S: StorageBackend>(
     user_id: &UserId,
     room_id: &RoomId,
 ) -> Result<Option<Event>, SyncError> {
-    if let Some(ev) = state
-        .store
-        .current_state_event(room_id, "m.room.member", user_id.as_str())
-        .await?
-    {
-        return Ok(Some(ev));
-    }
     Ok(state
         .store
-        .get_oob_membership(room_id, user_id)
+        .resolved_member_event(room_id, user_id)
         .await?
-        .map(|m| m.event))
+        .map(|r| r.event))
 }
 
 /// Whether `user_id`'s current `m.room.member` event in `room_id` is `invite`

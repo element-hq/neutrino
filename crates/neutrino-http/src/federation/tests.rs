@@ -6461,25 +6461,54 @@ async fn outbound_reject_invite_unreachable_server_still_removes_stub() {
 
 #[tokio::test]
 async fn csapi_leave_of_a_joined_room_ignores_a_stale_oob_stub() {
-    // Nothing clears an out-of-band stub once the server joins the room, so a
-    // stale leave/ban row can sit alongside a real in-room membership. In-room
-    // state wins: `/leave` must emit the leave rather than short-circuit on the
-    // stub, which would otherwise make the endpoint a permanent no-op for that
-    // room (the row is never removed, so every retry hits the same branch).
-    let (app, store, room_id, alice, join_id, _tempfile) = seed_joined_room().await;
+    // A stub written *before* the user joined is stale, and a later in-room
+    // join supersedes it: `/leave` must emit a real leave rather than
+    // short-circuit on the stub, which would make the endpoint a permanent
+    // no-op for that room. Ordering is what makes the stub stale — see
+    // `ResolvedMembership`; the stub is planted first for exactly that reason.
+    let (store, _tempfile) = fresh_store().await;
+    let alice = alice();
     let bob = inviter();
-    // A stale out-of-band *leave* stub for a room alice is genuinely joined to.
+    let create = EventBuilder::new(
+        alice.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
+    let room_id = create.room_id.clone();
+
     let stale = member_pdu(
         &bob,
         alice.as_str(),
         &room_id,
         "leave",
-        std::slice::from_ref(&join_id),
+        std::slice::from_ref(&create.event_id),
     );
     store
         .put_oob_membership(&room_id, &alice, &stale, ROOM_VERSION_ID)
         .await
         .unwrap();
+
+    let join = EventBuilder::new(
+        alice.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(alice.as_str().to_owned())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create.event_id.clone()])
+    .prev_state_events(vec![create.event_id.clone()])
+    .build()
+    .expect("build join");
+    store
+        .create_room(&create, &[join])
+        .await
+        .expect("create_room");
+    let app = router_with_store(config(), store.clone());
     assert_eq!(
         current_membership_str(&store, &room_id, &alice)
             .await

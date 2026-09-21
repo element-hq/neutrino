@@ -220,6 +220,7 @@ Intentional gaps in the sliding-sync implementation — see `MSC4186-gaps.md`:
 - room heroes
 - `expanded_timeline`
 - state-stub emission for removed state (clients keep their stale view of removed state)
+- `GET /rooms/{id}/state/m.room.member/{user}` does not reflect out-of-band memberships: it 404s for an invite to a room the server is not in, and returns the stale in-room `leave` for an invite to a room the server has left, while `/sync` correctly reports `invite`. Two client surfaces, two answers. (Synapse 403s `/state` for a room you are not in.)
 
 ### createRoom
 
@@ -240,6 +241,7 @@ Intentional gaps in the sliding-sync implementation — see `MSC4186-gaps.md`:
 ### Server-Server follow-ons
 
 - orphan-staging garbage collection: a max-age sweep of `staged_events` (federation gap-fill ancestry that never grounds)
+- out-of-band membership sweep: `oob_memberships` rows are pruned when the room's current state supersedes them (in the persist txn), but a stub for a room whose state never moves again — a declined invite to a room we are not in — is kept for good. Bounded by rooms-ever-invited-to, and inert (it can never win a `learned_after` comparison), so this is growth hygiene only.
 - inbound `/get_missing_events` deterministic ordering: the `state_dag` walk is min-hops + lexicographic, but the timeline walk still sorts by `origin_server_ts`; either responder stops at `limit` rather than continuing to the create event (the multi-round requester compensates functionally)
 - large state-DAG handling: `send_join` / `send_leave` serialize the whole state DAG into one response and state-res holds it in memory — streaming JSON is a future option if rooms get large
 - anti-entropy advertisement coalescing: the joined-set-growth advertisement (MSC anti-entropy-extension) drains all of a destination's owed rooms in one transaction, but the MSC's optional ~30s debounce window — coalescing triggers that arrive moments apart into a single send — is not implemented; each trigger that finds the link quiet advertises promptly. Deferred (MAY).

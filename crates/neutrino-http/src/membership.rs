@@ -239,18 +239,15 @@ pub(crate) async fn leave(
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    // The out-of-band stub table is authoritative for a (room, user) exactly
-    // when this server is not in the room — the same predicate `/invite` uses
-    // to decide where to put the membership in the first place. Once we are in
-    // the room the DAG wins, even if a stale stub survives alongside it
-    // (nothing clears one). A `rooms` row alone is not that predicate: we keep
-    // it after leaving, and a re-invite to such a room is stored out of band.
-    let (store, own_server) = {
-        let app = lock_app(&state.0);
-        (app.store.clone(), app.config.server_name.clone())
-    };
-    let in_room = match crate::federation::server_in_room(&*store, &room, &own_server).await {
-        Ok(v) => v,
+    // Which of the two membership tables holds the current fact is the store's
+    // call (see `ResolvedMembership`) — either can be the newer one, and the
+    // server's presence in the room does not decide it. Resolved *before*
+    // `require_room`, which would otherwise 404 a room we have no `rooms` row
+    // for. A storage fault is surfaced as a 500 rather than silently mistaken
+    // for "no invite" (which would 404 the room).
+    let store = lock_app(&state.0).store.clone();
+    let resolved = match store.resolved_member_event(&room, &sender).await {
+        Ok(r) => r,
         Err(e) => {
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -259,14 +256,10 @@ pub(crate) async fn leave(
             );
         }
     };
-    // An out-of-band invite (a room this server is not in, held only as an
-    // out-of-band stub) is declined via the federated leave handshake, the
-    // completed leave replacing the stub. Checked *before* `require_room`,
-    // which would otherwise 404 a room we have no `rooms` row for. A storage
-    // fault here is surfaced as a 500 rather than silently mistaken for "no
-    // invite" (which would 404 the room). The loaded stub is handed to
-    // `reject_invite` so it need not re-read it.
-    if !in_room {
+    // An out-of-band invite (held as a stub, for a room whose DAG cannot carry
+    // it) is declined via the federated leave handshake, the completed leave
+    // replacing the stub.
+    if resolved.as_ref().is_some_and(|r| r.out_of_band) {
         match store.get_oob_membership(&room, &sender).await {
             Ok(Some(oob)) if oob.membership == Membership::Invite => {
                 return crate::federation::leave::reject_invite(&state.0, sender, &room, oob).await;

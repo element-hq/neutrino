@@ -1359,14 +1359,16 @@ async fn in_room_membership_wins_over_oob_invite_stub() {
     let inviter = user_id!("@bob:other.example.org");
     let room = room_id!("!shared:example.org");
 
-    // We host the room and the user is joined …
-    setup_joined_room(&store, room, user).await;
-    // … yet a stale OOB invite stub for the same (room, user) also exists.
+    // An OOB invite stub arrives first …
     let stub = oob_invite_event(room, user, inviter, "Stale Invite", 50);
     store
         .put_oob_membership(room, user, &stub, neutrino_event::ROOM_VERSION_ID)
         .await
         .unwrap();
+    // … and is then superseded: we host the room and the user joins for real.
+    // Order is the point — the stub is stale because it is *older*, not
+    // because it is out-of-band (see `ResolvedMembership`).
+    setup_joined_room(&store, room, user).await;
 
     let state = SyncState::new(store, no_shutdown());
     let mut req = Request::new();
@@ -1381,7 +1383,8 @@ async fn in_room_membership_wins_over_oob_invite_stub() {
         "in-room join membership wins: the room is NOT rendered as an invite \
          despite the lingering OOB stub"
     );
-    // And it appears exactly once (the OOB union skipped it via `in_room`).
+    // And it appears exactly once — the store resolves the two sources into
+    // a single row per room.
     assert_eq!(resp.lists.get("all").unwrap().count, UInt::from(1u32));
 }
 
