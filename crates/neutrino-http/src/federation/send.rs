@@ -44,7 +44,7 @@ use axum::{
     http::HeaderMap,
 };
 use neutrino_event::{EventPolicy, Wire};
-use neutrino_store::{FederationInbox, OobMembershipStore, StagingStore, StorageError};
+use neutrino_store::{FederationInbox, OobMembershipStore, RoomStore, StagingStore, StorageError};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
@@ -116,7 +116,7 @@ pub(crate) struct ResponseBody {
 /// stage it like any other. `Ok(Some(id))` = consumed, whether stored or
 /// dropped (malformed, or not naming the stub it supersedes).
 async fn apply_oob_membership(
-    store: &impl OobMembershipStore,
+    store: &(impl OobMembershipStore + RoomStore),
     policy: &EventPolicy,
     origin: &ServerName,
     our_name: &str,
@@ -152,6 +152,15 @@ async fn apply_oob_membership(
     let Some(stub) = store.get_oob_membership(room_id, &user).await? else {
         return Ok(None);
     };
+    // A stub can outlive the server joining the room: another local user joins,
+    // or this user accepts locally, and nothing clears the row. Once we hold the
+    // room the PDU belongs in the room DAG — staging it is what actually applies
+    // the kick — so the out-of-band path must stand down. Without this the event
+    // would be diverted into the stub table and acked as applied while the room
+    // never saw it.
+    if store.room_exists(room_id).await? {
+        return Ok(None);
+    }
     let Some(version) = policy.versions.get(&stub.room_version).cloned() else {
         warn!(%room_id, version = %stub.room_version, "/send: out-of-band stub names a version this build does not speak");
         return Ok(None);

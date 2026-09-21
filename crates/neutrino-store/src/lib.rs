@@ -409,14 +409,12 @@ pub struct AncestryGap {
     /// ancestry is fully grounded (staged ∪ committed), so the staged subgraph
     /// can be applied (the inbound worker re-drains it).
     pub missing: Vec<OwnedEventId>,
-    /// Staged event ids reachable from the query heads via `prev_state_events`
-    /// (a staged head counts itself) — the cached ancestry the worker drains
-    /// once `missing` is empty. Unordered.
-    pub staged: Vec<OwnedEventId>,
-    /// The subset of `staged` with at least one `prev_state_events` entry in
-    /// `missing` — the backward extremities of the staged subgraph, i.e. the
-    /// `latest_events` a peer fetch walks back from. Empty iff `missing` is
-    /// empty or every missing id is a query head. Unordered.
+    /// Staged events reachable from the query heads (a staged head counts
+    /// itself) with at least one `prev_state_events` entry in `missing` — the
+    /// backward extremities of the staged subgraph, i.e. the `latest_events` a
+    /// peer fetch walks back from. Empty when `missing` is empty; note it can
+    /// also be non-empty while every missing id is a query head (a staged head
+    /// whose own parent is unheld). Unordered.
     pub frontier: Vec<OwnedEventId>,
 }
 

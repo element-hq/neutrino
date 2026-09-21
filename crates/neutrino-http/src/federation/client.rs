@@ -521,18 +521,18 @@ impl FederationClient {
         parse_2xx::<InviteResponse>(resp, dest, "PUT /invite").await
     }
 
-    /// `GET http://{dest}/_matrix/federation/v1/make_leave/{room}/{user}?ver={ver}`
-    /// — request a leave/rejection template from the resident (the first half of
-    /// the leave handshake; used by us to reject an invite). Returns the template
-    /// and the room's version. We send our `ver` for completeness; a spec-
-    /// compliant resident is lenient on leave (a user must always be able to
-    /// depart a room it is in) and won't gate on it.
+    /// `GET http://{dest}/_matrix/federation/v1/make_leave/{room}/{user}` —
+    /// request a leave/rejection template from the resident (the first half of
+    /// the leave handshake; used by us to reject an invite). Returns the
+    /// template and the room's version. Unlike `make_join` there is no `ver`
+    /// query parameter: the spec defines room-version negotiation for
+    /// `make_join` only, and a user must always be able to depart a room. The
+    /// resident's stated version is checked by the caller instead.
     pub(crate) async fn make_leave(
         &self,
         dest: &ServerName,
         room_id: &RoomId,
         user_id: &UserId,
-        vers: &[&str],
     ) -> Result<MakeLeaveResponse, FederationClientError> {
         info!(target: "neutrino_http", %dest, %room_id, %user_id, "outbound GET /_matrix/federation/v1/make_leave");
         let mut url = Url::parse(&format!(
@@ -544,10 +544,6 @@ impl FederationClient {
             .map_err(|()| FederationClientError::InvalidUrl)?
             .push(room_id.as_str())
             .push(user_id.as_str());
-        // Repeated `ver` — see `make_join`.
-        for ver in vers {
-            url.query_pairs_mut().append_pair("ver", ver);
-        }
 
         let resp = self
             .request(Method::GET, url, dest, None::<&Value>)?

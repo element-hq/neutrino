@@ -194,9 +194,8 @@ impl StagingStore for SqliteStore {
                     .map_err(|e| Error::Internal(format!("malformed staged event_id: {e}")))?;
                 if is_staged {
                     if parent_missing {
-                        gap.frontier.push(id.clone());
+                        gap.frontier.push(id);
                     }
-                    gap.staged.push(id);
                 } else if !is_committed {
                     gap.missing.push(id);
                 }
@@ -419,7 +418,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(gap.missing, vec![b.event_id.clone()]);
-        assert_eq!(gap.staged, vec![c.event_id.clone()]);
         assert_eq!(
             gap.frontier,
             vec![c.event_id.clone()],
@@ -435,11 +433,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(gap.missing, vec![a.event_id.clone()]);
-        let mut staged = gap.staged;
-        staged.sort();
-        let mut want = vec![b.event_id.clone(), c.event_id.clone()];
-        want.sort();
-        assert_eq!(staged, want);
         assert_eq!(
             gap.frontier,
             vec![b.event_id.clone()],
@@ -454,7 +447,6 @@ mod tests {
             .await
             .unwrap();
         assert!(gap.missing.is_empty(), "grounded once A is committed");
-        assert_eq!(gap.staged.len(), 2);
         assert!(
             gap.frontier.is_empty(),
             "no staged event has a missing parent"
@@ -486,11 +478,6 @@ mod tests {
             vec![a.event_id.clone()],
             "A reached via two staged paths must appear once (UNION, not UNION ALL)"
         );
-        let mut staged = gap.staged;
-        staged.sort();
-        let mut want = vec![c.event_id.clone(), d.event_id.clone()];
-        want.sort();
-        assert_eq!(staged, want);
     }
 
     #[tokio::test]
@@ -510,7 +497,7 @@ mod tests {
             .unwrap();
         // Under the other room it is neither staged nor committed → missing.
         assert_eq!(gap.missing, vec![a.event_id.clone()]);
-        assert!(gap.staged.is_empty());
+        assert!(gap.frontier.is_empty());
     }
 
     #[tokio::test]

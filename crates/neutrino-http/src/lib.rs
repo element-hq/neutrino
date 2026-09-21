@@ -1764,21 +1764,40 @@ fn build_initial_events(
 /// share the creator's power" is expressed in a v12-family room, and it is
 /// what Synapse does: creators hold implicit infinite power, which a numeric
 /// `users` entry cannot express, and a `users` entry would break the moment an
-/// invitee replaces the power-levels event without re-listing themselves. The
+/// invitee replaces the power-levels event without re-listing themselves.
+///
+/// The preset's creators are *unioned* with any the client named in
+/// `creation_content.additional_creators`, never substituted for them. The
 /// creator is never listed (`invite_targets` drops them) and the list is
-/// deduplicated, since rule 1.4 only demands valid user ids.
+/// sorted + deduplicated, since rule 1.4 only demands valid user ids.
+/// Malformed entries are dropped, matching `invite_targets`; the rest of
+/// `creation_content` is not yet honoured (see PLAN.md).
 fn create_content(sender: &OwnedUserId, body: &Value, version: &RoomVersion) -> Value {
     let mut content = json!({ "room_version": version.id });
+    let mut creators: Vec<String> = body
+        .pointer("/creation_content/additional_creators")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(|s| s.parse::<OwnedUserId>().ok())
+                .filter(|u| u != sender)
+                .map(|u| u.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
     if body.pointer("/preset").and_then(Value::as_str) == Some("trusted_private_chat") {
-        let mut creators: Vec<String> = invite_targets(sender, body)
-            .into_iter()
-            .map(|u| u.to_string())
-            .collect();
-        creators.sort();
-        creators.dedup();
-        if !creators.is_empty() {
-            content["additional_creators"] = json!(creators);
-        }
+        creators.extend(
+            invite_targets(sender, body)
+                .into_iter()
+                .map(|u| u.to_string()),
+        );
+    }
+    creators.sort();
+    creators.dedup();
+    if !creators.is_empty() {
+        content["additional_creators"] = json!(creators);
     }
     content
 }

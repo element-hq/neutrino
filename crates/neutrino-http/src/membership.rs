@@ -239,36 +239,45 @@ pub(crate) async fn leave(
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    // An out-of-band invite (a room this server is not in, held only as an
-    // out-of-band stub) is declined via the federated leave handshake, the
-    // completed leave replacing the stub. Checked *before* `require_room`, which
-    // would otherwise 404 a room we have no `rooms` row for. A storage fault
-    // here is surfaced as a 500 rather than silently mistaken for "no invite"
-    // (which would 404 the room). The loaded stub is handed to `reject_invite`
-    // so it need not re-read it.
-    let store = lock_app(&state.0).store.clone();
-    match store.get_oob_membership(&room, &sender).await {
-        Ok(Some(oob)) if oob.membership == Membership::Invite => {
-            return crate::federation::leave::reject_invite(&state.0, sender, &room, oob).await;
-        }
-        // Already left (or banned) out of band: nothing to leave.
-        Ok(Some(_)) => return (StatusCode::OK, Json(json!({}))).into_response(),
-        Ok(None) => {}
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "M_UNKNOWN",
-                &e.to_string(),
-            );
+    // In-room state wins over an out-of-band stub, as it does in the sync
+    // builder's ranking: nothing clears a stub once the server joins the room,
+    // so a stale one can sit alongside a real membership. Resolved first, and
+    // reused by the no-op check below.
+    let in_room = match current_membership(&state.0, &room, &sender).await {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    // With no in-room membership, an out-of-band invite (a room this server is
+    // not in, held only as an out-of-band stub) is declined via the federated
+    // leave handshake, the completed leave replacing the stub. Checked *before*
+    // `require_room`, which would otherwise 404 a room we have no `rooms` row
+    // for. A storage fault here is surfaced as a 500 rather than silently
+    // mistaken for "no invite" (which would 404 the room). The loaded stub is
+    // handed to `reject_invite` so it need not re-read it.
+    if in_room.is_none() {
+        let store = lock_app(&state.0).store.clone();
+        match store.get_oob_membership(&room, &sender).await {
+            Ok(Some(oob)) if oob.membership == Membership::Invite => {
+                return crate::federation::leave::reject_invite(&state.0, sender, &room, oob).await;
+            }
+            // Already left (or banned) out of band: nothing to leave.
+            Ok(Some(_)) => return (StatusCode::OK, Json(json!({}))).into_response(),
+            Ok(None) => {}
+            Err(e) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "M_UNKNOWN",
+                    &e.to_string(),
+                );
+            }
         }
     }
     if let Err(resp) = require_room(&state.0, &room).await {
         return resp;
     }
-    match current_membership(&state.0, &room, &sender).await {
-        Ok(Some(m)) if matches!(m.as_str(), "invite" | "join" | "knock") => {}
-        Ok(_) => return (StatusCode::OK, Json(json!({}))).into_response(),
-        Err(resp) => return resp,
+    match in_room {
+        Some(m) if matches!(m.as_str(), "invite" | "join" | "knock") => {}
+        _ => return (StatusCode::OK, Json(json!({}))).into_response(),
     }
     match change_membership(
         &state.0,

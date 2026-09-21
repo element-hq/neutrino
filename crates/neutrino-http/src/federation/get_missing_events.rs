@@ -34,6 +34,12 @@ const DEFAULT_LIMIT: u32 = 10;
 /// ample headroom for exponential growth to take effect. Saturating cap, not a
 /// 400.
 const MAX_LIMIT: u32 = 1000;
+/// MSC4242: `earliest_events` and `latest_events` each have an independent size
+/// limit of 100 elements when `state_dag = true`, and a server exceeding it gets
+/// a 400. Both are derived from a room's forward extremities, which are expected
+/// to be far below this. Unlike `limit` this is a hard error, not a saturating
+/// cap — truncating the walk heads would silently answer a different question.
+const MAX_STATE_DAG_EVENT_IDS: usize = 100;
 
 /// Body of the federation request.
 ///
@@ -183,6 +189,14 @@ pub(crate) async fn handle(
     // (1)
     if body.latest_events.is_empty() {
         return Err(FedError::BadRequest("latest_events must not be empty"));
+    }
+    if body.state_dag.0
+        && (body.latest_events.len() > MAX_STATE_DAG_EVENT_IDS
+            || body.earliest_events.len() > MAX_STATE_DAG_EVENT_IDS)
+    {
+        return Err(FedError::BadRequest(
+            "earliest_events and latest_events are limited to 100 elements when state_dag is set",
+        ));
     }
 
     // (2) — `missing_events` surfaces an unknown room as

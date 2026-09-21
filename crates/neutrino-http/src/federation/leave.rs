@@ -110,9 +110,8 @@ async fn try_federated_leave(
 ) -> Result<neutrino_event::Event, String> {
     let client =
         FederationClient::new(own_server.to_owned(), proxy).with_signer(policy.signer().cloned());
-    let offered: Vec<&str> = policy.versions.ids().collect();
     let template = client
-        .make_leave(dest, room_id, user, &offered)
+        .make_leave(dest, room_id, user)
         .await
         .map_err(|e| format!("make_leave request failed: {e}"))?;
     // The room's version, as the resident states it — the leave we build is

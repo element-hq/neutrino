@@ -1193,6 +1193,62 @@ async fn get_missing_events_rejects_non_member_origin() {
 }
 
 #[tokio::test]
+async fn get_missing_events_state_dag_caps_event_id_arrays() {
+    // MSC4242: `earliest_events` and `latest_events` each cap at 100 elements
+    // when `state_dag` is set, and over that is a 400 — not a silent truncation,
+    // which would answer a different question than the one asked.
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(2).await;
+    let over: Vec<String> = (0..101).map(|_| msgs[1].to_string()).collect();
+    let at_cap: Vec<String> = (0..100).map(|_| msgs[1].to_string()).collect();
+
+    for (earliest, latest, who) in [
+        (json!([]), json!(over), "latest_events"),
+        (json!(over), json!([msgs[1].as_str()]), "earliest_events"),
+    ] {
+        let (status, b) = post_json(
+            &app,
+            &fed_path(room_id.as_str()),
+            &json!({
+                "earliest_events": earliest,
+                "latest_events": latest,
+                "limit": 10,
+                crate::federation::get_missing_events::STATE_DAG_KEY: true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{who} over cap: {b}");
+        assert_eq!(
+            b.get("errcode").and_then(Value::as_str),
+            Some("M_INVALID_PARAM")
+        );
+    }
+
+    // Exactly at the cap is allowed, and the cap does not apply without the flag.
+    for (body, who) in [
+        (
+            json!({
+                "earliest_events": [],
+                "latest_events": at_cap,
+                "limit": 10,
+                crate::federation::get_missing_events::STATE_DAG_KEY: true,
+            }),
+            "at cap with state_dag",
+        ),
+        (
+            json!({
+                "earliest_events": [],
+                "latest_events": over,
+                "limit": 10,
+            }),
+            "over cap without state_dag",
+        ),
+    ] {
+        let (status, b) = post_json(&app, &fed_path(room_id.as_str()), &body).await;
+        assert_eq!(status, StatusCode::OK, "{who} must be allowed: {b}");
+    }
+}
+
+#[tokio::test]
 async fn send_rejects_x_matrix_origin_mismatch() {
     // The header origin is network-attested; `body.origin` is self-asserted. They
     // must agree, or the transaction is rejected.
@@ -2181,12 +2237,8 @@ async fn send_gapfills_missing_ancestry_then_accepts() {
     // staged rows are deleted. Wait for the drain to settle before asserting
     // emptiness, rather than racing the worker's follow-up unstage.
     wait_staging_empty(&store, &room_id).await;
-    let still_missing = store
-        .ancestry_gap(&room_id, &[child_id.as_ref()])
-        .await
-        .unwrap();
     assert!(
-        still_missing.staged.is_empty(),
+        store.staged_for_room(&room_id).await.unwrap().is_empty(),
         "promoted ancestry must be unstaged"
     );
 }
@@ -4649,6 +4701,134 @@ async fn federated_join_dangling_state_dag_reference_fails_without_registering()
 }
 
 #[tokio::test]
+async fn federated_join_timeline_dangling_state_reference_does_not_fail() {
+    // Only state-DAG events are subject to the connectedness rule (MSC4242:
+    // "all paths from the `prev_state_events` of the join event to the
+    // create"). The timeline carries message events, and a resident's timeline
+    // window can legitimately hold one whose `prev_state_events` names a state
+    // event `walk_state_dag` omitted (a rejected one). Checking those too would
+    // let any server in the room poison joins by parking such an event in the
+    // last-20 window.
+    let alice = alice();
+    let state_ev =
+        |ty: &str, sk: &str, content: Value, prev: &OwnedEventId, room: Option<&OwnedRoomId>| {
+            let mut b = EventBuilder::new(
+                alice.clone(),
+                ty.to_owned(),
+                neutrino_event::base_version().clone(),
+            )
+            .state_key(sk.to_owned())
+            .content(content)
+            .prev_events(vec![prev.clone()])
+            .prev_state_events(vec![prev.clone()]);
+            if let Some(r) = room {
+                b = b.room_id(r.clone());
+            }
+            b.build().unwrap()
+        };
+    let create = EventBuilder::new(
+        alice.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .unwrap();
+    let room_id = create.room_id.clone();
+    let a_join = state_ev(
+        "m.room.member",
+        alice.as_str(),
+        json!({ "membership": "join" }),
+        &create.event_id,
+        Some(&room_id),
+    );
+    let rules = state_ev(
+        "m.room.join_rules",
+        "",
+        json!({ "join_rule": "public" }),
+        &a_join.event_id,
+        Some(&room_id),
+    );
+    // A state event the resident's state-DAG walk omits (it would be rejected),
+    // so it is absent from `state_dag` and unknown to us.
+    let omitted = state_ev(
+        "m.room.topic",
+        "",
+        json!({ "topic": "omitted" }),
+        &rules.event_id,
+        Some(&room_id),
+    );
+    // A timeline message standing on it — the dangling reference.
+    let msg = EventBuilder::new(
+        alice,
+        "m.room.message".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .content(json!({ "body": "in the timeline window" }))
+    .prev_events(vec![rules.event_id.clone()])
+    .prev_state_events(vec![omitted.event_id.clone()])
+    .build()
+    .unwrap();
+    let zara: OwnedUserId = ZARA.parse().unwrap();
+    let template = EventBuilder::new(
+        zara.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(zara.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![rules.event_id.clone()])
+    .prev_state_events(vec![rules.event_id.clone()])
+    .build()
+    .unwrap();
+    let mj = json!({ "event": raw_to_value(&template), "room_version": ROOM_VERSION_ID });
+    // The state DAG itself is closed; only the timeline dangles.
+    let sj = json!({
+        "state_dag": [
+            raw_to_value(&create),
+            raw_to_value(&a_join),
+            raw_to_value(&rules),
+            raw_to_value(&template),
+        ],
+        "timeline": [raw_to_value(&msg)],
+        "event": raw_to_value(&template),
+    });
+    let b = crate::federation::test_support::spawn_stub(stub_resident(mj, sj)).await;
+
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_state = crate::AppState::from_store(config_for("a.example", "bob"), a_store.clone());
+    let resp = crate::federation::join::federated_join_with(
+        &a_state,
+        zara.clone(),
+        &room_id,
+        &[b],
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a dangling reference in the timeline must not fail the handshake: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        a_store
+            .current_state_event(&room_id, "m.room.member", zara.as_str())
+            .await
+            .unwrap()
+            .is_some(),
+        "the join landed in current state"
+    );
+}
+
+#[tokio::test]
 async fn federated_join_rejected_by_cascade_fails_fast_with_502() {
     // SJ02C..H: the response's state DAG is closed but our join stands on an
     // event the worker rejects (here: a *message* named in prev_state_events,
@@ -5504,6 +5684,20 @@ async fn seed_room_with_invited_zara() -> (
     .await
 }
 
+/// The user's current in-room `content.membership`, or `None` when the room DAG
+/// holds no member event for them.
+async fn current_membership_str(
+    store: &SqliteStore,
+    room_id: &RoomId,
+    user: &OwnedUserId,
+) -> Option<String> {
+    store
+        .current_state_event(room_id, "m.room.member", user.as_str())
+        .await
+        .unwrap()
+        .and_then(|e| e.content_str("membership"))
+}
+
 fn make_leave_path(room_id: &RoomId, user: &str) -> String {
     // No `?ver=`: the spec defines none for make_leave, and real requesters
     // (gomatrixserverlib, Synapse) send none.
@@ -6035,6 +6229,62 @@ async fn send_leave_for_oob_invited_user_replaces_the_stub() {
 }
 
 #[tokio::test]
+async fn send_leave_for_local_user_in_a_room_we_hold_is_staged_not_diverted() {
+    // A stub can outlive the server joining the room — nothing clears it when
+    // another local user joins or this one accepts locally. Once we hold the
+    // room the out-of-band path must stand down: the PDU belongs in the room
+    // DAG. Diverting it would ack the kick to the sender while the room never
+    // saw it.
+    let (app, store, room_id, alice, join_id, _tempfile) = seed_joined_room().await;
+    let bob = inviter();
+    // A stale out-of-band stub for a user in a room we are in.
+    let invite = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&join_id),
+    );
+    store
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID)
+        .await
+        .unwrap();
+    let kick = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "leave",
+        std::slice::from_ref(&invite.event_id),
+    );
+
+    let (status, body) = put_json(&app, &send_path("in-room-kick"), &txn(&[&kick])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    // It went to the room DAG, not the stub table: the stub is untouched.
+    let stub = store
+        .get_oob_membership(&room_id, &alice)
+        .await
+        .unwrap()
+        .expect("the stale stub is left alone");
+    assert_eq!(
+        stub.event.event_id, invite.event_id,
+        "the out-of-band path must not consume a PDU for a room we hold"
+    );
+
+    // And the PDU reached the room: either still staged, or already drained
+    // into `events` by the worker.
+    let staged = store.staged_for_room(&room_id).await.unwrap();
+    let reached = staged.iter().any(|r| r.event_id == kick.event_id)
+        || store
+            .get_events(&[kick.event_id.as_ref()])
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.event_id == kick.event_id);
+    assert!(reached, "the kick must be staged for the room worker");
+}
+
+#[tokio::test]
 async fn send_leave_for_oob_invited_user_not_naming_the_invite_is_ignored() {
     // INV02-Inbound: a rescission whose `prev_state_events` do not name the
     // invite it supersedes is dropped — the stub stays an invite, nothing is
@@ -6138,6 +6388,51 @@ async fn outbound_reject_invite_unreachable_server_still_removes_stub() {
             .unwrap()
             .is_none(),
         "stub must be removed even when the inviting server is unreachable"
+    );
+}
+
+#[tokio::test]
+async fn csapi_leave_of_a_joined_room_ignores_a_stale_oob_stub() {
+    // Nothing clears an out-of-band stub once the server joins the room, so a
+    // stale leave/ban row can sit alongside a real in-room membership. In-room
+    // state wins: `/leave` must emit the leave rather than short-circuit on the
+    // stub, which would otherwise make the endpoint a permanent no-op for that
+    // room (the row is never removed, so every retry hits the same branch).
+    let (app, store, room_id, alice, join_id, _tempfile) = seed_joined_room().await;
+    let bob = inviter();
+    // A stale out-of-band *leave* stub for a room alice is genuinely joined to.
+    let stale = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "leave",
+        std::slice::from_ref(&join_id),
+    );
+    store
+        .put_oob_membership(&room_id, &alice, &stale, ROOM_VERSION_ID)
+        .await
+        .unwrap();
+    assert_eq!(
+        current_membership_str(&store, &room_id, &alice)
+            .await
+            .as_deref(),
+        Some("join"),
+        "precondition: alice is joined in-room"
+    );
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        current_membership_str(&store, &room_id, &alice)
+            .await
+            .as_deref(),
+        Some("leave"),
+        "the leave must actually be emitted, not swallowed by the stale stub"
     );
 }
 

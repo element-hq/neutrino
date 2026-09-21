@@ -425,41 +425,55 @@ async fn ingest_state_dag(
     room_id: &RoomId,
     resp: SendJoinResponse,
 ) -> Result<OwnedEventId, &'static str> {
-    let mut events = Vec::new();
-    for raw in resp
-        .state_dag
-        .into_iter()
-        .chain(resp.timeline)
-        .chain(std::iter::once(resp.event))
-    {
-        match policy.admit_wire(raw, version).await {
-            Ok(neutrino_event::Wire::Valid(ev)) => events.push(ev),
-            // Rejected events are staged too — they persist as rejected rows
-            // so references to them cascade-reject instead of gapfilling.
-            Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
-                warn!(%room_id, event_id = %ev.event_id, %defect, "send_join response: keeping malformed event as rejected");
-                events.push(ev);
-            }
-            Err(_) => warn!(%room_id, "dropping unparseable event in send_join response"),
+    // Admit each event, keeping the *connected* half (the state DAG plus the
+    // join) separate from the timeline. Only state-DAG events are subject to
+    // the connectedness rule below: `timeline` carries message events, and may
+    // carry rejected ones, which `walk_state_dag` legitimately omits from
+    // `state_dag` — checking their `prev_state_events` would fail handshakes on
+    // well-formed responses.
+    let admit = async |raw| match policy.admit_wire(raw, version).await {
+        Ok(neutrino_event::Wire::Valid(ev)) => Some(ev),
+        // Rejected events are staged too — they persist as rejected rows
+        // so references to them cascade-reject instead of gapfilling.
+        Ok(neutrino_event::Wire::Rejected(ev, defect)) => {
+            warn!(%room_id, event_id = %ev.event_id, %defect, "send_join response: keeping malformed event as rejected");
+            Some(ev)
         }
+        Err(_) => {
+            warn!(%room_id, "dropping unparseable event in send_join response");
+            None
+        }
+    };
+    let mut state_dag = Vec::new();
+    for raw in resp.state_dag {
+        state_dag.extend(admit(raw).await);
     }
-    // `resp.event` was chained last, so it is the last admitted event unless
-    // it was unparseable — in which case there is no join to wait on.
-    let join_id = events
-        .last()
+    let mut timeline = Vec::new();
+    for raw in resp.timeline {
+        timeline.extend(admit(raw).await);
+    }
+    // The join we wait on is the one we staged, so it is read back off the
+    // admitted event rather than assumed to be the one we sent.
+    let join = admit(resp.event)
+        .await
         .filter(|e| e.event_type == "m.room.member")
-        .map(|e| e.event_id.clone())
         .ok_or("send_join response has no usable join event")?;
+    let join_id = join.event_id.clone();
+    state_dag.push(join);
 
-    // MSC4242: the response carries the *entire* state DAG, so every
-    // `prev_state_events` reference must resolve — to an event in the response
-    // or to one we already hold (a re-join of a room we left). A dangling
-    // reference is a malformed response: fail the handshake here rather than
-    // stage a DAG the worker could only try to gap-fill from a resident that
-    // just claimed to have sent everything.
-    require_closed_state_dag(store, &events)
+    // MSC4242: "verify that you have ALL paths from the `prev_state_events` of
+    // the join event to the create event for the room". The response carries
+    // the *entire* state DAG, so every `prev_state_events` reference within it
+    // must resolve — to an event in the state DAG or to one we already hold (a
+    // re-join of a room we left). A dangling reference is a malformed response:
+    // fail the handshake here rather than stage a DAG the worker could only try
+    // to gap-fill from a resident that just claimed to have sent everything.
+    require_closed_state_dag(store, &state_dag)
         .await
         .map_err(|e| e.unwrap_or("send_join state DAG is not closed"))?;
+
+    let mut events = state_dag;
+    events.append(&mut timeline);
 
     // Register the room from its create event so the actor can bootstrap (the
     // worker drops PDUs for an unknown room). The rest is staged + auth-checked.
@@ -497,7 +511,9 @@ async fn ingest_state_dag(
 }
 
 /// Every `prev_state_events` reference across `events` must name an event in
-/// `events` or one already committed. `Err(None)` = dangling reference;
+/// `events` or one already committed. Called with the response's state DAG
+/// (plus the join event), never its timeline — only state-DAG events are
+/// subject to the connectedness rule. `Err(None)` = dangling reference;
 /// `Err(Some(msg))` = storage fault.
 async fn require_closed_state_dag(
     store: &impl EventStore,
