@@ -6285,6 +6285,74 @@ async fn send_leave_for_local_user_in_a_room_we_hold_is_staged_not_diverted() {
 }
 
 #[tokio::test]
+async fn send_leave_for_a_room_we_hold_but_are_not_in_stays_out_of_band() {
+    // We keep the `rooms` row after leaving, so "do we hold a row" is not the
+    // same question as "are we in the room". `/invite` stubs a membership on
+    // `!server_in_room`, and the rescission path must use that same predicate:
+    // gating on the row instead diverts the rescission into a room DAG that
+    // cannot apply it (its prev_state names the stub, and the peer refuses us
+    // `/get_missing_events` for a room we are not in), leaving the phantom
+    // invite in place.
+    let (store, _tempfile) = fresh_store().await;
+    let app = router_with_store(config(), store.clone());
+    let bob = inviter();
+    let alice = alice();
+    // A room we hold state for but have no joined local member in.
+    let create = EventBuilder::new(
+        bob.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
+    let room_id = create.room_id.clone();
+    store.create_room(&create, &[]).await.expect("create_room");
+    assert!(store.room_exists(&room_id).await.unwrap());
+    assert!(
+        !crate::federation::server_in_room(&*store, &room_id, "example.org")
+            .await
+            .unwrap(),
+        "precondition: we hold the row but are not in the room"
+    );
+
+    let invite = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&create.event_id),
+    );
+    store
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID)
+        .await
+        .unwrap();
+    let kick = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "leave",
+        std::slice::from_ref(&invite.event_id),
+    );
+
+    let (status, body) = put_json(&app, &send_path("rescind-held-room"), &txn(&[&kick])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    let stub = store
+        .get_oob_membership(&room_id, &alice)
+        .await
+        .unwrap()
+        .expect("the stub is still the place this membership lives");
+    assert_eq!(
+        stub.membership,
+        Membership::Leave,
+        "the rescission must be applied to the stub, not diverted into the room DAG"
+    );
+    assert_eq!(stub.event.event_id, kick.event_id);
+}
+
+#[tokio::test]
 async fn send_leave_for_oob_invited_user_not_naming_the_invite_is_ignored() {
     // INV02-Inbound: a rescission whose `prev_state_events` do not name the
     // invite it supersedes is dropped — the stub stays an invite, nothing is
@@ -6433,6 +6501,68 @@ async fn csapi_leave_of_a_joined_room_ignores_a_stale_oob_stub() {
             .as_deref(),
         Some("leave"),
         "the leave must actually be emitted, not swallowed by the stale stub"
+    );
+}
+
+#[tokio::test]
+async fn csapi_leave_declines_oob_reinvite_to_a_room_we_left() {
+    // After the last local member leaves, `server_in_room` goes false but the
+    // `rooms` row and the stale in-room `leave` member event both remain, so a
+    // fresh invite is stored out of band. `/leave` must still reach the decline
+    // handshake: gating the out-of-band branch on the user's *in-room
+    // membership* instead sees the stale `leave` and returns a lying 200,
+    // stranding the invite forever (nothing clears a stub).
+    let dead = crate::federation::test_support::dead_peer().await;
+    let (app, store, room_id, alice, join_id, _tempfile) = seed_joined_room().await;
+
+    // Alice leaves in-room: current_state now holds her `leave`.
+    let (status, body) = post_json(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        current_membership_str(&store, &room_id, &alice)
+            .await
+            .as_deref(),
+        Some("leave"),
+        "precondition: a stale in-room leave survives"
+    );
+    assert!(
+        store.room_exists(&room_id).await.unwrap(),
+        "precondition: the rooms row survives the leave"
+    );
+
+    // A fresh out-of-band invite for the room we just left.
+    let dead_bob: OwnedUserId = format!("@bob:{dead}").parse().unwrap();
+    let invite = member_pdu(
+        &dead_bob,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&join_id),
+    );
+    store
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID)
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert!(
+        store
+            .get_oob_membership(&room_id, &alice)
+            .await
+            .unwrap()
+            .is_none(),
+        "the decline must run: the stub is gone (inviting server unreachable)"
     );
 }
 

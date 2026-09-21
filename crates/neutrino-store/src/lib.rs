@@ -488,9 +488,8 @@ pub trait StagingStore: Send + Sync {
     /// Post: walks `prev_state_events` back from `heads` through staged events
     ///       (a committed `events` row is a grounded boundary and is not
     ///       expanded), returning an [`AncestryGap`]: `missing` = reachable ids
-    ///       in neither table, `staged` = reachable ids currently staged,
-    ///       `frontier` = staged ids with a parent in `missing`. The walk is
-    ///       scoped to `room_id`.
+    ///       in neither table, `frontier` = staged ids with a parent in
+    ///       `missing`. The walk is scoped to `room_id`.
     async fn ancestry_gap(
         &self,
         room_id: &RoomId,

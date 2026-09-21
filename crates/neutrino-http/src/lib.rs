@@ -2710,6 +2710,79 @@ mod tests {
     }
 
     #[test]
+    fn create_content_unions_client_additional_creators_with_the_preset() {
+        // The preset's invitee-creators are unioned with any the client named
+        // in `creation_content`, never substituted for them; malformed entries
+        // and the creator itself are dropped rather than emitted (rule 1.4
+        // would otherwise reject the create event outright).
+        let sender: OwnedUserId = "@alice:127.0.0.1".parse().expect("user id");
+        let version = neutrino_event::base_version();
+
+        let content = create_content(
+            &sender,
+            &json!({
+                "preset": "trusted_private_chat",
+                "invite": ["@bob:remote.example"],
+                "creation_content": { "additional_creators": ["@carol:remote.example"] },
+            }),
+            version,
+        );
+        assert_eq!(
+            content["additional_creators"],
+            json!(["@bob:remote.example", "@carol:remote.example"]),
+            "both the preset's invitees and the client's entries survive"
+        );
+
+        // Honoured without the preset too, and deduped against it.
+        let content = create_content(
+            &sender,
+            &json!({
+                "creation_content": { "additional_creators": ["@carol:remote.example"] },
+            }),
+            version,
+        );
+        assert_eq!(
+            content["additional_creators"],
+            json!(["@carol:remote.example"])
+        );
+        let content = create_content(
+            &sender,
+            &json!({
+                "preset": "trusted_private_chat",
+                "invite": ["@bob:remote.example"],
+                "creation_content": { "additional_creators": ["@bob:remote.example"] },
+            }),
+            version,
+        );
+        assert_eq!(
+            content["additional_creators"],
+            json!(["@bob:remote.example"]),
+            "the union is deduplicated"
+        );
+
+        // Junk shapes and self-references never reach the event.
+        for creation_content in [
+            json!({ "additional_creators": ["not a user id"] }),
+            json!({ "additional_creators": ["@alice:127.0.0.1"] }),
+            json!({ "additional_creators": [42, null] }),
+            json!({ "additional_creators": "not an array" }),
+            json!({ "additional_creators": {} }),
+            json!("not an object"),
+        ] {
+            let content = create_content(
+                &sender,
+                &json!({ "creation_content": creation_content }),
+                version,
+            );
+            assert!(
+                content.get("additional_creators").is_none(),
+                "{creation_content}"
+            );
+            assert_eq!(content["room_version"], version.id);
+        }
+    }
+
+    #[test]
     fn build_initial_events_trusted_private_chat_create_carries_creators() {
         // The create event must pass validation (rule 1.4) and the rest of the
         // batch must still auth against it, with `users` left empty — a remote
