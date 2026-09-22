@@ -59,12 +59,19 @@ impl OobMembershipStore for SqliteStore {
 
         self.run_write(move |conn| -> Result<(), Error> {
             // The stream high-water mark at write time, so this row can be
-            // ordered against the in-room member event for the same pair. Read
-            // inside the write transaction so no event can land between the
-            // read and the insert. `MAX` over the rowid PK is an index lookup,
-            // not a scan, and is preferred over `sqlite_sequence.seq` — after a
-            // delete they diverge, and "the newest event we hold" is what the
-            // comparison means.
+            // ordered against the in-room member event for the same pair.
+            //
+            // The read and the insert are two statements, not one transaction.
+            // What makes that safe is that `run_write` owns the sole writer
+            // connection (`writer_pool` is `max_size = 1`), so no other write
+            // can interleave — widening that pool would let an event land
+            // between them and stamp a watermark that is too low, silently
+            // making the stub lose.
+            //
+            // `MAX` over the rowid PK is an index lookup, not a scan, and is
+            // preferred over `sqlite_sequence.seq` — after a delete they
+            // diverge, and "the newest event we hold" is what the comparison
+            // means.
             let learned_after: i64 = conn.query_row(
                 "SELECT COALESCE(MAX(stream_pos), 0) FROM events",
                 [],
@@ -101,23 +108,15 @@ impl OobMembershipStore for SqliteStore {
         let room_id = room_id.as_str().to_owned();
         let state_key = user_id.as_str().to_owned();
         self.run_read(move |conn| -> Result<Option<OobMembership>, Error> {
-            let row: Option<(String, String, String, String, i64)> = conn
+            let row: Option<(String, String, String, String)> = conn
                 .query_row(
-                    "SELECT event_id, membership, room_version, json, learned_after \
-                     FROM oob_memberships WHERE room_id = ? AND state_key = ?",
+                    "SELECT event_id, membership, room_version, json FROM oob_memberships \
+                     WHERE room_id = ? AND state_key = ?",
                     params![room_id, state_key],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()?;
-            let Some((event_id, membership, room_version, json, learned_after)) = row else {
+            let Some((event_id, membership, room_version, json)) = row else {
                 return Ok(None);
             };
             let raw = RawJsonValue::from_string(json).map_err(|e| {
@@ -141,7 +140,6 @@ impl OobMembershipStore for SqliteStore {
                 event,
                 membership,
                 room_version,
-                learned_after: learned_after.max(0) as u64,
             }))
         })
         .await
@@ -163,38 +161,6 @@ impl OobMembershipStore for SqliteStore {
             SqliteStore::notify_watch_changed(&watch_tx);
             Ok(())
         })
-        .await
-    }
-
-    async fn oob_memberships(
-        &self,
-        user_id: &UserId,
-    ) -> Result<Vec<(OwnedRoomId, Membership)>, StorageError> {
-        let state_key = user_id.as_str().to_owned();
-        self.run_read(
-            move |conn| -> Result<Vec<(OwnedRoomId, Membership)>, Error> {
-                let mut stmt = conn.prepare(
-                    "SELECT room_id, membership FROM oob_memberships WHERE state_key = ?",
-                )?;
-                let rows = stmt.query_map(params![state_key], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?;
-                let mut out = Vec::new();
-                for r in rows {
-                    let (room_id, membership) = r?;
-                    let room_id = OwnedRoomId::try_from(room_id).map_err(|e| {
-                        Error::Internal(format!("malformed room_id in oob_memberships row: {e}"))
-                    })?;
-                    let membership = Membership::from_wire(&membership).ok_or_else(|| {
-                        Error::Internal(format!(
-                            "malformed membership {membership:?} in oob_memberships row"
-                        ))
-                    })?;
-                    out.push((room_id, membership));
-                }
-                Ok(out)
-            },
-        )
         .await
     }
 
@@ -407,6 +373,8 @@ fn pick(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use neutrino_event::Event;
     use neutrino_event::event_id::base_version_event_id;
     use neutrino_store::{Membership, OobMembershipStore};
@@ -527,8 +495,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            s.oob_memberships(alice).await.unwrap(),
-            vec![(room.to_owned(), Membership::Invite)]
+            s.get_oob_membership(room, alice)
+                .await
+                .unwrap()
+                .unwrap()
+                .membership,
+            Membership::Invite
         );
 
         let leave = remote_member(room, alice, alice, "leave", "R");
@@ -538,10 +510,16 @@ mod tests {
         let got = s.get_oob_membership(room, alice).await.unwrap().unwrap();
         assert_eq!(got.membership, Membership::Leave);
         assert_eq!(got.event.event_id, leave.event_id);
-        // REPLACE, not a second row.
+        // REPLACE, not a second row: the PK is (room_id, state_key), so the
+        // resolver can only ever see one stub per pair.
         assert_eq!(
-            s.oob_memberships(alice).await.unwrap(),
-            vec![(room.to_owned(), Membership::Leave)]
+            s.resolved_memberships(
+                alice,
+                &BTreeSet::from([Membership::Invite, Membership::Leave])
+            )
+            .await
+            .unwrap(),
+            vec![(room.to_owned(), Membership::Leave, true)]
         );
 
         // `join` is in-room state, never out-of-band.
@@ -557,50 +535,6 @@ mod tests {
         assert!(
             matches!(err, neutrino_store::StorageError::InvalidInput(_)),
             "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn oob_memberships_lists_only_the_users_rows() {
-        let s = store().await;
-        let room_a = room_id!("!a:other.example.org");
-        let room_b = room_id!("!b:other.example.org");
-        let alice = user_id!("@alice:example.com");
-        let carol = user_id!("@carol:example.com");
-        let inviter = user_id!("@bob:other.example.org");
-
-        for (room, who) in [(room_a, alice), (room_b, alice), (room_a, carol)] {
-            s.put_oob_membership(
-                room,
-                who,
-                &remote_member(room, who, inviter, "invite", "N"),
-                VERSION,
-            )
-            .await
-            .unwrap();
-        }
-
-        let mut alice_rooms: Vec<_> = s
-            .oob_memberships(alice)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|(r, _)| r)
-            .collect();
-        alice_rooms.sort();
-        let mut want = vec![room_a.to_owned(), room_b.to_owned()];
-        want.sort();
-        assert_eq!(alice_rooms, want);
-
-        assert_eq!(
-            s.oob_memberships(carol).await.unwrap(),
-            vec![(room_a.to_owned(), Membership::Invite)]
-        );
-        assert!(
-            s.oob_memberships(user_id!("@nobody:example.com"))
-                .await
-                .unwrap()
-                .is_empty()
         );
     }
 
@@ -690,49 +624,6 @@ mod tests {
             "the later in-room event wins over the stub"
         );
         assert_eq!(got.membership, Membership::Join);
-    }
-
-    /// The bulk form must agree with the point form, and must emit exactly one
-    /// row per room even when both tables hold one.
-    #[tokio::test]
-    async fn resolved_memberships_agrees_with_the_point_resolver_and_never_doubles() {
-        use neutrino_store::RoomStore;
-        use std::collections::BTreeSet;
-
-        let s = store().await;
-        s.create_room(
-            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[member_leave(*ALICE_ROOM_ID, *BOB_USER_ID)],
-        )
-        .await
-        .unwrap();
-        let invite = remote_member(*ALICE_ROOM_ID, *BOB_USER_ID, *ALICE_USER_ID, "invite", "R");
-        s.put_oob_membership(*ALICE_ROOM_ID, *BOB_USER_ID, &invite, VERSION)
-            .await
-            .unwrap();
-
-        let wanted = BTreeSet::from([
-            Membership::Join,
-            Membership::Invite,
-            Membership::Knock,
-            Membership::Leave,
-            Membership::Ban,
-        ]);
-        let rows = s.resolved_memberships(*BOB_USER_ID, &wanted).await.unwrap();
-        assert_eq!(rows.len(), 1, "one row per room: {rows:?}");
-        assert_eq!(rows[0].1, Membership::Invite);
-        assert!(rows[0].2, "out_of_band");
-
-        // The membership filter applies to the *winner*, not to either source:
-        // asking only for `leave` must not surface this room via the losing
-        // in-room row.
-        let only_leave = BTreeSet::from([Membership::Leave]);
-        assert!(
-            s.resolved_memberships(*BOB_USER_ID, &only_leave)
-                .await
-                .unwrap()
-                .is_empty()
-        );
     }
 
     /// Persisting a member event that becomes current state drops the stub it

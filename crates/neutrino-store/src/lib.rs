@@ -309,24 +309,6 @@ pub trait StateStore: Send + Sync {
     ///       a single method with a membership filter in the future.
     async fn invited_rooms(&self, user_id: &UserId) -> Result<Vec<OwnedRoomId>, StorageError>;
 
-    /// Pre:  none. An empty `memberships` set returns an empty vec.
-    /// Post: returns **exactly one** `(room_id, current_membership)` pair for
-    ///       every room in which `user_id`'s current `m.room.member` event has
-    ///       a `content.membership` in `memberships`. The `current_membership`
-    ///       value is the actual membership the user currently has — duplicates
-    ///       per room are impossible by construction since each `(room, user)`
-    ///       has a single current member event. The caller can pass multiple
-    ///       memberships to get the union in one round-trip (used by sliding
-    ///       sync to enumerate candidate rooms across all the MSC4186-eligible
-    ///       memberships at once). Result order is unspecified — callers sort
-    ///       as needed. Implementations should answer this from an indexed
-    ///       lookup rather than a full table scan.
-    async fn rooms_with_membership(
-        &self,
-        user_id: &UserId,
-        memberships: &BTreeSet<Membership>,
-    ) -> Result<Vec<(OwnedRoomId, Membership)>, StorageError>;
-
     /// Pre:  none (returns empty map if the room does not exist).
     /// Post: returns one member event per `user_id` (state_key) whose current
     ///       `m.room.member` event has `content.membership = "join"`; left, banned, and
@@ -704,10 +686,6 @@ pub struct OobMembership {
     pub event: Event,
     pub membership: Membership,
     pub room_version: String,
-    /// The `events` stream high-water mark when this row was written. Orders
-    /// the stub against the in-room `m.room.member` event for the same
-    /// (room, user) — see [`ResolvedMembership`].
-    pub learned_after: u64,
 }
 
 /// The authoritative `m.room.member` event for one (room, user), resolved
@@ -778,20 +756,13 @@ pub trait OobMembershipStore: Send + Sync {
     ) -> Result<(), StorageError>;
 
     /// Pre:  none.
-    /// Post: returns `(room_id, membership)` for every out-of-band membership
-    ///       `user_id` holds. Sync unions these into its room list, separately
-    ///       from `rooms_with_membership` since they live in a different table
-    ///       and carry no auth.
-    async fn oob_memberships(
-        &self,
-        user_id: &UserId,
-    ) -> Result<Vec<(OwnedRoomId, Membership)>, StorageError>;
-
-    /// Pre:  none.
     /// Post: the user's authoritative member event for `room_id` — the newer
     ///       of the in-room current-state event and the out-of-band stub, per
-    ///       [`ResolvedMembership`]. `None` if neither table holds one. One
-    ///       round trip: the comparison happens inside a single read.
+    ///       [`ResolvedMembership`]. `None` if neither table holds one. The
+    ///       two sources are read as separate statements, so a concurrent
+    ///       write can land between them; the result is then one of the two
+    ///       adjacent states, and both writers fire the persist watch, so a
+    ///       sync rebuild follows.
     async fn resolved_member_event(
         &self,
         room_id: &RoomId,

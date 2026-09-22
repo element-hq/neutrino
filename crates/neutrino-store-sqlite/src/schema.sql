@@ -189,14 +189,15 @@ CREATE TABLE current_state (
 -- seek; with `room_id` between them (the prior shape) the planner could
 -- only seek by `state_key` and then filter `membership` post-scan,
 -- because constraints on a trailing index column aren't pushable past
--- an unconstrained intermediate column. `room_id` trails so the index
--- still covers both projected columns (`SELECT room_id, membership`).
+-- an unconstrained intermediate column. `room_id` and `event_id` trail so
+-- the index covers every projected column, including the `event_id` the
+-- membership resolver joins to `events` for its `stream_pos`.
 -- Partial on `event_type = 'm.room.member'` only — broadened from the
 -- prior `membership = 'join'` constraint so the same index serves any
 -- membership filter (sliding sync enumerates rooms across the full
 -- MSC4186-eligible membership set in one shot).
 CREATE INDEX ix_current_state_member
-    ON current_state(state_key, membership, room_id)
+    ON current_state(state_key, membership, room_id, event_id)
     WHERE event_type = 'm.room.member';
 
 -- joined_members(room): direct lookup by room_id, then filter by
