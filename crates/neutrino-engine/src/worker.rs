@@ -44,9 +44,10 @@
 //! - **Fetched rows are never gap-fill roots.** Only a row staged in its own
 //!   right (`fetched_for = NULL`: `/send`, join ingest, anti-entropy) walks the
 //!   peer. A fetched row whose own apply is retryable is simply left staged —
-//!   its root's next walk extends the prefix — and it is skipped while its
-//!   root is backing off. Otherwise a partially-fetched, ungrounded ancestry
-//!   would be promoted into independent PDUs that each re-walk the peer.
+//!   its root's next walk extends the prefix — and from then on it is skipped
+//!   while its root is backing off. Otherwise a partially-fetched, ungrounded
+//!   ancestry would be promoted into independent PDUs that each re-walk the
+//!   peer. A fetched row whose root is no longer staged is dropped.
 //! - **Non-retryable** (malformed / misrouted — can never apply): drop it
 //!   (unstage + log).
 //! - **UnknownRoom / storage fault**: back off and retry.
@@ -220,6 +221,8 @@ async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
     notify: Arc<Notify>,
 ) {
     let mut backoff: HashMap<OwnedEventId, Backoff> = HashMap::new();
+    // Fetched rows whose own apply came back retryable.
+    let mut failed: HashSet<OwnedEventId> = HashSet::new();
     loop {
         let rows = match ctx.store.staged_for_room(&room).await {
             Ok(r) => r,
@@ -234,6 +237,7 @@ async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
         if rows.is_empty() {
             // Fully drained: forget any backoff state and park until poked.
             backoff.clear();
+            failed.clear();
             notify.notified().await;
             continue;
         }
@@ -242,17 +246,38 @@ async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
         // dropped), so the map stays bounded by the live backlog.
         let present: HashSet<&OwnedEventId> = rows.iter().map(|p| &p.event_id).collect();
         backoff.retain(|id, _| present.contains(id));
+        failed.retain(|id| present.contains(id));
+
+        // A fetched row whose root is gone has no walk left to ground it, and
+        // no backoff of its own: drop it rather than retry it every pass.
+        let orphans: Vec<&EventId> = rows
+            .iter()
+            .filter(|p| p.fetched_for.as_ref().is_some_and(|r| !present.contains(r)))
+            .map(|p| p.event_id.as_ref())
+            .collect();
+        if !orphans.is_empty() {
+            warn!(%room, count = orphans.len(), "dropping fetched rows whose root is no longer staged");
+            if let Err(e) = ctx.store.unstage_events(&orphans).await {
+                error!(%room, error = %e, "unstaging orphaned fetched rows");
+                sleep_or_poke(ctx.backoff_base, &notify).await;
+            }
+            continue;
+        }
 
         // Eligible = not currently in a backoff window. A backing-off PDU is
         // skipped (left staged), never dequeued, so it can't block its siblings.
-        // A fetched row inherits its root's window: re-applying it while the
-        // root waits would fail identically (its ancestry is what the root is
-        // waiting to fetch).
+        // A fetched row that has already failed inherits its root's window:
+        // re-applying it while the root waits would fail identically (its
+        // ancestry is what the root is waiting to fetch). One not yet tried may
+        // be grounded already, so it is tried.
         let now = Instant::now();
         let waiting = |id: &OwnedEventId| backoff.get(id).is_some_and(|b| b.next > now);
         let eligible: Vec<StagedPdu> = rows
             .into_iter()
-            .filter(|p| !waiting(&p.event_id) && !p.fetched_for.as_ref().is_some_and(waiting))
+            .filter(|p| {
+                !(waiting(&p.event_id)
+                    || failed.contains(&p.event_id) && p.fetched_for.as_ref().is_some_and(waiting))
+            })
             .collect();
 
         if eligible.is_empty() {
@@ -300,7 +325,7 @@ async fn run_room<S: StorageBackend + WithStateProvider + 'static>(
         // here); for rows staged after an earlier admit it is defensive.
         // Unstage rather than spin forever.
         for staged in toposort(parse_or_drop(&ctx, &room, &eligible, &version).await) {
-            process_one(&ctx, &room, staged, &mut backoff).await;
+            process_one(&ctx, &room, staged, &mut backoff, &mut failed).await;
         }
     }
 }
@@ -356,13 +381,14 @@ struct Staged {
     fetched_for: Option<OwnedEventId>,
 }
 
-/// Integrate one staged PDU through the actor, updating `backoff` per the
-/// drain-pass disposition (see the module docs).
+/// Integrate one staged PDU through the actor, updating `backoff` and `failed`
+/// per the drain-pass disposition (see the module docs).
 async fn process_one<S: StorageBackend + WithStateProvider + 'static>(
     ctx: &WorkerCtx<S>,
     room: &RoomId,
     staged: Staged,
     backoff: &mut HashMap<OwnedEventId, Backoff>,
+    failed: &mut HashSet<OwnedEventId>,
 ) {
     let id = staged.event.event_id.clone();
     match ctx.registry.apply_pdu(room, staged.event.clone()).await {
@@ -374,11 +400,12 @@ async fn process_one<S: StorageBackend + WithStateProvider + 'static>(
         }
         // Retryable verdict on a *fetched* row: its own ancestry is still
         // missing, which is the gap its root is (or will be) walking. Leave it
-        // staged, untouched — never start a second walk rooted here. It is
-        // skipped while the root backs off, and deleted with the root if the
-        // root's gap proves unfillable.
+        // staged — never start a second walk rooted here. From now on it is
+        // skipped while the root backs off, and it is deleted with the root if
+        // the root's gap proves unfillable.
         Err(RoomActorError::Apply(e)) if e.is_retryable() && staged.fetched_for.is_some() => {
             debug!(%id, root = ?staged.fetched_for, "fetched ancestry still ungrounded; leaving it to its root's walk");
+            failed.insert(id);
         }
         // Retryable verdict on a root. `fill_state_ancestry` returns `Ok(true)`
         // if it staged a real missing-ancestry gap — clear the backoff so the
@@ -535,6 +562,7 @@ fn toposort(items: Vec<Staged>) -> Vec<Staged> {
 mod tests {
     use neutrino_event::ROOM_VERSION_ID;
     use neutrino_event::event_builder::EventBuilder;
+    use neutrino_store::{EventStore, RoomStore, StagingStore};
     use ruma::{OwnedUserId, server_name};
     use serde_json::json;
 
@@ -579,6 +607,252 @@ mod tests {
         let b = on(&a, "b");
         let c = on(&b, "c");
         (a, b, c)
+    }
+
+    /// A gap-fill peer whose timeline round returns `timeline` and whose every
+    /// state round fails with a 502.
+    #[derive(Default)]
+    struct TimelineThenUnreachable {
+        timeline: std::sync::Mutex<Vec<String>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TimelineThenUnreachable {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MissingEventsFetcher for TimelineThenUnreachable {
+        async fn fetch(
+            &self,
+            q: crate::ports::MissingEventsQuery<'_>,
+        ) -> Result<Vec<Box<serde_json::value::RawValue>>, crate::ports::TransportError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if q.state_dag {
+                return Err(crate::ports::TransportError::Status(502));
+            }
+            Ok(self
+                .timeline
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|j| serde_json::value::RawValue::from_string(j.clone()).unwrap())
+                .collect())
+        }
+    }
+
+    /// A room (create + alice's join) on an in-memory store, with a worker
+    /// whose backoff floor is an hour, so a row gated on a backoff window stays
+    /// put for the length of a test.
+    async fn worker_over(
+        fetcher: Arc<TimelineThenUnreachable>,
+    ) -> (
+        Arc<neutrino_store_sqlite::SqliteStore>,
+        mpsc::Sender<OwnedRoomId>,
+        OwnedUserId,
+        Event,
+    ) {
+        let store = Arc::new(
+            neutrino_store_sqlite::SqliteStore::open_in_memory()
+                .await
+                .unwrap(),
+        );
+        let alice: OwnedUserId = "@alice:example.org".parse().unwrap();
+        let create = EventBuilder::new(
+            alice.clone(),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .unwrap();
+        let join = EventBuilder::new(
+            alice.clone(),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(create.room_id.clone())
+        .state_key(alice.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create.event_id.clone()])
+        .prev_state_events(vec![create.event_id.clone()])
+        .build()
+        .unwrap();
+        store
+            .create_room(&create, std::slice::from_ref(&join))
+            .await
+            .unwrap();
+        let policy = EventPolicy::trusted_network();
+        let registry = Arc::new(RoomRegistry::new(
+            store.clone(),
+            "example.org".to_owned(),
+            policy.clone(),
+        ));
+        let poke = spawn_with(
+            store.clone(),
+            registry,
+            fetcher,
+            policy,
+            Duration::from_secs(3600),
+        );
+        (store, poke, alice, join)
+    }
+
+    /// A message (or, for `m.room.topic`, a state event) by `alice` on the
+    /// given parents.
+    fn event_on(
+        alice: &OwnedUserId,
+        room_id: &RoomId,
+        ty: &str,
+        prev: &OwnedEventId,
+        prev_state: &OwnedEventId,
+    ) -> Event {
+        let builder = EventBuilder::new(
+            alice.clone(),
+            ty.to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.to_owned())
+        .prev_events(vec![prev.clone()])
+        .prev_state_events(vec![prev_state.clone()]);
+        let builder = if ty == "m.room.topic" {
+            builder
+                .state_key(String::new())
+                .content(json!({ "topic": "t" }))
+        } else {
+            builder.content(json!({ "msgtype": "m.text", "body": "m" }))
+        };
+        builder.build().unwrap()
+    }
+
+    /// Polls `cond` until it holds, failing after five seconds.
+    async fn eventually<F: std::future::Future<Output = bool>>(what: &str, cond: impl Fn() -> F) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cond().await {
+            assert!(Instant::now() < deadline, "timed out waiting for: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A fetched row whose ancestry is already grounded applies while its root
+    /// backs off: here the root's timeline parent, which sits on held state,
+    /// while the root's state round keeps failing.
+    #[tokio::test]
+    async fn grounded_fetched_row_applies_while_its_root_backs_off() {
+        let fetcher = Arc::new(TimelineThenUnreachable::default());
+        let (store, poke, alice, join) = worker_over(fetcher.clone()).await;
+        let room = &join.room_id;
+        let parent = event_on(
+            &alice,
+            room,
+            "m.room.message",
+            &join.event_id,
+            &join.event_id,
+        );
+        let never_delivered =
+            event_on(&alice, room, "m.room.topic", &join.event_id, &join.event_id);
+        let missing = event_on(
+            &alice,
+            room,
+            "m.room.topic",
+            &never_delivered.event_id,
+            &never_delivered.event_id,
+        );
+        let root = event_on(
+            &alice,
+            room,
+            "m.room.message",
+            &parent.event_id,
+            &missing.event_id,
+        );
+        *fetcher.timeline.lock().unwrap() = vec![parent.raw.get().to_owned()];
+
+        let origin = ruma::server_name!("remote.example.org");
+        store
+            .stage_pdu(origin, room, &root.event_id, &root.raw, None)
+            .await
+            .unwrap();
+        poke.send(room.clone()).await.unwrap();
+
+        eventually("the timeline parent to commit", || async {
+            !store
+                .get_events(&[parent.event_id.as_ref()])
+                .await
+                .unwrap()
+                .is_empty()
+        })
+        .await;
+        let staged: Vec<OwnedEventId> = store
+            .staged_for_room(room)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.event_id)
+            .collect();
+        assert_eq!(
+            staged,
+            vec![root.event_id.clone()],
+            "the root still backs off"
+        );
+        assert_eq!(
+            fetcher.calls(),
+            2,
+            "one timeline round, one failed state round"
+        );
+    }
+
+    /// A fetched row whose root is no longer staged is dropped, not retried
+    /// every pass with nothing left to ground it.
+    #[tokio::test]
+    async fn fetched_row_without_its_root_is_dropped() {
+        let fetcher = Arc::new(TimelineThenUnreachable::default());
+        let (store, poke, alice, join) = worker_over(fetcher.clone()).await;
+        let room = &join.room_id;
+        let never_delivered =
+            event_on(&alice, room, "m.room.topic", &join.event_id, &join.event_id);
+        let gone_root = event_on(
+            &alice,
+            room,
+            "m.room.message",
+            &join.event_id,
+            &join.event_id,
+        );
+        let orphan = event_on(
+            &alice,
+            room,
+            "m.room.topic",
+            &never_delivered.event_id,
+            &never_delivered.event_id,
+        );
+
+        let origin = ruma::server_name!("remote.example.org");
+        store
+            .stage_pdu(
+                origin,
+                room,
+                &orphan.event_id,
+                &orphan.raw,
+                Some(&gone_root.event_id),
+            )
+            .await
+            .unwrap();
+        poke.send(room.clone()).await.unwrap();
+
+        eventually("staging to drain", || async {
+            store.staged_for_room(room).await.unwrap().is_empty()
+        })
+        .await;
+        assert!(
+            store
+                .get_events(&[orphan.event_id.as_ref()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fetcher.calls(), 0, "an orphan never walks");
     }
 
     #[test]

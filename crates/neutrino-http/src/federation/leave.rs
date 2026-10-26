@@ -74,15 +74,24 @@ pub(crate) async fn reject_invite(
     .await
     {
         // The completed leave replaces the invite: sync shows the room as left.
-        Ok(leave) => {
-            store
-                .put_oob_membership(room_id, &user, &leave, &invite.room_version)
-                .await
-        }
+        // Refused if we have since joined (the leave then reaches us in-room)
+        // or the invite was replaced meanwhile (the newer one stands).
+        Ok(leave) => store
+            .put_oob_membership(
+                room_id,
+                &user,
+                &leave,
+                &invite.room_version,
+                Some(&invite.event.event_id),
+            )
+            .await
+            .map(drop),
         // No leave event to show; drop the stub so the invite at least vanishes.
         Err(e) => {
             warn!(%room_id, %dest, error = %e, "federated leave (invite reject) failed; rejecting locally anyway");
-            store.remove_oob_membership(room_id, &user).await
+            store
+                .remove_oob_membership(room_id, &user, Some(&invite.event.event_id))
+                .await
         }
     };
     match local {

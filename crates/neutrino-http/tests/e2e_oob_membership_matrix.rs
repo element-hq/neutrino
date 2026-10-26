@@ -13,57 +13,34 @@
 //! result; an invite-only room is covered separately where it changes the
 //! answer.
 //!
-//! These tests **document** what neutrino does today. They are deliberately
-//! descriptive, not prescriptive: where the observed behaviour diverges from
-//! the spec or from Synapse the assertion records the divergence and the
-//! comment says so, rather than failing. The two things asserted as genuine
-//! invariants throughout are:
+//! These tests **pin** what neutrino does today. Each matrix ends in one
+//! `assert_eq!` of its observed cells against an `EXPECTED_*` table beside the
+//! test, so a behaviour change must update that table. Where a pinned value
+//! diverges from the spec or from Synapse, the row's comment says so. Asserted
+//! throughout:
 //!
 //! 1. **no wedge** — after every permutation the room is still usable: A can
 //!    still send, and B's user can still reach a correct membership.
 //! 2. **no 5xx** — a membership transition is either performed or refused with
-//!    a 4xx; it never faults.
+//!    a 4xx; it never faults. The read helpers fail on any status but 200/404,
+//!    so a fault cannot pass as "no membership".
 //!
-//! Reference points used for the "should this 4xx?" column:
+//! Reference points for the divergences:
 //! `https://spec.matrix.org/unstable/server-server-api/`, and where the spec is
 //! silent, Synapse at /workspace/synapse (`handlers/federation.py`,
 //! `federation/federation_server.py`).
 //!
-//! # Observed behaviour
+//! # Tables
 //!
-//! Every cell below is produced by the tests in this file; run with
-//! `--nocapture` to print the tables. `prior` is the membership of B's user in
-//! A's room before the call.
+//! `prior` is the membership of B's user in A's room before the call; run with
+//! `--nocapture` to print the observed tables.
 //!
-//! ## Resident-side endpoints (called on A, the server hosting the room)
+//! Resident-side (called on A, the server hosting the room):
+//! `EXPECTED_MAKE_TEMPLATES`, `EXPECTED_MAKE_JOIN_INVITE_ONLY`,
+//! `EXPECTED_SEND_JOIN_LEAVE`, `EXPECTED_SEND_TXN_MEMBERSHIP`.
 //!
-//! ```text
-//! endpoint      never      invited    joined     left       room
-//! make_join     200        200        200        200        public
-//! make_join     403        200        200        403        invite-only
-//! make_leave    200        200        200        200        public
-//! send_join     200→join   200→join   200→join   200→join   public
-//! send_leave    403        200→leave  200→leave  403        public
-//! ```
-//!
-//! `/send` carrying a self-authored member event for B's user, delivered to A.
-//! "changed" = A's current state moved; a 200 here is only a durable *accept*,
-//! so the C-S API is the oracle:
-//!
-//! ```text
-//! kind     never      invited    joined     left
-//! invite   no change  no change  no change  no change   (self-invite is illegal)
-//! join     →join      →join      no change  →join
-//! leave    no change  →leave     →leave     no change
-//! ```
-//!
-//! ## Invitee-side endpoints (called on B, the invited user's server)
-//!
-//! ```text
-//! endpoint          never            invited          joined     left
-//! /invite           200, sync=invite 200, sync=invite 200, join   200, sync=invite
-//! /send rescission  200, no room     200, sync=leave  200, leave  200, leave
-//! ```
+//! Invitee-side (called on B, the invited user's server):
+//! `EXPECTED_INVITE_INVITEE`, `EXPECTED_RESCISSION`.
 //!
 //! # Findings
 //!
@@ -112,8 +89,10 @@
 //! intact, and a rescinded invite was never left presented as actionable.
 #![cfg(not(feature = "multi-user-shim"))]
 
+use std::fmt;
 use std::time::Duration;
 
+use Prior::{Invited, Joined, Left, Never};
 use neutrino_ctl::{Command, Config, DiscoveryRegistry};
 use neutrino_event::event_builder::EventBuilder;
 use neutrino_event::ruma;
@@ -243,6 +222,39 @@ fn errcode(body: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Observed strings outlive the test, so cells hold `&'static str` and compare
+/// directly against `const` expected tables.
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// Prints the observed table, then asserts it equals `expected`. A mismatch
+/// lists each differing row in table form.
+fn assert_table<T: fmt::Display + fmt::Debug + PartialEq>(
+    title: &str,
+    header: &str,
+    observed: &[T],
+    expected: &[T],
+) {
+    eprintln!("\n=== {title} ===\n{header}");
+    for row in observed {
+        eprintln!("{row}");
+    }
+    eprintln!();
+    let diff: String = observed
+        .iter()
+        .zip(expected)
+        .filter(|(o, e)| o != e)
+        .map(|(o, e)| format!("\n  expected {e}\n  observed {o}"))
+        .collect();
+    assert_eq!(observed, expected, "{title}: table mismatch{diff}");
+}
+
+/// `j=_ i=_ l=_` for a `(join, invite, leave)` sync-bucket triple.
+fn buckets_label((j, i, l): (bool, bool, bool)) -> String {
+    format!("j={} i={} l={}", j as u8, i as u8, l as u8)
+}
+
 // ===================================================================
 // Observation helpers — all reads go through the client API
 // ===================================================================
@@ -265,9 +277,11 @@ async fn membership(
         None,
     )
     .await;
-    if status != 200 {
-        return None;
-    }
+    assert!(
+        status == 200 || status == 404,
+        "member state on {}: {status} {body}",
+        node.server_name
+    );
     body.get("membership")
         .and_then(Value::as_str)
         .map(str::to_owned)
@@ -284,9 +298,7 @@ async fn sync_buckets(http: &reqwest::Client, node: &Node, room: &str) -> (bool,
         None,
     )
     .await;
-    if status != 200 {
-        return (false, false, false);
-    }
+    assert_eq!(status, 200, "/sync on {}: {body}", node.server_name);
     let has = |bucket: &str| {
         body.pointer(&format!("/rooms/{bucket}"))
             .and_then(Value::as_object)
@@ -517,8 +529,7 @@ fn member_from_template(
 /// `make_leave` is neutrino's universal head oracle: unlike `make_join` it
 /// applies no membership pre-check (documented at `federation/make_leave.rs`),
 /// so it yields a usable template in every prior state. A Synapse resident
-/// would 403 two of the four (see the findings table), which is itself one of
-/// the divergences this file records.
+/// would 403 two of the four (F1).
 async fn heads_template(http: &reqwest::Client, a: &Node, b: &Node, room: &str) -> Value {
     let (status, body) = s2s(
         http,
@@ -567,6 +578,41 @@ async fn room_in_state_on_both(http: &reqwest::Client, a: &Node, b: &Node, prior
 // Matrix 1 — GET /make_join and GET /make_leave
 // ===================================================================
 
+/// One `make_*` request against the resident.
+#[derive(Debug, PartialEq)]
+struct TemplateCell {
+    op: &'static str,
+    prior: Prior,
+    status: u16,
+    errcode: Option<&'static str>,
+}
+
+impl fmt::Display for TemplateCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "| {:<9} | {:<10} | {:<3} | {:<18} |",
+            self.op,
+            self.prior.label(),
+            self.status,
+            self.errcode.unwrap_or("-")
+        )
+    }
+}
+
+/// `make_leave` answers 200 from `never` and `left` too (F1).
+#[rustfmt::skip]
+const EXPECTED_MAKE_TEMPLATES: [TemplateCell; 8] = [
+    TemplateCell { op: "make_join",  prior: Never,   status: 200, errcode: None },
+    TemplateCell { op: "make_leave", prior: Never,   status: 200, errcode: None },
+    TemplateCell { op: "make_join",  prior: Invited, status: 200, errcode: None },
+    TemplateCell { op: "make_leave", prior: Invited, status: 200, errcode: None },
+    TemplateCell { op: "make_join",  prior: Joined,  status: 200, errcode: None },
+    TemplateCell { op: "make_leave", prior: Joined,  status: 200, errcode: None },
+    TemplateCell { op: "make_join",  prior: Left,    status: 200, errcode: None },
+    TemplateCell { op: "make_leave", prior: Left,    status: 200, errcode: None },
+];
+
 #[tokio::test]
 async fn matrix_make_join_and_make_leave_across_prior_memberships() {
     let a = start_node("alice").await;
@@ -574,7 +620,7 @@ async fn matrix_make_join_and_make_leave_across_prior_memberships() {
     tokio::time::sleep(Duration::from_millis(250)).await;
     let http = client();
 
-    let mut rows: Vec<String> = Vec::new();
+    let mut observed = Vec::new();
 
     for prior in Prior::all() {
         for op in ["make_join", "make_leave"] {
@@ -627,29 +673,55 @@ async fn matrix_make_join_and_make_leave_across_prior_memberships() {
                 "{op}/{}: a make_* request must not change membership",
                 prior.label()
             );
-            assert!(status < 500, "{op}/{}: {status} {body}", prior.label());
 
-            rows.push(format!(
-                "| {:<9} | {:<10} | {:<3} | {:<18} |",
+            observed.push(TemplateCell {
                 op,
-                prior.label(),
+                prior,
                 status,
-                errcode(&body).unwrap_or_else(|| "-".into())
-            ));
+                errcode: errcode(&body).map(leak),
+            });
         }
     }
 
-    eprintln!("\n=== make_join / make_leave × prior membership (public room) ===");
-    eprintln!("| op        | prior      | st  | errcode            |");
-    for r in &rows {
-        eprintln!("{r}");
-    }
-    eprintln!();
+    assert_table(
+        "make_join / make_leave × prior membership (public room)",
+        "| op        | prior      | st  | errcode            |",
+        &observed,
+        &EXPECTED_MAKE_TEMPLATES,
+    );
 }
 
 // ===================================================================
 // Matrix 2 — GET /make_join on an invite-only room
 // ===================================================================
+
+/// One `make_join` request against an invite-only room.
+#[derive(Debug, PartialEq)]
+struct InviteOnlyCell {
+    prior: Prior,
+    status: u16,
+    errcode: Option<&'static str>,
+}
+
+impl fmt::Display for InviteOnlyCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "| {:<10} | {:<3} | {:<18} |",
+            self.prior.label(),
+            self.status,
+            self.errcode.unwrap_or("-")
+        )
+    }
+}
+
+#[rustfmt::skip]
+const EXPECTED_MAKE_JOIN_INVITE_ONLY: [InviteOnlyCell; 4] = [
+    InviteOnlyCell { prior: Never,   status: 403, errcode: Some("M_FORBIDDEN") },
+    InviteOnlyCell { prior: Invited, status: 200, errcode: None },
+    InviteOnlyCell { prior: Joined,  status: 200, errcode: None },
+    InviteOnlyCell { prior: Left,    status: 403, errcode: Some("M_FORBIDDEN") },
+];
 
 #[tokio::test]
 async fn matrix_make_join_on_invite_only_room_across_prior_memberships() {
@@ -658,7 +730,7 @@ async fn matrix_make_join_on_invite_only_room_across_prior_memberships() {
     tokio::time::sleep(Duration::from_millis(250)).await;
     let http = client();
 
-    let mut rows: Vec<String> = Vec::new();
+    let mut observed = Vec::new();
     for prior in Prior::all() {
         // `private_chat` = join_rules invite. A `joined`/`left` prior needs a
         // join first, which an invite-only room refuses without an invite, so
@@ -704,26 +776,63 @@ async fn matrix_make_join_on_invite_only_room_across_prior_memberships() {
             None,
         )
         .await;
-        assert!(status < 500, "make_join/{}: {status} {body}", prior.label());
-        rows.push(format!(
-            "| {:<10} | {:<3} | {:<18} |",
-            prior.label(),
+        observed.push(InviteOnlyCell {
+            prior,
             status,
-            errcode(&body).unwrap_or_else(|| "-".into())
-        ));
+            errcode: errcode(&body).map(leak),
+        });
     }
 
-    eprintln!("\n=== make_join × prior membership (INVITE-ONLY room) ===");
-    eprintln!("| prior      | st  | errcode            |");
-    for r in &rows {
-        eprintln!("{r}");
-    }
-    eprintln!();
+    assert_table(
+        "make_join × prior membership (INVITE-ONLY room)",
+        "| prior      | st  | errcode            |",
+        &observed,
+        &EXPECTED_MAKE_JOIN_INVITE_ONLY,
+    );
 }
 
 // ===================================================================
 // Matrix 3 — PUT /send_join and PUT /send_leave
 // ===================================================================
+
+/// One `send_join` / `send_leave` against the resident, and the membership
+/// A's client API settles on afterwards.
+#[derive(Debug, PartialEq)]
+struct SendCell {
+    endpoint: &'static str,
+    prior: Prior,
+    status: u16,
+    errcode: Option<&'static str>,
+    seen: Option<&'static str>,
+}
+
+impl fmt::Display for SendCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "| {:<10} | {:<9} | {:<3} | {:<22} | {:<8} -> {:<8} |",
+            self.endpoint,
+            self.prior.label(),
+            self.status,
+            self.errcode.unwrap_or("-"),
+            self.prior.expected_membership().unwrap_or("none"),
+            self.seen.unwrap_or("none"),
+        )
+    }
+}
+
+/// `send_leave` refuses the `never` / `left` templates `make_leave` issued (F1).
+#[rustfmt::skip]
+const EXPECTED_SEND_JOIN_LEAVE: [SendCell; 8] = [
+    SendCell { endpoint: "send_join",  prior: Never,   status: 200, errcode: None,                seen: Some("join") },
+    SendCell { endpoint: "send_leave", prior: Never,   status: 403, errcode: Some("M_FORBIDDEN"), seen: None },
+    SendCell { endpoint: "send_join",  prior: Invited, status: 200, errcode: None,                seen: Some("join") },
+    SendCell { endpoint: "send_leave", prior: Invited, status: 200, errcode: None,                seen: Some("leave") },
+    SendCell { endpoint: "send_join",  prior: Joined,  status: 200, errcode: None,                seen: Some("join") },
+    SendCell { endpoint: "send_leave", prior: Joined,  status: 200, errcode: None,                seen: Some("leave") },
+    SendCell { endpoint: "send_join",  prior: Left,    status: 200, errcode: None,                seen: Some("join") },
+    SendCell { endpoint: "send_leave", prior: Left,    status: 403, errcode: Some("M_FORBIDDEN"), seen: Some("leave") },
+];
 
 #[tokio::test]
 async fn matrix_send_join_and_send_leave_across_prior_memberships() {
@@ -732,7 +841,7 @@ async fn matrix_send_join_and_send_leave_across_prior_memberships() {
     tokio::time::sleep(Duration::from_millis(250)).await;
     let http = client();
 
-    let mut rows: Vec<String> = Vec::new();
+    let mut observed = Vec::new();
 
     for prior in Prior::all() {
         for kind in ["join", "leave"] {
@@ -759,11 +868,6 @@ async fn matrix_send_join_and_send_leave_across_prior_memberships() {
                 Some(&raw(&ev)),
             )
             .await;
-            assert!(
-                status < 500,
-                "{endpoint}/{}: {status} {body}",
-                prior.label()
-            );
 
             // Where the endpoint accepted, the transition must be reflected
             // down A's client API; where it refused, the prior state stands.
@@ -795,29 +899,72 @@ async fn matrix_send_join_and_send_leave_across_prior_memberships() {
                 prior.label()
             );
 
-            rows.push(format!(
-                "| {:<10} | {:<9} | {:<3} | {:<22} | {:<8} -> {:<8} |",
+            observed.push(SendCell {
                 endpoint,
-                prior.label(),
+                prior,
                 status,
-                errcode(&body).unwrap_or_else(|| "-".into()),
-                prior.expected_membership().unwrap_or("none"),
-                seen.as_deref().unwrap_or("none"),
-            ));
+                errcode: errcode(&body).map(leak),
+                seen: seen.map(leak),
+            });
         }
     }
 
-    eprintln!("\n=== send_join / send_leave × prior membership (public room) ===");
-    eprintln!("| endpoint   | prior     | st  | errcode                | A's CS-API view    |");
-    for r in &rows {
-        eprintln!("{r}");
-    }
-    eprintln!();
+    assert_table(
+        "send_join / send_leave × prior membership (public room)",
+        "| endpoint   | prior     | st  | errcode                | A's CS-API view    |",
+        &observed,
+        &EXPECTED_SEND_JOIN_LEAVE,
+    );
 }
 
 // ===================================================================
 // Matrix 4 — the same join / leave delivered via PUT /send instead
 // ===================================================================
+
+/// One self-authored member event for B's user delivered to A via `/send`.
+/// A 200 is only a durable *accept*, so `settled` (A's client API) is the
+/// oracle; `changed` = A's current state moved.
+#[derive(Debug, PartialEq)]
+struct TxnCell {
+    kind: &'static str,
+    prior: Prior,
+    status: u16,
+    settled: Option<&'static str>,
+    changed: bool,
+}
+
+impl fmt::Display for TxnCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "| {:<6} | {:<9} | {:<3} | {:<8} -> {:<8} | changed={:<5} |",
+            self.kind,
+            self.prior.label(),
+            self.status,
+            self.prior.expected_membership().unwrap_or("none"),
+            self.settled.unwrap_or("none"),
+            self.changed,
+        )
+    }
+}
+
+/// A self-invite is illegal (rule 5.5 requires sender != state_key), so
+/// `invite` never changes state.
+#[rustfmt::skip]
+const EXPECTED_SEND_TXN_MEMBERSHIP: [TxnCell; 12] = [
+    TxnCell { kind: "invite", prior: Never,   status: 200, settled: None,           changed: false },
+    TxnCell { kind: "join",   prior: Never,   status: 200, settled: Some("join"),   changed: true },
+    TxnCell { kind: "leave",  prior: Never,   status: 200, settled: None,           changed: false },
+    TxnCell { kind: "invite", prior: Invited, status: 200, settled: Some("invite"), changed: false },
+    TxnCell { kind: "join",   prior: Invited, status: 200, settled: Some("join"),   changed: true },
+    TxnCell { kind: "leave",  prior: Invited, status: 200, settled: Some("leave"),  changed: true },
+    TxnCell { kind: "invite", prior: Joined,  status: 200, settled: Some("join"),   changed: false },
+    TxnCell { kind: "join",   prior: Joined,  status: 200, settled: Some("join"),   changed: false },
+    TxnCell { kind: "leave",  prior: Joined,  status: 200, settled: Some("leave"),  changed: true },
+    TxnCell { kind: "invite", prior: Left,    status: 200, settled: Some("leave"),  changed: false },
+    TxnCell { kind: "join",   prior: Left,    status: 200, settled: Some("join"),   changed: true },
+    TxnCell { kind: "leave",  prior: Left,    status: 200, settled: Some("leave"),  changed: false },
+];
 
 #[tokio::test]
 async fn matrix_send_transaction_membership_across_prior_memberships() {
@@ -826,17 +973,14 @@ async fn matrix_send_transaction_membership_across_prior_memberships() {
     tokio::time::sleep(Duration::from_millis(250)).await;
     let http = client();
 
-    let mut rows: Vec<String> = Vec::new();
+    let mut observed = Vec::new();
 
     for prior in Prior::all() {
-        // `invite` is included even though a self-invite is not a legal
-        // transition (rule 5.5 requires sender != state_key for invite) — the
-        // point is that an illegal transition must be refused, not wedge.
         for kind in ["invite", "join", "leave"] {
             let room = room_in_state(&http, &a, &b, prior, "public_chat").await;
             let template = heads_template(&http, &a, &b, &room).await;
             let ev = member_from_template(&template, &b.user, &b.user, kind);
-            let (status, body) = s2s(
+            let (status, _) = s2s(
                 &http,
                 "PUT",
                 &a,
@@ -845,15 +989,10 @@ async fn matrix_send_transaction_membership_across_prior_memberships() {
                 Some(&txn(&[&ev])),
             )
             .await;
-            assert!(
-                status < 500,
-                "send/{kind}/{}: {status} {body}",
-                prior.label()
-            );
 
-            // `/send` is stage-then-async: a 200 is a durable *accept*, not an
-            // applied transition, so the C-S API is the only honest oracle.
-            let settled = settle(&http, &a, &room, &b.user, |m| m == Some(kind)).await;
+            let settled = settle(&http, &a, &room, &b.user, |m| m == Some(kind))
+                .await
+                .map(leak);
 
             let (send_status, _) = csapi(
                 &http,
@@ -875,26 +1014,24 @@ async fn matrix_send_transaction_membership_across_prior_memberships() {
                 prior.label()
             );
 
-            // "changed" is the honest question: `settled == kind` is a false
-            // positive whenever the prior state already equalled `kind`.
-            rows.push(format!(
-                "| {:<6} | {:<9} | {:<3} | {:<8} -> {:<8} | changed={:<5} |",
+            // `settled == kind` is a false positive whenever the prior state
+            // already equalled `kind`; `changed` is the honest question.
+            observed.push(TxnCell {
                 kind,
-                prior.label(),
+                prior,
                 status,
-                prior.expected_membership().unwrap_or("none"),
-                settled.as_deref().unwrap_or("none"),
-                settled.as_deref() != prior.expected_membership(),
-            ));
+                settled,
+                changed: settled != prior.expected_membership(),
+            });
         }
     }
 
-    eprintln!("\n=== /send self-authored member event × prior membership (to the resident) ===");
-    eprintln!("| kind   | prior     | st  | A's CS-API view    | changed       |");
-    for r in &rows {
-        eprintln!("{r}");
-    }
-    eprintln!();
+    assert_table(
+        "/send self-authored member event × prior membership (to the resident)",
+        "| kind   | prior     | st  | A's CS-API view    | changed       |",
+        &observed,
+        &EXPECTED_SEND_TXN_MEMBERSHIP,
+    );
 }
 
 // ===================================================================
@@ -907,6 +1044,50 @@ async fn matrix_send_transaction_membership_across_prior_memberships() {
 // DAG, and the two dispositions must agree with what B later does with a
 // rescission (matrix 6).
 
+/// One `/invite` delivered to B: B's two client surfaces once settled, then
+/// whether B's user can accept.
+#[derive(Debug, PartialEq)]
+struct InviteeCell {
+    prior: Prior,
+    status: u16,
+    errcode: Option<&'static str>,
+    /// B's state endpoint.
+    state: Option<&'static str>,
+    /// B's effective membership (sync first).
+    sync: Option<&'static str>,
+    /// `(join, invite, leave)` sync buckets.
+    buckets: (bool, bool, bool),
+    join_status: u16,
+    after_join: Option<&'static str>,
+}
+
+impl fmt::Display for InviteeCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "| {:<9} | {:<3} | {:<7} | state={:<7} sync={:<7} | {} | join={} -> {:<6} |",
+            self.prior.label(),
+            self.status,
+            self.errcode.unwrap_or("-"),
+            self.state.unwrap_or("none"),
+            self.sync.unwrap_or("none"),
+            buckets_label(self.buckets),
+            self.join_status,
+            self.after_join.unwrap_or("none"),
+        )
+    }
+}
+
+/// The state endpoint cannot see an out-of-band invite, and for `left` shows
+/// the stale in-room leave (F2).
+#[rustfmt::skip]
+const EXPECTED_INVITE_INVITEE: [InviteeCell; 4] = [
+    InviteeCell { prior: Never,   status: 200, errcode: None, state: None,          sync: Some("invite"), buckets: (false, true, false), join_status: 200, after_join: Some("join") },
+    InviteeCell { prior: Invited, status: 200, errcode: None, state: None,          sync: Some("invite"), buckets: (false, true, false), join_status: 200, after_join: Some("join") },
+    InviteeCell { prior: Joined,  status: 200, errcode: None, state: Some("join"),  sync: Some("join"),   buckets: (true, false, false), join_status: 200, after_join: Some("join") },
+    InviteeCell { prior: Left,    status: 200, errcode: None, state: Some("leave"), sync: Some("invite"), buckets: (false, true, false), join_status: 200, after_join: Some("join") },
+];
+
 #[tokio::test]
 async fn matrix_invite_endpoint_against_invitee_across_prior_memberships() {
     let a = start_node("alice").await;
@@ -914,7 +1095,7 @@ async fn matrix_invite_endpoint_against_invitee_across_prior_memberships() {
     tokio::time::sleep(Duration::from_millis(250)).await;
     let http = client();
 
-    let mut rows: Vec<String> = Vec::new();
+    let mut observed = Vec::new();
 
     for prior in Prior::all() {
         let room = room_in_state_on_both(&http, &a, &b, prior).await;
@@ -934,16 +1115,13 @@ async fn matrix_invite_endpoint_against_invitee_across_prior_memberships() {
             })),
         )
         .await;
-        assert!(status < 500, "invite/{}: {status} {body}", prior.label());
 
-        // A 200 means B accepted and co-signed; the invite must then be
-        // visible to B's own client somewhere.
-        let settled = settle_effective(&http, &b, &room, &b.user, |m| m == Some("invite")).await;
-        let state_view = membership(&http, &b, &room, &b.user).await;
-        let (joined, invited, left) = sync_buckets(&http, &b, &room).await;
+        let sync = settle_effective(&http, &b, &room, &b.user, |m| m == Some("invite")).await;
+        let state = membership(&http, &b, &room, &b.user).await;
+        let buckets = sync_buckets(&http, &b, &room).await;
 
-        // No wedge: B's user can still reach a correct membership afterwards.
-        // Accepting is the transition a real client would attempt next.
+        // No wedge: accepting is the transition a real client would attempt
+        // next, and B's user must always reach a real membership.
         let (join_status, _) = csapi(
             &http,
             "POST",
@@ -955,38 +1133,25 @@ async fn matrix_invite_endpoint_against_invitee_across_prior_memberships() {
         )
         .await;
         let after_join = settle_effective(&http, &b, &room, &b.user, |m| m == Some("join")).await;
-        // No wedge: whatever the endpoint decided, B's user can always reach a
-        // real membership afterwards.
-        assert_eq!(
-            after_join.as_deref(),
-            Some("join"),
-            "invite/{}: B's user could not recover to a joined state",
-            prior.label()
-        );
 
-        rows.push(format!(
-            "| {:<9} | {:<3} | {:<7} | state={:<7} sync={:<7} | j={} i={} l={} | join={} -> {:<6} |",
-            prior.label(),
+        observed.push(InviteeCell {
+            prior,
             status,
-            errcode(&body).unwrap_or_else(|| "-".into()),
-            state_view.as_deref().unwrap_or("none"),
-            settled.as_deref().unwrap_or("none"),
-            joined as u8,
-            invited as u8,
-            left as u8,
+            errcode: errcode(&body).map(leak),
+            state: state.map(leak),
+            sync: sync.map(leak),
+            buckets,
             join_status,
-            after_join.as_deref().unwrap_or("none"),
-        ));
+            after_join: after_join.map(leak),
+        });
     }
 
-    eprintln!("\n=== /invite × prior membership (against the INVITEE server B) ===");
-    eprintln!(
-        "| prior     | st  | errcode | B's two C-S surfaces        | B sync buckets | recovery          |"
+    assert_table(
+        "/invite × prior membership (against the INVITEE server B)",
+        "| prior     | st  | errcode | B's two C-S surfaces        | B sync buckets | recovery          |",
+        &observed,
+        &EXPECTED_INVITE_INVITEE,
     );
-    for r in &rows {
-        eprintln!("{r}");
-    }
-    eprintln!();
 }
 
 // ===================================================================
@@ -998,6 +1163,51 @@ async fn matrix_invite_endpoint_against_invitee_across_prior_memberships() {
 // Whichever it is, a subsequent leave/kick from A must land somewhere B's
 // client can see, and must never strand the invite.
 
+/// One A-authored leave for B's user delivered to B: B's two client surfaces
+/// once settled, then B's own `/leave`.
+#[derive(Debug, PartialEq)]
+struct RescindCell {
+    prior: Prior,
+    status: u16,
+    /// B's state endpoint, before B's `/leave`.
+    state: Option<&'static str>,
+    /// B's effective membership (sync first), before B's `/leave`.
+    sync: Option<&'static str>,
+    /// `(join, invite, leave)` sync buckets, before B's `/leave`.
+    buckets: (bool, bool, bool),
+    leave_status: u16,
+    after_leave: Option<&'static str>,
+    /// Sync still buckets the room under invite after B's `/leave`.
+    still_invited: bool,
+}
+
+impl fmt::Display for RescindCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "| {:<9} | {:<3} | state={:<7} sync={:<7} | {} | /leave={} -> {:<6} inv={} |",
+            self.prior.label(),
+            self.status,
+            self.state.unwrap_or("none"),
+            self.sync.unwrap_or("none"),
+            buckets_label(self.buckets),
+            self.leave_status,
+            self.after_leave.unwrap_or("none"),
+            self.still_invited as u8,
+        )
+    }
+}
+
+/// For `never` B holds no room at all, so the rescission and B's `/leave`
+/// (404) leave nothing to show.
+#[rustfmt::skip]
+const EXPECTED_RESCISSION: [RescindCell; 4] = [
+    RescindCell { prior: Never,   status: 200, state: None,          sync: None,          buckets: (false, false, false), leave_status: 404, after_leave: None,          still_invited: false },
+    RescindCell { prior: Invited, status: 200, state: None,          sync: Some("leave"), buckets: (false, false, true),  leave_status: 200, after_leave: Some("leave"), still_invited: false },
+    RescindCell { prior: Joined,  status: 200, state: Some("leave"), sync: Some("leave"), buckets: (false, false, true),  leave_status: 200, after_leave: Some("leave"), still_invited: false },
+    RescindCell { prior: Left,    status: 200, state: Some("leave"), sync: Some("leave"), buckets: (false, false, true),  leave_status: 200, after_leave: Some("leave"), still_invited: false },
+];
+
 #[tokio::test]
 async fn matrix_send_rescission_against_invitee_across_prior_memberships() {
     let a = start_node("alice").await;
@@ -1005,7 +1215,7 @@ async fn matrix_send_rescission_against_invitee_across_prior_memberships() {
     tokio::time::sleep(Duration::from_millis(250)).await;
     let http = client();
 
-    let mut rows: Vec<String> = Vec::new();
+    let mut observed = Vec::new();
 
     for prior in Prior::all() {
         let room = room_in_state_on_both(&http, &a, &b, prior).await;
@@ -1013,7 +1223,7 @@ async fn matrix_send_rescission_against_invitee_across_prior_memberships() {
         // A kicks B's user: authored by A, targeting B's user.
         let template = heads_template(&http, &a, &b, &room).await;
         let kick = member_from_template(&template, &a.user, &b.user, "leave");
-        let (status, body) = s2s(
+        let (status, _) = s2s(
             &http,
             "PUT",
             &b,
@@ -1022,64 +1232,45 @@ async fn matrix_send_rescission_against_invitee_across_prior_memberships() {
             Some(&txn(&[&kick])),
         )
         .await;
-        assert!(status < 500, "rescind/{}: {status} {body}", prior.label());
 
-        let settled = settle_effective(&http, &b, &room, &b.user, |m| m == Some("leave")).await;
-        let state_view = membership(&http, &b, &room, &b.user).await;
-        let (joined, invited, left) = sync_buckets(&http, &b, &room).await;
+        let sync = settle_effective(&http, &b, &room, &b.user, |m| m == Some("leave")).await;
+        let state = membership(&http, &b, &room, &b.user).await;
+        let buckets = sync_buckets(&http, &b, &room).await;
 
         // No wedge: whatever happened, B's client can still act. `/leave` must
-        // not hang or lie — it either succeeds or reports a real error, and
-        // afterwards B must not still be presented as invited.
-        let (leave_status, leave_body) = csapi(
+        // not hang or lie, and afterwards B must not still be presented as
+        // invited.
+        let (leave_status, _) = csapi(
             &http,
             "POST",
             format!("{}/_matrix/client/v3/rooms/{}/leave", b.http_base, room),
             Some(&json!({})),
         )
         .await;
-        assert!(
-            leave_status < 500,
-            "rescind/{}: /leave faulted: {leave_status} {leave_body}",
-            prior.label()
-        );
         let after_leave = settle_effective(&http, &b, &room, &b.user, |m| {
             m == Some("leave") || m.is_none()
         })
         .await;
         let (_, still_invited, _) = sync_buckets(&http, &b, &room).await;
-        // The wedge invariant: an invite that has been rescinded must never
-        // still be presented to the user as actionable.
-        assert!(
-            !still_invited,
-            "rescind/{}: B still shows the room as invited after the rescission \
-             and a /leave — the invite is stranded",
-            prior.label()
-        );
 
-        rows.push(format!(
-            "| {:<9} | {:<3} | state={:<7} sync={:<7} | j={} i={} l={} | /leave={} -> {:<6} inv={} |",
-            prior.label(),
+        observed.push(RescindCell {
+            prior,
             status,
-            state_view.as_deref().unwrap_or("none"),
-            settled.as_deref().unwrap_or("none"),
-            joined as u8,
-            invited as u8,
-            left as u8,
+            state: state.map(leak),
+            sync: sync.map(leak),
+            buckets,
             leave_status,
-            after_leave.as_deref().unwrap_or("none"),
-            still_invited as u8,
-        ));
+            after_leave: after_leave.map(leak),
+            still_invited,
+        });
     }
 
-    eprintln!("\n=== /send A-authored leave (rescission) × prior membership (against B) ===");
-    eprintln!(
-        "| prior     | st  | B's two C-S surfaces        | B sync buckets | recovery via /leave        |"
+    assert_table(
+        "/send A-authored leave (rescission) × prior membership (against B)",
+        "| prior     | st  | B's two C-S surfaces        | B sync buckets | recovery via /leave        |",
+        &observed,
+        &EXPECTED_RESCISSION,
     );
-    for r in &rows {
-        eprintln!("{r}");
-    }
-    eprintln!();
 }
 
 // ===================================================================
@@ -1393,11 +1584,9 @@ async fn csapi_invite_join_leave_reinvite_round_trip() {
             "[{preset}] and must be bucketed under invite in /sync"
         );
 
-        // The invite is not lost, only unshown: B's user can *decline* it, and
-        // declining runs the federated reject handshake, which moves A's state
-        // invite -> leave. A no-op /leave (which is what B would do if it held
-        // no stub) could not move A. So this discriminates "the stub exists
-        // and sync hides it" from "the invite never arrived".
+        // Declining runs the federated reject handshake, which moves A's state
+        // invite -> leave. A /leave with no invite held on B would be a no-op
+        // and could not move A, so this proves the shown invite is actionable.
         let (s, bd) = csapi(
             &http,
             "POST",
@@ -1405,21 +1594,29 @@ async fn csapi_invite_join_leave_reinvite_round_trip() {
             Some(&json!({})),
         )
         .await;
-        assert_eq!(s, 200, "[{preset}] decline the unseen re-invite: {bd}");
+        assert_eq!(s, 200, "[{preset}] decline the re-invite: {bd}");
         assert_eq!(
             settle(&http, &a, &room, &b.user, |m| m == Some("leave")).await,
             Some("leave".to_owned()),
-            "[{preset}] declining moved A's state, so B did hold the invite \
-             stub — sync hid it rather than the invite going missing"
+            "[{preset}] declining must run the reject handshake and move A's state"
         );
 
-        // Re-invite once more and confirm the same invisibility, then check the
-        // invite is still actionable by joining. On an invite-only room the
-        // join only works *because* A's room state holds a valid invite — B
-        // is acting on something its own client never showed it.
+        // Re-invite once more: B must see it again and be able to accept it.
+        // On an invite-only room the join works only because A's room state
+        // holds a valid invite.
         let (s, bd) = invite(&http, room.clone()).await;
         assert_eq!(s, 200, "[{preset}] second re-invite: {bd}");
         settle(&http, &a, &room, &b.user, |m| m == Some("invite")).await;
+        assert_eq!(
+            settle_effective(&http, &b, &room, &b.user, |m| m == Some("invite")).await,
+            Some("invite".to_owned()),
+            "[{preset}] the second re-invite must reach the client"
+        );
+        let (_, invited_bucket, _) = sync_buckets(&http, &b, &room).await;
+        assert!(
+            invited_bucket,
+            "[{preset}] and must be bucketed under invite in /sync"
+        );
         let (s, bd) = csapi(
             &http,
             "POST",

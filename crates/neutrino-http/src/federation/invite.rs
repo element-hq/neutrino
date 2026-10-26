@@ -37,7 +37,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use neutrino_store::{OobMembershipStore, StateStore};
+use neutrino_store::{OobMembershipStore, OobWrite, StateStore};
 use ruma::events::AnyStrippedStateEvent;
 use ruma::serde::Raw;
 use ruma::{OwnedUserId, RoomId, UserId};
@@ -180,21 +180,7 @@ pub(crate) async fn handle(
     // Keep the wire bytes for the response before either path moves `event`.
     let event_raw = event.raw.clone();
 
-    if server_in_room(&*store, &room_id, &our_server).await? {
-        // We are in the room: integrate the invite as a normal inbound PDU. The
-        // worker auth-checks + state-resolves + persists it (gap-filling its
-        // ancestry if needed), so it lands in `current_state`. Origin = the
-        // invite's sender domain (the worker's gap-fill fetch target).
-        let origin = event.sender.server_name().to_owned();
-        stage_and_poke(
-            &*store,
-            &worker_poke,
-            &origin,
-            &room_id,
-            std::slice::from_ref(&event),
-        )
-        .await?;
-    } else {
+    if !server_in_room(&*store, &room_id, &our_server).await? {
         // Out-of-band: no room state to auth against, and apply_pdu never runs, so
         // the network-attested origin MUST own the invite's sender (the inviting
         // server) — otherwise an authenticated peer could plant a stub with a
@@ -205,11 +191,30 @@ pub(crate) async fn handle(
             ));
         }
         // Store the stub so sync can surface the invite from its
-        // `unsigned.invite_room_state`.
-        store
-            .put_oob_membership(&room_id, &invited, &event, version.id)
-            .await?;
+        // `unsigned.invite_room_state`. Refused if we joined since the check
+        // above, in which case the invite is staged below.
+        if store
+            .put_oob_membership(&room_id, &invited, &event, version.id, None)
+            .await?
+            == OobWrite::Written
+        {
+            return Ok(Json(ResponseBody { event: event_raw }));
+        }
     }
+
+    // We are in the room: integrate the invite as a normal inbound PDU. The
+    // worker auth-checks + state-resolves + persists it (gap-filling its
+    // ancestry if needed), so it lands in `current_state`. Origin = the
+    // invite's sender domain (the worker's gap-fill fetch target).
+    let origin = event.sender.server_name().to_owned();
+    stage_and_poke(
+        &*store,
+        &worker_poke,
+        &origin,
+        &room_id,
+        std::slice::from_ref(&event),
+    )
+    .await?;
 
     Ok(Json(ResponseBody { event: event_raw }))
 }

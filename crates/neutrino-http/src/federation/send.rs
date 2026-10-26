@@ -44,7 +44,9 @@ use axum::{
     http::HeaderMap,
 };
 use neutrino_event::{EventPolicy, Wire};
-use neutrino_store::{FederationInbox, Membership, OobMembershipStore, StagingStore, StorageError};
+use neutrino_store::{
+    FederationInbox, Membership, OobMembershipStore, OobWrite, StagingStore, StorageError,
+};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
@@ -116,7 +118,7 @@ pub(crate) struct ResponseBody {
 /// does not own) — stage it like any other. `Ok(Some(id))` = consumed, whether
 /// stored or dropped (malformed, not a rescission by the inviter, or not naming
 /// the stub it supersedes).
-async fn apply_oob_membership(
+pub(super) async fn apply_oob_membership(
     store: &(impl OobMembershipStore + neutrino_store::StateStore),
     policy: &EventPolicy,
     origin: &ServerName,
@@ -200,10 +202,24 @@ async fn apply_oob_membership(
         warn!(event_id = %event.event_id, stub = %stub.event.event_id, "/send: dropping out-of-band membership that does not name the membership it supersedes");
         return Ok(Some(event.event_id));
     }
-    store
-        .put_oob_membership(room_id, &user, &event, &stub.room_version)
-        .await?;
-    Ok(Some(event.event_id))
+    match store
+        .put_oob_membership(
+            room_id,
+            &user,
+            &event,
+            &stub.room_version,
+            Some(&stub.event.event_id),
+        )
+        .await?
+    {
+        OobWrite::Written => Ok(Some(event.event_id)),
+        // We joined since the `server_in_room` check: stage it instead.
+        OobWrite::ServerJoined => Ok(None),
+        OobWrite::Superseded => {
+            warn!(event_id = %event.event_id, stub = %stub.event.event_id, "/send: dropping out-of-band membership whose stub was replaced while it was checked");
+            Ok(Some(event.event_id))
+        }
+    }
 }
 
 /// Federation `/send/{txnId}` handler. Stages the transaction's PDUs and pokes

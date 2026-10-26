@@ -173,6 +173,7 @@ mod tests {
                 user,
                 &oob_invite(room, user, inviter, "Remote Room"),
                 neutrino_event::ROOM_VERSION_ID,
+                None,
             )
             .await
             .unwrap();

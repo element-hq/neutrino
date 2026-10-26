@@ -1223,7 +1223,7 @@ mod unit_tests {
             }),
         );
         store
-            .put_oob_membership(room, user, &leave, neutrino_event::ROOM_VERSION_ID)
+            .put_oob_membership(room, user, &leave, neutrino_event::ROOM_VERSION_ID, None)
             .await
             .unwrap();
         let state = SyncState::new(store, no_shutdown());

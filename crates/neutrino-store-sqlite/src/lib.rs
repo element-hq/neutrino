@@ -61,9 +61,7 @@ pub struct SqliteStore {
     /// Writer pool, `max_size = 1`. The pool itself is the application-
     /// layer write mutex: `pool.get().await` is an async FIFO queue, so
     /// concurrent writers serialise here rather than racing the SQLite
-    /// write lock and surfacing as `SQLITE_BUSY`. Must stay at one:
-    /// `put_oob_membership` relies on no write interleaving between its
-    /// watermark read and its insert.
+    /// write lock and surfacing as `SQLITE_BUSY`.
     writer_pool: Pool,
     /// One sender per store. Receivers handed out via `subscribe()` /
     /// `EventStore::subscribe` see the `StreamPos` of the most recently

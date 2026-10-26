@@ -696,6 +696,17 @@ pub struct ResolvedMembership {
     pub out_of_band: bool,
 }
 
+/// The outcome of [`OobMembershipStore::put_oob_membership`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OobWrite {
+    Written,
+    /// A user on the stub user's server is joined: the membership belongs in
+    /// the room DAG.
+    ServerJoined,
+    /// The held row is not the event the write names as replacing.
+    Superseded,
+}
+
 #[async_trait]
 pub trait OobMembershipStore: Send + Sync {
     /// Pre:  `event` is an `m.room.member` event with `state_key == user_id`,
@@ -708,14 +719,17 @@ pub trait OobMembershipStore: Send + Sync {
     ///       decline, a leave after an invite). Does NOT advance the persist
     ///       watch (an out-of-band event is not a room event; it surfaces only
     ///       via the sync out-of-band path). `InvalidInput` if `membership` is
-    ///       not one of the three.
+    ///       not one of the three. Writes nothing, returning the reason, if a
+    ///       user on `user_id`'s server is joined to `room_id`, or if `replaces`
+    ///       is `Some` and the held row is not that event.
     async fn put_oob_membership(
         &self,
         room_id: &RoomId,
         user_id: &UserId,
         event: &Event,
         room_version: &str,
-    ) -> Result<(), StorageError>;
+        replaces: Option<&EventId>,
+    ) -> Result<OobWrite, StorageError>;
 
     /// Pre:  none.
     /// Post: returns the stored membership for `(room_id, user_id)`, or `None`
@@ -728,13 +742,14 @@ pub trait OobMembershipStore: Send + Sync {
     ) -> Result<Option<OobMembership>, StorageError>;
 
     /// Pre:  none.
-    /// Post: deletes the row for `(room_id, user_id)` if present; idempotent (a
-    ///       missing pair is a no-op). Called when the user joins the room for
-    ///       real — in-room state supersedes the stub.
+    /// Post: deletes the row for `(room_id, user_id)` if present and, when
+    ///       `replaces` is `Some`, it holds that event; idempotent (a missing
+    ///       pair is a no-op).
     async fn remove_oob_membership(
         &self,
         room_id: &RoomId,
         user_id: &UserId,
+        replaces: Option<&EventId>,
     ) -> Result<(), StorageError>;
 
     /// Pre:  none.

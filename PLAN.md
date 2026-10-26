@@ -240,6 +240,7 @@ Intentional gaps in the sliding-sync implementation — see `MSC4186-gaps.md`:
 
 ### Server-Server follow-ons
 
+- gap-fill worker: in a `/send` burst `P1 ← … ← Pn`, every `Pi` is a root and walks `P1`'s gap on its own retry timer while that walk is failing (solution C in `FETCHED_FOR.md`)
 - orphan-staging garbage collection: a max-age sweep of `staged_events` (federation gap-fill ancestry that never grounds)
 - out-of-band membership sweep: `oob_memberships` rows are pruned when the room's current state supersedes them (in the persist txn), but a stub for a room whose state never moves again — a declined invite to a room we are not in — is kept for good. Bounded by rooms-ever-invited-to, and inert (it can never win a `learned_after` comparison), so this is growth hygiene only.
 - inbound `/get_missing_events` deterministic ordering: the `state_dag` walk is min-hops + lexicographic, but the timeline walk still sorts by `origin_server_ts`; either responder stops at `limit` rather than continuing to the create event (the multi-round requester compensates functionally)

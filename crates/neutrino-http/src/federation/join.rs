@@ -190,7 +190,7 @@ async fn run_join_dance(
                 // peers see `leave`. Best-effort: a stale stub is otherwise
                 // superseded by the joined state in sync, so a removal
                 // fault must not fail an already-successful join.
-                if let Err(e) = store.remove_oob_membership(room_id, &user).await {
+                if let Err(e) = store.remove_oob_membership(room_id, &user, None).await {
                     warn!(%room_id, %user, error = %e, "failed to clear invite stub after federated join");
                 }
                 return Ok(());

@@ -4081,7 +4081,13 @@ async fn room_scoped_join_uses_pending_invite_server() {
     );
     let bob: OwnedUserId = "@bob:a.example".parse().unwrap();
     a_store
-        .put_oob_membership(&room_id, &bob, &invite, neutrino_event::ROOM_VERSION_ID)
+        .put_oob_membership(
+            &room_id,
+            &bob,
+            &invite,
+            neutrino_event::ROOM_VERSION_ID,
+            None,
+        )
         .await
         .unwrap();
 
@@ -4170,7 +4176,13 @@ async fn join_tries_hint_before_invite_fallback() {
     );
     let bob: OwnedUserId = "@bob:a.example".parse().unwrap();
     a_store
-        .put_oob_membership(&room_id, &bob, &invite, neutrino_event::ROOM_VERSION_ID)
+        .put_oob_membership(
+            &room_id,
+            &bob,
+            &invite,
+            neutrino_event::ROOM_VERSION_ID,
+            None,
+        )
         .await
         .unwrap();
 
@@ -4247,7 +4259,13 @@ async fn hosted_room_with_live_local_member_and_pending_invite_does_not_federate
     );
     let bob: OwnedUserId = "@bob:a.example".parse().unwrap();
     store
-        .put_oob_membership(&room_id, &bob, &invite, neutrino_event::ROOM_VERSION_ID)
+        .put_oob_membership(
+            &room_id,
+            &bob,
+            &invite,
+            neutrino_event::ROOM_VERSION_ID,
+            None,
+        )
         .await
         .unwrap();
 
@@ -6132,6 +6150,7 @@ async fn send_leave_unauthorised_leave_returns_403() {
 /// invite event (whose `sender` domain is B — the reject handshake target).
 async fn serve_resident_with_invite(
     invitee: &str,
+    layer: impl FnOnce(axum::Router) -> axum::Router,
 ) -> (
     String,
     Arc<SqliteStore>,
@@ -6182,7 +6201,7 @@ async fn serve_resident_with_invite(
         .create_room(&create, &[bob_join, invite.clone()])
         .await
         .expect("create_room on B");
-    let router = router_with_store(config_for(&name, "bob"), store.clone());
+    let router = layer(router_with_store(config_for(&name, "bob"), store.clone()));
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
@@ -6194,12 +6213,18 @@ async fn outbound_reject_invite_federates_leave_and_records_it() {
     // B hosts the room and invited our local alice. A holds only the OOB stub.
     let alice = alice();
     let (_b_name, b_store, room_id, invite, _b_tempfile) =
-        serve_resident_with_invite(alice.as_str()).await;
+        serve_resident_with_invite(alice.as_str(), |r| r).await;
 
     let (a_store, _a_temp) = fresh_store().await;
     let a_router = router_with_store(config(), a_store.clone());
     a_store
-        .put_oob_membership(&room_id, &alice, &invite, neutrino_event::ROOM_VERSION_ID)
+        .put_oob_membership(
+            &room_id,
+            &alice,
+            &invite,
+            neutrino_event::ROOM_VERSION_ID,
+            None,
+        )
         .await
         .unwrap();
 
@@ -6231,6 +6256,86 @@ async fn outbound_reject_invite_federates_leave_and_records_it() {
     assert_eq!(stub.membership, Membership::Leave);
     assert_eq!(stub.event.event_id, member.event_id);
     assert_eq!(stub.event.sender, alice);
+}
+
+/// Declining an invite names it; a re-invite landing during the leave
+/// handshake is newer and must survive the decline's local write.
+#[tokio::test]
+async fn outbound_reject_invite_racing_a_reinvite_keeps_the_reinvite() {
+    let alice = alice();
+    let (a_store, _a_temp) = fresh_store().await;
+    let pending: Arc<std::sync::OnceLock<(OwnedRoomId, neutrino_event::Event)>> = Arc::default();
+    let layer = {
+        let (a_store, pending, alice) = (a_store.clone(), pending.clone(), alice.clone());
+        move |r: axum::Router| {
+            r.layer(axum::middleware::from_fn(
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let (a_store, pending, alice) =
+                        (a_store.clone(), pending.clone(), alice.clone());
+                    async move {
+                        if req.uri().path().contains("/make_leave/")
+                            && let Some((room_id, reinvite)) = pending.get()
+                        {
+                            a_store
+                                .put_oob_membership(
+                                    room_id,
+                                    &alice,
+                                    reinvite,
+                                    ROOM_VERSION_ID,
+                                    None,
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        next.run(req).await
+                    }
+                },
+            ))
+        }
+    };
+    let (_b_name, b_store, room_id, invite, _b_tempfile) =
+        serve_resident_with_invite(alice.as_str(), layer).await;
+    let reinvite = member_pdu(
+        &invite.sender,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&invite.event_id),
+    );
+    pending
+        .set((room_id.clone(), reinvite.clone()))
+        .expect("set once");
+
+    let a_router = router_with_store(config(), a_store.clone());
+    a_store
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID, None)
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(
+        &a_router,
+        &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+
+    let member = b_store
+        .current_state_event(&room_id, "m.room.member", alice.as_str())
+        .await
+        .unwrap()
+        .expect("alice member on B");
+    assert_eq!(
+        membership_str(&member).as_deref(),
+        Some("leave"),
+        "handshake ran"
+    );
+    let stub = a_store
+        .get_oob_membership(&room_id, &alice)
+        .await
+        .unwrap()
+        .expect("stub held");
+    assert_eq!(stub.event.event_id, reinvite.event_id);
 }
 
 /// An invite for a room we hold *stale* state for — a local user joined and
@@ -6318,7 +6423,7 @@ async fn send_leave_for_oob_invited_user_replaces_the_stub() {
         std::slice::from_ref(&throwaway.event_id),
     );
     store
-        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID)
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID, None)
         .await
         .unwrap();
     let kick = member_pdu(
@@ -6347,6 +6452,204 @@ async fn send_leave_for_oob_invited_user_replaces_the_stub() {
     );
 }
 
+/// Lands `reinvite` in `inner` right after the stub is read: the interleaving
+/// a concurrent `/invite` produces against an in-flight rescission.
+struct ReinviteAfterRead {
+    inner: Arc<SqliteStore>,
+    reinvite: neutrino_event::Event,
+}
+
+#[async_trait::async_trait]
+impl OobMembershipStore for ReinviteAfterRead {
+    async fn put_oob_membership(
+        &self,
+        room_id: &RoomId,
+        user_id: &ruma::UserId,
+        event: &neutrino_event::Event,
+        room_version: &str,
+        replaces: Option<&ruma::EventId>,
+    ) -> Result<neutrino_store::OobWrite, neutrino_store::StorageError> {
+        self.inner
+            .put_oob_membership(room_id, user_id, event, room_version, replaces)
+            .await
+    }
+
+    async fn get_oob_membership(
+        &self,
+        room_id: &RoomId,
+        user_id: &ruma::UserId,
+    ) -> Result<Option<neutrino_store::OobMembership>, neutrino_store::StorageError> {
+        let held = self.inner.get_oob_membership(room_id, user_id).await?;
+        self.inner
+            .put_oob_membership(room_id, user_id, &self.reinvite, ROOM_VERSION_ID, None)
+            .await?;
+        Ok(held)
+    }
+
+    async fn remove_oob_membership(
+        &self,
+        room_id: &RoomId,
+        user_id: &ruma::UserId,
+        replaces: Option<&ruma::EventId>,
+    ) -> Result<(), neutrino_store::StorageError> {
+        self.inner
+            .remove_oob_membership(room_id, user_id, replaces)
+            .await
+    }
+
+    async fn resolved_member_event(
+        &self,
+        room_id: &RoomId,
+        user_id: &ruma::UserId,
+    ) -> Result<Option<neutrino_store::ResolvedMembership>, neutrino_store::StorageError> {
+        self.inner.resolved_member_event(room_id, user_id).await
+    }
+
+    async fn resolved_memberships(
+        &self,
+        user_id: &ruma::UserId,
+        memberships: &std::collections::BTreeSet<Membership>,
+    ) -> Result<Vec<(OwnedRoomId, Membership, bool)>, neutrino_store::StorageError> {
+        self.inner.resolved_memberships(user_id, memberships).await
+    }
+}
+
+#[async_trait::async_trait]
+impl StateStore for ReinviteAfterRead {
+    async fn current_room_state(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<
+        std::collections::HashMap<(String, String), neutrino_event::Event>,
+        neutrino_store::StorageError,
+    > {
+        self.inner.current_room_state(room_id).await
+    }
+
+    async fn current_state_event(
+        &self,
+        room_id: &RoomId,
+        event_type: &str,
+        state_key: &str,
+    ) -> Result<Option<neutrino_event::Event>, neutrino_store::StorageError> {
+        self.inner
+            .current_state_event(room_id, event_type, state_key)
+            .await
+    }
+
+    async fn current_state_events_of_type(
+        &self,
+        room_id: &RoomId,
+        event_type: &str,
+    ) -> Result<
+        std::collections::HashMap<String, neutrino_event::Event>,
+        neutrino_store::StorageError,
+    > {
+        self.inner
+            .current_state_events_of_type(room_id, event_type)
+            .await
+    }
+
+    async fn joined_servers(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<ruma::OwnedServerName>, neutrino_store::StorageError> {
+        self.inner.joined_servers(room_id).await
+    }
+
+    async fn joined_rooms(
+        &self,
+        user_id: &ruma::UserId,
+    ) -> Result<Vec<OwnedRoomId>, neutrino_store::StorageError> {
+        self.inner.joined_rooms(user_id).await
+    }
+
+    async fn invited_rooms(
+        &self,
+        user_id: &ruma::UserId,
+    ) -> Result<Vec<OwnedRoomId>, neutrino_store::StorageError> {
+        self.inner.invited_rooms(user_id).await
+    }
+
+    async fn joined_members(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<
+        std::collections::HashMap<OwnedUserId, neutrino_event::Event>,
+        neutrino_store::StorageError,
+    > {
+        self.inner.joined_members(room_id).await
+    }
+}
+
+/// A rescission names the invite it supersedes. If a re-invite replaces that
+/// invite while the rescission is being checked, the rescission is stale and
+/// must be dropped, not written over the re-invite.
+#[tokio::test]
+async fn send_leave_racing_a_reinvite_does_not_clobber_it() {
+    let (store, _tempfile) = fresh_store().await;
+    let bob = inviter();
+    let alice = alice();
+    let throwaway = EventBuilder::new(
+        bob.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build throwaway create");
+    let room_id = throwaway.room_id.clone();
+    let invite = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&throwaway.event_id),
+    );
+    store
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID, None)
+        .await
+        .unwrap();
+    let kick = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "leave",
+        std::slice::from_ref(&invite.event_id),
+    );
+    let reinvite = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&kick.event_id),
+    );
+    let racing = ReinviteAfterRead {
+        inner: store.clone(),
+        reinvite: reinvite.clone(),
+    };
+
+    let consumed = super::send::apply_oob_membership(
+        &racing,
+        &neutrino_event::EventPolicy::trusted_network(),
+        bob.server_name(),
+        "example.org",
+        &room_id,
+        &kick.raw,
+    )
+    .await
+    .unwrap();
+    assert_eq!(consumed, Some(kick.event_id), "dropped, not staged");
+
+    let stub = store
+        .get_oob_membership(&room_id, &alice)
+        .await
+        .unwrap()
+        .expect("stub held");
+    assert_eq!(stub.event.event_id, reinvite.event_id);
+}
+
 #[tokio::test]
 async fn send_leave_for_local_user_in_a_room_we_hold_is_staged_not_diverted() {
     // A stub can outlive the server joining the room — nothing clears it when
@@ -6354,20 +6657,31 @@ async fn send_leave_for_local_user_in_a_room_we_hold_is_staged_not_diverted() {
     // room the out-of-band path must stand down: the PDU belongs in the room
     // DAG. Diverting it would ack the kick to the sender while the room never
     // saw it.
-    let (app, store, room_id, alice, join_id, _tempfile) = seed_joined_room().await;
+    let (app, store, room_id, create_id, _tempfile) = seed_room(&[]).await;
+    let alice = alice();
     let bob = inviter();
-    // A stale out-of-band stub for a user in a room we are in.
+    // The stub is written while we are not in the room, then another local
+    // user joins.
     let invite = member_pdu(
         &bob,
         alice.as_str(),
         &room_id,
         "invite",
-        std::slice::from_ref(&join_id),
+        std::slice::from_ref(&create_id),
     );
     store
-        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID)
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID, None)
         .await
         .unwrap();
+    let carol: OwnedUserId = "@carol:example.org".parse().unwrap();
+    let join = member_pdu(
+        &carol,
+        carol.as_str(),
+        &room_id,
+        "join",
+        std::slice::from_ref(&create_id),
+    );
+    store.persist_event(&join, &[]).await.unwrap();
     let kick = member_pdu(
         &bob,
         alice.as_str(),
@@ -6444,7 +6758,7 @@ async fn send_leave_for_a_room_we_hold_but_are_not_in_stays_out_of_band() {
         std::slice::from_ref(&create.event_id),
     );
     store
-        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID)
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID, None)
         .await
         .unwrap();
     let kick = member_pdu(
@@ -6500,7 +6814,7 @@ async fn send_leave_for_oob_invited_user_not_naming_the_invite_is_ignored() {
         std::slice::from_ref(&throwaway.event_id),
     );
     store
-        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID)
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID, None)
         .await
         .unwrap();
     // Names some other state event (here the create), not the invite.
@@ -6558,7 +6872,7 @@ async fn send_oob_membership_other_than_inviter_rescinding_is_ignored() {
         std::slice::from_ref(&throwaway.event_id),
     );
     store
-        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID)
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID, None)
         .await
         .unwrap();
     let prevs = std::slice::from_ref(&invite.event_id);
@@ -6604,7 +6918,13 @@ async fn outbound_reject_invite_unreachable_server_still_removes_stub() {
         std::slice::from_ref(&create.event_id),
     );
     a_store
-        .put_oob_membership(&room_id, &alice, &invite, neutrino_event::ROOM_VERSION_ID)
+        .put_oob_membership(
+            &room_id,
+            &alice,
+            &invite,
+            neutrino_event::ROOM_VERSION_ID,
+            None,
+        )
         .await
         .unwrap();
 
@@ -6654,7 +6974,7 @@ async fn csapi_leave_of_a_joined_room_ignores_a_stale_oob_stub() {
         std::slice::from_ref(&create.event_id),
     );
     store
-        .put_oob_membership(&room_id, &alice, &stale, ROOM_VERSION_ID)
+        .put_oob_membership(&room_id, &alice, &stale, ROOM_VERSION_ID, None)
         .await
         .unwrap();
 
@@ -6740,7 +7060,7 @@ async fn csapi_leave_declines_oob_reinvite_to_a_room_we_left() {
         std::slice::from_ref(&join_id),
     );
     store
-        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID)
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID, None)
         .await
         .unwrap();
 

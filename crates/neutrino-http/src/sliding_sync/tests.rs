@@ -1141,7 +1141,13 @@ async fn oob_invite_surfaces_in_sliding_sync() {
 
     let invite_event = oob_invite_event(room, user, inviter, "Remote Room", 80);
     store
-        .put_oob_membership(room, user, &invite_event, neutrino_event::ROOM_VERSION_ID)
+        .put_oob_membership(
+            room,
+            user,
+            &invite_event,
+            neutrino_event::ROOM_VERSION_ID,
+            None,
+        )
         .await
         .unwrap();
 
@@ -1199,6 +1205,7 @@ async fn oob_leave_surfaces_once_after_the_invite() {
             user,
             &oob_invite_event(room, user, inviter, "Remote Room", 80),
             neutrino_event::ROOM_VERSION_ID,
+            None,
         )
         .await
         .unwrap();
@@ -1235,7 +1242,7 @@ async fn oob_leave_surfaces_once_after_the_invite() {
         }),
     );
     store
-        .put_oob_membership(room, user, &leave, neutrino_event::ROOM_VERSION_ID)
+        .put_oob_membership(room, user, &leave, neutrino_event::ROOM_VERSION_ID, None)
         .await
         .unwrap();
 
@@ -1283,7 +1290,7 @@ async fn re_invite_after_rejection_is_emitted_on_the_same_connection() {
         let store = store.clone();
         async move {
             store
-                .put_oob_membership(room, user, &ev, neutrino_event::ROOM_VERSION_ID)
+                .put_oob_membership(room, user, &ev, neutrino_event::ROOM_VERSION_ID, None)
                 .await
                 .unwrap();
         }
@@ -1357,7 +1364,7 @@ async fn in_room_membership_wins_over_oob_invite_stub() {
     // An OOB invite stub arrives first …
     let stub = oob_invite_event(room, user, inviter, "Stale Invite", 50);
     store
-        .put_oob_membership(room, user, &stub, neutrino_event::ROOM_VERSION_ID)
+        .put_oob_membership(room, user, &stub, neutrino_event::ROOM_VERSION_ID, None)
         .await
         .unwrap();
     // … and is then superseded: we host the room and the user joins for real.
@@ -1402,6 +1409,7 @@ async fn oob_invites_rank_by_member_event_ts() {
             user,
             &oob_invite_event(newer, user, inviter, "Newer", 900),
             neutrino_event::ROOM_VERSION_ID,
+            None,
         )
         .await
         .unwrap();
@@ -1411,6 +1419,7 @@ async fn oob_invites_rank_by_member_event_ts() {
             user,
             &oob_invite_event(older, user, inviter, "Older", 100),
             neutrino_event::ROOM_VERSION_ID,
+            None,
         )
         .await
         .unwrap();
@@ -1989,6 +1998,7 @@ async fn long_poll_wakes_on_oob_invite() {
                 &waker_user,
                 &invite,
                 neutrino_event::ROOM_VERSION_ID,
+                None,
             )
             .await
             .unwrap();

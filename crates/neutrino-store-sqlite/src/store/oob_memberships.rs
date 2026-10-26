@@ -23,9 +23,9 @@ use deadpool_sqlite::rusqlite::{self, OptionalExtension, params};
 use neutrino_event::Event;
 use neutrino_event::validate::parse_event;
 use neutrino_store::{
-    Membership, OobMembership, OobMembershipStore, ResolvedMembership, StorageError,
+    Membership, OobMembership, OobMembershipStore, OobWrite, ResolvedMembership, StorageError,
 };
-use ruma::{OwnedEventId, OwnedRoomId, RoomId, UserId};
+use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId, UserId};
 use serde_json::value::RawValue as RawJsonValue;
 
 use crate::row::{EVENT_COLUMNS_PREFIXED, EventRow};
@@ -39,7 +39,8 @@ impl OobMembershipStore for SqliteStore {
         user_id: &UserId,
         event: &Event,
         room_version: &str,
-    ) -> Result<(), StorageError> {
+        replaces: Option<&EventId>,
+    ) -> Result<OobWrite, StorageError> {
         let membership = event
             .content_str("membership")
             .as_deref()
@@ -55,47 +56,62 @@ impl OobMembershipStore for SqliteStore {
         let json = event.raw.get().to_owned();
         let event_id = event.event_id.as_str().to_owned();
         let room_version = room_version.to_owned();
+        let server_suffix = format!(":{}", user_id.server_name());
+        let replaces = replaces.map(|id| id.as_str().to_owned());
         let watch_tx = self.watch_tx.clone();
 
-        self.run_write(move |conn| -> Result<(), Error> {
-            // The stream high-water mark at write time, so this row can be
+        self.run_write(move |conn| -> Result<OobWrite, Error> {
+            // One transaction, so the checks and the insert see the same state:
+            // a join persisted before this write refuses it, one persisted after
+            // outranks its watermark.
+            let tx = conn.transaction()?;
+            let server_joined: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM current_state \
+                 WHERE room_id = ?1 AND event_type = 'm.room.member' \
+                   AND membership = 'join' AND substr(state_key, -length(?2)) = ?2)",
+                params![room_id, server_suffix],
+                |row| row.get(0),
+            )?;
+            if server_joined {
+                return Ok(OobWrite::ServerJoined);
+            }
+            if let Some(replaces) = replaces {
+                let held: Option<String> = tx
+                    .query_row(
+                        "SELECT event_id FROM oob_memberships WHERE room_id = ? AND state_key = ?",
+                        params![room_id, state_key],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if held.as_deref() != Some(replaces.as_str()) {
+                    return Ok(OobWrite::Superseded);
+                }
+            }
+            // `learned_after` is the stream high-water mark, so this row can be
             // ordered against the in-room member event for the same pair.
-            //
-            // The read and the insert are two statements, not one transaction.
-            // What makes that safe is that `run_write` owns the sole writer
-            // connection (`writer_pool` is `max_size = 1`), so no other write
-            // can interleave — widening that pool would let an event land
-            // between them and stamp a watermark that is too low, silently
-            // making the stub lose.
-            //
             // `MAX` over the rowid PK is an index lookup, not a scan, and is
             // preferred over `sqlite_sequence.seq` — after a delete they
             // diverge, and "the newest event we hold" is what the comparison
             // means.
-            let learned_after: i64 = conn.query_row(
-                "SELECT COALESCE(MAX(stream_pos), 0) FROM events",
-                [],
-                |row| row.get(0),
-            )?;
-            conn.execute(
+            tx.execute(
                 "INSERT OR REPLACE INTO oob_memberships \
                  (room_id, state_key, event_id, membership, room_version, json, learned_after) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(stream_pos), 0) FROM events))",
                 params![
                     room_id,
                     state_key,
                     event_id,
                     membership.as_str(),
                     room_version,
-                    json,
-                    learned_after
+                    json
                 ],
             )?;
+            tx.commit()?;
             // Wake any in-flight sliding-sync long-poll so the change surfaces
             // now, not at the poll's timeout. Inside the closure (like
             // `notify_watch`) so a committed row is never stranded.
             SqliteStore::notify_watch_changed(&watch_tx);
-            Ok(())
+            Ok(OobWrite::Written)
         })
         .await
     }
@@ -149,14 +165,17 @@ impl OobMembershipStore for SqliteStore {
         &self,
         room_id: &RoomId,
         user_id: &UserId,
+        replaces: Option<&EventId>,
     ) -> Result<(), StorageError> {
         let room_id = room_id.as_str().to_owned();
         let state_key = user_id.as_str().to_owned();
+        let replaces = replaces.map(|id| id.as_str().to_owned());
         let watch_tx = self.watch_tx.clone();
         self.run_write(move |conn| -> Result<(), Error> {
             conn.execute(
-                "DELETE FROM oob_memberships WHERE room_id = ? AND state_key = ?",
-                params![room_id, state_key],
+                "DELETE FROM oob_memberships \
+                 WHERE room_id = ?1 AND state_key = ?2 AND (?3 IS NULL OR event_id = ?3)",
+                params![room_id, state_key, replaces],
             )?;
             SqliteStore::notify_watch_changed(&watch_tx);
             Ok(())
@@ -382,7 +401,7 @@ mod tests {
 
     use neutrino_event::Event;
     use neutrino_event::event_id::base_version_event_id;
-    use neutrino_store::{Membership, OobMembershipStore};
+    use neutrino_store::{Membership, OobMembershipStore, OobWrite};
     use ruma::{RoomId, UserId, room_id, user_id};
     use serde_json::value::RawValue;
     use serde_json::{Value, json};
@@ -456,7 +475,7 @@ mod tests {
 
         assert!(s.get_oob_membership(room, invited).await.unwrap().is_none());
 
-        s.put_oob_membership(room, invited, &ev, VERSION)
+        s.put_oob_membership(room, invited, &ev, VERSION, None)
             .await
             .unwrap();
         let got = s
@@ -476,10 +495,10 @@ mod tests {
         assert_eq!(got.membership, Membership::Invite);
         assert_eq!(got.room_version, VERSION);
 
-        s.remove_oob_membership(room, invited).await.unwrap();
+        s.remove_oob_membership(room, invited, None).await.unwrap();
         assert!(s.get_oob_membership(room, invited).await.unwrap().is_none());
         // Removing a missing pair is a no-op, not an error.
-        s.remove_oob_membership(room, invited).await.unwrap();
+        s.remove_oob_membership(room, invited, None).await.unwrap();
     }
 
     // A leave (our rejection) or ban (the inviter's rescission) replaces the
@@ -496,6 +515,7 @@ mod tests {
             alice,
             &remote_member(room, alice, bob, "invite", "R"),
             VERSION,
+            None,
         )
         .await
         .unwrap();
@@ -509,7 +529,7 @@ mod tests {
         );
 
         let leave = remote_member(room, alice, alice, "leave", "R");
-        s.put_oob_membership(room, alice, &leave, VERSION)
+        s.put_oob_membership(room, alice, &leave, VERSION, None)
             .await
             .unwrap();
         let got = s.get_oob_membership(room, alice).await.unwrap().unwrap();
@@ -534,6 +554,7 @@ mod tests {
                 alice,
                 &remote_member(room, alice, alice, "join", "R"),
                 VERSION,
+                None,
             )
             .await
             .unwrap_err();
@@ -555,7 +576,7 @@ mod tests {
         let s = store().await;
         let remote = ruma::room_id!("!remote:other.example.org");
         let invite = remote_member(remote, *BOB_USER_ID, *ALICE_USER_ID, "invite", "R");
-        s.put_oob_membership(remote, *BOB_USER_ID, &invite, VERSION)
+        s.put_oob_membership(remote, *BOB_USER_ID, &invite, VERSION, None)
             .await
             .unwrap();
         let got = s
@@ -592,7 +613,7 @@ mod tests {
         .await
         .unwrap();
         let invite = remote_member(*ALICE_ROOM_ID, *BOB_USER_ID, *ALICE_USER_ID, "invite", "R");
-        s.put_oob_membership(*ALICE_ROOM_ID, *BOB_USER_ID, &invite, VERSION)
+        s.put_oob_membership(*ALICE_ROOM_ID, *BOB_USER_ID, &invite, VERSION, None)
             .await
             .unwrap();
         let got = s
@@ -613,7 +634,7 @@ mod tests {
             .await
             .unwrap();
         let invite = remote_member(*ALICE_ROOM_ID, *BOB_USER_ID, *ALICE_USER_ID, "invite", "R");
-        s.put_oob_membership(*ALICE_ROOM_ID, *BOB_USER_ID, &invite, VERSION)
+        s.put_oob_membership(*ALICE_ROOM_ID, *BOB_USER_ID, &invite, VERSION, None)
             .await
             .unwrap();
         s.persist_event(&member_join(*ALICE_ROOM_ID, *BOB_USER_ID), &[])
@@ -631,6 +652,132 @@ mod tests {
         assert_eq!(got.membership, Membership::Join);
     }
 
+    /// A stub must not be written once a user on the stub user's server is
+    /// joined: the write is refused rather than stamped with a watermark that
+    /// ties the join and wins.
+    #[tokio::test]
+    async fn put_is_refused_while_a_same_server_user_is_joined() {
+        use neutrino_store::{EventStore, RoomStore};
+
+        let s = store().await;
+        let carol = user_id!("@carol:other.example.org");
+        s.create_room(
+            &create_event(*ALICE_ROOM_ID, carol),
+            &[member_join(*ALICE_ROOM_ID, carol)],
+        )
+        .await
+        .unwrap();
+        let invite = remote_member(*ALICE_ROOM_ID, *BOB_USER_ID, carol, "invite", "R");
+        assert_eq!(
+            s.put_oob_membership(*ALICE_ROOM_ID, *BOB_USER_ID, &invite, VERSION, None)
+                .await
+                .unwrap(),
+            OobWrite::Written,
+            "a remote user's join does not put this server in the room"
+        );
+
+        s.persist_event(&member_join(*ALICE_ROOM_ID, *ALICE_USER_ID), &[])
+            .await
+            .unwrap();
+        let rescind = remote_member(*ALICE_ROOM_ID, *BOB_USER_ID, carol, "leave", "R");
+        assert_eq!(
+            s.put_oob_membership(*ALICE_ROOM_ID, *BOB_USER_ID, &rescind, VERSION, None)
+                .await
+                .unwrap(),
+            OobWrite::ServerJoined
+        );
+        let held = s
+            .get_oob_membership(*ALICE_ROOM_ID, *BOB_USER_ID)
+            .await
+            .unwrap()
+            .expect("earlier stub kept");
+        assert_eq!(held.event.event_id, invite.event_id);
+    }
+
+    /// A write naming the stub it replaces is refused once that stub has been
+    /// replaced: a rescission or decline of the first invite must not clobber
+    /// a re-invite that landed meanwhile.
+    #[tokio::test]
+    async fn put_naming_a_replaced_stub_is_refused() {
+        let s = store().await;
+        let room = room_id!("!remote:other.example.org");
+        let inviter = user_id!("@bob:other.example.org");
+        let reinviter = user_id!("@dave:other.example.org");
+        let first = remote_member(room, *ALICE_USER_ID, inviter, "invite", "first");
+        let second = remote_member(room, *ALICE_USER_ID, reinviter, "invite", "second");
+        let leave = remote_member(room, *ALICE_USER_ID, inviter, "leave", "R");
+
+        assert_eq!(
+            s.put_oob_membership(room, *ALICE_USER_ID, &leave, VERSION, Some(&first.event_id))
+                .await
+                .unwrap(),
+            OobWrite::Superseded,
+            "no row is not the named row"
+        );
+        s.put_oob_membership(room, *ALICE_USER_ID, &first, VERSION, None)
+            .await
+            .unwrap();
+        s.put_oob_membership(room, *ALICE_USER_ID, &second, VERSION, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.put_oob_membership(room, *ALICE_USER_ID, &leave, VERSION, Some(&first.event_id))
+                .await
+                .unwrap(),
+            OobWrite::Superseded
+        );
+        let held = s.get_oob_membership(room, *ALICE_USER_ID).await.unwrap();
+        assert_eq!(held.expect("kept").event.event_id, second.event_id);
+
+        assert_eq!(
+            s.put_oob_membership(
+                room,
+                *ALICE_USER_ID,
+                &leave,
+                VERSION,
+                Some(&second.event_id)
+            )
+            .await
+            .unwrap(),
+            OobWrite::Written
+        );
+        let held = s.get_oob_membership(room, *ALICE_USER_ID).await.unwrap();
+        assert_eq!(held.expect("replaced").event.event_id, leave.event_id);
+    }
+
+    #[tokio::test]
+    async fn remove_naming_a_replaced_stub_keeps_the_newer_one() {
+        let s = store().await;
+        let room = room_id!("!remote:other.example.org");
+        let inviter = user_id!("@bob:other.example.org");
+        let reinviter = user_id!("@dave:other.example.org");
+        let first = remote_member(room, *ALICE_USER_ID, inviter, "invite", "first");
+        let second = remote_member(room, *ALICE_USER_ID, reinviter, "invite", "second");
+        s.put_oob_membership(room, *ALICE_USER_ID, &second, VERSION, None)
+            .await
+            .unwrap();
+
+        s.remove_oob_membership(room, *ALICE_USER_ID, Some(&first.event_id))
+            .await
+            .unwrap();
+        assert!(
+            s.get_oob_membership(room, *ALICE_USER_ID)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        s.remove_oob_membership(room, *ALICE_USER_ID, Some(&second.event_id))
+            .await
+            .unwrap();
+        assert!(
+            s.get_oob_membership(room, *ALICE_USER_ID)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     /// The bulk form must agree with the point form, emit exactly one row per
     /// room when both tables hold one, and filter on the winner.
     #[tokio::test]
@@ -645,7 +792,7 @@ mod tests {
         .await
         .unwrap();
         let invite = remote_member(*ALICE_ROOM_ID, *BOB_USER_ID, *ALICE_USER_ID, "invite", "R");
-        s.put_oob_membership(*ALICE_ROOM_ID, *BOB_USER_ID, &invite, VERSION)
+        s.put_oob_membership(*ALICE_ROOM_ID, *BOB_USER_ID, &invite, VERSION, None)
             .await
             .unwrap();
 
@@ -694,7 +841,7 @@ mod tests {
             .await
             .unwrap();
         let invite = remote_member(*ALICE_ROOM_ID, *BOB_USER_ID, *ALICE_USER_ID, "invite", "R");
-        s.put_oob_membership(*ALICE_ROOM_ID, *BOB_USER_ID, &invite, VERSION)
+        s.put_oob_membership(*ALICE_ROOM_ID, *BOB_USER_ID, &invite, VERSION, None)
             .await
             .unwrap();
         assert!(
@@ -726,29 +873,30 @@ mod tests {
         use neutrino_store::{EventStore, RoomStore};
 
         let s = store().await;
+        let dave = user_id!("@dave:other.example.org");
         s.create_room(
-            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
-            &[member_join(*ALICE_ROOM_ID, *ALICE_USER_ID)],
+            &create_event(*ALICE_ROOM_ID, dave),
+            &[member_join(*ALICE_ROOM_ID, dave)],
         )
         .await
         .unwrap();
-
-        // Bob: stub first, then an in-room join — in-room wins.
-        let bob_invite = remote_member(*ALICE_ROOM_ID, *BOB_USER_ID, *ALICE_USER_ID, "invite", "R");
-        s.put_oob_membership(*ALICE_ROOM_ID, *BOB_USER_ID, &bob_invite, VERSION)
-            .await
-            .unwrap();
-        s.persist_event(&member_join(*ALICE_ROOM_ID, *BOB_USER_ID), &[])
-            .await
-            .unwrap();
 
         // Carol: in-room leave first, then a stub — the stub wins.
         let carol = user_id!("@carol:example.com");
         s.persist_event(&member_leave(*ALICE_ROOM_ID, carol), &[])
             .await
             .unwrap();
-        let carol_invite = remote_member(*ALICE_ROOM_ID, carol, *ALICE_USER_ID, "invite", "R");
-        s.put_oob_membership(*ALICE_ROOM_ID, carol, &carol_invite, VERSION)
+        let carol_invite = remote_member(*ALICE_ROOM_ID, carol, dave, "invite", "R");
+        s.put_oob_membership(*ALICE_ROOM_ID, carol, &carol_invite, VERSION, None)
+            .await
+            .unwrap();
+
+        // Bob: stub first, then an in-room join — in-room wins.
+        let bob_invite = remote_member(*ALICE_ROOM_ID, *BOB_USER_ID, dave, "invite", "R");
+        s.put_oob_membership(*ALICE_ROOM_ID, *BOB_USER_ID, &bob_invite, VERSION, None)
+            .await
+            .unwrap();
+        s.persist_event(&member_join(*ALICE_ROOM_ID, *BOB_USER_ID), &[])
             .await
             .unwrap();
 
@@ -783,7 +931,7 @@ mod tests {
         .await
         .unwrap();
         let invite = remote_member(*ALICE_ROOM_ID, *BOB_USER_ID, *ALICE_USER_ID, "invite", "R");
-        s.put_oob_membership(*ALICE_ROOM_ID, *BOB_USER_ID, &invite, VERSION)
+        s.put_oob_membership(*ALICE_ROOM_ID, *BOB_USER_ID, &invite, VERSION, None)
             .await
             .unwrap();
 
