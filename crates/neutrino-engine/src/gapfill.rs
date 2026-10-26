@@ -82,7 +82,7 @@ const INITIAL_GAPFILL_LIMIT: u32 = 10;
 #[derive(Debug)]
 pub(crate) enum GapFillError {
     /// The peer answered, but cannot supply a path from the PDU's
-    /// `prev_state_events` to `m.room.create` — nothing new, or a 4xx refusal.
+    /// `prev_state_events` to `m.room.create` — nothing new, or a 400 / 404 refusal.
     /// The PDU can never be authorised from this peer; MSC4242 says to reject it.
     Unfillable(String),
     /// Reaching the peer failed (transport / 5xx), or our own storage
@@ -173,12 +173,9 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
                 ));
             }
             Ok(fetched) => fetched,
-            // A 4xx is the peer's final word for this request (no such room,
-            // endpoint unsupported): nothing a retry can change. Except 429:
-            // rate limited, so retry later.
-            Err(e @ TransportError::Status(400..=499))
-                if !matches!(e, TransportError::Status(429)) =>
-            {
+            // 400 / 404 are the peer's final word for this request (malformed,
+            // no such room or endpoint): nothing a retry can change.
+            Err(e @ TransportError::Status(400 | 404)) => {
                 return Err(GapFillError::Unfillable(format!("peer refused: {e}")));
             }
             Err(e) => return Err(GapFillError::Transient(format!("peer fetch failed: {e}"))),

@@ -2734,6 +2734,71 @@ async fn send_rate_limited_gapfill_keeps_the_pdu_and_retries() {
     );
 }
 
+/// Sends a PDU whose state parent is missing, against a fetcher that always
+/// answers `code`.
+async fn send_with_gapfill_status(
+    code: u16,
+) -> (
+    axum::Router,
+    Arc<StubFetcher>,
+    Arc<SqliteStore>,
+    OwnedRoomId,
+    OwnedEventId,
+    TempDir,
+) {
+    let fetcher = StubFetcher::erroring(code);
+    let (app, store, room_id, alice, join_id, tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let orphan = topic_on(&alice, &room_id, &join_id, "x", 1_700_000_002_000);
+    let child = message_on_split(
+        &alice,
+        &room_id,
+        &join_id,
+        &orphan.event_id,
+        "child",
+        1_700_000_003_000,
+    );
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    (app, fetcher, store, room_id, child.event_id, tempfile)
+}
+
+#[tokio::test]
+async fn send_gapfill_refused_as_unauthorised_or_timed_out_retries() {
+    for code in [401, 403, 408] {
+        let (_app, fetcher, store, room_id, child_id, _tempfile) =
+            send_with_gapfill_status(code).await;
+        wait_fetch_count(&fetcher, 2).await;
+        assert!(
+            store
+                .staged_for_room(&room_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|p| p.event_id == child_id),
+            "HTTP {code} from the gap-fill peer must keep the PDU staged"
+        );
+    }
+}
+
+#[tokio::test]
+async fn send_gapfill_bad_request_or_not_found_rejects_the_pdu() {
+    for code in [400, 404] {
+        let (_app, fetcher, store, room_id, child_id, _tempfile) =
+            send_with_gapfill_status(code).await;
+        wait_fetch_attempted(&fetcher).await;
+        wait_staging_empty(&store, &room_id).await;
+        assert!(
+            store
+                .get_events(&[child_id.as_ref()])
+                .await
+                .unwrap()
+                .is_empty(),
+            "HTTP {code} from the gap-fill peer must reject the PDU"
+        );
+    }
+}
+
 #[tokio::test]
 async fn send_toposorts_out_of_order_batch() {
     // Two new message events arrive in the same transaction, child *before*

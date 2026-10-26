@@ -12,7 +12,7 @@ use serde_json::value::RawValue as RawJsonValue;
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     /// The peer answered with a non-2xx status. Carries the raw code so the
-    /// caller can distinguish a 4xx (give up) from a 5xx (retry).
+    /// caller can tell a permanent refusal from a retryable one.
     #[error("peer returned HTTP {0}")]
     Status(u16),
     /// Connection / DNS / timeout / malformed body / URL-build failure —
