@@ -774,11 +774,6 @@ async fn member_event<S: StorageBackend>(
         .map(|r| r.event))
 }
 
-/// `content.membership` of a member event; `None` if missing or unrecognised.
-fn membership_of(ev: &Event) -> Option<Membership> {
-    Membership::from_wire(&ev.content_str("membership")?)
-}
-
 /// MSC4186 §"Invite/Knock/Rejected Rooms": invited rooms return
 /// `invite_state` (stripped state) instead of a timeline.
 ///
