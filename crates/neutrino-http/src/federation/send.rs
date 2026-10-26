@@ -164,7 +164,7 @@ pub(super) async fn apply_oob_membership(
     // to decide where the membership goes in the first place: a `rooms` row
     // alone is not enough (we keep it after leaving), and using that instead
     // diverts the room-DAG PDU for a room we hold but are not in.
-    if crate::federation::server_in_room(store, room_id, our_name).await? {
+    if neutrino_engine::reconcile::server_in_room(store, room_id, user.server_name()).await? {
         return Ok(None);
     }
     let Some(version) = policy.versions.get(&stub.room_version).cloned() else {

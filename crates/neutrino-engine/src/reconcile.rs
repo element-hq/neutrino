@@ -31,7 +31,8 @@ use crate::util::room_version;
 /// (not an `X-Matrix` check): the advertised heads a peer sends are
 /// attacker-controllable, so reconciliation only honours an advertisement from a
 /// peer that actually shares the room. Also gates the read-scoped federation
-/// handlers (`backfill`, `get_missing_events`) in `neutrino-http`.
+/// handlers (`backfill`, `get_missing_events`) in `neutrino-http`, and with our
+/// own server decides whether an inbound membership is out-of-band.
 pub async fn server_in_room(
     store: &impl StateStore,
     room_id: &RoomId,

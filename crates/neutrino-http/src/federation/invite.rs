@@ -47,8 +47,9 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::federation::client::{FederationClient, FederationClientError};
-use crate::federation::{FedError, auth, co_sign_if_signed, server_in_room};
+use crate::federation::{FedError, auth, co_sign_if_signed};
 use crate::{AppState, error_response, lock_app};
+use neutrino_engine::reconcile::server_in_room;
 use neutrino_engine::{RoomActorError, stage_and_poke};
 
 /// v2 `/invite` request envelope: the PDU plus the room version and an optional
@@ -180,7 +181,7 @@ pub(crate) async fn handle(
     // Keep the wire bytes for the response before either path moves `event`.
     let event_raw = event.raw.clone();
 
-    if !server_in_room(&*store, &room_id, &our_server).await? {
+    if !server_in_room(&*store, &room_id, invited.server_name()).await? {
         // Out-of-band: no room state to auth against, and apply_pdu never runs, so
         // the network-attested origin MUST own the invite's sender (the inviting
         // server) — otherwise an authenticated peer could plant a stub with a

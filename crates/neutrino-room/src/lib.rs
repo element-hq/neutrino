@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
-use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
+use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, UserId};
 use thiserror::Error;
 
 pub mod auth_events;
@@ -37,6 +38,18 @@ use neutrino_event::FormatError;
 
 /// Resolved room state: one entry per `(event_type, state_key)` pair.
 pub type StateMap<V> = HashMap<(String, String), V>;
+
+/// The servers with at least one `join` member in `current_state`.
+pub fn joined_servers(current_state: &StateMap<Arc<Event>>) -> BTreeSet<OwnedServerName> {
+    current_state
+        .iter()
+        .filter(|((ty, _), ev)| {
+            ty == "m.room.member" && ev.content_str("membership").as_deref() == Some("join")
+        })
+        .filter_map(|((_, sk), _)| UserId::parse(sk.as_str()).ok())
+        .map(|user| user.server_name().to_owned())
+        .collect()
+}
 
 /// A change to apply to the resolved current state, keyed by
 /// `(event_type, state_key)`. `Some(id)` sets or replaces the pointer for

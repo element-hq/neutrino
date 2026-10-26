@@ -224,22 +224,6 @@ pub(crate) fn map_apply_err(err: neutrino_engine::RoomActorError) -> FedError {
     }
 }
 
-/// Whether any of this server's users is currently joined to `room_id` — the
-/// out-of-band predicate. A membership event for a local user in a room this
-/// server is not in cannot be applied against room state we may still hold: a
-/// stale copy from an earlier membership is not the room's current state.
-pub(crate) async fn server_in_room(
-    store: &impl neutrino_store::StateStore,
-    room_id: &ruma::RoomId,
-    own_server: &str,
-) -> Result<bool, neutrino_store::StorageError> {
-    Ok(store
-        .joined_members(room_id)
-        .await?
-        .keys()
-        .any(|user| user.server_name().as_str() == own_server))
-}
-
 /// Co-sign a locally-committed federation event with this server's signature
 /// when the deployment is signed — the resident/invitee side of the
 /// `send_join` / `send_leave` / `invite` round-trips, so the copy we persist +

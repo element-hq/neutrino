@@ -6744,9 +6744,13 @@ async fn send_leave_for_a_room_we_hold_but_are_not_in_stays_out_of_band() {
     store.create_room(&create, &[]).await.expect("create_room");
     assert!(store.room_exists(&room_id).await.unwrap());
     assert!(
-        !crate::federation::server_in_room(&*store, &room_id, "example.org")
-            .await
-            .unwrap(),
+        !neutrino_engine::reconcile::server_in_room(
+            &*store,
+            &room_id,
+            ruma::server_name!("example.org")
+        )
+        .await
+        .unwrap(),
         "precondition: we hold the row but are not in the room"
     );
 

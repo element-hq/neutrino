@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use neutrino_store::{Direction, Event, Membership, StorageBackend, StreamPos};
+use neutrino_store::{Direction, Event, Membership, ResolvedMembership, StorageBackend, StreamPos};
 use ruma::UInt;
 use ruma::api::client::sync::sync_events::v5::response;
 use ruma::api::client::sync::sync_events::v5::{Request, Response};
@@ -110,10 +110,13 @@ pub(super) async fn build_response<S: StorageBackend>(
             .map(Vec::as_slice)
             .unwrap_or(&[]);
 
+        let member = state.store.resolved_member_event(room_id, user_id).await?;
+        let membership = member.as_ref().map(|r| r.membership);
         let built = build_room(
             state,
             user_id,
             room_id,
+            member,
             combined_cfg,
             is_initial_for_room,
             was_invite,
@@ -135,7 +138,7 @@ pub(super) async fn build_response<S: StorageBackend>(
         update_sent(sent, &state_events, &deleted_state_keys);
         sent.emitted_as_invite = emitted_as_invite;
         rooms_response.insert(room_id.clone(), room_result);
-        if let Some(m) = combined_cfg.membership {
+        if let Some(m) = membership {
             memberships.insert(room_id.clone(), m);
         }
     }
@@ -282,7 +285,6 @@ async fn fetch_event_deltas<S: StorageBackend>(
 struct RankedRoom {
     room_id: OwnedRoomId,
     bump_stamp: u64,
-    membership: Membership,
 }
 
 /// Resolved per-room request after merging every rule that mentions it.
@@ -294,9 +296,6 @@ struct CombinedCfg {
     timeline_limit: usize,
     required_state: Vec<(StateEventType, String)>,
     bump_stamp: u64,
-    /// The membership the room was ranked under; `None` for a direct
-    /// subscription to a room the user has no membership in.
-    membership: Option<Membership>,
 }
 
 /// Rank every room the user can see by recency.
@@ -354,7 +353,6 @@ async fn candidate_rooms<S: StorageBackend>(
             ranked.push(RankedRoom {
                 bump_stamp: bump_stamp_for_invited(state, &room_id, user_id).await?,
                 room_id,
-                membership,
             });
             continue;
         }
@@ -374,7 +372,6 @@ async fn candidate_rooms<S: StorageBackend>(
         ranked.push(RankedRoom {
             room_id,
             bump_stamp,
-            membership,
         });
     }
 
@@ -525,14 +522,12 @@ fn combined_room_configs(conn: &Conn, ranked: &[RankedRoom]) -> BTreeMap<OwnedRo
     let apply = |out: &mut BTreeMap<OwnedRoomId, CombinedCfg>,
                  room_id: &OwnedRoomId,
                  bump_stamp: u64,
-                 membership: Option<Membership>,
                  timeline_limit: usize,
                  required_state: &[(StateEventType, String)]| {
         let entry = out.entry(room_id.clone()).or_insert(CombinedCfg {
             timeline_limit: 0,
             required_state: Vec::new(),
             bump_stamp,
-            membership,
         });
         entry.timeline_limit = entry.timeline_limit.max(timeline_limit);
         for pair in required_state {
@@ -551,7 +546,6 @@ fn combined_room_configs(conn: &Conn, ranked: &[RankedRoom]) -> BTreeMap<OwnedRo
                 &mut out,
                 &room.room_id,
                 room.bump_stamp,
-                Some(room.membership),
                 cfg.timeline_limit,
                 &cfg.required_state,
             );
@@ -563,7 +557,6 @@ fn combined_room_configs(conn: &Conn, ranked: &[RankedRoom]) -> BTreeMap<OwnedRo
             &mut out,
             room_id,
             ranked.map_or(0, |r| r.bump_stamp),
-            ranked.map(|r| r.membership),
             cfg.timeline_limit,
             &cfg.required_state,
         );
@@ -597,7 +590,8 @@ fn effective_range(range: Option<(usize, usize)>, total: usize) -> Option<(usize
     Some((a, b.min(total - 1)))
 }
 
-/// Produce one room's slice of the sync response.
+/// Produce one room's slice of the sync response, shaped by `member` (the
+/// user's resolved membership, which the caller files the room under).
 ///
 /// Returns `(response::Room, state_events, deleted_state_keys)`:
 /// - `state_events` are the state events we just emitted (caller records them
@@ -625,6 +619,7 @@ async fn build_room<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
     room_id: &OwnedRoomId,
+    member: Option<ResolvedMembership>,
     cfg: &CombinedCfg,
     is_initial_for_room: bool,
     was_invite: bool,
@@ -632,46 +627,14 @@ async fn build_room<S: StorageBackend>(
     room_delta: &[Event],
     sent_snapshot: Option<&RoomSent>,
 ) -> Result<BuiltRoom, SyncError> {
-    // Branch on the membership the room was *ranked* under, not on a fresh
-    // read: the response files the room under `cfg.membership`, so the shape
-    // must be built for that membership. Storage may have moved on since
-    // ranking (a leave landing mid-build); each branch checks the event it
-    // fetches still matches and otherwise skips the room for this pass — the
-    // store watch has already fired for that write, so the next build ranks
-    // the room under its new membership and emits it consistently.
-    match cfg.membership {
-        Some(Membership::Invite) => {
-            return build_invite_room(state, user_id, room_id, cfg, sent_snapshot).await;
+    match member {
+        Some(r) if r.membership == Membership::Invite => {
+            return build_invite_room(r.event, cfg, sent_snapshot);
         }
-        Some(Membership::Leave | Membership::Ban) => {
-            if let Some(left) = oob_left(state, user_id, room_id).await? {
-                return build_oob_left_room(left, cfg, sent_snapshot);
-            }
-            // Not out-of-band: an in-room leave/ban takes the joined path
-            // below, gated by the same membership check.
+        Some(r) if r.out_of_band && matches!(r.membership, Membership::Leave | Membership::Ban) => {
+            return build_oob_left_room(r.event, cfg, sent_snapshot);
         }
-        Some(Membership::Join | Membership::Knock) => {}
-        // A direct subscription to a room the user has no ranked membership
-        // in: probe storage for the shape.
-        None => {
-            if is_invited(state, user_id, room_id).await? {
-                return build_invite_room(state, user_id, room_id, cfg, sent_snapshot).await;
-            }
-            if let Some(left) = oob_left(state, user_id, room_id).await? {
-                return build_oob_left_room(left, cfg, sent_snapshot);
-            }
-        }
-    }
-    // Joined path: the in-room member event must still say what the room was
-    // ranked under, else skip this pass (see above).
-    if let Some(ranked) = cfg.membership {
-        let current = state
-            .store
-            .current_state_event(room_id, "m.room.member", user_id.as_str())
-            .await?;
-        if current.as_ref().and_then(membership_of) != Some(ranked) {
-            return Ok(None);
-        }
+        _ => {}
     }
 
     // Invite→join transition: the room's only prior emission was `invite_state`,
@@ -771,22 +734,6 @@ async fn build_room<S: StorageBackend>(
     Ok(Some((room, state_events, deleted_state_keys)))
 }
 
-/// The user's out-of-band leave or ban in a room we hold no in-room membership
-/// for: an invite this server rejected, or one the inviter rescinded.
-async fn oob_left<S: StorageBackend>(
-    state: &SyncState<S>,
-    user_id: &UserId,
-    room_id: &RoomId,
-) -> Result<Option<Event>, SyncError> {
-    Ok(state
-        .store
-        .resolved_member_event(room_id, user_id)
-        .await?
-        .filter(|r| r.out_of_band)
-        .filter(|r| matches!(r.membership, Membership::Leave | Membership::Ban))
-        .map(|r| r.event))
-}
-
 /// An out-of-band leave/ban has no timeline here: the member event itself is
 /// the whole update, emitted once (tracked through `required_state_keys` like
 /// any state event) as both timeline and state so either legacy `rooms.leave`
@@ -827,22 +774,6 @@ async fn member_event<S: StorageBackend>(
         .map(|r| r.event))
 }
 
-/// Whether `user_id`'s current `m.room.member` event in `room_id` is `invite`
-/// (in-room or out-of-band — see [`member_event`]). A malformed event (parse
-/// failure, missing/typed-wrong `content.membership`) degrades to `false` — a
-/// single bad row shouldn't take the whole sync down with a 500.
-async fn is_invited<S: StorageBackend>(
-    state: &SyncState<S>,
-    user_id: &UserId,
-    room_id: &RoomId,
-) -> Result<bool, SyncError> {
-    Ok(member_event(state, user_id, room_id)
-        .await?
-        .as_ref()
-        .and_then(membership_of)
-        == Some(Membership::Invite))
-}
-
 /// `content.membership` of a member event; `None` if missing or unrecognised.
 fn membership_of(ev: &Event) -> Option<Membership> {
     Membership::from_wire(&ev.content_str("membership")?)
@@ -864,24 +795,11 @@ fn membership_of(ev: &Event) -> Option<Membership> {
 ///
 /// Once the invite is accepted, the full state arrives via federation and
 /// the room enters the normal joined-room path.
-async fn build_invite_room<S: StorageBackend>(
-    state: &SyncState<S>,
-    user_id: &UserId,
-    room_id: &OwnedRoomId,
+fn build_invite_room(
+    invite_event: Event,
     cfg: &CombinedCfg,
     sent: Option<&RoomSent>,
 ) -> Result<BuiltRoom, SyncError> {
-    // The invite member event — in-room current state, or the out-of-band
-    // invite stub for a federated invite to a room we don't host. Its
-    // `unsigned.invite_room_state` is the stripped state we render from. If it
-    // is no longer an invite the membership moved since this room was ranked:
-    // skip it this pass rather than emit an invite shape for a left room.
-    let Some(invite_event) = member_event(state, user_id, room_id).await? else {
-        return Ok(None);
-    };
-    if membership_of(&invite_event) != Some(Membership::Invite) {
-        return Ok(None);
-    }
     // Emit each invite exactly once per connection, keyed by the member event
     // itself (tracked through `required_state_keys` like any state event): the
     // stripped state is fixed at invite time, so re-sending the same invite is
@@ -1183,7 +1101,7 @@ mod unit_tests {
     use std::collections::HashMap;
 
     use neutrino_event::Event;
-    use neutrino_store::OobMembershipStore;
+    use neutrino_store::{EventStore, OobMembershipStore};
     use ruma::events::StateEventType;
     use ruma::{event_id, room_id, user_id};
 
@@ -1195,12 +1113,9 @@ mod unit_tests {
     };
 
     #[tokio::test]
-    async fn build_room_skips_a_room_whose_membership_moved_since_ranking() {
-        // Ranked as an invite, but by the time the room is built the stub is a
-        // leave (the inviter rescinded mid-build). Emitting the invite shape
-        // would file a left room under `rooms.invite` with no `invite_state`;
-        // emitting the leave shape would contradict the ranked membership the
-        // response files it under. So: nothing this pass.
+    async fn build_room_shapes_a_rescinded_invite_as_a_leave() {
+        // The stub is a leave (the inviter rescinded): it is emitted as the
+        // leave it is now, whatever it was ranked under.
         let (store, _tmp) = fresh_store().await;
         let user = user_id!("@alice:example.org");
         let room = room_id!("!remote:other.example.org");
@@ -1226,41 +1141,23 @@ mod unit_tests {
             .put_oob_membership(room, user, &leave, neutrino_event::ROOM_VERSION_ID, None)
             .await
             .unwrap();
+        let member = store.resolved_member_event(room, user).await.unwrap();
+        assert_eq!(
+            member.as_ref().map(|r| r.membership),
+            Some(Membership::Leave)
+        );
         let state = SyncState::new(store, no_shutdown());
         let cfg = CombinedCfg {
             timeline_limit: 5,
             required_state: Vec::new(),
             bump_stamp: 0,
-            membership: Some(Membership::Invite),
         };
 
-        let built = build_room(
-            &state,
-            user,
-            &room.to_owned(),
-            &cfg,
-            true,
-            false,
-            true,
-            &[],
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(
-            built.is_none(),
-            "stale ranking must not emit a mismatched shape"
-        );
-
-        // Ranked under the membership storage now holds, the leave is emitted.
-        let cfg = CombinedCfg {
-            membership: Some(Membership::Leave),
-            ..cfg
-        };
         let (room_out, _, _) = build_room(
             &state,
             user,
             &room.to_owned(),
+            member,
             &cfg,
             true,
             false,
@@ -1270,66 +1167,86 @@ mod unit_tests {
         )
         .await
         .unwrap()
-        .expect("the leave is emitted under its own membership");
+        .expect("the leave is emitted");
         assert!(room_out.invite_state.is_none());
         assert_eq!(room_out.timeline.len(), 1);
     }
 
     #[tokio::test]
-    async fn build_room_joined_path_requires_the_ranked_membership() {
-        // A hosted room the user is joined to. Ranked as `leave` (a kick that
-        // was undone by a re-join mid-build, say) it must emit nothing; ranked
-        // as `join` it emits the joined shape.
+    async fn build_room_emits_the_drained_delta_after_a_mid_build_kick() {
+        // A message is drained for a room the connection already knows, then
+        // a kick lands before the room is built. The room is still emitted
+        // with the message: skipping it would lose the message, because the
+        // cursor has already moved past it.
         let (store, _tmp) = fresh_store().await;
         let user = user_id!("@alice:example.org");
+        let bob = user_id!("@bob:example.org");
         let room = room_id!("!hosted:example.org");
         setup_joined_room(&store, room, user).await;
+        let message = make_event_from_json(
+            room,
+            "m.room.message",
+            None,
+            bob,
+            10,
+            serde_json::json!({
+                "room_id": room.as_str(),
+                "type": "m.room.message",
+                "sender": bob.as_str(),
+                "origin_server_ts": 10,
+                "content": {"msgtype": "m.text", "body": "hi"},
+            }),
+        );
+        store.persist_event(&message, &[]).await.unwrap();
+        let kick = make_event_from_json(
+            room,
+            "m.room.member",
+            Some(user.as_str()),
+            bob,
+            20,
+            serde_json::json!({
+                "room_id": room.as_str(),
+                "type": "m.room.member",
+                "state_key": user.as_str(),
+                "sender": bob.as_str(),
+                "origin_server_ts": 20,
+                "content": {"membership": "leave"},
+            }),
+        );
+        store.persist_event(&kick, &[]).await.unwrap();
+        let member = store.resolved_member_event(room, user).await.unwrap();
+        assert_eq!(
+            member.as_ref().map(|r| r.membership),
+            Some(Membership::Leave)
+        );
         let state = SyncState::new(store, no_shutdown());
         let cfg = CombinedCfg {
             timeline_limit: 5,
             required_state: Vec::new(),
             bump_stamp: 0,
-            membership: Some(Membership::Leave),
         };
 
-        let built = build_room(
-            &state,
-            user,
-            &room.to_owned(),
-            &cfg,
-            true,
-            false,
-            true,
-            &[],
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(
-            built.is_none(),
-            "ranked leave, actually joined: skip this pass"
-        );
-
-        let cfg = CombinedCfg {
-            membership: Some(Membership::Join),
-            ..cfg
-        };
         let (room_out, _, _) = build_room(
             &state,
             user,
             &room.to_owned(),
+            member,
             &cfg,
-            true,
             false,
-            true,
-            &[],
-            None,
+            false,
+            false,
+            std::slice::from_ref(&message),
+            Some(&RoomSent::default()),
         )
         .await
         .unwrap()
-        .expect("ranked join, actually joined: emitted");
-        assert!(room_out.invite_state.is_none());
-        assert!(!room_out.timeline.is_empty());
+        .expect("the drained delta is emitted");
+        let ids: Vec<_> = room_out
+            .timeline
+            .iter()
+            .filter_map(|e| e.get_field::<String>("event_id").ok().flatten())
+            .collect();
+        assert_eq!(ids, vec![message.event_id.to_string()]);
     }
 
     #[test]

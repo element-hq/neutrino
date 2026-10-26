@@ -302,15 +302,8 @@ impl RoomCore {
     /// when no user on `target`'s server is joined. A membership change for
     /// such a user MUST name it in `prev_state_events`.
     fn out_of_band_member(&self, target: &str) -> Option<&OwnedEventId> {
-        let server = target.parse::<OwnedUserId>().ok()?.server_name().to_owned();
-        let server_joined = self.current_state.iter().any(|((ty, sk), ev)| {
-            ty == "m.room.member"
-                && sk
-                    .parse::<OwnedUserId>()
-                    .is_ok_and(|u| u.server_name() == server)
-                && ev.content_str("membership").as_deref() == Some("join")
-        });
-        if server_joined {
+        let user = target.parse::<OwnedUserId>().ok()?;
+        if crate::joined_servers(&self.current_state).contains(user.server_name()) {
             return None;
         }
         self.current_state

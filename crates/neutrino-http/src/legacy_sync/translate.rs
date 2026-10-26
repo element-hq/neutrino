@@ -139,7 +139,7 @@ const LEGACY_TIMELINE_LIMIT: u32 = 50;
 /// Translate a v5 sliding-sync response into a legacy `/sync` JSON payload.
 ///
 /// `resp.memberships` is the bucketing map keyed by `OwnedRoomId`, filled by
-/// the v5 handler from `StorageBackend::resolved_memberships`.
+/// the v5 handler from the same read that built each room.
 ///
 /// Bucketing rules per MSC4186 + the design doc:
 /// - `Membership::Invite` → `rooms.invite` with the v5 `invite_state` lifted
@@ -162,10 +162,8 @@ const LEGACY_TIMELINE_LIMIT: u32 = 50;
 ///   `tracing::warn!`, then probe `room.invite_state` as a tiebreaker. If
 ///   v5 supplied stripped invite state we bucket into `rooms.invite` so
 ///   those events aren't lost; otherwise we graceful-default to
-///   `rooms.join`. Shouldn't normally happen because the handler prefills
-///   `memberships` from the same query that drives candidate rooms, but
-///   covers the race where a fresh invite lands between the pre-query
-///   and the v5 call.
+///   `rooms.join`. Only a direct subscription to a room the user has no
+///   membership in lands here.
 ///
 /// Per-room `prev_batch` is the empty string (no `/messages` impl); `limited`
 /// is `false`. `state` and `org.matrix.msc4222.state_after` are dual-emitted
