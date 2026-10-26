@@ -813,13 +813,8 @@ fn build_oob_left_room(
     Ok(Some((room, vec![left], Vec::new())))
 }
 
-/// The user's `m.room.member` event for the room, sourced from in-room current
-/// state if we host the room, else from the out-of-band membership store (a
-/// federated invite, or the leave/ban that ended it, for a room we hold no
-/// state for — no create event, no auth chain, so it never entered
-/// `current_state`). In-room state takes precedence: if we host the room, its
-/// authed membership is authoritative over any stale OOB stub (and the two
-/// should not coexist in practice — accepting an invite removes the stub).
+/// The user's `m.room.member` event for the room: the newer of the in-room
+/// current-state event and the out-of-band stub (see `ResolvedMembership`).
 async fn member_event<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,

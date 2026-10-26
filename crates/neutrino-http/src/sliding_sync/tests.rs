@@ -1270,11 +1270,6 @@ async fn oob_leave_surfaces_once_after_the_invite() {
     );
 }
 
-/// In-room membership must win over a stale out-of-band invite stub for the
-/// same `(room, user)`. This pins the precedence the dedup logic depends on:
-/// `candidate_rooms` skips an OOB room already in `rooms_with_membership`, and
-/// `member_event` consults `current_state` before `get_oob_membership`. Without that
-/// precedence the joined room would be mis-rendered as an invite.
 #[tokio::test]
 async fn re_invite_after_rejection_is_emitted_on_the_same_connection() {
     // invite → reject → invite again, all on one connection. The second invite
@@ -2730,7 +2725,7 @@ async fn invited_room_emits_name_and_avatar_from_stripped_state() {
 // -----------------------------------------------------------------------------
 // MSC4186 §"Rooms included in the server list" — kicked / banned / left /
 // knocked. See `build::include_room_per_msc4186` and the storage trait
-// `StateStore::rooms_with_membership`.
+// `OobMembershipStore::resolved_memberships`.
 // -----------------------------------------------------------------------------
 
 #[tokio::test]

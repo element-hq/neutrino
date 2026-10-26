@@ -158,7 +158,7 @@ mod tests {
     }
 
     /// The legacy read-path: an OOB invite must be classified `Invite` by
-    /// `fetch_memberships` and bucketed under `rooms.invite` with its
+    /// `resolved_memberships` and bucketed under `rooms.invite` with its
     /// `invite_state` by the full v5→v3 composition — no `current_state` for
     /// the room exists.
     #[tokio::test]

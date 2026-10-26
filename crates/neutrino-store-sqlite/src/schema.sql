@@ -182,7 +182,7 @@ CREATE TABLE current_state (
         REFERENCES events(event_id, room_id, event_type, state_key)
 ) STRICT, WITHOUT ROWID;
 
--- joined_rooms(user) and rooms_with_membership(user, memberships): direct
+-- joined_rooms(user) and resolved_memberships(user, memberships): direct
 -- lookup by state_key, then filter by membership. `membership` sits
 -- immediately after the leading equality column so SQLite can push the
 -- `membership = 'join'` / `membership IN (…)` predicate into the index
@@ -378,7 +378,7 @@ CREATE INDEX ix_staged_events_fetched_for ON staged_events(room_id, fetched_for)
 -- can go through `RoomCore::apply_pdu` — there is no state DAG here to auth
 -- them against — so they live outside `events` / `current_state`, invisible
 -- to every state-res / timeline read path, and surface only via the sync
--- out-of-band path (`oob_memberships(user)`).
+-- out-of-band path (`resolved_memberships(user)`).
 --
 -- Keyed by (room_id, state_key): the `state_key` is the local user, so the
 -- pair is unique and `INSERT OR REPLACE` gives latest-membership-wins. Only
@@ -402,7 +402,9 @@ CREATE TABLE oob_memberships (
     -- written, so an out-of-band membership can be ordered against the in-room
     -- `m.room.member` event for the same (room, user) — both tables can hold
     -- one, and either can be the newer fact. A watermark, not an allocation:
-    -- `MAX(events.stream_pos)` is read inside the same write transaction. The
+    -- `MAX(events.stream_pos)` is read just before the insert, with no event
+    -- write in between only because the store has a single writer connection
+    -- (see `put_oob_membership`). The
     -- stub is newer iff `learned_after >= events.stream_pos` of the in-room
     -- event; a tie means the stub was written after that event was already in
     -- the table, so ties favour the stub. Never derived from remote input or a
@@ -412,7 +414,7 @@ CREATE TABLE oob_memberships (
     PRIMARY KEY (room_id, state_key)
 ) STRICT, WITHOUT ROWID;
 
--- oob_memberships(user): direct lookup by the local user (state_key).
+-- resolved_memberships(user): direct lookup by the local user (state_key).
 CREATE INDEX ix_oob_memberships_user ON oob_memberships(state_key);
 
 -- ----------------------------------------------------------------------------

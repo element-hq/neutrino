@@ -30,8 +30,8 @@ pub enum Direction {
     Backward,
 }
 
-/// The five canonical `m.room.member` membership states. Sliding sync's
-/// `rooms_with_membership` takes a set of these so the wire-string
+/// The five canonical `m.room.member` membership states.
+/// `resolved_memberships` takes a set of these so the wire-string
 /// alphabet is closed and duplicates can't be expressed at the type level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Membership {
@@ -659,24 +659,6 @@ pub trait FederationInbox: Send + Sync {
     ) -> Result<bool, StorageError>;
 }
 
-/// Out-of-band membership invites: invites for rooms where we host the
-/// **invitee** but hold no room state — no `m.room.create`, no auth chain —
-/// so they cannot go through `RoomCore::apply_pdu` (which auths a PDU against
-/// the room's state DAG). The inbound `/invite` federation handler stores the
-/// invite here; the sync invite path surfaces it.
-///
-/// Keyed by `(room_id, user_id)`. For an `m.room.member` invite the
-/// `state_key` *is* the invited `user_id`, so the pair uniquely identifies
-/// the invite. The stored event's `raw` carries the inviting server's
-/// `unsigned.invite_room_state` (already-stripped state events), which is the
-/// only room context we have pre-accept — the sync builder renders the room
-/// name / inviter from it.
-///
-/// This is a separate table from the authed room state on purpose: an OOB
-/// invite carries no auth and lives outside any room's DAG, so it must not be
-/// folded into `current_state` / `rooms_with_membership`. On accept (the room
-/// enters normal joined state) or reject (membership → leave) the stub is
-/// removed.
 /// The latest out-of-band `m.room.member` event a peer handed us for a local
 /// user in a room this server is not in — an invite, or the leave / ban that
 /// ended it — with the room version it was named under (there is no `rooms`
@@ -758,11 +740,8 @@ pub trait OobMembershipStore: Send + Sync {
     /// Pre:  none.
     /// Post: the user's authoritative member event for `room_id` — the newer
     ///       of the in-room current-state event and the out-of-band stub, per
-    ///       [`ResolvedMembership`]. `None` if neither table holds one. The
-    ///       two sources are read as separate statements, so a concurrent
-    ///       write can land between them; the result is then one of the two
-    ///       adjacent states, and both writers fire the persist watch, so a
-    ///       sync rebuild follows.
+    ///       [`ResolvedMembership`]. `None` if neither table holds one. Both
+    ///       tables are read from one consistent snapshot.
     async fn resolved_member_event(
         &self,
         room_id: &RoomId,

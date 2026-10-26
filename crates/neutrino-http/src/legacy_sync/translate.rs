@@ -138,9 +138,8 @@ const LEGACY_TIMELINE_LIMIT: u32 = 50;
 
 /// Translate a v5 sliding-sync response into a legacy `/sync` JSON payload.
 ///
-/// `memberships` is the caller-supplied bucketing map keyed by `OwnedRoomId`
-/// (built by the handler from `StorageBackend::rooms_with_membership` before
-/// invoking the v5 handler).
+/// `resp.memberships` is the bucketing map keyed by `OwnedRoomId`, filled by
+/// the v5 handler from `StorageBackend::resolved_memberships`.
 ///
 /// Bucketing rules per MSC4186 + the design doc:
 /// - `Membership::Invite` → `rooms.invite` with the v5 `invite_state` lifted

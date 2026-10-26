@@ -172,8 +172,11 @@ impl OobMembershipStore for SqliteStore {
         let room = room_id.as_str().to_owned();
         let state_key = user_id.as_str().to_owned();
         self.run_read(move |conn| -> Result<Option<ResolvedMembership>, Error> {
-            let in_room = in_room_member(conn, &room, &state_key)?;
-            let stub = stub_member(conn, &room, &state_key)?;
+            // One snapshot for both tables, so a concurrent persist that prunes
+            // the stub cannot pair it with a stale in-room row.
+            let tx = conn.transaction()?;
+            let in_room = in_room_member(&tx, &room, &state_key)?;
+            let stub = stub_member(&tx, &room, &state_key)?;
             Ok(pick(in_room, stub))
         })
         .await
@@ -192,10 +195,12 @@ impl OobMembershipStore for SqliteStore {
 
         self.run_read(
             move |conn| -> Result<Vec<(OwnedRoomId, Membership, bool)>, Error> {
+                // One snapshot for both tables — see `resolved_member_event`.
+                let tx = conn.transaction()?;
                 // (membership, learned_after/stream_pos, out_of_band) per room.
                 let mut best: BTreeMap<OwnedRoomId, (Membership, i64, bool)> = BTreeMap::new();
 
-                let mut stmt = conn.prepare(
+                let mut stmt = tx.prepare(
                     "SELECT cs.room_id, cs.membership, e.stream_pos \
                      FROM current_state cs JOIN events e ON e.event_id = cs.event_id \
                      WHERE cs.state_key = ? AND cs.event_type = 'm.room.member'",
@@ -216,7 +221,7 @@ impl OobMembershipStore for SqliteStore {
                     best.insert(parse_room(room_id)?, (membership, pos, false));
                 }
 
-                let mut stmt = conn.prepare(
+                let mut stmt = tx.prepare(
                     "SELECT room_id, membership, learned_after FROM oob_memberships \
                      WHERE state_key = ?",
                 )?;
@@ -624,6 +629,58 @@ mod tests {
             "the later in-room event wins over the stub"
         );
         assert_eq!(got.membership, Membership::Join);
+    }
+
+    /// The bulk form must agree with the point form, emit exactly one row per
+    /// room when both tables hold one, and filter on the winner.
+    #[tokio::test]
+    async fn resolved_memberships_matches_point_resolver_one_row_per_room() {
+        use neutrino_store::RoomStore;
+
+        let s = store().await;
+        s.create_room(
+            &create_event(*ALICE_ROOM_ID, *ALICE_USER_ID),
+            &[member_leave(*ALICE_ROOM_ID, *BOB_USER_ID)],
+        )
+        .await
+        .unwrap();
+        let invite = remote_member(*ALICE_ROOM_ID, *BOB_USER_ID, *ALICE_USER_ID, "invite", "R");
+        s.put_oob_membership(*ALICE_ROOM_ID, *BOB_USER_ID, &invite, VERSION)
+            .await
+            .unwrap();
+
+        let wanted = BTreeSet::from([
+            Membership::Join,
+            Membership::Invite,
+            Membership::Knock,
+            Membership::Leave,
+            Membership::Ban,
+        ]);
+        let rows = s.resolved_memberships(*BOB_USER_ID, &wanted).await.unwrap();
+        let point = s
+            .resolved_member_event(*ALICE_ROOM_ID, *BOB_USER_ID)
+            .await
+            .unwrap()
+            .expect("resolved");
+        assert_eq!(
+            rows,
+            vec![(
+                ALICE_ROOM_ID.to_owned(),
+                point.membership,
+                point.out_of_band
+            )]
+        );
+        assert_eq!(rows[0].1, Membership::Invite);
+        assert!(rows[0].2, "out_of_band");
+
+        // Asking only for `leave` must not surface the room via the losing
+        // in-room row.
+        assert!(
+            s.resolved_memberships(*BOB_USER_ID, &BTreeSet::from([Membership::Leave]))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Persisting a member event that becomes current state drops the stub it
