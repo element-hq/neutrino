@@ -25,7 +25,9 @@ env under `COMPLEMENT_SHARE_ENV_PREFIX`): `NEUTRINO_TRUSTED_NETWORK=0` (signed
 mode: events carry `hashes`/`signatures`, requests a signed `X-Matrix`, and
 peer keys are fetched from `/_matrix/key/v2/server` through the egress —
 gomatrixserverlib refuses hash-less events, so trusted mode cannot federate
-with complement), `NEUTRINO_STORAGE_DIR` (`/data`), `NEUTRINO_STARTUP_JITTER_MS`
+with complement), `NEUTRINO_HTTP_KEY_LOOKUP=1` (the test-only key resolver
+signed mode needs here; see `HttpKeyResolver` for why it is unsafe outside
+tests), `NEUTRINO_STORAGE_DIR` (`/data`), `NEUTRINO_STARTUP_JITTER_MS`
 (`0`; the production 30s pre-drain delay would stall federated sends past
 complement's sync timeouts).
 

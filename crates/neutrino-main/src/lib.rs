@@ -325,12 +325,12 @@ pub async fn entrypoint(
         None => None,
     };
 
-    // Signed mode needs a key namespace. A medium may declare one; otherwise
-    // named peers publish theirs at `/_matrix/key/v2/server`, fetched over the
-    // route outbound federation takes — so composed here, once
-    // `federation_proxy` is final.
+    // Signed mode needs a key namespace. A medium may declare one; otherwise,
+    // only when `http_key_lookup` opts in (Complement), named peers' keys are
+    // fetched from `/_matrix/key/v2/server` over the route outbound federation
+    // takes — so composed here, once `federation_proxy` is final.
     let key_resolver = key_resolver.or_else(|| {
-        security_config.sign_messages.then(|| {
+        (security_config.sign_messages && config.http_key_lookup).then(|| {
             Arc::new(neutrino_http::HttpKeyResolver::new(&config))
                 as Arc<dyn neutrino_event::KeyResolver>
         })

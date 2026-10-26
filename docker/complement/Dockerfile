@@ -78,8 +78,10 @@ RUN mkdir -p /etc/neutrino /data \
 # Signed mode: events carry hashes + signatures and requests a signed X-Matrix,
 # which Complement's gomatrixserverlib requires. Jitter is the pre-drain delay
 # on the outbound sender: the 30s production default would stall every
-# federated send past Complement's sync timeouts.
+# federated send past Complement's sync timeouts. HTTP key lookup is the
+# test-only key resolver for signed mode (see `Config::http_key_lookup`).
 ENV NEUTRINO_TRUSTED_NETWORK=0 \
+    NEUTRINO_HTTP_KEY_LOOKUP=1 \
     NEUTRINO_STORAGE_DIR=/data \
     NEUTRINO_STARTUP_JITTER_MS=0
 

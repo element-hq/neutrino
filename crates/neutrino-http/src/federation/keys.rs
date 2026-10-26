@@ -11,13 +11,20 @@ use ruma::ServerName;
 
 use super::client::FederationClient;
 
-/// [`KeyResolver`] for DNS/IP-named peers (the dev binary, the Complement
-/// image): `(server_name, key_id)` is answered by the peer's own
+/// [`KeyResolver`] for DNS/IP-named peers (the Complement image):
+/// `(server_name, key_id)` is answered by the peer's own
 /// `/_matrix/key/v2/server`, fetched over the route outbound federation takes
 /// (direct, or via `federation_proxy`) and checked against its self-signature.
-/// Resolved keys are cached for the process lifetime: this deployment's own
-/// key never rotates, and a peer rotating keys is a new key id, not a new
-/// value under an old one.
+///
+/// **TEST-ONLY. NOT SAFE FOR PRODUCTION.** Only enabled by
+/// `Config::http_key_lookup`. It does not:
+/// - authenticate the responder: the self-signature proves only that whoever
+///   answered holds the key, and the first answer is cached for the process
+///   lifetime, so whoever answers first can forge that server's events;
+/// - enforce `valid_until_ts` or consult `old_verify_keys`;
+/// - bound lookups: every key id an event lists is fetched, failures are not
+///   cached, concurrent lookups are not merged, and the host is whatever the
+///   sender's server name says (including loopback / LAN addresses).
 pub struct HttpKeyResolver {
     client: FederationClient,
     cache: Mutex<HashMap<(String, String), [u8; 32]>>,

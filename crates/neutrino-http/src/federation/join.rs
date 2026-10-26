@@ -402,19 +402,26 @@ async fn try_join_via(
         .await
         .map_err(|e| from_client_err(e, "send_join request failed"))?;
 
-    // The join to wait on is the one the resident handed back and we staged
-    // (`resp.event`) — the same event as ours modulo signatures, hence the same
-    // id, when the resident behaves; watching what was actually staged keeps
-    // the rejected-join check honest if it did not.
-    ingest_state_dag(store, worker_poke, policy, &version, dest, room_id, resp)
-        .await
-        .map_err(gateway)
+    ingest_state_dag(
+        store,
+        worker_poke,
+        policy,
+        &version,
+        dest,
+        room_id,
+        &join_id,
+        resp,
+    )
+    .await
+    .map_err(gateway)?;
+    Ok(join_id)
 }
 
 /// Ingest a `send_join` response: check the state DAG is closed, register the
 /// room from its create event (if new), then stage every returned event for the
 /// worker to apply. The create is staged too — it re-applies as an idempotent
-/// no-op. Returns the id of the join event (`resp.event`) as staged.
+/// no-op. `resp.event` is staged as the join, so it must be ours (`join_id`):
+/// the resident's countersignature does not change the event id.
 #[allow(clippy::too_many_arguments)]
 async fn ingest_state_dag(
     store: &(impl RoomStore + StagingStore + EventStore),
@@ -423,8 +430,9 @@ async fn ingest_state_dag(
     version: &std::sync::Arc<neutrino_event::RoomVersion>,
     origin: &ServerName,
     room_id: &RoomId,
+    join_id: &EventId,
     resp: SendJoinResponse,
-) -> Result<OwnedEventId, &'static str> {
+) -> Result<(), &'static str> {
     // Admit each event, keeping the *connected* half (the state DAG plus the
     // join) separate from the timeline. Only state-DAG events are subject to
     // the connectedness rule below: `timeline` carries message events, and may
@@ -452,13 +460,10 @@ async fn ingest_state_dag(
     for raw in resp.timeline {
         timeline.extend(admit(raw).await);
     }
-    // The join we wait on is the one we staged, so it is read back off the
-    // admitted event rather than assumed to be the one we sent.
     let join = admit(resp.event)
         .await
-        .filter(|e| e.event_type == "m.room.member")
-        .ok_or("send_join response has no usable join event")?;
-    let join_id = join.event_id.clone();
+        .filter(|e| e.event_id == join_id)
+        .ok_or("send_join response event is not our join")?;
     state_dag.push(join);
 
     // MSC4242: "verify that you have ALL paths from the `prev_state_events` of
@@ -507,7 +512,7 @@ async fn ingest_state_dag(
     neutrino_engine::stage_and_poke(store, worker_poke, origin, room_id, &events)
         .await
         .map_err(|_| "could not stage room state")?;
-    Ok(join_id)
+    Ok(())
 }
 
 /// Every `prev_state_events` reference across `events` must name an event in

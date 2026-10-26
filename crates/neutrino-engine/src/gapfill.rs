@@ -27,7 +27,9 @@ use neutrino_event::{Event, EventPolicy};
 use neutrino_store::StorageBackend;
 use ruma::{EventId, OwnedEventId, RoomId, ServerName};
 
-use crate::ports::{MissingEventsFetcher, MissingEventsQuery, TransportError};
+use crate::ports::{
+    MAX_STATE_DAG_EVENT_IDS, MissingEventsFetcher, MissingEventsQuery, TransportError,
+};
 use crate::util::room_version;
 
 /// Initial `limit` for the first gap-fill request; doubled each round (MSC4242
@@ -110,7 +112,10 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
     let version = room_version(store, &policy.versions, room_id)
         .await
         .map_err(|e| GapFillError::Transient(e.to_string()))?;
-    let (timeline_boundary, earliest) = boundaries(store, room_id).await;
+    let (timeline_boundary, mut earliest) = boundaries(store, room_id).await;
+    // Over the cap, a dropped boundary only lets the peer re-send events we
+    // hold; a dropped head is walked in a later round.
+    earliest.truncate(MAX_STATE_DAG_EVENT_IDS);
     let mut limit = INITIAL_GAPFILL_LIMIT;
     // Whether any round staged a new event. `false` at a grounded exit means the
     // retryable verdict wasn't a real gap (transient fault) — the signal the
@@ -146,6 +151,7 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
         {
             latest.push(event.event_id.clone());
         }
+        latest.truncate(MAX_STATE_DAG_EVENT_IDS);
 
         let fetched = match fetcher
             .fetch(MissingEventsQuery {
@@ -168,8 +174,11 @@ pub(crate) async fn fill_state_ancestry<F: MissingEventsFetcher + ?Sized>(
             }
             Ok(fetched) => fetched,
             // A 4xx is the peer's final word for this request (no such room,
-            // endpoint unsupported): nothing a retry can change.
-            Err(e @ TransportError::Status(400..=499)) => {
+            // endpoint unsupported): nothing a retry can change. Except 429:
+            // rate limited, so retry later.
+            Err(e @ TransportError::Status(400..=499))
+                if !matches!(e, TransportError::Status(429)) =>
+            {
                 return Err(GapFillError::Unfillable(format!("peer refused: {e}")));
             }
             Err(e) => return Err(GapFillError::Transient(format!("peer fetch failed: {e}"))),

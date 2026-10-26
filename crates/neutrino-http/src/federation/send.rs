@@ -44,7 +44,7 @@ use axum::{
     http::HeaderMap,
 };
 use neutrino_event::{EventPolicy, Wire};
-use neutrino_store::{FederationInbox, OobMembershipStore, StagingStore, StorageError};
+use neutrino_store::{FederationInbox, Membership, OobMembershipStore, StagingStore, StorageError};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
@@ -108,13 +108,14 @@ pub(crate) struct ResponseBody {
 }
 
 /// Out-of-band membership update: an `m.room.member` leave/ban for a local
-/// user we hold an out-of-band stub for (the inviter rescinding an invite). It
-/// cannot be applied — there is no room state here — so it is named under the
-/// stub's room version, admitted under the deployment policy, and stored over
-/// the stub for sync to surface. `Ok(None)` = not such a PDU (no stub for the
-/// target, another type/membership, or a sender the origin does not own) —
-/// stage it like any other. `Ok(Some(id))` = consumed, whether stored or
-/// dropped (malformed, or not naming the stub it supersedes).
+/// user we hold an out-of-band stub for. It cannot be applied — there is no
+/// room state here — so it is named under the stub's room version, admitted
+/// under the deployment policy, and, if it is the inviter rescinding its own
+/// invite, stored over the stub for sync to surface. `Ok(None)` = not such a
+/// PDU (no stub for the target, another type/membership, or a sender the origin
+/// does not own) — stage it like any other. `Ok(Some(id))` = consumed, whether
+/// stored or dropped (malformed, not a rescission by the inviter, or not naming
+/// the stub it supersedes).
 async fn apply_oob_membership(
     store: &(impl OobMembershipStore + neutrino_store::StateStore),
     policy: &EventPolicy,
@@ -180,6 +181,15 @@ async fn apply_oob_membership(
     // only anchor: the rescinding server must be the one delivering it.
     if event.sender.server_name() != origin || event.room_id != room_id {
         return Ok(None);
+    }
+    // As synapse: with no room state we cannot tell who may kick or ban, so the
+    // only change accepted is the inviter rescinding its own invite.
+    if member.content.membership.as_deref() != Some("leave")
+        || stub.membership != Membership::Invite
+        || event.sender != stub.event.sender
+    {
+        warn!(event_id = %event.event_id, stub = %stub.event.event_id, "/send: dropping out-of-band membership that is not the inviter rescinding its invite");
+        return Ok(Some(event.event_id));
     }
     // MSC4242 out-of-band events: the update MUST name the membership it
     // supersedes in `prev_state_events` — the only tie between this event and

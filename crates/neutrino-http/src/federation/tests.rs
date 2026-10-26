@@ -2703,6 +2703,38 @@ async fn send_transient_gapfill_failure_keeps_fetched_ancestry_and_resumes() {
 }
 
 #[tokio::test]
+async fn send_rate_limited_gapfill_keeps_the_pdu_and_retries() {
+    // A 429 is not the peer's final word: the PDU backs off and retries rather
+    // than being rejected like other 4xx answers.
+    let fetcher = StubFetcher::erroring(429);
+    let (app, store, room_id, alice, join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let orphan = topic_on(&alice, &room_id, &join_id, "x", 1_700_000_002_000);
+    let child = message_on_split(
+        &alice,
+        &room_id,
+        &join_id,
+        &orphan.event_id,
+        "child",
+        1_700_000_003_000,
+    );
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    wait_fetch_count(&fetcher, 2).await;
+    assert!(
+        store
+            .staged_for_room(&room_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|p| p.event_id == child.event_id),
+        "a rate-limited gap-fill keeps the PDU staged"
+    );
+}
+
+#[tokio::test]
 async fn send_toposorts_out_of_order_batch() {
     // Two new message events arrive in the same transaction, child *before*
     // parent in the array. The handler must toposort so the parent applies
@@ -4313,7 +4345,6 @@ async fn rejoining_hosted_room_with_no_local_members_resyncs_from_resident() {
             raw_to_value(&name),
         ],
         "timeline": [],
-        "event": raw_to_value(&bob_join),
     });
     let resident = crate::federation::test_support::spawn_stub(stub_resident(mj, sj)).await;
 
@@ -4582,25 +4613,32 @@ fn parse_server_names_lowercase_colon_and_drops_garbage() {
 }
 
 /// A canned-response resident server: make_join returns `make_join_body`,
-/// send_join returns `send_join_body`, get_missing_events returns no events.
+/// send_join returns `send_join_body` (its `event`, when absent, is the join it
+/// was sent — as a real resident does), get_missing_events returns no events.
 /// Lets a test drive the outbound ingest path against deliberately broken state.
 fn stub_resident(make_join_body: Value, send_join_body: Value) -> axum::Router {
     stub_resident_counting(make_join_body, send_join_body, std::time::Duration::ZERO).0
 }
 
 /// As [`stub_resident`], also returning a counter of make_join hits so a test
-/// can assert how many join handshakes actually ran, and holding the send_join
-/// response for `send_join_delay` (a slow link) before answering.
+/// can assert how many join handshakes actually ran, and the last join sent to
+/// send_join, which is held for `send_join_delay` (a slow link) before answering.
 fn stub_resident_counting(
     make_join_body: Value,
     send_join_body: Value,
     send_join_delay: std::time::Duration,
-) -> (axum::Router, Arc<std::sync::atomic::AtomicUsize>) {
+) -> (
+    axum::Router,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::Mutex<Option<Value>>>,
+) {
     use axum::routing::{get as rget, post as rpost, put as rput};
     let mj = Arc::new(make_join_body);
     let sj = Arc::new(send_join_body);
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mj_hits = hits.clone();
+    let sent_join = Arc::new(std::sync::Mutex::new(None));
+    let sj_sent = sent_join.clone();
     let router = axum::Router::new()
         .route(
             "/_matrix/federation/v1/make_join/{room}/{user}",
@@ -4615,11 +4653,17 @@ fn stub_resident_counting(
         )
         .route(
             "/_matrix/federation/v2/send_join/{room}/{event}",
-            rput(move || {
+            rput(move |axum::Json(join): axum::Json<Value>| {
                 let sj = sj.clone();
+                let sent = sj_sent.clone();
                 async move {
                     tokio::time::sleep(send_join_delay).await;
-                    axum::Json((*sj).clone())
+                    let mut sj = (*sj).clone();
+                    if sj.get("event").is_none() {
+                        sj["event"] = join.clone();
+                    }
+                    *sent.lock().unwrap() = Some(join);
+                    axum::Json(sj)
                 }
             }),
         )
@@ -4627,7 +4671,7 @@ fn stub_resident_counting(
             "/_matrix/federation/v1/get_missing_events/{room}",
             rpost(|| async { axum::Json(json!({ "events": [] })) }),
         );
-    (router, hits)
+    (router, hits, sent_join)
 }
 
 #[tokio::test]
@@ -4675,7 +4719,6 @@ async fn federated_join_dangling_state_dag_reference_fails_without_registering()
     let sj = json!({
         "state_dag": [raw_to_value(&create), raw_to_value(&template)],
         "timeline": [],
-        "event": raw_to_value(&template),
     });
     let b = crate::federation::test_support::spawn_stub(stub_resident(mj, sj)).await;
 
@@ -4794,7 +4837,6 @@ async fn federated_join_timeline_dangling_state_reference_does_not_fail() {
             raw_to_value(&template),
         ],
         "timeline": [raw_to_value(&msg)],
-        "event": raw_to_value(&template),
     });
     let b = crate::federation::test_support::spawn_stub(stub_resident(mj, sj)).await;
 
@@ -4874,9 +4916,9 @@ async fn federated_join_rejected_by_cascade_fails_fast_with_502() {
     let sj = json!({
         "state_dag": [raw_to_value(&create), raw_to_value(&msg), raw_to_value(&template)],
         "timeline": [],
-        "event": raw_to_value(&template),
     });
-    let b = crate::federation::test_support::spawn_stub(stub_resident(mj, sj)).await;
+    let (router, _, sent_join) = stub_resident_counting(mj, sj, std::time::Duration::ZERO);
+    let b = crate::federation::test_support::spawn_stub(router).await;
 
     let (a_store, _a_temp) = fresh_store().await;
     let a_state = crate::AppState::from_store(config_for("a.example", "bob"), a_store.clone());
@@ -4894,8 +4936,22 @@ async fn federated_join_rejected_by_cascade_fails_fast_with_502() {
         started.elapsed() < std::time::Duration::from_secs(10),
         "a rejected join must fail fast, not wait for the timeout"
     );
+    let sent_join = sent_join
+        .lock()
+        .unwrap()
+        .take()
+        .expect("send_join was called");
+    let join_id = neutrino_event::event_builder::from_wire(
+        serde_json::value::to_raw_value(&sent_join).unwrap(),
+        Vec::new(),
+        neutrino_event::base_version(),
+    )
+    .expect("parseable join")
+    .admit_on_faith()
+    .into_event()
+    .event_id;
     let join = a_store
-        .get_events(&[template.event_id.as_ref()])
+        .get_events(&[join_id.as_ref()])
         .await
         .unwrap()
         .pop()
@@ -4908,6 +4964,70 @@ async fn federated_join_rejected_by_cascade_fails_fast_with_502() {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn federated_join_foreign_event_in_response_fails_without_registering() {
+    // The resident hands back someone else's member event as `event`. Staging
+    // it as our join would leave the dance watching the wrong event, so the
+    // handshake fails at ingest: 502, nothing staged, room not registered.
+    let alice = alice();
+    let create = EventBuilder::new(
+        alice.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .unwrap();
+    let room_id = create.room_id.clone();
+    let alice_join = EventBuilder::new(
+        alice.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(alice.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create.event_id.clone()])
+    .prev_state_events(vec![create.event_id.clone()])
+    .build()
+    .unwrap();
+    let zara: OwnedUserId = ZARA.parse().unwrap();
+    let template = EventBuilder::new(
+        zara.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(zara.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![alice_join.event_id.clone()])
+    .prev_state_events(vec![alice_join.event_id.clone()])
+    .build()
+    .unwrap();
+    let mj = json!({ "event": raw_to_value(&template), "room_version": ROOM_VERSION_ID });
+    let sj = json!({
+        "state_dag": [raw_to_value(&create), raw_to_value(&alice_join)],
+        "timeline": [],
+        "event": raw_to_value(&alice_join),
+    });
+    let b = crate::federation::test_support::spawn_stub(stub_resident(mj, sj)).await;
+
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_state = crate::AppState::from_store(config_for("a.example", "bob"), a_store.clone());
+    let resp = crate::federation::join::federated_join_with(
+        &a_state,
+        zara,
+        &room_id,
+        &[b],
+        std::time::Duration::from_millis(800),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert!(!a_store.room_exists(&room_id).await.unwrap());
+    assert!(a_store.staged_for_room(&room_id).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -4940,7 +5060,7 @@ async fn federated_join_missing_create_in_response_fails_without_registering() {
     .unwrap();
     let mj = json!({ "event": raw_to_value(&template), "room_version": ROOM_VERSION_ID });
     // No create anywhere in the response.
-    let sj = json!({ "state_dag": [], "timeline": [], "event": raw_to_value(&template) });
+    let sj = json!({ "state_dag": [], "timeline": [] });
     let b = crate::federation::test_support::spawn_stub(stub_resident(mj, sj)).await;
 
     let (a_store, _a_temp) = fresh_store().await;
@@ -5012,9 +5132,8 @@ async fn federated_join_retry_reattaches_to_inflight_dance() {
     let sj = json!({
         "state_dag": [raw_to_value(&create), raw_to_value(&template)],
         "timeline": [],
-        "event": raw_to_value(&template),
     });
-    let (router, make_joins) =
+    let (router, make_joins, _) =
         stub_resident_counting(mj, sj, std::time::Duration::from_millis(1500));
     let b = crate::federation::test_support::spawn_stub(router).await;
 
@@ -6409,6 +6528,53 @@ async fn send_leave_for_oob_invited_user_not_naming_the_invite_is_ignored() {
         "an ignored rescission is consumed, not staged"
     );
     assert!(!store.room_exists(&room_id).await.unwrap());
+}
+
+#[tokio::test]
+async fn send_oob_membership_other_than_inviter_rescinding_is_ignored() {
+    // As synapse: out of band we cannot auth a kick or ban, so only the
+    // inviter's own leave replaces the invite stub. A ban from the inviter and
+    // a leave from another user on the same server are both dropped.
+    let (store, _tempfile) = fresh_store().await;
+    let app = router_with_store(config(), store.clone());
+    let bob = inviter();
+    let mallory: OwnedUserId = "@mallory:remote.example.org".parse().unwrap();
+    let alice = alice();
+    let throwaway = EventBuilder::new(
+        bob.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build throwaway create");
+    let room_id = throwaway.room_id.clone();
+    let invite = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&throwaway.event_id),
+    );
+    store
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID)
+        .await
+        .unwrap();
+    let prevs = std::slice::from_ref(&invite.event_id);
+    let ban = member_pdu(&bob, alice.as_str(), &room_id, "ban", prevs);
+    let kick = member_pdu(&mallory, alice.as_str(), &room_id, "leave", prevs);
+
+    let (status, body) = put_json(&app, &send_path("not-inviter"), &txn(&[&ban, &kick])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    let stub = store
+        .get_oob_membership(&room_id, &alice)
+        .await
+        .unwrap()
+        .expect("the stub survives");
+    assert_eq!(stub.event.event_id, invite.event_id);
+    assert!(store.staged_for_room(&room_id).await.unwrap().is_empty());
 }
 
 #[tokio::test]

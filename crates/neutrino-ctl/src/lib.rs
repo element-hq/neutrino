@@ -91,6 +91,12 @@ pub struct Config {
     /// "trust the hop") is declared by the medium on its `LinkProfile`. The
     /// two are independent, and all four combinations are valid deployments.
     pub trusted_network: bool,
+    /// Whether signed mode may fall back to fetching peer keys from
+    /// `/_matrix/key/v2/server` when the federation medium declares no key
+    /// resolver. **Test-only (Complement):** the first answer is trusted for
+    /// the life of the process with no transport authentication, so whoever
+    /// answers first can forge that server's events.
+    pub http_key_lookup: bool,
     /// Directory the server writes rotating log files into, in addition to the
     /// platform log sink (stdout, or logcat on Android). `None` — the default —
     /// means the platform sink only. Set by a host that needs the logs to
@@ -126,6 +132,7 @@ impl Default for Config {
             startup_jitter: Duration::from_millis(DEFAULT_STARTUP_JITTER_MS),
             enable_soft_failure: true,
             trusted_network: true,
+            http_key_lookup: false,
             log_dir: None,
             delivery_receipts: false,
         }
@@ -165,6 +172,10 @@ impl Config {
             // flips the stack into signed mode (see the field docs).
             trusted_network: std::env::var("NEUTRINO_TRUSTED_NETWORK")
                 .map_or(true, |v| !matches!(v.as_str(), "0" | "false")),
+            // Default off; `NEUTRINO_HTTP_KEY_LOOKUP=1`/`true` opts in (see the
+            // field docs).
+            http_key_lookup: std::env::var("NEUTRINO_HTTP_KEY_LOOKUP")
+                .is_ok_and(|v| matches!(v.as_str(), "1" | "true")),
             // Unset (the default) = stdout only; the embedded host sets this
             // over the FFI rather than through the environment.
             log_dir: std::env::var("NEUTRINO_LOG_DIR").ok().map(PathBuf::from),

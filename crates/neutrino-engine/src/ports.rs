@@ -38,6 +38,10 @@ impl ForwardExtremities {
     }
 }
 
+/// MSC4242: `earliest_events` and `latest_events` each have an independent size
+/// limit of 100 elements when `state_dag = true`; exceeding it is a 400.
+pub const MAX_STATE_DAG_EVENT_IDS: usize = 100;
+
 /// Parameters for a `get_missing_events` walk against a peer.
 pub struct MissingEventsQuery<'a> {
     pub origin: &'a ServerName,

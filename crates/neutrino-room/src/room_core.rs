@@ -275,8 +275,16 @@ impl RoomCore {
         signer: Option<&Arc<neutrino_event::EventSigner>>,
     ) -> Result<Event, FormatError> {
         let prev_events: Vec<OwnedEventId> = self.forward_extremities.iter().cloned().collect();
-        let prev_state_events: Vec<OwnedEventId> =
+        let mut prev_state_events: Vec<OwnedEventId> =
             self.state_forward_extremities.iter().cloned().collect();
+        if event_type == "m.room.member"
+            && let Some(id) = state_key
+                .as_deref()
+                .and_then(|t| self.out_of_band_member(t))
+            && !prev_state_events.contains(id)
+        {
+            prev_state_events.push(id.clone());
+        }
         let mut builder = EventBuilder::new(sender, event_type, self.version.clone())
             .room_id(self.room_id.clone())
             .content(content)
@@ -288,6 +296,26 @@ impl RoomCore {
         }
         let event = builder.build()?;
         Ok(event)
+    }
+
+    /// MSC4242 out-of-band events: the current membership event of `target`
+    /// when no user on `target`'s server is joined. A membership change for
+    /// such a user MUST name it in `prev_state_events`.
+    fn out_of_band_member(&self, target: &str) -> Option<&OwnedEventId> {
+        let server = target.parse::<OwnedUserId>().ok()?.server_name().to_owned();
+        let server_joined = self.current_state.iter().any(|((ty, sk), ev)| {
+            ty == "m.room.member"
+                && sk
+                    .parse::<OwnedUserId>()
+                    .is_ok_and(|u| u.server_name() == server)
+                && ev.content_str("membership").as_deref() == Some("join")
+        });
+        if server_joined {
+            return None;
+        }
+        self.current_state
+            .get(&("m.room.member".to_owned(), target.to_owned()))
+            .map(|ev| &ev.event_id)
     }
 
     /// Integrate a single event into the room. Returns the list of effects
@@ -2094,5 +2122,46 @@ mod tests {
         // v12 excludes the create event from auth_events (the room_id derives
         // from it), so a message auths against the sender's membership only.
         assert_eq!(persisted.auth_events, vec![join_id]);
+    }
+
+    #[test]
+    fn build_local_member_names_out_of_band_target_membership() {
+        // MSC4242 out-of-band events: rescinding an invite to a user whose
+        // server is not in the room names the invite in `prev_state_events`,
+        // even once later state has moved the heads past it.
+        let (mut room, mut provider, _create_id, _join_id, _room_id) =
+            alice_creates_and_joins(true);
+        let alice: OwnedUserId = "@alice:example.org".parse().expect("user");
+        let mut local = |room: &mut RoomCore, ty: &str, sk: &str, content| {
+            let ev = room
+                .build_local_event(
+                    alice.clone(),
+                    ty.to_owned(),
+                    Some(sk.to_owned()),
+                    content,
+                    None,
+                )
+                .expect("build");
+            let prev_state = ev.prev_state_events.clone();
+            (apply_clean(room, &mut provider, ev, ty), prev_state)
+        };
+        let member = json!({ "membership": "invite" });
+        let (remote_invite, _) = local(
+            &mut room,
+            "m.room.member",
+            "@bob:remote.org",
+            member.clone(),
+        );
+        let (local_invite, _) = local(&mut room, "m.room.member", "@carol:example.org", member);
+        let (topic, _) = local(&mut room, "m.room.topic", "", json!({ "topic": "t" }));
+
+        let leave = json!({ "membership": "leave" });
+        let (_, prev_state) = local(&mut room, "m.room.member", "@bob:remote.org", leave.clone());
+        assert_eq!(prev_state, vec![topic.clone(), remote_invite]);
+
+        // example.org is in the room (alice), so carol's change needs no extra
+        // reference.
+        let (_, prev_state) = local(&mut room, "m.room.member", "@carol:example.org", leave);
+        assert!(!prev_state.contains(&local_invite));
     }
 }
