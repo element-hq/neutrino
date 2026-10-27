@@ -285,6 +285,11 @@ impl RoomCore {
         {
             prev_state_events.push(id.clone());
         }
+        let prev_content = state_key.as_ref().and_then(|sk| {
+            self.current_state
+                .get(&(event_type.clone(), sk.clone()))
+                .map(|prev| serde_json::json!({ "prev_content": prev.content }))
+        });
         let mut builder = EventBuilder::new(sender, event_type, self.version.clone())
             .room_id(self.room_id.clone())
             .content(content)
@@ -293,6 +298,9 @@ impl RoomCore {
             .signer(signer.cloned());
         if let Some(sk) = state_key {
             builder = builder.state_key(sk);
+        }
+        if let Some(unsigned) = prev_content {
+            builder = builder.unsigned(unsigned);
         }
         let event = builder.build()?;
         Ok(event)
@@ -2156,5 +2164,36 @@ mod tests {
         // reference.
         let (_, prev_state) = local(&mut room, "m.room.member", "@carol:example.org", leave);
         assert!(!prev_state.contains(&local_invite));
+    }
+
+    #[test]
+    fn build_local_state_event_carries_replaced_content_as_prev_content() {
+        let (room, _provider, _create_id, _join_id, _room_id) = alice_creates_and_joins(true);
+        let alice = "@alice:example.org";
+        let build = |ty: &str, sk: &str, content| {
+            let ev = room
+                .build_local_event(
+                    alice.parse().expect("user"),
+                    ty.to_owned(),
+                    Some(sk.to_owned()),
+                    content,
+                    None,
+                )
+                .expect("build");
+            serde_json::from_str::<serde_json::Value>(ev.raw.get()).expect("raw")
+        };
+
+        let rename = build(
+            "m.room.member",
+            alice,
+            json!({ "membership": "join", "displayname": "new" }),
+        );
+        let join = &room.current_state[&("m.room.member".to_owned(), alice.to_owned())];
+        let join_content: serde_json::Value =
+            serde_json::from_str(join.content.get()).expect("content");
+        assert_eq!(rename["unsigned"]["prev_content"], join_content);
+
+        let topic = build("m.room.topic", "", json!({ "topic": "t" }));
+        assert!(topic.get("unsigned").is_none());
     }
 }
