@@ -49,11 +49,13 @@ pub struct Config {
     /// The server creates this directory if missing, but not its parents —
     /// those are the caller's responsibility (see `SqliteStore::open_in_dir`).
     pub storage_dir: PathBuf,
-    /// Outbound federation proxy URL (the `neutrino-lb` egress). **Internal /
-    /// derived — not operator-set.** `neutrino-main` fills this in when it runs
-    /// the in-process sidecar (see `lb_federation_port`), pointing it at the
-    /// loopback egress it allocates; `neutrino-http` reads it to route outbound
-    /// federation through the egress. `None` = direct federation (the default).
+    /// Outbound federation proxy URL; `neutrino-http` routes every outbound
+    /// federation request through it (the destination rides in the URL host,
+    /// `~`-suffixed). `neutrino-main` overrides it with the loopback egress it
+    /// allocates when it runs the in-process sidecar (see `lb_federation_port`);
+    /// otherwise `NEUTRINO_FEDERATION_PROXY` names an external egress (the
+    /// Complement image's TLS-upgrading proxy). `None` = direct federation
+    /// (the default).
     pub federation_proxy: Option<String>,
     /// When set, `neutrino-main` runs a `neutrino-lb` sidecar **in-process**
     /// alongside the homeserver (the embedded-on-mobile target), with the CoAP
@@ -89,6 +91,12 @@ pub struct Config {
     /// "trust the hop") is declared by the medium on its `LinkProfile`. The
     /// two are independent, and all four combinations are valid deployments.
     pub trusted_network: bool,
+    /// Whether signed mode may fall back to fetching peer keys from
+    /// `/_matrix/key/v2/server` when the federation medium declares no key
+    /// resolver. **Test-only (Complement):** the first answer is trusted for
+    /// the life of the process with no transport authentication, so whoever
+    /// answers first can forge that server's events.
+    pub http_key_lookup: bool,
     /// Directory the server writes rotating log files into, in addition to the
     /// platform log sink (stdout, or logcat on Android). `None` — the default —
     /// means the platform sink only. Set by a host that needs the logs to
@@ -124,6 +132,7 @@ impl Default for Config {
             startup_jitter: Duration::from_millis(DEFAULT_STARTUP_JITTER_MS),
             enable_soft_failure: true,
             trusted_network: true,
+            http_key_lookup: false,
             log_dir: None,
             delivery_receipts: false,
         }
@@ -143,9 +152,7 @@ impl Config {
                     .as_deref(),
             ),
             storage_dir: storage_dir_from(std::env::var("NEUTRINO_STORAGE_DIR").ok().as_deref()),
-            // `federation_proxy` is internal/derived (set by neutrino-main when
-            // the in-process sidecar runs), not an environment knob.
-            federation_proxy: None,
+            federation_proxy: std::env::var("NEUTRINO_FEDERATION_PROXY").ok(),
             lb_federation_port: std::env::var("NEUTRINO_LB_FEDERATION_PORT")
                 .ok()
                 .and_then(|s| s.parse::<u16>().ok()),
@@ -165,6 +172,10 @@ impl Config {
             // flips the stack into signed mode (see the field docs).
             trusted_network: std::env::var("NEUTRINO_TRUSTED_NETWORK")
                 .map_or(true, |v| !matches!(v.as_str(), "0" | "false")),
+            // Default off; `NEUTRINO_HTTP_KEY_LOOKUP=1`/`true` opts in (see the
+            // field docs).
+            http_key_lookup: std::env::var("NEUTRINO_HTTP_KEY_LOOKUP")
+                .is_ok_and(|v| matches!(v.as_str(), "1" | "true")),
             // Unset (the default) = stdout only; the embedded host sets this
             // over the FFI rather than through the environment.
             log_dir: std::env::var("NEUTRINO_LOG_DIR").ok().map(PathBuf::from),

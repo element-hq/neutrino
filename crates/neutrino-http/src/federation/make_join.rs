@@ -116,7 +116,8 @@ pub(crate) async fn handle(
 /// of the room being joined/left, which is the only version its template can be
 /// built under. A wholly-absent `ver` defaults to `["1"]` per spec, which never
 /// matches any version we host, so an absent `ver` is (correctly) incompatible.
-/// Shared with `make_leave` (same spec-mandated `ver` negotiation).
+/// make_join only: the spec defines no `ver` query for make_leave, which must
+/// never gate on it.
 pub(crate) fn ver_includes(raw: Option<&str>, want: &str) -> bool {
     let Some(raw) = raw else {
         return false;

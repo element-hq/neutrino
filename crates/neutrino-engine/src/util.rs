@@ -78,8 +78,9 @@ pub async fn stage_and_poke(
         if ev.room_id != *room_id {
             continue; // never stage a cross-room event a peer slipped in
         }
+        // Staged in its own right: a gap-fill root.
         store
-            .stage_pdu(origin, &ev.room_id, &ev.event_id, &ev.raw)
+            .stage_pdu(origin, &ev.room_id, &ev.event_id, &ev.raw, None)
             .await?;
     }
     if worker_poke.send(room_id.to_owned()).await.is_err() {

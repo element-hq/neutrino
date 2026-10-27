@@ -43,8 +43,11 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
-use neutrino_store::{FederationInbox, StagingStore};
-use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName};
+use neutrino_event::{EventPolicy, Wire};
+use neutrino_store::{
+    FederationInbox, Membership, OobMembershipStore, OobWrite, StagingStore, StorageError,
+};
+use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 use tracing::warn;
@@ -104,6 +107,119 @@ pub(crate) struct ResponseBody {
     pdus: BTreeMap<String, PduResult>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     forward_extremities: BTreeMap<OwnedRoomId, ForwardExtremities>,
+}
+
+/// Out-of-band membership update: an `m.room.member` leave/ban for a local
+/// user we hold an out-of-band stub for. It cannot be applied — there is no
+/// room state here — so it is named under the stub's room version, admitted
+/// under the deployment policy, and, if it is the inviter rescinding its own
+/// invite, stored over the stub for sync to surface. `Ok(None)` = not such a
+/// PDU (no stub for the target, another type/membership, or a sender the origin
+/// does not own) — stage it like any other. `Ok(Some(id))` = consumed, whether
+/// stored or dropped (malformed, not a rescission by the inviter, or not naming
+/// the stub it supersedes).
+pub(super) async fn apply_oob_membership(
+    store: &(impl OobMembershipStore + neutrino_store::StateStore),
+    policy: &EventPolicy,
+    origin: &ServerName,
+    our_name: &str,
+    room_id: &RoomId,
+    raw: &RawJsonValue,
+) -> Result<Option<OwnedEventId>, StorageError> {
+    #[derive(Deserialize)]
+    struct Member {
+        r#type: String,
+        state_key: Option<String>,
+        content: Content,
+    }
+    #[derive(Deserialize)]
+    struct Content {
+        membership: Option<String>,
+    }
+    let Ok(member) = serde_json::from_str::<Member>(raw.get()) else {
+        return Ok(None);
+    };
+    if member.r#type != "m.room.member"
+        || !matches!(member.content.membership.as_deref(), Some("leave" | "ban"))
+    {
+        return Ok(None);
+    }
+    let Some(user) = member
+        .state_key
+        .as_deref()
+        .and_then(|k| k.parse::<OwnedUserId>().ok())
+        .filter(|u| u.server_name().as_str() == our_name)
+    else {
+        return Ok(None);
+    };
+    let Some(stub) = store.get_oob_membership(room_id, &user).await? else {
+        return Ok(None);
+    };
+    // A stub can outlive the server joining the room: another local user joins,
+    // or this user accepts locally, and nothing clears the row. Once we are in
+    // the room the PDU belongs in the room DAG — staging it is what actually
+    // applies the kick — so the out-of-band path must stand down. Without this
+    // the event would be diverted into the stub table and acked as applied
+    // while the room never saw it. The predicate must be the one `/invite` uses
+    // to decide where the membership goes in the first place: a `rooms` row
+    // alone is not enough (we keep it after leaving), and using that instead
+    // diverts the room-DAG PDU for a room we hold but are not in.
+    if neutrino_engine::reconcile::server_in_room(store, room_id, user.server_name()).await? {
+        return Ok(None);
+    }
+    let Some(version) = policy.versions.get(&stub.room_version).cloned() else {
+        warn!(%room_id, version = %stub.room_version, "/send: out-of-band stub names a version this build does not speak");
+        return Ok(None);
+    };
+    let event = match policy.admit_wire(raw.to_owned(), &version).await {
+        Ok(Wire::Valid(ev)) => ev,
+        Ok(Wire::Rejected(ev, defect)) => {
+            warn!(event_id = %ev.event_id, %defect, "/send: dropping malformed out-of-band membership");
+            return Ok(Some(ev.event_id));
+        }
+        Err(_) => return Ok(None),
+    };
+    // With no room state to auth against, the network-attested origin is the
+    // only anchor: the rescinding server must be the one delivering it.
+    if event.sender.server_name() != origin || event.room_id != room_id {
+        return Ok(None);
+    }
+    // As synapse: with no room state we cannot tell who may kick or ban, so the
+    // only change accepted is the inviter rescinding its own invite.
+    if member.content.membership.as_deref() != Some("leave")
+        || stub.membership != Membership::Invite
+        || event.sender != stub.event.sender
+    {
+        warn!(event_id = %event.event_id, stub = %stub.event.event_id, "/send: dropping out-of-band membership that is not the inviter rescinding its invite");
+        return Ok(Some(event.event_id));
+    }
+    // MSC4242 out-of-band events: the update MUST name the membership it
+    // supersedes in `prev_state_events` — the only tie between this event and
+    // the stub, since we cannot compute its auth events. Without it a stale
+    // rescission could be replayed to cancel a newer invite. Consumed, not
+    // staged: it is addressed to a stub, so there is nothing else to do with it.
+    if !event.prev_state_events.contains(&stub.event.event_id) {
+        warn!(event_id = %event.event_id, stub = %stub.event.event_id, "/send: dropping out-of-band membership that does not name the membership it supersedes");
+        return Ok(Some(event.event_id));
+    }
+    match store
+        .put_oob_membership(
+            room_id,
+            &user,
+            &event,
+            &stub.room_version,
+            Some(&stub.event.event_id),
+        )
+        .await?
+    {
+        OobWrite::Written => Ok(Some(event.event_id)),
+        // We joined since the `server_in_room` check: stage it instead.
+        OobWrite::ServerJoined => Ok(None),
+        OobWrite::Superseded => {
+            warn!(event_id = %event.event_id, stub = %stub.event.event_id, "/send: dropping out-of-band membership whose stub was replaced while it was checked");
+            Ok(Some(event.event_id))
+        }
+    }
 }
 
 /// Federation `/send/{txnId}` handler. Stages the transaction's PDUs and pokes
@@ -219,6 +335,23 @@ pub(crate) async fn handle(
         // which is what makes the peer resend it. Dropping on a fault would lose
         // the event for good, since the txn-dedup would swallow the resend.
         let keys = neutrino_event::room_version_keys(&raw);
+        // A leave/ban for a local user we hold an out-of-band stub for (the
+        // inviter rescinding) is stored over the stub, not staged: there is no
+        // room state here to apply it against.
+        if let Some(room_id) = &keys.room_id {
+            match apply_oob_membership(&*store, &policy, &origin, &our_name, room_id, &raw).await {
+                Ok(Some(event_id)) => {
+                    pdus.insert(event_id.to_string(), PduResult::default());
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(%room_id, error = %e, "/send: out-of-band membership store fault; leaving the transaction unrecorded so the peer resends");
+                    all_staged = false;
+                    continue;
+                }
+            }
+        }
         let cached = versions.get(&keys.room_id).cloned();
         let version = match cached {
             Some(decided) => decided,
@@ -268,8 +401,10 @@ pub(crate) async fn handle(
             continue;
         }
         let id = event.event_id.to_string();
+        // `None`: a `/send` PDU is staged in its own right — a gap-fill root
+        // (and, if we only held it as fetched ancestry so far, this promotes it).
         let result = match store
-            .stage_pdu(&origin, &event.room_id, &event.event_id, &event.raw)
+            .stage_pdu(&origin, &event.room_id, &event.event_id, &event.raw, None)
             .await
         {
             // Staged (newly, or already present from an earlier delivery) — in

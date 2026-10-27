@@ -36,6 +36,10 @@ impl EventStore for SqliteStore {
 
             let stream_pos = event.write_into_tx(&tx)?;
 
+            // Drop any out-of-band stub this room's current state has now
+            // superseded. See `prune_superseded_oob`.
+            crate::store::oob_memberships::prune_superseded_oob(&tx, event.room_id.as_str())?;
+
             // Outbox: one row per destination. `event.event_id` resolves
             // through `EventRow: Deref<Target = Event>`.
             insert_outbox_rows(&tx, event.event_id.as_str(), &destinations)?;
@@ -130,6 +134,10 @@ impl EventStore for SqliteStore {
             // Temporal state-group index — maintained in the same txn so it
             // can never desync from the event write. See `maintain_room_state`.
             maintain_room_state(&tx, &event, stream_pos)?;
+
+            // Drop any out-of-band stub this room's current state has now
+            // superseded. See `prune_superseded_oob`.
+            crate::store::oob_memberships::prune_superseded_oob(&tx, room_id.as_str())?;
 
             // Outbox: one row per federation destination, same txn as the
             // event so a crash can't persist the event but drop its delivery.

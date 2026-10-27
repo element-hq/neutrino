@@ -174,7 +174,7 @@ POST /_matrix/federation/v1/get_missing_events/{roomId}
   "latest_events":   ["$Bc89nmu..."],        // the missing advertised heads
   "earliest_events": ["$gpmcAjK..."],        // our own forward extremities
   "include_latest_events": true,             // return the heads, not just ancestors
-  "state_dag": true,                         // MSC4242: walk the state DAG too
+  "org.matrix.msc4242.state_dag": true,      // MSC4242: walk the state DAG too
   "limit": 50
 }
 ```

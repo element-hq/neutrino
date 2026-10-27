@@ -30,8 +30,8 @@ pub enum Direction {
     Backward,
 }
 
-/// The five canonical `m.room.member` membership states. Sliding sync's
-/// `rooms_with_membership` takes a set of these so the wire-string
+/// The five canonical `m.room.member` membership states.
+/// `resolved_memberships` takes a set of these so the wire-string
 /// alphabet is closed and duplicates can't be expressed at the type level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Membership {
@@ -309,24 +309,6 @@ pub trait StateStore: Send + Sync {
     ///       a single method with a membership filter in the future.
     async fn invited_rooms(&self, user_id: &UserId) -> Result<Vec<OwnedRoomId>, StorageError>;
 
-    /// Pre:  none. An empty `memberships` set returns an empty vec.
-    /// Post: returns **exactly one** `(room_id, current_membership)` pair for
-    ///       every room in which `user_id`'s current `m.room.member` event has
-    ///       a `content.membership` in `memberships`. The `current_membership`
-    ///       value is the actual membership the user currently has — duplicates
-    ///       per room are impossible by construction since each `(room, user)`
-    ///       has a single current member event. The caller can pass multiple
-    ///       memberships to get the union in one round-trip (used by sliding
-    ///       sync to enumerate candidate rooms across all the MSC4186-eligible
-    ///       memberships at once). Result order is unspecified — callers sort
-    ///       as needed. Implementations should answer this from an indexed
-    ///       lookup rather than a full table scan.
-    async fn rooms_with_membership(
-        &self,
-        user_id: &UserId,
-        memberships: &BTreeSet<Membership>,
-    ) -> Result<Vec<(OwnedRoomId, Membership)>, StorageError>;
-
     /// Pre:  none (returns empty map if the room does not exist).
     /// Post: returns one member event per `user_id` (state_key) whose current
     ///       `m.room.member` event has `content.membership = "join"`; left, banned, and
@@ -371,10 +353,13 @@ pub trait DagStore: Send + Sync {
     ///       walk terminates at the boundary rather than leaking PDUs from
     ///       another room. Mirrors Synapse's `_get_missing_events`.
     ///
-    /// `state_dag` selects which edge kind to walk (MSC4242 `/get_missing_events`
-    /// `state_dag` flag): `false` walks `prev_events` (timeline DAG), `true`
-    /// walks `prev_state_events` (the state DAG — the ancestry that
-    /// `RoomCore::apply_pdu` requires to auth a PDU).
+    /// `state_dag` selects the walk (MSC4242 `/get_missing_events` flag).
+    /// `false` is the timeline walk described above over `prev_events`. `true`
+    /// walks `prev_state_events` (the ancestry `RoomCore::apply_pdu` needs to
+    /// auth a PDU) breadth-first: each event at its shortest hop from `latest`,
+    /// hops ascending, siblings by ascending `event_id`. Rejected events are
+    /// neither returned nor expanded and a rejected `latest` seeds nothing;
+    /// soft-failed events are returned like any other.
     async fn missing_events(
         &self,
         room_id: &RoomId,
@@ -406,11 +391,13 @@ pub struct AncestryGap {
     /// ancestry is fully grounded (staged ∪ committed), so the staged subgraph
     /// can be applied (the inbound worker re-drains it).
     pub missing: Vec<OwnedEventId>,
-    /// Staged event ids reachable from the query heads via `prev_state_events`
-    /// (a staged head counts itself) — the cached ancestry the worker drains
-    /// once `missing` is empty, and the boundary to exclude from the next peer
-    /// fetch so we re-request only the frontier. Unordered.
-    pub staged: Vec<OwnedEventId>,
+    /// Staged events reachable from the query heads (a staged head counts
+    /// itself) with at least one `prev_state_events` entry in `missing` — the
+    /// backward extremities of the staged subgraph, i.e. the `latest_events` a
+    /// peer fetch walks back from. Empty when `missing` is empty; note it can
+    /// also be non-empty while every missing id is a query head (a staged head
+    /// whose own parent is unheld). Unordered.
+    pub frontier: Vec<OwnedEventId>,
 }
 
 /// One staged PDU as returned by [`StagingStore::staged_for_room`]: the raw
@@ -421,6 +408,11 @@ pub struct StagedPdu {
     pub event_id: OwnedEventId,
     pub origin: OwnedServerName,
     pub raw: Box<RawJsonValue>,
+    /// `None` — arrived in its own right; a gap-fill root. `Some(root)` — state
+    /// ancestry fetched on behalf of the staged root PDU `root`; never a
+    /// gap-fill root itself, and unstaged along with `root`
+    /// ([`StagingStore::unstage_with_fetched`]).
+    pub fetched_for: Option<OwnedEventId>,
 }
 
 /// Pre-auth staging of inbound federation PDUs and the ancestry fetched while
@@ -437,23 +429,29 @@ pub trait StagingStore: Send + Sync {
     /// Pre:  `raw` is the canonical post-`from_wire` bytes whose reference hash
     ///       is `event_id` (so id ↔ bytes round-trip), `room_id` matches, and
     ///       `origin` is the server it arrived from (or was fetched from).
-    /// Post: `(event_id, room_id, origin, raw)` is recorded in the staging
-    ///       area; idempotent — re-staging the same id is a no-op (a peer may
-    ///       resend, and gap-fill may re-fetch, the same event). Does NOT
-    ///       advance the `subscribe` watch (staged events are invisible).
+    ///       `fetched_for` is `None` for a PDU staged in its own right (a
+    ///       gap-fill root) or `Some(root)` for ancestry fetched while
+    ///       gap-filling the staged root PDU `root`.
+    /// Post: `(event_id, room_id, origin, raw, fetched_for)` is recorded in the
+    ///       staging area; idempotent — re-staging the same id is a no-op (a
+    ///       peer may resend, and gap-fill may re-fetch, the same event), except
+    ///       that re-staging a fetched row with `fetched_for = None` *promotes*
+    ///       it to a root (the event has now arrived in its own right). Does
+    ///       NOT advance the `subscribe` watch (staged events are invisible).
     ///       Returns `true` if a new row was inserted, `false` if the id was
-    ///       already staged (an ignored duplicate) — the gap-fill loop uses
-    ///       this to tell "fetched new ancestry" from "peer re-sent what we
-    ///       already hold". Staging is deliberately *unbounded*: grounding an
-    ///       event requires fetching its entire state-DAG ancestry back to
-    ///       `m.room.create`, however deep (inherent to MSC4242 / auth-chain
-    ///       CRDTs), and the mesh is trusted.
+    ///       already staged or committed (a promotion also returns `false`) —
+    ///       the gap-fill loop uses this to tell "fetched new ancestry" from
+    ///       "peer re-sent what we already hold". Staging is deliberately
+    ///       *unbounded*: grounding an event requires fetching its entire
+    ///       state-DAG ancestry back to `m.room.create`, however deep (inherent
+    ///       to MSC4242 / auth-chain CRDTs), and the mesh is trusted.
     async fn stage_pdu(
         &self,
         origin: &ServerName,
         room_id: &RoomId,
         event_id: &EventId,
         raw: &RawJsonValue,
+        fetched_for: Option<&EventId>,
     ) -> Result<bool, StorageError>;
 
     /// Pre:  none.
@@ -472,8 +470,8 @@ pub trait StagingStore: Send + Sync {
     /// Post: walks `prev_state_events` back from `heads` through staged events
     ///       (a committed `events` row is a grounded boundary and is not
     ///       expanded), returning an [`AncestryGap`]: `missing` = reachable ids
-    ///       in neither table, `staged` = reachable ids currently staged. The
-    ///       walk is scoped to `room_id`.
+    ///       in neither table, `frontier` = staged ids with a parent in
+    ///       `missing`. The walk is scoped to `room_id`.
     async fn ancestry_gap(
         &self,
         room_id: &RoomId,
@@ -484,6 +482,18 @@ pub trait StagingStore: Send + Sync {
     /// Post: deletes the matching staged rows; idempotent — ids not present are
     ///       ignored. Called once a staged PDU has been durably applied.
     async fn unstage_events(&self, event_ids: &[&EventId]) -> Result<(), StorageError>;
+
+    /// Pre:  none (`root` need not be staged).
+    /// Post: deletes the staged row `root` and, in the same write, every row
+    ///       in `room_id` with `fetched_for = root` — the ancestry fetched on
+    ///       its behalf, which has no reason to exist once the root is gone
+    ///       (applied, rejected, or dropped). Idempotent; a no-op for a
+    ///       `root` that is not staged and has no fetched rows.
+    async fn unstage_with_fetched(
+        &self,
+        room_id: &RoomId,
+        root: &EventId,
+    ) -> Result<(), StorageError>;
 }
 
 #[async_trait]
@@ -649,66 +659,121 @@ pub trait FederationInbox: Send + Sync {
     ) -> Result<bool, StorageError>;
 }
 
-/// Out-of-band membership invites: invites for rooms where we host the
-/// **invitee** but hold no room state — no `m.room.create`, no auth chain —
-/// so they cannot go through `RoomCore::apply_pdu` (which auths a PDU against
-/// the room's state DAG). The inbound `/invite` federation handler stores the
-/// invite here; the sync invite path surfaces it.
+/// The latest out-of-band `m.room.member` event a peer handed us for a local
+/// user in a room this server is not in — an invite, or the leave / ban that
+/// ended it — with the room version it was named under (there is no `rooms`
+/// row to recover it from).
+#[derive(Debug, Clone)]
+pub struct OobMembership {
+    pub event: Event,
+    pub membership: Membership,
+    pub room_version: String,
+}
+
+/// The authoritative `m.room.member` event for one (room, user), resolved
+/// across the two tables that can each hold one.
 ///
-/// Keyed by `(room_id, user_id)`. For an `m.room.member` invite the
-/// `state_key` *is* the invited `user_id`, so the pair uniquely identifies
-/// the invite. The stored event's `raw` carries the inviting server's
-/// `unsigned.invite_room_state` (already-stripped state events), which is the
-/// only room context we have pre-accept — the sync builder renders the room
-/// name / inviter from it.
+/// Both can be populated at once and **either** can be the newer fact:
+/// - the stub is newer when a peer invites a user to a room this server has
+///   left (the in-room `leave` is frozen; the invite arrives out of band), and
+/// - the in-room event is newer when the user joined for real and a stale stub
+///   was left behind.
 ///
-/// This is a separate table from the authed room state on purpose: an OOB
-/// invite carries no auth and lives outside any room's DAG, so it must not be
-/// folded into `current_state` / `rooms_with_membership`. On accept (the room
-/// enters normal joined state) or reject (membership → leave) the stub is
-/// removed.
+/// Neither "in-room always wins" nor "stub always wins" is correct, and the
+/// server's current membership in the room does not decide it either — a stub
+/// written *before* the server joined outlives the join. Only an explicit
+/// order does, so `oob_memberships.learned_after` records the `events` stream
+/// high-water mark at write time and the newer row wins. Ties favour the stub:
+/// a stub recording watermark P was necessarily written after event P was
+/// already in the table.
+#[derive(Debug, Clone)]
+pub struct ResolvedMembership {
+    pub event: Event,
+    pub membership: Membership,
+    /// `true` when the winning row came from `oob_memberships` — the caller
+    /// needs this because an out-of-band membership has no room DAG behind it
+    /// (no timeline, no current state to read).
+    pub out_of_band: bool,
+}
+
+/// The outcome of [`OobMembershipStore::put_oob_membership`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OobWrite {
+    Written,
+    /// A user on the stub user's server is joined: the membership belongs in
+    /// the room DAG.
+    ServerJoined,
+    /// The held row is not the event the write names as replacing.
+    Superseded,
+}
+
 #[async_trait]
-pub trait InviteStore: Send + Sync {
-    /// Pre:  `event` is an `m.room.member` event with `content.membership =
-    ///       "invite"`, `state_key == user_id`, and `room_id == room_id`; its
-    ///       `raw` is the canonical wire form (round-trips its `event_id`) and
-    ///       carries `unsigned.invite_room_state`.
-    /// Post: records the invite keyed by `(room_id, user_id)`, **replacing**
-    ///       any prior invite for the same pair — latest invite wins (a peer
-    ///       may re-invite after a decline; the most recent stripped state is
-    ///       the one to render). Does NOT advance the persist watch (an OOB
-    ///       invite is not a room event; it surfaces only via the sync invite
-    ///       path).
-    async fn put_invite(
+pub trait OobMembershipStore: Send + Sync {
+    /// Pre:  `event` is an `m.room.member` event with `state_key == user_id`,
+    ///       `room_id == room_id` and `content.membership` one of `invite`,
+    ///       `leave`, `ban`; its `raw` is the canonical wire form (round-trips
+    ///       its `event_id`) and, for an invite, carries
+    ///       `unsigned.invite_room_state`.
+    /// Post: records the membership keyed by `(room_id, user_id)`, **replacing**
+    ///       any prior row for the same pair — latest wins (an invite after a
+    ///       decline, a leave after an invite). Does NOT advance the persist
+    ///       watch (an out-of-band event is not a room event; it surfaces only
+    ///       via the sync out-of-band path). `InvalidInput` if `membership` is
+    ///       not one of the three. Writes nothing, returning the reason, if a
+    ///       user on `user_id`'s server is joined to `room_id`, or if `replaces`
+    ///       is `Some` and the held row is not that event.
+    async fn put_oob_membership(
         &self,
         room_id: &RoomId,
         user_id: &UserId,
         event: &Event,
-    ) -> Result<(), StorageError>;
+        room_version: &str,
+        replaces: Option<&EventId>,
+    ) -> Result<OobWrite, StorageError>;
 
     /// Pre:  none.
-    /// Post: returns the stored invite `m.room.member` event for
-    ///       `(room_id, user_id)`, or `None` if none is held. The returned
-    ///       `Event` round-trips the stored wire bytes (including
-    ///       `unsigned.invite_room_state`).
-    async fn get_invite(
+    /// Post: returns the stored membership for `(room_id, user_id)`, or `None`
+    ///       if none is held. The `Event` round-trips the stored wire bytes
+    ///       (including `unsigned.invite_room_state`).
+    async fn get_oob_membership(
         &self,
         room_id: &RoomId,
         user_id: &UserId,
-    ) -> Result<Option<Event>, StorageError>;
+    ) -> Result<Option<OobMembership>, StorageError>;
 
     /// Pre:  none.
-    /// Post: deletes the invite for `(room_id, user_id)` if present;
-    ///       idempotent (a missing pair is a no-op). Called when the invite is
-    ///       accepted or rejected.
-    async fn remove_invite(&self, room_id: &RoomId, user_id: &UserId) -> Result<(), StorageError>;
+    /// Post: deletes the row for `(room_id, user_id)` if present and, when
+    ///       `replaces` is `Some`, it holds that event; idempotent (a missing
+    ///       pair is a no-op).
+    async fn remove_oob_membership(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+        replaces: Option<&EventId>,
+    ) -> Result<(), StorageError>;
 
     /// Pre:  none.
-    /// Post: returns the `room_id` of every room in which `user_id` currently
-    ///       holds an out-of-band invite. Sync unions these into its room list
-    ///       (as membership = invite), separately from `rooms_with_membership`
-    ///       since OOB invites live in a different table and carry no auth.
-    async fn invited_oob_rooms(&self, user_id: &UserId) -> Result<Vec<OwnedRoomId>, StorageError>;
+    /// Post: the user's authoritative member event for `room_id` — the newer
+    ///       of the in-room current-state event and the out-of-band stub, per
+    ///       [`ResolvedMembership`]. `None` if neither table holds one. Both
+    ///       tables are read from one consistent snapshot.
+    async fn resolved_member_event(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+    ) -> Result<Option<ResolvedMembership>, StorageError>;
+
+    /// Pre:  none.
+    /// Post: the bulk form of [`resolved_member_event`](Self::resolved_member_event):
+    ///       one `(room_id, membership, out_of_band)` per room in which
+    ///       `user_id`'s winning membership is in `memberships`. Exactly one
+    ///       row per room — the union is resolved in the store, so a caller
+    ///       cannot double-count a room held in both tables.
+    async fn resolved_memberships(
+        &self,
+        user_id: &UserId,
+        memberships: &BTreeSet<Membership>,
+    ) -> Result<Vec<(OwnedRoomId, Membership, bool)>, StorageError>;
 }
 
 /// The server's persistent identity facts: the opaque 32-byte node secret and
@@ -770,7 +835,7 @@ pub trait StorageBackend:
     + FederationInbox
     + DeliveryStore
     + StagingStore
-    + InviteStore
+    + OobMembershipStore
     + IdentityStore
 {
 }
@@ -784,7 +849,7 @@ impl<T> StorageBackend for T where
         + FederationInbox
         + DeliveryStore
         + StagingStore
-        + InviteStore
+        + OobMembershipStore
         + IdentityStore
 {
 }

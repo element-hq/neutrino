@@ -148,7 +148,8 @@ pub(crate) const KEYS: &[(&str, i64)] = &[
     ("m.room.history_visibility", 136),
     ("notifications", 137),
     ("prev_state_events", 138),
-    ("state_dag", 139),
+    // MSC4242 `/get_missing_events` request flag; neutrino-http `STATE_DAG_KEY`.
+    ("org.matrix.msc4242.state_dag", 139),
     ("partial_state_event_ids", 140),
     ("partial_auth_chain_ids", 141),
     ("members_omitted", 142),

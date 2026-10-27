@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 
 use neutrino_event::{Event, FormatError};
 use neutrino_room::room_core::{Effect, RoomCore};
-use neutrino_room::{CoreError, StateDelta, StateMap};
+use neutrino_room::{CoreError, StateDelta, StateMap, joined_servers};
 use neutrino_store::{Membership, StorageBackend, StorageError, WithStateProvider};
 #[cfg(test)]
 use neutrino_store_sqlite::SqliteStore;
@@ -393,12 +393,12 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomActor<S> {
 
         // Federate to every remote server in the post-apply room state — but a
         // soft-failed event must not be relayed (it failed auth against current
-        // state, so peers would reject it too). Soft-fail is only ever set on
-        // non-state events, so an unrejected state event always federates; the
-        // explicit `state_key.is_none()` guard keeps that invariant local.
+        // state, so peers would reject it too). State or not: a local event is
+        // built on current state so it cannot soft-fail in practice, but the
+        // rule is the same for both kinds.
         let own = self.own_server.clone();
         self.commit_accepted(next, effects, |event, next| {
-            if event.soft_failed && event.state_key.is_none() {
+            if event.soft_failed {
                 Vec::new()
             } else {
                 outbound_destinations(next.current_state(), event, &own)
@@ -474,24 +474,6 @@ fn outbound_destinations(
 
     servers.retain(|s| s.as_str() != own_server);
     servers.into_iter().collect()
-}
-
-/// The set of servers with at least one `join` member in `current_state` — a
-/// room's joined-server set. Shared by [`outbound_destinations`] (fan-out
-/// recipients) and [`RoomActor::advertise_targets`] (anti-entropy
-/// joined-set-growth trigger). Does not exclude our own server; callers that
-/// need to do so filter it out themselves.
-fn joined_servers(current_state: &StateMap<Arc<Event>>) -> BTreeSet<OwnedServerName> {
-    let mut servers: BTreeSet<OwnedServerName> = BTreeSet::new();
-    for ((event_type, state_key), member) in current_state {
-        if event_type == "m.room.member"
-            && event_membership(member) == Some(Membership::Join)
-            && let Ok(user) = UserId::parse(state_key.as_str())
-        {
-            servers.insert(user.server_name().to_owned());
-        }
-    }
-    servers
 }
 
 /// The event ids of `server`'s `join` membership events in `current_state` —

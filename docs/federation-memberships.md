@@ -77,9 +77,9 @@ IP:port, no `.well-known` / SRV / TLS — `federation::client`).
 |---|---|---|
 | `RoomCore::apply_pdu` — single ingest path; DROP/RETRY/REJECT disposition; computes `auth_events`; idempotent persisted-check | `crates/neutrino-state/src/room_core.rs` | every inbound membership apply |
 | `RoomRegistry` / `RoomActor` — per-room serialised actor; `Command::Send` (local build+apply+persist+enqueue), `Command::ApplyPdu` (received PDU, persists rejects, `&[]` destinations) | `crates/neutrino-http/src/room_actor.rs` | apply + distribution |
-| Staging table + `StagingStore` (`staged_events(event_id PK, room_id, json, origin)`; `stage_pdu` / `staged_rooms` / `staged_for_room` / `ancestry_gap` / `unstage_events`) | `crates/neutrino-store-sqlite/src/store/staging.rs` | **join ingest** + gap-fill |
+| Staging table + `StagingStore` (`staged_events(event_id PK, room_id, json, origin, fetched_for)`; `stage_pdu` / `staged_rooms` / `staged_for_room` / `ancestry_gap` / `unstage_events` / `unstage_with_fetched`) | `crates/neutrino-store-sqlite/src/store/staging.rs` | **join ingest** + gap-fill |
 | Per-room **drain worker** (toposort → `apply_pdu` → `fill_state_ancestry` on retryable → in-memory backoff; supervisor enumerates `staged_rooms()` on startup + in-process `mpsc<RoomId>` poke) | `crates/neutrino-http/src/federation/worker.rs` | join ingest drains here |
-| Shared gap-fill (`fill_state_ancestry` / `state_dag_boundary` / `MissingEventsFetcher`) | `crates/neutrino-http/src/federation/gapfill.rs` | join ingest gap-fill |
+| Shared gap-fill (`fill_state_ancestry` / `fill_timeline_parents` / `boundaries` / `MissingEventsFetcher`) | `crates/neutrino-http/src/federation/gapfill.rs` | join ingest gap-fill |
 | `FederationClient` (`send_transaction`, `get_missing_events`) + `ReqwestFetcher` + resolver + `TxnIdGen` + `FederationClientError` | `crates/neutrino-http/src/federation/client.rs` | **outbound handshakes** (extend with make/send_join, invite, make/send_leave) |
 | Outbound sender pool + outbox (`pending_pdus` / `remove_pdus`; retry-forever, full-jitter backoff) | `crates/neutrino-http/src/federation/sender.rs` | durable `/send` delivery (joined-room leave, distribution duty) |
 | `outbound_destinations` (post-apply join-member servers + departing target, − own) | `crates/neutrino-http/src/room_actor.rs` | distribution duty destination set |
@@ -224,7 +224,9 @@ CSAPI entry: `POST /_matrix/client/v3/join/{roomIdOrAlias}` (and room-scoped
 | make_join 404 / 403 / version mismatch | map to CSAPI 404 / 403 / 400; iterate to next `server_name` on 403/transport |
 | All candidate servers unreachable | CSAPI 5xx / error; client retries |
 | Room isn't our version | hard 400 `M_INCOMPATIBLE_ROOM_VERSION` (we only do v12+MSC4242) |
-| `state_dag` incomplete (a path to create is missing) | drain's `fill_state_ancestry` gap-fills (bounded by being grounded); genuinely unfillable → worker backs off, CSAPI times out, nothing half-committed |
+| `send_join` `state_dag` not closed (a `prev_state_events` reference resolves to nothing in the response or in our store) | malformed response: `502 M_UNKNOWN` at ingest, nothing staged, room not registered |
+| Our join is persisted **rejected** by the drain (it stands on an event the resident's DAG cannot authorise — cascade) | `wait_for_join` sees the rejected row and returns `502 M_UNKNOWN` at once |
+| `state_dag` closed but an ancestor cannot be grounded at apply time | drain's `fill_state_ancestry` gap-fills; unfillable (peer answered with nothing new, or 4xx) → worker rejects/unstages the PDU with the ancestry fetched for it (`staged_events.fetched_for`); peer unreachable/5xx → worker backs off, fetched ancestry kept so the retry resumes from the staged frontier. CSAPI times out (504), nothing half-committed |
 | Ingest takes minutes (huge room) | drain keeps working; CSAPI times out gracefully; join completes on a later sync |
 | Crash mid-ingest | `staged_rooms()` resumes; mid-event re-apply is an idempotent no-op |
 | Banned between make_join & send_join (inbound) | `apply_pdu` REJECT → 403, nothing persisted |

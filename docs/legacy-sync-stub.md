@@ -88,10 +88,15 @@ Top-level mapping:
 ### Per-room bucketing
 
 Sliding-sync returns a flat `rooms` map keyed by room id. The v3 shape
-needs each room bucketed by current membership. Query
-`store.rooms_with_membership(user_id, &all_memberships)` once at the start
-of the response build and bucket from that map. Avoids re-walking JSON
-to find the user's `m.room.member` event in `required_state`.
+needs each room bucketed by current membership. The sliding-sync builder
+already reads each room's membership to decide its shape; it returns that
+per-room map alongside the v5 response (`SyncResponse::memberships`) and the
+translator buckets from it. The builder shapes each room for the membership
+it was ranked under and skips the room for that pass if storage has moved on
+since ranking (the store watch re-runs the build), so bucket and contents
+always agree. A separate membership query, or a fresh re-read inside the
+builder, can be one event behind and file a just-landed leave under
+`rooms.invite` with no `invite_state`.
 
 ### Join / leave room shape
 

@@ -64,7 +64,8 @@ use crate::{AuthError, Event, StateMap, StateResError};
 ///       `auth_events`); no mutation. Soft-fail handling
 ///       (auth-vs-current-state) is the caller's concern — `apply_pdu` runs
 ///       this function twice, once against state-before-event and once
-///       against the post-update current state.
+///       against the current-state basis (for a state event, the state
+///       resolved across our heads and its `prev_state_events`).
 pub fn check_auth_rules(
     event: &Event,
     state: &StateMap<Arc<Event>>,

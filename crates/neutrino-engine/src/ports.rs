@@ -12,7 +12,7 @@ use serde_json::value::RawValue as RawJsonValue;
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     /// The peer answered with a non-2xx status. Carries the raw code so the
-    /// caller can distinguish a 4xx (give up) from a 5xx (retry).
+    /// caller can tell a permanent refusal from a retryable one.
     #[error("peer returned HTTP {0}")]
     Status(u16),
     /// Connection / DNS / timeout / malformed body / URL-build failure —
@@ -37,6 +37,10 @@ impl ForwardExtremities {
         self.timeline.is_empty() && self.state.is_empty()
     }
 }
+
+/// MSC4242: `earliest_events` and `latest_events` each have an independent size
+/// limit of 100 elements when `state_dag = true`; exceeding it is a 400.
+pub const MAX_STATE_DAG_EVENT_IDS: usize = 100;
 
 /// Parameters for a `get_missing_events` walk against a peer.
 pub struct MissingEventsQuery<'a> {

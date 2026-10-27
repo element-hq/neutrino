@@ -15,6 +15,7 @@ pub use ruma;
 pub use sign::{
     CoSignError, EventPolicy, EventSecurity, EventSigner, KeyResolveError, KeyResolver,
     NodeIdKeyResolver, SIGNING_KEY_ID, VerifyError, verify_event_signature, verify_event_signed_by,
+    verify_key_response,
 };
 pub use validate::{FormatError, SemanticVerdict, semantic_verdict};
 

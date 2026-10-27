@@ -19,8 +19,8 @@ This directory holds neutrino's integration with the
 ## Scope
 
 - Only the curated **client-server** tests in `allowlist.txt` run by default.
-- Federation is **out of scope**. Nginx in the container terminates TLS on
-  `:8448` so complement is happy, but no federation traffic is implemented.
+- Federation runs in signed mode through a TLS proxy on each side (nginx in on
+  `:8448`, a TLS-upgrading egress out — see `docker/complement/README.md`).
 - The allowlist grows test-by-test as endpoints land. A failing allowlisted
   test means either fix neutrino or remove the test from the allowlist with a
   rationale.

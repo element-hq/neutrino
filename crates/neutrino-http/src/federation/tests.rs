@@ -28,7 +28,8 @@ use neutrino_ctl::Config;
 use neutrino_event::ROOM_VERSION_ID;
 use neutrino_event::event_builder::EventBuilder;
 use neutrino_store::{
-    EventStore, FederationOutbox, InviteStore, RoomStore, StagingStore, StateStore,
+    EventStore, FederationOutbox, Membership, OobMembershipStore, RoomStore, StagingStore,
+    StateStore,
 };
 use neutrino_store_sqlite::SqliteStore;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, ServerName};
@@ -42,11 +43,12 @@ use neutrino_engine::{MissingEventsFetcher, MissingEventsQuery, TransportError};
 
 /// The arguments one `fetch` call was made with, recorded so a test can assert
 /// the gap-fill loop targets the right frontier / boundary / limit.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct FetchCall {
     latest: Vec<OwnedEventId>,
     earliest: Vec<OwnedEventId>,
     limit: u32,
+    state_dag: bool,
 }
 
 /// Deterministic gap-fill [`MissingEventsFetcher`] for the inbound `/send`
@@ -69,6 +71,9 @@ enum StubOutcome {
     Sequence(std::collections::VecDeque<Vec<String>>),
     /// `Err(Status(code))` — a peer HTTP failure.
     Error(u16),
+    /// `Ok(batch)` per call, popped front-first; exhausted ⇒ `Err(Status(code))`.
+    /// Drives a gap-fill that stages some ancestry and then hits a peer failure.
+    SequenceThenError(std::collections::VecDeque<Vec<String>>, u16),
 }
 
 impl StubFetcher {
@@ -104,6 +109,13 @@ impl StubFetcher {
         *self.outcome.lock().unwrap() = StubOutcome::Sequence(q);
     }
 
+    /// Like [`set_sequence`](Self::set_sequence), but once the batches run out
+    /// every further `fetch` fails with HTTP `code`.
+    fn set_sequence_then_error(&self, batches: Vec<Vec<&neutrino_event::Event>>, code: u16) {
+        let q = batches.iter().map(|b| Self::raws_of(b)).collect();
+        *self.outcome.lock().unwrap() = StubOutcome::SequenceThenError(q, code);
+    }
+
     fn calls(&self) -> Vec<FetchCall> {
         self.calls.lock().unwrap().clone()
     }
@@ -123,6 +135,7 @@ impl MissingEventsFetcher for StubFetcher {
             latest: q.latest.to_vec(),
             earliest: q.earliest.to_vec(),
             limit: q.limit,
+            state_dag: q.state_dag,
         });
         let rebuild = |jsons: &[String]| {
             jsons
@@ -137,6 +150,10 @@ impl MissingEventsFetcher for StubFetcher {
                 Ok(batches.pop_front().map(|b| rebuild(&b)).unwrap_or_default())
             }
             StubOutcome::Error(code) => Err(TransportError::Status(*code)),
+            StubOutcome::SequenceThenError(batches, code) => match batches.pop_front() {
+                Some(b) => Ok(rebuild(&b)),
+                None => Err(TransportError::Status(*code)),
+            },
         }
     }
 }
@@ -1176,6 +1193,62 @@ async fn get_missing_events_rejects_non_member_origin() {
 }
 
 #[tokio::test]
+async fn get_missing_events_state_dag_caps_event_id_arrays() {
+    // MSC4242: `earliest_events` and `latest_events` each cap at 100 elements
+    // when `state_dag` is set, and over that is a 400 — not a silent truncation,
+    // which would answer a different question than the one asked.
+    let (app, room_id, _create_id, msgs, _tempfile) = build_seeded_router(2).await;
+    let over: Vec<String> = (0..101).map(|_| msgs[1].to_string()).collect();
+    let at_cap: Vec<String> = (0..100).map(|_| msgs[1].to_string()).collect();
+
+    for (earliest, latest, who) in [
+        (json!([]), json!(over), "latest_events"),
+        (json!(over), json!([msgs[1].as_str()]), "earliest_events"),
+    ] {
+        let (status, b) = post_json(
+            &app,
+            &fed_path(room_id.as_str()),
+            &json!({
+                "earliest_events": earliest,
+                "latest_events": latest,
+                "limit": 10,
+                crate::federation::get_missing_events::STATE_DAG_KEY: true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{who} over cap: {b}");
+        assert_eq!(
+            b.get("errcode").and_then(Value::as_str),
+            Some("M_INVALID_PARAM")
+        );
+    }
+
+    // Exactly at the cap is allowed, and the cap does not apply without the flag.
+    for (body, who) in [
+        (
+            json!({
+                "earliest_events": [],
+                "latest_events": at_cap,
+                "limit": 10,
+                crate::federation::get_missing_events::STATE_DAG_KEY: true,
+            }),
+            "at cap with state_dag",
+        ),
+        (
+            json!({
+                "earliest_events": [],
+                "latest_events": over,
+                "limit": 10,
+            }),
+            "over cap without state_dag",
+        ),
+    ] {
+        let (status, b) = post_json(&app, &fed_path(room_id.as_str()), &body).await;
+        assert_eq!(status, StatusCode::OK, "{who} must be allowed: {b}");
+    }
+}
+
+#[tokio::test]
 async fn send_rejects_x_matrix_origin_mismatch() {
     // The header origin is network-attested; `body.origin` is self-asserted. They
     // must agree, or the transaction is rejected.
@@ -1454,6 +1527,108 @@ async fn get_missing_events_serves_rejected_and_soft_failed_events() {
     );
 }
 
+// MSC4242 state-DAG walk over HTTP: the response keeps the walk's nearest-hop-
+// first order (no oldest-first reversal, unlike the timeline walk), includes
+// soft-failed events, and hides rejected ones without walking through them.
+// Chain: join(held) ← b ← c(soft-failed) ← d, all state events.
+#[tokio::test]
+async fn get_missing_events_state_dag_is_hop_ordered_and_hides_rejected() {
+    async fn chain(
+        b_rejected: bool,
+    ) -> (
+        axum::Router,
+        OwnedRoomId,
+        Vec<neutrino_event::Event>,
+        TempDir,
+    ) {
+        let (store, tempfile) = fresh_store().await;
+        let peer = peer_user();
+        let create = EventBuilder::new(
+            peer.clone(),
+            "m.room.create".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .state_key(String::new())
+        .content(json!({ "room_version": ROOM_VERSION_ID }))
+        .build()
+        .expect("build create");
+        let room_id = create.room_id.clone();
+        let join = EventBuilder::new(
+            peer.clone(),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key(peer.as_str().to_owned())
+        .content(json!({ "membership": "join" }))
+        .prev_events(vec![create.event_id.clone()])
+        .prev_state_events(vec![create.event_id.clone()])
+        .build()
+        .expect("build join");
+        let join_id = join.event_id.clone();
+        store
+            .create_room(&create, &[join])
+            .await
+            .expect("create_room");
+        let mut b = topic_on(&peer, &room_id, &join_id, "b", 1_700_000_001_000);
+        b.rejected = b_rejected;
+        let mut c = topic_on(&peer, &room_id, &b.event_id, "c", 1_700_000_002_000);
+        c.soft_failed = true;
+        let d = topic_on(&peer, &room_id, &c.event_id, "d", 1_700_000_003_000);
+        for ev in [&b, &c, &d] {
+            store.persist_historical_event(ev).await.unwrap();
+        }
+        (
+            router_with_store(config(), store),
+            room_id,
+            vec![b, c, d],
+            tempfile,
+        )
+    }
+    async fn topics(app: &axum::Router, room_id: &RoomId, latest: &str) -> Vec<String> {
+        let (status, body) = post_json(
+            app,
+            &fed_path(room_id.as_str()),
+            &json!({
+                "earliest_events": [],
+                "latest_events": [latest],
+                "limit": 10,
+                crate::federation::get_missing_events::STATE_DAG_KEY: true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body = {body}");
+        body["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .map(|p| {
+                p.pointer("/content/topic")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<non-topic>")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    let (app, room_id, evs, _tempfile) = chain(false).await;
+    let got = topics(&app, &room_id, evs[2].event_id.as_str()).await;
+    assert_eq!(
+        &got[..2],
+        ["c", "b"],
+        "nearest hop first, soft-failed c included; then join and create"
+    );
+    assert_eq!(got.len(), 4, "c, b, join, create");
+
+    let (app, room_id, evs, _tempfile) = chain(true).await;
+    let got = topics(&app, &room_id, evs[2].event_id.as_str()).await;
+    assert_eq!(
+        got,
+        ["c"],
+        "rejected b is neither returned nor walked through"
+    );
+}
+
 // Unknown room → 404 M_NOT_FOUND (spec-required), not a 500 or the
 // bare-text fallback.
 #[tokio::test]
@@ -1613,7 +1788,7 @@ async fn seed_joined_room() -> (
     TempDir,
 ) {
     // Default to a no-progress fetcher: the in-order tests never trigger
-    // gap-fill, and the one that does (`send_unfillable_ancestry_stays_unapplied`) wants
+    // gap-fill, and the one that does (`send_unfillable_ancestry_is_rejected`) wants
     // exactly "the peer has nothing" — deterministic, no network.
     seed_joined_room_with_fetcher(StubFetcher::no_progress()).await
 }
@@ -1781,13 +1956,35 @@ async fn wait_staging_empty(store: &SqliteStore, room_id: &RoomId) {
 /// Poll until the stub fetcher has recorded at least one call — i.e. the worker
 /// reached the gap-fill for a PDU with missing ancestry.
 async fn wait_fetch_attempted(fetcher: &StubFetcher) {
+    wait_fetch_count(fetcher, 1).await;
+}
+
+/// Poll until the stub fetcher has recorded at least `n` calls.
+async fn wait_fetch_count(fetcher: &StubFetcher, n: usize) {
     for _ in 0..500 {
-        if fetcher.call_count() >= 1 {
+        if fetcher.call_count() >= n {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("fetcher was never called within timeout");
+    panic!("fetcher was not called {n} times within timeout");
+}
+
+/// Poll until the room's staged rows are exactly `expected` (any order).
+async fn wait_staged_exactly(store: &SqliteStore, room_id: &RoomId, expected: &[&ruma::EventId]) {
+    let want: std::collections::BTreeSet<OwnedEventId> =
+        expected.iter().map(|e| (*e).to_owned()).collect();
+    for _ in 0..500 {
+        if let Ok(rows) = store.staged_for_room(room_id).await {
+            let got: std::collections::BTreeSet<OwnedEventId> =
+                rows.into_iter().map(|p| p.event_id).collect();
+            if got == want {
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("staging for {room_id} did not settle to {want:?} within timeout");
 }
 
 #[tokio::test]
@@ -1859,11 +2056,12 @@ async fn send_persists_rejected_pdu_as_success_result() {
 }
 
 #[tokio::test]
-async fn send_unfillable_ancestry_stays_unapplied() {
+async fn send_unfillable_ancestry_is_rejected() {
     // A PDU referencing a parent we don't have, and the peer (a no-progress
     // fetcher) returns nothing → the gap is unfillable. `/send` still 200s
-    // (staged); the worker tries the gap-fill, fails, backs off, and the PDU is
-    // never committed (left durably staged for a later retry/restart).
+    // (staged); the worker tries the gap-fill, fails, and *rejects* the PDU
+    // (MSC4242: a server that cannot supply a path to create SHOULD have its
+    // `/send` rejected) — it is unstaged, never committed, and never retried.
     let fetcher = StubFetcher::no_progress();
     let (app, store, room_id, alice, join_id, _tempfile) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
@@ -1886,16 +2084,17 @@ async fn send_unfillable_ancestry_stays_unapplied() {
         "staging succeeds even when the eventual gap-fill won't; body = {body}"
     );
 
-    // The worker reaches the gap-fill (fetcher called) but can't ground the
-    // ancestry, so the child is never committed.
+    // The worker reaches the gap-fill (fetcher called), can't ground the
+    // ancestry, and drops the child: staging drains without it committing.
     wait_fetch_attempted(&fetcher).await;
+    wait_staging_empty(&store, &room_id).await;
     assert!(
         store
             .get_events(&[child_id.as_ref()])
             .await
             .unwrap()
             .is_empty(),
-        "child must not be committed while its ancestry is unfillable"
+        "child must not be committed when its ancestry is unfillable"
     );
 }
 
@@ -2038,12 +2237,8 @@ async fn send_gapfills_missing_ancestry_then_accepts() {
     // staged rows are deleted. Wait for the drain to settle before asserting
     // emptiness, rather than racing the worker's follow-up unstage.
     wait_staging_empty(&store, &room_id).await;
-    let still_missing = store
-        .ancestry_gap(&room_id, &[child_id.as_ref()])
-        .await
-        .unwrap();
     assert!(
-        still_missing.staged.is_empty(),
+        store.staged_for_room(&room_id).await.unwrap().is_empty(),
         "promoted ancestry must be unstaged"
     );
 }
@@ -2052,16 +2247,18 @@ async fn send_gapfills_missing_ancestry_then_accepts() {
 async fn send_gapfill_fetch_targets_frontier_and_state_boundary() {
     // Pin the outbound fetch arguments: `latest` is the triggering event (the
     // walk-from point), `earliest` is the room's *state-DAG* forward extremity
-    // (not the timeline one — the `state_dag_boundary`), and
-    // the first round uses the initial limit. A no-progress fetcher records one
-    // call; the resulting unfillable error is irrelevant here.
+    // (not the timeline one), and the first round uses the initial limit. The
+    // child's timeline parent is held, so no timeline round precedes the state
+    // walk. A no-progress fetcher records one call; the resulting unfillable
+    // error is irrelevant here.
     let fetcher = StubFetcher::no_progress();
     let (app, _store, room_id, alice, join_id, _tempfile) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
     let orphan = topic_on(&alice, &room_id, &join_id, "x", 1_700_000_002_000);
-    let child = message_on(
+    let child = message_on_split(
         &alice,
         &room_id,
+        &join_id,
         &orphan.event_id,
         "child",
         1_700_000_003_000,
@@ -2069,10 +2266,14 @@ async fn send_gapfill_fetch_targets_frontier_and_state_boundary() {
 
     let _ = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
 
-    // The gap is unfillable (no-progress peer), so the worker backs off and
-    // retries — pin the *first* round's arguments rather than the call count.
+    // The gap is unfillable (no-progress peer), so the worker rejects the PDU
+    // after this one round — pin the *first* round's arguments.
     wait_fetch_attempted(&fetcher).await;
     let calls = fetcher.calls();
+    assert!(
+        calls[0].state_dag,
+        "the gap-fill walk is over the state DAG"
+    );
     assert_eq!(
         calls[0].latest,
         vec![child.event_id.clone()],
@@ -2091,15 +2292,24 @@ async fn send_gapfill_fetch_targets_frontier_and_state_boundary() {
 
 #[tokio::test]
 async fn send_gapfills_over_multiple_rounds() {
-    // The peer dribbles ancestry one event per round: child→A→B→join(held).
+    // The peer dribbles state ancestry one event per round: child→A→B→join(held).
     // Round 1 fetches A, round 2 fetches B; the loop must double the limit and
-    // carry the staged frontier in `latest` so it doesn't re-request A.
+    // name only the frontier (A) in `latest` — not the child above it — so the
+    // peer resumes below A instead of re-sending it. The child's timeline
+    // parent is held, so every round is a state-DAG round.
     let fetcher = StubFetcher::no_progress();
     let (app, store, room_id, alice, join_id, _tempfile) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
     let b = topic_on(&alice, &room_id, &join_id, "b", 1_700_000_002_000);
     let a = topic_on(&alice, &room_id, &b.event_id, "a", 1_700_000_003_000);
-    let child = message_on(&alice, &room_id, &a.event_id, "child", 1_700_000_004_000);
+    let child = message_on_split(
+        &alice,
+        &room_id,
+        &join_id,
+        &a.event_id,
+        "child",
+        1_700_000_004_000,
+    );
     let child_id = child.event_id.clone();
     // Newest-first dribble: A (child's parent) then B (A's parent).
     fetcher.set_sequence(vec![vec![&a], vec![&b]]);
@@ -2121,9 +2331,10 @@ async fn send_gapfills_over_multiple_rounds() {
     assert_eq!(calls.len(), 2, "two gap-fill rounds");
     assert_eq!(calls[0].limit, 10);
     assert_eq!(calls[1].limit, 20, "limit doubles each round");
-    assert!(
-        calls[1].latest.contains(&a.event_id),
-        "round 2 carries the staged frontier (A) in `latest` so the peer skips it"
+    assert_eq!(
+        calls[1].latest,
+        vec![a.event_id.clone()],
+        "round 2 names exactly the frontier (A), not the child above it"
     );
 
     // All of A, B, child committed and not rejected.
@@ -2133,6 +2344,88 @@ async fn send_gapfills_over_multiple_rounds() {
         .unwrap();
     assert_eq!(committed.len(), 3, "B + A + child all committed");
     assert!(committed.iter().all(|e| !e.rejected));
+}
+
+#[tokio::test]
+async fn send_gapfill_walks_timeline_parent_before_state_dag() {
+    // The child's `prev_events` and `prev_state_events` both name an event we
+    // lack. One timeline-DAG round (`state_dag: false`, `latest` = the child,
+    // `earliest` = the timeline head) runs first. The peer answers with the
+    // parent, whose own state ancestry is grounded, so no state-DAG round
+    // follows and both events commit.
+    let fetcher = StubFetcher::no_progress();
+    let (app, store, room_id, alice, join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let orphan = topic_on(&alice, &room_id, &join_id, "x", 1_700_000_002_000);
+    let child = message_on(
+        &alice,
+        &room_id,
+        &orphan.event_id,
+        "child",
+        1_700_000_003_000,
+    );
+    fetcher.set_sequence(vec![vec![&orphan]]);
+
+    let _ = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
+
+    wait_committed(&store, child.event_id.as_ref()).await;
+    let calls = fetcher.calls();
+    assert_eq!(calls.len(), 1, "one timeline round grounded everything");
+    assert!(
+        !calls[0].state_dag,
+        "the first round walks the timeline DAG"
+    );
+    assert_eq!(calls[0].latest, vec![child.event_id.clone()]);
+    assert_eq!(
+        calls[0].earliest,
+        vec![join_id.clone()],
+        "earliest is the timeline forward extremity"
+    );
+    assert_eq!(
+        calls[0].limit, 10,
+        "the timeline round is bounded at the initial limit"
+    );
+    let committed = store
+        .get_events(&[orphan.event_id.as_ref(), child.event_id.as_ref()])
+        .await
+        .unwrap();
+    assert_eq!(committed.len(), 2, "parent + child committed");
+    assert!(committed.iter().all(|e| !e.rejected));
+}
+
+#[tokio::test]
+async fn send_gapfill_timeline_round_is_best_effort() {
+    // The peer has nothing for the timeline round; the state-DAG walk still
+    // runs, fetches the parent, and grounds the child.
+    let fetcher = StubFetcher::no_progress();
+    let (app, store, room_id, alice, join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let orphan = topic_on(&alice, &room_id, &join_id, "x", 1_700_000_002_000);
+    let child = message_on(
+        &alice,
+        &room_id,
+        &orphan.event_id,
+        "child",
+        1_700_000_003_000,
+    );
+    fetcher.set_sequence(vec![vec![], vec![&orphan]]);
+
+    let _ = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
+
+    wait_committed(&store, child.event_id.as_ref()).await;
+    let calls = fetcher.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "an empty timeline round, then one state round"
+    );
+    assert!(!calls[0].state_dag);
+    assert!(
+        calls[1].state_dag,
+        "the state-DAG walk follows the empty timeline round"
+    );
+    assert_eq!(calls[1].latest, vec![child.event_id.clone()]);
+    assert_eq!(calls[1].earliest, vec![join_id.clone()]);
 }
 
 #[tokio::test]
@@ -2223,6 +2516,287 @@ async fn send_fetcher_failure_leaves_pdu_unapplied() {
             .is_empty(),
         "child must not be persisted on fetch failure"
     );
+    // A peer failure says nothing about the DAG, so the PDU is *not* rejected:
+    // it stays staged (backing off) for a later retry — unlike an unfillable
+    // gap, which drops it.
+    let staged: Vec<OwnedEventId> = store
+        .staged_for_room(&room_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.event_id)
+        .collect();
+    assert_eq!(
+        staged,
+        vec![child_id],
+        "child stays staged across a transient peer failure"
+    );
+}
+
+#[tokio::test]
+async fn send_unfillable_gapfill_drops_root_with_fetched_ancestry() {
+    // The Complement GME05 shape. child → orphan → grandorphan → join, where the
+    // peer supplies `orphan` in the timeline round and then nothing for the
+    // state walk (grandorphan is never delivered), so the gap is unfillable.
+    // `orphan` is staged as ancestry *fetched for* `child`, never a gap-fill
+    // root of its own — so it must not be drained as if it had arrived via
+    // `/send` and start a `latest=[orphan]` timeline round against the peer. On
+    // the unfillable verdict `child` is rejected and `orphan` goes with it:
+    // staging drains, nothing commits, and the peer sees exactly the two rounds
+    // rooted at `child`.
+    let fetcher = StubFetcher::no_progress();
+    let (app, store, room_id, alice, join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let grandorphan = topic_on(
+        &alice,
+        &room_id,
+        &join_id,
+        "never delivered",
+        1_700_000_001_000,
+    );
+    let orphan = topic_on(
+        &alice,
+        &room_id,
+        &grandorphan.event_id,
+        "delivered then rolled back",
+        1_700_000_002_000,
+    );
+    let child = message_on(
+        &alice,
+        &room_id,
+        &orphan.event_id,
+        "child",
+        1_700_000_003_000,
+    );
+    let orphan_id = orphan.event_id.clone();
+    let child_id = child.event_id.clone();
+    // Round 1 (timeline, latest=[child]) yields orphan; the state walk then gets
+    // nothing → unfillable.
+    fetcher.set_sequence(vec![vec![&orphan]]);
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    wait_staging_empty(&store, &room_id).await;
+    assert!(
+        store
+            .get_events(&[orphan_id.as_ref(), child_id.as_ref()])
+            .await
+            .unwrap()
+            .is_empty(),
+        "neither the child nor the rolled-back orphan may commit"
+    );
+    // Staging is empty and the worker has parked, so the call log is final.
+    let calls = fetcher.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "one timeline round + one state round, both rooted at child: {calls:?}"
+    );
+    assert!(!calls[0].state_dag);
+    assert_eq!(
+        calls[0].latest,
+        vec![child_id.clone()],
+        "timeline round walks from the received PDU"
+    );
+    assert!(calls[1].state_dag);
+    assert_eq!(
+        calls[1].latest,
+        vec![orphan_id.clone()],
+        "state round walks from the staged frontier"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| !c.state_dag && c.latest == vec![orphan_id.clone()]),
+        "the fetched orphan must never become its own gap-fill root: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn send_transient_gapfill_failure_keeps_fetched_ancestry_and_resumes() {
+    // Same DAG as the unfillable case, but the state walk fails with a peer
+    // error after the timeline round staged `orphan`. Transient ⇒ the child is
+    // kept (backing off) rather than rejected, and the fetched `orphan` is kept
+    // too, tagged `fetched_for = child` — so it is neither drained as an
+    // independent gap-fill root nor refetched: the retry's `ancestry_gap` sees
+    // it staged and resumes the state walk from the frontier below it.
+    let fetcher = StubFetcher::no_progress();
+    let (app, store, room_id, alice, join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let grandorphan = topic_on(
+        &alice,
+        &room_id,
+        &join_id,
+        "never delivered",
+        1_700_000_001_000,
+    );
+    let orphan = topic_on(
+        &alice,
+        &room_id,
+        &grandorphan.event_id,
+        "delivered then rolled back",
+        1_700_000_002_000,
+    );
+    let child = message_on(
+        &alice,
+        &room_id,
+        &orphan.event_id,
+        "child",
+        1_700_000_003_000,
+    );
+    let orphan_id = orphan.event_id.clone();
+    let child_id = child.event_id.clone();
+    fetcher.set_sequence_then_error(vec![vec![&orphan]], 502);
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    // After the failed state round both rows stay staged: the child (backing
+    // off) and the orphan fetched for it.
+    wait_fetch_count(&fetcher, 2).await;
+    wait_staged_exactly(&store, &room_id, &[child_id.as_ref(), orphan_id.as_ref()]).await;
+    let rows = store.staged_for_room(&room_id).await.unwrap();
+    let orphan_row = rows.iter().find(|p| p.event_id == orphan_id).unwrap();
+    assert_eq!(
+        orphan_row.fetched_for.as_ref(),
+        Some(&child_id),
+        "the orphan is tagged as ancestry fetched for the child"
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|p| p.event_id == child_id)
+            .unwrap()
+            .fetched_for,
+        None,
+        "the /send PDU is a root"
+    );
+    assert!(
+        store
+            .get_events(&[orphan_id.as_ref(), child_id.as_ref()])
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing commits on a transient failure"
+    );
+
+    // The child's backoff expires and it retries. Its timeline parent (orphan)
+    // is now held (staged), so no timeline round; the state walk resumes from
+    // the staged frontier — a *state* round with `latest=[orphan]`.
+    wait_fetch_count(&fetcher, 3).await;
+    let calls = fetcher.calls();
+    assert!(!calls[0].state_dag);
+    assert_eq!(calls[0].latest, vec![child_id.clone()]);
+    assert!(calls[1].state_dag);
+    assert_eq!(calls[1].latest, vec![orphan_id.clone()]);
+    assert!(
+        calls[2].state_dag,
+        "the retry resumes the state walk, no timeline refetch: {calls:?}"
+    );
+    assert_eq!(calls[2].latest, vec![orphan_id.clone()]);
+    assert!(
+        !calls
+            .iter()
+            .any(|c| !c.state_dag && c.latest == vec![orphan_id.clone()]),
+        "the fetched orphan must never become its own gap-fill root: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn send_rate_limited_gapfill_keeps_the_pdu_and_retries() {
+    // A 429 is not the peer's final word: the PDU backs off and retries rather
+    // than being rejected like other 4xx answers.
+    let fetcher = StubFetcher::erroring(429);
+    let (app, store, room_id, alice, join_id, _tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let orphan = topic_on(&alice, &room_id, &join_id, "x", 1_700_000_002_000);
+    let child = message_on_split(
+        &alice,
+        &room_id,
+        &join_id,
+        &orphan.event_id,
+        "child",
+        1_700_000_003_000,
+    );
+
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    wait_fetch_count(&fetcher, 2).await;
+    assert!(
+        store
+            .staged_for_room(&room_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|p| p.event_id == child.event_id),
+        "a rate-limited gap-fill keeps the PDU staged"
+    );
+}
+
+/// Sends a PDU whose state parent is missing, against a fetcher that always
+/// answers `code`.
+async fn send_with_gapfill_status(
+    code: u16,
+) -> (
+    axum::Router,
+    Arc<StubFetcher>,
+    Arc<SqliteStore>,
+    OwnedRoomId,
+    OwnedEventId,
+    TempDir,
+) {
+    let fetcher = StubFetcher::erroring(code);
+    let (app, store, room_id, alice, join_id, tempfile) =
+        seed_joined_room_with_fetcher(fetcher.clone()).await;
+    let orphan = topic_on(&alice, &room_id, &join_id, "x", 1_700_000_002_000);
+    let child = message_on_split(
+        &alice,
+        &room_id,
+        &join_id,
+        &orphan.event_id,
+        "child",
+        1_700_000_003_000,
+    );
+    let (status, body) = put_json(&app, &send_path("txn1"), &txn(&[&child])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    (app, fetcher, store, room_id, child.event_id, tempfile)
+}
+
+#[tokio::test]
+async fn send_gapfill_refused_as_unauthorised_or_timed_out_retries() {
+    for code in [401, 403, 408] {
+        let (_app, fetcher, store, room_id, child_id, _tempfile) =
+            send_with_gapfill_status(code).await;
+        wait_fetch_count(&fetcher, 2).await;
+        assert!(
+            store
+                .staged_for_room(&room_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|p| p.event_id == child_id),
+            "HTTP {code} from the gap-fill peer must keep the PDU staged"
+        );
+    }
+}
+
+#[tokio::test]
+async fn send_gapfill_bad_request_or_not_found_rejects_the_pdu() {
+    for code in [400, 404] {
+        let (_app, fetcher, store, room_id, child_id, _tempfile) =
+            send_with_gapfill_status(code).await;
+        wait_fetch_attempted(&fetcher).await;
+        wait_staging_empty(&store, &room_id).await;
+        assert!(
+            store
+                .get_events(&[child_id.as_ref()])
+                .await
+                .unwrap()
+                .is_empty(),
+            "HTTP {code} from the gap-fill peer must reject the PDU"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2505,7 +3079,7 @@ async fn worker_drains_rows_staged_before_startup() {
     let origin: &ServerName = "remote.example.org".try_into().unwrap();
     assert!(
         store
-            .stage_pdu(origin, &room_id, &msg.event_id, &msg.raw)
+            .stage_pdu(origin, &room_id, &msg.event_id, &msg.raw, None)
             .await
             .unwrap()
     );
@@ -2519,10 +3093,11 @@ async fn worker_drains_rows_staged_before_startup() {
 
 #[tokio::test]
 async fn worker_wedged_pdu_does_not_block_sibling() {
-    // One PDU has unfillable ancestry (it backs off forever); an independent,
+    // One PDU has missing ancestry and the peer keeps failing (a transient
+    // error, so it backs off rather than being rejected); an independent,
     // directly-appliable PDU in the same room must still be processed. Proves a
     // backing-off event is skipped, not head-of-line blocking.
-    let fetcher = StubFetcher::no_progress();
+    let fetcher = StubFetcher::erroring(502);
     let (app, store, room_id, alice, join_id, _tempfile) =
         seed_joined_room_with_fetcher(fetcher.clone()).await;
 
@@ -2561,7 +3136,7 @@ async fn worker_wedged_pdu_does_not_block_sibling() {
     assert_eq!(status, StatusCode::OK);
     wait_committed(&store, healthy2_id.as_ref()).await;
 
-    // The wedged PDU is still uncommitted (its ancestry is permanently unfillable).
+    // The wedged PDU is still uncommitted (the peer never answered).
     assert!(
         store
             .get_events(&[wedged_id.as_ref()])
@@ -3570,7 +4145,16 @@ async fn room_scoped_join_uses_pending_invite_server() {
         std::slice::from_ref(&throwaway.event_id),
     );
     let bob: OwnedUserId = "@bob:a.example".parse().unwrap();
-    a_store.put_invite(&room_id, &bob, &invite).await.unwrap();
+    a_store
+        .put_oob_membership(
+            &room_id,
+            &bob,
+            &invite,
+            neutrino_event::ROOM_VERSION_ID,
+            None,
+        )
+        .await
+        .unwrap();
 
     // Room-scoped join with NO `server_name` — the SDK's invite-accept path.
     let path = format!("/_matrix/client/v3/rooms/{room_id}/join");
@@ -3656,7 +4240,16 @@ async fn join_tries_hint_before_invite_fallback() {
         std::slice::from_ref(&throwaway.event_id),
     );
     let bob: OwnedUserId = "@bob:a.example".parse().unwrap();
-    a_store.put_invite(&room_id, &bob, &invite).await.unwrap();
+    a_store
+        .put_oob_membership(
+            &room_id,
+            &bob,
+            &invite,
+            neutrino_event::ROOM_VERSION_ID,
+            None,
+        )
+        .await
+        .unwrap();
 
     // `via` lists a dead hint (transport failure, skipped) then the live decoy
     // (contacted, refuses) ahead of the invite server — so the join can only
@@ -3730,7 +4323,16 @@ async fn hosted_room_with_live_local_member_and_pending_invite_does_not_federate
         std::slice::from_ref(&throwaway.event_id),
     );
     let bob: OwnedUserId = "@bob:a.example".parse().unwrap();
-    store.put_invite(&room_id, &bob, &invite).await.unwrap();
+    store
+        .put_oob_membership(
+            &room_id,
+            &bob,
+            &invite,
+            neutrino_event::ROOM_VERSION_ID,
+            None,
+        )
+        .await
+        .unwrap();
 
     let path = format!("/_matrix/client/v3/rooms/{room_id}/join");
     let (status, body) = post_json(&router, &path, &json!({})).await;
@@ -3826,7 +4428,6 @@ async fn rejoining_hosted_room_with_no_local_members_resyncs_from_resident() {
             raw_to_value(&name),
         ],
         "timeline": [],
-        "event": raw_to_value(&bob_join),
     });
     let resident = crate::federation::test_support::spawn_stub(stub_resident(mj, sj)).await;
 
@@ -4095,23 +4696,32 @@ fn parse_server_names_lowercase_colon_and_drops_garbage() {
 }
 
 /// A canned-response resident server: make_join returns `make_join_body`,
-/// send_join returns `send_join_body`, get_missing_events returns no events.
+/// send_join returns `send_join_body` (its `event`, when absent, is the join it
+/// was sent — as a real resident does), get_missing_events returns no events.
 /// Lets a test drive the outbound ingest path against deliberately broken state.
 fn stub_resident(make_join_body: Value, send_join_body: Value) -> axum::Router {
-    stub_resident_counting(make_join_body, send_join_body).0
+    stub_resident_counting(make_join_body, send_join_body, std::time::Duration::ZERO).0
 }
 
 /// As [`stub_resident`], also returning a counter of make_join hits so a test
-/// can assert how many join handshakes actually ran.
+/// can assert how many join handshakes actually ran, and the last join sent to
+/// send_join, which is held for `send_join_delay` (a slow link) before answering.
 fn stub_resident_counting(
     make_join_body: Value,
     send_join_body: Value,
-) -> (axum::Router, Arc<std::sync::atomic::AtomicUsize>) {
+    send_join_delay: std::time::Duration,
+) -> (
+    axum::Router,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::Mutex<Option<Value>>>,
+) {
     use axum::routing::{get as rget, post as rpost, put as rput};
     let mj = Arc::new(make_join_body);
     let sj = Arc::new(send_join_body);
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mj_hits = hits.clone();
+    let sent_join = Arc::new(std::sync::Mutex::new(None));
+    let sj_sent = sent_join.clone();
     let router = axum::Router::new()
         .route(
             "/_matrix/federation/v1/make_join/{room}/{user}",
@@ -4126,24 +4736,34 @@ fn stub_resident_counting(
         )
         .route(
             "/_matrix/federation/v2/send_join/{room}/{event}",
-            rput(move || {
+            rput(move |axum::Json(join): axum::Json<Value>| {
                 let sj = sj.clone();
-                async move { axum::Json((*sj).clone()) }
+                let sent = sj_sent.clone();
+                async move {
+                    tokio::time::sleep(send_join_delay).await;
+                    let mut sj = (*sj).clone();
+                    if sj.get("event").is_none() {
+                        sj["event"] = join.clone();
+                    }
+                    *sent.lock().unwrap() = Some(join);
+                    axum::Json(sj)
+                }
             }),
         )
         .route(
             "/_matrix/federation/v1/get_missing_events/{room}",
             rpost(|| async { axum::Json(json!({ "events": [] })) }),
         );
-    (router, hits)
+    (router, hits, sent_join)
 }
 
 #[tokio::test]
-async fn federated_join_times_out_when_state_never_grounds() {
-    // The resident hands back a join whose prev_state references a "ghost" event
-    // nobody has (and get_missing_events returns nothing), so the worker can
-    // never ground it → the CSAPI join times out with 504, but the room shell
-    // is registered and our membership never appears.
+async fn federated_join_dangling_state_dag_reference_fails_without_registering() {
+    // SJ02A/B: the resident hands back a join whose prev_state references a
+    // "ghost" event that is neither in the response nor held by us. MSC4242
+    // makes the send_join response the *entire* state DAG, so this is a
+    // malformed response: 502 at ingest, nothing staged, room not registered —
+    // not a 20 s wait on gap-fills the resident cannot serve.
     let alice = alice();
     let create = EventBuilder::new(
         alice.clone(),
@@ -4182,7 +4802,6 @@ async fn federated_join_times_out_when_state_never_grounds() {
     let sj = json!({
         "state_dag": [raw_to_value(&create), raw_to_value(&template)],
         "timeline": [],
-        "event": raw_to_value(&template),
     });
     let b = crate::federation::test_support::spawn_stub(stub_resident(mj, sj)).await;
 
@@ -4196,9 +4815,231 @@ async fn federated_join_times_out_when_state_never_grounds() {
         std::time::Duration::from_millis(800),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
-    // Room shell registered (create grounded), but the join never landed.
-    assert!(a_store.room_exists(&room_id).await.unwrap());
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        !a_store.room_exists(&room_id).await.unwrap(),
+        "a non-closed state DAG must not register the room"
+    );
+    assert!(
+        a_store.staged_for_room(&room_id).await.unwrap().is_empty(),
+        "nothing is staged from a malformed response"
+    );
+}
+
+#[tokio::test]
+async fn federated_join_timeline_dangling_state_reference_does_not_fail() {
+    // Only state-DAG events are subject to the connectedness rule (MSC4242:
+    // "all paths from the `prev_state_events` of the join event to the
+    // create"). The timeline carries message events, and a resident's timeline
+    // window can legitimately hold one whose `prev_state_events` names a state
+    // event `walk_state_dag` omitted (a rejected one). Checking those too would
+    // let any server in the room poison joins by parking such an event in the
+    // last-20 window.
+    let alice = alice();
+    let state_ev =
+        |ty: &str, sk: &str, content: Value, prev: &OwnedEventId, room: Option<&OwnedRoomId>| {
+            let mut b = EventBuilder::new(
+                alice.clone(),
+                ty.to_owned(),
+                neutrino_event::base_version().clone(),
+            )
+            .state_key(sk.to_owned())
+            .content(content)
+            .prev_events(vec![prev.clone()])
+            .prev_state_events(vec![prev.clone()]);
+            if let Some(r) = room {
+                b = b.room_id(r.clone());
+            }
+            b.build().unwrap()
+        };
+    let create = EventBuilder::new(
+        alice.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .unwrap();
+    let room_id = create.room_id.clone();
+    let a_join = state_ev(
+        "m.room.member",
+        alice.as_str(),
+        json!({ "membership": "join" }),
+        &create.event_id,
+        Some(&room_id),
+    );
+    let rules = state_ev(
+        "m.room.join_rules",
+        "",
+        json!({ "join_rule": "public" }),
+        &a_join.event_id,
+        Some(&room_id),
+    );
+    // A state event the resident's state-DAG walk omits (it would be rejected),
+    // so it is absent from `state_dag` and unknown to us.
+    let omitted = state_ev(
+        "m.room.topic",
+        "",
+        json!({ "topic": "omitted" }),
+        &rules.event_id,
+        Some(&room_id),
+    );
+    // A timeline message standing on it — the dangling reference.
+    let msg = EventBuilder::new(
+        alice,
+        "m.room.message".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .content(json!({ "body": "in the timeline window" }))
+    .prev_events(vec![rules.event_id.clone()])
+    .prev_state_events(vec![omitted.event_id.clone()])
+    .build()
+    .unwrap();
+    let zara: OwnedUserId = ZARA.parse().unwrap();
+    let template = EventBuilder::new(
+        zara.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(zara.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![rules.event_id.clone()])
+    .prev_state_events(vec![rules.event_id.clone()])
+    .build()
+    .unwrap();
+    let mj = json!({ "event": raw_to_value(&template), "room_version": ROOM_VERSION_ID });
+    // The state DAG itself is closed; only the timeline dangles.
+    let sj = json!({
+        "state_dag": [
+            raw_to_value(&create),
+            raw_to_value(&a_join),
+            raw_to_value(&rules),
+            raw_to_value(&template),
+        ],
+        "timeline": [raw_to_value(&msg)],
+    });
+    let b = crate::federation::test_support::spawn_stub(stub_resident(mj, sj)).await;
+
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_state = crate::AppState::from_store(config_for("a.example", "bob"), a_store.clone());
+    let resp = crate::federation::join::federated_join_with(
+        &a_state,
+        zara.clone(),
+        &room_id,
+        &[b],
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a dangling reference in the timeline must not fail the handshake: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        a_store
+            .current_state_event(&room_id, "m.room.member", zara.as_str())
+            .await
+            .unwrap()
+            .is_some(),
+        "the join landed in current state"
+    );
+}
+
+#[tokio::test]
+async fn federated_join_rejected_by_cascade_fails_fast_with_502() {
+    // SJ02C..H: the response's state DAG is closed but our join stands on an
+    // event the worker rejects (here: a *message* named in prev_state_events,
+    // a reference rejection), so the join is persisted rejected by cascade.
+    // The dance must surface that as 502 as soon as the worker persists it,
+    // not sit out the 20 s timeout waiting for a join that will never land.
+    let alice = alice();
+    let create = EventBuilder::new(
+        alice.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .unwrap();
+    let room_id = create.room_id.clone();
+    let msg = EventBuilder::new(
+        alice,
+        "m.room.message".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .content(json!({ "body": "not a state event" }))
+    .prev_events(vec![create.event_id.clone()])
+    .prev_state_events(vec![create.event_id.clone()])
+    .build()
+    .unwrap();
+    let zara: OwnedUserId = ZARA.parse().unwrap();
+    let template = EventBuilder::new(
+        zara.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(zara.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![msg.event_id.clone()])
+    .prev_state_events(vec![msg.event_id.clone()])
+    .build()
+    .unwrap();
+    let mj = json!({ "event": raw_to_value(&template), "room_version": ROOM_VERSION_ID });
+    let sj = json!({
+        "state_dag": [raw_to_value(&create), raw_to_value(&msg), raw_to_value(&template)],
+        "timeline": [],
+    });
+    let (router, _, sent_join) = stub_resident_counting(mj, sj, std::time::Duration::ZERO);
+    let b = crate::federation::test_support::spawn_stub(router).await;
+
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_state = crate::AppState::from_store(config_for("a.example", "bob"), a_store.clone());
+    let started = std::time::Instant::now();
+    let resp = crate::federation::join::federated_join_with(
+        &a_state,
+        zara.clone(),
+        &room_id,
+        &[b],
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "a rejected join must fail fast, not wait for the timeout"
+    );
+    let sent_join = sent_join
+        .lock()
+        .unwrap()
+        .take()
+        .expect("send_join was called");
+    let join_id = neutrino_event::event_builder::from_wire(
+        serde_json::value::to_raw_value(&sent_join).unwrap(),
+        Vec::new(),
+        neutrino_event::base_version(),
+    )
+    .expect("parseable join")
+    .admit_on_faith()
+    .into_event()
+    .event_id;
+    let join = a_store
+        .get_events(&[join_id.as_ref()])
+        .await
+        .unwrap()
+        .pop()
+        .expect("our join was persisted");
+    assert!(join.rejected, "persisted rejected by cascade");
     assert!(
         a_store
             .current_state_event(&room_id, "m.room.member", zara.as_str())
@@ -4206,6 +5047,70 @@ async fn federated_join_times_out_when_state_never_grounds() {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn federated_join_foreign_event_in_response_fails_without_registering() {
+    // The resident hands back someone else's member event as `event`. Staging
+    // it as our join would leave the dance watching the wrong event, so the
+    // handshake fails at ingest: 502, nothing staged, room not registered.
+    let alice = alice();
+    let create = EventBuilder::new(
+        alice.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .unwrap();
+    let room_id = create.room_id.clone();
+    let alice_join = EventBuilder::new(
+        alice.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(alice.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create.event_id.clone()])
+    .prev_state_events(vec![create.event_id.clone()])
+    .build()
+    .unwrap();
+    let zara: OwnedUserId = ZARA.parse().unwrap();
+    let template = EventBuilder::new(
+        zara.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(zara.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![alice_join.event_id.clone()])
+    .prev_state_events(vec![alice_join.event_id.clone()])
+    .build()
+    .unwrap();
+    let mj = json!({ "event": raw_to_value(&template), "room_version": ROOM_VERSION_ID });
+    let sj = json!({
+        "state_dag": [raw_to_value(&create), raw_to_value(&alice_join)],
+        "timeline": [],
+        "event": raw_to_value(&alice_join),
+    });
+    let b = crate::federation::test_support::spawn_stub(stub_resident(mj, sj)).await;
+
+    let (a_store, _a_temp) = fresh_store().await;
+    let a_state = crate::AppState::from_store(config_for("a.example", "bob"), a_store.clone());
+    let resp = crate::federation::join::federated_join_with(
+        &a_state,
+        zara,
+        &room_id,
+        &[b],
+        std::time::Duration::from_millis(800),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert!(!a_store.room_exists(&room_id).await.unwrap());
+    assert!(a_store.staged_for_room(&room_id).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -4238,7 +5143,7 @@ async fn federated_join_missing_create_in_response_fails_without_registering() {
     .unwrap();
     let mj = json!({ "event": raw_to_value(&template), "room_version": ROOM_VERSION_ID });
     // No create anywhere in the response.
-    let sj = json!({ "state_dag": [], "timeline": [], "event": raw_to_value(&template) });
+    let sj = json!({ "state_dag": [], "timeline": [] });
     let b = crate::federation::test_support::spawn_stub(stub_resident(mj, sj)).await;
 
     let (a_store, _a_temp) = fresh_store().await;
@@ -4268,10 +5173,10 @@ async fn federated_join_retry_reattaches_to_inflight_dance() {
     // an aborted waiter and its retry; only a /join arriving after the dance
     // resolves starts a fresh one.
     //
-    // The ghost-referencing template (as in
-    // `federated_join_times_out_when_state_never_grounds`) keeps the dance in
-    // flight for its full ingest wait, so the retry deterministically lands
-    // while it is still running.
+    // A slow send_join (the resident holds the response for 1.5 s) keeps the
+    // dance in flight, so the retry deterministically lands while it is still
+    // running. The response is the ghost-referencing DAG, so once it arrives
+    // the dance resolves to 502 at ingest.
     let alice = alice();
     let create = EventBuilder::new(
         alice.clone(),
@@ -4310,9 +5215,9 @@ async fn federated_join_retry_reattaches_to_inflight_dance() {
     let sj = json!({
         "state_dag": [raw_to_value(&create), raw_to_value(&template)],
         "timeline": [],
-        "event": raw_to_value(&template),
     });
-    let (router, make_joins) = stub_resident_counting(mj, sj);
+    let (router, make_joins, _) =
+        stub_resident_counting(mj, sj, std::time::Duration::from_millis(1500));
     let b = crate::federation::test_support::spawn_stub(router).await;
 
     let (a_store, _a_temp) = fresh_store().await;
@@ -4346,8 +5251,8 @@ async fn federated_join_retry_reattaches_to_inflight_dance() {
     // The client gives up (reqwest timeout drops the request future).
     waiter.abort();
 
-    // The retry re-attaches: it inherits the running dance's outcome (a 504
-    // after ITS 1500ms ingest wait — the retry's own 1ms timeout is unused)
+    // The retry re-attaches: it inherits the running dance's outcome (the 502
+    // once the slow send_join lands — the retry's own 1ms timeout is unused)
     // and the resident sees no second handshake.
     let resp = crate::federation::join::federated_join_with(
         &a_state,
@@ -4357,7 +5262,7 @@ async fn federated_join_retry_reattaches_to_inflight_dance() {
         std::time::Duration::from_millis(1),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         make_joins.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -4373,7 +5278,7 @@ async fn federated_join_retry_reattaches_to_inflight_dance() {
         std::time::Duration::from_millis(1),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         make_joins.load(std::sync::atomic::Ordering::SeqCst),
         2,
@@ -4482,12 +5387,12 @@ async fn invite_oob_stores_stub_and_returns_event() {
 
     // Stub stored, retrievable, and `unsigned.invite_room_state` preserved.
     let stored = store
-        .get_invite(&room_id, &invited)
+        .get_oob_membership(&room_id, &invited)
         .await
         .unwrap()
         .expect("OOB invite stub stored");
-    assert_eq!(stored.event_id, invite_id);
-    let v: Value = serde_json::from_str(stored.raw.get()).unwrap();
+    assert_eq!(stored.event.event_id, invite_id);
+    let v: Value = serde_json::from_str(stored.event.raw.get()).unwrap();
     assert_eq!(
         v.pointer("/unsigned/invite_room_state/0/content/name")
             .and_then(|n| n.as_str()),
@@ -4540,7 +5445,11 @@ async fn invite_for_hosted_room_applies_via_worker_not_oob_stub() {
         .expect("carol now has a member event in current state");
     assert_eq!(member.content_str("membership").as_deref(), Some("invite"));
     assert!(
-        store.get_invite(&room_id, &carol).await.unwrap().is_none(),
+        store
+            .get_oob_membership(&room_id, &carol)
+            .await
+            .unwrap()
+            .is_none(),
         "a hosted-room invite must NOT be stored as an out-of-band stub"
     );
 }
@@ -4586,7 +5495,7 @@ async fn invite_rejects_non_local_invitee() {
     // Nothing stored.
     assert!(
         store
-            .get_invite(
+            .get_oob_membership(
                 &room_id,
                 &"@dave:other.example.org".parse::<OwnedUserId>().unwrap()
             )
@@ -4757,11 +5666,11 @@ async fn outbound_invite_federates_then_persists() {
     // B stored the OOB stub (it doesn't host the room) with our stripped
     // invite_room_state (the round-trip through B's real /invite/v2).
     let stub = b_store
-        .get_invite(&room_id, &dave_uid)
+        .get_oob_membership(&room_id, &dave_uid)
         .await
         .unwrap()
         .expect("B stored the OOB invite stub");
-    let v: Value = serde_json::from_str(stub.raw.get()).unwrap();
+    let v: Value = serde_json::from_str(stub.event.raw.get()).unwrap();
     let types: Vec<&str> = v
         .pointer("/unsigned/invite_room_state")
         .and_then(|a| a.as_array())
@@ -4884,7 +5793,11 @@ async fn invite_for_hosted_room_unauthorised_inviter_is_rejected() {
     );
     // …and a hosted-room invite is NEVER parked as an out-of-band stub.
     assert!(
-        store.get_invite(&room_id, &carol).await.unwrap().is_none(),
+        store
+            .get_oob_membership(&room_id, &carol)
+            .await
+            .unwrap()
+            .is_none(),
         "hosted-room invite must not fall back to an OOB stub"
     );
 }
@@ -4973,8 +5886,24 @@ async fn seed_room_with_invited_zara() -> (
     .await
 }
 
+/// The user's current in-room `content.membership`, or `None` when the room DAG
+/// holds no member event for them.
+async fn current_membership_str(
+    store: &SqliteStore,
+    room_id: &RoomId,
+    user: &OwnedUserId,
+) -> Option<String> {
+    store
+        .current_state_event(room_id, "m.room.member", user.as_str())
+        .await
+        .unwrap()
+        .and_then(|e| e.content_str("membership"))
+}
+
 fn make_leave_path(room_id: &RoomId, user: &str) -> String {
-    format!("/_matrix/federation/v1/make_leave/{room_id}/{user}?ver={ROOM_VERSION_ID}")
+    // No `?ver=`: the spec defines none for make_leave, and real requesters
+    // (gomatrixserverlib, Synapse) send none.
+    format!("/_matrix/federation/v1/make_leave/{room_id}/{user}")
 }
 
 fn send_leave_path(room_id: &RoomId, event_id: &OwnedEventId) -> String {
@@ -5035,22 +5964,22 @@ async fn make_leave_unknown_room_returns_404() {
 }
 
 #[tokio::test]
-async fn make_leave_incompatible_version_returns_400() {
-    // make_leave negotiates the room version like make_join: a `ver` that does
-    // not include ours — or an absent `ver` (which defaults to `[1]`) — yields
-    // 400 M_INCOMPATIBLE_ROOM_VERSION with our `room_version` in the body.
+async fn make_leave_ignores_ver_query() {
+    // The spec defines no `ver` query for make_leave (unlike make_join), and
+    // real requesters (gomatrixserverlib, Synapse) send none. A missing or even
+    // mismatching `ver` must not gate the template: the requester learns the
+    // version from `room_version` in the response.
     let (router, _store, room_id, _head, _tempfile) = seed_room_with_invited_zara().await;
 
-    let path = format!("/_matrix/federation/v1/make_leave/{room_id}/{ZARA}?ver=1");
-    let (status, body) = get(&router, &path).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
-    assert_eq!(body["errcode"], "M_INCOMPATIBLE_ROOM_VERSION");
-    assert_eq!(body["room_version"], ROOM_VERSION_ID);
-
-    let path = format!("/_matrix/federation/v1/make_leave/{room_id}/{ZARA}");
-    let (status, body) = get(&router, &path).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
-    assert_eq!(body["errcode"], "M_INCOMPATIBLE_ROOM_VERSION");
+    for path in [
+        format!("/_matrix/federation/v1/make_leave/{room_id}/{ZARA}"),
+        format!("/_matrix/federation/v1/make_leave/{room_id}/{ZARA}?ver=1"),
+    ] {
+        let (status, body) = get(&router, &path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body:?}");
+        assert_eq!(body["room_version"], ROOM_VERSION_ID, "{path}");
+        assert_eq!(body["event"]["content"]["membership"], "leave", "{path}");
+    }
 }
 
 // --- send_leave (inbound) ----------------------------------------------
@@ -5286,6 +6215,7 @@ async fn send_leave_unauthorised_leave_returns_403() {
 /// invite event (whose `sender` domain is B — the reject handshake target).
 async fn serve_resident_with_invite(
     invitee: &str,
+    layer: impl FnOnce(axum::Router) -> axum::Router,
 ) -> (
     String,
     Arc<SqliteStore>,
@@ -5336,7 +6266,7 @@ async fn serve_resident_with_invite(
         .create_room(&create, &[bob_join, invite.clone()])
         .await
         .expect("create_room on B");
-    let router = router_with_store(config_for(&name, "bob"), store.clone());
+    let router = layer(router_with_store(config_for(&name, "bob"), store.clone()));
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
@@ -5344,15 +6274,24 @@ async fn serve_resident_with_invite(
 }
 
 #[tokio::test]
-async fn outbound_reject_invite_federates_leave_and_removes_stub() {
+async fn outbound_reject_invite_federates_leave_and_records_it() {
     // B hosts the room and invited our local alice. A holds only the OOB stub.
     let alice = alice();
     let (_b_name, b_store, room_id, invite, _b_tempfile) =
-        serve_resident_with_invite(alice.as_str()).await;
+        serve_resident_with_invite(alice.as_str(), |r| r).await;
 
     let (a_store, _a_temp) = fresh_store().await;
     let a_router = router_with_store(config(), a_store.clone());
-    a_store.put_invite(&room_id, &alice, &invite).await.unwrap();
+    a_store
+        .put_oob_membership(
+            &room_id,
+            &alice,
+            &invite,
+            neutrino_event::ROOM_VERSION_ID,
+            None,
+        )
+        .await
+        .unwrap();
 
     let (status, body) = post_json(
         &a_router,
@@ -5362,15 +6301,6 @@ async fn outbound_reject_invite_federates_leave_and_removes_stub() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
 
-    // A's stub is gone (declined).
-    assert!(
-        a_store
-            .get_invite(&room_id, &alice)
-            .await
-            .unwrap()
-            .is_none(),
-        "the OOB invite stub must be removed on reject"
-    );
     // B applied the leave: alice is now `leave` in B's current state.
     let member = b_store
         .current_state_event(&room_id, "m.room.member", alice.as_str())
@@ -5382,6 +6312,652 @@ async fn outbound_reject_invite_federates_leave_and_removes_stub() {
         Some("leave"),
         "B must record alice's leave via the handshake"
     );
+    // A's stub is now that same leave (declined, and visible as such to sync).
+    let stub = a_store
+        .get_oob_membership(&room_id, &alice)
+        .await
+        .unwrap()
+        .expect("the completed leave replaces the OOB invite stub");
+    assert_eq!(stub.membership, Membership::Leave);
+    assert_eq!(stub.event.event_id, member.event_id);
+    assert_eq!(stub.event.sender, alice);
+}
+
+/// Declining an invite names it; a re-invite landing during the leave
+/// handshake is newer and must survive the decline's local write.
+#[tokio::test]
+async fn outbound_reject_invite_racing_a_reinvite_keeps_the_reinvite() {
+    let alice = alice();
+    let (a_store, _a_temp) = fresh_store().await;
+    let pending: Arc<std::sync::OnceLock<(OwnedRoomId, neutrino_event::Event)>> = Arc::default();
+    let layer = {
+        let (a_store, pending, alice) = (a_store.clone(), pending.clone(), alice.clone());
+        move |r: axum::Router| {
+            r.layer(axum::middleware::from_fn(
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let (a_store, pending, alice) =
+                        (a_store.clone(), pending.clone(), alice.clone());
+                    async move {
+                        if req.uri().path().contains("/make_leave/")
+                            && let Some((room_id, reinvite)) = pending.get()
+                        {
+                            a_store
+                                .put_oob_membership(
+                                    room_id,
+                                    &alice,
+                                    reinvite,
+                                    ROOM_VERSION_ID,
+                                    None,
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        next.run(req).await
+                    }
+                },
+            ))
+        }
+    };
+    let (_b_name, b_store, room_id, invite, _b_tempfile) =
+        serve_resident_with_invite(alice.as_str(), layer).await;
+    let reinvite = member_pdu(
+        &invite.sender,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&invite.event_id),
+    );
+    pending
+        .set((room_id.clone(), reinvite.clone()))
+        .expect("set once");
+
+    let a_router = router_with_store(config(), a_store.clone());
+    a_store
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID, None)
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(
+        &a_router,
+        &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+
+    let member = b_store
+        .current_state_event(&room_id, "m.room.member", alice.as_str())
+        .await
+        .unwrap()
+        .expect("alice member on B");
+    assert_eq!(
+        membership_str(&member).as_deref(),
+        Some("leave"),
+        "handshake ran"
+    );
+    let stub = a_store
+        .get_oob_membership(&room_id, &alice)
+        .await
+        .unwrap()
+        .expect("stub held");
+    assert_eq!(stub.event.event_id, reinvite.event_id);
+}
+
+/// An invite for a room we hold *stale* state for — a local user joined and
+/// left earlier — is out-of-band like any other: this server is not in the
+/// room, so there is nothing current to auth it against. Staging it would
+/// send the worker gap-filling ancestry the resident refuses to a non-member.
+#[tokio::test]
+async fn invite_for_room_we_left_is_stored_out_of_band() {
+    let (app, store, room_id, head, _tempfile) = seed_room(&[
+        (
+            ALICE,
+            "m.room.member",
+            ALICE,
+            json!({ "membership": "join" }),
+        ),
+        (
+            ALICE,
+            "m.room.member",
+            ALICE,
+            json!({ "membership": "leave" }),
+        ),
+    ])
+    .await;
+    let carol: OwnedUserId = "@carol:example.org".parse().unwrap();
+    let invite = member_pdu(
+        &inviter(),
+        carol.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&head),
+    );
+
+    let (status, body) = put_json(
+        &app,
+        &invite_path(room_id.as_str(), invite.event_id.as_str()),
+        &invite_body(&invite, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    let stub = store
+        .get_oob_membership(&room_id, &carol)
+        .await
+        .unwrap()
+        .expect("invite into a room we are no longer in is an out-of-band stub");
+    assert_eq!(stub.membership, Membership::Invite);
+    assert_eq!(stub.event.event_id, invite.event_id);
+    assert_eq!(stub.room_version, ROOM_VERSION_ID);
+    assert!(
+        store
+            .current_state_event(&room_id, "m.room.member", carol.as_str())
+            .await
+            .unwrap()
+            .is_none(),
+        "not applied to the stale room state"
+    );
+}
+
+/// The inviter rescinding an out-of-band invite: its kick arrives as a PDU in a
+/// `/send` transaction for a room we hold no state for. It is named under the
+/// stub's room version and stored over the stub, not staged.
+#[tokio::test]
+async fn send_leave_for_oob_invited_user_replaces_the_stub() {
+    let (store, _tempfile) = fresh_store().await;
+    let app = router_with_store(config(), store.clone());
+    let bob = inviter();
+    let alice = alice();
+    // A throwaway create only to source a valid room id + a syntactically-valid
+    // prev event id; the room is NOT created in our store (out-of-band).
+    let throwaway = EventBuilder::new(
+        bob.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build throwaway create");
+    let room_id = throwaway.room_id.clone();
+    let invite = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&throwaway.event_id),
+    );
+    store
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID, None)
+        .await
+        .unwrap();
+    let kick = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "leave",
+        std::slice::from_ref(&invite.event_id),
+    );
+
+    let (status, body) = put_json(&app, &send_path("rescind-1"), &txn(&[&kick])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(body["pdus"][kick.event_id.as_str()], json!({}));
+
+    let stub = store
+        .get_oob_membership(&room_id, &alice)
+        .await
+        .unwrap()
+        .expect("the kick replaces the invite stub");
+    assert_eq!(stub.membership, Membership::Leave);
+    assert_eq!(stub.event.event_id, kick.event_id);
+    assert_eq!(stub.event.sender, bob);
+    assert!(
+        !store.room_exists(&room_id).await.unwrap(),
+        "nothing was staged or applied: we are still not in the room"
+    );
+}
+
+/// Lands `reinvite` in `inner` right after the stub is read: the interleaving
+/// a concurrent `/invite` produces against an in-flight rescission.
+struct ReinviteAfterRead {
+    inner: Arc<SqliteStore>,
+    reinvite: neutrino_event::Event,
+}
+
+#[async_trait::async_trait]
+impl OobMembershipStore for ReinviteAfterRead {
+    async fn put_oob_membership(
+        &self,
+        room_id: &RoomId,
+        user_id: &ruma::UserId,
+        event: &neutrino_event::Event,
+        room_version: &str,
+        replaces: Option<&ruma::EventId>,
+    ) -> Result<neutrino_store::OobWrite, neutrino_store::StorageError> {
+        self.inner
+            .put_oob_membership(room_id, user_id, event, room_version, replaces)
+            .await
+    }
+
+    async fn get_oob_membership(
+        &self,
+        room_id: &RoomId,
+        user_id: &ruma::UserId,
+    ) -> Result<Option<neutrino_store::OobMembership>, neutrino_store::StorageError> {
+        let held = self.inner.get_oob_membership(room_id, user_id).await?;
+        self.inner
+            .put_oob_membership(room_id, user_id, &self.reinvite, ROOM_VERSION_ID, None)
+            .await?;
+        Ok(held)
+    }
+
+    async fn remove_oob_membership(
+        &self,
+        room_id: &RoomId,
+        user_id: &ruma::UserId,
+        replaces: Option<&ruma::EventId>,
+    ) -> Result<(), neutrino_store::StorageError> {
+        self.inner
+            .remove_oob_membership(room_id, user_id, replaces)
+            .await
+    }
+
+    async fn resolved_member_event(
+        &self,
+        room_id: &RoomId,
+        user_id: &ruma::UserId,
+    ) -> Result<Option<neutrino_store::ResolvedMembership>, neutrino_store::StorageError> {
+        self.inner.resolved_member_event(room_id, user_id).await
+    }
+
+    async fn resolved_memberships(
+        &self,
+        user_id: &ruma::UserId,
+        memberships: &std::collections::BTreeSet<Membership>,
+    ) -> Result<Vec<(OwnedRoomId, Membership, bool)>, neutrino_store::StorageError> {
+        self.inner.resolved_memberships(user_id, memberships).await
+    }
+}
+
+#[async_trait::async_trait]
+impl StateStore for ReinviteAfterRead {
+    async fn current_room_state(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<
+        std::collections::HashMap<(String, String), neutrino_event::Event>,
+        neutrino_store::StorageError,
+    > {
+        self.inner.current_room_state(room_id).await
+    }
+
+    async fn current_state_event(
+        &self,
+        room_id: &RoomId,
+        event_type: &str,
+        state_key: &str,
+    ) -> Result<Option<neutrino_event::Event>, neutrino_store::StorageError> {
+        self.inner
+            .current_state_event(room_id, event_type, state_key)
+            .await
+    }
+
+    async fn current_state_events_of_type(
+        &self,
+        room_id: &RoomId,
+        event_type: &str,
+    ) -> Result<
+        std::collections::HashMap<String, neutrino_event::Event>,
+        neutrino_store::StorageError,
+    > {
+        self.inner
+            .current_state_events_of_type(room_id, event_type)
+            .await
+    }
+
+    async fn joined_servers(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<ruma::OwnedServerName>, neutrino_store::StorageError> {
+        self.inner.joined_servers(room_id).await
+    }
+
+    async fn joined_rooms(
+        &self,
+        user_id: &ruma::UserId,
+    ) -> Result<Vec<OwnedRoomId>, neutrino_store::StorageError> {
+        self.inner.joined_rooms(user_id).await
+    }
+
+    async fn invited_rooms(
+        &self,
+        user_id: &ruma::UserId,
+    ) -> Result<Vec<OwnedRoomId>, neutrino_store::StorageError> {
+        self.inner.invited_rooms(user_id).await
+    }
+
+    async fn joined_members(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<
+        std::collections::HashMap<OwnedUserId, neutrino_event::Event>,
+        neutrino_store::StorageError,
+    > {
+        self.inner.joined_members(room_id).await
+    }
+}
+
+/// A rescission names the invite it supersedes. If a re-invite replaces that
+/// invite while the rescission is being checked, the rescission is stale and
+/// must be dropped, not written over the re-invite.
+#[tokio::test]
+async fn send_leave_racing_a_reinvite_does_not_clobber_it() {
+    let (store, _tempfile) = fresh_store().await;
+    let bob = inviter();
+    let alice = alice();
+    let throwaway = EventBuilder::new(
+        bob.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build throwaway create");
+    let room_id = throwaway.room_id.clone();
+    let invite = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&throwaway.event_id),
+    );
+    store
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID, None)
+        .await
+        .unwrap();
+    let kick = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "leave",
+        std::slice::from_ref(&invite.event_id),
+    );
+    let reinvite = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&kick.event_id),
+    );
+    let racing = ReinviteAfterRead {
+        inner: store.clone(),
+        reinvite: reinvite.clone(),
+    };
+
+    let consumed = super::send::apply_oob_membership(
+        &racing,
+        &neutrino_event::EventPolicy::trusted_network(),
+        bob.server_name(),
+        "example.org",
+        &room_id,
+        &kick.raw,
+    )
+    .await
+    .unwrap();
+    assert_eq!(consumed, Some(kick.event_id), "dropped, not staged");
+
+    let stub = store
+        .get_oob_membership(&room_id, &alice)
+        .await
+        .unwrap()
+        .expect("stub held");
+    assert_eq!(stub.event.event_id, reinvite.event_id);
+}
+
+#[tokio::test]
+async fn send_leave_for_local_user_in_a_room_we_hold_is_staged_not_diverted() {
+    // A stub can outlive the server joining the room — nothing clears it when
+    // another local user joins or this one accepts locally. Once we hold the
+    // room the out-of-band path must stand down: the PDU belongs in the room
+    // DAG. Diverting it would ack the kick to the sender while the room never
+    // saw it.
+    let (app, store, room_id, create_id, _tempfile) = seed_room(&[]).await;
+    let alice = alice();
+    let bob = inviter();
+    // The stub is written while we are not in the room, then another local
+    // user joins.
+    let invite = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&create_id),
+    );
+    store
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID, None)
+        .await
+        .unwrap();
+    let carol: OwnedUserId = "@carol:example.org".parse().unwrap();
+    let join = member_pdu(
+        &carol,
+        carol.as_str(),
+        &room_id,
+        "join",
+        std::slice::from_ref(&create_id),
+    );
+    store.persist_event(&join, &[]).await.unwrap();
+    let kick = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "leave",
+        std::slice::from_ref(&invite.event_id),
+    );
+
+    let (status, body) = put_json(&app, &send_path("in-room-kick"), &txn(&[&kick])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    // It went to the room DAG, not the stub table: the stub is untouched.
+    let stub = store
+        .get_oob_membership(&room_id, &alice)
+        .await
+        .unwrap()
+        .expect("the stale stub is left alone");
+    assert_eq!(
+        stub.event.event_id, invite.event_id,
+        "the out-of-band path must not consume a PDU for a room we hold"
+    );
+
+    // And the PDU reached the room: either still staged, or already drained
+    // into `events` by the worker.
+    let staged = store.staged_for_room(&room_id).await.unwrap();
+    let reached = staged.iter().any(|r| r.event_id == kick.event_id)
+        || store
+            .get_events(&[kick.event_id.as_ref()])
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.event_id == kick.event_id);
+    assert!(reached, "the kick must be staged for the room worker");
+}
+
+#[tokio::test]
+async fn send_leave_for_a_room_we_hold_but_are_not_in_stays_out_of_band() {
+    // We keep the `rooms` row after leaving, so "do we hold a row" is not the
+    // same question as "are we in the room". `/invite` stubs a membership on
+    // `!server_in_room`, and the rescission path must use that same predicate:
+    // gating on the row instead diverts the rescission into a room DAG that
+    // cannot apply it (its prev_state names the stub, and the peer refuses us
+    // `/get_missing_events` for a room we are not in), leaving the phantom
+    // invite in place.
+    let (store, _tempfile) = fresh_store().await;
+    let app = router_with_store(config(), store.clone());
+    let bob = inviter();
+    let alice = alice();
+    // A room we hold state for but have no joined local member in.
+    let create = EventBuilder::new(
+        bob.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
+    let room_id = create.room_id.clone();
+    store.create_room(&create, &[]).await.expect("create_room");
+    assert!(store.room_exists(&room_id).await.unwrap());
+    assert!(
+        !neutrino_engine::reconcile::server_in_room(
+            &*store,
+            &room_id,
+            ruma::server_name!("example.org")
+        )
+        .await
+        .unwrap(),
+        "precondition: we hold the row but are not in the room"
+    );
+
+    let invite = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&create.event_id),
+    );
+    store
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID, None)
+        .await
+        .unwrap();
+    let kick = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "leave",
+        std::slice::from_ref(&invite.event_id),
+    );
+
+    let (status, body) = put_json(&app, &send_path("rescind-held-room"), &txn(&[&kick])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    let stub = store
+        .get_oob_membership(&room_id, &alice)
+        .await
+        .unwrap()
+        .expect("the stub is still the place this membership lives");
+    assert_eq!(
+        stub.membership,
+        Membership::Leave,
+        "the rescission must be applied to the stub, not diverted into the room DAG"
+    );
+    assert_eq!(stub.event.event_id, kick.event_id);
+}
+
+#[tokio::test]
+async fn send_leave_for_oob_invited_user_not_naming_the_invite_is_ignored() {
+    // INV02-Inbound: a rescission whose `prev_state_events` do not name the
+    // invite it supersedes is dropped — the stub stays an invite, nothing is
+    // staged. The reference is the only tie to the stub (no auth events can be
+    // computed out of band); without the check a stale rescission could be
+    // replayed against a newer invite.
+    let (store, _tempfile) = fresh_store().await;
+    let app = router_with_store(config(), store.clone());
+    let bob = inviter();
+    let alice = alice();
+    let throwaway = EventBuilder::new(
+        bob.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build throwaway create");
+    let room_id = throwaway.room_id.clone();
+    let invite = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&throwaway.event_id),
+    );
+    store
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID, None)
+        .await
+        .unwrap();
+    // Names some other state event (here the create), not the invite.
+    let stale_kick = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "leave",
+        std::slice::from_ref(&throwaway.event_id),
+    );
+
+    let (status, body) = put_json(&app, &send_path("rescind-stale"), &txn(&[&stale_kick])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(body["pdus"][stale_kick.event_id.as_str()], json!({}));
+
+    let stub = store
+        .get_oob_membership(&room_id, &alice)
+        .await
+        .unwrap()
+        .expect("the stub survives");
+    assert_eq!(stub.membership, Membership::Invite);
+    assert_eq!(stub.event.event_id, invite.event_id);
+    assert!(
+        store.staged_for_room(&room_id).await.unwrap().is_empty(),
+        "an ignored rescission is consumed, not staged"
+    );
+    assert!(!store.room_exists(&room_id).await.unwrap());
+}
+
+#[tokio::test]
+async fn send_oob_membership_other_than_inviter_rescinding_is_ignored() {
+    // As synapse: out of band we cannot auth a kick or ban, so only the
+    // inviter's own leave replaces the invite stub. A ban from the inviter and
+    // a leave from another user on the same server are both dropped.
+    let (store, _tempfile) = fresh_store().await;
+    let app = router_with_store(config(), store.clone());
+    let bob = inviter();
+    let mallory: OwnedUserId = "@mallory:remote.example.org".parse().unwrap();
+    let alice = alice();
+    let throwaway = EventBuilder::new(
+        bob.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build throwaway create");
+    let room_id = throwaway.room_id.clone();
+    let invite = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&throwaway.event_id),
+    );
+    store
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID, None)
+        .await
+        .unwrap();
+    let prevs = std::slice::from_ref(&invite.event_id);
+    let ban = member_pdu(&bob, alice.as_str(), &room_id, "ban", prevs);
+    let kick = member_pdu(&mallory, alice.as_str(), &room_id, "leave", prevs);
+
+    let (status, body) = put_json(&app, &send_path("not-inviter"), &txn(&[&ban, &kick])).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    let stub = store
+        .get_oob_membership(&room_id, &alice)
+        .await
+        .unwrap()
+        .expect("the stub survives");
+    assert_eq!(stub.event.event_id, invite.event_id);
+    assert!(store.staged_for_room(&room_id).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -5410,7 +6986,16 @@ async fn outbound_reject_invite_unreachable_server_still_removes_stub() {
         "invite",
         std::slice::from_ref(&create.event_id),
     );
-    a_store.put_invite(&room_id, &alice, &invite).await.unwrap();
+    a_store
+        .put_oob_membership(
+            &room_id,
+            &alice,
+            &invite,
+            neutrino_event::ROOM_VERSION_ID,
+            None,
+        )
+        .await
+        .unwrap();
 
     let (status, body) = post_json(
         &a_router,
@@ -5421,11 +7006,147 @@ async fn outbound_reject_invite_unreachable_server_still_removes_stub() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert!(
         a_store
-            .get_invite(&room_id, &alice)
+            .get_oob_membership(&room_id, &alice)
             .await
             .unwrap()
             .is_none(),
         "stub must be removed even when the inviting server is unreachable"
+    );
+}
+
+#[tokio::test]
+async fn csapi_leave_of_a_joined_room_ignores_a_stale_oob_stub() {
+    // A stub written *before* the user joined is stale, and a later in-room
+    // join supersedes it: `/leave` must emit a real leave rather than
+    // short-circuit on the stub, which would make the endpoint a permanent
+    // no-op for that room. Ordering is what makes the stub stale — see
+    // `ResolvedMembership`; the stub is planted first for exactly that reason.
+    let (store, _tempfile) = fresh_store().await;
+    let alice = alice();
+    let bob = inviter();
+    let create = EventBuilder::new(
+        alice.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
+    let room_id = create.room_id.clone();
+
+    let stale = member_pdu(
+        &bob,
+        alice.as_str(),
+        &room_id,
+        "leave",
+        std::slice::from_ref(&create.event_id),
+    );
+    store
+        .put_oob_membership(&room_id, &alice, &stale, ROOM_VERSION_ID, None)
+        .await
+        .unwrap();
+
+    let join = EventBuilder::new(
+        alice.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(alice.as_str().to_owned())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create.event_id.clone()])
+    .prev_state_events(vec![create.event_id.clone()])
+    .build()
+    .expect("build join");
+    store
+        .create_room(&create, &[join])
+        .await
+        .expect("create_room");
+    let app = router_with_store(config(), store.clone());
+    assert_eq!(
+        current_membership_str(&store, &room_id, &alice)
+            .await
+            .as_deref(),
+        Some("join"),
+        "precondition: alice is joined in-room"
+    );
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        current_membership_str(&store, &room_id, &alice)
+            .await
+            .as_deref(),
+        Some("leave"),
+        "the leave must actually be emitted, not swallowed by the stale stub"
+    );
+}
+
+#[tokio::test]
+async fn csapi_leave_declines_oob_reinvite_to_a_room_we_left() {
+    // After the last local member leaves, `server_in_room` goes false but the
+    // `rooms` row and the stale in-room `leave` member event both remain, so a
+    // fresh invite is stored out of band. `/leave` must still reach the decline
+    // handshake: gating the out-of-band branch on the user's *in-room
+    // membership* instead sees the stale `leave` and returns a lying 200,
+    // stranding the invite forever (nothing clears a stub).
+    let dead = crate::federation::test_support::dead_peer().await;
+    let (app, store, room_id, alice, join_id, _tempfile) = seed_joined_room().await;
+
+    // Alice leaves in-room: current_state now holds her `leave`.
+    let (status, body) = post_json(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        current_membership_str(&store, &room_id, &alice)
+            .await
+            .as_deref(),
+        Some("leave"),
+        "precondition: a stale in-room leave survives"
+    );
+    assert!(
+        store.room_exists(&room_id).await.unwrap(),
+        "precondition: the rooms row survives the leave"
+    );
+
+    // A fresh out-of-band invite for the room we just left.
+    let dead_bob: OwnedUserId = format!("@bob:{dead}").parse().unwrap();
+    let invite = member_pdu(
+        &dead_bob,
+        alice.as_str(),
+        &room_id,
+        "invite",
+        std::slice::from_ref(&join_id),
+    );
+    store
+        .put_oob_membership(&room_id, &alice, &invite, ROOM_VERSION_ID, None)
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert!(
+        store
+            .get_oob_membership(&room_id, &alice)
+            .await
+            .unwrap()
+            .is_none(),
+        "the decline must run: the stub is gone (inviting server unreachable)"
     );
 }
 
@@ -5474,7 +7195,7 @@ async fn reject_then_reinvite_resurrects_stub() {
     assert_eq!(s, StatusCode::OK);
     assert!(
         a_store
-            .get_invite(&room_id, &alice)
+            .get_oob_membership(&room_id, &alice)
             .await
             .unwrap()
             .is_some()
@@ -5489,7 +7210,7 @@ async fn reject_then_reinvite_resurrects_stub() {
     assert_eq!(s, StatusCode::OK);
     assert!(
         a_store
-            .get_invite(&room_id, &alice)
+            .get_oob_membership(&room_id, &alice)
             .await
             .unwrap()
             .is_none()
@@ -5507,7 +7228,7 @@ async fn reject_then_reinvite_resurrects_stub() {
     assert_eq!(s, StatusCode::OK);
     assert!(
         a_store
-            .get_invite(&room_id, &alice)
+            .get_oob_membership(&room_id, &alice)
             .await
             .unwrap()
             .is_some(),
@@ -5704,7 +7425,7 @@ async fn invite_oob_rejects_forged_sender() {
     // Nothing stored.
     assert!(
         store
-            .get_invite(&room_id, &invited)
+            .get_oob_membership(&room_id, &invited)
             .await
             .unwrap()
             .is_none(),
@@ -5728,10 +7449,25 @@ async fn invite_oob_rejects_forged_sender() {
     );
     assert!(
         store
-            .get_invite(&room_id, &invited)
+            .get_oob_membership(&room_id, &invited)
             .await
             .unwrap()
             .is_some(),
         "honest OOB invite stub must be stored"
+    );
+}
+
+/// The low-bandwidth key table must code the MSC4242 request flag under the
+/// same literal as `STATE_DAG_KEY`, or the flag goes over CoAP as a string
+/// key. Flip both together when the MSC stabilises.
+#[test]
+fn state_dag_key_is_lb_coded() {
+    let json =
+        serde_json::to_vec(&serde_json::json!({ super::get_missing_events::STATE_DAG_KEY: true }))
+            .unwrap();
+    // CBOR: map(1), uint 139, true.
+    assert_eq!(
+        neutrino_lb::codec::json_to_cbor(&json).unwrap(),
+        [0xA1, 0x18, 0x8B, 0xF5]
     );
 }
