@@ -142,6 +142,7 @@ impl FederationClient {
         // default `Client::new()` that silently drops the timeouts and the
         // proxy/`no_proxy` config above — consistent with the `unreachable!()`
         // for a bad proxy URL just above, not a silent degrade beside it.
+        #[expect(clippy::expect_used, reason = "no TLS backend, so build() cannot fail")]
         let http = builder
             .build()
             .expect("plaintext reqwest client always builds; no TLS backend to init");

@@ -1,3 +1,7 @@
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use std::{
     collections::{BTreeMap, HashMap},
     ops::ControlFlow,

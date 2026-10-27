@@ -4,6 +4,8 @@
 //! lives in the out-of-tree medium repositories that compose this workspace.
 
 mod complement;
+#[cfg(test)]
+mod layers;
 mod sh;
 
 use std::process::ExitCode;

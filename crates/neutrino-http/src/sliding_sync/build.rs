@@ -704,9 +704,11 @@ async fn build_room<S: StorageBackend>(
             .iter()
             .map(TryInto::try_into)
             .collect::<Result<_, _>>()?;
-        for (t, k) in &deleted_state_keys {
-            raw.push(state_stub_raw(t, k));
-        }
+        raw.extend(
+            deleted_state_keys
+                .iter()
+                .filter_map(|(t, k)| state_stub_raw(t, k)),
+        );
         room.required_state = raw;
     }
 
@@ -968,14 +970,13 @@ fn diff_required_state(
 /// to tell the client a state key was deleted from the room. Ruma v5 types
 /// `required_state` as `Vec<Raw<AnySyncStateEvent>>` with no stub variant, so
 /// we hand-roll the JSON and lean on `Raw` being lazy about its phantom type.
-fn state_stub_raw(event_type: &str, state_key: &str) -> Raw<AnySyncStateEvent> {
+fn state_stub_raw(event_type: &str, state_key: &str) -> Option<Raw<AnySyncStateEvent>> {
     let stub = serde_json::json!({
         "type": event_type,
         "state_key": state_key,
     });
-    let raw: Box<RawValue> = serde_json::value::to_raw_value(&stub)
-        .expect("serialising a fixed-shape JSON literal cannot fail");
-    Raw::<AnySyncStateEvent>::from_json(raw)
+    let raw: Box<RawValue> = serde_json::value::to_raw_value(&stub).ok()?;
+    Some(Raw::from_json(raw))
 }
 
 /// Populate `name`, `avatar`, `joined_count`, `invited_count`, `bump_stamp`

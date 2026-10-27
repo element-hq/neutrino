@@ -27,18 +27,7 @@ Some boundaries exist for a reason the dependency list doesn't show:
 - **`neutrino-testkit`** depends on nothing: its contract with the server is env-var names, SIGUSR2 and HTTP. Renaming an env var in `Config::from_env` makes the rig silently fall back to defaults.
 - **`neutrino-ffi`** depends only on `neutrino-main` (whose re-exports carry everything it needs). It mirrors `Config`/`Command` to keep UniFFI out of the shared crates. Out-of-tree media compose through `neutrino_ffi::start_with`.
 
-Allowed internal dependencies (normal deps):
-
-```
-ctl, event, lb, testkit   → (none)
-room                      → event
-store                     → event, room
-store-sqlite              → event, room, store
-engine                    → event, room, store
-http                      → ctl, event, room, store, engine, store-sqlite   (store-sqlite: see the TODO on App.store)
-main                      → ctl, event, http, lb, store, store-sqlite
-ffi, neutrino             → main
-```
+The internal dependency graph is pinned, edge by edge, in `tools/xtask/src/layers.rs`; `cargo test` fails when a crate gains or drops an internal dependency without updating that table.
 
 ## Data flow
 
