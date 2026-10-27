@@ -37,7 +37,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use neutrino_store::{OobMembershipStore, OobWrite, StateStore};
+use neutrino_store::{OobWrite, StateStore};
 use ruma::events::AnyStrippedStateEvent;
 use ruma::serde::Raw;
 use ruma::{OwnedUserId, RoomId, UserId};
@@ -48,7 +48,7 @@ use tracing::{debug, warn};
 
 use crate::federation::client::{FederationClient, FederationClientError};
 use crate::federation::{FedError, auth, co_sign_if_signed};
-use crate::{AppState, error_response, lock_app};
+use crate::{AppState, Store, error_response, lock_app};
 use neutrino_engine::reconcile::server_in_room;
 use neutrino_engine::{RoomActorError, stage_and_poke};
 
@@ -77,8 +77,8 @@ pub(crate) struct ResponseBody {
 /// authoritative for both (the event id is recomputed from the reference hash,
 /// never read), so a transport is free to compress/elide them and send
 /// placeholder segments.
-pub(crate) async fn handle(
-    State(state): State<AppState>,
+pub(crate) async fn handle<S: Store>(
+    State(state): State<AppState<S>>,
     headers: HeaderMap,
     body: Result<Json<InviteRequestBody>, JsonRejection>,
 ) -> Result<Json<ResponseBody>, FedError> {
@@ -242,8 +242,8 @@ const INVITE_ROOM_STATE_TYPES: &[&str] = &[
 /// invitee already has it from the handshake, and invites are excluded from
 /// transaction broadcast) → 200. Any failure persists nothing, so 200 OK ⟺ the
 /// invitee server acked AND it's persisted AND propagating.
-pub(crate) async fn federated_invite(
-    state: &AppState,
+pub(crate) async fn federated_invite<S: Store>(
+    state: &AppState<S>,
     sender: OwnedUserId,
     room_id: &RoomId,
     target: &UserId,

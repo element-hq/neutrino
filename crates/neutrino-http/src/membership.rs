@@ -10,11 +10,11 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use neutrino_store::{Membership, OobMembershipStore, RoomStore, StateStore};
+use neutrino_store::Membership;
 use ruma::{OwnedUserId, RoomAliasId, RoomId, UserId};
 use serde_json::{Value, json};
 
-use crate::{AppState, AuthUser, error_response, lock_app, room_actor_response};
+use crate::{AppState, AuthUser, Store, error_response, lock_app, room_actor_response};
 
 /// Body extractor for the membership endpoints, whose request body is optional.
 /// `Option<Json<T>>` is not sufficient: axum yields `None` only when the
@@ -84,8 +84,8 @@ fn body_reason(body: Option<&Value>) -> Option<String> {
 /// The current `content.membership` of `target` in `room`, or `None` when the
 /// user has no member event. Maps a storage failure to a ready 500 response.
 #[allow(clippy::result_large_err)] // see `parse_room`
-pub(crate) async fn current_membership(
-    state: &AppState,
+pub(crate) async fn current_membership<S: Store>(
+    state: &AppState<S>,
     room: &RoomId,
     target: &UserId,
 ) -> Result<Option<String>, axum::response::Response> {
@@ -109,7 +109,10 @@ pub(crate) async fn current_membership(
 /// a room that *exists* falls through to the no-op / bad-state handling. Maps a
 /// storage failure to a ready 500.
 #[allow(clippy::result_large_err)] // see `parse_room`
-async fn require_room(state: &AppState, room: &RoomId) -> Result<(), axum::response::Response> {
+async fn require_room<S: Store>(
+    state: &AppState<S>,
+    room: &RoomId,
+) -> Result<(), axum::response::Response> {
     let store = lock_app(state).store.clone();
     match store.room_exists(room).await {
         Ok(true) => Ok(()),
@@ -131,8 +134,8 @@ async fn require_room(state: &AppState, room: &RoomId) -> Result<(), axum::respo
 /// resulting membership string; `reason`, when present, is copied into
 /// content. Returns `Ok(())` on accept, or the actor's standard error response.
 #[allow(clippy::result_large_err)] // see `parse_room`
-async fn change_membership(
-    state: &AppState,
+async fn change_membership<S: Store>(
+    state: &AppState<S>,
     sender: OwnedUserId,
     room: &RoomId,
     target: &UserId,
@@ -154,7 +157,7 @@ async fn change_membership(
     // The `displayname` describes the state_key user; set the server-wide name
     // only when that target is one of our local users.
     if target.server_name().as_str() == own_server {
-        let name = crate::local_display_name(&store).await;
+        let name = crate::local_display_name(&*store).await;
         crate::set_member_displayname(&mut content, &name);
     }
     registry
@@ -177,8 +180,8 @@ async fn change_membership(
 /// Only the `join` state is skipped — `invite`/`leave`/`ban`/absent all fall
 /// through so accepting an invite, re-joining after leaving, or a public join
 /// still emit an event (and `ban` is left for the auth rules to reject).
-pub(crate) async fn join(
-    state: State<AppState>,
+pub(crate) async fn join<S: Store>(
+    state: State<AppState<S>>,
     AuthUser(sender): AuthUser,
     Path(room_id): Path<String>,
     OptionalBody(body): OptionalBody,
@@ -226,8 +229,8 @@ pub(crate) async fn join(
 /// state (never joined, already left, banned) the spec treats the call as a
 /// no-op success, so the handler short-circuits rather than emit an event the
 /// auth rules would reject as an invalid self-leave (rule 5.5.1 → 403).
-pub(crate) async fn leave(
-    state: State<AppState>,
+pub(crate) async fn leave<S: Store>(
+    state: State<AppState<S>>,
     AuthUser(sender): AuthUser,
     Path(room_id): Path<String>,
     OptionalBody(body): OptionalBody,
@@ -309,8 +312,8 @@ pub(crate) async fn leave(
 /// resident servers: for a room we don't host they trigger a federated join
 /// (`federation::join::federated_join`); for a room we already host they are
 /// ignored (we are the resident).
-pub(crate) async fn join_by_id_or_alias(
-    state: State<AppState>,
+pub(crate) async fn join_by_id_or_alias<S: Store>(
+    state: State<AppState<S>>,
     auth: AuthUser,
     Path(room_id_or_alias): Path<String>,
     RawQuery(query): RawQuery,
@@ -339,8 +342,8 @@ pub(crate) async fn join_by_id_or_alias(
 /// Shared body for the target-from-body endpoints (`invite`/`kick`/`ban`):
 /// resolve the required `user_id` target, lift an optional `reason`, emit the
 /// member event, and return `{}` on success.
-async fn targeted(
-    state: &AppState,
+async fn targeted<S: Store>(
+    state: &AppState<S>,
     sender: OwnedUserId,
     room_id: &str,
     body: Option<&Value>,
@@ -366,8 +369,8 @@ async fn targeted(
 /// **remote** invitee (a v12 room id carries no server, so "remote"
 /// is decided by the target's domain vs ours) takes the federated path —
 /// `federation::invite::federated_invite` (federate-then-persist, atomic).
-pub(crate) async fn invite(
-    state: State<AppState>,
+pub(crate) async fn invite<S: Store>(
+    state: State<AppState<S>>,
     AuthUser(sender): AuthUser,
     Path(room_id): Path<String>,
     OptionalBody(body): OptionalBody,
@@ -411,8 +414,8 @@ pub(crate) async fn invite(
 /// redundant `leave` (which v12 auth would otherwise accept from a powerful
 /// sender). We mirror that with a current-membership pre-check; only
 /// `join`/`invite`/`knock` are kickable.
-pub(crate) async fn kick(
-    state: State<AppState>,
+pub(crate) async fn kick<S: Store>(
+    state: State<AppState<S>>,
     AuthUser(sender): AuthUser,
     Path(room_id): Path<String>,
     OptionalBody(body): OptionalBody,
@@ -445,8 +448,8 @@ pub(crate) async fn kick(
 }
 
 /// `POST /rooms/{roomId}/ban` — ban `body.user_id` from the room.
-pub(crate) async fn ban(
-    state: State<AppState>,
+pub(crate) async fn ban<S: Store>(
+    state: State<AppState<S>>,
     AuthUser(sender): AuthUser,
     Path(room_id): Path<String>,
     OptionalBody(body): OptionalBody,
@@ -463,8 +466,8 @@ pub(crate) async fn ban(
 /// the auth rules as a *kick* (the kick-vs-unban arm of rule 5.5 is selected
 /// from the target's current membership). We pre-check and reject the non-ban
 /// case with `403 M_BAD_STATE` (matching Synapse) rather than silently kick.
-pub(crate) async fn unban(
-    state: State<AppState>,
+pub(crate) async fn unban<S: Store>(
+    state: State<AppState<S>>,
     AuthUser(sender): AuthUser,
     Path(room_id): Path<String>,
     OptionalBody(body): OptionalBody,

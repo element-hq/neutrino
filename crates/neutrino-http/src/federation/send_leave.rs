@@ -19,7 +19,7 @@ use serde_json::value::RawValue as RawJsonValue;
 use serde_json::{Value, json};
 
 use crate::federation::{FedError, auth, co_sign_if_signed, map_apply_err};
-use crate::{AppState, lock_app};
+use crate::{AppState, Store, lock_app};
 
 /// Federation `/send_leave` (v2) handler. Returns `{}` on accept.
 ///
@@ -27,8 +27,8 @@ use crate::{AppState, lock_app};
 /// authoritative for both (the event id is recomputed from the reference hash,
 /// never read), so a transport is free to compress/elide them and send
 /// placeholder segments.
-pub(crate) async fn handle(
-    State(state): State<AppState>,
+pub(crate) async fn handle<S: Store>(
+    State(state): State<AppState<S>>,
     headers: HeaderMap,
     body: Result<Json<Box<RawJsonValue>>, JsonRejection>,
 ) -> Result<Json<Value>, FedError> {

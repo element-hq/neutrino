@@ -10,8 +10,7 @@
 //! with the outbound [`FederationClient::backfill`] client call.
 
 use neutrino_event::EventPolicy;
-use neutrino_store::{DagStore, EventStore, StateStore};
-use neutrino_store_sqlite::SqliteStore;
+use neutrino_store::StorageBackend;
 use ruma::RoomId;
 use tracing::{info, warn};
 
@@ -28,7 +27,7 @@ const MAX_SEEDS: usize = 5;
 // `persist_pdus` → `FederationClient::backfill`); its production caller is the
 // backward-underflow trigger in the `/messages` handler (`messages.rs`).
 pub(crate) async fn backfill_once(
-    store: &SqliteStore,
+    store: &impl StorageBackend,
     client: &FederationClient,
     policy: &EventPolicy,
     own_server: &str,
@@ -77,7 +76,7 @@ pub(crate) async fn backfill_once(
 /// Defensive cap: we sent `limit` on the wire, but a buggy/hostile peer could
 /// return more — `.take(limit)` bounds how many we persist regardless.
 async fn persist_pdus(
-    store: &SqliteStore,
+    store: &impl StorageBackend,
     policy: &EventPolicy,
     room_id: &RoomId,
     pdus: Vec<Box<serde_json::value::RawValue>>,
@@ -331,7 +330,7 @@ mod tests {
         let client = FederationClient::new(OWN.to_owned(), None);
 
         let n = backfill_once(
-            &store,
+            &*store,
             &client,
             &EventPolicy::trusted_network(),
             OWN,
@@ -356,7 +355,7 @@ mod tests {
         let client = FederationClient::new(OWN.to_owned(), None);
 
         let n = backfill_once(
-            &store,
+            &*store,
             &client,
             &EventPolicy::trusted_network(),
             OWN,
@@ -379,7 +378,7 @@ mod tests {
 
         let client = FederationClient::new(OWN.to_owned(), None);
         let n = backfill_once(
-            &store,
+            &*store,
             &client,
             &EventPolicy::trusted_network(),
             OWN,
@@ -430,7 +429,7 @@ mod tests {
 
         let client = FederationClient::new(OWN.to_owned(), None);
         let n = backfill_once(
-            &store,
+            &*store,
             &client,
             &EventPolicy::trusted_network(),
             OWN,
@@ -461,7 +460,7 @@ mod tests {
 
         let client = FederationClient::new(OWN.to_owned(), None);
         let n = backfill_once(
-            &store,
+            &*store,
             &client,
             &EventPolicy::trusted_network(),
             OWN,
@@ -493,7 +492,7 @@ mod tests {
 
         let client = FederationClient::new(OWN.to_owned(), None);
         let n = backfill_once(
-            &store,
+            &*store,
             &client,
             &EventPolicy::trusted_network(),
             OWN,
@@ -532,7 +531,7 @@ mod tests {
 
         let client = FederationClient::new(OWN.to_owned(), None);
         let n = backfill_once(
-            &store,
+            &*store,
             &client,
             &EventPolicy::trusted_network(),
             OWN,
@@ -592,7 +591,7 @@ mod tests {
         stub.set_pdus(vec![held_raw]);
         let client = FederationClient::new(OWN.to_owned(), None);
         let n = backfill_once(
-            &store,
+            &*store,
             &client,
             &EventPolicy::trusted_network(),
             OWN,
@@ -638,7 +637,7 @@ mod tests {
 
         let client = FederationClient::new(OWN.to_owned(), None);
         let n = backfill_once(
-            &store,
+            &*store,
             &client,
             &EventPolicy::trusted_network(),
             OWN,

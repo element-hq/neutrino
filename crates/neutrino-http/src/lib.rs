@@ -22,8 +22,7 @@ use neutrino_event::{Event, EventPolicy, FormatError, RoomVersion};
 use neutrino_room::CoreError;
 use neutrino_room::provider::InMemoryStateProvider;
 use neutrino_room::room_core::{Effect, RoomCore};
-use neutrino_store::{IdentityStore, RoomStore, StateStore, StorageError};
-use neutrino_store_sqlite::SqliteStore;
+use neutrino_store::{IdentityStore, StorageBackend, WithStateProvider};
 use ruma::api::client::sync::sync_events::v5;
 use ruma::events::AnyTimelineEvent;
 use ruma::serde::Raw;
@@ -51,14 +50,16 @@ pub use federation::keys::HttpKeyResolver;
 use neutrino_engine::{MissingEventsFetcher, RoomActorError, RoomRegistry};
 use sliding_sync::{SyncError, SyncState};
 
-struct App {
-    // TODO: depend on the storage traits (`StorageBackend`), not `SqliteStore`,
-    // with construction in neutrino-main, so neutrino-store-sqlite can leave
-    // this crate's normal dependencies.
-    store: Arc<SqliteStore>,
+/// The storage the HTTP layer runs on.
+pub trait Store: StorageBackend + WithStateProvider + 'static {}
+
+impl<T: StorageBackend + WithStateProvider + 'static> Store for T {}
+
+struct App<S: Store> {
+    store: Arc<S>,
     /// Per-room state-machine actors. CSAPI writes go through here so they
     /// are DAG-linked, auth-checked, and state-resolved.
-    room_registry: Arc<RoomRegistry<SqliteStore>>,
+    room_registry: Arc<RoomRegistry<S>>,
     /// In-process poke to the inbound staging worker. The `/send` handler sends
     /// the room id of each freshly-staged PDU; the worker spawns or wakes that
     /// room's drain task. Best-effort (`try_send`): a full buffer just means the
@@ -81,7 +82,7 @@ struct App {
     /// round. (`fetcher` also wraps a `FederationClient`, but only as a type-
     /// erased `MissingEventsFetcher`, which exposes no `backfill` method.)
     fed_client: Arc<FederationClient>,
-    sync_state: Arc<SyncState<SqliteStore>>,
+    sync_state: Arc<SyncState<S>>,
     keys: Option<Value>,
     /// Out-of-band peer discovery (BLE mesh): the host pushes the set of
     /// currently-visible peers here and the user-directory search handler reads
@@ -133,15 +134,20 @@ struct App {
     user_tokens: Arc<Mutex<multi_user::UserTokens>>,
 }
 
-#[derive(Clone)]
-pub struct AppState(Arc<Mutex<App>>);
+pub struct AppState<S: Store>(Arc<Mutex<App<S>>>);
+
+impl<S: Store> Clone for AppState<S> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
 
 /// Lock `App`, recovering from `PoisonError` by taking the inner value.
 /// `App`'s fields hold no invariants that can be broken by a panic
 /// mid-write (each field is independently meaningful), so the poison
 /// flag carries no useful signal — `.unwrap()` would crash every
 /// subsequent request once any handler ever panicked under the lock.
-fn lock_app(state: &AppState) -> std::sync::MutexGuard<'_, App> {
+fn lock_app<S: Store>(state: &AppState<S>) -> std::sync::MutexGuard<'_, App<S>> {
     state.0.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -153,13 +159,13 @@ fn lock_app(state: &AppState) -> std::sync::MutexGuard<'_, App> {
 ///   (`config.user_id()`).
 pub struct AuthUser(pub OwnedUserId);
 
-impl axum::extract::FromRequestParts<AppState> for AuthUser {
+impl<S: Store> axum::extract::FromRequestParts<AppState<S>> for AuthUser {
     type Rejection = axum::response::Response;
 
     #[cfg(feature = "multi-user-shim")]
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
-        state: &AppState,
+        state: &AppState<S>,
     ) -> Result<Self, Self::Rejection> {
         let tokens = lock_app(state).user_tokens.clone();
         match multi_user::resolve(&parts.headers, &tokens) {
@@ -180,7 +186,7 @@ impl axum::extract::FromRequestParts<AppState> for AuthUser {
     #[cfg(not(feature = "multi-user-shim"))]
     async fn from_request_parts(
         _parts: &mut axum::http::request::Parts,
-        state: &AppState,
+        state: &AppState<S>,
     ) -> Result<Self, Self::Rejection> {
         let user_id = lock_app(state).config.user_id();
         match user_id.parse() {
@@ -194,18 +200,16 @@ impl axum::extract::FromRequestParts<AppState> for AuthUser {
     }
 }
 
-/// Errors `AppState::new` (and therefore `router` / `serve`) can surface.
+/// Errors `router` / `serve` can surface.
 #[derive(Debug, thiserror::Error)]
 pub enum StartupError {
     #[error("startup i/o error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("opening sqlite store: {0}")]
-    Store(#[from] StorageError),
     #[error("invalid federation_proxy: {0}")]
     InvalidFederationProxy(String),
 }
 
-impl AppState {
+impl<S: Store> AppState<S> {
     /// Validate `Config` fields that must be well-formed before serving. A
     /// configured federation proxy must parse as a proxy URL — bail at startup
     /// rather than silently falling back to direct federation: in a sidecar
@@ -219,24 +223,9 @@ impl AppState {
         Ok(())
     }
 
-    async fn new(config: Config) -> Result<Self, StartupError> {
-        Self::validate_config(&config)?;
-        // Persistent file-backed store rooted at the configured directory;
-        // the store owns the `<dir>/neutrino.db` layout and creates the dir
-        // if missing. (`open_in_memory` exists but its shared-cache mode is
-        // unsafe for the concurrent reader+writer workloads sliding-sync
-        // long-polls drive — see that method's doc-comment.)
-        let store = Arc::new(SqliteStore::open_in_dir(&config.storage_dir).await?);
-        Ok(Self::from_store(config, store))
-    }
-
-    /// Build an `AppState` around an already-open `SqliteStore`. Used by
-    /// the e2e tests in `src/federation/tests.rs` to seed events via the
-    /// storage trait *before* the router is mounted — `DagStore::missing_events`
-    /// needs specific multi-event DAG shapes (gaps, branches) that are
-    /// simplest to construct directly through the trait rather than via the
-    /// CSAPI write path.
-    pub(crate) fn from_store(config: Config, store: Arc<SqliteStore>) -> Self {
+    /// Build an `AppState` around an already-open store, with an empty
+    /// discovery registry and a trusted-network event policy.
+    pub(crate) fn from_store(config: Config, store: Arc<S>) -> Self {
         Self::from_store_with_discovery(
             config,
             store,
@@ -252,7 +241,7 @@ impl AppState {
     /// one (and [`EventPolicy::trusted_network()`]) for tests/the dev binary.
     pub(crate) fn from_store_with_discovery(
         config: Config,
-        store: Arc<SqliteStore>,
+        store: Arc<S>,
         discovery: Arc<DiscoveryRegistry>,
         policy: EventPolicy,
     ) -> Self {
@@ -273,7 +262,7 @@ impl AppState {
     /// would otherwise reach the network).
     fn from_store_with_fetcher(
         config: Config,
-        store: Arc<SqliteStore>,
+        store: Arc<S>,
         fetcher: Arc<dyn MissingEventsFetcher>,
         discovery: Arc<DiscoveryRegistry>,
         policy: EventPolicy,
@@ -332,8 +321,8 @@ impl AppState {
     }
 
     /// The shared storage handle. Used by `serve` to wire the outbound
-    /// federation sender pool to the same `SqliteStore` the router serves from.
-    fn store(&self) -> Arc<SqliteStore> {
+    /// federation sender pool to the same store the router serves from.
+    fn store(&self) -> Arc<S> {
         lock_app(self).store.clone()
     }
 
@@ -428,10 +417,10 @@ impl AppState {
 // The composition seam: every parameter is one injected policy/handle from the
 // entrypoint, and bundling them into a struct would just move the list.
 #[allow(clippy::too_many_arguments)]
-pub async fn serve(
+pub async fn serve<S: Store>(
     listener: TcpListener,
     config: Config,
-    store: Arc<SqliteStore>,
+    store: Arc<S>,
     commands: mpsc::UnboundedReceiver<Command>,
     // Out-of-band peer discovery registry. The embedding host holds a clone and
     // pushes the visible peer set into it; the user-directory search handler
@@ -450,7 +439,7 @@ pub async fn serve(
     // The caller (the entrypoint) opens the store, resolves the server identity
     // from it, and hands the live handle in — so we build state around it rather
     // than re-opening the same DB.
-    AppState::validate_config(&config)?;
+    AppState::<S>::validate_config(&config)?;
     let state = AppState::from_store_with_discovery(config, store, discovery, policy);
     lock_app(&state).display_name_tx = display_name_tx;
     // Start draining the federation outbox before serving. Outbox rows survive
@@ -496,7 +485,7 @@ pub async fn serve(
 /// more arm in [`handle`] returning [`ControlFlow::Continue`] to keep the loop
 /// running. `state` is the handle to those internals — every *terminal* command
 /// fires the shutdown token before returning.
-async fn dispatch(mut commands: mpsc::UnboundedReceiver<Command>, state: AppState) {
+async fn dispatch<S: Store>(mut commands: mpsc::UnboundedReceiver<Command>, state: AppState<S>) {
     while let Some(command) = commands.recv().await {
         if handle(command, &state).is_break() {
             return; // Shutdown already signalled inside handle
@@ -510,7 +499,7 @@ async fn dispatch(mut commands: mpsc::UnboundedReceiver<Command>, state: AppStat
 /// stop ([`ControlFlow::Break`]) or keep running ([`ControlFlow::Continue`]).
 /// Splitting this out of [`dispatch`] keeps per-command behaviour
 /// unit-testable, and the `Continue` path is what makes the loop a genuine loop.
-fn handle(command: Command, state: &AppState) -> ControlFlow<()> {
+fn handle<S: Store>(command: Command, state: &AppState<S>) -> ControlFlow<()> {
     match command {
         Command::Shutdown => {
             state.begin_shutdown();
@@ -525,19 +514,21 @@ fn handle(command: Command, state: &AppState) -> ControlFlow<()> {
     }
 }
 
-pub async fn router(config: Config) -> Result<Router, StartupError> {
-    let state = AppState::new(config).await?;
-    Ok(build_router(&state))
+/// The router over an already-open store, with an empty discovery registry
+/// and a trusted-network event policy.
+pub async fn router<S: Store>(config: Config, store: Arc<S>) -> Result<Router, StartupError> {
+    AppState::<S>::validate_config(&config)?;
+    Ok(build_router(&AppState::from_store(config, store)))
 }
 
 /// Test-only constructor that mounts the same router over an externally-
-/// provided `SqliteStore`. Used by `src/federation/tests.rs` to seed events
+/// provided store. Used by `src/federation/tests.rs` to seed events
 /// via the `StorageBackend` trait directly before the HTTP layer observes
 /// them — the DAG-walk tests need arbitrary chain/gap shapes that are
 /// simplest to construct through the trait rather than via the CSAPI write
 /// path.
 #[cfg(test)]
-pub(crate) fn router_with_store(config: Config, store: Arc<SqliteStore>) -> Router {
+pub(crate) fn router_with_store<S: Store>(config: Config, store: Arc<S>) -> Router {
     let state = AppState::from_store(config, store);
     build_router(&state)
 }
@@ -547,9 +538,9 @@ pub(crate) fn router_with_store(config: Config, store: Arc<SqliteStore>) -> Rout
 /// [`MissingEventsFetcher`] stub (the default reqwest fetcher would reach the
 /// network for an unreachable test `origin`).
 #[cfg(test)]
-pub(crate) fn router_with_store_and_fetcher(
+pub(crate) fn router_with_store_and_fetcher<S: Store>(
     config: Config,
-    store: Arc<SqliteStore>,
+    store: Arc<S>,
     fetcher: Arc<dyn MissingEventsFetcher>,
 ) -> Router {
     let state = AppState::from_store_with_fetcher(
@@ -562,7 +553,7 @@ pub(crate) fn router_with_store_and_fetcher(
     build_router(&state)
 }
 
-fn build_router(state: &AppState) -> Router {
+fn build_router<S: Store>(state: &AppState<S>) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/_matrix/client/versions", get(versions))
@@ -806,7 +797,7 @@ async fn versions() -> Json<Value> {
 /// all, so the endpoint answers 404 there. No rotation mechanics — the key IS
 /// the node identity, `old_verify_keys` is permanently empty, and
 /// `valid_until_ts` is a rolling window that only paces peer re-fetches.
-async fn server_keys(state: State<AppState>) -> axum::response::Response {
+async fn server_keys<S: Store>(state: State<AppState<S>>) -> axum::response::Response {
     let (signer, server_name) = {
         let app = lock_app(&state.0);
         (app.policy.signer().cloned(), app.config.server_name.clone())
@@ -858,7 +849,10 @@ async fn get_login() -> Json<Value> {
     }))
 }
 
-async fn post_register(state: State<AppState>, body: Json<Value>) -> (StatusCode, Json<Value>) {
+async fn post_register<S: Store>(
+    state: State<AppState<S>>,
+    body: Json<Value>,
+) -> (StatusCode, Json<Value>) {
     // No `auth` block — initiate UIA so the client knows which flows to attempt.
     if body.0.get("auth").is_none() {
         return (
@@ -934,8 +928,8 @@ async fn post_register(state: State<AppState>, body: Json<Value>) -> (StatusCode
     }
 }
 
-async fn post_login(
-    state: State<AppState>,
+async fn post_login<S: Store>(
+    state: State<AppState<S>>,
     #[cfg(feature = "multi-user-shim")] body: Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     info!("Logged in");
@@ -1003,8 +997,8 @@ async fn post_login(
 /// - clones the `Arc<SyncState>` out from under the std-mutex'd `AppState`
 ///   so we don't hold a `!Send` lock across `.await`;
 /// - maps `SyncError` to the spec's HTTP / errcode shape.
-async fn sync(
-    state: State<AppState>,
+async fn sync<S: Store>(
+    state: State<AppState<S>>,
     AuthUser(user_id): AuthUser,
     query: Query<HashMap<String, String>>,
     body: Json<Value>,
@@ -1231,7 +1225,7 @@ fn error_response(status: StatusCode, errcode: &str, error: &str) -> axum::respo
     (status, Json(json!({"errcode": errcode, "error": error}))).into_response()
 }
 
-async fn keys_query(state: State<AppState>, body: Json<Value>) -> Json<Value> {
+async fn keys_query<S: Store>(state: State<AppState<S>>, body: Json<Value>) -> Json<Value> {
     info!("Received query: {:?}", body.0);
 
     if let Some(keys) = &lock_app(&state.0).keys {
@@ -1247,7 +1241,7 @@ async fn keys_query(state: State<AppState>, body: Json<Value>) -> Json<Value> {
     }
 }
 
-async fn keys_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
+async fn keys_upload<S: Store>(state: State<AppState<S>>, body: Json<Value>) -> Json<Value> {
     info!("Received keys upload: {:?}", body.0);
 
     let mut app = lock_app(&state.0);
@@ -1271,7 +1265,10 @@ async fn keys_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
     }))
 }
 
-async fn device_signing_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
+async fn device_signing_upload<S: Store>(
+    state: State<AppState<S>>,
+    body: Json<Value>,
+) -> Json<Value> {
     let mut app = lock_app(&state.0);
 
     let mut body = body.0;
@@ -1292,7 +1289,7 @@ async fn device_signing_upload(state: State<AppState>, body: Json<Value>) -> Jso
     Json(json!({}))
 }
 
-async fn signatures_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
+async fn signatures_upload<S: Store>(state: State<AppState<S>>, body: Json<Value>) -> Json<Value> {
     info!("Received signatures upload: {:?}", body.0);
     let mut app = lock_app(&state.0);
     let user_id = app.config.user_id();
@@ -1329,7 +1326,7 @@ async fn signatures_upload(state: State<AppState>, body: Json<Value>) -> Json<Va
 /// [`IdentityStore`] (falling back to [`DEFAULT_DISPLAY_NAME`]), a discovered
 /// peer's from the [`DiscoveryRegistry`] (matched on the user id's
 /// `server_name`). `None` only for an unknown remote user.
-async fn resolve_display_name(state: &AppState, user_id: &str) -> Option<String> {
+async fn resolve_display_name<S: Store>(state: &AppState<S>, user_id: &str) -> Option<String> {
     let (is_self, store, discovery) = {
         let app = lock_app(state);
         (
@@ -1339,7 +1336,7 @@ async fn resolve_display_name(state: &AppState, user_id: &str) -> Option<String>
         )
     };
     if is_self {
-        return Some(local_display_name(&store).await);
+        return Some(local_display_name(&*store).await);
     }
     user_id
         .rsplit_once(':')
@@ -1351,7 +1348,7 @@ async fn resolve_display_name(state: &AppState, user_id: &str) -> Option<String>
 /// [`DEFAULT_DISPLAY_NAME`] when never set. This is the server-wide display
 /// name both reported for the local user's profile and embedded into the
 /// `m.room.member` events the server authors for the local user.
-pub(crate) async fn local_display_name(store: &SqliteStore) -> String {
+pub(crate) async fn local_display_name(store: &impl IdentityStore) -> String {
     store
         .get_display_name()
         .await
@@ -1374,8 +1371,8 @@ pub(crate) fn set_member_displayname(content: &mut Value, name: &str) {
 /// variant. An unknown remote user yields an empty profile (`{}`) — the spec
 /// permits an absent `displayname`, and there is no profile store to 404 a
 /// never-seen peer against.
-async fn profile(
-    state: State<AppState>,
+async fn profile<S: Store>(
+    state: State<AppState<S>>,
     axum::extract::Path(user_id): axum::extract::Path<String>,
 ) -> Json<Value> {
     match resolve_display_name(&state.0, &user_id).await {
@@ -1386,8 +1383,8 @@ async fn profile(
 
 /// `GET /_matrix/client/v3/profile/{user_id}/displayname` — the keyed variant
 /// of [`profile`], returning only the `displayname` field.
-async fn get_display_name(
-    state: State<AppState>,
+async fn get_display_name<S: Store>(
+    state: State<AppState<S>>,
     axum::extract::Path(user_id): axum::extract::Path<String>,
 ) -> Json<Value> {
     match resolve_display_name(&state.0, &user_id).await {
@@ -1408,8 +1405,8 @@ struct SetDisplayNameRequest {
 /// embedded server is single-user, so the name is server-wide) and re-emits
 /// the user's `m.room.member` in every room they are joined to, as the spec
 /// asks of servers.
-async fn put_display_name(
-    state: State<AppState>,
+async fn put_display_name<S: Store>(
+    state: State<AppState<S>>,
     axum::extract::Path(user_id): axum::extract::Path<String>,
     Json(req): Json<SetDisplayNameRequest>,
 ) -> axum::response::Response {
@@ -1442,7 +1439,7 @@ async fn put_display_name(
 /// as a fresh join. Per-room failures are logged, not surfaced — the name is
 /// already stored, and a room that cannot take the event now picks the name
 /// up on the user's next membership event, as before.
-async fn propagate_display_name(state: &AppState, user: &OwnedUserId, name: &str) {
+async fn propagate_display_name<S: Store>(state: &AppState<S>, user: &OwnedUserId, name: &str) {
     let (store, registry) = {
         let app = lock_app(state);
         (app.store.clone(), app.room_registry.clone())
@@ -1502,8 +1499,8 @@ struct SearchRequest {
 /// user id is rebuilt as `@{localpart}:{server_name}` from its stored fields; a
 /// peer whose advertised data doesn't form a syntactically valid id is skipped
 /// rather than failing the whole search.
-async fn user_directory_search(
-    state: State<AppState>,
+async fn user_directory_search<S: Store>(
+    state: State<AppState<S>>,
     Json(req): Json<SearchRequest>,
 ) -> Json<Value> {
     let mut matches = state.discovery().search(&req.search_term);
@@ -1544,8 +1541,8 @@ async fn get_room_keys() -> (StatusCode, Json<Value>) {
     )
 }
 
-async fn create_room(
-    state: State<AppState>,
+async fn create_room<S: Store>(
+    state: State<AppState<S>>,
     AuthUser(sender): AuthUser,
     body: Json<Value>,
 ) -> axum::response::Response {
@@ -1565,7 +1562,7 @@ async fn create_room(
     // `build_initial_events`. Any failure here is a server bug (the events are
     // server-authored), so it maps to 500. Only *local* invitees are baked into
     // the batch; remote invitees are federated separately below.
-    let display_name = local_display_name(&store).await;
+    let display_name = local_display_name(&*store).await;
     let (create, initial) =
         match build_initial_events(&sender, &body.0, &own_server, &display_name, &policy) {
             Ok(batch) => batch,
@@ -1579,7 +1576,7 @@ async fn create_room(
         };
     let room_id = create.room_id.clone();
 
-    // SqliteStore requires `create_room` to register the room before any
+    // The store requires `create_room` to register the room before any
     // `persist_event` calls succeed. The create event lands via the trait's
     // dedicated path; the rest of the batch comes through alongside as
     // `initial_events` so the whole thing is one transaction. The chain is
@@ -1851,8 +1848,8 @@ fn join_rule_for(body: &Value) -> &'static str {
     if is_public { "public" } else { "invite" }
 }
 
-async fn members(
-    state: State<AppState>,
+async fn members<S: Store>(
+    state: State<AppState<S>>,
     axum::extract::Path(room_id): axum::extract::Path<String>,
 ) -> axum::response::Response {
     let store = lock_app(&state.0).store.clone();
@@ -1887,8 +1884,8 @@ async fn members(
 }
 
 /// `PUT /rooms/{room}/send/{type}/{txn}` — a message (non-state) event.
-async fn put_event(
-    state: State<AppState>,
+async fn put_event<S: Store>(
+    state: State<AppState<S>>,
     AuthUser(sender): AuthUser,
     axum::extract::Path((room_id, event_type, _msg_id)): axum::extract::Path<(
         String,
@@ -1901,8 +1898,8 @@ async fn put_event(
 }
 
 /// `PUT /rooms/{room}/state/{type}/{stateKey}` — a state event.
-async fn put_state(
-    state: State<AppState>,
+async fn put_state<S: Store>(
+    state: State<AppState<S>>,
     AuthUser(sender): AuthUser,
     axum::extract::Path((room_id, event_type, state_key)): axum::extract::Path<(
         String,
@@ -1924,8 +1921,8 @@ async fn put_state(
 
 /// `PUT /rooms/{room}/state/{type}` — a state event with the empty state key
 /// (the common case for `m.room.name`, `m.room.topic`, …).
-async fn put_state_empty_key(
-    state: State<AppState>,
+async fn put_state_empty_key<S: Store>(
+    state: State<AppState<S>>,
     AuthUser(sender): AuthUser,
     axum::extract::Path((room_id, event_type)): axum::extract::Path<(String, String)>,
     body: Json<Value>,
@@ -1944,8 +1941,8 @@ async fn put_state_empty_key(
 /// `GET /rooms/{room}/state` — every current state event, as a bare array of
 /// full (enriched) events. No auth/visibility gating (embedded trusted surface;
 /// matches `members`).
-async fn get_state_all(
-    state: State<AppState>,
+async fn get_state_all<S: Store>(
+    state: State<AppState<S>>,
     axum::extract::Path(room_id): axum::extract::Path<String>,
 ) -> axum::response::Response {
     let store = lock_app(&state.0).store.clone();
@@ -1974,8 +1971,8 @@ async fn get_state_all(
 /// default response is the event `content`; `?format=event` returns the full
 /// enriched event. Reads room state only, so an out-of-band membership (e.g. an
 /// invite to a room this server is not in) is not reflected, unlike `/sync`.
-async fn get_state_event(
-    state: State<AppState>,
+async fn get_state_event<S: Store>(
+    state: State<AppState<S>>,
     axum::extract::Path((room_id, event_type, state_key)): axum::extract::Path<(
         String,
         String,
@@ -1988,16 +1985,16 @@ async fn get_state_event(
 
 /// `GET /rooms/{room}/state/{type}` (and the trailing-slash form) — as
 /// [`get_state_event`] with the empty state key.
-async fn get_state_event_empty_key(
-    state: State<AppState>,
+async fn get_state_event_empty_key<S: Store>(
+    state: State<AppState<S>>,
     axum::extract::Path((room_id, event_type)): axum::extract::Path<(String, String)>,
     query: Query<HashMap<String, String>>,
 ) -> axum::response::Response {
     state_event_response(&state.0, &room_id, &event_type, "", &query.0).await
 }
 
-async fn state_event_response(
-    state: &AppState,
+async fn state_event_response<S: Store>(
+    state: &AppState<S>,
     room_id: &str,
     event_type: &str,
     state_key: &str,
@@ -2052,8 +2049,8 @@ async fn state_event_response(
 /// event through the room's actor (DAG-linked, auth-checked, state-resolved)
 /// and return `{ event_id }`. `state_key = None` for a message event,
 /// `Some(_)` for a state event.
-async fn send_via_actor(
-    state: &AppState,
+async fn send_via_actor<S: Store>(
+    state: &AppState<S>,
     sender: OwnedUserId,
     room_id: String,
     event_type: String,
@@ -2126,9 +2123,10 @@ async fn default_fallback() -> (StatusCode, &'static str) {
 mod tests {
     use super::{
         AppState, Command, Config, ControlFlow, DiscoveryRegistry, Event, EventPolicy, OwnedUserId,
-        SqliteStore, StatusCode, TcpListener, Value, build_initial_events, build_router,
-        create_content, dispatch, handle, invite_targets, join_rule_for, mpsc,
+        StatusCode, TcpListener, Value, build_initial_events, build_router, create_content,
+        dispatch, handle, invite_targets, join_rule_for, mpsc,
     };
+    use neutrino_store_sqlite::SqliteStore;
     use serde_json::json;
     use std::sync::Arc;
     use std::time::Duration;
@@ -2172,7 +2170,7 @@ mod tests {
     /// A throwaway `AppState` over a fresh temp-dir store. `dispatch` takes a
     /// state handle (for future server-directed commands); these tests only
     /// exercise the lifecycle arms, so the state is constructed but unused.
-    async fn test_state() -> (AppState, TempDir) {
+    async fn test_state() -> (AppState<SqliteStore>, TempDir) {
         let tmp = TempDir::new().expect("tempdir");
         let store = Arc::new(
             SqliteStore::open_in_dir(tmp.path())
@@ -2251,7 +2249,12 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let mut config = test_config(&tmp);
         config.federation_proxy = Some("not a url".to_string());
-        let err = super::router(config)
+        let store = Arc::new(
+            SqliteStore::open_in_dir(tmp.path())
+                .await
+                .expect("open store"),
+        );
+        let err = super::router(config, store)
             .await
             .expect_err("invalid federation_proxy must abort startup");
         assert!(

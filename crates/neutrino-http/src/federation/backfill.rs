@@ -15,13 +15,12 @@ use axum::{
     extract::{Path, RawQuery, State},
     http::HeaderMap,
 };
-use neutrino_store::{EventStore, RoomStore};
 use ruma::{EventId, OwnedEventId, OwnedRoomId};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 
 use crate::federation::{FedError, auth};
-use crate::{AppState, lock_app};
+use crate::{AppState, Store, lock_app};
 
 /// Spec/Synapse default for `limit` when the requester omits it. Backfill's
 /// `limit` is nominally required (ruma types it `UInt`), but a *missing* or
@@ -71,8 +70,8 @@ pub(crate) struct ResponseBody {
 ///    skipped, not a 500 — `events_before` rejects unknown seeds).
 /// 6. Walk back via `DagStore::events_before` (seeds included, newest-first).
 /// 7. Ship `Event.raw` verbatim inside the transaction envelope.
-pub(crate) async fn handle(
-    State(state): State<AppState>,
+pub(crate) async fn handle<S: Store>(
+    State(state): State<AppState<S>>,
     Path(room_id): Path<String>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,

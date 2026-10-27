@@ -20,7 +20,7 @@ use axum::{
     response::IntoResponse,
 };
 
-use crate::{AppState, error_response, lock_app};
+use crate::{AppState, Store, error_response, lock_app};
 use crate::{
     legacy_sync::translate::{parse_legacy_query, synthesize_v5_request, translate_response},
     sliding_sync::{self, SyncError},
@@ -35,8 +35,8 @@ pub mod translate;
 /// `AppState` so we don't hold a `!Send` lock across `.await`) and error
 /// mapping (`UnknownPos` → 400 M_UNKNOWN_POS, `BadRequest` → 400
 /// M_INVALID_PARAM, `Storage` / `EventConversion` → 500 M_UNKNOWN).
-pub(crate) async fn handle(
-    state: State<AppState>,
+pub(crate) async fn handle<S: Store>(
+    state: State<AppState<S>>,
     crate::AuthUser(user_id): crate::AuthUser,
     query: Query<HashMap<String, String>>,
 ) -> axum::response::Response {

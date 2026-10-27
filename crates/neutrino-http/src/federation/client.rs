@@ -127,7 +127,7 @@ impl FederationClient {
         builder = match proxy {
             Some(url) => match reqwest::Proxy::all(url) {
                 Ok(p) => builder.proxy(p),
-                // `federation_proxy` is validated at startup (`AppState::new`
+                // `federation_proxy` is validated at startup (`AppState::validate_config`
                 // returns `StartupError::InvalidFederationProxy`). Reaching this
                 // arm means the config was constructed past that check, which is
                 // a programming bug — fail loud rather than silently go direct.

@@ -44,16 +44,14 @@ use axum::{
     http::HeaderMap,
 };
 use neutrino_event::{EventPolicy, Wire};
-use neutrino_store::{
-    FederationInbox, Membership, OobMembershipStore, OobWrite, StagingStore, StorageError,
-};
+use neutrino_store::{Membership, OobMembershipStore, OobWrite, StorageError};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 use tracing::warn;
 
 use crate::federation::{FedError, auth};
-use crate::{AppState, lock_app};
+use crate::{AppState, Store, lock_app};
 use neutrino_engine::{ForwardExtremities, reconcile};
 
 /// Inbound federation transaction body.
@@ -222,8 +220,8 @@ pub(super) async fn apply_oob_membership(
 
 /// Federation `/send/{txnId}` handler. Stages the transaction's PDUs and pokes
 /// the background worker; integration happens asynchronously.
-pub(crate) async fn handle(
-    State(state): State<AppState>,
+pub(crate) async fn handle<S: Store>(
+    State(state): State<AppState<S>>,
     Path(txn_id): Path<String>,
     headers: HeaderMap,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,

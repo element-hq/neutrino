@@ -23,13 +23,13 @@
 //! same join as a no-op and we simply rebuild and return the state again.
 
 use axum::{Json, extract::State, extract::rejection::JsonRejection, http::HeaderMap};
-use neutrino_store::{DagStore, EventStore, RoomStore};
+use neutrino_store::{DagStore, EventStore};
 use ruma::{EventId, OwnedEventId};
 use serde::Serialize;
 use serde_json::value::RawValue as RawJsonValue;
 
 use crate::federation::{FedError, auth, co_sign_if_signed, map_apply_err};
-use crate::{AppState, lock_app};
+use crate::{AppState, Store, lock_app};
 
 /// Recent timeline events to include in the `send_join` response. The joiner
 /// backfills deeper history lazily via `/backfill`; this only needs to cover
@@ -54,8 +54,8 @@ pub(crate) struct ResponseBody {
 /// authoritative for both (the event id is recomputed from the reference hash,
 /// never read), so a transport is free to compress/elide them and send
 /// placeholder segments.
-pub(crate) async fn handle(
-    State(state): State<AppState>,
+pub(crate) async fn handle<S: Store>(
+    State(state): State<AppState<S>>,
     headers: HeaderMap,
     body: Result<Json<Box<RawJsonValue>>, JsonRejection>,
 ) -> Result<Json<ResponseBody>, FedError> {

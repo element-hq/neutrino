@@ -48,7 +48,12 @@ async fn room_survives_restart_on_same_storage_dir() {
     let cfg = config_in(tmp.path());
 
     // First boot: create a room.
-    let app1 = router(cfg.clone()).await.expect("router boot 1");
+    let store = std::sync::Arc::new(
+        neutrino_store_sqlite::SqliteStore::open_in_dir(&cfg.storage_dir)
+            .await
+            .expect("open store"),
+    );
+    let app1 = router(cfg.clone(), store).await.expect("router boot 1");
     let (status, body) = send(
         &app1,
         "POST",
@@ -61,7 +66,12 @@ async fn room_survives_restart_on_same_storage_dir() {
     drop(app1); // close the pools so the DB file is fully released
 
     // Second boot on the SAME directory: the room must still be there.
-    let app2 = router(cfg).await.expect("router boot 2");
+    let store = std::sync::Arc::new(
+        neutrino_store_sqlite::SqliteStore::open_in_dir(&cfg.storage_dir)
+            .await
+            .expect("open store"),
+    );
+    let app2 = router(cfg, store).await.expect("router boot 2");
     let (status, state) = send(
         &app2,
         "GET",
