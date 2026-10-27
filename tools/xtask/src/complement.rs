@@ -1,3 +1,20 @@
+//! `cargo xtask complement`: runs [Complement](https://github.com/matrix-org/complement)
+//! against the `neutrino:complement` image (`docker/complement/Dockerfile`;
+//! `IMAGE_TAG` overrides the tag). The image is rebuilt unless
+//! `SKIP_IMAGE_BUILD` is set and it already exists.
+//!
+//! `complement/` holds a Go module whose `go.mod` pins the Complement framework
+//! for neutrino's own tests (`tests/`, run with `--in-repo`), and
+//! `allowlist.txt`. Upstream tests come from `COMPLEMENT_DIR` if set, else a
+//! `matrix-org/complement` archive at `COMPLEMENT_REF` (default `main`) fetched
+//! into `./complement-<ref>/`; only `./tests/csapi/...` is run.
+//!
+//! Each allowlist entry (non-blank, non-`#` line) runs as its own
+//! `go test -run <entry>` and failures are aggregated. Trailing args are
+//! forwarded to `go test`; an explicit `-run` among them bypasses the
+//! allowlist. A failing allowlisted test means fix neutrino or remove the
+//! entry with a rationale.
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -29,7 +46,7 @@ pub fn parse_allowlist(contents: &str) -> Vec<String> {
 }
 
 /// True when the forwarded args contain an explicit `-run` selection, which
-/// bypasses the allowlist (matches the old script's debug escape hatch).
+/// bypasses the allowlist (the single-test debug escape hatch).
 pub fn is_adhoc_run(extra: &[String]) -> bool {
     extra.iter().any(|a| a == "-run")
 }
@@ -64,7 +81,7 @@ fn ensure_image(root: &Path, image: &str) -> Result<(), sh::Error> {
 }
 
 /// Resolve a complement checkout: COMPLEMENT_DIR if set, else fetch the
-/// matrix-org/complement archive for COMPLEMENT_REF into ./complement-<ref>/.
+/// matrix-org/complement archive for COMPLEMENT_REF into `./complement-<ref>/`.
 fn ensure_complement_checkout(root: &Path) -> Result<PathBuf, sh::Error> {
     if let Some(dir) = std::env::var_os("COMPLEMENT_DIR") {
         return Ok(PathBuf::from(dir));

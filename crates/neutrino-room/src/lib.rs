@@ -28,9 +28,8 @@ pub(crate) mod test_utils {
     }
 }
 
-// The canonical `Event` type and the `RoomVersion` enum live in
-// `neutrino-event` so storage and state-machine code share them. See
-// `event-id-design.md` for the rationale.
+// The canonical `Event` type lives in `neutrino-event` so storage and
+// state-machine code share it.
 pub use neutrino_event::Event;
 // `FormatError` is event-scoped (wire-format / provider-free semantic rules)
 // and lives in `neutrino-event`; `CoreError` wraps it here.
@@ -54,7 +53,7 @@ pub fn joined_servers(current_state: &StateMap<Arc<Event>>) -> BTreeSet<OwnedSer
 /// A change to apply to the resolved current state, keyed by
 /// `(event_type, state_key)`. `Some(id)` sets or replaces the pointer for
 /// that key (the referenced event is already persisted); `None` removes the
-/// key entirely. Emitted by `RoomCore::apply` as the delta between the old
+/// key entirely. Emitted by `RoomCore::apply_pdu` as the delta between the old
 /// and recomputed current state — the persist layer applies it verbatim. A
 /// `BTreeMap` (not `HashMap`) so the iteration order the persist layer sees
 /// is deterministic.

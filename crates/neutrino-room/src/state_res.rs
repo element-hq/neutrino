@@ -686,7 +686,7 @@ pub fn mainline_sort(
 // ----------------- state_before / state_at_heads -----------------
 
 /// Memoisation table for `state_at_heads` / `state_before` walks. Threaded
-/// through both calls in `RoomCore::apply` so the overlapping
+/// through both calls in `RoomCore::apply_pdu` so the overlapping
 /// `prev_state_events` ↔ forward-extremity subgraphs are walked once.
 pub type StateBeforeCache = HashMap<OwnedEventId, Arc<StateMap<OwnedEventId>>>;
 
@@ -700,7 +700,7 @@ pub type StateBeforeCache = HashMap<OwnedEventId, Arc<StateMap<OwnedEventId>>>;
 ///
 /// `cache` is consulted (and populated) for every event_id whose
 /// `state_before` is computed during the walk. Pass a fresh cache for a
-/// one-shot call; share one across multiple calls within the same `apply`
+/// one-shot call; share one across multiple calls within the same `apply_pdu`
 /// to amortise the overlap.
 ///
 /// **Errors**: any unknown id traversed (a head, or any
@@ -748,7 +748,7 @@ pub fn state_at_heads(
 /// after a `get_event` lookup. Root case (no `prev_state_events`, i.e. a
 /// create event) returns the empty map.
 ///
-/// Convenience wrapper that allocates its own cache; for `apply`'s
+/// Convenience wrapper that allocates its own cache; for `apply_pdu`'s
 /// back-to-back walks, prefer `state_at_heads` with a shared
 /// `StateBeforeCache`.
 pub fn state_before(

@@ -1,6 +1,5 @@
 //! Contention tests — verify the read/write pool split survives
-//! concurrent access. Public-API subset of the design doc §4 contention
-//! surface (`docs/2026-05-18-read-write-pool-split.md`).
+//! concurrent access, through the public API only.
 //!
 //! Tests requiring internals not exposed to integration tests — raw
 //! reader/writer pool-connection accessors, deliberately-slow closures
@@ -169,11 +168,9 @@ async fn watch_monotonic_under_concurrent_writes() {
 /// regardless of writer activity, and the reader pool isn't serialised
 /// by the writer mutex, so neither side should block the other.
 ///
-/// Not as precise as the design-doc §4 tests 7-9 (which would pin
-/// `≤ 500ms` for a writer-during-long-read deadline), but at the public
-/// API boundary we don't have the "slow read"/"slow write" hooks
-/// needed for those — this is the cheap deadlock-class regression
-/// guard instead.
+/// Does not pin a latency bound (e.g. a writer-during-long-read deadline):
+/// the public API has no "slow read"/"slow write" hooks for that. This is
+/// the cheap deadlock-class regression guard instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mixed_reads_and_writes_make_progress() {
     let (s, _tempfile) = store_with_room_on_tempfile().await;

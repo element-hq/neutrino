@@ -169,7 +169,7 @@ async fn two_in_process_nodes_federate_over_cbor() {
 /// and *join* the sidecar before returning `Ok` — the `DendriteService.stop()`
 /// analogue. A hang in that join, or a sidecar that never releases its port, is
 /// exactly what this pins. The federation test above holds the command channel
-/// open for its whole life, so this path was previously unexercised.
+/// open for its whole life, so only this test exercises this path.
 #[tokio::test]
 async fn entrypoint_tears_down_sidecar_when_homeserver_stops() {
     let hs = free_port().await;

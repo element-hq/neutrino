@@ -1,4 +1,11 @@
+//! Developer tasks that don't fit a plain `cargo` invocation
+//! ([xtask pattern](https://github.com/matklad/cargo-xtask)). Run
+//! `cargo xtask <command>` from the workspace root. Android artifact packaging
+//! lives in the out-of-tree medium repositories that compose this workspace.
+
 mod complement;
+#[cfg(test)]
+mod layers;
 mod sh;
 
 use std::process::ExitCode;

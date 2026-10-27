@@ -5,8 +5,8 @@
 //! (`?via=` hints — a v12 room id carries no server, so we cannot derive one):
 //!
 //! 1. `make_join` → a membership-event template on the resident's heads.
-//! 2. Complete it (fill ts, recompute the reference-hash id — no signature) and
-//!    `send_join` it back.
+//! 2. Complete it (fill ts, recompute the reference-hash id, sign in signed
+//!    mode) and `send_join` it back.
 //! 3. **Ingest** the MSC4242 `state_dag` + `timeline`: register the room from
 //!    its create event, then **stage** every event and let the per-room drain
 //!    worker apply them through `apply_pdu` (auth + state-res + persist). No DAG
@@ -218,12 +218,10 @@ async fn run_join_dance(
 /// client cannot supply a `via` for a v12 room id (no domain), so we mirror
 /// Synapse (`handlers/room_member.py:1108`) and source it from the invite.
 ///
-/// Trust model: peers in the mesh are implicitly trusted, so the inviter's
-/// `server_name` is used as an outbound join target verbatim — there is no
-/// loopback / private-range / allowlist check. A hostile invite could point
-/// this request at an arbitrary host, but every federated peer is trusted by
-/// design (signatures are off for the same reason), so this is intentional, not
-/// an oversight.
+/// The inviter's `server_name` is used as an outbound join target verbatim —
+/// there is no loopback / private-range / allowlist check, in either trust
+/// mode. A hostile invite can point this request at an arbitrary host; event
+/// signatures (signed mode) protect what the join accepts, not where it dials.
 ///
 /// Returns:
 ///   - `Some(_)` when a federated join was attempted (its CSAPI response), or

@@ -11,7 +11,7 @@ const SCHEMA_SQL: &str = include_str!("schema.sql");
 pub(crate) const SCHEMA_VERSION: i64 = 3;
 
 /// Version-gate the database against the bundled schema. Authoritative
-/// open-time check per design doc §2 "Open path: version gate & schema bundle".
+/// open-time check.
 ///
 /// | `user_version`     | Action                                          |
 /// |--------------------|-------------------------------------------------|
@@ -59,7 +59,7 @@ pub(crate) fn ensure_schema(conn: &mut Connection) -> Result<(), Error> {
 }
 
 /// Per-connection PRAGMAs applied via the deadpool `post_create` hook on
-/// every connection check-out. Per design doc §2 "Pool initialization".
+/// every connection check-out.
 ///
 /// `foreign_keys` enforcement is the critical one — it's per-connection,
 /// not persisted in the DB file, and defaults to OFF. The hook makes
@@ -68,8 +68,8 @@ pub(crate) fn ensure_schema(conn: &mut Connection) -> Result<(), Error> {
 /// `journal_mode = WAL` is NOT applied here — it's persisted in the DB
 /// file and only needs setting once at open time (via `schema.sql`).
 ///
-/// `query_only` flips between reader (ON) and writer (OFF) per the
-/// read/write pool split doc §1 — runtime enforcement that a mis-routed
+/// `query_only` flips between reader (ON) and writer (OFF) — runtime
+/// enforcement that a mis-routed
 /// write on a reader connection fails fast with `SQLITE_READONLY`.
 pub(crate) fn apply_connection_pragmas(conn: &Connection, query_only: bool) -> Result<(), Error> {
     // Tuning values (journal_size_limit / mmap_size / cache_size) adapted

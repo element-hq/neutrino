@@ -26,7 +26,7 @@ use crate::error::Error;
 ///
 /// `auth_events_json` carries the MSC4242 server-computed auth_events
 /// list — it's not on the wire and not in `json`, so the column is its
-/// authoritative storage. See `event-id-design.md` §"Co-location pattern".
+/// authoritative storage.
 pub(crate) const EVENT_COLUMNS: &str = "event_id, room_id, event_type, state_key, sender, origin_server_ts, json, auth_events_json, rejected, soft_failed";
 
 /// Same as [`EVENT_COLUMNS`] but with an `e.` prefix on each column, for

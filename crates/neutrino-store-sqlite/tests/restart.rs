@@ -1,12 +1,6 @@
 //! Restart durability tests — verify that an `SqliteStore` reopened
 //! at the same file path observes everything the prior process
-//! committed. The design doc
-//! (`docs/2026-05-14-sqlite-storage-backend.md` §2 "Restart & crash
-//! semantics") makes load-bearing claims about WAL atomicity, watch
-//! seeding from `MAX(stream_pos)`, and outbox redelivery on restart;
-//! the integration test surface had no coverage of those before, so a
-//! regression that broke any of them would only have shown up in
-//! production.
+//! committed.
 //!
 //! File-backed via `tempfile::TempDir` (a throwaway directory per test,
 //! opened through `SqliteStore::open_in_dir`) — `open_in_memory` is
@@ -188,10 +182,8 @@ async fn restart_preserves_all_state() {
     assert_eq!(pdus[0].event_id.as_str(), msg_id.as_str());
 
     // Federation inbox dedup record survives — replaying the same
-    // (origin, txn_id) must return true (already seen). This is the
-    // "outbox redelivery on restart is safe because
-    // record_federation_txn is idempotent on the remote" property
-    // from the design doc.
+    // (origin, txn_id) must return true (already seen) — what makes outbox
+    // redelivery on restart safe on the receiving side.
     let already = s
         .record_federation_txn(origin, "txn-Z")
         .await

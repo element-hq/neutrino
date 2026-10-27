@@ -78,12 +78,10 @@ pub(crate) struct TransactionBody {
     #[serde(default)]
     pdus: Vec<Box<RawJsonValue>>,
     /// EDUs are out of scope (no presence/typing/receipts/E2EE on this server).
-    /// Deserialized for shape validation, then dropped — stubbed per CLAUDE.md.
+    /// Deserialized for shape validation, then dropped.
     #[serde(default, rename = "edus")]
     _edus: Vec<Box<RawJsonValue>>,
-    /// Anti-entropy: the sender's per-room forward extremities. Optional; a peer
-    /// that has not implemented forward-extremity reconciliation omits it and the
-    /// transaction behaves exactly as before. For each advertised room we hold,
+    /// Anti-entropy: the sender's per-room forward extremities. Optional. For each advertised room we hold,
     /// any head we are missing is fetched + reconciled (off the response path).
     #[serde(default)]
     forward_extremities: BTreeMap<OwnedRoomId, ForwardExtremities>,

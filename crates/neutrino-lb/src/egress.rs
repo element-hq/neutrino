@@ -83,10 +83,8 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
         .iter()
         .map(|(k, v)| (k.as_str().to_owned(), v.as_bytes().to_vec()))
         .collect();
-    // No body-size cap (`usize::MAX`): the body here is our own homeserver's
-    // outbound request (loopback), so it is trusted. Neutrino assumes a trusted
-    // network throughout (see the peer-facing note in `transport::http` and
-    // `neutrino/CLAUDE.md`), so no limit is imposed.
+    // No body-size cap (`usize::MAX`): the body is our own homeserver's
+    // outbound request over loopback.
     let json_body = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b.to_vec(),
         Err(e) => {

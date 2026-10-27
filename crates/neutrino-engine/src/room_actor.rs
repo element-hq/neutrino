@@ -11,17 +11,16 @@
 //!
 //! - The actor owns the mutable state ([`RoomCore`]: the two head-sets +
 //!   current_state) in memory. Single owner ⇒ no concurrent writer.
-//! - `RoomCore::apply` reads only immutable data (persisted events + auth
-//!   chains) through a provider, so it needs no write transaction. The
-//!   provider is connection-bound and `pub(crate)`, so the actor borrows one
-//!   for the apply via [`SqliteStore::with_state_provider`] — the store opens
-//!   a reader connection and hands back a `&dyn StateProvider`; the apply
-//!   itself stays here in the actor.
+//! - `RoomCore::apply_pdu` reads only immutable data (persisted events + auth
+//!   chains) through a provider, so it needs no write transaction. The actor
+//!   borrows one for the apply via
+//!   [`WithStateProvider::with_state_provider`], which hands back a
+//!   `&dyn StateProvider`; the apply itself stays here in the actor.
 //! - Persisting the accepted event + new head-sets is the one short write
 //!   transaction — `EventStore::persist_resolved_event`.
 //!
 //! The actor applies to a **clone** of its `RoomCore` and adopts it only
-//! after the persist commits, so an apply hard-reject or a storage fault
+//! after the persist commits, so an apply error or a storage fault
 //! leaves the in-memory state untouched.
 //!
 //! The CSAPI write handlers (`/send`, `/state`) drive this via the
@@ -330,7 +329,7 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomActor<S> {
     ///
     /// `source` labels where the event came from (`federation` / `resident` /
     /// `local`) so the one-line-per-event apply log can be filtered. Logging
-    /// lives here, not in `apply_pdu`, because `neutrino-state` carries no
+    /// lives here, not in `apply_pdu`, because `neutrino-room` carries no
     /// `tracing` dependency and isn't in the default log filter — and the
     /// verdict (accept / reject / soft-fail / duplicate / retry, and whether
     /// `current_state` moved) is fully reconstructable from the effects.

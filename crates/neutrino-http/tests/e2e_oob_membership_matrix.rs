@@ -27,8 +27,8 @@
 //!
 //! Reference points for the divergences:
 //! `https://spec.matrix.org/unstable/server-server-api/`, and where the spec is
-//! silent, Synapse at /workspace/synapse (`handlers/federation.py`,
-//! `federation/federation_server.py`).
+//! silent, Synapse (`synapse/handlers/federation.py`,
+//! `synapse/federation/federation_server.py`).
 //!
 //! # Tables
 //!

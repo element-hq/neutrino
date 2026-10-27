@@ -34,7 +34,7 @@
 //! The ingress points are mirrored relative to the egress ones — lb is a server
 //! on one leg and a client on the other. Recording the real bytes rather than
 //! re-transcoding CBOR at a lower layer matters: `json_to_cbor` → `cbor_to_json`
-//! is not byte-identical (key mapping in [`crate::codec::keys`], key ordering,
+//! is not byte-identical (key mapping in `codec::keys`, key ordering,
 //! number forms), so a re-transcode would show a canonicalised view and would
 //! hide exactly the codec bugs a JSON capture is for.
 //!
@@ -72,10 +72,9 @@
 //!
 //! Each exchange is a real TCP conversation: SYN, SYN-ACK, ACK, then the request
 //! and response segmented at [`MSS`] with correct sequence and acknowledgement
-//! numbers. Bodies therefore have no size ceiling — the previous CoAP-over-UDP
-//! capture silently dropped anything over 64 KiB, which meant large `send_join`
-//! responses and fat `/send` transactions were missing from exactly the captures
-//! taken to investigate them.
+//! numbers. Bodies therefore have no size ceiling: a single-datagram framing
+//! would cap them at 64 KiB and drop the large `send_join` responses and fat
+//! `/send` transactions a capture is usually taken to investigate.
 //!
 //! Timestamps are wall-clock ([`SystemTime`]); a merged two-device timeline
 //! (`mergecap`) is only as good as the two device clocks.

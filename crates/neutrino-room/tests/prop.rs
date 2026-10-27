@@ -1,6 +1,6 @@
 //! Property-based tests.
 //!
-//! The 69 case tests in `src/` are the spec-anchored documentation — each one
+//! The case tests in `src/` are the spec-anchored documentation — each one
 //! corresponds to a quoted "reject" / "MUST" clause. The properties below
 //! supplement those by sweeping inputs that hand-written cases couldn't
 //! efficiently cover:
@@ -128,8 +128,7 @@ fn arb_prev_state_events() -> impl Strategy<Value = Vec<OwnedEventId>> {
 }
 
 /// Strategy for an `m.room.message` event with varied sender and ancestry.
-/// `EventBuilder` computes the event_id from the canonical bytes, so the
-/// strategy no longer threads in a separate `arb_event_id`.
+/// `EventBuilder` computes the event_id from the canonical bytes.
 fn arb_message_event() -> impl Strategy<Value = Event> {
     (
         arb_user_id(),

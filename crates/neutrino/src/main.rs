@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Translate SIGUSR2 into [`neutrino_main::Command::KickBackoff`] for the local
-/// dev binary. The federation test rig sends SIGUSR2 to a container after
+/// dev binary. The federation test rig sends SIGUSR2 to a child process after
 /// healing a network partition so that destination's outbound sender resets its
 /// backoff and retries immediately, rather than waiting out the (up to 15 min)
 /// backoff cap.

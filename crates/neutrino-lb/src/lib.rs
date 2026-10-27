@@ -1,6 +1,45 @@
-//! neutrino-lb: a sidecar that transcodes Server-Server federation bodies
-//! between JSON (local side) and CBOR (wire side). See
-//! `docs/superpowers/specs/2026-06-15-neutrino-lb-cbor-proxy-design.md`.
+//! In-process sidecar that transcodes Server-Server federation bodies between
+//! JSON (the local homeserver) and CBOR (the wire), behind the
+//! [`transport::WireClient`] / [`transport::WireServer`] seam. The [`egress`]
+//! half is `neutrino-http`'s federation forward proxy; the [`ingress`] half
+//! forwards peer requests to the loopback homeserver. The body codec
+//! ([`codec`]) is integer-key, a port of Dendrite `internal/lb`.
+//!
+//! Wire transports ([`WireKind`]; both peers must agree):
+//! - [`WireKind::Http`] — CBOR over HTTP; the type's default, debuggable with
+//!   ordinary tooling.
+//! - [`WireKind::Coap`] — CON CoAP with RFC 7959 blockwise transfer.
+//! - [`WireKind::CoapQBlock`] — RFC 9177 NON-mode bursts with missing-block
+//!   recovery; what `neutrino-main` runs.
+//!
+//! The CoAP wire runs over a UDP socket, or over an injected [`DatagramLink`]
+//! when [`LbConfig::link`] is `Some` (see [`transport::coap::datagram`]).
+//!
+//! A medium declares facts ([`LinkProfile`]) and
+//! [`WireKind::coap_qblock_for_profile`] derives the Q-Block config from them:
+//! the block size from its MTU and, for a medium that meters its sends, the
+//! timing from its [`LinkPacing`] ([`QBlockTuning::for_pacing`]). The
+//! load-bearing value is `non_receive_timeout`: coap-rs fires recovery on time
+//! since last activity, so a timeout at or below the sender's own inter-burst
+//! pause reads that pause as loss, and the recovery traffic then competes for
+//! the air time that made the link slow.
+//!
+//! A one-block Q-Block request has no burst for a 4.08 to reach, so its loss
+//! surfaces only as silence: the exchange gives up after one
+//! `non_receive_timeout` and the caller retries under a fresh token. That bound
+//! is also all the time a peer gets to answer, so widening the MTU (which moves
+//! heavier endpoints into one block) means re-checking it against their answer
+//! time.
+//!
+//! DoS posture — the wire ingress is the network-exposed surface: assembled
+//! bodies are capped (ingress 413, egress error). Q-Block reassembly is also
+//! capped before allocation, limited in concurrent transfers, bound to its
+//! source address and expired by an absolute partial-transfer TTL; the client's
+//! request timeout is derived from the tuning so recovery isn't killed
+//! mid-exchange.
+//!
+//! The pcap tap ([`capture`]) sits at the HTTP/JSON edges, so it works on every
+//! transport and is blind to everything below it.
 
 pub mod capture;
 pub mod codec;
@@ -64,8 +103,8 @@ pub fn install_crypto_provider() {
 /// 2)` — an implementation quantity, *not* an RFC constant (the RFC's own
 /// receiver delay grows exponentially with the per-payload retry count, so it can
 /// exceed this linear figure). `CoapWireClient::with_qblock` sizes the
-/// total-exchange timeout to cover this linger automatically, so raising these
-/// knobs no longer risks a recovery being killed mid-exchange by `REQUEST_TIMEOUT`.
+/// total-exchange timeout to cover this linger, so raising these knobs does not
+/// risk a recovery being killed mid-exchange by `REQUEST_TIMEOUT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QBlockTuning {
     /// Blocks sent per burst before the inter-burst congestion delay
@@ -131,9 +170,9 @@ impl QBlockTuning {
     }
 
     /// Map to coap-rs's `QBlockConfig`, leaving its CON-mode fields
-    /// (`probing_rate`, `nstart`, `non_probing_wait`) and the NON field
-    /// `non_partial_timeout` (a partial-body hold time, not yet wired in coap-rs
-    /// v1) at their defaults — none are read on the NON send/serve path today.
+    /// (`probing_rate`, `nstart`, `non_probing_wait`), unread on the NON path,
+    /// and `non_partial_timeout` (the absolute partial-transfer TTL) at their
+    /// defaults.
     ///
     /// `block1_size` is the wire's per-block payload cap (`None` = coap-rs's
     /// 1024 B default). Both ends of the LB hop run this stack, so the config
@@ -205,10 +244,7 @@ impl WireKind {
     /// block beyond the framing is the medium's business — its [`LinkCodec`]
     /// controls the per-block options — and a datagram that still overflows
     /// the link's MTU is the link's to detect and log loudly, not to size
-    /// around. (The pre-LinkCodec wire reserved 384 B here for the
-    /// uncompressed path/credential options, after a 1024 B block + real
-    /// federation options overflowed the 1280 B message cap and silently
-    /// stalled the send.)
+    /// around.
     ///
     /// The MTU is clamped to coap-lite's `Packet::MAX_SIZE` first —
     /// `to_bytes()` refuses larger messages regardless of link capacity, so a
@@ -475,8 +511,8 @@ async fn run_pair<S: WireServer>(
 mod profile_tests {
     use super::*;
 
-    // The default profile states today's operating assumptions — the values
-    // every existing medium implicitly ran under before profiles existed.
+    // The default profile: a full `Packet::MAX_SIZE` datagram budget on an
+    // authenticated, unmetered hop.
     #[test]
     fn default_profile_is_todays_assumptions() {
         let p = LinkProfile::default();

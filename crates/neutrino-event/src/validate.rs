@@ -9,12 +9,12 @@
 //!
 //! Reference validation (v12 rule 2 + the MSC4242 `prev_state_events` triad)
 //! requires provider lookups against a single room's DAG, so it is room-scoped
-//! and lives in `neutrino-state` (`validate::validate_references`).
+//! and lives in `neutrino-room` (`validate::validate_references`).
 //!
 //! `validate_pdu` is split out of `parse_event` so downstream callers
-//! (`RoomCore::apply`) don't have to take "you ran parse_event already" as
+//! (`RoomCore::apply_pdu`) don't have to take "you ran parse_event already" as
 //! a precondition. Both `EventBuilder::build` / `from_wire` and
-//! `RoomCore::apply` run validate_pdu explicitly; apply also runs it
+//! `RoomCore::apply_pdu` run validate_pdu explicitly; apply also runs it
 //! defensively so a hand-constructed `Event` can't bypass the semantic
 //! checks.
 //!
@@ -257,7 +257,7 @@ pub fn semantic_verdict(err: &FormatError) -> SemanticVerdict {
 /// required field presence, JSON value types, ID parsing. Semantic rules
 /// (count limits, create structural constraints, rule 9, per-type content
 /// shape) belong to [`validate_pdu`]; reference validation belongs to
-/// `neutrino-state`'s `validate::validate_references`.
+/// `neutrino-room`'s `validate::validate_references`.
 ///
 /// `event_id` is provided by the caller: under v12 it derives from the event's
 /// reference hash, which is computed by a separate event-building step. This
@@ -267,8 +267,8 @@ pub fn semantic_verdict(err: &FormatError) -> SemanticVerdict {
 /// first failed check (validation is not exhaustive — additional issues may
 /// surface after fixing the first).
 ///
-/// The `signatures` field is intentionally ignored. Per `CLAUDE.md` the
-/// server runs on a trusted network and does not verify signatures.
+/// The `signatures` field is not inspected; provenance is checked at ingress
+/// by [`EventSecurity::admit`](crate::sign::EventSecurity::admit).
 pub fn parse_event(
     raw: Box<RawValue>,
     event_id: OwnedEventId,
@@ -409,7 +409,7 @@ pub fn parse_event(
 /// Split out of [`parse_event`] so callers don't have to take "you ran
 /// parse_event" as an implicit precondition for the semantic rules: a
 /// hand-constructed `Event` that bypassed parse_event still has to satisfy
-/// these checks before `RoomCore::apply` will accept it.
+/// these checks before `RoomCore::apply_pdu` will accept it.
 ///
 /// Checks:
 /// - **S-S API §"Size limits"**: the whole PDU ≤ `MAX_PDU_BYTES` bytes as
@@ -434,9 +434,7 @@ pub fn parse_event(
 pub fn validate_pdu(event: &Event, version: &RoomVersion) -> Result<(), FormatError> {
     // S-S API §"Size limits" — first, mirroring synapse's
     // `check_state_independent_auth_rules` ordering. The whole-PDU limit is
-    // measured on the canonical JSON encoding of the wire bytes (`Event.raw`);
-    // this server has no signatures, so canonical `raw` is the full
-    // federation-format event.
+    // measured on the canonical JSON encoding of the wire bytes (`Event.raw`).
     let wire = match serde_json::from_str::<CanonicalJsonValue>(event.raw.get())? {
         CanonicalJsonValue::Object(obj) => obj,
         _ => {

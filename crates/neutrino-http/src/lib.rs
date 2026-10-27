@@ -1,3 +1,7 @@
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use std::{
     collections::{BTreeMap, HashMap},
     ops::ControlFlow,
@@ -48,6 +52,9 @@ use neutrino_engine::{MissingEventsFetcher, RoomActorError, RoomRegistry};
 use sliding_sync::{SyncError, SyncState};
 
 struct App {
+    // TODO: depend on the storage traits (`StorageBackend`), not `SqliteStore`,
+    // with construction in neutrino-main, so neutrino-store-sqlite can leave
+    // this crate's normal dependencies.
     store: Arc<SqliteStore>,
     /// Per-room state-machine actors. CSAPI writes go through here so they
     /// are DAG-linked, auth-checked, and state-resolved.
@@ -143,7 +150,7 @@ fn lock_app(state: &AppState) -> std::sync::MutexGuard<'_, App> {
 /// - feature `multi-user-shim` ON: resolves `Authorization: Bearer <token>`
 ///   against the in-memory token map; 401 on missing/unknown.
 /// - feature OFF: ignores any token and yields the single configured user
-///   (`config.user_id()`), exactly matching today's single-user behaviour.
+///   (`config.user_id()`).
 pub struct AuthUser(pub OwnedUserId);
 
 impl axum::extract::FromRequestParts<AppState> for AuthUser {
@@ -1024,7 +1031,7 @@ async fn sync(
 
     // Wrap the handler in an absolute backstop deadline. A healthy long-poll
     // returns well within `BACKSTOP_TIMEOUT`; if it doesn't, the handler is
-    // wedged (see the const's doc + the decisions log). The outer timer's
+    // wedged (see the const's doc). The outer timer's
     // waker is registered with the time driver independently of any inner
     // await, so it fires even when the inner wakers are lost; on fire we drop
     // `handle` (which frees the conn lock) and return a retryable error rather
@@ -1554,7 +1561,7 @@ async fn create_room(
     // Build the spec-mandated initial-state batch (create → join →
     // power_levels → join_rules, plus name/topic when requested). Each event
     // is built on the running heads, server-side `auth_events` selected, and
-    // verified through `RoomCore::apply` before it's persisted — see
+    // verified through `RoomCore::apply_pdu` before it's persisted — see
     // `build_initial_events`. Any failure here is a server bug (the events are
     // server-authored), so it maps to 500. Only *local* invitees are baked into
     // the batch; remote invitees are federated separately below.
@@ -1770,8 +1777,8 @@ fn build_initial_events(
 /// `creation_content.additional_creators`, never substituted for them. The
 /// creator is never listed (`invite_targets` drops them) and the list is
 /// sorted + deduplicated, since rule 1.4 only demands valid user ids.
-/// Malformed entries are dropped, matching `invite_targets`; the rest of
-/// `creation_content` is not yet honoured (see PLAN.md).
+/// Malformed entries are dropped, matching `invite_targets`. No other
+/// `creation_content` key is read.
 fn create_content(sender: &OwnedUserId, body: &Value, version: &RoomVersion) -> Value {
     let mut content = json!({ "room_version": version.id });
     let mut creators: Vec<String> = body
@@ -1965,7 +1972,8 @@ async fn get_state_all(
 
 /// `GET /rooms/{room}/state/{type}/{stateKey}` — the current state event. The
 /// default response is the event `content`; `?format=event` returns the full
-/// enriched event.
+/// enriched event. Reads room state only, so an out-of-band membership (e.g. an
+/// invite to a room this server is not in) is not reflected, unlike `/sync`.
 async fn get_state_event(
     state: State<AppState>,
     axum::extract::Path((room_id, event_type, state_key)): axum::extract::Path<(
@@ -2094,6 +2102,8 @@ async fn pushers_set() -> (StatusCode, Json<Value>) {
 }
 
 async fn get_capabilities() -> Json<Value> {
+    // TODO: advertises "12", not the version createRoom stamps
+    // (`RoomVersions::default_for_new_rooms`, e.g. `org.matrix.msc4242.12`).
     Json(json!({
         "capabilities": {
             "m.room_versions": {
@@ -2125,10 +2135,9 @@ mod tests {
     use tempfile::TempDir;
 
     /// The wire mirror must keep an extensions object that carries *only*
-    /// receipts. It previously used a hand-rolled emptiness predicate that knew
-    /// about to-device and e2ee alone, so a receipts-only response serialised
-    /// with the whole extensions object dropped — the synthesised receipt was
-    /// built and then silently discarded at the JSON edge.
+    /// receipts. An emptiness predicate that knows only to-device and e2ee
+    /// drops the whole object for a receipts-only response, silently
+    /// discarding the synthesised receipt at the JSON edge.
     #[test]
     fn wire_keeps_a_receipts_only_extensions_object() {
         use ruma::api::client::sync::sync_events::v5;
@@ -2489,8 +2498,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_shutdown_breaks() {
-        // The only terminal command today. When a non-terminal variant lands it
-        // returns ControlFlow::Continue, and this stays the per-command oracle.
+        // Shutdown is the only terminal command.
         let (state, _tmp) = test_state().await;
         assert_eq!(handle(Command::Shutdown, &state), ControlFlow::Break(()));
     }

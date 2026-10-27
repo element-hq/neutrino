@@ -3,16 +3,15 @@
 //!
 //! We return an unsigned `m.room.member` (`membership: join`) *template* built
 //! on the room's current heads. The joining server completes it (filling
-//! `origin_server_ts`, recomputing the reference-hash event id — we add no
-//! signature, trusted mesh) and sends it back via `send_join`.
+//! `origin_server_ts`, recomputing the reference-hash event id, signing it in
+//! signed mode) and sends it back via `send_join`.
 //!
 //! Per MSC4242 the template carries `prev_events` (timeline forward
 //! extremities) and `prev_state_events` (state-DAG forward extremities) but
 //! **no `auth_events`** — those are server-computed at apply time, so the
 //! joining server neither has nor needs the state DAG to produce a valid id.
 //!
-//! Trusted-mesh deviations match the sibling federation handlers: no signature,
-//! no `join_authorised_via_users_server` (restricted rooms are out of scope — a
+//! No `join_authorised_via_users_server` (restricted rooms are out of scope — a
 //! `restricted`/`knock` join rule is refused 403 here). The `X-Matrix` origin is
 //! authenticated and must own the joining user (see handler).
 

@@ -6,7 +6,10 @@
 //! [`translate`]. This module's [`handle`] is the axum entrypoint
 //! that ties them together — extracts state, calls into
 //! `sliding_sync::handle`, maps errors and shapes the response.
-//! See `docs/legacy-sync-stub.md` for the design.
+//!
+//! Room state is returned as MSC4222 `state_after`: sliding sync's
+//! `required_state` is already the state after the returned timeline, so no
+//! state-at-start-of-batch has to be recomputed.
 
 use std::collections::HashMap;
 
@@ -48,7 +51,7 @@ pub(crate) async fn handle(
     // last-issued one with `UnknownPos` (a v5-only reconnect signal). So on an
     // unknown/stale token we don't 400; we fall back to a full initial sync,
     // which returns current state under a fresh token. (Stale tokens collapse to
-    // "state now" rather than a true cumulative delta — see docs/legacy-sync-stub.md.)
+    // "state now" rather than a true cumulative delta.)
     let resp = match sliding_sync::handle(&sync_state, &user_id, req).await {
         Err(SyncError::UnknownPos) => {
             let mut initial = synthesize_v5_request(&legacy_query);

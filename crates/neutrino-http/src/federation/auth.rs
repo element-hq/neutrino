@@ -1,22 +1,18 @@
 //! `X-Matrix` federation auth — a **network-attested** identity, NOT a
 //! cryptographic proof.
 //!
-//! Real Matrix federation signs each request and the receiver verifies the
-//! signature against the origin's published key. Neutrino has no signing key and
-//! runs no signature checks (trusted mesh — see the crate root), so we can
-//! neither produce nor verify a real `X-Matrix` header. Instead we carry only
-//! `origin` + `destination` (no `key`/`sig`) and trust the `origin` **solely
-//! because the network layer (mTLS / a trusted proxy / a private mesh)
-//! authenticated the peer**. The absent signature field is deliberate and
-//! self-documenting: a reader sees there is no signature, so this can never be
-//! mistaken for verified federation auth.
+//! Only `origin` is read; an inbound `key`/`sig` is never verified, even when
+//! `trusted_network` is off (outbound requests carry one only in signed mode — see
+//! [`crate::federation::client`]). The `origin` is trusted **solely because the
+//! network layer (mTLS / a trusted proxy / a private mesh) authenticated the
+//! peer**.
 //!
 //! SECURITY: `origin` is an identity *hint* only. It drives transaction dedup,
 //! gap-fill / reconcile fetch targeting, member-only read scoping, and
 //! cross-checks of self-asserted fields (`body.origin`, an event's `sender`). It
 //! MUST NOT bypass event-level auth / state resolution — a PDU from an
 //! authenticated origin is still an untrusted event that must pass the room's
-//! auth rules, exactly as before. If the network layer does NOT bind the peer to
+//! auth rules. If the network layer does NOT bind the peer to
 //! its claimed origin, this header is as forgeable as any self-asserted field and
 //! provides no protection.
 

@@ -9,11 +9,10 @@
 //! - `auth_events`, which is **not** on the v12 wire under MSC4242 but is
 //!   calculated server-side and co-located here for state resolution.
 //! - `event_id`, which is **never** on the v12 wire — it is computed from
-//!   the reference hash of `raw` (see `event-id-design.md`).
+//!   the reference hash of `raw`.
 //! - `raw`, the canonical wire bytes of the event.
 //!
-//! See `event-id-design.md` §"Co-location pattern" for the five
-//! server-computed fields that live on the struct but not in `raw`:
+//! Server-computed fields that live on the struct but not in `raw`:
 //! `event_id`, `room_id` (create events only), `auth_events`, `rejected`,
 //! `soft_failed`.
 

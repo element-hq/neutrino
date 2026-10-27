@@ -142,6 +142,7 @@ impl FederationClient {
         // default `Client::new()` that silently drops the timeouts and the
         // proxy/`no_proxy` config above — consistent with the `unreachable!()`
         // for a bad proxy URL just above, not a silent degrade beside it.
+        #[expect(clippy::expect_used, reason = "no TLS backend, so build() cannot fail")]
         let http = builder
             .build()
             .expect("plaintext reqwest client always builds; no TLS backend to init");
@@ -484,8 +485,8 @@ impl FederationClient {
     /// carrying the **v2 request envelope** `{ event, room_version,
     /// invite_room_state }` (the v2 endpoint wraps the PDU; v1's bare event is
     /// not used). `invite_room_state` is the stripped state for the invitee to
-    /// render the room. Returns the peer's copy of the event (`{ event }`) — in
-    /// a signatures world this is where the invitee server's signature is added.
+    /// render the room. Returns the peer's copy of the event (`{ event }`),
+    /// co-signed by the invitee server in signed mode.
     pub(crate) async fn invite(
         &self,
         dest: &ServerName,

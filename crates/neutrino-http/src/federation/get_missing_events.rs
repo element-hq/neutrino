@@ -1,8 +1,11 @@
 //! `POST /_matrix/federation/v1/get_missing_events/{roomId}`.
 //!
-//! Pure read over `DagStore::missing_events`. See `docs/get-missing-events.md`
-//! for the design — the algorithm comments below cross-reference the seven
-//! steps from the design doc's §Handler/Algorithm.
+//! Pure read over `DagStore::missing_events`, scoped to callers whose
+//! network-attested `X-Matrix` origin is in the room (403 otherwise).
+//!
+//! Spec deviations: `min_depth` is accepted but ignored (no depth column), and
+//! there is no `m.room.history_visibility` filter — a member peer can read
+//! history from before it joined.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -52,9 +55,7 @@ pub(crate) struct RequestBody {
     limit: Option<u32>,
     /// Parsed for spec compliance (so a malformed `min_depth` still 400s
     /// via serde) then dropped on the floor — Neutrino stores no depth
-    /// column. See
-    /// `docs/get-missing-events.md` §"Trust model & spec deviations".
-    /// Typed `i64` (not `u64`) because the spec defines `depth` as a
+    /// column. Typed `i64` (not `u64`) because the spec defines `depth` as a
     /// signed integer; using `u64` would reject negative values at serde
     /// and contradict the accept-but-ignore intent. The underscore prefix
     /// tells `dead_code` the field is intentionally unused after
@@ -139,7 +140,7 @@ pub(crate) struct ResponseBody {
 
 /// Federation `/get_missing_events` handler.
 ///
-/// Algorithm (cross-ref `docs/get-missing-events.md` §Handler/Algorithm):
+/// Algorithm:
 /// 1. Reject empty `latest_events` (400 M_INVALID_PARAM).
 /// 2. 404 if room is unknown (pre-checked via `RoomStore::room_exists`).
 /// 3. Clamp `limit`: default 10, max 1000.
