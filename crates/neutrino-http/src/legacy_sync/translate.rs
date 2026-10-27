@@ -24,8 +24,7 @@ use serde_json::{Value, json};
 /// Parsed v3 `/sync` query parameters.
 ///
 /// Only the fields that influence the synthesized v5 request are kept;
-/// `filter`, `full_state` and `set_presence` are read-and-discarded per
-/// the design doc.
+/// `filter`, `full_state` and `set_presence` are read-and-discarded.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LegacyQuery {
     /// Opaque continuation token. Passed straight to v5 `pos`.
@@ -35,13 +34,11 @@ pub struct LegacyQuery {
     pub timeout: Duration,
     /// `true` iff the client advertised MSC4222 awareness via either
     /// `use_state_after=true` or `org.matrix.msc4222.use_state_after=true`.
-    /// The translator currently dual-emits regardless, but the flag is
-    /// captured so a future strict-mode path can branch on it.
+    /// Unread: the translator dual-emits regardless.
     pub use_state_after: bool,
 }
 
-/// Parse a v3 `/sync` query parameter map per the design doc's
-/// "Query parameter mapping" table.
+/// Parse a v3 `/sync` query parameter map.
 ///
 /// Behaviour:
 /// - `since` → `LegacyQuery::since`. An empty string (`?since=`) is treated
@@ -76,7 +73,7 @@ fn is_truthy(value: Option<&String>) -> bool {
 
 /// Build the synthesized [`v5::Request`] from a parsed legacy query.
 ///
-/// Shape (per the design doc's "Synthesized into the v5 request" section):
+/// Shape:
 /// - `pos` carries `query.since` verbatim,
 /// - `timeout` is `Some(d)` only when the legacy query asked for a non-zero
 ///   wait (legacy `/sync` defaults to "return immediately"; the v5 handler
@@ -141,7 +138,7 @@ const LEGACY_TIMELINE_LIMIT: u32 = 50;
 /// `resp.memberships` is the bucketing map keyed by `OwnedRoomId`, filled by
 /// the v5 handler from the same read that built each room.
 ///
-/// Bucketing rules per MSC4186 + the design doc:
+/// Bucketing rules:
 /// - `Membership::Invite` → `rooms.invite` with the v5 `invite_state` lifted
 ///   verbatim under `invite_state.events`. No timeline, no state.
 /// - `Membership::Join` → `rooms.join` with `timeline`, `state`,
@@ -167,8 +164,8 @@ const LEGACY_TIMELINE_LIMIT: u32 = 50;
 ///
 /// Per-room `prev_batch` is the empty string (no `/messages` impl); `limited`
 /// is `false`. `state` and `org.matrix.msc4222.state_after` are dual-emitted
-/// with identical contents — see `docs/legacy-sync-stub.md` §"Join/leave
-/// room shape" for why.
+/// with identical contents, whether or not the client sent `use_state_after`,
+/// so clients that don't read `state_after` still see state.
 pub fn translate_response(resp: SyncResponse) -> Value {
     let mut join = serde_json::Map::new();
     let mut invite = serde_json::Map::new();
@@ -392,9 +389,8 @@ mod tests {
 
     #[test]
     fn parse_query_filter_full_state_set_presence_ignored() {
-        // These three params are listed in the design doc as "dropped" /
-        // "noop". The parser must accept them without erroring and not
-        // surface them in `LegacyQuery`.
+        // The parser must accept these three params without erroring and
+        // not surface them in `LegacyQuery`.
         let q = parse_legacy_query(&query([
             ("filter", "0"),
             ("full_state", "true"),
@@ -833,7 +829,6 @@ mod tests {
 
     #[test]
     fn translate_stubs_always_present_and_well_shaped() {
-        // Verified against the exact shape the design doc pins down.
         let resp = make_response("p", vec![]);
         let v = translate_response(with_memberships(resp, BTreeMap::new()));
         assert_eq!(v["presence"]["events"], json!([]));

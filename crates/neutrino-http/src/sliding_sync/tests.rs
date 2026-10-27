@@ -2885,7 +2885,6 @@ async fn banned_room_remains_visible_after_being_emitted_while_joined() {
 // MSC3575/4186 forbids concurrent requests with the same conn_id. The
 // embedded server cancels the in-flight long-poll rather than queueing the
 // newcomer (which would otherwise block for up to 30 s) or rejecting it.
-// See `MSC4186-gaps.md` for the spec deviation note.
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
@@ -3089,8 +3088,7 @@ async fn concurrent_body_differing_request_gets_unknown_pos_after_cancellation()
     // cache, drops the lock. B acquires the lock; B's pos (= resp1.pos)
     // no longer matches the now-advanced `conn.pos`, so the pos-validation
     // gate in `handle` returns `M_UNKNOWN_POS`. The client is expected to
-    // re-init from scratch — accepted single-re-init cost is documented
-    // in MSC4186-gaps.md.
+    // re-init from scratch — an accepted single-re-init cost.
     let state_b = state.clone();
     let conn_id_b = conn_id.clone();
     let resp1_pos_b = resp1.pos.clone();

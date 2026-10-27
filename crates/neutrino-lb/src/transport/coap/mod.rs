@@ -14,9 +14,8 @@
 //! *during* blockwise reassembly: `max_total_message_size` caps only the
 //! negotiated per-block size, not the running total across Block1 chunks (verified
 //! in `coap_lite::block_handler`), so a peer streaming unbounded chunks can still
-//! grow that internal buffer before our post-reassembly check fires. A true
-//! reassembly-time cap is a follow-up (see `PLAN.md`); it needs coap-lite to bound
-//! the block accumulator, which the current API does not allow from the outside.
+//! grow that internal buffer before our post-reassembly check fires; coap-lite
+//! exposes no way to bound the accumulator from outside.
 
 pub mod datagram;
 mod message;
@@ -74,8 +73,7 @@ use crate::transport::{MAX_WIRE_BODY_BYTES, WireClient, WireError, WireRequest, 
 pub struct CoapWireClient {
     /// Max bytes per Block1 (request) chunk. `None` uses coap-rs's 1024 B
     /// default. Lower it to fit a constrained link's datagram budget. (Block2 —
-    /// the response chunk size — is fixed by the responding server's coap-rs
-    /// default and not yet tunable; see the module docs / `PLAN.md`.)
+    /// the response chunk size — is the responding server's choice.)
     block1_size: Option<usize>,
     /// When `Some`, `send` uses RFC 9177 Q-Block NON-mode (`send_qblock`) with
     /// this config; when `None`, the CON path (`send`). Set on the pooled client
@@ -522,6 +520,8 @@ impl WireServer for CoapWireServer {
         handler: Arc<dyn WireHandler>,
         shutdown: CancellationToken,
     ) -> Result<(), WireError> {
+        // TODO: bound the RFC 7959 (CON) reassembly mid-transfer; only the
+        // assembled body is capped (see the module OOM note).
         let mut server = match self.max_message_size {
             Some(max_total_message_size) => Server::new_udp_with_config(
                 self.bind,
@@ -541,6 +541,9 @@ impl WireServer for CoapWireServer {
             // ingress analogue of the egress response cap), instead of coap-rs's
             // hardcoded 16 MiB default; capping concurrent transfers stops a peer
             // opening many Request-Tags from exhausting memory.
+            // TODO: validate the final (More-unset) block: it is bounded only
+            // by `max_body_len`, so one forged datagram can end a reassembly
+            // short; Size1/Size2 is never checked against the assembled length.
             server.set_qblock_max_body_len(self.max_body_bytes);
             server.set_qblock_max_transfers(MAX_QBLOCK_INFLIGHT_TRANSFERS);
         }

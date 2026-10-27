@@ -29,7 +29,7 @@ pub use validate::{FormatError, SemanticVerdict, semantic_verdict};
 /// Stored verbatim in `rooms.room_version` and emitted in the `m.room.create`
 /// event's `content.room_version`.
 ///
-/// Nothing compares against this in production any more — which version an
+/// Nothing compares against this in production — which version an
 /// event belongs to is resolved through [`RoomVersions`], because a store may
 /// legitimately hold rooms of several. It remains the base version's
 /// [`RoomVersion::id`] (and what test fixtures stamp).

@@ -106,7 +106,7 @@ pub struct Conn {
     /// limit-grew situation and resend older events. MSC4186 calls this
     /// `expanded_timeline`. Ruma v5's `response::Room` doesn't carry that
     /// field, so we can't actually surface it on the wire — kept tracked for
-    /// when ruma catches up. See MSC4186-gaps.md.
+    /// when ruma catches up.
     pub prev_list_timeline_limits: BTreeMap<String, usize>,
     /// Idempotency cache: the `pos` value the client sent on the most
     /// recently *processed* request (i.e. the input pos, not the output). If
@@ -228,7 +228,7 @@ impl ConnEntry {
 /// requests on the same `(user_id, conn_id)` serialise. MSC3575 forbids
 /// concurrent requests with the same conn_id; we cancel-and-replace the
 /// in-flight request rather than reject the newcomer (see
-/// `ConnEntry::cancel` / `MSC4186-gaps.md`).
+/// `ConnEntry::cancel`).
 ///
 /// **Lifecycle**: connections are created on initial sync (no `pos`) and never
 /// expire. There is **no eviction**, **no idle timeout**, **no LRU**, no

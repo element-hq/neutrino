@@ -24,8 +24,6 @@ impl EventStore for SqliteStore {
         event: &Event,
         destinations: &[&ServerName],
     ) -> Result<(), StorageError> {
-        // event_id <-> raw consistency is asserted inside `EventRow::from`
-        // (debug builds only). No need to repeat the check here.
         let event = EventRow::from(event).to_owned();
         let destinations: Vec<OwnedServerName> =
             destinations.iter().map(|s| (*s).to_owned()).collect();
@@ -56,7 +54,6 @@ impl EventStore for SqliteStore {
     }
 
     async fn persist_historical_event(&self, event: &Event) -> Result<(), StorageError> {
-        // event_id <-> raw consistency asserted inside `EventRow::from`.
         let event = EventRow::from(event).to_owned();
 
         self.run_write(move |conn| -> Result<(), Error> {
@@ -90,7 +87,6 @@ impl EventStore for SqliteStore {
         destinations: &[&ServerName],
         advertise_to: &[&ServerName],
     ) -> Result<(), StorageError> {
-        // event_id <-> raw consistency asserted inside `EventRow::from`.
         let event = EventRow::from(event).to_owned();
         let room_id = event.room_id.clone();
         let timeline_json = fe_json(timeline_fes)?;

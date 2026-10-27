@@ -270,8 +270,7 @@ async fn fill_timeline_parents<F: MissingEventsFetcher + ?Sized>(
 /// nothing and the caller's no-progress terminator declares the gap unfillable.
 /// Rows are staged under `origin` — the peer that referenced them, not their
 /// true author — so if an ancestor itself later needs gap-filling we ask the
-/// same peer (it vouched for the reference); `origin` is otherwise unused in
-/// the trusted mesh.
+/// same peer (it vouched for the reference); `origin` is otherwise unused.
 async fn stage_fetched(
     store: &impl StorageBackend,
     policy: &EventPolicy,

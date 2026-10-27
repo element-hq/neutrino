@@ -1,21 +1,21 @@
 //! Per-room state machine orchestration.
 //!
-//! `RoomCore::apply(event, provider)` integrates a single incoming event
+//! `RoomCore::apply_pdu(event, provider)` integrates a single incoming event
 //! against the receipt-of-PDU checks the spec defines at
 //! <https://spec.matrix.org/v1.18/server-server-api/#checks-performed-on-receipt-of-a-pdu>.
 //! Reading the spec's numbered list against our implementation:
 //!
 //! - **Step 1** (PDU schema / required fields): wire-format part is
-//!   upstream of `apply` (`validate::parse_event` — enforced by
+//!   upstream of `apply_pdu` (`validate::parse_event` — enforced by
 //!   `EventBuilder::build()` / `Event::from_wire`). The semantic rules
 //!   that don't need a provider (count limits, create structural rules,
-//!   rule 9, per-type content shape) run inside `apply` via
+//!   rule 9, per-type content shape) run inside `apply_pdu` via
 //!   `validate::validate_pdu`. Running validate_pdu here
 //!   defensively means a caller that hand-constructs an `Event` (bypassing
 //!   the builder/wire path) still can't smuggle a semantically-malformed
 //!   event past us.
-//! - **Step 2** (signature verification): intentionally skipped per
-//!   `CLAUDE.md` — trusted-network policy.
+//! - **Step 2** (signature verification): upstream of `apply_pdu`, at
+//!   ingress via `EventSecurity::admit` (signed deployments only).
 //! - **Step 3** (auth check against the event's auth_events): under
 //!   MSC4242 the wire-level `auth_events` field is gone; the equivalent
 //!   check is "auth against state-before-event", which we derive from
@@ -39,11 +39,11 @@
 //! (`validate::validate_references`) runs before the auth checks to
 //! ensure the room exists and `prev_state_events` are well-formed.
 //!
-//! ## What `apply` mutates
+//! ## What `apply_pdu` mutates
 //!
-//! On a hard-rejected event (room_id mismatch, reference invalid, auth
-//! fails against state-before-event), `apply` returns `Err(CoreError)`
-//! and does NOT mutate `RoomCore`. On acceptance:
+//! A dropped or retryable event (`Err(CoreError)`) does NOT mutate
+//! `RoomCore`. A rejected event returns `Ok` with `rejected = true` and is
+//! persisted, without FE/state mutation. On acceptance:
 //! - **every accepted, non-soft-failed event** advances the timeline forward
 //!   extremities (`forward_extremities`): the parents listed in the event's
 //!   `prev_events` are removed and the event itself is inserted. This holds
@@ -80,7 +80,7 @@ use crate::{CoreError, ReferenceError, StateDelta, StateMap, StateResError};
 
 /// Provider wrapper that transparently resolves a single `local_event` —
 /// the event currently being applied — while delegating everything else to
-/// the inner provider. Lets `apply` reuse the same `state_at_heads` /
+/// the inner provider. Lets `apply_pdu` reuse the same `state_at_heads` /
 /// `resolve_state` code paths whether the FE under consideration is an
 /// already-persisted event or the not-yet-persisted local one.
 struct ProviderWithLocal<'a> {
@@ -139,7 +139,7 @@ impl StateProvider for ProviderWithLocal<'_> {
     }
 }
 
-/// Side-effects emitted by `RoomCore::apply`. The caller (storage and
+/// Side-effects emitted by `RoomCore::apply_pdu`. The caller (storage and
 /// federation layers) interprets them sequentially in emission order.
 #[derive(Debug, Clone)]
 pub enum Effect {
@@ -161,14 +161,14 @@ pub enum Effect {
 }
 
 /// Per-room state machine state: the two head-sets of the room's DAGs and
-/// the current resolved state. `apply` mutates all three as it accepts
+/// the current resolved state. `apply_pdu` mutates all three as it accepts
 /// events.
 ///
 /// - `forward_extremities` — timeline-DAG heads (events not yet referenced
 ///   by any event's `prev_events`). Every accepted, non-soft-failed event
 ///   advances this, state and non-state alike, because every such event sits
 ///   in the timeline DAG. (A soft-failed event is persisted but never becomes
-///   a head — see `apply`.) This is the set a locally-originated event draws
+///   a head — see `apply_pdu`.) This is the set a locally-originated event draws
 ///   its `prev_events` from.
 /// - `state_forward_extremities` — state-DAG heads (state events not yet
 ///   referenced by any `prev_state_events`). Only state events advance it.
@@ -193,7 +193,7 @@ pub struct RoomCore {
 
 impl RoomCore {
     /// Create a fresh `RoomCore` for `room_id` under `version`. Starts with
-    /// empty forward extremities and empty current_state — the first `apply`
+    /// empty forward extremities and empty current_state — the first `apply_pdu`
     /// call is expected to be the room's create event.
     pub fn new(room_id: OwnedRoomId, version: Arc<RoomVersion>) -> Self {
         Self {
@@ -208,7 +208,7 @@ impl RoomCore {
     /// Rebuild a `RoomCore` from state previously persisted to storage: the
     /// two head-sets and the resolved current state. Bootstraps a room's
     /// in-memory state machine on first access (e.g. after a restart) — the
-    /// inverse of persisting `apply`'s effects. `timeline_fes` are the
+    /// inverse of persisting `apply_pdu`'s effects. `timeline_fes` are the
     /// timeline-DAG heads (`forward_extremities`), `state_fes` the state-DAG
     /// heads (`state_forward_extremities`).
     pub fn hydrate(
@@ -239,19 +239,19 @@ impl RoomCore {
 
     /// Current forward extremities of the timeline DAG (the events a new
     /// local event would list in its `prev_events`). Read-only view;
-    /// mutation is the exclusive responsibility of `apply`.
+    /// mutation is the exclusive responsibility of `apply_pdu`.
     pub fn forward_extremities(&self) -> &BTreeSet<OwnedEventId> {
         &self.forward_extremities
     }
 
     /// Current forward extremities of the state DAG (the events a new local
     /// event would list in its `prev_state_events`). Read-only view;
-    /// mutation is the exclusive responsibility of `apply`.
+    /// mutation is the exclusive responsibility of `apply_pdu`.
     pub fn state_forward_extremities(&self) -> &BTreeSet<OwnedEventId> {
         &self.state_forward_extremities
     }
 
-    /// Current resolved state. Read-only; mutate only through `apply`.
+    /// Current resolved state. Read-only; mutate only through `apply_pdu`.
     pub fn current_state(&self) -> &Arc<StateMap<Arc<Event>>> {
         &self.current_state
     }
@@ -747,7 +747,7 @@ mod tests {
         .expect("valid pl")
     }
 
-    /// Drive a complete create → alice_join setup through `apply`. Returns
+    /// Drive a complete create → alice_join setup through `apply_pdu`. Returns
     /// the room, provider (with both events inserted), and the create +
     /// alice_join ids.
     fn alice_creates_and_joins(

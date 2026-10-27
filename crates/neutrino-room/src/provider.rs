@@ -1,21 +1,9 @@
-//! Read-side interface the state machine uses to look up events, plus the
-//! in-memory implementation used by tests and (until storage lands) by
-//! `RoomCore::apply`.
-//!
-//! The trait carries:
-//! - `get_event(id)`: used by `validate::validate_references` and
-//!   anywhere downstream that needs the event body / rejection flag. Rejection
-//!   lives on `Event.rejected` (server-computed, co-located on the struct),
-//!   so the trait surface is just `Option<Arc<Event>>`.
-//! - `auth_chain(seeds)`: used by state resolution. Returns the
-//!   transitive backwards closure of the seeds through their `auth_events`
-//!   (including the seeds themselves). **Errors** if any event in the
-//!   closure isn't in the store — every event we know about must have its
-//!   complete auth chain locally (no federation auth-chain backfill).
+//! Read-side interface the state machine uses to look up events, plus an
+//! in-memory implementation used by tests.
 //!
 //! Under MSC4242 `auth_events` is **not** on the wire; the server calculates
-//! it once at insert time and stores it on the `Event` struct. The provider
-//! reads from there — there's no separate `auth_event_ids` map any more.
+//! it once at insert time and stores it on the `Event` struct, which is where
+//! the provider reads it from.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -53,8 +41,7 @@ pub trait StateProvider {
     ///
     /// In-memory impls do a stack-based DFS reading `event.auth_events`
     /// per step. SQLite-backed impls collapse the walk to a single recursive
-    /// CTE join against `event_edges WHERE edge_type = 'auth'` — see
-    /// `event-id-design.md` §"What event_edges is doing".
+    /// CTE join against `event_edges WHERE edge_type = 'auth'`.
     fn auth_chain(
         &self,
         seeds: &HashSet<OwnedEventId>,
@@ -84,9 +71,8 @@ pub trait StateProvider {
     }
 }
 
-/// In-memory `StateProvider`. Public (not test-cfg) — `RoomCore::apply` uses
-/// it as the storage-free fallback, and unit tests use it directly. Clone
-/// is cheap: events are `Arc`-shared.
+/// In-memory `StateProvider`. Public (not test-cfg) so other crates' tests
+/// can use it. Clone is cheap: events are `Arc`-shared.
 #[derive(Debug, Default, Clone)]
 pub struct InMemoryStateProvider {
     events: HashMap<OwnedEventId, Arc<Event>>,

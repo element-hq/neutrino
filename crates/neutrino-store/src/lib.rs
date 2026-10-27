@@ -161,7 +161,7 @@ pub trait EventStore: Send + Sync {
     async fn persist_historical_event(&self, event: &Event) -> Result<(), StorageError>;
 
     /// Pre:  `event.room_id` must exist; `event` is the just-accepted output
-    ///       of `neutrino_room::RoomCore::apply`; `timeline_fes` /
+    ///       of `neutrino_room::RoomCore::apply_pdu`; `timeline_fes` /
     ///       `state_fes` are the head-sets that apply produced (read off the
     ///       post-apply `RoomCore`); and `current_state_delta` is the
     ///       `Effect::UpdateCurrentState` payload apply emitted (empty for a

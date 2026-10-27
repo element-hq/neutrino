@@ -14,8 +14,6 @@
 //! Which redaction keep-list and which derivation apply is a property of the
 //! room's version, so the functions here take a [`RoomVersion`] rather than
 //! hardcoding v12 — see `room_version.rs`.
-//!
-//! See `event-id-design.md` for the full flow.
 
 use base64::Engine;
 use base64::engine::general_purpose;
@@ -74,8 +72,6 @@ pub(crate) fn b64_url_unpadded(bytes: &[u8]) -> String {
 /// are preserved across the call (ruma's keep-list does not mention them —
 /// MSC4242's `prev_state_events`, and whatever a stamping [`EventIdScheme`]
 /// writes), `removed` are stripped after it.
-///
-/// See `event-id-design.md` §"ruma redaction wrapper".
 ///
 /// On error the saved keys are restored before returning, so the caller sees
 /// the input in its original shape regardless of outcome.

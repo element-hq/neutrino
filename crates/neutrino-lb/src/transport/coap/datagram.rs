@@ -1,9 +1,8 @@
 //! In-process datagram-backed CoAP wire path, a sibling of the UDP path in the
 //! parent module. For the embedded/Android target the OS UDP socket is replaced
 //! by an injected transport keyed by an opaque, medium-defined **link address**
-//! (a byte string — no socket, no IP, no ports). The concrete link (e.g. a QUIC
-//! endpoint over the BLE mesh) lives out of
-//! tree; this module defines the [`DatagramLink`] seam it implements.
+//! (a byte string — no socket, no IP, no ports). Concrete links live out of
+//! tree; this module defines the [`DatagramLink`] seam they implement.
 //!
 //! ## Why a Hub
 //!
@@ -36,14 +35,15 @@
 //!
 //! ## Why an origin↔source binding
 //!
-//! The link authenticates the source of each inbound datagram, and a peer's link
-//! address IS its federation `server_name` as the egress resolver renders it
-//! (UTF-8 bytes, verbatim — e.g. the 64-hex node id on an authenticated QUIC
-//! medium). `federation::auth` trusts the `X-Matrix origin` header *solely
-//! because the network layer authenticated the peer* — so this layer MUST enforce
-//! that an authenticated peer asserts only its own origin.
-//! [`Hub::origin_binding_violation`] rejects a request whose claimed `origin`
-//! bytes ≠ the authenticated source address (impersonation).
+//! A peer's link address IS its federation `server_name` as the egress resolver
+//! renders it (UTF-8 bytes, verbatim; the medium defines the naming). The link
+//! tags each inbound datagram with its source address, so a peer may assert only
+//! its own origin: [`Hub::origin_binding_violation`] rejects a request whose
+//! claimed `X-Matrix origin` bytes ≠ the tagged source address (impersonation).
+//! The gate runs on every link ingress; it is only as strong as the medium's
+//! source tagging, which [`LinkProfile::authenticates_connections`] declares.
+//! On an unauthenticated medium, origin trust rests on event signatures or the
+//! app's `trusted_network` posture instead.
 
 use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
@@ -68,10 +68,9 @@ use super::{CoapDispatch, MAX_QBLOCK_INFLIGHT_TRANSFERS, exchange, random_token_
 
 /// A peer's link-layer address: its federation `server_name` as the egress
 /// resolver renders it, UTF-8 bytes, verbatim. Opaque to this crate — the
-/// medium defines what the bytes mean (a 64-hex node id for an authenticated
-/// QUIC medium) and any length is
-/// legal. Comparisons are exact bytes, so a `server_name` must be canonical
-/// (lowercase hex media produce lowercase).
+/// medium defines what the bytes mean and any length is legal. Comparisons are
+/// exact bytes, so a `server_name` must be canonical (lowercase hex media
+/// produce lowercase).
 pub type LinkAddr = Vec<u8>;
 
 /// A datagram tagged with the link address it came from / is bound for.
@@ -129,15 +128,12 @@ pub struct LinkPacing {
 }
 
 impl Default for LinkProfile {
-    /// Today's injected-medium assumptions: a full `Packet::MAX_SIZE`
-    /// datagram budget and an authenticated hop (every current medium is an
-    /// authenticated QUIC endpoint). Mediums that differ override
-    /// [`DatagramLink::profile`].
+    /// A full `Packet::MAX_SIZE` datagram budget on an authenticated,
+    /// unmetered hop. Mediums that differ override [`DatagramLink::profile`].
     fn default() -> Self {
         Self {
             max_datagram: coap_lite::Packet::MAX_SIZE,
             authenticates_connections: true,
-            // Unmetered: an authenticated QUIC endpoint sends when asked.
             pacing: None,
         }
     }
@@ -170,6 +166,12 @@ pub struct CodecError(pub String);
 /// (the federation outbox retries); `decode_request` → 400 before the
 /// handler; `encode_response` → 500.
 ///
+/// A codec that maps distinct paths onto one must not run over
+/// [`WireKind::Coap`](crate::WireKind::Coap): its RFC 7959 reassembly
+/// (coap-lite's `BlockHandler`) buckets by (method, path, source), so
+/// concurrent same-route multi-block requests from one peer would share a
+/// bucket. Q-Block reassembly keys on Request-Tag and is unaffected.
+///
 /// All hooks default to no-ops so a codec overrides only the directions it
 /// transforms.
 pub trait LinkCodec: Send + Sync {
@@ -192,10 +194,9 @@ pub trait LinkCodec: Send + Sync {
 }
 
 /// The transport seam. The embedded composition injects an implementation
-/// (e.g. an authenticated QUIC endpoint dialed over the BLE mesh)
-/// keyed by an opaque [`LinkAddr`]; lb never
-/// names the concrete transport or interprets the address bytes. A single
-/// instance multiplexes BOTH directions (see the module-level Hub note).
+/// keyed by an opaque [`LinkAddr`]; lb never names the concrete transport or
+/// interprets the address bytes. A single instance multiplexes BOTH directions
+/// (see the module-level Hub note).
 ///
 /// Implementors MUST tag each `recv` datagram with the source peer's link
 /// address — exactly the bytes the egress resolver yields for that peer's

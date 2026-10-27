@@ -545,6 +545,10 @@ fn build_lb_config(
         // rides each block is controlled by the medium's LinkCodec, and an
         // over-MTU datagram is the link's to detect and log loudly (see
         // `WireKind::coap_qblock_for_profile`).
+        // TODO: the profile is read once at startup and the block size is fixed
+        // at wire construction, but a medium's MTU can be per-peer and change
+        // mid-session (e.g. BLE): needs a per-peer profile + block-size
+        // renegotiation.
         wire: neutrino_lb::WireKind::coap_qblock_for_profile(&profile)?,
         // The in-process sidecar is the embedded/datagram-link target: map a
         // peer's node-id `server_name` to its bare 64-char hex node id so the

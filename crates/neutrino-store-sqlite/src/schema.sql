@@ -1,10 +1,8 @@
 -- ============================================================================
--- neutrino-store-sqlite — V1 schema (bundled, no migration framework yet).
--- See docs/2026-05-14-sqlite-storage-backend.md for the design rationale.
+-- neutrino-store-sqlite — V1 schema (bundled, no migration framework).
 --
 -- This file only ever runs against a fresh database; the loader gates on
--- `PRAGMA user_version` before executing it. See "Open path: version gate
--- & schema bundle" in the design doc.
+-- `PRAGMA user_version` before executing it.
 --
 -- Surrounding PRAGMAs are owned by `schema::ensure_schema`, not by this
 -- file:
@@ -26,17 +24,8 @@
 -- ----------------------------------------------------------------------------
 -- rooms — RoomStore
 -- ----------------------------------------------------------------------------
--- `room_version` CHECK pins the only wire identifier this server accepts —
--- mirrors `neutrino_common::ROOM_VERSION_ID` (MSC4242-on-v12). Defends
--- against a corrupt-DB / bad-migration path where a row with a different
--- string gets inserted: the trait read paths would otherwise see
--- `RoomVersionId::Custom(<wrong-string>)` (ruma maps unknown strings to
--- Custom rather than erroring) and propagate it silently. The string is
--- duplicated here rather than templated because it's both a schema-level
--- invariant *and* a stability promise — if/when the value ever changes
--- the schema needs an explicit migration, not a silent code edit.
 -- `forward_extremities` / `state_dag_forward_extremities` persist the two
--- head-sets of a room's `RoomCore` (neutrino-state) so the per-room actor
+-- head-sets of a room's `RoomCore` so the per-room actor
 -- can be rebuilt after a restart without replaying the whole DAG:
 --   * `forward_extremities`           — timeline-DAG heads (events not yet
 --                                       referenced by any event's `prev_events`).
@@ -44,8 +33,7 @@
 --                                       referenced by any `prev_state_events`).
 -- Both are JSON arrays of event ids. `DEFAULT '[]'` covers the create-time
 -- INSERT (which omits them); the storage-side apply+persist path is what
--- maintains them thereafter. No `user_version` bump — no live data, schema
--- amended in place (same policy as the `events.rejected` column).
+-- maintains them thereafter.
 CREATE TABLE rooms (
     room_id        TEXT NOT NULL PRIMARY KEY,
     room_version   TEXT NOT NULL CHECK (room_version <> ''),
@@ -71,10 +59,9 @@ CREATE TABLE events (
     json              TEXT    NOT NULL,
     -- MSC4242: `auth_events` is calculated server-side and not on the
     -- wire. Stored here as a JSON array of event ids so it survives the
-    -- round-trip into the canonical `neutrino_common::Event`. The
+    -- round-trip into the canonical `neutrino_event::Event`. The
     -- denormalised `event_edges WHERE edge_type='auth'` rows below are
-    -- derivable from this column; see `event-id-design.md` §"What
-    -- event_edges is doing".
+    -- derivable from this column.
     auth_events_json  TEXT    NOT NULL DEFAULT '[]',
     -- Server-side rejection verdict from auth-rule evaluation. Rejected
     -- events MUST still be observable so state-res can skip their
@@ -92,7 +79,7 @@ CREATE TABLE events (
     -- persisted and observed, but never becomes a forward extremity and
     -- must be kept out of client timelines. Default 0 covers the common
     -- "accepted, not soft-failed" case. See `Event.soft_failed` in
-    -- `neutrino-common`.
+    -- `neutrino-event`.
     soft_failed       INTEGER NOT NULL DEFAULT 0
         CHECK (soft_failed IN (0, 1))
 ) STRICT;

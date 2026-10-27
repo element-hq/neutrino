@@ -4,16 +4,13 @@
 //! `Event.raw` is the canonical v12 / MSC4242 wire bytes — by design those
 //! bytes don't carry `event_id` (it's the computed reference hash, never on
 //! the wire) and for `m.room.create` they don't carry `room_id` either
-//! (derived from the event_id via sigil swap). Those three server-computed
+//! (derived from the event_id via sigil swap). Those two server-computed
 //! fields live on the `Event` struct as sidecar fields; this module is the
 //! single place that merges them back into the JSON before delivery to a
 //! CSAPI client.
 //!
 //! Federation paths must continue to ship `Event.raw` verbatim — federation
 //! peers verify the reference hash against those exact bytes.
-//!
-//! See `docs/event-view-conversions.md` for the rationale and the call-site
-//! migration plan.
 
 use ruma::events::{
     AnyStrippedStateEvent, AnySyncStateEvent, AnySyncTimelineEvent, AnyTimelineEvent,

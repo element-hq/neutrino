@@ -1,17 +1,39 @@
 //! MSC4186 simplified sliding sync — CSAPI handler.
 //!
 //! Endpoint: `POST /_matrix/client/unstable/org.matrix.simplified_msc3575/sync`.
-//! Generic over `S: StorageBackend` so this compiles against the trait alone;
-//! production wiring (mapping `SyncState<SqliteStore>` into the axum router)
-//! lands when the sqlite `StorageBackend` impl is finished.
+//! Generic over `S: StorageBackend`.
 //!
 //! Per-connection state lives in `ConnRegistry`; see its docs for the lifecycle
-//! and persistence story (short version: in-memory, no expiry yet, lost on
+//! and persistence story (short version: in-memory, no expiry, lost on
 //! restart and recovered via `M_UNKNOWN_POS` → client reconnects).
+//!
+//! ## Intentional gaps
+//!
+//! - List filters (`is_dm`, `is_encrypted`, `room_types`, `spaces`, `tags`, …)
+//!   are parsed but ignored: every candidate room is returned.
+//! - `set_presence` is ignored.
+//! - No lazy-loaded members: `$LAZY` matches like `*`.
+//! - Not emitted: `heroes`, `unread_notifications`, `is_dm`, and the MSC4186
+//!   room fields ruma's v5 `response::Room` lacks (`expanded_timeline`,
+//!   `lists`, `membership`).
+//! - Removed state keys produce no state stubs (`EMIT_STATE_STUBS`); the client
+//!   keeps its stale view until the key is re-set.
+//! - ruma's v5 request keeps MSC3575 shapes (`ranges`, tuple `required_state`,
+//!   `invite_state`); only `ranges[0]` is honoured.
+//! - Extensions: `e2ee` / `to_device` are constant echo stubs, `receipts`
+//!   carries only synthesised delivery receipts (see [`receipts`]), and
+//!   `account_data` / `typing` are always empty.
+//! - `bump_stamp` is the latest event of any type (no `bump_event_types`
+//!   filter).
+//! - A banned room is included only if already emitted on this connection
+//!   (MSC4186 says "previously joined"), so a fresh connection omits it.
+//! - Events in rooms outside every list range and subscription still advance
+//!   the high-water mark, so they are not re-sent if the room later enters a
+//!   range.
+//! - A newer request on the same `conn_id` cancels the in-flight one rather
+//!   than being rejected; a newer request with a different body at the same
+//!   `pos` then gets `M_UNKNOWN_POS`.
 
-// Items here are reachable from `tests` but not from the live router yet, which
-// would normally trip dead_code. Re-evaluate this allow once the router wiring
-// lands.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
@@ -66,7 +88,7 @@ const MAX_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 /// The wrapper's outer timer registers its own waker with the time driver, so
 /// it fires independently of whatever inner await is stuck; on fire the wrapper
 /// drops `handle` (freeing the conn lock) and returns an error the client
-/// retries. See the decisions log.
+/// retries.
 pub const BACKSTOP_TIMEOUT: Duration = Duration::from_secs(40);
 
 #[derive(Debug, Error)]
@@ -441,7 +463,7 @@ fn clamp_timeout(req_timeout: Option<Duration>) -> Duration {
 /// Why it's safe right now: the e2ee/to_device extensions are pure echo
 /// stubs of the request, with constant payload — they never *independently*
 /// change between long-poll iterations, so waiting on them would be waiting
-/// forever. The other extensions are dropped entirely per CLAUDE.md.
+/// forever. `account_data` / `typing` are never populated.
 ///
 /// If any of those signals ever gets a real implementation, this helper is
 /// the one place that needs to learn about them — or the loop will hold the
@@ -460,7 +482,7 @@ fn populate_extension_stubs(req_ext: &v5::request::Extensions, resp: &mut v5::Re
     if req_ext.e2ee.enabled == Some(true) {
         let mut e2ee = v5::response::E2EE::default();
         // Constant "we have 100 OTKs of this type" stub. Real number tracking
-        // would require an OTK store, which is out of scope (CLAUDE.md).
+        // would require an OTK store, which is out of scope.
         e2ee.device_one_time_keys_count
             .insert(OneTimeKeyAlgorithm::SignedCurve25519, UInt::from(100u32));
         e2ee.device_unused_fallback_key_types = Some(vec![OneTimeKeyAlgorithm::SignedCurve25519]);

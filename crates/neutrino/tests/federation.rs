@@ -20,7 +20,7 @@ fn msg_body(e: &Value) -> Option<&str> {
 }
 
 /// Directed reproduction of the joined-set-growth advertisement
-/// (`anti-entropy-extension.md`).
+/// (`mscs/anti-entropy-extension.md`).
 ///
 /// Background: a server only sends an event to the servers it currently sees as
 /// joined. The base anti-entropy mechanism repairs any miss by piggybacking its

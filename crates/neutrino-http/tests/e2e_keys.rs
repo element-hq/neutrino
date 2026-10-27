@@ -1,7 +1,6 @@
 //! E2EE keys-endpoint stubs are reached over loopback by the embedded client.
 //! They must never panic on a malformed body — a `.unwrap()` on a missing JSON
-//! pointer would tear down the request (CLAUDE.md: no `.unwrap()` in handler
-//! code). These tests POST deliberately-malformed bodies to each keys endpoint
+//! pointer would tear down the request. These tests POST deliberately-malformed bodies to each keys endpoint
 //! and assert a clean 2xx stub response instead of a 500 from a panic.
 
 use axum::body::Body;

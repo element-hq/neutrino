@@ -12,8 +12,6 @@
 //! ruma stays the authority for everything it can express, and we carry only
 //! the deltas it cannot ([`RoomVersion::ids`], because
 //! `EventIdFormatVersion` is a closed enum).
-//!
-//! See `room-version-registry-design.md`.
 
 use std::sync::{Arc, LazyLock};
 

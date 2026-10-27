@@ -4,10 +4,9 @@ mod watchdog;
 
 /// FFI-facing server configuration. Mirrors `neutrino_ctl::Config` so EX
 /// Android can fully configure the embedded homeserver. Kept here (not on the
-/// common `Config`) so UniFFI stays out of the common crates — see the
-/// crate-structure rule in CLAUDE.md. Fields are required unless marked with a
-/// `uniffi` default; the dev binary's defaults live in
-/// `Config::default`/`from_env`.
+/// common `Config`) so UniFFI stays out of the common crates. Fields are
+/// required unless marked with a `uniffi` default; the dev binary's defaults
+/// live in `Config::default`/`from_env`.
 #[derive(uniffi::Record, Clone)]
 pub struct NeutrinoConfig {
     pub bind_addr: String,

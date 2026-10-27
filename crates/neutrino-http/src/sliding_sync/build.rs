@@ -156,8 +156,8 @@ pub(super) async fn build_response<S: StorageBackend>(
         .collect();
 
     // Remember each list's current timeline_limit for next-time
-    // expanded_timeline detection (data tracked but not yet surfaced — ruma
-    // v5 doesn't carry the `expanded_timeline` field; see MSC4186-gaps.md).
+    // expanded_timeline detection (tracked but not surfaced — ruma v5's
+    // `response::Room` has no `expanded_timeline` field).
     let snapshot: Vec<(String, usize)> = conn
         .lists
         .iter()
@@ -205,7 +205,7 @@ fn apply_sticky(conn: &mut Conn, req: &Request) {
         // a singular `range`. Ruma v5's `ranges: Vec` is a half-migrated
         // artefact — we honour only the first entry and silently drop any
         // others. Going strict-with-400 would break clients that haven't fully
-        // migrated yet (see MSC4186-gaps.md notes on ruma's dialect).
+        // migrated.
         let range = list
             .ranges
             .first()
@@ -240,8 +240,7 @@ fn apply_sticky(conn: &mut Conn, req: &Request) {
 /// silently advance the high-water mark and won't be re-fetched on the
 /// next sync, even if the room later enters a list range. In practice
 /// the embedded server has one user with no filters → every event maps
-/// to an emitted room. Surface this in MSC4186-gaps.md so it doesn't
-/// become a surprise if filters are ever wired up.
+/// to an emitted room.
 ///
 /// **Invisible-tail stall (benign):** `events_after` excludes rejected /
 /// soft-failed events, and `max_pos` advances only over returned rows. If the
@@ -313,7 +312,7 @@ struct CombinedCfg {
 ///   with "previously emitted" because we don't keep a separate
 ///   per-conn history of historical join events. False negatives are
 ///   possible after a restart (the conn is fresh, so prior emissions are
-///   lost) — documented in MSC4186-gaps.md.
+///   lost).
 ///
 /// We don't apply MSC4186's `is_dm`/`is_encrypted`/`spaces`/`tags`/etc.
 /// filters — the embedded single-user server returns the full set. Sorted

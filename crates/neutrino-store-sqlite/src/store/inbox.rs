@@ -38,8 +38,8 @@ impl FederationInbox for SqliteStore {
 
         self.run_write(move |conn| -> Result<bool, Error> {
             // INSERT OR IGNORE + `conn.changes() == 0` ⇒ row already
-            // existed, return `true`. Per design doc §3 + trait
-            // post-condition: "returns true if it was already recorded".
+            // existed, return `true` (trait post-condition: "returns true if
+            // it was already recorded").
             conn.execute(
                 "INSERT OR IGNORE INTO federation_txns (origin, txn_id) VALUES (?, ?)",
                 params![origin.as_str(), txn_id],

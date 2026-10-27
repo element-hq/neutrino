@@ -1,66 +1,73 @@
-//! converge — seeded, randomized convergence fuzzer over an in-process 3-server
-//! rig (`neutrino-testkit`: real `neutrino` child processes on loopback, proxy
-//! partitions, SIGKILL crash/revive — no docker, no `nctl`).
+//! converge — seeded, randomized convergence fuzzer over a three-server rig
+//! (`neutrino-testkit`: real `neutrino` child processes on loopback, proxy
+//! partitions, SIGKILL crash/revive). It builds the `neutrino` binary itself.
 //!
-//! It drives random episodes of room operations interleaved with random partition
-//! cut/heal, heals everything at a barrier, and asserts every joined server
-//! reaches a byte-identical resolved `/state` with no locally-accepted message
-//! lost. The three logical servers `hs1`/`hs2`/`hs3` are the model's keys; their
-//! real Matrix server-name and address are resolved through the rig.
+//! ```sh
+//! cargo run -p converge                 # fresh seed, printed (and re-printed on failure)
+//! cargo run -p converge -- 16646        # replay a seed's op sequence
+//! EPISODES=10 ROUNDS_PER_EPISODE=20 cargo run -p converge -- 16646
+//! ```
 //!
-//! Usage:
-//!   converge [SEED]
-//!     SEED   u64; reproduces an exact op sequence. Omitted -> a fresh seed is
-//!            chosen and printed (and re-printed on failure) so any run replays.
-//!   env knobs: EPISODES (6), ROUNDS_PER_EPISODE (12), DEADLINE (90s),
-//!              INTERVAL (2s), STABLE_POLLS (2), STRICT_EVENT_PRESENCE (1),
-//!              CRASH_PROB (10).
+//! One [`StdRng`] seeded from `SEED` drives every choice, so the op sequence is
+//! a pure function of the seed; federation delivery timing is not, so runs are
+//! highly reproducible, not bit-identical. On failure it dumps the seed, the op
+//! log, each server's resolved state and child log tails. `hs1`/`hs2`/`hs3` are
+//! the model's keys; their real server names and addresses come from the rig.
 //!
-//! ## What it tests
+//! ## Shape of a run
 //!
-//! The convergence invariant: after every partition is healed and outboxes
-//! drain, every server joined to the room agrees on the SAME resolved room
-//! state, and no locally-accepted message is lost. It does not predict which
-//! concurrent write wins (state-res tie-breaks on wall-clock `origin_server_ts`
-//! then `event_id`); it asserts AGREEMENT, which is timing-independent.
+//! Setup: hs1 creates the room, invites + joins hs2 and hs3, barrier, exact
+//! probes. Each episode is `ROUNDS_PER_EPISODE` rounds of: ~30% topology change
+//! (cut a live link / heal a downed one); ~15% manufactured conflict;
+//! `CRASH_PROB`% crash/revive; else a model-valid mutation (message, name,
+//! power, invite, kick, leave, rejoin). Then a barrier and the exact probes.
 //!
-//! ## Determinism
+//! The barrier heals every link, revives crashed servers, rejoins anyone who
+//! churned out, polls until all three `/state` maps are identical and stable
+//! for `STABLE_POLLS` polls and every ledgered message is present (within
+//! `DEADLINE`), then re-syncs the shadow model from real state.
 //!
-//! One [`StdRng`] seeded from `SEED` is the single source of every choice; the op
-//! sequence is a pure function of the seed (federation *delivery* timing is async
-//! and not seed-controlled, so runs are highly reproducible, not bit-identical).
+//! ## What it asserts
 //!
-//! ## Two-tier status policy
+//! 1. **State convergence** (the hard gate): every joined server reaches a
+//!    byte-identical resolved `(type, state_key) → event_id` map. It asserts
+//!    agreement, never which concurrent write wins (state-res tie-breaks on
+//!    wall-clock `origin_server_ts`, then `event_id`).
+//! 2. **No lost messages**: every message appears via `/messages` on every
+//!    server joined when it was sent. A later joiner is not required to
+//!    backfill what it missed.
+//! 3. **Two-tier status**: ops issued at a converged barrier assert exact
+//!    status (a deny → promote → allow → demote → deny power-level battery,
+//!    then leave/rejoin). Mid-partition mutations are record-only: a 2xx joins
+//!    the must-converge ledger, a non-2xx is a legitimate stale-view rejection.
+//! 4. **Divergence actually happens**: a manufactured conflict cuts the link
+//!    between two joined co-admins and has each set `m.room.name`; when both
+//!    are accepted their `/state` must differ on the spot. The barrier also
+//!    samples pre-heal divergence, and a run that cut links but never diverged
+//!    is flagged as vacuous.
+//! 5. **Crash recovery**: a SIGKILLed server's storage dir survives (WAL +
+//!    `synchronous = NORMAL`: a process crash, not power loss), so on revive it
+//!    must recover committed state and redeliver its outbox. A run whose
+//!    crashes all landed with no writes pending is flagged as vacuous.
 //!
-//! * EXACT tier — ops issued while fully healed + converged (the shadow model ==
-//!   reality). Status is asserted exactly (2xx, or a specific `M_` code). This is
-//!   where admin / power-level / membership-validity is checked hard.
-//! * RECORD tier — mutating ops during the fuzz phase. The model picks ops it
-//!   believes valid, issues them, and records the actual outcome: a 2xx event
-//!   joins the must-converge ledger; a non-2xx is a legitimate stale-view
-//!   rejection mid-partition, logged not asserted.
+//! Structural invariants: hs1 never leaves, is never kicked or demoted (it can
+//! crash), so a resident admin always exists; at least one server is always
+//! alive; ban is excluded (there is no unban path to restore the barrier's
+//! all-joined comparison). The shadow model (members + power levels) gates op
+//! selection and is authoritative only at barriers.
 //!
-//! ## Topology control
+//! ## Knobs (env)
 //!
-//! Partition cut/heal is delegated to the rig's proxy cut-set ([`Harness::cut`] /
-//! [`Harness::heal`]); a cut 503s federation between the pair, parking it in the
-//! sender's durable outbox. Heal clears the cut and resets outbound backoff on
-//! both ends (SIGUSR2 -> KickBackoff), so a healed link drains promptly.
-//!
-//! ## Crash testing
-//!
-//! `CRASH_PROB`% of rounds (default 10) instead crash a live server (SIGKILL the
-//! real `neutrino` process) or revive a crashed one (re-spawn on the same on-disk
-//! storage). This is distinct from a partition: a cut leaves the process alive
-//! (its outbox accrues and retries), a crash kills it outright. The storage dir
-//! is parent-owned and survives the kill, so the revived process recovers its
-//! committed state and re-arms its outbox sender on startup, redelivering any
-//! federation transaction parked before the crash. With WAL + `synchronous =
-//! NORMAL`, a SIGKILL preserves committed data via the OS page cache, so this
-//! models a process crash, not host power-loss. At least one server is always
-//! kept alive; the barrier revives any still-down server before checking
-//! convergence. A run that crashes only while idle/converged is flagged at the
-//! end (recovery was vacuous) — mirroring the partition divergence guard.
+//! | var | default | meaning |
+//! | --- | --- | --- |
+//! | `EPISODES` | 6 | fuzz episodes |
+//! | `ROUNDS_PER_EPISODE` | 12 | rounds per episode |
+//! | `DEADLINE` | 90 | seconds for any single convergence poll |
+//! | `STABLE_POLLS` | 2 | consecutive identical polls before "quiescent" |
+//! | `INTERVAL` | 2 | seconds between convergence polls |
+//! | `STRICT_EVENT_PRESENCE` | 1 | 0 skips the message-presence check |
+//! | `CRASH_PROB` | 10 | per-round crash/revive percent (0 disables; clamped to ≤ 55) |
+//! | `NEUTRINO_ENABLE_SOFT_FAILURE` | `false` | passed to the servers; `true` restores the client soft-fail filter (see `main`) |
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -77,7 +84,7 @@ const LINKS: [&str; 3] = ["12", "13", "23"];
 
 /// Logical server label (`"hs1"`/`"hs2"`/`"hs3"`) -> rig index. The labels are
 /// the model's keys; their real Matrix server-name + address are resolved through
-/// the rig (`rig.name(idx)` / `rig.mxid(idx)` / `rig.backend(idx)`).
+/// the rig (`rig.name(idx)` / `rig.mxid(idx)`).
 fn idx(hs: &str) -> usize {
     match hs {
         "hs2" => 1,
@@ -217,9 +224,9 @@ struct Harness {
     cfg: Config,
     seed: u64,
     rng: StdRng,
-    /// The in-process rig: real `neutrino` child processes + proxy partitions +
-    /// SIGKILL crash/revive. Replaces docker-compose + `nctl`; its `Drop` kills
-    /// the children, so no explicit teardown guard is needed.
+    /// Real `neutrino` child processes + proxy partitions + SIGKILL
+    /// crash/revive. Its `Drop` kills the children, so no explicit teardown
+    /// guard is needed.
     rig: neutrino_testkit::Harness,
     room: String,
     txn_ctr: u64,
@@ -850,10 +857,9 @@ impl Harness {
     async fn barrier(&mut self) -> Result<(), String> {
         self.log("barrier: revive crashed servers, heal all links, restore membership, converge");
         self.sample_divergence().await;
-        // Heal every link, then revive any crashed server. (In-process, revive
-        // re-spawns a real process and needs no link healed first — but healing
-        // up front is the simplest way to reach a fully-connected cluster before
-        // the convergence gate.)
+        // Heal every link, then revive any crashed server. (Revive needs no
+        // link healed first — but healing up front is the simplest way to reach
+        // a fully-connected cluster before the convergence gate.)
         for k in LINKS {
             if !self.is_up(k) {
                 self.partition("heal", k).await;
@@ -1053,6 +1059,9 @@ impl Harness {
     /// Manufacture a state-res conflict: two joined co-admins set `m.room.name`
     /// to different values across an active cut. Returns `false` when no two
     /// co-admins are joined (caller falls through to a normal mutation).
+    // TODO: collide `m.room.power_levels` and same-`state_key` membership too, to
+    // exercise state-res mainline ordering concurrently; and a three-way fork
+    // (all links cut, all three write, pairwise `assert_divergent`).
     async fn fuzz_conflict(&mut self) -> Result<bool, String> {
         let req = self.state_req("m.room.name");
         let pairs: Vec<&str> = LINKS
@@ -1151,6 +1160,9 @@ impl Harness {
     /// crash doesn't pin a server down for the whole episode). At least one
     /// server is always kept alive, so the rig keeps making progress and a
     /// readable `/state` always exists for the divergence probes.
+    // TODO: directed victims — crash a server while a cut holds rows parked in
+    // its outbox / `staged_events` (ledgering those ids), and crash one mid-drain
+    // right after a heal.
     async fn fuzz_crash(&mut self) -> Result<(), String> {
         let alive: Vec<&str> = SERVERS.into_iter().filter(|s| self.is_proc_up(s)).collect();
         let dead: Vec<&str> = SERVERS
@@ -1200,7 +1212,7 @@ impl Harness {
         Ok(())
     }
 
-    // ---- rig lifecycle (delegated to the in-process testkit) ----------------
+    // ---- rig lifecycle (delegated to the testkit) ---------------------------
 
     /// Topology control. The rig's `heal` resets outbound backoff on both ends
     /// (SIGUSR2 -> KickBackoff), so the harness never signals the servers itself.
@@ -1212,8 +1224,9 @@ impl Harness {
         }
     }
 
-    /// Hard-crash a server: SIGKILL the real `neutrino` process. `/data` survives
-    /// (parent-owned tempdir), so this models a process crash, not host power-loss.
+    /// Hard-crash a server: SIGKILL the real `neutrino` process. Its storage dir
+    /// survives (parent-owned tempdir), so this models a process crash, not host
+    /// power-loss.
     async fn crash(&mut self, hs: &str) {
         self.rig.crash(idx(hs));
     }
@@ -1221,8 +1234,8 @@ impl Harness {
     /// Re-spawn a crashed server and wait for it to serve again. It re-opens its
     /// on-disk DB (recovering committed state) and re-arms its outbox sender;
     /// with `NEUTRINO_STARTUP_JITTER_MS=0` it redrains immediately, and the
-    /// caller's subsequent heal resets peer backoff. Unlike the old docker path
-    /// there is no network to reattach, so links need not be healed first.
+    /// caller's subsequent heal resets peer backoff. Links need not be healed
+    /// first.
     async fn revive(&mut self, hs: &str) -> Result<(), String> {
         self.rig.revive(idx(hs)).await;
         Ok(())
@@ -1329,6 +1342,9 @@ impl Harness {
         .await?;
         self.barrier().await?;
         self.exact_probes().await?;
+        // TODO: a deep-isolation episode — cut one server off while the others
+        // build a state-DAG chain deeper than one `get_missing_events` page, then
+        // heal and assert every intermediate state event reached it.
         for ep in 1..=self.cfg.episodes {
             self.log(&format!(
                 "episode {ep}/{}: {} fuzz rounds (record tier)",
@@ -1426,7 +1442,7 @@ async fn run_converge() {
             h.dump().await;
         }
     }
-    // The rig's `Drop` kills the child servers; no docker teardown to run.
+    // The rig's `Drop` kills the child servers.
     if result.is_err() {
         std::process::exit(1);
     }

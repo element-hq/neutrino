@@ -16,8 +16,6 @@
 //!   outcome — a state-independent auth-rule failure comes back as
 //!   [`Wire::Rejected`] (persisted rejected, not dropped at the wire edge),
 //!   not an error (see `from_wire`'s docs).
-//!
-//! See `event-id-design.md` §"Updated `EventBuilder`".
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -375,11 +373,9 @@ pub fn from_wire(
     // still re-derive this event's id — receipt-check 3 redacts and carries on,
     // so the id must survive it.
     //
-    // Not an `expect`: this used to be guaranteed because `reference_hash`
-    // had already run the same redaction a few lines above, but an arbitrary
-    // `EventIdScheme::derive` need not touch redaction at all, so a malformed
-    // `content`/`hashes`/`signatures` can reach here and fail. Attacker-supplied
-    // bytes must not panic the ingress.
+    // Not an `expect`: an `EventIdScheme::derive` need not touch redaction,
+    // so a malformed `content`/`hashes`/`signatures` can reach here and fail.
+    // Attacker-supplied bytes must not panic the ingress.
     let raw_to_parse = match check_content_hash(&obj) {
         ContentHashCheck::Absent | ContentHashCheck::Matches => raw,
         ContentHashCheck::Mismatch => {
@@ -505,7 +501,7 @@ impl UnverifiedWire {
     /// Two sanctioned exceptions carry the check elsewhere rather than skip it:
     /// - The `/send` transaction handler parses on faith and **defers** the
     ///   signature check to the inbound worker, which re-admits every staged
-    ///   row via [`EventSecurity::admit_wire`](crate::sign::EventSecurity::admit_wire)
+    ///   row via [`EventPolicy::admit_wire`](crate::sign::EventPolicy::admit_wire)
     ///   before applying it. The worker is the sole staged→applied authority
     ///   and staged rows are pre-auth (never served), so a bad-signature PDU is
     ///   dropped there and never reaches room state.

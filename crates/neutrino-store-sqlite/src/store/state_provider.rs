@@ -11,24 +11,24 @@
 //! ```text
 //! storage.run_read(move |conn| {
 //!     let provider = SqliteStateProvider::new(conn);
-//!     // ... call state-res / room_core::apply against `&provider`
+//!     // ... call state-res / `RoomCore::apply_pdu` against `&provider`
 //! }).await
 //! ```
 //!
-//! The deferred apply+persist step needs the state-res read *and* the
-//! persist write to be atomic — i.e. share one write transaction. The
-//! `&Connection` borrow composes with that: a [`rusqlite::Transaction`]
-//! derefs to `&Connection`, so the provider is built from `&tx`, used for
-//! reads, then dropped before the `tx` is consumed by `commit`:
+//! `maintain_room_state` needs the state-res read *and* the index write to
+//! share one write transaction. The `&Connection` borrow composes with that:
+//! a [`rusqlite::Transaction`] derefs to `&Connection`, so the provider is
+//! built from `&tx`, used for reads, then dropped before the `tx` is consumed
+//! by `commit`:
 //!
 //! ```text
 //! storage.run_write(move |conn| {
 //!     let tx = conn.transaction()?;
-//!     let effects = {
+//!     let state = {
 //!         let provider = SqliteStateProvider::new(&tx); // Transaction: Deref<Connection>
-//!         room_core::apply(&provider, event)?           // reads via provider
+//!         state_at_heads(&prev_state_events, &provider, &mut cache)? // reads via provider
 //!     };                                                // provider dropped here
-//!     // ... apply `effects`: writes via the *same* `tx` ...
+//!     // ... write `state`: writes via the *same* `tx` ...
 //!     tx.commit()?;                                     // consumes `tx`
 //! }).await
 //! ```
@@ -38,7 +38,7 @@
 //! takes `tx` by value, which is why the provider lives in an inner scope.
 //! `provider_usable_inside_write_transaction` in the tests pins this down.
 //!
-//! Two trait methods, both single-query:
+//! Trait methods:
 //!
 //! - [`get_event`]: one SELECT against `events`, hydrating the row through
 //!   the existing [`EventRow`] machinery so `auth_events` / `rejected` /
@@ -52,11 +52,14 @@
 //!   documented on the trait. `event_edges.parent_event_id` has no FK
 //!   (federation backfill can reference parents we haven't yet seen),
 //!   so the join is the only way to detect a dangling edge.
+//! - [`state_after`]: reads back the `room_state` interval rows that
+//!   `maintain_room_state` writes, without walking `prev_state_events`.
 //!
 //! [`StateResError::MissingEvent`]: neutrino_room::StateResError::MissingEvent
 //! [`SqliteStore`]: crate::SqliteStore
 //! [`get_event`]: neutrino_room::provider::StateProvider::get_event
 //! [`auth_chain`]: neutrino_room::provider::StateProvider::auth_chain
+//! [`state_after`]: neutrino_room::provider::StateProvider::state_after
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -83,7 +86,7 @@ impl<'a> SqliteStateProvider<'a> {
         Self { conn }
     }
 
-    /// Both trait methods funnel SQL errors through this — the trait
+    /// All trait methods funnel SQL errors through this — the trait
     /// only knows about [`StateResError`], so driver / hydration faults
     /// surface as `StateResError::Internal`.
     fn into_internal(err: Error) -> StateResError {
@@ -490,12 +493,11 @@ mod tests {
 
     #[tokio::test]
     async fn provider_usable_inside_write_transaction() {
-        // The deferred apply+persist step builds the provider and writes in
-        // ONE write transaction (atomic apply). The provider borrows
-        // `&Connection`; a `Transaction` derefs to one, so it's constructed
-        // from `&tx`, used for reads, then dropped before `commit` consumes
-        // the `tx`. This pins that borrow pattern so the future wiring can't
-        // regress into a borrow-checker dead end.
+        // `maintain_room_state` builds the provider and writes in ONE write
+        // transaction. The provider borrows `&Connection`; a `Transaction`
+        // derefs to one, so it's constructed from `&tx`, used for reads, then
+        // dropped before `commit` consumes the `tx`. This pins that borrow
+        // pattern.
         let (s, create) = store_with_room_and_create().await;
         let create_id = create.event_id.clone();
         let present = s

@@ -19,15 +19,15 @@
 //!   inbound PDU (auth + state-res + persist), so it becomes normal
 //!   `current_state` rather than a redundant out-of-band stub.
 //!
-//! Response is `{ event }` — our copy of the invite event, verbatim. In a
-//! signatures world this is where the resident signature would be added.
+//! Response is `{ event }` — our copy of the invite event, co-signed in signed
+//! mode.
 //!
 //! Requires an authenticated `X-Matrix` origin (network-attested — see
-//! [`crate::federation::auth`]); no signature verification (no signing keys).
-//! Unlike send_join/leave it does NOT require `origin == sender.server` on the
-//! hosted-room path (an invite may be authored by a local user yet arrive over
-//! federation, and apply_pdu is authoritative there); the out-of-band path,
-//! which has no state to auth against, DOES require it. The invite event's
+//! [`crate::federation::auth`]). Unlike send_join/leave it does NOT require
+//! `origin == sender.server` on the hosted-room path (an invite may be authored
+//! by a local user yet arrive over federation, and apply_pdu is authoritative
+//! there); the out-of-band path, which has no state to auth against, DOES
+//! require it. The invite event's
 //! `sender` domain is the staged row's gap-fill fetch target.
 
 use axum::{
@@ -131,8 +131,7 @@ pub(crate) async fn handle(
 
     let room_id = event.room_id.clone();
 
-    // Structural validation (spec §invite). No signature check (no signing
-    // keys). The X-Matrix origin is authenticated below; the origin==sender
+    // Structural validation (spec §invite). The X-Matrix origin is authenticated below; the origin==sender
     // constraint is imposed only on the out-of-band path (see below).
     if event.event_type != "m.room.member" {
         return Err(FedError::BadRequest("event is not an m.room.member event"));

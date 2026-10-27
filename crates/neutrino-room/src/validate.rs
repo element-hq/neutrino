@@ -6,7 +6,7 @@
 //!
 //! Wire-format parsing (`parse_event`) and the provider-free semantic rules
 //! (`validate_pdu`) are event-scoped and live in
-//! [`neutrino_event::validate`]. `RoomCore::apply` runs `validate_pdu`
+//! [`neutrino_event::validate`]. `RoomCore::apply_pdu` runs `validate_pdu`
 //! (event-scoped) and then `validate_references` (room-scoped) before the auth
 //! checks.
 

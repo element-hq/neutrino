@@ -118,7 +118,6 @@ async fn legacy_sync_returns_v3_envelope() {
     assert_eq!(status, StatusCode::OK);
 
     let obj = body.as_object().expect("top-level object");
-    // The full set of top-level keys the design doc pins down.
     let expected_keys = [
         "next_batch",
         "rooms",
@@ -175,7 +174,6 @@ async fn send_event_then_legacy_sync_delivers_it_in_timeline() {
         .pointer(&format!("/rooms/join/{}", room_id))
         .expect("room landed in rooms.join");
 
-    // Joined-room shape per the design doc.
     assert_eq!(room_v["timeline"]["limited"], json!(false));
     assert_eq!(room_v["timeline"]["prev_batch"], json!(""));
 
@@ -190,7 +188,7 @@ async fn send_event_then_legacy_sync_delivers_it_in_timeline() {
     );
 
     // `state` and `org.matrix.msc4222.state_after` are both present and
-    // carry identical content (the design doc commits to dual emission).
+    // carry identical content.
     let state = &room_v["state"]["events"];
     let state_after = &room_v["org.matrix.msc4222.state_after"]["events"];
     assert!(state.is_array(), "state.events present");

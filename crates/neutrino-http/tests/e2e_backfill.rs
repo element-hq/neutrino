@@ -3,11 +3,11 @@
 //! joins, so B never receives those messages forward (no `/send` for them) — B
 //! can only obtain them by backfilling from A on a backward `/messages` page.
 //!
-//! Proves the whole chain (Tasks 1-7): a `dir=b` page on B that underflows its
-//! local history, with B holding a backward extremity (its join event's
-//! `prev_events` point at A's unheld history) and A as the only other joined
-//! server, triggers a synchronous outbound backfill round (Task 7) that fetches
-//! A's pre-join messages and serves them newest-first.
+//! A `dir=b` page on B that underflows its local history, with B holding a
+//! backward extremity (its join event's `prev_events` point at A's unheld
+//! history) and A as the only other joined server, triggers a synchronous
+//! outbound backfill round that fetches A's pre-join messages and serves them
+//! newest-first.
 //!
 //! Each node is the full production stack (`neutrino_http::serve`: router +
 //! outbound sender pool), driven only over its public HTTP/CSAPI surface, so

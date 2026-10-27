@@ -2,9 +2,9 @@
 //!
 //! Drains the durable `outbox` (populated atomically with each accepted event
 //! — see `EventStore::persist_resolved_event`) and PUTs transactions to peers
-//! via `neutrino-http`'s `FederationClient`. This is where the "events MUST eventually be sent
-//! / never lost / retry on restart" clause of the Server-Server `/send` task
-//! lives.
+//! via the [`FederationTransport`] port.
+//! This is where the "events MUST eventually be sent / never lost / retry on
+//! restart" guarantee lives.
 //!
 //! ## Shape
 //!

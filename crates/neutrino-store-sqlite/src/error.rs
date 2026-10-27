@@ -8,7 +8,7 @@ use thiserror::Error;
 /// [`SqliteStore::run_read`](crate::SqliteStore::run_read) /
 /// [`run_write`](crate::SqliteStore::run_write) returns. The single
 /// `From<Error> for StorageError` impl in this file is the canonical mapping
-/// point — design doc §3, the "single point of variant-selection".
+/// point.
 ///
 /// Orphan rule: `StorageError` lives in `neutrino-store`, which does not (and
 /// must not) depend on `rusqlite`/`deadpool`. We can't write
@@ -42,7 +42,7 @@ impl From<Error> for StorageError {
     fn from(e: Error) -> Self {
         match &e {
             // ConstraintViolation (FK, CHECK, NOT NULL, UNIQUE) ⇒ caller passed
-            // something the schema rejects. Per design doc §3 mapping table.
+            // something the schema rejects.
             Error::Sqlite(rusqlite::Error::SqliteFailure(f, _))
                 if matches!(f.code, ErrorCode::ConstraintViolation) =>
             {

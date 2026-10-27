@@ -17,8 +17,7 @@
 //!   state resolution itself. No size cap (a large room must still be joinable).
 //! - `timeline` — the most recent timeline events, so the joiner has context
 //!   and the join event's `prev_events` resolve.
-//! - `event` — our copy of the membership event (identical to the request body;
-//!   in a signatures world this is where the resident signature would be added).
+//! - `event` — our copy of the membership event, co-signed in signed mode.
 //!
 //! Idempotent: a re-sent `send_join` (our response was lost) re-applies the
 //! same join as a no-op and we simply rebuild and return the state again.
@@ -98,9 +97,9 @@ pub(crate) async fn handle(
     };
     let room_id = event.room_id.clone();
 
-    // Structural validation (spec §send_join). The signature check is skipped
-    // (no signing keys); the sender-on-origin check is enforced below via the
-    // network-attested `X-Matrix` origin. apply_resident remains the real auth.
+    // Structural validation (spec §send_join). The sender-on-origin check is
+    // enforced below via the network-attested `X-Matrix` origin. apply_resident
+    // remains the real auth.
     if event.event_type != "m.room.member" {
         return Err(FedError::BadRequest("event is not an m.room.member event"));
     }

@@ -1,10 +1,9 @@
 //! Server-to-server (federation) HTTP handlers.
 //!
 //! Houses the inbound + outbound Server-Server handlers (see the submodules
-//! below). `X-Matrix` origin auth is network-attested (see [`auth`]); the
-//! remaining trust-model caveats are deliberate spec deviations under the
-//! trusted-mesh assumption: no signature verification, no `min_depth` filter,
-//! no history-visibility filter. See `docs/get-missing-events.md` for design.
+//! below). `X-Matrix` origin auth is network-attested (see [`auth`]). The
+//! history reads (`get_missing_events`, `backfill`) apply no history-visibility
+//! filter.
 //!
 //! New federation endpoints land as sibling modules and register their
 //! routes in `lib.rs::build_router`.

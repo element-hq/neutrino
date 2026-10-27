@@ -1,8 +1,8 @@
-//! In-process multi-server federation test harness.
+//! Multi-server federation test harness.
 //!
-//! Spawns N real `neutrino` binaries (at a caller-provided path) on loopback and
-//! drives real federation HTTP between them, with toggleable proxy partitions and
-//! real SIGKILL crash/revive. No docker. Shared by the `neutrino` crate's
+//! Spawns N real `neutrino` binaries (at a caller-provided path) as child
+//! processes on loopback and drives real federation HTTP between them, with
+//! toggleable proxy partitions and real SIGKILL crash/revive. Shared by the `neutrino` crate's
 //! integration tests (which pass `env!("CARGO_BIN_EXE_neutrino")`) and the
 //! `converge` fuzzer (which builds + locates the binary itself). Depends on no
 //! other neutrino crate.
@@ -19,7 +19,7 @@
 //! heal); otherwise it forwards to the backend. The proxy outlives child
 //! crash/revive, so the advertised endpoint is stable while the child is dead.
 //!
-//! Drive CSAPI over the [`Harness::backend`] port directly (never partitioned);
+//! Drive CSAPI over each server's backend port directly (never partitioned);
 //! the typed CSAPI/await helpers do exactly that.
 //!
 //! ## Crash / revive / heal

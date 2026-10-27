@@ -1,7 +1,7 @@
 //! Synthesised delivery receipts for the sliding-sync receipts extension.
 //!
 //! This server produces no receipt EDUs and receives none — federation carries
-//! PDUs only (CLAUDE.md). What it *does* know is when a peer acknowledged a
+//! PDUs only. What it *does* know is when a peer acknowledged a
 //! `/send` transaction, which the outbound sender records as a per-(room,
 //! destination) high-water mark (`DeliveryStore`). This module turns those
 //! marks into `m.receipt` ephemerals so a client can render "the other side
@@ -95,7 +95,7 @@ pub(super) async fn build_receipts<S: StorageBackend>(
         }
         // Only reachable if `ReceiptEventContent` isn't representable as JSON,
         // which it is by construction — but the alternative to mapping it is an
-        // `.unwrap()` in handler code (CLAUDE.md).
+        // `.unwrap()` in handler code.
         let raw = Raw::new(&SyncReceiptEvent::new(content))
             .map_err(|e| SyncError::Storage(StorageError::Internal(e.to_string())))?;
         receipts.rooms.insert(room_id.to_owned(), raw);

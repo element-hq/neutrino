@@ -382,7 +382,7 @@ impl SqliteStore {
     }
 }
 
-/// The connection-bridging primitive the per-room actor drives `RoomCore::apply`
+/// The connection-bridging primitive the per-room actor drives `RoomCore::apply_pdu`
 /// through: `run_read` and `SqliteStateProvider` are `pub(crate)`/connection-
 /// bound, so the engine can't build a provider itself — but it owns the state
 /// machine. `f` runs the apply (a read: immutable events + auth chains, no write

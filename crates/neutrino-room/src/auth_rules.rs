@@ -15,7 +15,7 @@
 //!   `RoomRejected`, `RoomTypeMismatch`).
 //! - Rule 3 (`auth_events` checks) — dead under MSC4242. The wire field is
 //!   rejected up front by `validate::parse_event`
-//!   (`FormatError::AuthEventsPresent`); the algorithm now uses
+//!   (`FormatError::AuthEventsPresent`); the algorithm uses
 //!   `auth_events::calculate_auth_events` instead.
 //! - Rule 9 (state_key starts with `@`) — `validate::validate_pdu` raises
 //!   `FormatError::StateKeyAtSignSenderMismatch`. (Excludes `m.room.member`;
@@ -24,8 +24,7 @@
 //!   `validate::validate_pdu` via `check_power_levels`
 //!   (`FormatError::PowerLevelsBadIntField`, `PowerLevelsBadObjectField`,
 //!   `PowerLevelsBadUsers`).
-//! - Signature checks (rule 5.2, third-party `signed.*`) — skipped per
-//!   `CLAUDE.md` trusted-network policy.
+//! - Signature checks (rule 5.2, third-party `signed.*`) — not implemented.
 //!
 //! `check_auth_rules` is a pure function over an `Event` and a fully-resolved
 //! `StateMap<Arc<Event>>` (state-before-event). The caller is responsible for
@@ -422,8 +421,7 @@ fn check_rule_5_member(member_event: &Event, ctx: &AuthContext) -> Result<(), Au
     // validate::check_member (FormatError::MemberMissingStateKey /
     // MemberMissingMembership) — the `.expect()`s below are guaranteed safe
     // for events that reach the state-dependent authorization rules.
-    // 5.2 (signature on join_authorised_via_users_server): skipped per
-    // CLAUDE.md trusted-network policy.
+    // 5.2 (signature on join_authorised_via_users_server): not checked.
     let state_key = member_event
         .state_key
         .as_deref()
@@ -591,8 +589,8 @@ fn check_third_party_invite_path(
             "sender does not match third_party_invite sender",
         ));
     }
-    // Signature verification skipped per trusted-network policy. Accept once
-    // a `public_key` or `public_keys` is present on the invite.
+    // The `signed` block's signature is not verified. Accept once a
+    // `public_key` or `public_keys` is present on the invite.
     let tpi_content = parse_content(tpi_event);
     if tpi_content.get("public_key").is_some() || tpi_content.get("public_keys").is_some() {
         return Ok(());
@@ -1846,7 +1844,7 @@ mod tests {
                     "signed": {
                         "mxid": target,
                         "token": token,
-                        // signatures omitted per trusted-network policy.
+                        // signatures omitted: never verified.
                     }
                 }
             }),

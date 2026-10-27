@@ -1,7 +1,7 @@
 # Curated allowlist of complement CS-API tests run against neutrino.
 #
 # Each non-comment line becomes its own `go test -run <line>` invocation
-# (see scripts/complement.sh). One entry per line. Use the full slash-
+# (see `cargo xtask complement`). One entry per line. Use the full slash-
 # separated test path; trailing `$` anchors the match where a name is a
 # prefix of a sibling.
 
@@ -38,9 +38,8 @@ TestRoomCreationReportsEventsToMyself/parallel/Room_creation_reports_m.room.memb
 # run. Four server fixes came out of that run: empty-body extractor, kick
 # non-member 403, trailing-slash empty state key, and legacy /sync recovering a
 # stale since token via a full re-sync instead of M_UNKNOWN_POS (the last
-# un-parks TestCumulativeJoinLeaveJoinSync). One test dropped as not viable, see
-# VIABLE-TESTS.md: TestMembersLocal (its fixture sets presence, an out-of-scope
-# EDU). Trailing `$` anchors each name.
+# un-parks TestCumulativeJoinLeaveJoinSync). TestMembersLocal is not viable: its
+# fixture sets presence, an out-of-scope EDU. Trailing `$` anchors each name.
 TestCumulativeJoinLeaveJoinSync$
 TestGetRoomMembers$
 TestRoomMembers/Parallel/POST_/rooms/:room_id/join_can_join_a_room$
@@ -64,7 +63,7 @@ TestNotPresentUserCannotBanOthers$
 # match the sibling `joined_rooms` subtest. `\?` escapes the literal `?` in the
 # format=event name; trailing `$` anchors prefix-siblings (e.g. "…with_a_topic"
 # vs "…with_a_topic_and_writes_rich…"). TODO: anchor segments in the allowlist
-# parser (scripts/complement.sh) so per-entry anchoring isn't needed.
+# parser (tools/xtask/src/complement.rs) so per-entry anchoring isn't needed.
 TestRoomState/Parallel/GET_/^rooms$/:room_id/state/m.room.member/:user_id_fetches_my_membership$
 TestRoomState/Parallel/GET_/^rooms$/:room_id/state/m.room.member/:user_id\?format=event_fetches_my_membership_event$
 TestRoomState/Parallel/GET_/^rooms$/:room_id/state/m.room.power_levels_fetches_powerlevels$
@@ -105,5 +104,5 @@ TestRoomCreate/Parallel/Rooms_can_be_created_with_an_initial_invite_list_\(SYN-2
 # asserts. The other room_messages_test.go cases are not viable here (filters /
 # lazy-loaded state, /send txn-id dedup, federation backfill) and
 # TestSendAndFetchMessage is blocked on a durable stream-position legacy /sync
-# token — see VIABLE-TESTS.md.
+# token.
 TestFetchMessagesFromNonExistentRoom$

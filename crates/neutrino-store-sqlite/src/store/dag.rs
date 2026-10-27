@@ -65,10 +65,9 @@ fn hydrate_pdu(
     };
     // `prev_events` and `prev_state_events` are populated by row hydration
     // from the canonical JSON in `events.json` — no edge-table lookup
-    // needed for the per-event view. `event_edges` still exists for graph
+    // needed for the per-event view. `event_edges` serves graph
     // queries (the priority-queue walk in `events_before` /
-    // `missing_events`); see the
-    // "denormalisation" note in `event-id-design.md`.
+    // `missing_events`).
     Ok(Some(inner?))
 }
 
@@ -427,8 +426,7 @@ impl DagStore for SqliteStore {
             // walk because no walked event matches.
             //
             // See `_get_missing_events` in synapse's
-            // storage/databases/main/event_federation.py and
-            // docs/get-missing-events.md.
+            // storage/databases/main/event_federation.py.
             //
             // The MSC4242 state-DAG walk (`state_dag`) has its own ordering
             // and rejection rules — see `walk_state_dag`. Below is the

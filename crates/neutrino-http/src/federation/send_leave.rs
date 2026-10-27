@@ -63,9 +63,8 @@ pub(crate) async fn handle(
     };
     let room_id = event.room_id.clone();
 
-    // Structural validation (spec §send_leave). The signature check is skipped
-    // (no signing keys); the sender-on-origin check is enforced below via the
-    // network-attested `X-Matrix` origin. state_key == sender is mandatory, so
+    // Structural validation (spec §send_leave). The sender-on-origin check is
+    // enforced below via the network-attested `X-Matrix` origin. state_key == sender is mandatory, so
     // this endpoint can only ever express a *self*-leave; a kick/ban of another
     // user rides `/send` as a normal PDU instead.
     if event.event_type != "m.room.member" {

@@ -15,8 +15,6 @@
 //!   a fresh `SqliteStore`, build chains with explicit `prev_events`, persist
 //!   them via the trait, then mount the router on top with
 //!   `router_with_store`.
-//!
-//! See `docs/get-missing-events.md` for the behaviour this file covers.
 
 #![cfg(test)]
 

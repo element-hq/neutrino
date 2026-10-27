@@ -10,9 +10,9 @@ caveats:
      * Instead, it's runnable from the P2P branch of Element X Android, embedded within the Android app.
  3. It is very deliberately **NOT SECURE** for use on the public internet.
      * Again, please DO NOT USE NEUTRINO ON UNTRUSTED NETWORKS (e.g. the internet) yet.
-     * It does not yet put signatures on events, nor does it check them.
+     * Events are unsigned and unverified by default; signing is opt-in (`NEUTRINO_TRUSTED_NETWORK=0`).
  4. It does not speak or interoperate with normal Matrix yet.
- 5. It is deliberately very feature poor; it only supports joining/leaving rooms and sending messages.
+ 5. It is deliberately very feature poor; it only supports room membership (join/leave/invite/kick/ban) and sending messages.
      * It has no E2EE, or file transfer, or typing notifications, or read receipts, etc. etc.
  6. It is deliberately not at all optimised yet - e.g. it has no caching.
  7. It only implements the very latest room versions (Hydra Phase 2 and (in future) 3 - e.g. State DAGs: MSC4242)
@@ -27,31 +27,10 @@ caveats:
 
 ## Overview
 
-Neutrino is split into a number of different modules:
-
-Server operations:
-- `neutrino-ctl` contains control plane operations e.g. configuration, shutdown commands.
-- `neutrino-http` contains the HTTP router for both the C2S and S2S Matrix APIs.
-- `neutrino-lb` contains the low bandwidth modifications which map HTTP to CoaP.
-- `neutrino-testkit` contains a multi-federation test harness.
-
-Matrix logic:
-- `neutrino-engine` contains operations which work on a collection of rooms e.g. event ingestion pipeline, actor models
-- `neutrino-room` contains operations which work in a single room e.g. state resolution.
-- `neutrino-event` contains operations which work on a single event e.g. redaction/hashing algorithms, canonical JSON.
-
-FFI/bindings/stand-alone:
-- `neutrino-ffi` defines the FFI functions exposed to Android generated using UniFFI.
-- `neutrino` defines the development binary.
-- `neutrino-main` defines shared entrypoint code between binary/FFI.
-
-Storage:
-- `neutrino-store` defines the `StorageBackend` storage trait that handlers go through.
-- `neutrino-store-sqlite` is the SQLite implementation of that storage trait.
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the crates fit together.
 
 Neutrino makes use of the [`xtask` pattern](https://github.com/matklad/cargo-xtask) for the
-developer tasks that don't fit a plain `cargo` invocation; see
-[`tools/xtask/README.md`](tools/xtask/README.md) for the command reference.
+developer tasks that don't fit a plain `cargo` invocation; run `cargo xtask --help` for the command reference.
 
 ## Building
 
@@ -67,13 +46,13 @@ You can run the homeserver locally during development to test against arbitrary 
 $ cargo run --bin neutrino
 ```
 
-By default, this starts the server on `http://localhost:3000`.
+By default, this starts the server on `http://localhost:8008`.
 
 You can also reverse-proxy the development server into an Android emulator running the **mainline**
 `element-x-android`:
 
 ```
-$ adb reverse tcp:3000 tcp:3000
+$ adb reverse tcp:8008 tcp:8008
 ```
 
 You can then use the same URL as above as the homeserver URL when logging in.
