@@ -168,7 +168,7 @@ impl Config {
             // events client-visible for the rig.
             enable_soft_failure: std::env::var("NEUTRINO_ENABLE_SOFT_FAILURE")
                 .map_or(true, |v| !matches!(v.as_str(), "0" | "false")),
-            // Default on (today's deployments); `NEUTRINO_TRUSTED_NETWORK=0`
+            // Default on; `NEUTRINO_TRUSTED_NETWORK=0`
             // flips the stack into signed mode (see the field docs).
             trusted_network: std::env::var("NEUTRINO_TRUSTED_NETWORK")
                 .map_or(true, |v| !matches!(v.as_str(), "0" | "false")),

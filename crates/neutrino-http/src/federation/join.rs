@@ -218,11 +218,10 @@ async fn run_join_dance(
 /// client cannot supply a `via` for a v12 room id (no domain), so we mirror
 /// Synapse (`handlers/room_member.py:1108`) and source it from the invite.
 ///
-/// Trust model: peers in the mesh are implicitly trusted, so the inviter's
-/// `server_name` is used as an outbound join target verbatim — there is no
-/// loopback / private-range / allowlist check. A hostile invite could point
-/// this request at an arbitrary host, but every federated peer is trusted by
-/// design, so this is intentional, not an oversight.
+/// The inviter's `server_name` is used as an outbound join target verbatim —
+/// there is no loopback / private-range / allowlist check, in either trust
+/// mode. A hostile invite can point this request at an arbitrary host; event
+/// signatures (signed mode) protect what the join accepts, not where it dials.
 ///
 /// Returns:
 ///   - `Some(_)` when a federated join was attempted (its CSAPI response), or

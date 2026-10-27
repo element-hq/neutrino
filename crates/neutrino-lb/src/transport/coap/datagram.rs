@@ -214,9 +214,8 @@ pub trait DatagramLink: Send + Sync {
     /// is closed (which ends the [`Hub`] drain task).
     async fn recv(&self) -> Option<(LinkAddr, Vec<u8>)>;
     /// The wire-level link facts CoAP framing is derived from — see
-    /// [`LinkProfile`]. Defaults to today's assumptions so existing
-    /// implementations are unaffected. Decorators MUST delegate to the wrapped
-    /// link, or they mask its declared facts.
+    /// [`LinkProfile`]. Defaults to [`LinkProfile::default`]. Decorators MUST
+    /// delegate to the wrapped link, or they mask its declared facts.
     fn profile(&self) -> LinkProfile {
         LinkProfile::default()
     }

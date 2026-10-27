@@ -150,7 +150,7 @@ fn lock_app(state: &AppState) -> std::sync::MutexGuard<'_, App> {
 /// - feature `multi-user-shim` ON: resolves `Authorization: Bearer <token>`
 ///   against the in-memory token map; 401 on missing/unknown.
 /// - feature OFF: ignores any token and yields the single configured user
-///   (`config.user_id()`), exactly matching today's single-user behaviour.
+///   (`config.user_id()`).
 pub struct AuthUser(pub OwnedUserId);
 
 impl axum::extract::FromRequestParts<AppState> for AuthUser {
@@ -2135,10 +2135,9 @@ mod tests {
     use tempfile::TempDir;
 
     /// The wire mirror must keep an extensions object that carries *only*
-    /// receipts. It previously used a hand-rolled emptiness predicate that knew
-    /// about to-device and e2ee alone, so a receipts-only response serialised
-    /// with the whole extensions object dropped — the synthesised receipt was
-    /// built and then silently discarded at the JSON edge.
+    /// receipts. An emptiness predicate that knows only to-device and e2ee
+    /// drops the whole object for a receipts-only response, silently
+    /// discarding the synthesised receipt at the JSON edge.
     #[test]
     fn wire_keeps_a_receipts_only_extensions_object() {
         use ruma::api::client::sync::sync_events::v5;
@@ -2499,8 +2498,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_shutdown_breaks() {
-        // The only terminal command today. When a non-terminal variant lands it
-        // returns ControlFlow::Continue, and this stays the per-command oracle.
+        // Shutdown is the only terminal command.
         let (state, _tmp) = test_state().await;
         assert_eq!(handle(Command::Shutdown, &state), ControlFlow::Break(()));
     }

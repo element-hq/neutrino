@@ -511,8 +511,8 @@ async fn run_pair<S: WireServer>(
 mod profile_tests {
     use super::*;
 
-    // The default profile states today's operating assumptions — the values
-    // every existing medium implicitly ran under before profiles existed.
+    // The default profile: a full `Packet::MAX_SIZE` datagram budget on an
+    // authenticated, unmetered hop.
     #[test]
     fn default_profile_is_todays_assumptions() {
         let p = LinkProfile::default();

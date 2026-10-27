@@ -20,9 +20,8 @@ use crate::transport::{WireHandler, WireRequest, WireResponse};
 /// `neutrino-http` serves the (unauthenticated, trusted-network) Client-Server
 /// API on the same listener (see `build_router`). Forwarding only
 /// `/_matrix/federation/*` keeps a peer from reaching CSAPI/other routes
-/// through the proxy — restoring the route boundary the single-port homeserver
-/// used to imply when it wasn't network-exposed. No `/_matrix/key/` prefix:
-/// this server has no signing keys and serves no key endpoints.
+/// through the proxy. No `/_matrix/key/` prefix: over lb, peer keys come from
+/// the medium's key resolver, never from a fetch over the wire.
 const FEDERATION_PREFIX: &str = "/_matrix/federation/";
 
 /// Join an error's source chain into `": "`-separated causes. reqwest's `Display`

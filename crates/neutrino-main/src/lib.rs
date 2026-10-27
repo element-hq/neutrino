@@ -255,8 +255,8 @@ pub async fn entrypoint(
     // authenticated (its LinkProfile; plain UDP authenticates nothing), the
     // app declares whether origins are trusted on faith (`trusted_network`).
     // All four combinations are valid deployments — e.g. sigs=on/auth=off is
-    // a future anonymous store-and-forward relay, sigs=off/auth=on is
-    // today's BLE mesh — so nothing is refused here; the composition is
+    // an anonymous store-and-forward relay, sigs=off/auth=on is a BLE
+    // mesh — so nothing is refused here; the composition is
     // logged so a deployment's posture is one grep away.
     let link_profile = link.as_ref().map(|l| l.profile()).unwrap_or_default();
     let security_config = SecurityConfig {
@@ -676,7 +676,7 @@ mod tests {
         assert_eq!(lb.egress_bind, egress());
         assert_eq!(lb.upstream, "http://127.0.0.1:8008");
         // The default profile derives the SZX-max 1024 B Q-Block1 size: no
-        // per-request option budget is reserved any more — the medium's
+        // per-request option budget is reserved — the medium's
         // LinkCodec controls what rides each block, and an over-MTU datagram
         // is the link's to detect and log loudly.
         assert!(matches!(

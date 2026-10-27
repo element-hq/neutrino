@@ -867,7 +867,7 @@ mod tests {
 
     // D12b: multi-seed walk with a `limit` returns the *globally* newest
     // events, not one level per seed. This is the property the priority
-    // queue buys over the old FIFO BFS: with seeds [c(3), d(4)] across two
+    // queue buys over a FIFO BFS: with seeds [c(3), d(4)] across two
     // forks and limit=2, the result is [d, c] (the two newest by ts) — a
     // FIFO would have returned [c, d] (seed order) or [d, c] but then, at
     // limit=3, leaked an older event before a newer one on the other fork.

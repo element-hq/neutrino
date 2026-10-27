@@ -428,7 +428,7 @@ mod tests {
         assert_eq!(
             list.room_details.timeline_limit,
             ruma::UInt::from(50u32),
-            "timeline_limit fixed at 50 per design doc",
+            "timeline_limit fixed at 50",
         );
     }
 

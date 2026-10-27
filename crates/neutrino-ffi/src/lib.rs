@@ -202,9 +202,9 @@ impl NeutrinoHandle {
     /// running normally. The host polls this alongside `server_name()`: a
     /// `Some(server_name)` means "ready", a `Some(last_error)` means "refused to
     /// start — show this message in a dialog". A non-blocking in-memory read
-    /// (like `server_name`), safe to call from the FFI/JNI thread. Startup
-    /// failures that used to only reach logcat (identity mismatch, bad config,
-    /// bind failure) are now observable by the host.
+    /// (like `server_name`), safe to call from the FFI/JNI thread. Covers
+    /// startup failures such as an identity mismatch, bad config or a bind
+    /// failure.
     pub fn last_error(&self) -> Option<String> {
         self.last_error.borrow().clone()
     }
@@ -322,8 +322,7 @@ pub fn start_with(
     let discovery_for_handle = discovery_for_server.clone();
     std::thread::spawn(move || {
         // The caller's runtime if it built one (it had to, to open the store it
-        // passed), else ours. current_thread = parity with the previous
-        // async-compat global (also current_thread); all DB work is offloaded to
+        // passed), else ours. current_thread: all DB work is offloaded to
         // the blocking pool, so the executor is I/O-bound. enable_all() = I/O +
         // time drivers (TcpListener, reqwest, tokio::time). A `Runtime` is
         // `Send`, so one built on the caller's thread drives fine here.

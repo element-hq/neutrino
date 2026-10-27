@@ -31,7 +31,7 @@ pub struct RoomVersion {
     /// and tweaked. Authority for redaction, auth, state-res, signatures and
     /// event format.
     ///
-    /// Only `.redaction` is consumed today (see
+    /// Only `.redaction` is consumed (see
     /// [`redact_for_hash`](crate::event_id::redact_for_hash)): the v12 auth
     /// rules and state-res in `neutrino-room` are hand-written and do not
     /// consult ruma's rules at all. The whole struct is carried anyway because
