@@ -21,8 +21,6 @@ const ALLOWED: &[(&str, &[&str])] = &[
         "neutrino-engine",
         &["neutrino-event", "neutrino-room", "neutrino-store"],
     ),
-    // TODO: drop neutrino-store-sqlite once `App.store` is generic over the
-    // storage traits.
     (
         "neutrino-http",
         &[
@@ -31,7 +29,6 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "neutrino-room",
             "neutrino-store",
             "neutrino-engine",
-            "neutrino-store-sqlite",
         ],
     ),
     (

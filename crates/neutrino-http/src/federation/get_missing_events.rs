@@ -15,7 +15,6 @@ use axum::{
     http::HeaderMap,
 };
 use neutrino_engine::ports::MAX_STATE_DAG_EVENT_IDS;
-use neutrino_store::{DagStore, EventStore, RoomStore};
 use ruma::{OwnedEventId, OwnedRoomId};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -23,7 +22,7 @@ use serde_json::Value;
 use serde_json::value::RawValue as RawJsonValue;
 
 use crate::federation::{FedError, auth};
-use crate::{AppState, lock_app};
+use crate::{AppState, Store, lock_app};
 
 /// Spec default for `limit` when the client omits it.
 const DEFAULT_LIMIT: u32 = 10;
@@ -150,8 +149,8 @@ pub(crate) struct ResponseBody {
 /// 6. Build response from `Event.raw` verbatim (no enrichment): the timeline
 ///    walk reversed to oldest-first, the state-DAG walk in its hop order.
 /// 7. Storage errors → 500 M_UNKNOWN via `FedError::Storage`.
-pub(crate) async fn handle(
-    State(state): State<AppState>,
+pub(crate) async fn handle<S: Store>(
+    State(state): State<AppState<S>>,
     Path(room_id): Path<String>,
     headers: HeaderMap,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,

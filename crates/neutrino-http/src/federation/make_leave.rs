@@ -25,7 +25,6 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
-use neutrino_store::RoomStore;
 use ruma::{OwnedRoomId, OwnedUserId};
 use serde::Serialize;
 use serde_json::json;
@@ -33,7 +32,7 @@ use serde_json::value::RawValue as RawJsonValue;
 
 use crate::federation::make_join::map_build_err;
 use crate::federation::{FedError, auth};
-use crate::{AppState, lock_app};
+use crate::{AppState, Store, lock_app};
 
 /// `make_leave` response: the leave-event `template` plus the room's version.
 #[derive(Serialize)]
@@ -51,8 +50,8 @@ pub(crate) struct ResponseBody {
 ///    persist) and return it with `room_version`. No eligibility pre-check —
 ///    `send_leave`'s apply is authoritative (a user who cannot leave is refused
 ///    there).
-pub(crate) async fn handle(
-    State(state): State<AppState>,
+pub(crate) async fn handle<S: Store>(
+    State(state): State<AppState<S>>,
     Path((room_id, user_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<ResponseBody>, FedError> {

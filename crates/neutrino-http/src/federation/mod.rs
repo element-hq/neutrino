@@ -231,8 +231,8 @@ pub(crate) fn map_apply_err(err: neutrino_engine::RoomActorError) -> FedError {
 /// id is unchanged (signatures are outside the reference hash). An event that
 /// reached a handler came through `from_wire`, so `co_sign` only fails on a
 /// genuinely malformed `raw` — mapped to a 400.
-pub(crate) fn co_sign_if_signed(
-    state: &crate::AppState,
+pub(crate) fn co_sign_if_signed<S: crate::Store>(
+    state: &crate::AppState<S>,
     event: &mut neutrino_event::Event,
     version: &neutrino_event::RoomVersion,
 ) -> Result<(), FedError> {

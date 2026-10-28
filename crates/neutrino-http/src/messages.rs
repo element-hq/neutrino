@@ -26,11 +26,11 @@ use ruma::events::AnyTimelineEvent;
 use ruma::serde::Raw;
 use serde_json::{Map, Value, json};
 
-use neutrino_store::{Direction, EventStore, PaginationToken};
+use neutrino_store::{Direction, PaginationToken};
 
 use crate::federation::client::FederationClient;
 use crate::membership::current_membership;
-use crate::{AppState, AuthUser, error_response, lock_app};
+use crate::{AppState, AuthUser, Store, error_response, lock_app};
 
 /// Parse `dir`. Absent → Forward (Synapse default; the spec marks it required,
 /// we mirror Synapse's leniency). Only `b`/`f` accepted.
@@ -101,7 +101,7 @@ fn parse_limit(params: &HashMap<String, String>) -> Result<usize, axum::response
 /// the first `room_messages` read's mapping.
 #[allow(clippy::result_large_err)] // see `parse_dir`
 async fn backfill_and_reread(
-    store: &neutrino_store_sqlite::SqliteStore,
+    store: &impl neutrino_store::StorageBackend,
     own_server: &str,
     client: &FederationClient,
     policy: &neutrino_event::EventPolicy,
@@ -142,8 +142,8 @@ async fn backfill_and_reread(
     }
 }
 
-pub(crate) async fn get_messages(
-    state: State<AppState>,
+pub(crate) async fn get_messages<S: Store>(
+    state: State<AppState<S>>,
     AuthUser(user): AuthUser,
     Path(room_id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
@@ -253,7 +253,7 @@ pub(crate) async fn get_messages(
     let (events, next) = match reread_tokens {
         Some((from_again, to_again)) if events.len() < limit => {
             match backfill_and_reread(
-                &store,
+                &*store,
                 &own_server,
                 &fed_client,
                 &policy,
@@ -393,7 +393,7 @@ mod tests {
 
         let client = FederationClient::new(OWN.to_owned(), None);
         let out = backfill_and_reread(
-            &store,
+            &*store,
             OWN,
             &client,
             &neutrino_event::EventPolicy::trusted_network(),

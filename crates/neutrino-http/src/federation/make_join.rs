@@ -20,13 +20,13 @@ use axum::{
     extract::{Path, RawQuery, State},
     http::HeaderMap,
 };
-use neutrino_store::{RoomStore, StateStore};
+use neutrino_store::StateStore;
 use ruma::{OwnedRoomId, OwnedUserId};
 use serde::Serialize;
 use serde_json::value::RawValue as RawJsonValue;
 
 use crate::federation::{FedError, auth};
-use crate::{AppState, lock_app};
+use crate::{AppState, Store, lock_app};
 use neutrino_engine::RoomActorError;
 
 /// `make_join` response: the membership-event `template` plus the room's
@@ -50,8 +50,8 @@ pub(crate) struct ResponseBody {
 ///    scope). Fail-fast only — `send_join`'s apply is authoritative.
 /// 4. Build the `m.room.member`/`join` template on the current heads (no
 ///    persist) and return it with `room_version`.
-pub(crate) async fn handle(
-    State(state): State<AppState>,
+pub(crate) async fn handle<S: Store>(
+    State(state): State<AppState<S>>,
     Path((room_id, user_id)): Path<(String, String)>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,

@@ -35,9 +35,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use neutrino_event::EventPolicy;
-use neutrino_store::{
-    EventStore, Membership, OobMembershipStore, RoomStore, StagingStore, StateStore, StreamPos,
-};
+use neutrino_store::{EventStore, Membership, RoomStore, StagingStore, StateStore, StreamPos};
 use ruma::{
     EventId, OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId,
 };
@@ -46,7 +44,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
 use crate::federation::client::{FederationClient, FederationClientError, SendJoinResponse};
-use crate::{AppState, error_response, lock_app};
+use crate::{AppState, Store, error_response, lock_app};
 
 /// How long the CSAPI `/join` request blocks waiting for the worker to ground
 /// the fetched state DAG and apply our join. On timeout the client gets an
@@ -64,8 +62,8 @@ pub(crate) type JoinWatch = watch::Receiver<Option<JoinOutcome>>;
 
 /// Join a room we don't host via the federation handshake, trying each
 /// candidate resident server in turn. Returns the CSAPI `/join` response.
-pub(crate) async fn federated_join(
-    state: &AppState,
+pub(crate) async fn federated_join<S: Store>(
+    state: &AppState<S>,
     user: OwnedUserId,
     room_id: &RoomId,
     candidates: &[OwnedServerName],
@@ -80,8 +78,8 @@ pub(crate) async fn federated_join(
 /// function only spawns-or-attaches and awaits the outcome. A retried `/join`
 /// therefore re-uses the running dance (its `candidates`/`timeout` are the
 /// spawning call's), and an aborted request never aborts the transfer.
-pub(crate) async fn federated_join_with(
-    state: &AppState,
+pub(crate) async fn federated_join_with<S: Store>(
+    state: &AppState<S>,
     user: OwnedUserId,
     room_id: &RoomId,
     candidates: &[OwnedServerName],
@@ -137,8 +135,8 @@ pub(crate) async fn federated_join_with(
 /// One full join dance: try each candidate resident (make_join → send_join →
 /// ingest), then block until our join lands in current state (or `timeout`).
 /// Runs detached from any request — see [`federated_join_with`].
-async fn run_join_dance(
-    state: &AppState,
+async fn run_join_dance<S: Store>(
+    state: &AppState<S>,
     user: OwnedUserId,
     room_id: &RoomId,
     candidates: &[OwnedServerName],
@@ -156,7 +154,7 @@ async fn run_join_dance(
     };
     let client = FederationClient::new(own_server, federation_proxy.as_deref())
         .with_signer(policy.signer().cloned());
-    let display_name = crate::local_display_name(&store).await;
+    let display_name = crate::local_display_name(&*store).await;
 
     // Subscribe to the persist watch *before* staging anything (subscribe-
     // before-query: a persist between staging and subscribing can't be missed),
@@ -228,8 +226,8 @@ async fn run_join_dance(
 ///     when reading the invite hit a storage fault (surfaced as a `500`), or
 ///   - `None` when the room is hosted, or no candidate could be sourced — the
 ///     caller then falls back to the local join path.
-pub(crate) async fn federated_join_if_remote(
-    state: &AppState,
+pub(crate) async fn federated_join_if_remote<S: Store>(
+    state: &AppState<S>,
     user: &UserId,
     room_id: &RoomId,
     hints: &[OwnedServerName],

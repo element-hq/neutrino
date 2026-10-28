@@ -26,7 +26,12 @@ async fn test_router() -> (axum::Router, tempfile::TempDir) {
     let tmp = tempfile::TempDir::new().expect("create storage tempdir");
     let mut cfg = config();
     cfg.storage_dir = tmp.path().to_path_buf();
-    let app = router(cfg).await.expect("router");
+    let store = std::sync::Arc::new(
+        neutrino_store_sqlite::SqliteStore::open_in_dir(&cfg.storage_dir)
+            .await
+            .expect("open store"),
+    );
+    let app = router(cfg, store).await.expect("router");
     (app, tmp)
 }
 

@@ -28,20 +28,20 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use neutrino_store::{OobMembership, OobMembershipStore};
+use neutrino_store::OobMembership;
 use ruma::{OwnedUserId, RoomId, ServerName, UserId};
 use serde_json::json;
 use tracing::warn;
 
 use crate::federation::client::FederationClient;
 use crate::federation::complete_membership_template;
-use crate::{AppState, error_response, lock_app};
+use crate::{AppState, Store, error_response, lock_app};
 
 /// Reject an out-of-band invite. The caller (`membership::leave`) passes the
 /// already-loaded `invite` stub (so we don't re-read it). Always returns
 /// `200 {}` unless the local stub write itself fails (a real storage fault).
-pub(crate) async fn reject_invite(
-    state: &AppState,
+pub(crate) async fn reject_invite<S: Store>(
+    state: &AppState<S>,
     user: OwnedUserId,
     room_id: &RoomId,
     invite: OobMembership,
@@ -61,7 +61,7 @@ pub(crate) async fn reject_invite(
     // *with its underlying cause* and swallowed — the local write below is what
     // the client relies on.
     let dest = invite.event.sender.server_name().to_owned();
-    let display_name = crate::local_display_name(&store).await;
+    let display_name = crate::local_display_name(&*store).await;
     let local = match try_federated_leave(
         &own_server,
         federation_proxy.as_deref(),
