@@ -117,6 +117,9 @@ pub struct QBlockTuning {
     pub non_receive_timeout: Duration,
     /// Max missing-block recovery rounds (`NON_MAX_RETRANSMIT`, default 4).
     pub non_max_retransmit: u32,
+    /// The time one response takes on the link, over which a receiver spreads
+    /// its response to a shared request (`None`, default: no delay).
+    pub response_slot: Option<Duration>,
 }
 
 impl Default for QBlockTuning {
@@ -126,6 +129,7 @@ impl Default for QBlockTuning {
             non_timeout: Duration::from_secs(2),
             non_receive_timeout: Duration::from_secs(4),
             non_max_retransmit: 4,
+            response_slot: None,
         }
     }
 }
@@ -149,6 +153,7 @@ impl QBlockTuning {
     ///   sender's own deliberate inter-burst pause or the pause itself reads
     ///   as loss. Sized to that pause plus a full queueing bound, which is
     ///   the longest a block can legitimately still be in flight.
+    /// - `response_slot` — one datagram interval per response.
     ///
     /// Left alone: `non_max_retransmit` (recovery rounds are a loss-tolerance
     /// choice, not a timing one) and the CON-mode fields the NON path ignores.
@@ -165,6 +170,7 @@ impl QBlockTuning {
             max_payloads,
             non_timeout,
             non_receive_timeout: non_timeout + pacing.max_queueing_delay,
+            response_slot: Some(pacing.datagram_interval),
             ..Self::default()
         }
     }
@@ -186,6 +192,7 @@ impl QBlockTuning {
             non_timeout: self.non_timeout,
             non_receive_timeout: self.non_receive_timeout,
             non_max_retransmit: self.non_max_retransmit,
+            response_slot: self.response_slot,
             assume_peer_block_size: Some(
                 block1_size.unwrap_or(coap::client::UdpCoAPClient::MAX_PAYLOAD_BLOCK),
             ),
@@ -596,6 +603,23 @@ mod profile_tests {
         }
     }
 
+    /// A paced link spreads responses to a shared request one datagram interval
+    /// apart; an unpaced one answers at once.
+    #[test]
+    fn pacing_sets_the_response_slot() {
+        let pacing = LinkPacing {
+            datagram_interval: Duration::from_millis(800),
+            max_queueing_delay: Duration::from_secs(5),
+        };
+        let t = QBlockTuning::for_pacing(pacing);
+        assert_eq!(t.response_slot, Some(Duration::from_millis(800)));
+        assert_eq!(
+            t.to_qblock_config(None).response_slot,
+            Some(Duration::from_millis(800))
+        );
+        assert_eq!(QBlockTuning::default().response_slot, None);
+    }
+
     /// An unmetered medium is left on the RFC defaults: the derivation exists
     /// for links that withhold datagrams, and inventing pacing for a LAN would
     /// make its loss recovery needlessly sluggish.
@@ -753,6 +777,7 @@ mod qblock_tuning_tests {
             non_timeout: Duration::from_millis(500),
             non_receive_timeout: Duration::from_millis(900),
             non_max_retransmit: 2,
+            response_slot: None,
         };
         let c = t.to_qblock_config(Some(512));
         assert_eq!(c.max_payloads, 7);

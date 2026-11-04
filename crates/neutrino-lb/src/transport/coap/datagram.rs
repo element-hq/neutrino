@@ -56,7 +56,7 @@ use async_trait::async_trait;
 use coap::Server;
 use coap::client::CoAPClient;
 use coap::server::{Listener, Responder, TransportRequestSender};
-use coap_lite::{BlockHandlerConfig, MessageClass, Packet};
+use coap_lite::{BlockHandlerConfig, CoapRequest, MessageClass, Packet};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -64,7 +64,11 @@ use crate::transport::{
     MAX_WIRE_BODY_BYTES, WireClient, WireError, WireHandler, WireRequest, WireResponse, WireServer,
 };
 
-use super::{CoapDispatch, MAX_QBLOCK_INFLIGHT_TRANSFERS, exchange, random_token_seed};
+use super::group::Gathers;
+use super::{
+    CoapDispatch, MAX_QBLOCK_INFLIGHT_TRANSFERS, SharedExchange, exchange, message,
+    random_token_seed,
+};
 
 /// A peer's link-layer address: its federation `server_name` as the egress
 /// resolver renders it, UTF-8 bytes, verbatim. Opaque to this crate — the
@@ -223,6 +227,12 @@ pub trait DatagramLink: Send + Sync {
     /// Defaults to `None` (no transformation) so existing implementations are
     /// unaffected. Decorators MUST delegate, or they strip the medium's codec.
     fn codec(&self) -> Option<Arc<dyn LinkCodec>> {
+        None
+    }
+    /// The address whose one `send` also reaches `dst`, if any. The peer answers
+    /// from its own address, as for a unicast request. Defaults to `None`.
+    /// Decorators MUST delegate, or they hide the medium's group address.
+    fn group_addr(&self, _dst: &[u8]) -> Option<LinkAddr> {
         None
     }
 }
@@ -547,13 +557,13 @@ impl Responder for LinkResponder {
 /// whole-exchange timeout are NOT duplicated. The peer's link address is
 /// `WireRequest.dest`'s UTF-8 bytes, verbatim — never interpreted here.
 pub struct LinkCoapWireClient {
-    hub: Arc<Hub>,
+    pub(super) hub: Arc<Hub>,
     /// The medium's wire codec (from [`DatagramLink::codec`], cached at
     /// construction): `encode_request` before the exchange, `decode_response`
     /// after. `None` = no transformation.
-    codec: Option<Arc<dyn LinkCodec>>,
-    block1_size: Option<usize>,
-    qblock: Option<coap::qblock::QBlockConfig>,
+    pub(super) codec: Option<Arc<dyn LinkCodec>>,
+    pub(super) block1_size: Option<usize>,
+    pub(super) qblock: Option<coap::qblock::QBlockConfig>,
     request_timeout: Duration,
     max_body_bytes: usize,
     /// Per-node client pool. Each `CoAPClient` owns one inbox registration and
@@ -561,6 +571,7 @@ pub struct LinkCoapWireClient {
     /// peer. Sharing is safe because each request carries a unique token.
     pool: Mutex<HashMap<LinkAddr, Arc<CoAPClient<LinkClientTransport>>>>,
     token_counter: AtomicU32,
+    pub(super) gathers: Gathers,
 }
 
 impl LinkCoapWireClient {
@@ -576,6 +587,7 @@ impl LinkCoapWireClient {
             max_body_bytes: MAX_WIRE_BODY_BYTES,
             pool: Mutex::new(HashMap::new()),
             token_counter: AtomicU32::new(random_token_seed()),
+            gathers: Gathers::default(),
         }
     }
 
@@ -597,7 +609,7 @@ impl LinkCoapWireClient {
         }
     }
 
-    fn next_token(&self) -> Vec<u8> {
+    pub(super) fn next_token(&self) -> Vec<u8> {
         self.token_counter
             .fetch_add(1, Ordering::Relaxed)
             .to_be_bytes()
@@ -608,7 +620,7 @@ impl LinkCoapWireClient {
     /// spawning its receive task) on first use. The pool lock is not held across
     /// the `await` that builds the client; a race on the same node discards the
     /// loser.
-    async fn client_for(&self, node: &[u8]) -> Arc<CoAPClient<LinkClientTransport>> {
+    pub(super) async fn client_for(&self, node: &[u8]) -> Arc<CoAPClient<LinkClientTransport>> {
         if let Some(client) = self.pool.lock().await.get(node).cloned() {
             return client;
         }
@@ -654,6 +666,94 @@ impl LinkCoapWireClient {
     async fn evict(&self, node: &[u8]) {
         self.pool.lock().await.remove(node);
     }
+
+    pub(super) async fn send_ordinary(
+        &self,
+        mut req: WireRequest,
+    ) -> Result<WireResponse, WireError> {
+        let token = self.next_token();
+        // Medium codec, egress half: transform the request BEFORE the CoAP
+        // message is built, so the rewritten path/headers/body feed the
+        // per-block options and the pre-segmentation payload.
+        if let Some(codec) = &self.codec {
+            codec
+                .encode_request(&mut req)
+                .map_err(|e| WireError::Transport(format!("link codec encode_request: {e}")))?;
+        }
+        // Per-request federation egress trace: the destination node, the request,
+        // and the body size (the load-bearing field — a body over the Q-Block
+        // block size must fit `block size + option overhead` within coap-lite's
+        // 1280 message cap, which is why `block1_size` is kept small).
+        tracing::debug!(dest = %req.dest, method = %req.method, path = %req.path, body_len = req.body.len(), qblock = self.qblock.is_some(), "datagram wire: dispatching federation request");
+        let client = self.client_for(req.dest.as_bytes()).await;
+        let mut coap_req = message::build_request(&req);
+        coap_req.message.set_token(token);
+        let result = exchange(
+            &client,
+            coap_req,
+            &req.dest,
+            self.qblock.is_some(),
+            None,
+            self.max_body_bytes,
+            self.request_timeout,
+        )
+        .await;
+        self.finish(&req.dest, result).await
+    }
+
+    /// Runs one member's exchange of a group request, `coap_req`, to `dest`.
+    pub(super) async fn send_member(
+        &self,
+        dest: &str,
+        coap_req: CoapRequest<SocketAddr>,
+        shared: SharedExchange,
+    ) -> Result<WireResponse, WireError> {
+        tracing::debug!(%dest, "datagram wire: dispatching federation request as a group member");
+        let client = self.client_for(dest.as_bytes()).await;
+        let result = exchange(
+            &client,
+            coap_req,
+            dest,
+            true,
+            Some(shared),
+            self.max_body_bytes,
+            self.request_timeout,
+        )
+        .await;
+        self.finish(dest, result).await
+    }
+
+    /// Decodes an exchange's response and evicts `dest`'s client on failure.
+    async fn finish(
+        &self,
+        dest: &str,
+        result: Result<WireResponse, WireError>,
+    ) -> Result<WireResponse, WireError> {
+        // Medium codec, egress half: undo the peer's `encode_response`. A
+        // response that doesn't decode is malformed — a transport error, so
+        // the outbox retries and the pooled client is evicted below.
+        let result = result.and_then(|mut resp| match &self.codec {
+            Some(codec) => codec
+                .decode_response(&mut resp)
+                .map(|()| resp)
+                .map_err(|e| WireError::Transport(format!("link codec decode_response: {e}"))),
+            None => Ok(resp),
+        });
+        match &result {
+            Ok(r) => {
+                tracing::debug!(%dest, status = r.status, "datagram wire: federation request completed")
+            }
+            Err(e) => {
+                tracing::warn!(%dest, error = %e, "datagram wire: federation request failed")
+            }
+        }
+        // On failure drop the pooled client: ends the stale receive task and
+        // forces a fresh inbox registration on the next send.
+        if result.is_err() {
+            self.evict(dest.as_bytes()).await;
+        }
+        result
+    }
 }
 
 #[async_trait]
@@ -671,56 +771,13 @@ impl WireClient for LinkCoapWireClient {
         if req.dest.is_empty() {
             return Err(WireError::Transport("empty destination address".to_owned()));
         }
-        let mut req = req;
-        let token = self.next_token();
-        // Medium codec, egress half: transform the request BEFORE the CoAP
-        // message is built, so the rewritten path/headers/body feed the
-        // per-block options and the pre-segmentation payload.
-        if let Some(codec) = &self.codec {
-            codec
-                .encode_request(&mut req)
-                .map_err(|e| WireError::Transport(format!("link codec encode_request: {e}")))?;
+        if let Some(expected) = req.group_size
+            && self.qblock.is_some()
+            && let Some(group_addr) = self.hub.link().group_addr(req.dest.as_bytes())
+        {
+            return self.send_grouped(req, expected, group_addr).await;
         }
-        let node = req.dest.as_bytes();
-        // Per-request federation egress trace: the destination node, the request,
-        // and the body size (the load-bearing field — a body over the Q-Block
-        // block size must fit `block size + option overhead` within coap-lite's
-        // 1280 message cap, which is why `block1_size` is kept small).
-        tracing::debug!(dest = %req.dest, method = %req.method, path = %req.path, body_len = req.body.len(), qblock = self.qblock.is_some(), "datagram wire: dispatching federation request");
-        let client = self.client_for(node).await;
-        let result = exchange(
-            &client,
-            &req,
-            token,
-            self.qblock.is_some(),
-            self.max_body_bytes,
-            self.request_timeout,
-        )
-        .await;
-        // Medium codec, egress half: undo the peer's `encode_response`. A
-        // response that doesn't decode is malformed — a transport error, so
-        // the outbox retries and the pooled client is evicted below.
-        let result = result.and_then(|mut resp| match &self.codec {
-            Some(codec) => codec
-                .decode_response(&mut resp)
-                .map(|()| resp)
-                .map_err(|e| WireError::Transport(format!("link codec decode_response: {e}"))),
-            None => Ok(resp),
-        });
-        match &result {
-            Ok(r) => {
-                tracing::debug!(dest = %req.dest, status = r.status, "datagram wire: federation request completed")
-            }
-            Err(e) => {
-                tracing::warn!(dest = %req.dest, error = %e, "datagram wire: federation request failed")
-            }
-        }
-        // On failure drop the pooled client: ends the stale receive task and
-        // forces a fresh inbox registration on the next send.
-        if result.is_err() {
-            self.evict(node).await;
-        }
-        result
+        self.send_ordinary(req).await
     }
 }
 
@@ -1867,5 +1924,415 @@ mod tests {
             matches!(classify(&[0x40, 0x01, 0x00]), Class::Drop),
             "3-byte"
         );
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::super::group::GATHER_TIMEOUT;
+    use super::*;
+    use axum::http::Method;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::time::Instant;
+
+    const GROUP: &[u8] = b"group";
+    const SENDER: &str = "a";
+    const PATH: &str = "/_matrix/federation/v1/send/txn-g";
+
+    /// A broadcast medium: a send to [`GROUP`] reaches every other node, from
+    /// the sender's address. Records every datagram put on it.
+    #[derive(Default)]
+    struct Mesh {
+        nodes: std::sync::Mutex<HashMap<LinkAddr, mpsc::UnboundedSender<NodeDatagram>>>,
+        air: std::sync::Mutex<Vec<(LinkAddr, LinkAddr, Vec<u8>)>>,
+        no_groups: bool,
+    }
+
+    impl Mesh {
+        /// The requests `from` put on the air, by destination.
+        fn requests_from(&self, from: &str) -> Vec<(LinkAddr, Packet)> {
+            self.air
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(src, _, _)| src == from.as_bytes())
+                .map(|(_, dst, bytes)| (dst.clone(), Packet::from_bytes(bytes).unwrap()))
+                .filter(|(_, p)| matches!(p.header.code, MessageClass::Request(_)))
+                .collect()
+        }
+
+        fn sent_anything(&self, from: &str) -> bool {
+            self.air
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(src, _, _)| src == from.as_bytes())
+        }
+    }
+
+    struct MeshLink {
+        node: LinkAddr,
+        mesh: Arc<Mesh>,
+        inbound: Mutex<mpsc::UnboundedReceiver<NodeDatagram>>,
+    }
+
+    impl MeshLink {
+        fn join(mesh: &Arc<Mesh>, node: &str) -> Arc<MeshLink> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            mesh.nodes
+                .lock()
+                .unwrap()
+                .insert(node.as_bytes().to_vec(), tx);
+            Arc::new(MeshLink {
+                node: node.as_bytes().to_vec(),
+                mesh: mesh.clone(),
+                inbound: Mutex::new(rx),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl DatagramLink for MeshLink {
+        async fn send(&self, dst: &[u8], datagram: &[u8]) -> std::io::Result<()> {
+            self.mesh.air.lock().unwrap().push((
+                self.node.clone(),
+                dst.to_vec(),
+                datagram.to_vec(),
+            ));
+            for (node, tx) in self.mesh.nodes.lock().unwrap().iter() {
+                if node == dst || (dst == GROUP && *node != self.node) {
+                    let _ = tx.send((self.node.clone(), datagram.to_vec()));
+                }
+            }
+            Ok(())
+        }
+
+        async fn recv(&self) -> Option<(LinkAddr, Vec<u8>)> {
+            self.inbound.lock().await.recv().await
+        }
+
+        fn group_addr(&self, dst: &[u8]) -> Option<LinkAddr> {
+            let known = self.mesh.nodes.lock().unwrap().contains_key(dst);
+            (known && !self.mesh.no_groups).then(|| GROUP.to_vec())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// 200, with the peer's name as the body.
+        Name,
+        NotFound,
+        Never,
+    }
+
+    struct Peer {
+        name: &'static str,
+        answer: Answer,
+        handled: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl WireHandler for Peer {
+        async fn handle(&self, _req: WireRequest) -> WireResponse {
+            self.handled.fetch_add(1, Ordering::Relaxed);
+            match self.answer {
+                Answer::Name => WireResponse {
+                    status: 200,
+                    body: self.name.as_bytes().to_vec(),
+                    ..Default::default()
+                },
+                Answer::NotFound => WireResponse {
+                    status: 404,
+                    ..Default::default()
+                },
+                Answer::Never => std::future::pending().await,
+            }
+        }
+    }
+
+    fn cfg() -> coap::qblock::QBlockConfig {
+        coap::qblock::QBlockConfig {
+            assume_peer_block_size: Some(64),
+            non_timeout: Duration::from_millis(20),
+            non_receive_timeout: Duration::from_millis(300),
+            response_slot: Some(Duration::from_millis(20)),
+            ..Default::default()
+        }
+    }
+
+    struct Rig {
+        client: LinkCoapWireClient,
+        mesh: Arc<Mesh>,
+        peers: Vec<Arc<Peer>>,
+        _shutdown: tokio_util::sync::DropGuard,
+    }
+
+    /// The sender `a` and one server per peer, all on one mesh.
+    async fn rig(
+        peers: &[(&'static str, Answer)],
+        mesh: Mesh,
+        qblock: coap::qblock::QBlockConfig,
+    ) -> Rig {
+        let mesh = Arc::new(mesh);
+        let token = CancellationToken::new();
+        let sender = Hub::new(MeshLink::join(&mesh, SENDER));
+        let mut handlers = Vec::new();
+        for &(name, answer) in peers {
+            let peer = Arc::new(Peer {
+                name,
+                answer,
+                handled: AtomicUsize::new(0),
+            });
+            let server = LinkCoapWireServer::with_qblock(
+                Hub::new(MeshLink::join(&mesh, name)),
+                qblock.clone(),
+            );
+            let (handler, token) = (peer.clone(), token.clone());
+            tokio::spawn(async move { server.serve(handler, token).await });
+            handlers.push(peer);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Rig {
+            client: LinkCoapWireClient::with_qblock(sender, Some(64), qblock),
+            mesh,
+            peers: handlers,
+            _shutdown: token.drop_guard(),
+        }
+    }
+
+    fn grouped(dest: &str, body: &[u8], group_size: usize) -> WireRequest {
+        WireRequest {
+            dest: dest.to_owned(),
+            method: Method::PUT,
+            path: PATH.to_owned(),
+            body: body.to_vec(),
+            group_size: Some(group_size),
+            ..Default::default()
+        }
+    }
+
+    /// Sends `req` and returns its result with how long it took.
+    async fn timed(
+        client: &LinkCoapWireClient,
+        req: WireRequest,
+    ) -> (Result<WireResponse, WireError>, Duration) {
+        let start = Instant::now();
+        let result = client.send(req).await;
+        (result, start.elapsed())
+    }
+
+    fn body_of(result: &Result<WireResponse, WireError>) -> &[u8] {
+        &result.as_ref().expect("send").body
+    }
+
+    #[tokio::test]
+    async fn a_group_puts_one_request_on_the_link() {
+        let peers = [
+            ("b", Answer::Name),
+            ("c", Answer::Name),
+            ("d", Answer::Name),
+        ];
+        let rig = rig(&peers, Mesh::default(), cfg()).await;
+        let (b, c, d) = tokio::join!(
+            rig.client.send(grouped("b", b"pdu", 3)),
+            rig.client.send(grouped("c", b"pdu", 3)),
+            rig.client.send(grouped("d", b"pdu", 3)),
+        );
+        assert_eq!(body_of(&b), b"b");
+        assert_eq!(body_of(&c), b"c");
+        assert_eq!(body_of(&d), b"d");
+
+        let requests = rig.mesh.requests_from(SENDER);
+        assert_eq!(requests.len(), 1, "one request datagram for the group");
+        let (dst, packet) = &requests[0];
+        assert_eq!(dst, GROUP);
+        assert_eq!(coap::qblock::group_size(packet), Some(3));
+    }
+
+    #[tokio::test]
+    async fn a_body_that_fits_one_burst_goes_out_as_one_burst() {
+        let peers = [("b", Answer::Name), ("c", Answer::Name)];
+        let rig = rig(&peers, Mesh::default(), cfg()).await;
+        let body = vec![7u8; 150];
+        let (b, c) = tokio::join!(
+            rig.client.send(grouped("b", &body, 2)),
+            rig.client.send(grouped("c", &body, 2)),
+        );
+        assert_eq!(body_of(&b), b"b");
+        assert_eq!(body_of(&c), b"c");
+
+        let requests = rig.mesh.requests_from(SENDER);
+        assert_eq!(requests.len(), 3, "a three-block burst");
+        assert!(requests.iter().all(|(dst, _)| dst == GROUP));
+    }
+
+    #[tokio::test]
+    async fn a_body_larger_than_one_burst_goes_ordinary() {
+        let peers = [("b", Answer::Name), ("c", Answer::Name)];
+        let qblock = coap::qblock::QBlockConfig {
+            max_payloads: 2,
+            ..cfg()
+        };
+        let rig = rig(&peers, Mesh::default(), qblock).await;
+        let body = vec![7u8; 150];
+        let (b, c) = tokio::join!(
+            rig.client.send(grouped("b", &body, 2)),
+            rig.client.send(grouped("c", &body, 2)),
+        );
+        assert_eq!(body_of(&b), b"b");
+        assert_eq!(body_of(&c), b"c");
+        assert!(
+            rig.mesh
+                .requests_from(SENDER)
+                .iter()
+                .all(|(dst, _)| dst != GROUP)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_member_whose_body_differs_goes_ordinary() {
+        let peers = [
+            ("b", Answer::Name),
+            ("c", Answer::Name),
+            ("d", Answer::Name),
+        ];
+        let rig = rig(&peers, Mesh::default(), cfg()).await;
+        let (b, c, d) = tokio::join!(
+            rig.client.send(grouped("b", b"pdu", 3)),
+            rig.client.send(grouped("c", b"pdu", 3)),
+            rig.client.send(grouped("d", b"other", 3)),
+        );
+        assert_eq!(body_of(&b), b"b");
+        assert_eq!(body_of(&c), b"c");
+        assert_eq!(body_of(&d), b"d");
+
+        let dsts: Vec<LinkAddr> = rig
+            .mesh
+            .requests_from(SENDER)
+            .into_iter()
+            .map(|(dst, _)| dst)
+            .collect();
+        assert_eq!(dsts.len(), 2);
+        assert!(dsts.contains(&GROUP.to_vec()));
+        assert!(dsts.contains(&b"d".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn a_short_group_forms_at_the_gather_timeout() {
+        let peers = [("b", Answer::Name), ("c", Answer::Name)];
+        let rig = rig(&peers, Mesh::default(), cfg()).await;
+        let ((b, waited), (c, _)) = tokio::join!(
+            timed(&rig.client, grouped("b", b"pdu", 3)),
+            timed(&rig.client, grouped("c", b"pdu", 3)),
+        );
+        assert_eq!(body_of(&b), b"b");
+        assert_eq!(body_of(&c), b"c");
+        assert!(waited >= GATHER_TIMEOUT, "{waited:?}");
+        let requests = rig.mesh.requests_from(SENDER);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(coap::qblock::group_size(&requests[0].1), Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_lone_arrival_goes_ordinary_at_the_gather_timeout() {
+        let rig = rig(&[("b", Answer::Name)], Mesh::default(), cfg()).await;
+        let (b, waited) = timed(&rig.client, grouped("b", b"pdu", 3)).await;
+        assert_eq!(body_of(&b), b"b");
+        assert!(waited >= GATHER_TIMEOUT, "{waited:?}");
+        let requests = rig.mesh.requests_from(SENDER);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, b"b");
+    }
+
+    #[tokio::test]
+    async fn a_late_arrival_goes_ordinary_without_waiting() {
+        // `c` never answers, so the group exchange is still running when `d`
+        // arrives.
+        let peers = [
+            ("b", Answer::Name),
+            ("c", Answer::Never),
+            ("d", Answer::Name),
+        ];
+        let rig = rig(&peers, Mesh::default(), cfg()).await;
+        let late = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            timed(&rig.client, grouped("d", b"pdu", 2)).await
+        };
+        let (_, _, (d, waited)) = tokio::join!(
+            rig.client.send(grouped("b", b"pdu", 2)),
+            rig.client.send(grouped("c", b"pdu", 2)),
+            late,
+        );
+        assert_eq!(body_of(&d), b"d");
+        assert!(waited < GATHER_TIMEOUT, "{waited:?}");
+        assert!(
+            rig.mesh
+                .requests_from(SENDER)
+                .iter()
+                .any(|(dst, _)| dst == b"d")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_destination_without_a_group_address_does_not_wait() {
+        let peers = [("b", Answer::Name), ("c", Answer::Name)];
+        let mesh = Mesh {
+            no_groups: true,
+            ..Default::default()
+        };
+        let rig = rig(&peers, mesh, cfg()).await;
+        let ((b, waited), (c, _)) = tokio::join!(
+            timed(&rig.client, grouped("b", b"pdu", 3)),
+            timed(&rig.client, grouped("c", b"pdu", 3)),
+        );
+        assert_eq!(body_of(&b), b"b");
+        assert_eq!(body_of(&c), b"c");
+        assert!(waited < GATHER_TIMEOUT, "{waited:?}");
+        assert!(
+            rig.mesh
+                .requests_from(SENDER)
+                .iter()
+                .all(|(dst, _)| dst != GROUP)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_member_answering_404_stays_silent() {
+        let peers = [
+            ("b", Answer::Name),
+            ("c", Answer::Name),
+            ("x", Answer::NotFound),
+        ];
+        let rig = rig(&peers, Mesh::default(), cfg()).await;
+        let (b, c) = tokio::join!(
+            rig.client.send(grouped("b", b"pdu", 2)),
+            rig.client.send(grouped("c", b"pdu", 2)),
+        );
+        assert_eq!(body_of(&b), b"b");
+        assert_eq!(body_of(&c), b"c");
+        // Past any response delay `x` could have drawn.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(rig.peers[2].handled.load(Ordering::Relaxed), 1);
+        assert!(!rig.mesh.sent_anything("x"));
+    }
+
+    #[tokio::test]
+    async fn a_silent_member_fails_after_head_and_leisure_alone() {
+        let peers = [
+            ("b", Answer::Name),
+            ("c", Answer::Never),
+            ("d", Answer::Name),
+        ];
+        let rig = rig(&peers, Mesh::default(), cfg()).await;
+        let ((b, _), (c, waited), (d, _)) = tokio::join!(
+            timed(&rig.client, grouped("b", b"pdu", 3)),
+            timed(&rig.client, grouped("c", b"pdu", 3)),
+            timed(&rig.client, grouped("d", b"pdu", 3)),
+        );
+        assert_eq!(body_of(&b), b"b");
+        assert_eq!(body_of(&d), b"d");
+        assert!(c.is_err());
+        let head_and_leisure = cfg().non_receive_timeout + cfg().leisure(3);
+        assert!(waited >= head_and_leisure, "{waited:?}");
     }
 }

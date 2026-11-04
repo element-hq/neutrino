@@ -47,7 +47,9 @@ mod multi_user;
 
 use federation::client::{FederationClient, ReqwestFetcher};
 pub use federation::keys::HttpKeyResolver;
-use neutrino_engine::{MissingEventsFetcher, RoomActorError, RoomRegistry};
+use neutrino_engine::{
+    FederationTransport, GroupTags, MissingEventsFetcher, RoomActorError, RoomRegistry,
+};
 use sliding_sync::{SyncError, SyncState};
 
 /// The storage the HTTP layer runs on.
@@ -82,6 +84,8 @@ struct App<S: Store> {
     /// round. (`fetcher` also wraps a `FederationClient`, but only as a type-
     /// erased `MissingEventsFetcher`, which exposes no `backfill` method.)
     fed_client: Arc<FederationClient>,
+    /// Group tags, shared by the room actors and the outbound sender pool.
+    group_tags: Arc<GroupTags>,
     sync_state: Arc<SyncState<S>>,
     keys: Option<Value>,
     /// Out-of-band peer discovery (BLE mesh): the host pushes the set of
@@ -271,10 +275,21 @@ impl<S: Store> AppState<S> {
         let mut sync_state = SyncState::new(store.clone(), shutdown.clone());
         sync_state.delivery_receipts = config.delivery_receipts;
         let sync_state = Arc::new(sync_state);
+        // Outbound federation client, built once here and shared (rather than
+        // rebuilt per back-page in `messages.rs`'s backfill path).
+        let fed_client = Arc::new(
+            FederationClient::new(
+                config.server_name.clone(),
+                config.federation_proxy.as_deref(),
+            )
+            .with_signer(policy.signer().cloned()),
+        );
+        let group_tags = Arc::new(GroupTags::new(fed_client.supports_groups()));
         let room_registry = Arc::new(RoomRegistry::new(
             store.clone(),
             config.server_name.clone(),
             policy.clone(),
+            group_tags.clone(),
         ));
         // Spawn the inbound staging worker bound to this store/registry/fetcher.
         // It runs wherever the router does (production `serve` and the e2e
@@ -290,21 +305,13 @@ impl<S: Store> AppState<S> {
         // task); the initial receiver is dropped — `send_modify` notifies any
         // live receivers and is a no-op when there are none.
         let (kick_backoff, _) = watch::channel(());
-        // Outbound federation client, built once here and shared (rather than
-        // rebuilt per back-page in `messages.rs`'s backfill path).
-        let fed_client = Arc::new(
-            FederationClient::new(
-                config.server_name.clone(),
-                config.federation_proxy.as_deref(),
-            )
-            .with_signer(policy.signer().cloned()),
-        );
         let app = App {
             store,
             room_registry,
             worker_poke,
             fetcher,
             fed_client,
+            group_tags,
             sync_state,
             keys: None,
             discovery,
@@ -361,6 +368,11 @@ impl<S: Store> AppState<S> {
     /// reconciliation stages fetched events it pokes the worker to apply them.
     fn worker_poke(&self) -> mpsc::Sender<OwnedRoomId> {
         lock_app(self).worker_poke.clone()
+    }
+
+    /// The group tags the room actors write, for the outbound sender pool.
+    fn group_tags(&self) -> Arc<GroupTags> {
+        lock_app(self).group_tags.clone()
     }
 
     /// The configured cap on concurrent outbound federation transactions.
@@ -452,6 +464,7 @@ pub async fn serve<S: Store>(
     let sender_task = neutrino_engine::sender::spawn(
         state.store(),
         transport,
+        state.group_tags(),
         state.outbound_concurrency(),
         state.startup_jitter(),
         state.subscribe_shutdown(),

@@ -42,6 +42,8 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
+use crate::group::GroupTags;
+
 /// Inbox depth for a room actor. Senders `.await` when full, applying
 /// natural back-pressure rather than unbounded buffering.
 const ACTOR_INBOX: usize = 32;
@@ -157,6 +159,7 @@ struct RoomActor<S> {
     /// (never, on a trusted network) and how their ids are derived. Handed to
     /// `RoomCore::build_local_event`.
     policy: neutrino_event::EventPolicy,
+    tags: Arc<GroupTags>,
 }
 
 impl<S: StorageBackend + WithStateProvider + 'static> RoomActor<S> {
@@ -241,7 +244,7 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomActor<S> {
         // delivered the event to us) and minus our own (excluded by
         // `outbound_destinations`).
         let own = self.own_server.clone();
-        self.commit_accepted(next, effects, |event, next| {
+        self.commit_accepted(next, effects, false, |event, next| {
             let mut dests = outbound_destinations(next.current_state(), event, &own);
             dests.retain(|s| s.as_str() != sender_server.as_str());
             dests
@@ -253,13 +256,15 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomActor<S> {
     /// Shared accept→persist→adopt tail for the local-send and resident-apply
     /// paths. Both run an event through `apply_pdu`, refuse a reject (403, not
     /// persisted — local policy), enqueue federation destinations, and persist
-    /// atomically. The only thing the two callers differ on is how they derive
-    /// the destination set (computed by `destinations` from the persisted event
-    /// + post-apply core), so that is a closure. Returns the persisted event.
+    /// atomically. The two callers differ on how they derive the destination
+    /// set (computed by `destinations` from the persisted event and post-apply
+    /// core), so that is a closure, and on whether the event's first send may be
+    /// grouped (`tag`). Returns the persisted event.
     async fn commit_accepted(
         &mut self,
         next: RoomCore,
         effects: Vec<Effect>,
+        tag: bool,
         destinations: impl FnOnce(&Event, &RoomCore) -> Vec<OwnedServerName>,
     ) -> Result<Arc<Event>, RoomActorError> {
         let (persisted, delta) = collect_effects(effects);
@@ -277,7 +282,14 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomActor<S> {
         let dest_refs: Vec<&ServerName> = dests.iter().map(AsRef::as_ref).collect();
         let advertise = self.advertise_targets(&next, &delta);
         let advertise_refs: Vec<&ServerName> = advertise.iter().map(AsRef::as_ref).collect();
-        self.store
+        // Tagged before the persist: any task that reads the outbox row also sees
+        // the tag.
+        if tag && self.tags.enabled() {
+            let members = self.group_members(&next, &dests).await;
+            self.tags.tag(&event.event_id, members);
+        }
+        if let Err(e) = self
+            .store
             .persist_resolved_event(
                 &event,
                 next.forward_extremities(),
@@ -286,10 +298,48 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomActor<S> {
                 &dest_refs,
                 &advertise_refs,
             )
-            .await?;
+            .await
+        {
+            self.tags.untag(&event.event_id);
+            return Err(e.into());
+        }
         // Commit succeeded — adopt the post-apply state.
         self.room = next;
         Ok(event)
+    }
+
+    /// The `dests` that may share an event's first send: joined to the room and
+    /// with nothing pending. A departing server need not be in the room (for a
+    /// rescinded invite it holds only an out-of-band stub), and the `/send`
+    /// handler answers a grouped copy for a room it is not in with 404.
+    async fn group_members(
+        &self,
+        next: &RoomCore,
+        dests: &[OwnedServerName],
+    ) -> BTreeSet<OwnedServerName> {
+        let joined = joined_servers(next.current_state());
+        let mut members = BTreeSet::new();
+        for dest in dests {
+            if joined.contains(dest) && self.idle(dest).await {
+                members.insert(dest.clone());
+            }
+        }
+        members
+    }
+
+    /// Whether `dest` has no outbox row and no advertisement owed. Both stay in
+    /// the store until a 2xx, so this excludes a destination that is mid-send or
+    /// backing off. A read error counts as busy.
+    async fn idle(&self, dest: &ServerName) -> bool {
+        self.store
+            .pending_pdus(dest, 1)
+            .await
+            .is_ok_and(|rows| rows.is_empty())
+            && self
+                .store
+                .pending_advertisements(dest)
+                .await
+                .is_ok_and(|rooms| rooms.is_empty())
     }
 
     /// Anti-entropy (MSC anti-entropy-extension): the servers that just became
@@ -396,7 +446,7 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomActor<S> {
         // built on current state so it cannot soft-fail in practice, but the
         // rule is the same for both kinds.
         let own = self.own_server.clone();
-        self.commit_accepted(next, effects, |event, next| {
+        self.commit_accepted(next, effects, true, |event, next| {
             if event.soft_failed {
                 Vec::new()
             } else {
@@ -612,15 +662,23 @@ pub struct RoomRegistry<S> {
     own_server: String,
     /// Cloned into every spawned actor — see `RoomActor::policy`.
     policy: neutrino_event::EventPolicy,
+    /// Shared with every spawned actor and the outbound sender pool.
+    tags: Arc<GroupTags>,
     actors: Mutex<HashMap<OwnedRoomId, mpsc::Sender<Command>>>,
 }
 
 impl<S: StorageBackend + WithStateProvider + 'static> RoomRegistry<S> {
-    pub fn new(store: Arc<S>, own_server: String, policy: neutrino_event::EventPolicy) -> Self {
+    pub fn new(
+        store: Arc<S>,
+        own_server: String,
+        policy: neutrino_event::EventPolicy,
+        tags: Arc<GroupTags>,
+    ) -> Self {
         Self {
             store,
             own_server,
             policy,
+            tags,
             actors: Mutex::new(HashMap::new()),
         }
     }
@@ -764,6 +822,7 @@ impl<S: StorageBackend + WithStateProvider + 'static> RoomRegistry<S> {
                 store: self.store.clone(),
                 own_server: self.own_server.clone(),
                 policy: self.policy.clone(),
+                tags: self.tags.clone(),
             }
             .run(rx),
         );
@@ -820,6 +879,7 @@ mod tests {
             store.clone(),
             "example.org".to_owned(),
             neutrino_event::EventPolicy::trusted_network(),
+            Arc::new(GroupTags::new(false)),
         );
         (registry, store, room_id, alice)
     }
@@ -1036,6 +1096,7 @@ mod tests {
             store.clone(),
             "example.org".to_owned(),
             neutrino_event::EventPolicy::trusted_network(),
+            Arc::new(GroupTags::new(false)),
         );
         (registry, store, room_id, alice, create_id)
     }
@@ -1432,5 +1493,214 @@ mod tests {
                 .is_empty(),
             "a linear join leaves us converged with the joiner — no advertisement owed"
         );
+    }
+
+    // ----- group tags -----
+
+    /// `user`'s self-join, built on the room's current heads.
+    async fn join_on_heads(store: &SqliteStore, room_id: &OwnedRoomId, user: &UserId) -> Event {
+        let (timeline, state) = store.forward_extremities(room_id).await.unwrap().unwrap();
+        EventBuilder::new(
+            user.to_owned(),
+            "m.room.member".to_owned(),
+            neutrino_event::base_version().clone(),
+        )
+        .room_id(room_id.clone())
+        .state_key(user.to_string())
+        .content(json!({ "membership": "join" }))
+        .prev_events(timeline.into_iter().collect())
+        .prev_state_events(state.into_iter().collect())
+        .build()
+        .expect("build join pdu")
+    }
+
+    /// A public room with alice and one joined user on each of `remotes`, none of
+    /// which has anything pending, served by a registry over `tags`.
+    async fn room_with_remotes(
+        remotes: &[&ServerName],
+        tags: Arc<GroupTags>,
+    ) -> (
+        RoomRegistry<SqliteStore>,
+        Arc<SqliteStore>,
+        OwnedRoomId,
+        OwnedUserId,
+    ) {
+        let (registry, store, room_id, alice) = setup().await;
+        for (event_type, state_key, content) in [
+            (
+                "m.room.member",
+                alice.to_string(),
+                json!({ "membership": "join" }),
+            ),
+            (
+                "m.room.join_rules",
+                String::new(),
+                json!({ "join_rule": "public" }),
+            ),
+        ] {
+            registry
+                .send_event(
+                    &room_id,
+                    alice.clone(),
+                    event_type.to_owned(),
+                    Some(state_key),
+                    content,
+                )
+                .await
+                .expect("alice sets up the room");
+        }
+        for server in remotes {
+            let user: OwnedUserId = format!("@user:{server}").parse().unwrap();
+            let join = join_on_heads(&store, &room_id, &user).await;
+            registry
+                .apply_pdu(&room_id, join)
+                .await
+                .expect("remote join");
+            assert!(
+                store
+                    .current_state_event(&room_id, "m.room.member", user.as_str())
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{user} must be joined"
+            );
+        }
+        // `setup`'s registry groups nothing; a fresh one over the same store
+        // carries `tags`.
+        let registry = RoomRegistry::new(
+            store.clone(),
+            "example.org".to_owned(),
+            neutrino_event::EventPolicy::trusted_network(),
+            tags,
+        );
+        (registry, store, room_id, alice)
+    }
+
+    async fn say(
+        registry: &RoomRegistry<SqliteStore>,
+        room_id: &RoomId,
+        alice: &OwnedUserId,
+        body: &str,
+    ) -> Arc<Event> {
+        registry
+            .send_event(
+                room_id,
+                alice.clone(),
+                "m.room.message".to_owned(),
+                None,
+                json!({ "msgtype": "m.text", "body": body }),
+            )
+            .await
+            .expect("alice message")
+    }
+
+    #[tokio::test]
+    async fn local_send_tags_every_idle_joined_server() {
+        let (a, b) = (server_name!("a.example"), server_name!("b.example"));
+        let tags = Arc::new(GroupTags::new(true));
+        let (registry, _store, room_id, alice) = room_with_remotes(&[a, b], tags.clone()).await;
+
+        let msg = say(&registry, &room_id, &alice, "hi").await;
+
+        for server in [a, b] {
+            let group = tags
+                .take(&msg.event_id, server)
+                .unwrap_or_else(|| panic!("{server} is tagged"));
+            assert_eq!(group.size, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_with_a_pending_row_is_left_out() {
+        let (a, b, c) = (
+            server_name!("a.example"),
+            server_name!("b.example"),
+            server_name!("c.example"),
+        );
+        let tags = Arc::new(GroupTags::new(true));
+        let (registry, store, room_id, alice) = room_with_remotes(&[a, b, c], tags.clone()).await;
+
+        // Every server gets a row for `one`; a and b have taken theirs.
+        let one = say(&registry, &room_id, &alice, "one").await;
+        store.remove_pdus(a, &[&one.event_id]).await.unwrap();
+        store.remove_pdus(b, &[&one.event_id]).await.unwrap();
+        let two = say(&registry, &room_id, &alice, "two").await;
+        assert!(tags.tagged_for(&two.event_id, a) && tags.tagged_for(&two.event_id, b));
+        assert!(!tags.tagged_for(&two.event_id, c), "c has a row pending");
+
+        // Only a has taken `two`: one idle server is no group.
+        store.remove_pdus(a, &[&two.event_id]).await.unwrap();
+        let three = say(&registry, &room_id, &alice, "three").await;
+        for server in [a, b, c] {
+            assert!(!tags.tagged_for(&three.event_id, server), "{server}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_departing_server_is_never_tagged() {
+        let (a, b, c) = (
+            server_name!("a.example"),
+            server_name!("b.example"),
+            server_name!("c.example"),
+        );
+        let tags = Arc::new(GroupTags::new(true));
+        let (registry, store, room_id, alice) = room_with_remotes(&[a, b, c], tags.clone()).await;
+
+        let kick = registry
+            .send_event(
+                &room_id,
+                alice.clone(),
+                "m.room.member".to_owned(),
+                Some(format!("@user:{a}")),
+                json!({ "membership": "leave" }),
+            )
+            .await
+            .expect("alice kicks a's user");
+
+        let pending = store.pending_pdus(a, usize::MAX).await.unwrap();
+        assert!(
+            pending.iter().any(|e| e.event_id == kick.event_id),
+            "the departing server still gets the kick"
+        );
+        assert!(!tags.tagged_for(&kick.event_id, a));
+        assert!(tags.tagged_for(&kick.event_id, b) && tags.tagged_for(&kick.event_id, c));
+    }
+
+    #[tokio::test]
+    async fn nothing_is_tagged_with_grouping_disabled() {
+        let (a, b) = (server_name!("a.example"), server_name!("b.example"));
+        let tags = Arc::new(GroupTags::new(false));
+        let (registry, store, room_id, alice) = room_with_remotes(&[a, b], tags.clone()).await;
+
+        let msg = say(&registry, &room_id, &alice, "hi").await;
+
+        for server in [a, b] {
+            assert!(!tags.tagged_for(&msg.event_id, server));
+            assert_eq!(
+                store.pending_pdus(server, usize::MAX).await.unwrap().len(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resident_apply_is_never_tagged() {
+        let (a, b) = (server_name!("a.example"), server_name!("b.example"));
+        let tags = Arc::new(GroupTags::new(true));
+        let (registry, store, room_id, _alice) = room_with_remotes(&[a, b], tags.clone()).await;
+
+        let joiner: OwnedUserId = "@user:c.example".parse().unwrap();
+        let join = join_on_heads(&store, &room_id, &joiner).await;
+        let join_id = join.event_id.clone();
+        registry
+            .apply_resident(&room_id, join)
+            .await
+            .expect("resident join");
+
+        for server in [a, b] {
+            let pending = store.pending_pdus(server, usize::MAX).await.unwrap();
+            assert!(pending.iter().any(|e| e.event_id == join_id), "{server}");
+            assert!(!tags.tagged_for(&join_id, server), "{server}");
+        }
     }
 }

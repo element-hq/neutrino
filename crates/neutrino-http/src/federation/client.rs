@@ -94,6 +94,13 @@ pub(crate) struct FederationClient {
 /// a dependency here).
 const HOST_SENTINEL: char = '~';
 
+/// Marks a `/send` as one of a group of copies of one transaction; the value is
+/// the group's size. It lives only on loopback: the `neutrino-lb` egress strips
+/// it, and the lb ingress sets it on a request that arrived as a group's shared
+/// transmission. Mirrored in `neutrino_lb::headers` (kept local on both sides —
+/// lb is deliberately not a dependency here).
+pub(crate) const GROUP_HEADER: &str = "X-Neutrino-Group";
+
 /// Install rustls' ring crypto provider as the process default, once.
 ///
 /// reqwest has no TLS backend in this workspace, but an out-of-tree composition
@@ -276,6 +283,20 @@ impl FederationClient {
         pdus: &[Box<RawJsonValue>],
         forward_extremities: &BTreeMap<OwnedRoomId, ForwardExtremities>,
     ) -> Result<BTreeMap<OwnedRoomId, ForwardExtremities>, FederationClientError> {
+        self.put_transaction(dest, txn_id, pdus, forward_extremities, None)
+            .await
+    }
+
+    /// [`Self::send_transaction`], carrying [`GROUP_HEADER`] when `group_size`
+    /// is set.
+    async fn put_transaction(
+        &self,
+        dest: &ServerName,
+        txn_id: &str,
+        pdus: &[Box<RawJsonValue>],
+        forward_extremities: &BTreeMap<OwnedRoomId, ForwardExtremities>,
+        group_size: Option<usize>,
+    ) -> Result<BTreeMap<OwnedRoomId, ForwardExtremities>, FederationClientError> {
         // `txn_id` is locally generated (`{u64}-{u64}`) and `dest` is a
         // validated `ServerName`, so neither needs escaping in the path.
         let url = Url::parse(&format!(
@@ -288,10 +309,11 @@ impl FederationClient {
             edus: &[],
             forward_extremities,
         };
-        let resp = self
-            .request(Method::PUT, url, dest, Some(&body))?
-            .send()
-            .await?;
+        let mut req = self.request(Method::PUT, url, dest, Some(&body))?;
+        if let Some(size) = group_size {
+            req = req.header(GROUP_HEADER, size);
+        }
+        let resp = req.send().await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "PUT /send").await);
         }
@@ -701,6 +723,25 @@ impl FederationTransport for FederationClient {
             .await
             .map_err(TransportError::from)
     }
+
+    /// Only the lb egress can share a transmission, and only unsigned: an
+    /// `X-Matrix` signature covers `destination`.
+    fn supports_groups(&self) -> bool {
+        self.proxied && self.signer.is_none()
+    }
+
+    async fn send_group_transaction(
+        &self,
+        dest: &ServerName,
+        txn_id: &str,
+        pdus: &[Box<RawJsonValue>],
+        forward_extremities: &BTreeMap<OwnedRoomId, ForwardExtremities>,
+        group_size: usize,
+    ) -> Result<BTreeMap<OwnedRoomId, ForwardExtremities>, TransportError> {
+        self.put_transaction(dest, txn_id, pdus, forward_extremities, Some(group_size))
+            .await
+            .map_err(TransportError::from)
+    }
 }
 
 /// [`FederationClient::get_missing_events`] with MSC4242 `state_dag: true`.
@@ -953,6 +994,51 @@ mod tests {
                 "X-Matrix origin=\"local.test\",destination=\"{dest}\",key=\"{SIGNING_KEY_ID}\",sig=\"{expected_sig}\""
             )
         );
+    }
+
+    #[tokio::test]
+    async fn only_a_group_send_carries_the_group_header() {
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = seen.clone();
+        let app = Router::new().route(
+            "/_matrix/federation/v1/send/{txn}",
+            put(move |headers: axum::http::HeaderMap| {
+                let cap = cap.clone();
+                async move {
+                    let group = headers
+                        .get(GROUP_HEADER)
+                        .map(|v| v.to_str().unwrap().to_owned());
+                    cap.lock().unwrap().push(group);
+                    Json(json!({}))
+                }
+            }),
+        );
+        let dest = spawn_stub(app).await;
+        let client = FederationClient::new("local.test".to_owned(), None);
+        let pdu = raw(r#"{"n":1}"#);
+        let pdus = std::slice::from_ref(&pdu);
+
+        FederationTransport::send_transaction(&client, &dest, "t1", pdus, &BTreeMap::new())
+            .await
+            .unwrap();
+        client
+            .send_group_transaction(&dest, "t2", pdus, &BTreeMap::new(), 3)
+            .await
+            .unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), vec![None, Some("3".to_owned())]);
+    }
+
+    #[test]
+    fn supports_groups_only_when_proxied_and_unsigned() {
+        let proxy = Some("http://127.0.0.1:1");
+        let signer = || Some(Arc::new(EventSigner::new(&[9u8; 32], "local.test")));
+        let client = |proxy| FederationClient::new("local.test".to_owned(), proxy);
+
+        assert!(client(proxy).supports_groups());
+        assert!(!client(proxy).with_signer(signer()).supports_groups());
+        assert!(!client(None).supports_groups());
+        assert!(!client(None).with_signer(signer()).supports_groups());
     }
 
     #[tokio::test]

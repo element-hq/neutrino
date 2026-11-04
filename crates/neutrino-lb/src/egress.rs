@@ -20,7 +20,7 @@ use tracing::{debug, warn};
 
 use crate::capture::{CaptureControl, Leg, record_response};
 use crate::codec::{cbor_to_json, json_to_cbor};
-use crate::headers::is_forwardable;
+use crate::headers::{GROUP_HEADER, is_forwardable};
 use crate::transport::{DestinationResolver, WireClient, WireRequest};
 
 /// Shared egress state: the wire client used to reach peers, the resolver that
@@ -54,7 +54,7 @@ pub async fn serve(
 }
 
 async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     // Forward-proxy requests carry an absolute-form target, so the authority is
     // the destination server. Its absence means we were called as an origin
     // server, which is a misconfiguration — but answer 502 (like every other
@@ -78,6 +78,10 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
         .path_and_query()
         .map(|pq| pq.as_str().to_owned())
         .unwrap_or_else(|| parts.uri.path().to_owned());
+    let group_size = parts
+        .headers
+        .remove(GROUP_HEADER)
+        .and_then(|v| v.to_str().ok()?.parse().ok());
     let headers: Vec<(String, Vec<u8>)> = parts
         .headers
         .iter()
@@ -122,6 +126,7 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
             path,
             headers,
             body: cbor_body,
+            group_size,
             ..Default::default()
         })
         .await
@@ -305,6 +310,57 @@ mod tests {
 
         token.cancel();
         let _ = handle.await;
+    }
+
+    /// Sends one proxied `/send` with `group` as its group header, if any, and
+    /// returns what the wire client saw.
+    async fn proxy_with_group_header(group: Option<&str>) -> WireRequest {
+        let client = Arc::new(RecordingClient {
+            seen: Mutex::new(None),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let token = CancellationToken::new();
+        let client_dyn: Arc<dyn WireClient> = client.clone();
+        let server_token = token.clone();
+        let handle =
+            tokio::spawn(
+                async move { serve(addr, client_dyn, direct(), None, server_token).await },
+            );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        crate::install_crypto_provider();
+        let http = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{addr}")).unwrap())
+            .build()
+            .unwrap();
+        let mut req = http
+            .put("http://peer.example:8448/_matrix/federation/v1/send/9")
+            .body("{}");
+        if let Some(group) = group {
+            req = req.header("X-Neutrino-Group", group);
+        }
+        assert_eq!(req.send().await.expect("proxied request").status(), 200);
+
+        token.cancel();
+        let _ = handle.await;
+        client.seen.lock().unwrap().clone().unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_group_header_becomes_the_group_size() {
+        for (header, size) in [(Some("3"), Some(3)), (Some("three"), None), (None, None)] {
+            let seen = proxy_with_group_header(header).await;
+            assert_eq!(seen.group_size, size, "{header:?}");
+            assert!(
+                !seen
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(GROUP_HEADER)),
+                "{header:?}: the header must not reach the wire"
+            );
+        }
     }
 
     // A resolver that rewrites the authority, standing in for the tunnel's

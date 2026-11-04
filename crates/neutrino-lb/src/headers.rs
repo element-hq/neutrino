@@ -7,11 +7,17 @@
 //! means a header has to be explicitly understood to survive; framing headers
 //! are recomputed per hop by the downstream HTTP client regardless.
 
-/// Lowercase header names the proxy forwards verbatim. The only semantic header
-/// this (signature-less, trusted-network) server uses is `authorization`: it
-/// carries the `X-Matrix origin="…",destination="…"` credential the inbound
-/// side reads to authenticate the origin (see `federation::auth`).
-const ALLOWED: &[&str] = &["authorization"];
+/// Marks a `/send` whose transmission is shared by a group of destinations;
+/// its value is the group's size. It exists only on loopback: the wire carries
+/// it as the CoAP Group option, and lb always sets its value itself.
+/// `neutrino-http` spells the same name.
+pub const GROUP_HEADER: &str = "x-neutrino-group";
+
+/// Lowercase header names the proxy forwards verbatim. `authorization` carries
+/// the `X-Matrix origin="…",destination="…"` credential the inbound side reads
+/// to authenticate the origin (see `federation::auth`); [`GROUP_HEADER`] is
+/// the one ingress synthesises from the Group option.
+const ALLOWED: &[&str] = &["authorization", GROUP_HEADER];
 
 /// Lowercase prefixes the proxy forwards. Reserved for any future
 /// low-bandwidth `X-Matrix-*` header; matches the `X-Matrix` auth scheme family.

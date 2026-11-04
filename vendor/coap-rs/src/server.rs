@@ -23,8 +23,8 @@ use crate::observer::{encode_coap_uint, Observer};
 
 #[cfg(feature = "q-block")]
 use crate::qblock::{
-    drive_receive, drive_send, parse_missing_request, QBlockConfig, QBlockReceiver, QBlockSender,
-    ResponderSink, TransferKind,
+    drive_receive, drive_send, group_size, parse_missing_request, QBlockConfig, QBlockReceiver,
+    QBlockSender, ResponderSink, TransferKind,
 };
 #[cfg(feature = "q-block")]
 use coap_lite::{block_handler::BlockValue, MessageType};
@@ -765,6 +765,12 @@ impl Server {
         respond: Arc<dyn Responder>,
     ) {
         request = handler.handle_request(request).await;
+        // The receivers of a shared transmission all answer it: spread their
+        // responses over the leisure so they don't collide (RFC 7252 §8.2).
+        if let (Some(_), Some(size)) = (&request.response, group_size(&request.message)) {
+            let leisure = qblock.config.leisure(size);
+            tokio::time::sleep(leisure.mul_f64(rand::random_range(0.0..=1.0))).await;
+        }
         // Stream a large response via Q-Block2 if the client asked for it (or
         // `assume_peer_block_size` says it can take one). Runs before
         // `intercept_response` so the RFC 7959 BlockHandler never sees a
@@ -824,6 +830,16 @@ impl Server {
         let _ = tx.send(bytes).await;
 
         let token = packet.get_token().to_vec();
+        // A shared transmission is never repaired: a receiver can't tell it is
+        // outside the group until the body is whole, and its 4.08 would go
+        // unanswered.
+        let config = match group_size(packet) {
+            Some(_) => QBlockConfig {
+                non_max_retransmit: 0,
+                ..qblock.config.clone()
+            },
+            None => qblock.config.clone(),
+        };
         tokio::spawn(async move {
             // 4.08 recovery requests echo the request token + Request-Tag.
             let mut tmpl = Packet::new();
@@ -836,13 +852,9 @@ impl Server {
             // sending: if nothing is ever recorded, every block it sent was
             // rejected and there is nothing to wait for. Release the slot and the
             // source binding on the head timeout rather than the partial timeout.
-            let receiver = QBlockReceiver::new(
-                CoapOption::QBlock1,
-                tmpl,
-                qblock.max_body_len,
-                qblock.config.clone(),
-            )
-            .expire_when_nothing_arrives();
+            let receiver =
+                QBlockReceiver::new(CoapOption::QBlock1, tmpl, qblock.max_body_len, config)
+                    .expire_when_nothing_arrives();
             let sink = ResponderSink(respond.clone());
             if let Ok(Some((body, mut carrier))) = drive_receive(receiver, rx, &sink).await {
                 carrier.payload = body;
@@ -1677,11 +1689,105 @@ pub mod test {
         }
     }
 
+    /// Responses to a request whose transmission several exchanges share.
+    #[cfg(feature = "q-block")]
+    mod qblock_group_tests {
+        use super::*;
+        use crate::qblock::GROUP_OPTION;
+        use coap_lite::option_value::OptionValueU32;
+        use coap_lite::{MessageClass, ResponseType};
+        use tokio::time::Instant;
+
+        struct RecordingResponder(mpsc::UnboundedSender<Vec<u8>>);
+
+        #[async_trait]
+        impl Responder for RecordingResponder {
+            async fn respond(&self, response: Vec<u8>) {
+                let _ = self.0.send(response);
+            }
+            fn address(&self) -> SocketAddr {
+                "127.0.0.1:5683".parse().unwrap()
+            }
+        }
+
+        /// Dispatches a request marked as shared by 3 exchanges through
+        /// `handler`, with a 1 s response slot. Returns what was sent back and
+        /// when.
+        async fn dispatch_group_request<H: RequestHandler>(
+            handler: H,
+        ) -> (Option<Vec<u8>>, Duration) {
+            let mut pkt = Packet::new();
+            pkt.header.set_type(MessageType::NonConfirmable);
+            pkt.header.code = MessageClass::Request(RequestType::Put);
+            pkt.set_token(vec![0x42]);
+            pkt.add_option_as(GROUP_OPTION, OptionValueU32(3));
+            let request = Box::new(CoapRequest::from_packet(
+                pkt,
+                "127.0.0.1:5683".parse().unwrap(),
+            ));
+            let qblock = Arc::new(QBlockServerState::new(QBlockConfig {
+                response_slot: Some(Duration::from_secs(1)),
+                ..Default::default()
+            }));
+            let coap_state = Arc::new(Mutex::new(ServerCoapState::new(
+                BlockHandlerConfig::default(),
+            )));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let start = Instant::now();
+            Server::dispatch_and_respond(
+                Arc::new(handler),
+                coap_state,
+                qblock,
+                request,
+                Arc::new(RecordingResponder(tx)),
+            )
+            .await;
+            (rx.try_recv().ok(), start.elapsed())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_group_response_waits_within_the_leisure() {
+            let mut delays = Vec::new();
+            for _ in 0..20 {
+                let (response, delay) =
+                    dispatch_group_request(|mut req: Box<CoapRequest<SocketAddr>>| async move {
+                        if let Some(resp) = req.response.as_mut() {
+                            resp.message.header.code =
+                                MessageClass::Response(ResponseType::Changed);
+                        }
+                        req
+                    })
+                    .await;
+                assert!(response.is_some());
+                delays.push(delay);
+            }
+            assert!(delays.iter().all(|d| *d <= Duration::from_secs(3)));
+            assert!(
+                delays.iter().any(|d| !d.is_zero()),
+                "no response was delayed"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_group_request_without_a_response_sends_nothing() {
+            let (response, delay) =
+                dispatch_group_request(|mut req: Box<CoapRequest<SocketAddr>>| async move {
+                    req.response = None;
+                    req
+                })
+                .await;
+            assert_eq!(response, None);
+            assert_eq!(delay, Duration::ZERO);
+        }
+    }
+
     /// DoS-hardening of the Q-Block1 (inbound request) receive path: source
     /// binding, the concurrent-transfer cap, and the body-size cap.
     #[cfg(feature = "q-block")]
     mod qblock_dos_tests {
         use super::*;
+        use crate::qblock::GROUP_OPTION;
+        use coap_lite::option_value::OptionValueU32;
         use coap_lite::MessageClass;
         use std::sync::Mutex;
 
@@ -1736,17 +1842,19 @@ pub mod test {
                 non_receive_timeout: Duration::from_millis(40),
                 ..Default::default()
             };
-            let (addr, bodies) =
-                spawn_recording_server(move |s| s.set_qblock_config(cfg)).await;
+            let (addr, bodies) = spawn_recording_server(move |s| s.set_qblock_config(cfg)).await;
 
             let good: Vec<u8> = (0..32u8).collect();
             let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
             // A opens transfer "T" with block 0 → binds it to A's source.
-            a.send_to(&q1_block(b"T", b"\x01", 0, true, good[0..16].to_vec()), addr)
-                .await
-                .unwrap();
+            a.send_to(
+                &q1_block(b"T", b"\x01", 0, true, good[0..16].to_vec()),
+                addr,
+            )
+            .await
+            .unwrap();
             tokio::time::sleep(Duration::from_millis(30)).await;
             // B (different source) forges the final block for the same tag.
             b.send_to(&q1_block(b"T", b"\x01", 1, false, vec![0xFFu8; 16]), addr)
@@ -1754,9 +1862,12 @@ pub mod test {
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(30)).await;
             // A completes the transfer correctly.
-            a.send_to(&q1_block(b"T", b"\x01", 1, false, good[16..32].to_vec()), addr)
-                .await
-                .unwrap();
+            a.send_to(
+                &q1_block(b"T", b"\x01", 1, false, good[16..32].to_vec()),
+                addr,
+            )
+            .await
+            .unwrap();
 
             let mut got = None;
             for _ in 0..50 {
@@ -1782,16 +1893,22 @@ pub mod test {
             let body: Vec<u8> = (0..32u8).collect();
             // Transfer A occupies the one slot with an incomplete (more=true) block.
             let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            a.send_to(&q1_block(b"A", b"\x01", 0, true, body[0..16].to_vec()), addr)
-                .await
-                .unwrap();
+            a.send_to(
+                &q1_block(b"A", b"\x01", 0, true, body[0..16].to_vec()),
+                addr,
+            )
+            .await
+            .unwrap();
             tokio::time::sleep(Duration::from_millis(40)).await;
             // Transfer B is a complete single block — without the cap it would
             // dispatch immediately; at the cap its opening block is dropped.
             let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            b.send_to(&q1_block(b"B", b"\x02", 0, false, body[16..32].to_vec()), addr)
-                .await
-                .unwrap();
+            b.send_to(
+                &q1_block(b"B", b"\x02", 0, false, body[16..32].to_vec()),
+                addr,
+            )
+            .await
+            .unwrap();
 
             tokio::time::sleep(Duration::from_millis(150)).await;
             assert!(
@@ -1844,6 +1961,52 @@ pub mod test {
             );
         }
 
+        #[tokio::test]
+        async fn a_group_transfer_with_a_lost_block_is_never_repaired() {
+            let cfg = QBlockConfig {
+                non_receive_timeout: Duration::from_millis(100),
+                non_partial_timeout: Duration::from_secs(10),
+                ..Default::default()
+            };
+            let (addr, bodies) = spawn_recording_server(move |s| {
+                s.set_qblock_config(cfg);
+                s.set_qblock_max_transfers(1);
+            })
+            .await;
+            let grouped = |pdu: Vec<u8>| {
+                let mut p = Packet::from_bytes(&pdu).unwrap();
+                p.add_option_as(GROUP_OPTION, OptionValueU32(3));
+                p.to_bytes().unwrap()
+            };
+
+            // Blocks 0 and 2 of three: block 1 is lost.
+            let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            for (num, more) in [(0, true), (2, false)] {
+                let block = q1_block(b"G", b"\x01", num, more, vec![0u8; 16]);
+                a.send_to(&grouped(block), addr).await.unwrap();
+            }
+            let mut buf = [0u8; 64];
+            let heard = tokio::time::timeout(Duration::from_millis(400), a.recv_from(&mut buf));
+            assert!(
+                heard.await.is_err(),
+                "a group transfer must not send a 4.08"
+            );
+
+            // The one slot is free again.
+            let body: Vec<u8> = (0..16u8).collect();
+            let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            b.send_to(&q1_block(b"B", b"\x02", 0, false, body.clone()), addr)
+                .await
+                .unwrap();
+            for _ in 0..50 {
+                if !bodies.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(*bodies.lock().unwrap(), vec![body]);
+        }
+
         // I2: a Q-Block1 body exceeding `max_body_len` is rejected, not dispatched.
         #[tokio::test]
         async fn oversized_body_is_rejected_by_max_body_len() {
@@ -1851,14 +2014,20 @@ pub mod test {
 
             let body: Vec<u8> = (0..32u8).collect();
             let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            a.send_to(&q1_block(b"X", b"\x01", 0, true, body[0..16].to_vec()), addr)
-                .await
-                .unwrap();
+            a.send_to(
+                &q1_block(b"X", b"\x01", 0, true, body[0..16].to_vec()),
+                addr,
+            )
+            .await
+            .unwrap();
             tokio::time::sleep(Duration::from_millis(20)).await;
             // Block 1 starts at offset 16, end 32 > the 16-byte cap → rejected.
-            a.send_to(&q1_block(b"X", b"\x01", 1, false, body[16..32].to_vec()), addr)
-                .await
-                .unwrap();
+            a.send_to(
+                &q1_block(b"X", b"\x01", 1, false, body[16..32].to_vec()),
+                addr,
+            )
+            .await
+            .unwrap();
 
             tokio::time::sleep(Duration::from_millis(150)).await;
             assert!(

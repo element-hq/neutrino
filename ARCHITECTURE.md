@@ -60,6 +60,7 @@ Each states the rule, who keeps it, who relies on it, and what breaks without it
 - **Soft-fail is always computed.** `Config.enable_soft_failure` only controls whether clients see soft-failed events; DAG and relay behaviour don't change.
 - **C-S reads never return rejected events**, nor soft-failed ones when they're hidden. Federation reads serve both, because peers need the ancestry. C-S handlers must use the store's client read methods.
 - **`persist_resolved_event` is one SQLite transaction.** It writes the event, the state delta, forward extremities, the room_state index, out-of-band pruning, the outbox and anti-entropy obligations, and notifies the watch only after commit. The outbox is the never-lose ledger; sync subscribes before it queries.
+- **A group tag exists before its outbox row.** The room actor tags before `persist_resolved_event`, and the sender relies on any task that reads the row also seeing the tag.
 - **"Server is in the room" has one definition**, `engine::reconcile::server_in_room`. The store's out-of-band membership write re-checks the same fact atomically. If the two drift, a room PDU gets diverted into the out-of-band table, acknowledged and never applied.
 
 ### Federated membership
@@ -84,6 +85,13 @@ Each states the rule, who keeps it, who relies on it, and what breaks without it
 - **The lb egress is loopback-only by construction**: main allocates it. That is why it has no body cap.
 - **In lb mode main replaces `Config.federation_proxy` with the egress.** A configured proxy must parse or startup fails (`AppState::validate_config`), never falling back to direct, which would send JSON to a CBOR peer.
 - **Proxied URLs carry a `~` host suffix.** The federation client adds it and lb egress strips it; the two copies of this rule must change together.
+- **`X-Neutrino-Group` lives only on loopback.**
+  - http's client sets it on a grouped `/send`.
+  - lb egress strips it into `WireRequest.group_size`.
+  - lb ingress synthesises it from the Group option.
+  - The `/send` handler reads it.
+  - Both crates spell the name, and the copies must change together.
+- **`/send` answers 404 only to a Group-marked request for rooms we are not in.** lb withholds any response to a Group-marked request that comes back 404. Without that, a non-member's 404 would go on the air.
 - **Only the engine sender retries.**
   - A 4xx drops the batch permanently; anything else backs off.
   - lb must preserve the status class, so its own failures map to 502.

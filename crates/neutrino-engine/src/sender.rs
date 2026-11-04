@@ -31,7 +31,8 @@
 //! - **A global send semaphore.** At most `NEUTRINO_OUTBOUND_CONCURRENCY` (default
 //!   `DEFAULT_OUTBOUND_CONCURRENCY`, min 1) transactions are in flight across
 //!   all destinations at once. A backing-off destination holds no permit, so it
-//!   never starves a healthy one.
+//!   never starves a healthy one. A grouped first attempt takes none either:
+//!   the group's requests must reach the transport together.
 //!
 //! ## Failure handling
 //!
@@ -61,9 +62,10 @@ use tracing::{debug, error, info, warn};
 
 use neutrino_event::{EventPolicy, now_ms};
 
+use crate::group::{GroupSend, GroupTags};
 use crate::ports::{FederationTransport, ForwardExtremities, MissingEventsFetcher, TransportError};
 use crate::reconcile;
-use crate::util::{BACKOFF_BASE, MAX_PDUS_PER_TXN, TxnIdGen, jitter, next_backoff};
+use crate::util::{BACKOFF_BASE, MAX_PDUS_PER_TXN, jitter, next_backoff};
 
 /// Shared, cheaply-cloneable handles every sender task needs. Bundled so the
 /// per-destination signatures stay readable as the pool grows (mirrors
@@ -71,7 +73,7 @@ use crate::util::{BACKOFF_BASE, MAX_PDUS_PER_TXN, TxnIdGen, jitter, next_backoff
 struct SenderCtx<S> {
     store: Arc<S>,
     transport: Arc<dyn FederationTransport>,
-    idgen: Arc<TxnIdGen>,
+    tags: Arc<GroupTags>,
     send_slots: Arc<Semaphore>,
     /// Anti-entropy: peer fetcher for reconciling against the forward extremities
     /// a peer advertises on a transaction *response*. Shared with the inbound
@@ -93,7 +95,7 @@ impl<S> Clone for SenderCtx<S> {
         Self {
             store: self.store.clone(),
             transport: self.transport.clone(),
-            idgen: self.idgen.clone(),
+            tags: self.tags.clone(),
             send_slots: self.send_slots.clone(),
             fetcher: self.fetcher.clone(),
             policy: self.policy.clone(),
@@ -113,6 +115,7 @@ impl<S> Clone for SenderCtx<S> {
 pub fn spawn<S: StorageBackend + 'static>(
     store: Arc<S>,
     transport: Arc<dyn FederationTransport>,
+    tags: Arc<GroupTags>,
     concurrency: usize,
     startup_jitter_max: Duration,
     shutdown: CancellationToken,
@@ -122,9 +125,6 @@ pub fn spawn<S: StorageBackend + 'static>(
     worker_poke: mpsc::Sender<OwnedRoomId>,
 ) -> JoinHandle<()> {
     let watch_rx = store.subscribe();
-    // Process-startup prefix keeps txn ids unique across restarts; the
-    // in-memory counter keeps them unique within a run.
-    let idgen = Arc::new(TxnIdGen::new(now_ms()));
     // `Semaphore::new(0)` would block every send forever; clamp here so the
     // "≥ 1" invariant holds regardless of how `Config` was constructed (the
     // `from_env` path already clamps, but the field is `pub`).
@@ -132,7 +132,7 @@ pub fn spawn<S: StorageBackend + 'static>(
     let ctx = SenderCtx {
         store,
         transport,
-        idgen,
+        tags,
         send_slots,
         fetcher,
         policy,
@@ -260,7 +260,19 @@ async fn run_destination<S: StorageBackend + 'static>(
         };
 
         if !batch.is_empty() {
-            if deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await {
+            // A row tagged for this destination goes alone, as its group's send;
+            // the rows before it go first, ungrouped.
+            let (rows, group) = match ctx.tags.take(&batch[0].event_id, &dest) {
+                Some(group) => (&batch[..1], Some(group)),
+                None => {
+                    let cut = batch
+                        .iter()
+                        .position(|e| ctx.tags.tagged_for(&e.event_id, &dest))
+                        .unwrap_or(batch.len());
+                    (&batch[..cut], None)
+                }
+            };
+            if deliver_batch(&ctx, &dest, rows, group, &mut backoff, &mut kick_rx).await {
                 backoff = BACKOFF_BASE;
                 continue;
             }
@@ -318,12 +330,17 @@ enum SendOutcome {
 /// array. The caller owns `txn_id` (so a post-success durable-write fault can
 /// re-call this under the *same* id, which the peer dedups on `(origin, txnId)`)
 /// and decides what `Delivered` / `Rejected` mean for its durable state.
+///
+/// With `group_size`, the first attempt is one of a group's copies; every retry
+/// is an ordinary send.
+#[allow(clippy::too_many_arguments)]
 async fn send_transaction_with_retry<S: StorageBackend + 'static>(
     ctx: &SenderCtx<S>,
     dest: &ServerName,
     txn_id: &str,
     pdus: &[Box<RawJsonValue>],
     our_fes: &BTreeMap<OwnedRoomId, ForwardExtremities>,
+    mut group_size: Option<usize>,
     backoff: &mut Duration,
     kick_rx: &mut watch::Receiver<()>,
 ) -> SendOutcome {
@@ -335,6 +352,7 @@ async fn send_transaction_with_retry<S: StorageBackend + 'static>(
         // `attempt`; `pdus = 0` marks an anti-entropy advertisement. The `/send`
         // path is spelled out so it surfaces when filtering on `_matrix/federation/`.
         attempt += 1;
+        let group = group_size.take();
         info!(
             target: "neutrino_http",
             %dest,
@@ -342,19 +360,28 @@ async fn send_transaction_with_retry<S: StorageBackend + 'static>(
             pdus = pdus.len(),
             rooms = our_fes.len(),
             attempt,
+            group,
             "outbound PUT /_matrix/federation/v1/send",
         );
-        // Hold a global permit only around the network call — released before
-        // any backoff sleep, so a slow peer can't pin a concurrency slot.
-        let send_result = match ctx.send_slots.acquire().await {
-            Ok(_permit) => {
+        let send_result = match group {
+            // No permit: the semaphore would hold back the group's other copies.
+            Some(size) => {
                 ctx.transport
-                    .send_transaction(dest, txn_id, pdus, our_fes)
+                    .send_group_transaction(dest, txn_id, pdus, our_fes, size)
                     .await
             }
-            // The semaphore is never closed in normal operation; an error here
-            // means shutdown.
-            Err(_) => return SendOutcome::Shutdown,
+            // Hold a global permit only around the network call — released before
+            // any backoff sleep, so a slow peer can't pin a concurrency slot.
+            None => match ctx.send_slots.acquire().await {
+                Ok(_permit) => {
+                    ctx.transport
+                        .send_transaction(dest, txn_id, pdus, our_fes)
+                        .await
+                }
+                // The semaphore is never closed in normal operation; an error here
+                // means shutdown.
+                Err(_) => return SendOutcome::Shutdown,
+            },
         };
 
         match send_result {
@@ -397,10 +424,14 @@ fn covered_by(batch: &[neutrino_event::Event]) -> BTreeSet<OwnedEventId> {
 /// advertisement). A 4xx drops the batch but leaves the obligation (our heads
 /// never landed, so the duty stands). A post-2xx `remove_pdus` fault re-sends
 /// under the same txn id (the peer dedups). Returns `false` only on shutdown.
+///
+/// With `group`, the batch is sent under the group's `txn_id`, and only its
+/// first attempt is grouped.
 async fn deliver_batch<S: StorageBackend + 'static>(
     ctx: &SenderCtx<S>,
     dest: &ServerName,
     batch: &[neutrino_event::Event],
+    group: Option<GroupSend>,
     backoff: &mut Duration,
     kick_rx: &mut watch::Receiver<()>,
 ) -> bool {
@@ -426,10 +457,22 @@ async fn deliver_batch<S: StorageBackend + 'static>(
     // advertise it more strongly than telling it the id would.
     let advert = reconcile::strip_known(&our_fes, &covered_by(batch));
 
-    let txn_id = ctx.idgen.next_id();
+    let (txn_id, mut group_size) = match group {
+        Some(GroupSend { txn_id, size }) => (txn_id, Some(size)),
+        None => (ctx.tags.next_txn_id(), None),
+    };
     loop {
-        match send_transaction_with_retry(ctx, dest, &txn_id, &pdus, &advert, backoff, kick_rx)
-            .await
+        match send_transaction_with_retry(
+            ctx,
+            dest,
+            &txn_id,
+            &pdus,
+            &advert,
+            group_size.take(),
+            backoff,
+            kick_rx,
+        )
+        .await
         {
             SendOutcome::Shutdown => return false,
             // 4xx: drop the batch (retrying won't help), but DO NOT clear the
@@ -555,7 +598,7 @@ async fn send_advertisement<S: StorageBackend + 'static>(
     // left for the junk-clear branch above to reap on a later pass.
     let advertised: Vec<&RoomId> = our_fes.keys().map(AsRef::as_ref).collect();
     let empty_pdus: Vec<Box<RawJsonValue>> = Vec::new();
-    let txn_id = ctx.idgen.next_id();
+    let txn_id = ctx.tags.next_txn_id();
     loop {
         match send_transaction_with_retry(
             ctx,
@@ -563,6 +606,7 @@ async fn send_advertisement<S: StorageBackend + 'static>(
             &txn_id,
             &empty_pdus,
             &our_fes,
+            None,
             backoff,
             kick_rx,
         )
@@ -948,7 +992,7 @@ mod tests {
         SenderCtx {
             store,
             transport,
-            idgen: Arc::new(TxnIdGen::new(now_ms())),
+            tags: Arc::new(GroupTags::new(false)),
             send_slots: Arc::new(Semaphore::new(1)),
             fetcher: null_fetcher(),
             policy: EventPolicy::trusted_network(),
@@ -986,6 +1030,7 @@ mod tests {
         drop(spawn(
             store.clone(),
             stub.clone(),
+            Arc::new(GroupTags::new(false)),
             2,
             NO_JITTER,
             no_shutdown(),
@@ -1023,6 +1068,7 @@ mod tests {
         drop(spawn(
             store.clone(),
             stub.clone(),
+            Arc::new(GroupTags::new(false)),
             2,
             NO_JITTER,
             no_shutdown(),
@@ -1056,6 +1102,7 @@ mod tests {
         drop(spawn(
             store.clone(),
             stub.clone(),
+            Arc::new(GroupTags::new(false)),
             2,
             NO_JITTER,
             no_shutdown(),
@@ -1080,6 +1127,7 @@ mod tests {
         drop(spawn(
             store.clone(),
             stub.clone(),
+            Arc::new(GroupTags::new(false)),
             2,
             NO_JITTER,
             no_shutdown(),
@@ -1127,6 +1175,7 @@ mod tests {
         drop(spawn(
             store.clone(),
             stub.clone(),
+            Arc::new(GroupTags::new(false)),
             2,
             NO_JITTER,
             no_shutdown(),
@@ -1159,6 +1208,7 @@ mod tests {
         drop(spawn(
             store.clone(),
             stub.clone(),
+            Arc::new(GroupTags::new(false)),
             2,
             NO_JITTER,
             no_shutdown(),
@@ -1206,6 +1256,7 @@ mod tests {
         drop(spawn(
             store.clone(),
             stub.clone(),
+            Arc::new(GroupTags::new(false)),
             2,
             NO_JITTER,
             no_shutdown(),
@@ -1243,6 +1294,7 @@ mod tests {
         drop(spawn(
             store.clone(),
             stub.clone(),
+            Arc::new(GroupTags::new(false)),
             2,
             NO_JITTER,
             no_shutdown(),
@@ -1290,7 +1342,7 @@ mod tests {
         let batch = store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await.unwrap();
         let mut backoff = BACKOFF_BASE;
         let mut kick_rx = test_backoff();
-        assert!(deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await);
+        assert!(deliver_batch(&ctx, &dest, &batch, None, &mut backoff, &mut kick_rx).await);
 
         // Checked before the stub locks are taken, so no guard is held across it.
         assert!(
@@ -1336,7 +1388,7 @@ mod tests {
         let batch = store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await.unwrap();
         let mut backoff = BACKOFF_BASE;
         let mut kick_rx = test_backoff();
-        assert!(deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await);
+        assert!(deliver_batch(&ctx, &dest, &batch, None, &mut backoff, &mut kick_rx).await);
 
         assert_eq!(
             batch.iter().map(|e| e.event_id.clone()).collect::<Vec<_>>(),
@@ -1413,7 +1465,7 @@ mod tests {
         let batch = store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await.unwrap();
         let mut backoff = BACKOFF_BASE;
         let mut kick_rx = test_backoff();
-        let delivered = deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await;
+        let delivered = deliver_batch(&ctx, &dest, &batch, None, &mut backoff, &mut kick_rx).await;
 
         assert!(delivered, "a 4xx drops the batch (returns true)");
         assert!(
@@ -1462,7 +1514,7 @@ mod tests {
         let batch = store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await.unwrap();
         let mut backoff = BACKOFF_BASE;
         let mut kick_rx = test_backoff();
-        assert!(deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await);
+        assert!(deliver_batch(&ctx, &dest, &batch, None, &mut backoff, &mut kick_rx).await);
 
         assert_eq!(
             marks(&store).await,
@@ -1491,7 +1543,7 @@ mod tests {
         let batch = store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await.unwrap();
         let mut backoff = BACKOFF_BASE;
         let mut kick_rx = test_backoff();
-        assert!(deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await);
+        assert!(deliver_batch(&ctx, &dest, &batch, None, &mut backoff, &mut kick_rx).await);
 
         assert!(
             marks(&store).await.is_empty(),
@@ -1543,7 +1595,7 @@ mod tests {
         let mut kick_rx = test_backoff();
         for dest in [&one, &two] {
             let batch = store.pending_pdus(dest, MAX_PDUS_PER_TXN).await.unwrap();
-            assert!(deliver_batch(&ctx, dest, &batch, &mut backoff, &mut kick_rx).await);
+            assert!(deliver_batch(&ctx, dest, &batch, None, &mut backoff, &mut kick_rx).await);
         }
 
         let mut got = marks(&store).await;
@@ -1638,6 +1690,7 @@ mod tests {
         let supervisor = spawn(
             store.clone(),
             stub.clone(),
+            Arc::new(GroupTags::new(false)),
             2,
             NO_JITTER,
             shutdown.clone(),
@@ -1674,6 +1727,7 @@ mod tests {
         drop(spawn(
             store.clone(),
             stub.clone(),
+            Arc::new(GroupTags::new(false)),
             2,
             NO_JITTER,
             no_shutdown(),
@@ -1710,6 +1764,226 @@ mod tests {
         assert!(
             txns.iter().all(|t| t == &txns[0]),
             "txn_id must be reused across retries: {txns:?}"
+        );
+    }
+
+    /// One send a [`Recorder`] received.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Call {
+        txn: String,
+        /// `Some(size)` for a `send_group_transaction`.
+        group: Option<usize>,
+        bodies: Vec<String>,
+    }
+
+    /// Records every send in order. A grouped send fails with `group_status`
+    /// when set; every other send succeeds.
+    #[derive(Default)]
+    struct Recorder {
+        calls: Mutex<Vec<Call>>,
+        group_status: Option<u16>,
+    }
+
+    impl Recorder {
+        fn record(&self, txn_id: &str, group: Option<usize>, pdus: &[Box<RawJsonValue>]) {
+            let bodies = pdus
+                .iter()
+                .map(|p| body_of(&serde_json::from_str(p.get()).unwrap()))
+                .collect();
+            self.calls.lock().unwrap().push(Call {
+                txn: txn_id.to_owned(),
+                group,
+                bodies,
+            });
+        }
+
+        fn calls(&self) -> Vec<Call> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FederationTransport for Recorder {
+        async fn send_transaction(
+            &self,
+            _dest: &ServerName,
+            txn_id: &str,
+            pdus: &[Box<RawJsonValue>],
+            _forward_extremities: &BTreeMap<OwnedRoomId, ForwardExtremities>,
+        ) -> Result<BTreeMap<OwnedRoomId, ForwardExtremities>, TransportError> {
+            self.record(txn_id, None, pdus);
+            Ok(BTreeMap::new())
+        }
+
+        async fn send_group_transaction(
+            &self,
+            _dest: &ServerName,
+            txn_id: &str,
+            pdus: &[Box<RawJsonValue>],
+            _forward_extremities: &BTreeMap<OwnedRoomId, ForwardExtremities>,
+            group_size: usize,
+        ) -> Result<BTreeMap<OwnedRoomId, ForwardExtremities>, TransportError> {
+            self.record(txn_id, Some(group_size), pdus);
+            match self.group_status {
+                Some(code) => Err(TransportError::Status(code)),
+                None => Ok(BTreeMap::new()),
+            }
+        }
+    }
+
+    /// A second member for the groups these tests tag.
+    fn other() -> OwnedServerName {
+        "other.test".parse().unwrap()
+    }
+
+    /// Tag `event` for a group of `peer()` and `other()`.
+    fn tag_pair(tags: &GroupTags, event: &EventId) {
+        tags.tag(event, [peer(), other()].into_iter().collect());
+    }
+
+    /// Run the pool over `store` until `peer()` has drained.
+    async fn drain_through_pool(
+        store: &Arc<SqliteStore>,
+        transport: Arc<dyn FederationTransport>,
+        tags: Arc<GroupTags>,
+    ) {
+        drop(spawn(
+            store.clone(),
+            transport,
+            tags,
+            2,
+            NO_JITTER,
+            no_shutdown(),
+            no_kick(),
+            null_fetcher(),
+            EventPolicy::trusted_network(),
+            null_poke(),
+        ));
+        wait_drained(store, &peer()).await;
+    }
+
+    #[tokio::test]
+    async fn a_tagged_row_is_sent_as_its_group() {
+        let recorder = Arc::new(Recorder::default());
+        let (store, _tmp, _room, ids) = store_with_outbox(&peer(), 1).await;
+        let tags = Arc::new(GroupTags::new(true));
+        tag_pair(&tags, &ids[0]);
+
+        drain_through_pool(&store, recorder.clone(), tags.clone()).await;
+
+        // The other member's share names the same transaction.
+        let group = tags.take(&ids[0], &other()).expect("other is still tagged");
+        assert_eq!(group.size, 2);
+        assert_eq!(
+            recorder.calls(),
+            vec![Call {
+                txn: group.txn_id,
+                group: Some(2),
+                bodies: vec!["msg 0".to_owned()],
+            }]
+        );
+        assert!(!tags.tagged_for(&ids[0], &peer()), "peer took its send");
+    }
+
+    #[tokio::test]
+    async fn a_failed_group_send_retries_ungrouped_under_its_txn_id() {
+        let recorder = Arc::new(Recorder {
+            group_status: Some(500),
+            ..Recorder::default()
+        });
+        let dest = peer();
+        let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 1).await;
+
+        let ctx = test_ctx(store.clone(), recorder.clone());
+        let batch = store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await.unwrap();
+        let group = GroupSend {
+            txn_id: "group-txn".to_owned(),
+            size: 3,
+        };
+        let mut backoff = Duration::ZERO;
+        let mut kick_rx = test_backoff();
+        let delivery = deliver_batch(&ctx, &dest, &batch, Some(group), &mut backoff, &mut kick_rx);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), delivery)
+                .await
+                .expect("the retry is ungrouped, so it succeeds")
+        );
+
+        let attempt = |group| Call {
+            txn: "group-txn".to_owned(),
+            group,
+            bodies: vec!["msg 0".to_owned()],
+        };
+        assert_eq!(recorder.calls(), vec![attempt(Some(3)), attempt(None)]);
+        assert!(
+            store
+                .pending_pdus(&dest, usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_group_send_takes_no_send_permit() {
+        let recorder = Arc::new(Recorder::default());
+        let dest = peer();
+        let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 1).await;
+
+        let ctx = test_ctx(store.clone(), recorder.clone());
+        let _permit = ctx.send_slots.clone().try_acquire_owned().unwrap();
+        let batch = store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await.unwrap();
+        let group = GroupSend {
+            txn_id: "group-txn".to_owned(),
+            size: 2,
+        };
+        let mut backoff = BACKOFF_BASE;
+        let mut kick_rx = test_backoff();
+        let grouped = deliver_batch(&ctx, &dest, &batch, Some(group), &mut backoff, &mut kick_rx);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), grouped)
+                .await
+                .expect("a grouped send proceeds without the permit")
+        );
+
+        let ungrouped = deliver_batch(&ctx, &dest, &batch, None, &mut backoff, &mut kick_rx);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), ungrouped)
+                .await
+                .is_err(),
+            "an ungrouped send waits for the permit"
+        );
+        assert_eq!(recorder.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rows_before_a_tagged_row_go_first_ungrouped() {
+        let recorder = Arc::new(Recorder::default());
+        let (store, _tmp, _room, ids) = store_with_outbox(&peer(), 2).await;
+        let tags = Arc::new(GroupTags::new(true));
+        tag_pair(&tags, &ids[1]);
+
+        drain_through_pool(&store, recorder.clone(), tags.clone()).await;
+
+        let group = tags.take(&ids[1], &other()).expect("other is still tagged");
+        let calls = recorder.calls();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(
+            calls[0],
+            Call {
+                txn: calls[0].txn.clone(),
+                group: None,
+                bodies: vec!["msg 0".to_owned()],
+            }
+        );
+        assert_ne!(calls[0].txn, group.txn_id);
+        assert_eq!(
+            calls[1],
+            Call {
+                txn: group.txn_id,
+                group: Some(2),
+                bodies: vec!["msg 1".to_owned()],
+            }
         );
     }
 }
