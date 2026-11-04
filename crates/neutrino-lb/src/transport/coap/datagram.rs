@@ -2167,6 +2167,29 @@ mod group_tests {
     }
 
     #[tokio::test]
+    async fn every_block_of_a_group_request_is_non_confirmable() {
+        let peers = [("b", Answer::Name), ("c", Answer::Name)];
+        let rig = rig(&peers, Mesh::default(), cfg()).await;
+        let body = vec![7u8; 150];
+        let (b, c) = tokio::join!(
+            rig.client.send(grouped("b", &body, 2)),
+            rig.client.send(grouped("c", &body, 2)),
+        );
+        assert_eq!(body_of(&b), b"b");
+        assert_eq!(body_of(&c), b"c");
+
+        let requests = rig.mesh.requests_from(SENDER);
+        assert_eq!(requests.len(), 3);
+        for (dst, packet) in &requests {
+            assert_eq!(dst, GROUP);
+            assert_eq!(
+                packet.header.get_type(),
+                coap_lite::MessageType::NonConfirmable
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_body_larger_than_one_burst_goes_ordinary() {
         let peers = [("b", Answer::Name), ("c", Answer::Name)];
         let qblock = coap::qblock::QBlockConfig {

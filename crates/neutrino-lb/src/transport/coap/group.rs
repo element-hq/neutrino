@@ -10,8 +10,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axum::http::Method;
 use coap::qblock::{BlockSink, GROUP_OPTION, SharedFirstBurst};
-use coap_lite::CoapRequest;
 use coap_lite::option_value::OptionValueU32;
+use coap_lite::{CoapRequest, MessageType};
 use std::net::SocketAddr;
 use tokio::sync::{Notify, oneshot};
 
@@ -233,7 +233,9 @@ impl LinkCoapWireClient {
             for sharer in &mut sharers {
                 let _ = (&mut sharer.registered).await;
             }
+            // A request sent to many receivers is Non-confirmable (RFC 7252 §8.1).
             let mut copy = coap_req;
+            copy.message.header.set_type(MessageType::NonConfirmable);
             copy.message.add_option_as(
                 GROUP_OPTION,
                 OptionValueU32(u32::try_from(size).unwrap_or(u32::MAX)),

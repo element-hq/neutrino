@@ -98,11 +98,22 @@ pub struct QBlockConfig {
     pub response_slot: Option<Duration>,
 }
 
+/// The most sharing exchanges a [`QBlockConfig::leisure`] counts. The Group
+/// option's value is the peer's claim, so it is bounded.
+const MAX_GROUP_SIZE: u32 = 255;
+
+/// The longest [`QBlockConfig::leisure`].
+const MAX_LEISURE: Duration = Duration::from_secs(255);
+
 impl QBlockConfig {
-    /// The window a receiver spreads its response to a group of `size` over.
+    /// The window a receiver spreads its response to a group of `size` over:
+    /// one slot per member, for at most [`MAX_GROUP_SIZE`] members and
+    /// [`MAX_LEISURE`] in all.
     pub fn leisure(&self, size: u32) -> Duration {
-        self.response_slot
-            .map_or(Duration::ZERO, |slot| slot * size)
+        self.response_slot.map_or(Duration::ZERO, |slot| {
+            slot.saturating_mul(size.min(MAX_GROUP_SIZE))
+                .min(MAX_LEISURE)
+        })
     }
 }
 
@@ -1759,6 +1770,19 @@ mod tests {
             "there is no block to ask for, so nothing may go on the wire"
         );
         drop(tx);
+    }
+
+    #[test]
+    fn leisure_is_bounded_whatever_the_group_option_claims() {
+        let cfg = |slot_ms| QBlockConfig {
+            response_slot: Some(Duration::from_millis(slot_ms)),
+            ..Default::default()
+        };
+        assert_eq!(cfg(100).leisure(3), Duration::from_millis(300));
+        assert_eq!(cfg(100).leisure(u32::MAX), Duration::from_millis(25_500));
+        assert_eq!(cfg(1_000).leisure(255), Duration::from_secs(255));
+        assert_eq!(cfg(2_000).leisure(200), Duration::from_secs(255));
+        assert_eq!(QBlockConfig::default().leisure(u32::MAX), Duration::ZERO);
     }
 
     #[tokio::test(start_paused = true)]
