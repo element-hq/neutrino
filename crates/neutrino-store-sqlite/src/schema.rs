@@ -79,7 +79,7 @@ pub(crate) fn apply_connection_pragmas(conn: &Connection, query_only: bool) -> R
     conn.execute_batch(
         "
         PRAGMA foreign_keys       = ON;
-        PRAGMA synchronous        = NORMAL;
+        PRAGMA synchronous        = FULL;
         PRAGMA busy_timeout       = 5000;
         PRAGMA trusted_schema     = OFF;
         PRAGMA journal_size_limit = 67108864;

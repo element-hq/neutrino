@@ -46,7 +46,7 @@
 //!    samples pre-heal divergence, and a run that cut links but never diverged
 //!    is flagged as vacuous.
 //! 5. **Crash recovery**: a SIGKILLed server's storage dir survives (WAL +
-//!    `synchronous = NORMAL`: a process crash, not power loss), so on revive it
+//!    `synchronous = FULL`; this harness only exercises process crashes), so on revive it
 //!    must recover committed state and redeliver its outbox. A run whose
 //!    crashes all landed with no writes pending is flagged as vacuous.
 //!
