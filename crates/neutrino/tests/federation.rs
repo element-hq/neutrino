@@ -229,7 +229,7 @@ async fn smoke_concurrent_name_resolution() {
 /// Real-crash durability — the capability the child-process harness exists for.
 /// A SIGKILL'd server must recover its committed state *and* redeliver anything
 /// parked in its durable outbox. Only a genuine process kill (not an in-process
-/// drop) exercises WAL + `synchronous=NORMAL` survival across abrupt termination.
+/// drop) exercises WAL + `synchronous=FULL` survival across abrupt termination.
 ///
 /// - Server 0 and 1 are joined and converged.
 /// - Cut 0–1, then 0 sends a message. It commits locally on 0 and parks in 0's

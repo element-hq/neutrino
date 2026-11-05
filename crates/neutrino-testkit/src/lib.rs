@@ -25,7 +25,7 @@
 //! ## Crash / revive / heal
 //!
 //! * **crash** = SIGKILL the child's process group (real abrupt kill → genuine
-//!   WAL + `synchronous=NORMAL` durability).
+//!   WAL + `synchronous=FULL` durability).
 //! * **revive** = re-spawn the binary with the same env (same backend port and
 //!   parent-owned storage dir, which survives the kill).
 //! * **heal** = clear the cut pair and SIGUSR2 the live children (→ `KickBackoff`,
