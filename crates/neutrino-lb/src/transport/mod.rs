@@ -52,6 +52,9 @@ pub struct WireRequest {
     /// It rides the wire as the CoAP Content-Format option (the HTTP transport
     /// has no equivalent and ignores it).
     pub content_format: u16,
+    /// How many requests to different destinations share this one's body and
+    /// path, as one group transmission. Only the datagram link client reads it.
+    pub group_size: Option<usize>,
 }
 
 /// A federation response from the wire. `body` is CBOR.
@@ -76,6 +79,7 @@ impl Default for WireRequest {
             headers: Vec::new(),
             body: Vec::new(),
             content_format: CBOR_CONTENT_FORMAT,
+            group_size: None,
         }
     }
 }

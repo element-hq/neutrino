@@ -18,6 +18,7 @@
 //! exposes no way to bound the accumulator from outside.
 
 pub mod datagram;
+mod group;
 mod message;
 mod paths;
 
@@ -272,15 +273,17 @@ impl WireClient for CoapWireClient {
         }
         let dest = req.dest.clone();
         let client = self.client_for(&dest).await?;
-        let token = self.next_token();
+        let mut coap_req = message::build_request(&req);
+        coap_req.message.set_token(self.next_token());
         // Drive the actual exchange through the transport-agnostic helper shared
         // with the link datagram client (see `datagram`); the only UDP-specific
         // part is `client_for` (pooling + `UdpCoAPClient::new`) above.
         let result = exchange(
             &client,
-            &req,
-            token,
+            coap_req,
+            &dest,
             self.qblock.is_some(),
+            None,
             self.max_body_bytes,
             self.request_timeout,
         )
@@ -302,24 +305,28 @@ impl WireClient for CoapWireClient {
 /// CON-vs-Q-Block send selection, the untrusted-side response body cap, the
 /// whole-exchange timeout that bounds a slow/black-hole peer — lives here once.
 ///
-/// `qblock` selects `send_qblock` (RFC 9177 NON-mode) over `send` (CON); it
-/// mirrors `CoapWireClient::qblock.is_some()`. The caller is responsible for any
+/// `coap_req` is the built request, tagged with its token. `qblock` selects
+/// `send_qblock` (RFC 9177 NON-mode) over `send` (CON); it mirrors
+/// `CoapWireClient::qblock.is_some()`. `shared` makes it a Q-Block exchange whose
+/// first transmission another sender makes. The caller is responsible for any
 /// post-failure cleanup (e.g. the UDP pool eviction) since that *is* transport
 /// specific.
 async fn exchange<T: ClientTransport + 'static>(
     client: &CoAPClient<T>,
-    req: &WireRequest,
-    token: Vec<u8>,
+    coap_req: CoapRequest<SocketAddr>,
+    dest: &str,
     qblock: bool,
+    shared: Option<SharedExchange>,
     max_body_bytes: usize,
     request_timeout: Duration,
 ) -> Result<WireResponse, WireError> {
     let do_exchange = async {
-        let mut coap_req = message::build_request(req);
-        coap_req.message.set_token(token);
         let resp = if qblock {
+            let (burst, deadline_extra) = shared.map_or((None, Duration::ZERO), |s| {
+                (Some(s.burst), s.deadline_extra)
+            });
             client
-                .send_qblock(coap_req)
+                .send_qblock_with(coap_req, burst, deadline_extra)
                 .await
                 .map_err(|e| WireError::Transport(format!("coap send_qblock: {e}")))?
         } else {
@@ -343,10 +350,16 @@ async fn exchange<T: ClientTransport + 'static>(
     match tokio::time::timeout(request_timeout, do_exchange).await {
         Ok(inner) => inner,
         Err(_) => Err(WireError::Transport(format!(
-            "coap request to {} exceeded {request_timeout:?}",
-            req.dest
+            "coap request to {dest} exceeded {request_timeout:?}"
         ))),
     }
+}
+
+/// An [`exchange`] whose first transmission is shared with other exchanges.
+struct SharedExchange {
+    burst: coap::qblock::SharedFirstBurst,
+    /// How long the peer may delay its response, on top of the head timeout.
+    deadline_extra: Duration,
 }
 
 use std::net::SocketAddr;
@@ -454,6 +467,12 @@ impl CoapDispatch {
         } else {
             self.dispatch(&request).await
         };
+        // A shared request also reaches nodes outside the room, and the upstream
+        // answers them 404: they stay silent.
+        if wire_resp.status == 404 && coap::qblock::group_size(&request.message).is_some() {
+            request.response = None;
+            return request;
+        }
         // Medium codec, ingress half: transform the response BEFORE it is
         // written (and Block2-segmented). A response our own codec can't
         // encode is a bug surfaced as a 500, never a corrupt wire message.

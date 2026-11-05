@@ -50,6 +50,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 use tracing::warn;
 
+use crate::federation::client::GROUP_HEADER;
 use crate::federation::{FedError, auth};
 use crate::{AppState, Store, lock_app};
 use neutrino_engine::{ForwardExtremities, reconcile};
@@ -218,6 +219,26 @@ pub(super) async fn apply_oob_membership(
     }
 }
 
+/// Whether this server is in the room of any of `pdus`.
+async fn in_any_room(
+    store: &impl neutrino_store::StateStore,
+    pdus: &[Box<RawJsonValue>],
+    our_name: &str,
+) -> Result<bool, FedError> {
+    let ours = <&ServerName>::try_from(our_name)
+        .map_err(|_| FedError::Internal("this server's name is not a valid server name"))?;
+    let rooms: BTreeSet<OwnedRoomId> = pdus
+        .iter()
+        .filter_map(|raw| neutrino_event::room_version_keys(raw).room_id)
+        .collect();
+    for room in &rooms {
+        if reconcile::server_in_room(store, room, ours).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Federation `/send/{txnId}` handler. Stages the transaction's PDUs and pokes
 /// the background worker; integration happens asynchronously.
 pub(crate) async fn handle<S: Store>(
@@ -259,6 +280,13 @@ pub(crate) async fn handle<S: Store>(
         return Err(FedError::Unauthorized(
             "X-Matrix origin does not match the transaction origin",
         ));
+    }
+
+    // A group's shared transmission reaches servers outside its rooms too. Such
+    // a server answers 404, which lb keeps off the wire, and stages and records
+    // nothing.
+    if headers.contains_key(GROUP_HEADER) && !in_any_room(&*store, &body.pdus, &our_name).await? {
+        return Err(FedError::RoomNotFound);
     }
 
     // Cheap whole-transaction dedup: a re-sent transaction we've already fully

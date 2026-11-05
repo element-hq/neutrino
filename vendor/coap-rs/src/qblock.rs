@@ -23,7 +23,7 @@ use coap_lite::option_value::{OptionValueU16, OptionValueU32};
 use coap_lite::qblock::{missing_blocks, RangeSet};
 use coap_lite::{CoapOption, ContentFormat, MessageClass, MessageType, Packet, ResponseType};
 use log::debug;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::client::ClientTransport;
@@ -37,6 +37,26 @@ const REQUEST_TAG: u16 = 292;
 /// The Request-Tag option used to correlate a Q-Block1 transfer.
 fn request_tag() -> CoapOption {
     CoapOption::Unknown(REQUEST_TAG)
+}
+
+/// The Group option: an elective, safe-to-forward uint option from the
+/// experimental range, carried by a transmission that several exchanges share.
+/// Its value is the number of exchanges sharing it.
+pub const GROUP_OPTION: CoapOption = CoapOption::Unknown(65000);
+
+/// The value of `msg`'s [`GROUP_OPTION`], if it carries one.
+pub fn group_size(msg: &Packet) -> Option<u32> {
+    msg.get_first_option_as::<OptionValueU32>(GROUP_OPTION)
+        .and_then(|r| r.ok())
+        .map(|v| v.0)
+}
+
+/// The first burst of a `send_qblock` request, transmitted by another sender.
+pub struct SharedFirstBurst {
+    /// Fired once the exchange receives for its token.
+    pub registered: oneshot::Sender<()>,
+    /// The shared send's result. The exchange's head deadline starts when it resolves.
+    pub sent: oneshot::Receiver<std::io::Result<()>>,
 }
 
 /// RFC 9177 §6.2 timing and congestion constants (per transfer/session).
@@ -72,6 +92,29 @@ pub struct QBlockConfig {
     /// negotiated size is used). `None` (default): RFC 9177 behaviour — only
     /// requests that opt in via Q-Block2 get Q-Block2 responses.
     pub assume_peer_block_size: Option<usize>,
+    /// The time one response takes on the link. A receiver delays its response
+    /// to a [`GROUP_OPTION`] request by up to one slot per sharing exchange.
+    /// `None` (default): no delay.
+    pub response_slot: Option<Duration>,
+}
+
+/// The most sharing exchanges a [`QBlockConfig::leisure`] counts. The Group
+/// option's value is the peer's claim, so it is bounded.
+const MAX_GROUP_SIZE: u32 = 255;
+
+/// The longest [`QBlockConfig::leisure`].
+const MAX_LEISURE: Duration = Duration::from_secs(255);
+
+impl QBlockConfig {
+    /// The window a receiver spreads its response to a group of `size` over:
+    /// one slot per member, for at most [`MAX_GROUP_SIZE`] members and
+    /// [`MAX_LEISURE`] in all.
+    pub fn leisure(&self, size: u32) -> Duration {
+        self.response_slot.map_or(Duration::ZERO, |slot| {
+            slot.saturating_mul(size.min(MAX_GROUP_SIZE))
+                .min(MAX_LEISURE)
+        })
+    }
 }
 
 impl Default for QBlockConfig {
@@ -86,6 +129,7 @@ impl Default for QBlockConfig {
             nstart: 1,
             non_probing_wait: Duration::from_secs(247),
             assume_peer_block_size: None,
+            response_slot: None,
         }
     }
 }
@@ -364,6 +408,8 @@ pub struct QBlockReceiver {
     /// Whether to abandon the transfer when no block at all has arrived (see
     /// [`expire_when_nothing_arrives`](Self::expire_when_nothing_arrives)).
     expire_when_nothing_arrives: bool,
+    /// Added to the head timeout of [`expire_when_nothing_arrives`](Self::expire_when_nothing_arrives).
+    deadline_extra: Duration,
     /// Upper bound on the reassembled body, to cap buffer growth from a block
     /// claiming a wild offset (mirrors coap-lite's uncommitted-reserve guard).
     max_body_len: usize,
@@ -404,6 +450,7 @@ impl QBlockReceiver {
             retry: 0,
             recovery_template,
             expire_when_nothing_arrives: false,
+            deadline_extra: Duration::ZERO,
             max_body_len,
             config,
         }
@@ -420,6 +467,14 @@ impl QBlockReceiver {
     /// a multi-block request uploads, silence is not evidence of anything.
     pub fn expire_when_nothing_arrives(mut self) -> Self {
         self.expire_when_nothing_arrives = true;
+        self
+    }
+
+    /// Extends the head timeout of
+    /// [`expire_when_nothing_arrives`](Self::expire_when_nothing_arrives) by `extra`,
+    /// for a peer that delays its response.
+    pub fn with_deadline_extra(mut self, extra: Duration) -> Self {
+        self.deadline_extra = extra;
         self
     }
 
@@ -660,7 +715,8 @@ impl QBlockReceiver {
     /// freshly-built request (counting the retry), and finally [`Expired`] once
     /// `NON_MAX_RETRANSMIT` rounds are spent — or, for a receiver that opted into
     /// [`expire_when_nothing_arrives`](Self::expire_when_nothing_arrives) and has
-    /// received nothing, once one `NON_RECEIVE_TIMEOUT` has passed.
+    /// received nothing, once one `NON_RECEIVE_TIMEOUT` plus its deadline extra
+    /// has passed.
     ///
     /// [`Resend`]: RecoveryOutcome::Resend
     pub fn poll_recovery(&mut self, since_activity: Duration) -> RecoveryOutcome {
@@ -670,7 +726,7 @@ impl QBlockReceiver {
         // buy retransmissions, and there is nothing here to retransmit. Not an
         // RFC 9177 quantity — its receiver timers all presuppose a partial body.
         if self.expire_when_nothing_arrives && self.rec_blocks.is_empty() {
-            let head = self.config.non_receive_timeout;
+            let head = self.config.non_receive_timeout + self.deadline_extra;
             return if since_activity < head {
                 RecoveryOutcome::Wait(head - since_activity)
             } else {
@@ -1713,6 +1769,39 @@ mod tests {
             req_sink.sent.lock().unwrap().is_empty(),
             "there is no block to ask for, so nothing may go on the wire"
         );
+        drop(tx);
+    }
+
+    #[test]
+    fn leisure_is_bounded_whatever_the_group_option_claims() {
+        let cfg = |slot_ms| QBlockConfig {
+            response_slot: Some(Duration::from_millis(slot_ms)),
+            ..Default::default()
+        };
+        assert_eq!(cfg(100).leisure(3), Duration::from_millis(300));
+        assert_eq!(cfg(100).leisure(u32::MAX), Duration::from_millis(25_500));
+        assert_eq!(cfg(1_000).leisure(255), Duration::from_secs(255));
+        assert_eq!(cfg(2_000).leisure(200), Duration::from_secs(255));
+        assert_eq!(QBlockConfig::default().leisure(u32::MAX), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_extra_extends_the_head_timeout() {
+        let cfg = QBlockConfig {
+            non_receive_timeout: Duration::from_secs(4),
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let receiver = QBlockReceiver::new(CoapOption::QBlock2, request_template(), 1 << 20, cfg)
+            .expire_when_nothing_arrives()
+            .with_deadline_extra(Duration::from_secs(3));
+
+        let start = Instant::now();
+        let got = drive_receive(receiver, rx, &RecordingSink::default())
+            .await
+            .unwrap();
+        assert_eq!(got, None);
+        assert_eq!(start.elapsed(), Duration::from_secs(7));
         drop(tx);
     }
 

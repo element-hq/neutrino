@@ -74,6 +74,26 @@ pub trait FederationTransport: Send + Sync {
         pdus: &[Box<RawJsonValue>],
         forward_extremities: &BTreeMap<OwnedRoomId, ForwardExtremities>,
     ) -> Result<BTreeMap<OwnedRoomId, ForwardExtremities>, TransportError>;
+
+    /// Whether `send_group_transaction` can share one transmission between
+    /// destinations.
+    fn supports_groups(&self) -> bool {
+        false
+    }
+
+    /// `send_transaction`, as one of `group_size` copies of the same transaction
+    /// sent to different destinations under the same `txn_id`.
+    async fn send_group_transaction(
+        &self,
+        dest: &ServerName,
+        txn_id: &str,
+        pdus: &[Box<RawJsonValue>],
+        forward_extremities: &BTreeMap<OwnedRoomId, ForwardExtremities>,
+        _group_size: usize,
+    ) -> Result<BTreeMap<OwnedRoomId, ForwardExtremities>, TransportError> {
+        self.send_transaction(dest, txn_id, pdus, forward_extremities)
+            .await
+    }
 }
 
 /// Fetch events from a peer via

@@ -690,6 +690,7 @@ mod tests {
             store.clone(),
             "example.org".to_owned(),
             policy.clone(),
+            Arc::new(crate::GroupTags::new(false)),
         ));
         let poke = spawn_with(
             store.clone(),

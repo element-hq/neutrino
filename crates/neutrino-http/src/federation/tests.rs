@@ -3020,6 +3020,122 @@ async fn send_empty_transaction_is_ok() {
     assert_eq!(body, json!({ "pdus": {} }), "body = {body}");
 }
 
+/// A room this server holds but is not in: [`peer_user`] created and joined it.
+/// Returns the router, the store, the room id and the join's id (the sole head).
+async fn seed_room_we_are_not_in() -> (
+    axum::Router,
+    Arc<SqliteStore>,
+    OwnedRoomId,
+    OwnedEventId,
+    TempDir,
+) {
+    let (store, tempfile) = fresh_store().await;
+    let peer = peer_user();
+    let create = EventBuilder::new(
+        peer.clone(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .expect("build create");
+    let room_id = create.room_id.clone();
+    let join = EventBuilder::new(
+        peer.clone(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(peer.to_string())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create.event_id.clone()])
+    .prev_state_events(vec![create.event_id.clone()])
+    .build()
+    .expect("build join");
+    let join_id = join.event_id.clone();
+    store
+        .create_room(&create, &[join])
+        .await
+        .expect("create_room");
+    let router = router_with_store_and_fetcher(config(), store.clone(), StubFetcher::no_progress());
+    (router, store, room_id, join_id, tempfile)
+}
+
+/// [`put_json`], marked as one copy of a group's shared transmission.
+async fn put_grouped(app: &axum::Router, path: &str, body: &Value) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("PUT")
+        .uri(path)
+        .header("content-type", "application/json")
+        .header(crate::federation::client::GROUP_HEADER, "2")
+        .body(Body::from(serde_json::to_vec(body).unwrap()))
+        .unwrap();
+    drive(app, req).await
+}
+
+#[tokio::test]
+async fn grouped_send_for_a_room_we_are_not_in_is_404_and_stages_nothing() {
+    let (app, store, room_id, join_id, _tempfile) = seed_room_we_are_not_in().await;
+    let msg = message_on(
+        &peer_user(),
+        &room_id,
+        &join_id,
+        "not ours",
+        1_700_000_001_000,
+    );
+
+    let (status, body) = put_grouped(&app, &send_path("g1"), &txn(&[&msg])).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "body = {body}");
+    assert_eq!(body["errcode"], "M_NOT_FOUND", "body = {body}");
+    assert!(store.staged_for_room(&room_id).await.unwrap().is_empty());
+    let origin = <&ServerName>::try_from(TEST_PEER).unwrap();
+    assert!(
+        !neutrino_store::FederationInbox::federation_txn_seen(&*store, origin, "g1")
+            .await
+            .unwrap(),
+        "the transaction is not recorded"
+    );
+}
+
+#[tokio::test]
+async fn grouped_send_for_a_room_we_are_in_is_accepted() {
+    let (app, store, room_id, alice, join_id, _tempfile) = seed_joined_room().await;
+    let msg = message_on(&alice, &room_id, &join_id, "grouped", 1_700_000_001_000);
+
+    let (status, body) = put_grouped(&app, &send_path("g1"), &txn(&[&msg])).await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(
+        body["pdus"][msg.event_id.as_str()],
+        json!({}),
+        "body = {body}"
+    );
+    wait_committed(&store, &msg.event_id).await;
+}
+
+#[tokio::test]
+async fn ungrouped_send_for_a_room_we_are_not_in_is_accepted() {
+    let (app, _store, room_id, join_id, _tempfile) = seed_room_we_are_not_in().await;
+    let msg = message_on(
+        &peer_user(),
+        &room_id,
+        &join_id,
+        "not ours",
+        1_700_000_001_000,
+    );
+
+    let (status, body) = put_json(&app, &send_path("u1"), &txn(&[&msg])).await;
+
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(
+        body["pdus"][msg.event_id.as_str()],
+        json!({}),
+        "body = {body}"
+    );
+}
+
 #[tokio::test]
 async fn send_malformed_body_returns_400() {
     let (app, _store, _room_id, _alice, _join_id, _tempfile) = seed_joined_room().await;

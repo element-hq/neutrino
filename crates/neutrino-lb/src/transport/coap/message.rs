@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use axum::http::Method;
 use coap_lite::{CoapOption, CoapRequest, CoapResponse, RequestType};
 
-use crate::headers::is_forwardable;
+use crate::headers::{GROUP_HEADER, is_forwardable};
 use crate::transport::{WireRequest, WireResponse};
 
 use super::{CBOR_CONTENT_FORMAT, OPT_FWD_HEADER, OPT_HTTP_STATUS, OPT_X_MATRIX_AUTH};
@@ -116,6 +116,11 @@ pub(crate) fn parse_request(req: &CoapRequest<SocketAddr>) -> WireRequest {
         headers.retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
         headers.push(auth);
     }
+    // The Group option is the header's only source: a peer can't forward one.
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case(GROUP_HEADER));
+    if let Some(size) = coap::qblock::group_size(&req.message) {
+        headers.push((GROUP_HEADER.to_owned(), size.to_string().into_bytes()));
+    }
     WireRequest {
         dest: String::new(),
         method: to_http_method(req.get_method()),
@@ -125,6 +130,7 @@ pub(crate) fn parse_request(req: &CoapRequest<SocketAddr>) -> WireRequest {
         content_format: parse_content_format(
             req.message.get_first_option(CoapOption::ContentFormat),
         ),
+        group_size: None,
     }
 }
 
@@ -331,6 +337,30 @@ mod tests {
             !got.headers.iter().any(|(k, _)| k == "content-length"),
             "non-forwardable header leaked"
         );
+    }
+
+    #[test]
+    fn the_group_option_is_the_only_source_of_the_group_header() {
+        let forged = WireRequest {
+            headers: vec![(GROUP_HEADER.to_owned(), b"9".to_vec())],
+            ..Default::default()
+        };
+        let group_header = |wire: &WireRequest| -> Vec<Vec<u8>> {
+            wire.headers
+                .iter()
+                .filter(|(name, _)| name == GROUP_HEADER)
+                .map(|(_, value)| value.clone())
+                .collect()
+        };
+
+        let mut coap = build_request(&forged);
+        assert_eq!(group_header(&parse_request(&coap)), Vec::<Vec<u8>>::new());
+
+        coap.message.add_option_as(
+            coap::qblock::GROUP_OPTION,
+            coap_lite::option_value::OptionValueU32(3),
+        );
+        assert_eq!(group_header(&parse_request(&coap)), vec![b"3".to_vec()]);
     }
 
     // Serialize a built request through packet bytes and reparse, as the tests

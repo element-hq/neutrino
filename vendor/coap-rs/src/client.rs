@@ -347,6 +347,16 @@ pub struct CoAPClient<T: ClientTransport> {
     qblock_config: crate::qblock::QBlockConfig,
 }
 
+/// How a [`send_qblock`](CoAPClient::send_qblock) request's first transmission
+/// leaves.
+#[cfg(feature = "q-block")]
+enum QBlockTransmission {
+    /// The whole request in one datagram.
+    Datagram(Vec<u8>),
+    /// A Q-Block1 burst pump over the body.
+    Burst(Box<crate::qblock::QBlockSender>),
+}
+
 impl<T: ClientTransport> Clone for CoAPClient<T> {
     fn clone(&self) -> Self {
         Self {
@@ -740,40 +750,63 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
     /// Request-Tag, with the server recovering losses via 4.08); a small body
     /// goes as a single PDU.
     #[cfg(feature = "q-block")]
-    pub async fn send_qblock(&self, mut request: CoapRequest<SocketAddr>) -> IoResult<CoapResponse>
+    pub async fn send_qblock(&self, request: CoapRequest<SocketAddr>) -> IoResult<CoapResponse>
+    where
+        T: 'static,
+    {
+        self.send_qblock_with(request, None, Duration::ZERO).await
+    }
+
+    /// Sends the first transmission of `request` into `sink`, prepared as
+    /// [`send_qblock`](CoAPClient::send_qblock) prepares it: its single datagram,
+    /// or its burst of Q-Block1 blocks. A body larger than one burst is
+    /// `InvalidInput`.
+    ///
+    /// The exchanges that share it are [`send_qblock_with`](CoAPClient::send_qblock_with)
+    /// calls given `request`'s token.
+    #[cfg(feature = "q-block")]
+    pub async fn send_first_burst<S: crate::qblock::BlockSink + ?Sized>(
+        &self,
+        mut request: CoapRequest<SocketAddr>,
+        sink: &S,
+    ) -> IoResult<()> {
+        let burst = self.block1_size * self.qblock_config.max_payloads as usize;
+        if request.message.payload.len() > burst {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "body is larger than one burst",
+            ));
+        }
+        self.tag_qblock(&mut request);
+        match self.split_qblock(&mut request)? {
+            QBlockTransmission::Datagram(pdu) => sink.send_block(pdu).await,
+            QBlockTransmission::Burst(mut sender) => sender.drain_burst(sink).await.map(|_| ()),
+        }
+    }
+
+    /// [`send_qblock`](CoAPClient::send_qblock), for an exchange whose peer may
+    /// delay its response by `deadline_extra`, which extends the head timeout.
+    ///
+    /// With `shared`, the request's first transmission is sent by another
+    /// sender ([`send_first_burst`](CoAPClient::send_first_burst)) and this
+    /// exchange sends nothing: it registers for its token, fires `registered`,
+    /// and waits on `sent`. An error there ends the exchange with that error. A
+    /// 4.08 goes unanswered.
+    #[cfg(feature = "q-block")]
+    pub async fn send_qblock_with(
+        &self,
+        mut request: CoapRequest<SocketAddr>,
+        shared: Option<crate::qblock::SharedFirstBurst>,
+        deadline_extra: Duration,
+    ) -> IoResult<CoapResponse>
     where
         T: 'static,
     {
         use crate::qblock::{
             drive_receive, drive_send, parse_missing_request, ClientTransportSink, QBlockReceiver,
-            QBlockSender, TransferKind,
         };
 
-        if request.message.get_token().is_empty() {
-            request.message.set_token(self.gen_token());
-        }
-        if request.message.header.message_id == 0 {
-            request.message.header.message_id = self.gen_message_id();
-        }
-        let token = request.message.get_token().to_vec();
-        let block_size = self.block1_size;
-        let szx = BlockValue::new(0, false, block_size)
-            .map_err(|e| Error::new(ErrorKind::InvalidInput, e.to_string()))?
-            .size_exponent;
-
-        // Tag the request so a Q-Block1 send (large body) can be correlated by
-        // the server. No Q-Block2 opt-in is added: RFC 9177 §4.4 early
-        // negotiation belongs on requests that actually want a specific
-        // response block size, and stamping it on every request both diverges
-        // from libcoap (which only probes once per session) and breaks
-        // Wireshark's Q-Block reassembly (its single block-state slot lets a
-        // request's Q-Block2 clobber the Q-Block1 state, as options parse in
-        // ascending number order and 31 > 19). Servers that know the peer runs
-        // this stack stream large responses via
-        // `QBlockConfig::assume_peer_block_size` instead.
-        request
-            .message
-            .add_option(CoapOption::Unknown(292), token.clone()); // Request-Tag
+        let token = self.tag_qblock(&mut request);
 
         // Receive every packet for this token via the synchronizer, demuxing the
         // three reply shapes: Q-Block2 response blocks (-> pdu_rx, reassembled
@@ -834,41 +867,47 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
         }
 
         // Send the request: Q-Block1 burst if the body needs more than one block,
-        // else a single PDU.
-        let body = std::mem::take(&mut request.message.payload);
-        let single_datagram = body.len() <= block_size;
-        let _drive_guard = if !single_datagram {
-            let mut template = request.message.clone();
-            template.payload.clear();
-            let seed = token
-                .iter()
-                .fold(0u64, |a, &b| a.wrapping_mul(31).wrapping_add(u64::from(b)));
-            let sender = QBlockSender::new(
-                template,
-                CoapOption::QBlock1,
-                body.into(),
-                szx,
-                TransferKind::Non,
-                self.qblock_config.clone(),
-                seed,
-            );
-            let linger = self.qblock_config.non_receive_timeout
-                * (self.qblock_config.non_max_retransmit + 2);
-            // Drive the request send (incl. 4.08 recovery) in the background;
-            // we return once the response is reassembled below.
-            let send_sink = ClientTransportSink(self.transport.transport.clone());
-            Some(AbortOnDrop(tokio::spawn(async move {
-                let _ = drive_send(sender, &send_sink, miss_rx, linger).await;
-            })))
-        } else {
-            request.message.payload = body;
-            let req_bytes = request
-                .message
-                .to_bytes()
-                .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
-            self.transport.transport.send(&req_bytes).await?;
-            drop(miss_rx);
-            None
+        // else a single PDU. `whole_request_sent`: the peer has everything it
+        // needs to reply.
+        let (whole_request_sent, _drive_guard) = match shared {
+            Some(shared) => {
+                let _ = shared.registered.send(());
+                let sent = shared
+                    .sent
+                    .await
+                    .unwrap_or_else(|_| Err(Error::other("shared first burst was dropped")));
+                if let Err(e) = sent {
+                    self.transport.synchronizer.remove_sender(&token).await;
+                    return Err(e);
+                }
+                // The shared burst is the whole body and is never repaired, and
+                // the body stays out of Q-Block2 recovery requests.
+                drop(miss_rx);
+                request.message.payload.clear();
+                (true, None)
+            }
+            None => match self.split_qblock(&mut request) {
+                Ok(QBlockTransmission::Burst(sender)) => {
+                    let linger = self.qblock_config.non_receive_timeout
+                        * (self.qblock_config.non_max_retransmit + 2);
+                    // Drive the request send (incl. 4.08 recovery) in the
+                    // background; we return once the response is reassembled below.
+                    let send_sink = ClientTransportSink(self.transport.transport.clone());
+                    let guard = AbortOnDrop(tokio::spawn(async move {
+                        let _ = drive_send(*sender, &send_sink, miss_rx, linger).await;
+                    }));
+                    (false, Some(guard))
+                }
+                Ok(QBlockTransmission::Datagram(pdu)) => {
+                    self.transport.transport.send(&pdu).await?;
+                    drop(miss_rx);
+                    (true, None)
+                }
+                Err(e) => {
+                    self.transport.synchronizer.remove_sender(&token).await;
+                    return Err(e);
+                }
+            },
         };
 
         let mut receiver = QBlockReceiver::new(
@@ -876,10 +915,11 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
             request.message.clone(),
             self.max_total_message_size.unwrap_or(usize::MAX),
             self.qblock_config.clone(),
-        );
-        if single_datagram {
-            // The whole request went in one datagram, so it had no burst for the
-            // peer's 4.08 to recover and its loss is only visible as silence.
+        )
+        .with_deadline_extra(deadline_extra);
+        if whole_request_sent {
+            // The whole request went in one transmission, so it had no burst for
+            // the peer's 4.08 to recover and its loss is only visible as silence.
             // Give up on the head timeout so the caller can re-send under a fresh
             // token, instead of waiting out its whole request timeout.
             //
@@ -916,6 +956,71 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
                 None => Err(timed_out()),
             },
         }
+    }
+
+    /// Fills in `request`'s token and message id and tags it with a Request-Tag
+    /// (RFC 9175) equal to the token. Returns the token.
+    #[cfg(feature = "q-block")]
+    fn tag_qblock(&self, request: &mut CoapRequest<SocketAddr>) -> Vec<u8> {
+        if request.message.get_token().is_empty() {
+            request.message.set_token(self.gen_token());
+        }
+        if request.message.header.message_id == 0 {
+            request.message.header.message_id = self.gen_message_id();
+        }
+        let token = request.message.get_token().to_vec();
+        // Tag the request so a Q-Block1 send (large body) can be correlated by
+        // the server. No Q-Block2 opt-in is added: RFC 9177 §4.4 early
+        // negotiation belongs on requests that actually want a specific
+        // response block size, and stamping it on every request both diverges
+        // from libcoap (which only probes once per session) and breaks
+        // Wireshark's Q-Block reassembly (its single block-state slot lets a
+        // request's Q-Block2 clobber the Q-Block1 state, as options parse in
+        // ascending number order and 31 > 19). Servers that know the peer runs
+        // this stack stream large responses via
+        // `QBlockConfig::assume_peer_block_size` instead.
+        request
+            .message
+            .add_option(CoapOption::Unknown(292), token.clone()); // Request-Tag
+        token
+    }
+
+    /// Splits a tagged `request` into its first transmission: a single datagram
+    /// when its body fits one block, else a Q-Block1 sender over the body. The
+    /// body stays in `request` only in the single-datagram case.
+    #[cfg(feature = "q-block")]
+    fn split_qblock(&self, request: &mut CoapRequest<SocketAddr>) -> IoResult<QBlockTransmission> {
+        use crate::qblock::{QBlockSender, TransferKind};
+
+        let block_size = self.block1_size;
+        let szx = BlockValue::new(0, false, block_size)
+            .map_err(|e| Error::new(ErrorKind::InvalidInput, e.to_string()))?
+            .size_exponent;
+        let body = std::mem::take(&mut request.message.payload);
+        if body.len() <= block_size {
+            request.message.payload = body;
+            let pdu = request
+                .message
+                .to_bytes()
+                .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+            return Ok(QBlockTransmission::Datagram(pdu));
+        }
+        let mut template = request.message.clone();
+        template.payload.clear();
+        let seed = request
+            .message
+            .get_token()
+            .iter()
+            .fold(0u64, |a, &b| a.wrapping_mul(31).wrapping_add(u64::from(b)));
+        Ok(QBlockTransmission::Burst(Box::new(QBlockSender::new(
+            template,
+            CoapOption::QBlock1,
+            body.into(),
+            szx,
+            TransferKind::Non,
+            self.qblock_config.clone(),
+            seed,
+        ))))
     }
 
     pub async fn observe<H: FnMut(IoResult<Message>) + Send + 'static>(
@@ -2867,5 +2972,214 @@ mod test {
             .unwrap();
 
         assert_eq!(resp.message.payload, body);
+    }
+
+    #[cfg(feature = "q-block")]
+    mod qblock_shared_tests {
+        use super::*;
+        use crate::qblock::{BlockSink, QBlockConfig, SharedFirstBurst};
+
+        type Sent = Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
+        /// Records every datagram the client sends and receives what the test
+        /// injects.
+        struct Scripted {
+            sent: Sent,
+            inbound: Mutex<UnboundedReceiver<Vec<u8>>>,
+        }
+
+        #[async_trait]
+        impl ClientTransport for Scripted {
+            async fn recv(&self, buf: &mut [u8]) -> IoResult<(usize, Option<SocketAddr>)> {
+                let pdu = self
+                    .inbound
+                    .lock()
+                    .await
+                    .recv()
+                    .await
+                    .ok_or_else(|| Error::other("inbound closed"))?;
+                buf[..pdu.len()].copy_from_slice(&pdu);
+                Ok((pdu.len(), None))
+            }
+
+            async fn send(&self, buf: &[u8]) -> IoResult<usize> {
+                self.sent.lock().unwrap().push(buf.to_vec());
+                Ok(buf.len())
+            }
+        }
+
+        #[derive(Default)]
+        struct VecSink(std::sync::Mutex<Vec<Vec<u8>>>);
+
+        #[async_trait]
+        impl BlockSink for VecSink {
+            async fn send_block(&self, pdu: Vec<u8>) -> IoResult<()> {
+                self.0.lock().unwrap().push(pdu);
+                Ok(())
+            }
+        }
+
+        fn scripted_client() -> (CoAPClient<Scripted>, Sent, UnboundedSender<Vec<u8>>) {
+            let sent = Sent::default();
+            let (inject, inbound) = unbounded_channel();
+            let mut client = CoAPClient::from_transport(Scripted {
+                sent: sent.clone(),
+                inbound: Mutex::new(inbound),
+            });
+            client.set_block1_size(64);
+            client.set_qblock_config(QBlockConfig {
+                non_timeout: Duration::from_millis(5),
+                non_receive_timeout: Duration::from_millis(200),
+                ..Default::default()
+            });
+            (client, sent, inject)
+        }
+
+        const TOKEN: [u8; 2] = [7, 7];
+
+        fn request(body_len: usize) -> CoapRequest<SocketAddr> {
+            let mut request = RequestBuilder::new("/r", Method::Put).build();
+            request.message.set_token(TOKEN.to_vec());
+            request.message.header.message_id = 42;
+            request.message.payload = vec![9; body_len];
+            request
+        }
+
+        fn response(code: Status, payload: Vec<u8>) -> Vec<u8> {
+            let mut pkt = Message::new();
+            pkt.header.set_type(MessageType::NonConfirmable);
+            pkt.header.code = MessageClass::Response(code);
+            pkt.set_token(TOKEN.to_vec());
+            pkt.payload = payload;
+            pkt.to_bytes().unwrap()
+        }
+
+        fn shared() -> (
+            SharedFirstBurst,
+            oneshot::Receiver<()>,
+            oneshot::Sender<IoResult<()>>,
+        ) {
+            let (registered, registered_rx) = oneshot::channel();
+            let (sent_tx, sent) = oneshot::channel();
+            (
+                SharedFirstBurst { registered, sent },
+                registered_rx,
+                sent_tx,
+            )
+        }
+
+        #[tokio::test]
+        async fn a_shared_exchange_sends_nothing_and_completes_on_a_plain_response() {
+            let (client, sent, inject) = scripted_client();
+            let (burst, registered, sent_tx) = shared();
+            let exchange = tokio::spawn(async move {
+                client
+                    .send_qblock_with(request(10), Some(burst), Duration::ZERO)
+                    .await
+            });
+
+            time::timeout(Duration::from_secs(1), registered)
+                .await
+                .expect("registered must fire before the shared send resolves")
+                .unwrap();
+            // The response beats `sent`: registration already routes it.
+            inject
+                .send(response(Status::Changed, b"ok".to_vec()))
+                .unwrap();
+            time::sleep(Duration::from_millis(50)).await;
+            sent_tx.send(Ok(())).unwrap();
+
+            let resp = time::timeout(Duration::from_secs(1), exchange)
+                .await
+                .expect("exchange timed out")
+                .unwrap()
+                .unwrap();
+            assert_eq!(resp.message.payload, b"ok");
+            assert!(sent.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_failed_shared_send_fails_the_exchange() {
+            let (client, _sent, _inject) = scripted_client();
+            let (burst, registered, sent_tx) = shared();
+            let exchange = tokio::spawn(async move {
+                client
+                    .send_qblock_with(request(10), Some(burst), Duration::ZERO)
+                    .await
+            });
+
+            registered.await.unwrap();
+            sent_tx
+                .send(Err(Error::new(ErrorKind::BrokenPipe, "link down")))
+                .unwrap();
+
+            let err = time::timeout(Duration::from_secs(1), exchange)
+                .await
+                .expect("exchange timed out")
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::BrokenPipe);
+        }
+
+        #[tokio::test]
+        async fn a_shared_exchange_does_not_answer_a_4_08() {
+            let (client, sent, inject) = scripted_client();
+            let (burst, registered, sent_tx) = shared();
+            // Three blocks: unshared, a 4.08 for block 1 would resend it.
+            let exchange = tokio::spawn(async move {
+                client
+                    .send_qblock_with(request(150), Some(burst), Duration::ZERO)
+                    .await
+            });
+
+            registered.await.unwrap();
+            sent_tx.send(Ok(())).unwrap();
+            let missing = coap_lite::qblock::missing_blocks::encode([1]);
+            inject
+                .send(response(Status::RequestEntityIncomplete, missing))
+                .unwrap();
+            time::sleep(Duration::from_millis(100)).await;
+            inject.send(response(Status::Changed, Vec::new())).unwrap();
+
+            time::timeout(Duration::from_secs(1), exchange)
+                .await
+                .expect("exchange timed out")
+                .unwrap()
+                .unwrap();
+            assert!(sent.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn send_first_burst_emits_what_send_qblock_sends() {
+            for (body_len, datagrams) in [(10, 1), (150, 3)] {
+                let (client, sent, _inject) = scripted_client();
+                let exchange = {
+                    let client = client.clone();
+                    tokio::spawn(async move { client.send_qblock(request(body_len)).await })
+                };
+                time::timeout(Duration::from_secs(1), async {
+                    while sent.lock().unwrap().len() < datagrams {
+                        time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("send_qblock did not send");
+                exchange.abort();
+
+                let sink = VecSink::default();
+                client
+                    .send_first_burst(request(body_len), &sink)
+                    .await
+                    .unwrap();
+                assert_eq!(*sink.0.lock().unwrap(), *sent.lock().unwrap());
+            }
+
+            let (client, _sent, _inject) = scripted_client();
+            let err = client
+                .send_first_burst(request(64 * 10 + 1), &VecSink::default())
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
     }
 }

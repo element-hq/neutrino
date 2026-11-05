@@ -12,6 +12,7 @@
 //! concrete store. Only the tests bind `neutrino-store-sqlite` (a dev-dep).
 
 mod gapfill;
+mod group;
 pub mod ports;
 pub mod reconcile;
 mod room_actor;
@@ -19,6 +20,7 @@ pub mod sender;
 mod util;
 pub mod worker;
 
+pub use group::GroupTags;
 pub use ports::{
     FederationTransport, ForwardExtremities, MissingEventsFetcher, MissingEventsQuery,
     TransportError,
