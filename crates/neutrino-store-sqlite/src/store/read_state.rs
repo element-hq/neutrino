@@ -155,10 +155,13 @@ impl ReadStateStore for SqliteStore {
         let user_id = user_id.to_owned();
         let after = after.0 as i64;
         self.run_read(move |conn| -> Result<ReadStateDelta, Error> {
+            // One snapshot for both tables: a write landing between two reads
+            // could put the returned position past a row the first read missed.
+            let tx = conn.transaction()?;
             let mut delta = ReadStateDelta::default();
             let mut highest = 0i64;
 
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 "SELECT room_id, receipt_type, thread, event_id, ts, read_state_pos \
                  FROM receipts WHERE user_id = ? AND read_state_pos > ?",
             )?;
@@ -185,7 +188,7 @@ impl ReadStateStore for SqliteStore {
                 });
             }
 
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 "SELECT room_id, data_type, content, read_state_pos \
                  FROM room_account_data WHERE user_id = ? AND read_state_pos > ?",
             )?;

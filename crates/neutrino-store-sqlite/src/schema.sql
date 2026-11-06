@@ -307,8 +307,7 @@ CREATE INDEX ix_deliveries_pos ON deliveries(delivery_pos);
 -- A local user's read state; never federated. A receipt is a high-water mark
 -- like `deliveries` (`thread` is '' when unthreaded). Both tables share one
 -- stream: `read_state_pos` is MAX+1 across the two on every write, so sync
--- keeps one cursor. No `user_version` bump (additive, same policy as
--- `deliveries`).
+-- keeps one cursor.
 -- ----------------------------------------------------------------------------
 CREATE TABLE receipts (
     room_id        TEXT    NOT NULL,
