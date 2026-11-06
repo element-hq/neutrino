@@ -3484,3 +3484,41 @@ async fn receipt_covers_every_user_of_the_acking_server_only() {
         "both of peer.test's users, and nobody from a server that never acked"
     );
 }
+
+/// The user's own receipt and a delivery receipt on the same event land in
+/// one `m.receipt` for the room.
+#[tokio::test]
+async fn own_receipt_merges_with_a_delivery_receipt() {
+    use neutrino_store::{DeliveryStore, ReadStateStore};
+
+    let (store, _tmp) = fresh_store().await;
+    let alice = user_id!("@alice:example.org");
+    let bob = user_id!("@bob:peer.test");
+    let room = room_id!("!room:example.org");
+    let event_id = room_with_remote_member(&store, room, alice, bob).await;
+    store
+        .record_delivery(ruma::server_name!("peer.test"), room, &event_id, 5)
+        .await
+        .unwrap();
+    store
+        .record_receipt(room, alice, "m.read", "", &event_id, 7)
+        .await
+        .unwrap();
+
+    let mut state = SyncState::new(store, no_shutdown());
+    state.delivery_receipts = true;
+    let mut lists = BTreeMap::new();
+    lists.insert("all".to_string(), list_with(5, vec![]));
+    let resp = handle(&state, alice, req_with_receipts(lists))
+        .await
+        .unwrap()
+        .response;
+
+    assert_eq!(
+        read_receipt_users(&resp, room, &event_id).expect("room has a receipt"),
+        BTreeMap::from([
+            ("@alice:example.org".to_owned(), 7),
+            ("@bob:peer.test".to_owned(), 5),
+        ]),
+    );
+}

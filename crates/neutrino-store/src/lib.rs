@@ -255,6 +255,15 @@ pub trait EventStore: Send + Sync {
     async fn room_stream_head(&self, room_id: &RoomId) -> Result<StreamPos, StorageError>;
 
     /// Pre:  none.
+    /// Post: the `StreamPos` of `event_id`, or `None` if it is not an event in
+    ///       `room_id`.
+    async fn event_stream_pos(
+        &self,
+        room_id: &RoomId,
+        event_id: &EventId,
+    ) -> Result<Option<StreamPos>, StorageError>;
+
+    /// Pre:  none.
     /// Post: returns a receiver whose value is the `StreamPos` of the most recently
     ///       committed event — advanced by both `persist_event` and
     ///       `persist_historical_event`. Callers must subscribe *before* performing
@@ -638,6 +647,94 @@ pub trait DeliveryStore: Send + Sync {
     fn subscribe_deliveries(&self) -> watch::Receiver<DeliveryPos>;
 }
 
+/// Position in the read-state stream, advanced by every receipt or room
+/// account data write. One stream covers both, so sync keeps one cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct ReadStatePos(pub u64);
+
+/// A local user's receipt in one room, for one receipt type and thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnReceipt {
+    pub room_id: OwnedRoomId,
+    /// `m.read` or `m.read.private`.
+    pub receipt_type: String,
+    /// Empty for an unthreaded receipt.
+    pub thread: String,
+    pub event_id: OwnedEventId,
+    /// When the receipt was sent (Unix ms).
+    pub ts: u64,
+}
+
+/// One piece of a user's room account data.
+#[derive(Debug, Clone)]
+pub struct RoomAccountData {
+    pub room_id: OwnedRoomId,
+    pub data_type: String,
+    pub content: Box<RawJsonValue>,
+}
+
+/// The read state that moved after a [`ReadStatePos`].
+#[derive(Debug, Clone, Default)]
+pub struct ReadStateDelta {
+    pub receipts: Vec<OwnReceipt>,
+    pub account_data: Vec<RoomAccountData>,
+    /// The highest position among the returned rows; `None` when nothing moved.
+    pub pos: Option<ReadStatePos>,
+}
+
+/// A local user's receipts and room account data. Neither leaves this server.
+#[async_trait]
+pub trait ReadStateStore: Send + Sync {
+    /// Pre:  none.
+    /// Post: moves the `(room_id, user_id, receipt_type, thread)` receipt to
+    ///       `event_id` and advances the read-state stream, **iff** `event_id`
+    ///       is an event in `room_id` newer (by `StreamPos`) than the current
+    ///       receipt. Anything else is a no-op, including an unknown event.
+    async fn record_receipt(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+        receipt_type: &str,
+        thread: &str,
+        event_id: &EventId,
+        ts: u64,
+    ) -> Result<(), StorageError>;
+
+    /// Pre:  `content` is a JSON object.
+    /// Post: replaces the `(user_id, room_id, data_type)` content and advances
+    ///       the read-state stream.
+    async fn set_room_account_data(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        data_type: &str,
+        content: &RawJsonValue,
+    ) -> Result<(), StorageError>;
+
+    /// Pre:  none.
+    /// Post: the `(user_id, room_id, data_type)` content, or `None` if unset.
+    async fn room_account_data(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        data_type: &str,
+    ) -> Result<Option<Box<RawJsonValue>>, StorageError>;
+
+    /// Pre:  none.
+    /// Post: `user_id`'s receipts and room account data whose position is
+    ///       strictly greater than `after`. `ReadStatePos(0)` returns all of it.
+    async fn read_state_since(
+        &self,
+        user_id: &UserId,
+        after: ReadStatePos,
+    ) -> Result<ReadStateDelta, StorageError>;
+
+    /// Pre:  none.
+    /// Post: returns a receiver whose value is the newest [`ReadStatePos`].
+    ///       Same subscribe-before-query discipline as [`EventStore::subscribe`].
+    fn subscribe_read_state(&self) -> watch::Receiver<ReadStatePos>;
+}
+
 #[async_trait]
 pub trait FederationInbox: Send + Sync {
     /// Pre:  none.
@@ -838,6 +935,7 @@ pub trait StorageBackend:
     + FederationOutbox
     + FederationInbox
     + DeliveryStore
+    + ReadStateStore
     + StagingStore
     + OobMembershipStore
     + IdentityStore
@@ -852,6 +950,7 @@ impl<T> StorageBackend for T where
         + FederationOutbox
         + FederationInbox
         + DeliveryStore
+        + ReadStateStore
         + StagingStore
         + OobMembershipStore
         + IdentityStore

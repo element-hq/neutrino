@@ -99,6 +99,9 @@ pub struct Conn {
     /// does. Held as a plain `u64` for the same reason `last_event_stream_pos`
     /// is — the newtype belongs to the store's API, not the cursor.
     pub last_delivery_pos: u64,
+    /// The highest `ReadStatePos` this connection has rendered into its
+    /// receipts or account data extension.
+    pub last_read_state_pos: u64,
     pub lists: BTreeMap<String, ListCfg>,
     pub subs: BTreeMap<OwnedRoomId, SubCfg>,
     pub sent: HashMap<OwnedRoomId, RoomSent>,

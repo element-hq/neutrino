@@ -1,11 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use neutrino_store::{Direction, Event, Membership, ResolvedMembership, StorageBackend, StreamPos};
+use neutrino_store::{
+    Direction, Event, Membership, ReadStatePos, ResolvedMembership, RoomAccountData,
+    StorageBackend, StorageError, StreamPos,
+};
 use ruma::UInt;
 use ruma::api::client::sync::sync_events::v5::response;
 use ruma::api::client::sync::sync_events::v5::{Request, Response};
 use ruma::events::{
-    AnyStrippedStateEvent, AnySyncStateEvent, AnySyncTimelineEvent, StateEventType,
+    AnyRoomAccountDataEvent, AnyStrippedStateEvent, AnySyncStateEvent, AnySyncTimelineEvent,
+    StateEventType,
 };
 use ruma::serde::Raw;
 use ruma::{OwnedRoomId, RoomId, UserId};
@@ -180,16 +184,52 @@ pub(super) async fn build_response<S: StorageBackend>(
     resp.txn_id = req.txn_id.clone();
     resp.lists = lists_response;
     resp.rooms = rooms_response;
-    // Delivery receipts: server-enabled and client-opted-in, or nothing at all
-    // (the marks keep accruing either way, so enabling either side later
-    // surfaces the current state rather than starting from empty).
-    if state.delivery_receipts && req.extensions.receipts.enabled == Some(true) {
-        resp.extensions.receipts = receipts::build_receipts(state, conn, initial_sync).await?;
+    let want_receipts = req.extensions.receipts.enabled == Some(true);
+    let want_account_data = req.extensions.account_data.enabled == Some(true);
+    if want_receipts || want_account_data {
+        let since = if initial_sync {
+            ReadStatePos(0)
+        } else {
+            ReadStatePos(conn.last_read_state_pos)
+        };
+        let read_state = state.store.read_state_since(user_id, since).await?;
+        if want_receipts {
+            resp.extensions.receipts =
+                receipts::build_receipts(state, user_id, conn, initial_sync, &read_state.receipts)
+                    .await?;
+        }
+        if want_account_data {
+            resp.extensions.account_data.rooms = room_account_data(read_state.account_data)?;
+        }
+        // Advanced only once the extensions are built: a failed build must
+        // not consume read state.
+        if let Some(pos) = read_state.pos {
+            conn.last_read_state_pos = conn.last_read_state_pos.max(pos.0);
+        }
     }
     Ok(SyncResponse {
         response: resp,
         memberships,
     })
+}
+
+/// Group room account data by room, as `{type, content}` events.
+fn room_account_data(
+    data: Vec<RoomAccountData>,
+) -> Result<BTreeMap<OwnedRoomId, Vec<Raw<AnyRoomAccountDataEvent>>>, SyncError> {
+    let mut rooms: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for d in data {
+        let event = serde_json::value::to_raw_value(&serde_json::json!({
+            "type": d.data_type,
+            "content": d.content,
+        }))
+        .map_err(|e| SyncError::Storage(StorageError::Internal(e.to_string())))?;
+        rooms
+            .entry(d.room_id)
+            .or_default()
+            .push(Raw::from_json(event));
+    }
+    Ok(rooms)
 }
 
 /// Merge per-request sticky params into the connection's stored state.

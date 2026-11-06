@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use deadpool_sqlite::{Config, Hook, HookError, Pool, Runtime, rusqlite::Connection};
 use neutrino_room::provider::StateProvider;
-use neutrino_store::{DeliveryPos, StorageError, StreamPos, WithStateProvider};
+use neutrino_store::{DeliveryPos, ReadStatePos, StorageError, StreamPos, WithStateProvider};
 use tokio::sync::watch;
 
 /// Wall-clock ceiling for any single `run_write` call. The writer pool is
@@ -76,6 +76,9 @@ pub struct SqliteStore {
     /// `watch_tx` because an acknowledgement is not an event — it must wake a
     /// long-poll without pretending the event stream moved.
     delivery_watch_tx: watch::Sender<DeliveryPos>,
+    /// The read-state sibling of `delivery_watch_tx`, advanced by every
+    /// `ReadStateStore` write. Seeded at open from the highest `read_state_pos`.
+    read_state_watch_tx: watch::Sender<ReadStatePos>,
     /// Whether client-visible reads (`events_after` for `/sync`,
     /// `room_messages` for `/messages`) exclude soft-failed rows. `true` in
     /// production; the convergence harness sets it `false` (see
@@ -244,14 +247,21 @@ impl SqliteStore {
             .map_err(Error::Interact)?
             .map_err(Error::Sqlite)?;
 
+        let initial_read_state: i64 = reader
+            .interact(|conn| store::max_read_state_pos(conn))
+            .await
+            .map_err(Error::Interact)??;
+
         let (watch_tx, _) = watch::channel(StreamPos(initial as u64));
         let (delivery_watch_tx, _) = watch::channel(DeliveryPos(initial_delivery as u64));
+        let (read_state_watch_tx, _) = watch::channel(ReadStatePos(initial_read_state as u64));
 
         Ok(Self {
             reader_pool,
             writer_pool,
             watch_tx,
             delivery_watch_tx,
+            read_state_watch_tx,
             // Production default: soft-failed events are hidden from clients.
             hide_soft_failed: true,
         })
@@ -327,6 +337,23 @@ impl SqliteStore {
     ) {
         let new_pos = DeliveryPos(new_pos as u64);
         delivery_watch_tx.send_if_modified(|cur| {
+            if new_pos > *cur {
+                *cur = new_pos;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Advance the read-state watch under the same max-guard as
+    /// [`Self::notify_watch`].
+    pub(crate) fn notify_read_state_watch(
+        read_state_watch_tx: &watch::Sender<ReadStatePos>,
+        new_pos: i64,
+    ) {
+        let new_pos = ReadStatePos(new_pos as u64);
+        read_state_watch_tx.send_if_modified(|cur| {
             if new_pos > *cur {
                 *cur = new_pos;
                 true

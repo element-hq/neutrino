@@ -40,6 +40,7 @@ mod federation;
 mod legacy_sync;
 mod membership;
 mod messages;
+mod read_state;
 mod sliding_sync;
 
 #[cfg(feature = "multi-user-shim")]
@@ -663,6 +664,18 @@ fn build_router<S: Store>(state: &AppState<S>) -> Router {
         .route(
             "/_matrix/client/v3/rooms/{room_id}/unban",
             post(membership::unban),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}",
+            post(read_state::post_receipt),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/read_markers",
+            post(read_state::post_read_markers),
+        )
+        .route(
+            "/_matrix/client/v3/user/{user_id}/rooms/{room_id}/account_data/{type}",
+            put(read_state::put_room_account_data),
         )
         .route("/_matrix/client/v3/pushers/set", post(pushers_set))
         .route("/_matrix/client/v3/capabilities", get(get_capabilities))
