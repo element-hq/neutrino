@@ -4,9 +4,12 @@
 //! Push rules are not evaluated here: the host's client applies them when it
 //! resolves the event, and drops whatever should not notify.
 //!
-//! A remote join applies the room's recent timeline, and the invite it
-//! accepts, as live events, so they are reported too. The host opens the room
-//! as the join completes, which suppresses them.
+//! An invite is reported when it becomes the user's membership, whether it
+//! arrived in a room or out of band.
+//!
+//! A remote join applies the room's recent timeline as live events, so it is
+//! reported too. The host opens the room as the join completes, which
+//! suppresses it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -37,13 +40,18 @@ pub(crate) struct Notifier<S> {
     store: Arc<S>,
     user_id: OwnedUserId,
     cursor: StreamPos,
-    /// Out-of-band invites already reported, or held when the notifier started.
+    /// Invites already reported, or held when the notifier started.
     seen_invites: HashSet<OwnedEventId>,
 }
 
+struct Memberships {
+    joined: HashSet<OwnedRoomId>,
+    /// The event behind each invite the user holds.
+    invites: HashMap<OwnedEventId, OwnedRoomId>,
+}
+
 impl<S: EventStore + OobMembershipStore> Notifier<S> {
-    /// Reports only what arrives after `cursor`, and no out-of-band invite
-    /// held now.
+    /// Reports only what arrives after `cursor`, and no invite held now.
     pub(crate) async fn new(
         store: Arc<S>,
         user_id: OwnedUserId,
@@ -55,24 +63,16 @@ impl<S: EventStore + OobMembershipStore> Notifier<S> {
             cursor,
             seen_invites: HashSet::new(),
         };
-        notifier.seen_invites = notifier.oob_invites().await?.into_keys().collect();
+        notifier.seen_invites = notifier.memberships().await?.invites.into_keys().collect();
         Ok(notifier)
     }
 
-    /// Everything that arrived since the last call, in stream order, with
-    /// out-of-band invites last.
+    /// Everything that arrived since the last call, in stream order, with new
+    /// invites last.
     pub(crate) async fn poll(&mut self) -> Result<Vec<Notifiable>, StorageError> {
         let mut out = Vec::new();
         let mut cursor = self.cursor;
-        // A room the user has left keeps receiving events from members who
-        // have not yet seen the leave.
-        let joined: HashSet<OwnedRoomId> = self
-            .store
-            .resolved_memberships(&self.user_id, &[Membership::Join].into())
-            .await?
-            .into_iter()
-            .map(|(room_id, _, _)| room_id)
-            .collect();
+        let Memberships { joined, invites } = self.memberships().await?;
         loop {
             let page = self.store.events_after(cursor, PAGE).await?;
             let full = page.len() == PAGE;
@@ -89,7 +89,6 @@ impl<S: EventStore + OobMembershipStore> Notifier<S> {
                 break;
             }
         }
-        let invites = self.oob_invites().await?;
         for (event_id, room_id) in &invites {
             if !self.seen_invites.contains(event_id) {
                 out.push(Notifiable {
@@ -99,44 +98,48 @@ impl<S: EventStore + OobMembershipStore> Notifier<S> {
             }
         }
         self.cursor = cursor;
-        // Forget invites no longer held, so a re-invite reports again.
+        // A re-invite is a new event, so an invite no longer held cannot
+        // return.
         self.seen_invites = invites.into_keys().collect();
         Ok(out)
     }
 
     fn notifies(&self, event: &Event, joined: &HashSet<OwnedRoomId>) -> bool {
-        if event.sender == self.user_id {
-            return false;
-        }
-        match event.state_key.as_deref() {
-            None => joined.contains(&event.room_id),
-            Some(state_key) => {
-                event.event_type == "m.room.member"
-                    && state_key == self.user_id.as_str()
-                    && event.content_str("membership").as_deref() == Some("invite")
-            }
-        }
+        // A room the user has left keeps receiving events from members who
+        // have not yet seen the leave.
+        event.sender != self.user_id && event.state_key.is_none() && joined.contains(&event.room_id)
     }
 
-    async fn oob_invites(&self) -> Result<HashMap<OwnedEventId, OwnedRoomId>, StorageError> {
+    async fn memberships(&self) -> Result<Memberships, StorageError> {
         let rooms = self
             .store
-            .resolved_memberships(&self.user_id, &[Membership::Invite].into())
+            .resolved_memberships(
+                &self.user_id,
+                &[Membership::Join, Membership::Invite].into(),
+            )
             .await?;
-        let mut invites = HashMap::new();
-        for (room_id, _, out_of_band) in rooms {
-            if !out_of_band {
+        let mut memberships = Memberships {
+            joined: HashSet::new(),
+            invites: HashMap::new(),
+        };
+        for (room_id, membership, _) in rooms {
+            if membership == Membership::Join {
+                memberships.joined.insert(room_id);
                 continue;
             }
-            if let Some(oob) = self
+            // A separate read, so the invite may have been replaced since.
+            let Some(member) = self
                 .store
-                .get_oob_membership(&room_id, &self.user_id)
+                .resolved_member_event(&room_id, &self.user_id)
                 .await?
-            {
-                invites.insert(oob.event.event_id, room_id);
+            else {
+                continue;
+            };
+            if member.membership == Membership::Invite {
+                memberships.invites.insert(member.event.event_id, room_id);
             }
         }
-        Ok(invites)
+        Ok(memberships)
     }
 }
 
@@ -384,15 +387,74 @@ mod tests {
         assert!(notifier.poll().await.expect("poll").is_empty());
     }
 
+    fn member(id: &str, room_id: &RoomId, sender: &UserId, membership: &str) -> Event {
+        let me = me();
+        event(
+            id,
+            room_id,
+            "m.room.member",
+            Some(me.as_str()),
+            sender,
+            json!({"membership": membership}),
+        )
+    }
+
     #[tokio::test]
-    async fn in_room_invite_for_me_is_reported() {
+    async fn in_room_invite_is_reported_once_and_again_after_a_rescind() {
         let room = room_id!("!room:me");
         let store = store_with_room(room).await;
         let mut notifier = notifier(&store).await;
+        persist(&store, &member("leave", room, &me(), "leave")).await;
 
-        persist(&store, &invite("inv", room, &bob(), &me())).await;
+        persist(&store, &invite("inv1", room, &bob(), &me())).await;
+        assert_eq!(ids(&notifier.poll().await.expect("poll")), ["$inv1"]);
+        assert!(notifier.poll().await.expect("poll").is_empty());
 
+        persist(&store, &member("rescind", room, &bob(), "leave")).await;
+        assert!(notifier.poll().await.expect("poll").is_empty());
+
+        persist(&store, &invite("inv2", room, &bob(), &me())).await;
+        assert_eq!(ids(&notifier.poll().await.expect("poll")), ["$inv2"]);
+    }
+
+    /// Joining a remote room applies the invite it accepts as a room event.
+    #[tokio::test]
+    async fn accepted_invite_is_not_reported_again() {
+        let store = store_with_room(room_id!("!room:me")).await;
+        let remote = room_id!("!remote:other");
+        let inv = invite("inv", remote, &bob(), &me());
+        let mut notifier = notifier(&store).await;
+
+        store
+            .put_oob_membership(remote, &me(), &inv, ROOM_VERSION, None)
+            .await
+            .expect("oob write");
         assert_eq!(ids(&notifier.poll().await.expect("poll")), ["$inv"]);
+
+        let create = event(
+            "remote-create",
+            remote,
+            "m.room.create",
+            Some(""),
+            &bob(),
+            json!({"room_version": ROOM_VERSION}),
+        );
+        let bob_join = event(
+            "bob-join",
+            remote,
+            "m.room.member",
+            Some(bob().as_str()),
+            &bob(),
+            json!({"membership": "join"}),
+        );
+        store
+            .create_room(&create, &[bob_join])
+            .await
+            .expect("create room");
+        persist(&store, &inv).await;
+        persist(&store, &member("my-join", remote, &me(), "join")).await;
+
+        assert!(notifier.poll().await.expect("poll").is_empty());
     }
 
     #[tokio::test]
