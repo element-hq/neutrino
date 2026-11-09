@@ -21,8 +21,11 @@
 //! - ruma's v5 request keeps MSC3575 shapes (`ranges`, tuple `required_state`,
 //!   `invite_state`); only `ranges[0]` is honoured.
 //! - Extensions: `e2ee` / `to_device` are constant echo stubs, `receipts`
-//!   carries only synthesised delivery receipts (see [`receipts`]), and
-//!   `account_data` / `typing` are always empty.
+//!   carries the user's own receipts plus synthesised delivery receipts (see
+//!   [`receipts`]), `account_data` carries only room account data, and
+//!   `typing` is always empty. Both read-state extensions ignore their
+//!   `lists` / `rooms` filters and share one cursor, so read state that moves
+//!   while only one of them is enabled is not sent to the other later.
 //! - `bump_stamp` is the latest event of any type (no `bump_event_types`
 //!   filter).
 //! - A banned room is included only if already emitted on this connection
@@ -249,6 +252,7 @@ pub async fn handle<S: StorageBackend>(
     // the event stream: a peer acknowledging an event we sent minutes ago is
     // new data for this client without any new event behind it.
     let mut delivery_rx = state.store.subscribe_deliveries();
+    let mut read_state_rx = state.store.subscribe_read_state();
 
     // Short wait while the prior holder (if any) observes the cancel above
     // and unwinds.
@@ -294,6 +298,8 @@ pub async fn handle<S: StorageBackend>(
     // "zero remaining wall time". `wait_for_data` is the only branch that
     // can iterate; everything else exits after one build.
     let wait_for_data = !initial_sync && !timeout.is_zero();
+    let wants_read_state = req.extensions.receipts.enabled == Some(true)
+        || req.extensions.account_data.enabled == Some(true);
 
     let mut final_resp = loop {
         let resp = build::build_response(state, user_id, &req, &mut conn_guard).await?;
@@ -317,17 +323,20 @@ pub async fn handle<S: StorageBackend>(
         //   cache; a body-differing newer request will see the advanced
         //   `conn.pos` and either match it (process fresh) or return
         //   UnknownPos.
-        // - `rx.changed()` / `delivery_rx.changed()` fires → new event(s) or a
-        //   new federation delivery mark; rebuild with the advanced high-water
-        //   mark. Either is enough to make the next build non-empty, so they
-        //   share one arm. The delivery half is disabled when receipts are off
-        //   — marks are recorded either way, and waking a client for data the
-        //   next build will not emit is pure battery on the embedded target.
+        // - `rx.changed()` / `delivery_rx.changed()` / `read_state_rx.changed()`
+        //   fires → new event(s), a new federation delivery mark, or a receipt
+        //   or account data write; rebuild with the advanced high-water mark.
+        //   Each is enough to make the next build non-empty, so they share one
+        //   arm. The delivery and read-state halves are disabled when the
+        //   extensions that carry them are off — the data is recorded either
+        //   way, and waking a client for data the next build will not emit is
+        //   pure battery on the embedded target.
         // - `tokio::time::timeout` elapses → return the current empty resp.
         let new_data = async {
             tokio::select! {
                 _ = rx.changed() => {}
                 _ = delivery_rx.changed(), if state.delivery_receipts => {}
+                _ = read_state_rx.changed(), if wants_read_state => {}
             }
         };
         tokio::select! {
@@ -445,8 +454,8 @@ fn clamp_timeout(req_timeout: Option<Duration>) -> Duration {
 /// Whether the response carries any user-visible update worth returning to
 /// the client right now (vs. continuing to wait in the long-poll loop).
 ///
-/// **Today's definition is deliberately narrow: a non-empty `rooms`, or a
-/// receipts extension carrying at least one synthesised delivery receipt.**
+/// **Today's definition is deliberately narrow: a non-empty `rooms`, a
+/// non-empty receipts extension, or non-empty room account data.**
 /// This is correct *only* for the current scope — the embedded server with
 /// stubbed extensions and no EDUs. The following signals do NOT cause this
 /// helper to return `true`, even though a fully-spec'd server would have to
@@ -454,22 +463,23 @@ fn clamp_timeout(req_timeout: Option<Duration>) -> Duration {
 /// - **OTK / fallback-key changes** (`extensions.e2ee.device_one_time_keys_count`).
 /// - **Device-list changes** (`extensions.e2ee.device_lists`).
 /// - **New to-device messages** (`extensions.to_device.events`).
-/// - **Account-data updates** (`extensions.account_data.*`).
-/// - **Typing / presence** (and any real, federated receipt — the receipts
-///   below are locally synthesised delivery marks, not EDUs).
+/// - **Global account-data updates** (`extensions.account_data.global`).
+/// - **Typing / presence**, and any other user's real, federated receipt.
 /// - **List `count` changes** (a room joining/leaving the candidate set
 ///   without otherwise being included in `resp.rooms`).
 ///
 /// Why it's safe right now: the e2ee/to_device extensions are pure echo
 /// stubs of the request, with constant payload — they never *independently*
 /// change between long-poll iterations, so waiting on them would be waiting
-/// forever. `account_data` / `typing` are never populated.
+/// forever. Global account data and `typing` are never populated.
 ///
 /// If any of those signals ever gets a real implementation, this helper is
 /// the one place that needs to learn about them — or the loop will hold the
 /// connection open for events the response no longer reflects.
 fn has_data(resp: &v5::Response) -> bool {
-    !resp.rooms.is_empty() || !resp.extensions.receipts.rooms.is_empty()
+    !resp.rooms.is_empty()
+        || !resp.extensions.receipts.rooms.is_empty()
+        || !resp.extensions.account_data.rooms.is_empty()
 }
 
 /// Echo the e2ee / to_device extensions when the client opted in.

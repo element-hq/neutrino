@@ -303,6 +303,38 @@ CREATE TABLE deliveries (
 CREATE INDEX ix_deliveries_pos ON deliveries(delivery_pos);
 
 -- ----------------------------------------------------------------------------
+-- receipts, room_account_data — ReadStateStore
+-- A local user's read state; never federated. A receipt is a high-water mark
+-- like `deliveries` (`thread` is '' when unthreaded). Both tables share one
+-- stream: `read_state_pos` is MAX+1 across the two on every write, so sync
+-- keeps one cursor.
+-- ----------------------------------------------------------------------------
+CREATE TABLE receipts (
+    room_id        TEXT    NOT NULL,
+    user_id        TEXT    NOT NULL,
+    receipt_type   TEXT    NOT NULL,
+    thread         TEXT    NOT NULL,
+    event_id       TEXT    NOT NULL REFERENCES events(event_id),
+    stream_pos     INTEGER NOT NULL,
+    read_state_pos INTEGER NOT NULL,
+    ts             INTEGER NOT NULL,
+    PRIMARY KEY (room_id, user_id, receipt_type, thread)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX ix_receipts_user_pos ON receipts(user_id, read_state_pos);
+
+CREATE TABLE room_account_data (
+    user_id        TEXT    NOT NULL,
+    room_id        TEXT    NOT NULL,
+    data_type      TEXT    NOT NULL,
+    content        TEXT    NOT NULL,
+    read_state_pos INTEGER NOT NULL,
+    PRIMARY KEY (user_id, room_id, data_type)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX ix_room_account_data_user_pos ON room_account_data(user_id, read_state_pos);
+
+-- ----------------------------------------------------------------------------
 -- staged_events — StagingStore
 -- A pre-auth holding pen for federation ancestry fetched while gap-filling a
 -- received PDU's state DAG. Events here are NOT yet authorised: we must auth

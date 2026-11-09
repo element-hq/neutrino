@@ -386,6 +386,26 @@ impl EventStore for SqliteStore {
         .await
     }
 
+    async fn event_stream_pos(
+        &self,
+        room_id: &RoomId,
+        event_id: &EventId,
+    ) -> Result<Option<StreamPos>, StorageError> {
+        let room_id = room_id.to_owned();
+        let event_id = event_id.to_owned();
+        self.run_read(move |conn| -> Result<Option<StreamPos>, Error> {
+            let pos: Option<i64> = conn
+                .query_row(
+                    "SELECT stream_pos FROM events WHERE event_id = ? AND room_id = ?",
+                    params![event_id.as_str(), room_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(pos.map(|p| StreamPos(p as u64)))
+        })
+        .await
+    }
+
     fn subscribe(&self) -> watch::Receiver<StreamPos> {
         SqliteStore::subscribe(self)
     }
