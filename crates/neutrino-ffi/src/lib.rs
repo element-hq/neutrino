@@ -1,6 +1,9 @@
 uniffi::setup_scaffolding!("neutrino");
 
+mod notifier;
 mod watchdog;
+
+pub use notifier::NotificationListener;
 
 /// FFI-facing server configuration. Mirrors `neutrino_ctl::Config` so EX
 /// Android can fully configure the embedded homeserver. Kept here (not on the
@@ -159,6 +162,8 @@ pub struct NeutrinoHandle {
     /// Same `Arc` as the one wrapping the transport link; the Settings toggle
     /// drives it via `start_capture`/`stop_capture`.
     capture: std::sync::Arc<neutrino_main::CaptureControl>,
+    /// Read by the notifier task on every wake.
+    listener: tokio::sync::watch::Sender<notifier::ListenerSlot>,
 }
 
 #[uniffi::export]
@@ -186,6 +191,15 @@ impl NeutrinoHandle {
     /// connectivity is restored so backed-off destinations reconnect promptly.
     pub fn kick_backoff(&self) {
         self.command(Command::KickBackoff);
+    }
+
+    /// Who hears about events that may deserve a notification; `None` stops
+    /// it. Events persisted while no listener is set are never reported.
+    pub fn set_notification_listener(
+        &self,
+        listener: Option<std::sync::Arc<dyn NotificationListener>>,
+    ) {
+        self.listener.send_replace(listener);
     }
 
     /// The server's resolved federation name — its derived node id, or `None`
@@ -320,6 +334,9 @@ pub fn start_with(
     // an injected medium receives the same `Arc` via its `LinkContext`.
     let discovery_for_server = std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new());
     let discovery_for_handle = discovery_for_server.clone();
+    let (listener_tx, listener_rx) = tokio::sync::watch::channel(None);
+    let localpart = config.localpart.clone();
+    let identity_for_notifier = handoff_rx.clone();
     std::thread::spawn(move || {
         // The caller's runtime if it built one (it had to, to open the store it
         // passed), else ours. current_thread: all DB work is offloaded to
@@ -361,6 +378,12 @@ pub fn start_with(
                     }
                 },
             };
+            tokio::spawn(notifier::run(
+                store.clone(),
+                localpart,
+                identity_for_notifier,
+                listener_rx,
+            ));
             if let Err(e) = neutrino_main::entrypoint(
                 config,
                 store,
@@ -392,6 +415,7 @@ pub fn start_with(
         last_error: error_rx,
         discovery: discovery_for_handle,
         capture,
+        listener: listener_tx,
     }
 }
 
@@ -504,6 +528,7 @@ mod tests {
             last_error: tokio::sync::watch::channel::<Option<String>>(None).1,
             discovery: std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new()),
             capture: neutrino_main::CaptureControl::new(),
+            listener: tokio::sync::watch::channel(None).0,
         };
         handle.shutdown();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::Shutdown);
@@ -521,6 +546,7 @@ mod tests {
             last_error: tokio::sync::watch::channel::<Option<String>>(None).1,
             discovery: std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new()),
             capture: neutrino_main::CaptureControl::new(),
+            listener: tokio::sync::watch::channel(None).0,
         };
         handle.kick_backoff();
         assert_eq!(rx.try_recv().unwrap(), neutrino_main::Command::KickBackoff);
@@ -551,6 +577,7 @@ mod tests {
             last_error: tokio::sync::watch::channel::<Option<String>>(None).1,
             discovery,
             capture: neutrino_main::CaptureControl::new(),
+            listener: tokio::sync::watch::channel(None).0,
         };
         let peers = handle.discovered_peers();
         // Sorted by (display_name, server_name); localpart is dropped, other
@@ -575,6 +602,7 @@ mod tests {
             last_error: error_rx,
             discovery: std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new()),
             capture: neutrino_main::CaptureControl::new(),
+            listener: tokio::sync::watch::channel(None).0,
         };
         assert_eq!(handle.last_error(), None, "no error before boot fails");
         error_tx
@@ -595,6 +623,7 @@ mod tests {
             last_error: tokio::sync::watch::channel::<Option<String>>(None).1,
             discovery: std::sync::Arc::new(neutrino_main::DiscoveryRegistry::new()),
             capture: neutrino_main::CaptureControl::new(),
+            listener: tokio::sync::watch::channel(None).0,
         };
         assert!(handle.discovered_peers().is_empty());
     }

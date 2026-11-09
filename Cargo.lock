@@ -1778,6 +1778,7 @@ name = "neutrino-ffi"
 version = "0.1.0"
 dependencies = [
  "neutrino-main",
+ "serde_json",
  "tokio",
  "tracing",
  "uniffi",
