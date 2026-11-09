@@ -4,8 +4,10 @@
 //! Push rules are not evaluated here: the host's client applies them when it
 //! resolves the event, and drops whatever should not notify.
 //!
-//! An invite is reported when it becomes the user's membership, whether it
-//! arrived in a room or out of band.
+//! Invites are reported from the out-of-band memberships `/invite` stores. An
+//! invite for a user whose server is in the room is rejected, since that user
+//! is joined, so an invite among the room's events is a copy of one already
+//! reported, or history a join replays.
 //!
 //! A remote join applies the room's recent timeline as live events, so it is
 //! reported too. The host opens the room as the join completes, which
@@ -46,7 +48,7 @@ pub(crate) struct Notifier<S> {
 
 struct Memberships {
     joined: HashSet<OwnedRoomId>,
-    /// The event behind each invite the user holds.
+    /// The event behind each out-of-band invite the user holds.
     invites: HashMap<OwnedEventId, OwnedRoomId>,
 }
 
@@ -122,9 +124,12 @@ impl<S: EventStore + OobMembershipStore> Notifier<S> {
             joined: HashSet::new(),
             invites: HashMap::new(),
         };
-        for (room_id, membership, _) in rooms {
+        for (room_id, membership, out_of_band) in rooms {
             if membership == Membership::Join {
                 memberships.joined.insert(room_id);
+                continue;
+            }
+            if !out_of_band {
                 continue;
             }
             // A separate read, so the invite may have been replaced since.
@@ -135,7 +140,7 @@ impl<S: EventStore + OobMembershipStore> Notifier<S> {
             else {
                 continue;
             };
-            if member.membership == Membership::Invite {
+            if member.out_of_band && member.membership == Membership::Invite {
                 memberships.invites.insert(member.event.event_id, room_id);
             }
         }
@@ -400,36 +405,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_room_invite_is_reported_once_and_again_after_a_rescind() {
-        let room = room_id!("!room:me");
-        let store = store_with_room(room).await;
+    async fn invite_is_reported_once_and_again_after_a_rescind() {
+        let store = store_with_room(room_id!("!room:me")).await;
+        let remote = room_id!("!remote:other");
         let mut notifier = notifier(&store).await;
-        persist(&store, &member("leave", room, &me(), "leave")).await;
+        let oob = |event: Event| {
+            let store = store.clone();
+            async move {
+                store
+                    .put_oob_membership(remote, &me(), &event, ROOM_VERSION, None)
+                    .await
+                    .expect("oob write");
+            }
+        };
 
-        persist(&store, &invite("inv1", room, &bob(), &me())).await;
+        oob(invite("inv1", remote, &bob(), &me())).await;
         assert_eq!(ids(&notifier.poll().await.expect("poll")), ["$inv1"]);
         assert!(notifier.poll().await.expect("poll").is_empty());
 
-        persist(&store, &member("rescind", room, &bob(), "leave")).await;
+        oob(member("rescind", remote, &bob(), "leave")).await;
         assert!(notifier.poll().await.expect("poll").is_empty());
 
-        persist(&store, &invite("inv2", room, &bob(), &me())).await;
+        oob(invite("inv2", remote, &bob(), &me())).await;
         assert_eq!(ids(&notifier.poll().await.expect("poll")), ["$inv2"]);
     }
 
-    /// Joining a remote room applies the invite it accepts as a room event.
+    /// A join applies the room's state history one event at a time, so each
+    /// of the user's past member events is briefly their membership.
     #[tokio::test]
-    async fn accepted_invite_is_not_reported_again() {
+    async fn joining_after_a_reinvite_reports_nothing() {
         let store = store_with_room(room_id!("!room:me")).await;
         let remote = room_id!("!remote:other");
-        let inv = invite("inv", remote, &bob(), &me());
+        let inv1 = invite("inv1", remote, &bob(), &me());
+        let rescind = member("rescind", remote, &bob(), "leave");
+        let inv2 = invite("inv2", remote, &bob(), &me());
         let mut notifier = notifier(&store).await;
-
-        store
-            .put_oob_membership(remote, &me(), &inv, ROOM_VERSION, None)
-            .await
-            .expect("oob write");
-        assert_eq!(ids(&notifier.poll().await.expect("poll")), ["$inv"]);
+        for (event, expected) in [
+            (&inv1, vec!["$inv1"]),
+            (&rescind, vec![]),
+            (&inv2, vec!["$inv2"]),
+        ] {
+            store
+                .put_oob_membership(remote, &me(), event, ROOM_VERSION, None)
+                .await
+                .expect("oob write");
+            assert_eq!(ids(&notifier.poll().await.expect("poll")), expected);
+        }
 
         let create = event(
             "remote-create",
@@ -451,10 +472,19 @@ mod tests {
             .create_room(&create, &[bob_join])
             .await
             .expect("create room");
-        persist(&store, &inv).await;
-        persist(&store, &member("my-join", remote, &me(), "join")).await;
-
-        assert!(notifier.poll().await.expect("poll").is_empty());
+        for event in [
+            &inv1,
+            &rescind,
+            &inv2,
+            &member("my-join", remote, &me(), "join"),
+        ] {
+            persist(&store, event).await;
+            assert!(
+                notifier.poll().await.expect("poll").is_empty(),
+                "reported after replaying {}",
+                event.event_id
+            );
+        }
     }
 
     #[tokio::test]
