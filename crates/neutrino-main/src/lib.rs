@@ -5,6 +5,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 pub use neutrino_ctl::{Command, Config, DiscoveredPeer, DiscoveryRegistry};
+/// For the FFI's notifier and its tests, which read the client-visible event
+/// stream: `neutrino-ffi` may depend on this crate alone.
+pub use neutrino_event::Event;
 pub use neutrino_event::event_id::{EventIdError, EventIdScheme};
 pub use neutrino_event::{KeyResolver, NodeIdKeyResolver, RedactionKeys, RoomVersion, ruma};
 pub use neutrino_lb::{
@@ -12,6 +15,7 @@ pub use neutrino_lb::{
     LinkProfile, WireRequest, WireResponse,
 };
 pub use neutrino_store::StorageError;
+pub use neutrino_store::{EventStore, Membership, OobMembershipStore, RoomStore, StreamPos};
 pub use neutrino_store_sqlite::{Error as SqliteError, SqliteStore, rusqlite};
 
 use std::future::Future;

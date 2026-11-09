@@ -18,6 +18,10 @@ uniffi.workspace = true
 
 neutrino-main = { path = "../neutrino-main" }
 
+[dev-dependencies]
+# Builds the notifier tests' fixture events.
+serde_json.workspace = true
+
 [features]
 # Diagnostic-only passthrough — see neutrino-http's `task-dump`. Build the FFI
 # lib with `RUSTFLAGS="--cfg tokio_unstable" cargo build -p neutrino-ffi
