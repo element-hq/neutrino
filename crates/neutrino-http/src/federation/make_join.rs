@@ -39,7 +39,9 @@ pub(crate) struct ResponseBody {
     room_version: String,
 }
 
-/// Federation `/make_join` handler.
+/// # `GET /_matrix/federation/v1/make_join/{roomId}/{userId}`
+///
+/// Returns a join event template for a remote user.
 ///
 /// 1. Parse `room_id` (400 JSON) + `user_id` (400 JSON).
 /// 2. Negotiate the room version: the room must exist (else 404) and our

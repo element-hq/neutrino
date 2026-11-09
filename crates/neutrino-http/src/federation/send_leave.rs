@@ -21,7 +21,9 @@ use serde_json::{Value, json};
 use crate::federation::{FedError, auth, co_sign_if_signed, map_apply_err};
 use crate::{AppState, Store, lock_app};
 
-/// Federation `/send_leave` (v2) handler. Returns `{}` on accept.
+/// # `PUT /_matrix/federation/v2/send_leave/{roomId}/{eventId}`
+///
+/// Accepts a remote user's leave event. Returns `{}` on accept.
 ///
 /// The `{roomId}`/`{eventId}` path segments are IGNORED: the event body is
 /// authoritative for both (the event id is recomputed from the reference hash,

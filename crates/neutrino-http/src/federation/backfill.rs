@@ -59,7 +59,9 @@ pub(crate) struct ResponseBody {
     pub(crate) pdus: Vec<Box<RawJsonValue>>,
 }
 
-/// Federation `/backfill` handler.
+/// # `GET /_matrix/federation/v1/backfill/{roomId}`
+///
+/// Returns room history preceding the given events.
 ///
 /// 1. Parse `room_id` manually (400 JSON, not axum's plain-text default).
 /// 2. Reject an empty `v` (400) — nothing to walk back from.

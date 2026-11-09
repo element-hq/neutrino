@@ -807,6 +807,9 @@ async fn root() -> &'static str {
     "Hello, World!"
 }
 
+/// # `GET /_matrix/client/versions`
+///
+/// Lists the spec versions and unstable features this server supports.
 async fn versions() -> Json<Value> {
     Json(json!({
         "unstable_features": {
@@ -817,12 +820,14 @@ async fn versions() -> Json<Value> {
     }))
 }
 
-/// `GET /_matrix/key/v2/server` — this server's signing key, as signed JSON
-/// (spec §"Retrieving server keys"). Only meaningful on a signed
-/// deployment (`trusted_network = false`): a trusted network has no signing keys at
-/// all, so the endpoint answers 404 there. No rotation mechanics — the key IS
-/// the node identity, `old_verify_keys` is permanently empty, and
-/// `valid_until_ts` is a rolling window that only paces peer re-fetches.
+/// # `GET /_matrix/key/v2/server`
+///
+/// Returns this server's signing key, as signed JSON (spec §"Retrieving server
+/// keys"). Only meaningful on a signed deployment (`trusted_network = false`): a
+/// trusted network has no signing keys at all, so the endpoint answers 404 there.
+/// No rotation mechanics — the key IS the node identity, `old_verify_keys` is
+/// permanently empty, and `valid_until_ts` is a rolling window that only paces
+/// peer re-fetches.
 async fn server_keys<S: Store>(state: State<AppState<S>>) -> axum::response::Response {
     let (signer, server_name) = {
         let app = lock_app(&state.0);
@@ -865,6 +870,9 @@ async fn server_keys<S: Store>(state: State<AppState<S>>) -> axum::response::Res
     (StatusCode::OK, Json(obj)).into_response()
 }
 
+/// # `GET /_matrix/client/{version}/login`
+///
+/// Lists the supported login flows.
 async fn get_login() -> Json<Value> {
     Json(json!({
         "flows": [
@@ -875,6 +883,10 @@ async fn get_login() -> Json<Value> {
     }))
 }
 
+/// # `POST /_matrix/client/{version}/register`
+///
+/// Stub registration: a request without `auth` starts an `m.login.dummy`
+/// user-interactive auth flow; completing it returns an access token.
 async fn post_register<S: Store>(
     state: State<AppState<S>>,
     body: Json<Value>,
@@ -954,6 +966,9 @@ async fn post_register<S: Store>(
     }
 }
 
+/// # `POST /_matrix/client/{version}/login`
+///
+/// Stub login: returns an access token without checking credentials.
 async fn post_login<S: Store>(
     state: State<AppState<S>>,
     #[cfg(feature = "multi-user-shim")] body: Json<Value>,
@@ -1016,8 +1031,10 @@ async fn post_login<S: Store>(
     }
 }
 
-/// MSC4186 sliding-sync entrypoint. The actual work is in
-/// `sliding_sync::handle`; this wrapper handles the HTTP/JSON edge:
+/// # `POST /_matrix/client/unstable/org.matrix.simplified_msc3575/sync`
+///
+/// MSC4186 sliding sync. The actual work is in `sliding_sync::handle`; this
+/// wrapper handles the HTTP/JSON edge:
 /// - assembles a `v5::Request` from the JSON body plus query string (`pos`,
 ///   `timeout` live on the URL per ruma's annotations);
 /// - clones the `Arc<SyncState>` out from under the std-mutex'd `AppState`
@@ -1251,6 +1268,9 @@ fn error_response(status: StatusCode, errcode: &str, error: &str) -> axum::respo
     (status, Json(json!({"errcode": errcode, "error": error}))).into_response()
 }
 
+/// # `POST /_matrix/client/v3/keys/query`
+///
+/// E2EE stub: returns the device keys stored by the last upload, if any.
 async fn keys_query<S: Store>(state: State<AppState<S>>, body: Json<Value>) -> Json<Value> {
     info!("Received query: {:?}", body.0);
 
@@ -1267,6 +1287,10 @@ async fn keys_query<S: Store>(state: State<AppState<S>>, body: Json<Value>) -> J
     }
 }
 
+/// # `POST /_matrix/client/v3/keys/upload`
+///
+/// E2EE stub: stores the first uploaded device keys and reports a fixed
+/// one-time key count.
 async fn keys_upload<S: Store>(state: State<AppState<S>>, body: Json<Value>) -> Json<Value> {
     info!("Received keys upload: {:?}", body.0);
 
@@ -1291,6 +1315,9 @@ async fn keys_upload<S: Store>(state: State<AppState<S>>, body: Json<Value>) -> 
     }))
 }
 
+/// # `POST /_matrix/client/v3/keys/device_signing/upload`
+///
+/// E2EE stub: merges the uploaded cross-signing keys into the stored keys.
 async fn device_signing_upload<S: Store>(
     state: State<AppState<S>>,
     body: Json<Value>,
@@ -1315,6 +1342,9 @@ async fn device_signing_upload<S: Store>(
     Json(json!({}))
 }
 
+/// # `POST /_matrix/client/v3/keys/signatures/upload`
+///
+/// E2EE stub: merges the uploaded signatures into the stored device keys.
 async fn signatures_upload<S: Store>(state: State<AppState<S>>, body: Json<Value>) -> Json<Value> {
     info!("Received signatures upload: {:?}", body.0);
     let mut app = lock_app(&state.0);
@@ -1393,44 +1423,19 @@ pub(crate) fn set_member_displayname(content: &mut Value, name: &str) {
     }
 }
 
-/// `GET /_matrix/client/v3/profile/{user_id}` and the `/displayname` keyed
-/// variant. An unknown remote user yields an empty profile (`{}`) — the spec
-/// permits an absent `displayname`, and there is no profile store to 404 a
-/// never-seen peer against.
-async fn profile<S: Store>(
-    state: State<AppState<S>>,
-    axum::extract::Path(user_id): axum::extract::Path<String>,
-) -> Json<Value> {
-    match resolve_display_name(&state.0, &user_id).await {
-        Some(dn) => Json(json!({ "displayname": dn })),
-        None => Json(json!({})),
-    }
-}
-
-/// `GET /_matrix/client/v3/profile/{user_id}/displayname` — the keyed variant
-/// of [`profile`], returning only the `displayname` field.
-async fn get_display_name<S: Store>(
-    state: State<AppState<S>>,
-    axum::extract::Path(user_id): axum::extract::Path<String>,
-) -> Json<Value> {
-    match resolve_display_name(&state.0, &user_id).await {
-        Some(dn) => Json(json!({ "displayname": dn })),
-        None => Json(json!({})),
-    }
-}
-
 #[derive(serde::Deserialize)]
 struct SetDisplayNameRequest {
     #[serde(default)]
     displayname: String,
 }
 
-/// `PUT /_matrix/client/v3/profile/{user_id}/displayname`
+/// # `PUT /_matrix/client/v3/profile/{userId}/displayname`
+///
+/// Sets the local user's display name
 /// (https://spec.matrix.org/v1.18/client-server-api/#put_matrixclientv3profileuseriddisplayname).
-/// Persists the local user's display name in the [`IdentityStore`] (the
-/// embedded server is single-user, so the name is server-wide) and re-emits
-/// the user's `m.room.member` in every room they are joined to, as the spec
-/// asks of servers.
+/// Persists it in the [`IdentityStore`] (the embedded server is single-user, so
+/// the name is server-wide) and re-emits the user's `m.room.member` in every room
+/// they are joined to, as the spec asks of servers.
 async fn put_display_name<S: Store>(
     state: State<AppState<S>>,
     axum::extract::Path(user_id): axum::extract::Path<String>,
@@ -1518,7 +1523,9 @@ struct SearchRequest {
     limit: usize,
 }
 
-/// `POST /_matrix/client/v3/user_directory/search`.
+/// # `POST /_matrix/client/v3/user_directory/search`
+///
+/// Searches for users.
 ///
 /// The embedded server has no Matrix-level user directory: it answers from the
 /// out-of-band [`DiscoveryRegistry`] (peers seen over the BLE mesh). Each peer's
@@ -1545,6 +1552,9 @@ async fn user_directory_search<S: Store>(
     Json(json!({ "results": results, "limited": limited }))
 }
 
+/// # `GET /_matrix/client/v3/user/{userId}/account_data/{type}`
+///
+/// Stub: global account data is not stored, so this is always 404.
 async fn get_account_data(
     axum::extract::Path((_user_id, _account_data_type)): axum::extract::Path<(String, String)>,
 ) -> (StatusCode, Json<Value>) {
@@ -1557,6 +1567,38 @@ async fn get_account_data(
     )
 }
 
+/// # `GET /_matrix/client/v3/profile/{userId}`
+///
+/// Gets a user's profile. An unknown remote user yields an empty profile
+/// (`{}`) — the spec permits an absent `displayname`, and there is no profile
+/// store to 404 a never-seen peer against.
+async fn profile<S: Store>(
+    state: State<AppState<S>>,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+) -> Json<Value> {
+    match resolve_display_name(&state.0, &user_id).await {
+        Some(dn) => Json(json!({ "displayname": dn })),
+        None => Json(json!({})),
+    }
+}
+
+/// # `GET /_matrix/client/v3/profile/{userId}/displayname`
+///
+/// Gets a user's display name: the keyed variant of [`profile`], returning
+/// only the `displayname` field.
+async fn get_display_name<S: Store>(
+    state: State<AppState<S>>,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+) -> Json<Value> {
+    match resolve_display_name(&state.0, &user_id).await {
+        Some(dn) => Json(json!({ "displayname": dn })),
+        None => Json(json!({})),
+    }
+}
+
+/// # `GET /_matrix/client/v3/room_keys/version`
+///
+/// Key backup stub: there is never a backup, so this is always 404.
 async fn get_room_keys() -> (StatusCode, Json<Value>) {
     (
         StatusCode::NOT_FOUND,
@@ -1874,6 +1916,9 @@ fn join_rule_for(body: &Value) -> &'static str {
     if is_public { "public" } else { "invite" }
 }
 
+/// # `GET /_matrix/client/v3/rooms/{roomId}/members`
+///
+/// Lists the `m.room.member` events of a room.
 async fn members<S: Store>(
     state: State<AppState<S>>,
     axum::extract::Path(room_id): axum::extract::Path<String>,
@@ -1909,7 +1954,9 @@ async fn members<S: Store>(
     (StatusCode::OK, Json(json!({"chunk": chunk}))).into_response()
 }
 
-/// `PUT /rooms/{room}/send/{type}/{txn}` — a message (non-state) event.
+/// # `PUT /_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}`
+///
+/// Sends a message (non-state) event to a room.
 async fn put_event<S: Store>(
     state: State<AppState<S>>,
     AuthUser(sender): AuthUser,
@@ -1923,7 +1970,9 @@ async fn put_event<S: Store>(
     send_via_actor(&state.0, sender, room_id, event_type, None, body.0).await
 }
 
-/// `PUT /rooms/{room}/state/{type}/{stateKey}` — a state event.
+/// # `PUT /_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}`
+///
+/// Sends a state event to a room.
 async fn put_state<S: Store>(
     state: State<AppState<S>>,
     AuthUser(sender): AuthUser,
@@ -1945,8 +1994,10 @@ async fn put_state<S: Store>(
     .await
 }
 
-/// `PUT /rooms/{room}/state/{type}` — a state event with the empty state key
-/// (the common case for `m.room.name`, `m.room.topic`, …).
+/// # `PUT /_matrix/client/v3/rooms/{roomId}/state/{eventType}`
+///
+/// Sends a state event with the empty state key (the common case for
+/// `m.room.name`, `m.room.topic`, …). Also serves the trailing-slash form.
 async fn put_state_empty_key<S: Store>(
     state: State<AppState<S>>,
     AuthUser(sender): AuthUser,
@@ -1964,9 +2015,10 @@ async fn put_state_empty_key<S: Store>(
     .await
 }
 
-/// `GET /rooms/{room}/state` — every current state event, as a bare array of
-/// full (enriched) events. No auth/visibility gating (embedded trusted surface;
-/// matches `members`).
+/// # `GET /_matrix/client/v3/rooms/{roomId}/state`
+///
+/// Gets every current state event, as a bare array of full (enriched) events.
+/// No auth/visibility gating (embedded trusted surface; matches `members`).
 async fn get_state_all<S: Store>(
     state: State<AppState<S>>,
     axum::extract::Path(room_id): axum::extract::Path<String>,
@@ -1993,10 +2045,12 @@ async fn get_state_all<S: Store>(
     (StatusCode::OK, Json(events)).into_response()
 }
 
-/// `GET /rooms/{room}/state/{type}/{stateKey}` — the current state event. The
-/// default response is the event `content`; `?format=event` returns the full
-/// enriched event. Reads room state only, so an out-of-band membership (e.g. an
-/// invite to a room this server is not in) is not reflected, unlike `/sync`.
+/// # `GET /_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}`
+///
+/// Gets the current state event. The default response is the event `content`;
+/// `?format=event` returns the full enriched event. Reads room state only, so an
+/// out-of-band membership (e.g. an invite to a room this server is not in) is
+/// not reflected, unlike `/sync`.
 async fn get_state_event<S: Store>(
     state: State<AppState<S>>,
     axum::extract::Path((room_id, event_type, state_key)): axum::extract::Path<(
@@ -2009,8 +2063,10 @@ async fn get_state_event<S: Store>(
     state_event_response(&state.0, &room_id, &event_type, &state_key, &query.0).await
 }
 
-/// `GET /rooms/{room}/state/{type}` (and the trailing-slash form) — as
-/// [`get_state_event`] with the empty state key.
+/// # `GET /_matrix/client/v3/rooms/{roomId}/state/{eventType}`
+///
+/// As [`get_state_event`] with the empty state key. Also serves the
+/// trailing-slash form.
 async fn get_state_event_empty_key<S: Store>(
     state: State<AppState<S>>,
     axum::extract::Path((room_id, event_type)): axum::extract::Path<(String, String)>,
@@ -2120,10 +2176,16 @@ fn room_actor_response(e: RoomActorError) -> axum::response::Response {
     error_response(status, code, &e.to_string())
 }
 
+/// # `POST /_matrix/client/v3/pushers/set`
+///
+/// Push stub: accepts and ignores the pusher.
 async fn pushers_set() -> (StatusCode, Json<Value>) {
     (StatusCode::OK, Json(json!({})))
 }
 
+/// # `GET /_matrix/client/v3/capabilities`
+///
+/// Lists the server's capabilities.
 async fn get_capabilities() -> Json<Value> {
     // TODO: advertises "12", not the version createRoom stamps
     // (`RoomVersions::default_for_new_rooms`, e.g. `org.matrix.msc4242.12`).

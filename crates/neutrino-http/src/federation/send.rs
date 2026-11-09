@@ -239,8 +239,10 @@ async fn in_any_room(
     Ok(false)
 }
 
-/// Federation `/send/{txnId}` handler. Stages the transaction's PDUs and pokes
-/// the background worker; integration happens asynchronously.
+/// # `PUT /_matrix/federation/v1/send/{txnId}`
+///
+/// Receives a transaction from another server. Stages the transaction's PDUs
+/// and pokes the background worker; integration happens asynchronously.
 pub(crate) async fn handle<S: Store>(
     State(state): State<AppState<S>>,
     Path(txn_id): Path<String>,

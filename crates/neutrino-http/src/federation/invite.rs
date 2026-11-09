@@ -71,7 +71,9 @@ pub(crate) struct ResponseBody {
     event: Box<RawJsonValue>,
 }
 
-/// Federation `/invite/v2` handler.
+/// # `PUT /_matrix/federation/v2/invite/{roomId}/{eventId}`
+///
+/// Accepts an invite for a local user from another server.
 ///
 /// The `{roomId}`/`{eventId}` path segments are IGNORED: the event body is
 /// authoritative for both (the event id is recomputed from the reference hash,

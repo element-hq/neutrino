@@ -28,7 +28,9 @@ use crate::{
 
 pub mod translate;
 
-/// Legacy `GET /_matrix/client/v3/sync` handler.
+/// # `GET /_matrix/client/v3/sync`
+///
+/// Legacy sync.
 ///
 /// Mirrors the MSC4186 wrapper in `lib.rs::sync` exactly in terms of state
 /// extraction (clone `sync_state` + `user_id` out of the std-mutex'd

@@ -137,7 +137,10 @@ pub(crate) struct ResponseBody {
     pub(crate) events: Vec<Box<RawJsonValue>>,
 }
 
-/// Federation `/get_missing_events` handler.
+/// # `POST /_matrix/federation/v1/get_missing_events/{roomId}`
+///
+/// Returns events the requesting server is missing between its latest and
+/// earliest known events.
 ///
 /// Algorithm:
 /// 1. Reject empty `latest_events` (400 M_INVALID_PARAM).
