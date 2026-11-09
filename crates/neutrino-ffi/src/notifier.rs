@@ -3,6 +3,10 @@
 //!
 //! Push rules are not evaluated here: the host's client applies them when it
 //! resolves the event, and drops whatever should not notify.
+//!
+//! A remote join applies the room's recent timeline, and the invite it
+//! accepts, as live events, so they are reported too. The host opens the room
+//! as the join completes, which suppresses them.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -60,12 +64,21 @@ impl<S: EventStore + OobMembershipStore> Notifier<S> {
     pub(crate) async fn poll(&mut self) -> Result<Vec<Notifiable>, StorageError> {
         let mut out = Vec::new();
         let mut cursor = self.cursor;
+        // A room the user has left keeps receiving events from members who
+        // have not yet seen the leave.
+        let joined: HashSet<OwnedRoomId> = self
+            .store
+            .resolved_memberships(&self.user_id, &[Membership::Join].into())
+            .await?
+            .into_iter()
+            .map(|(room_id, _, _)| room_id)
+            .collect();
         loop {
             let page = self.store.events_after(cursor, PAGE).await?;
             let full = page.len() == PAGE;
             for (pos, event) in page {
                 cursor = pos;
-                if self.notifies(&event) {
+                if self.notifies(&event, &joined) {
                     out.push(Notifiable {
                         room_id: event.room_id,
                         event_id: event.event_id,
@@ -91,12 +104,12 @@ impl<S: EventStore + OobMembershipStore> Notifier<S> {
         Ok(out)
     }
 
-    fn notifies(&self, event: &Event) -> bool {
+    fn notifies(&self, event: &Event, joined: &HashSet<OwnedRoomId>) -> bool {
         if event.sender == self.user_id {
             return false;
         }
         match event.state_key.as_deref() {
-            None => true,
+            None => joined.contains(&event.room_id),
             Some(state_key) => {
                 event.event_type == "m.room.member"
                     && state_key == self.user_id.as_str()
@@ -346,6 +359,27 @@ mod tests {
         persist(&store, &name).await;
         let carol = user_id!("@carol:other");
         persist(&store, &invite("carol", room, &bob(), carol)).await;
+
+        assert!(notifier.poll().await.expect("poll").is_empty());
+    }
+
+    #[tokio::test]
+    async fn messages_after_leaving_are_not_reported() {
+        let room = room_id!("!room:me");
+        let store = store_with_room(room).await;
+        let mut notifier = notifier(&store).await;
+        let me = me();
+
+        let leave = event(
+            "leave",
+            room,
+            "m.room.member",
+            Some(me.as_str()),
+            &me,
+            json!({"membership": "leave"}),
+        );
+        persist(&store, &leave).await;
+        persist(&store, &message("late", room, &bob())).await;
 
         assert!(notifier.poll().await.expect("poll").is_empty());
     }

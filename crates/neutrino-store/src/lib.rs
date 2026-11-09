@@ -818,8 +818,9 @@ pub trait OobMembershipStore: Send + Sync {
     /// Post: records the membership keyed by `(room_id, user_id)`, **replacing**
     ///       any prior row for the same pair — latest wins (an invite after a
     ///       decline, a leave after an invite). Does NOT advance the persist
-    ///       watch (an out-of-band event is not a room event; it surfaces only
-    ///       via the sync out-of-band path). `InvalidInput` if `membership` is
+    ///       watch (an out-of-band event is not a room event), but wakes its
+    ///       subscribers once the row is written: readers of out-of-band
+    ///       memberships wait on that watch. `InvalidInput` if `membership` is
     ///       not one of the three. Writes nothing, returning the reason, if a
     ///       user on `user_id`'s server is joined to `room_id`, or if `replaces`
     ///       is `Some` and the held row is not that event.
@@ -845,7 +846,8 @@ pub trait OobMembershipStore: Send + Sync {
     /// Pre:  none.
     /// Post: deletes the row for `(room_id, user_id)` if present and, when
     ///       `replaces` is `Some`, it holds that event; idempotent (a missing
-    ///       pair is a no-op).
+    ///       pair is a no-op). Wakes the persist watch's subscribers without
+    ///       advancing it, as `put_oob_membership` does.
     async fn remove_oob_membership(
         &self,
         room_id: &RoomId,
