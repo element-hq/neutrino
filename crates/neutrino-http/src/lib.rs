@@ -1610,12 +1610,30 @@ async fn get_room_keys() -> (StatusCode, Json<Value>) {
 }
 
 async fn create_room<S: Store>(
-    state: State<AppState<S>>,
+    State(state): State<AppState<S>>,
     AuthUser(sender): AuthUser,
-    body: Json<Value>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    // The request shouldn't be cancelled by the client, as it is non-atomic
+    // We still want to return errors that happen in the process, though.
+    match tokio::spawn(async move { run_create_room(&state, sender, &body).await }).await {
+        Ok(resp) => resp,
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &format!("createRoom task failed: {e}"),
+        ),
+    }
+}
+
+/// The createRoom logic proper, run detached from the request by [`create_room`].
+async fn run_create_room<S: Store>(
+    state: &AppState<S>,
+    sender: OwnedUserId,
+    body: &Value,
 ) -> axum::response::Response {
     let (store, own_server, policy) = {
-        let app = lock_app(&state.0);
+        let app = lock_app(state);
         (
             app.store.clone(),
             app.config.server_name.clone(),
@@ -1632,7 +1650,7 @@ async fn create_room<S: Store>(
     // the batch; remote invitees are federated separately below.
     let display_name = local_display_name(&*store).await;
     let (create, initial) =
-        match build_initial_events(&sender, &body.0, &own_server, &display_name, &policy) {
+        match build_initial_events(&sender, body, &own_server, &display_name, &policy) {
             Ok(batch) => batch,
             Err(e) => {
                 return error_response(
@@ -1663,12 +1681,12 @@ async fn create_room<S: Store>(
     // /federation/v2/invite) can deliver the invite. Local invitees already rode
     // the initial batch. Best-effort: the room is persisted, so a failed invite
     // is logged and left for the client to retry rather than unwinding the room.
-    for target in invite_targets(&sender, &body.0) {
+    for target in invite_targets(&sender, body) {
         if target.server_name().as_str() == own_server {
             continue;
         }
         let resp = crate::federation::invite::federated_invite(
-            &state.0,
+            state,
             sender.clone(),
             &room_id,
             &target,
