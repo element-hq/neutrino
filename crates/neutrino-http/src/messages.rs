@@ -142,6 +142,9 @@ async fn backfill_and_reread(
     }
 }
 
+/// # `GET /_matrix/client/v3/rooms/{roomId}/messages`
+///
+/// Gets a page of room history.
 pub(crate) async fn get_messages<S: Store>(
     state: State<AppState<S>>,
     AuthUser(user): AuthUser,

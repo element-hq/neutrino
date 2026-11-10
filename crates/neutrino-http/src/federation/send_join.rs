@@ -48,7 +48,9 @@ pub(crate) struct ResponseBody {
     event: Box<RawJsonValue>,
 }
 
-/// Federation `/send_join` handler.
+/// # `PUT /_matrix/federation/v2/send_join/{roomId}/{eventId}`
+///
+/// Accepts a remote user's join event and returns the room's state.
 ///
 /// The `{roomId}`/`{eventId}` path segments are IGNORED: the event body is
 /// authoritative for both (the event id is recomputed from the reference hash,

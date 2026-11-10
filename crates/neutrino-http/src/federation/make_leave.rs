@@ -42,7 +42,9 @@ pub(crate) struct ResponseBody {
     room_version: String,
 }
 
-/// Federation `/make_leave` handler.
+/// # `GET /_matrix/federation/v1/make_leave/{roomId}/{userId}`
+///
+/// Returns a leave event template for a remote user.
 ///
 /// 1. Parse `room_id` + `user_id` (400 JSON on a malformed id).
 /// 2. Room unknown → 404 `M_NOT_FOUND`.

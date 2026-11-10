@@ -173,13 +173,15 @@ async fn change_membership<S: Store>(
         .map_err(room_actor_response)
 }
 
-/// `POST /rooms/{roomId}/join` — the caller joins the room. Returns the room
-/// id per spec. Re-joining when already `join` is an idempotent `200` with no
-/// new event (Synapse `room_member.py:1015-1025`); without this short-circuit
-/// every call would stack a duplicate `m.room.member` join into the timeline.
-/// Only the `join` state is skipped — `invite`/`leave`/`ban`/absent all fall
-/// through so accepting an invite, re-joining after leaving, or a public join
-/// still emit an event (and `ban` is left for the auth rules to reject).
+/// # `POST /_matrix/client/v3/rooms/{roomId}/join`
+///
+/// The caller joins the room. Returns the room id per spec. Re-joining when
+/// already `join` is an idempotent `200` with no new event (Synapse
+/// `room_member.py:1015-1025`); without this short-circuit every call would stack
+/// a duplicate `m.room.member` join into the timeline. Only the `join` state is
+/// skipped — `invite`/`leave`/`ban`/absent all fall through so accepting an
+/// invite, re-joining after leaving, or a public join still emit an event (and
+/// `ban` is left for the auth rules to reject).
 pub(crate) async fn join<S: Store>(
     state: State<AppState<S>>,
     AuthUser(sender): AuthUser,
@@ -223,12 +225,14 @@ pub(crate) async fn join<S: Store>(
     }
 }
 
-/// `POST /rooms/{roomId}/leave` — the caller leaves the room. A room that was
-/// never created is `404 M_NOT_FOUND` (see [`require_room`]). For a room that
-/// exists, leaving is only defined from `invite`/`join`/`knock`; from any other
-/// state (never joined, already left, banned) the spec treats the call as a
-/// no-op success, so the handler short-circuits rather than emit an event the
-/// auth rules would reject as an invalid self-leave (rule 5.5.1 → 403).
+/// # `POST /_matrix/client/v3/rooms/{roomId}/leave`
+///
+/// The caller leaves the room. A room that was never created is `404
+/// M_NOT_FOUND` (see [`require_room`]). For a room that exists, leaving is only
+/// defined from `invite`/`join`/`knock`; from any other state (never joined,
+/// already left, banned) the spec treats the call as a no-op success, so the
+/// handler short-circuits rather than emit an event the auth rules would reject
+/// as an invalid self-leave (rule 5.5.1 → 403).
 pub(crate) async fn leave<S: Store>(
     state: State<AppState<S>>,
     AuthUser(sender): AuthUser,
@@ -301,17 +305,18 @@ pub(crate) async fn leave<S: Store>(
     }
 }
 
-/// `POST /join/{roomIdOrAlias}` — the global join endpoint most clients (and
-/// Complement's `MustJoinRoom`) use; for a room *id* it is the same operation as
-/// the room-scoped [`join`], so it delegates straight to it. We have no room
-/// directory, so any syntactically valid alias (`#…`) is unresolvable: we report
-/// `404 M_NOT_FOUND` ("No such room alias", matching Synapse) rather than the
-/// `400` a room-id parse would give, so clients see the alias as *unknown* not
-/// *malformed*. A string that is neither a valid id nor a valid alias still
-/// falls through to [`join`]'s `400`. The `via` query lists candidate
-/// resident servers: for a room we don't host they trigger a federated join
-/// (`federation::join::federated_join`); for a room we already host they are
-/// ignored (we are the resident).
+/// # `POST /_matrix/client/v3/join/{roomIdOrAlias}`
+///
+/// The global join endpoint most clients (and Complement's `MustJoinRoom`) use;
+/// for a room *id* it is the same operation as the room-scoped [`join`], so it
+/// delegates straight to it. We have no room directory, so any syntactically
+/// valid alias (`#…`) is unresolvable: we report `404 M_NOT_FOUND` ("No such room
+/// alias", matching Synapse) rather than the `400` a room-id parse would give, so
+/// clients see the alias as *unknown* not *malformed*. A string that is neither a
+/// valid id nor a valid alias still falls through to [`join`]'s `400`. The `via`
+/// query lists candidate resident servers: for a room we don't host they trigger
+/// a federated join (`federation::join::federated_join`); for a room we already
+/// host they are ignored (we are the resident).
 pub(crate) async fn join_by_id_or_alias<S: Store>(
     state: State<AppState<S>>,
     auth: AuthUser,
@@ -364,11 +369,13 @@ async fn targeted<S: Store>(
     }
 }
 
-/// `POST /rooms/{roomId}/invite` — invite `body.user_id` to the room. A
-/// **local** invitee emits an `m.room.member` event through the actor. A
-/// **remote** invitee (a v12 room id carries no server, so "remote"
-/// is decided by the target's domain vs ours) takes the federated path —
-/// `federation::invite::federated_invite` (federate-then-persist, atomic).
+/// # `POST /_matrix/client/v3/rooms/{roomId}/invite`
+///
+/// Invites `body.user_id` to the room. A **local** invitee emits an
+/// `m.room.member` event through the actor. A **remote** invitee (a v12 room id
+/// carries no server, so "remote" is decided by the target's domain vs ours)
+/// takes the federated path — `federation::invite::federated_invite`
+/// (federate-then-persist, atomic).
 pub(crate) async fn invite<S: Store>(
     state: State<AppState<S>>,
     AuthUser(sender): AuthUser,
@@ -407,13 +414,14 @@ pub(crate) async fn invite<S: Store>(
     }
 }
 
-/// `POST /rooms/{roomId}/kick` — force `body.user_id` to `leave`. A kick is only
-/// valid against a user who is in the room: if the target's current membership
-/// is `leave`/`ban` or they have no member event, Synapse 403s ("The target
-/// user is not in the room", `room_member.py:1027-1045`) rather than emitting a
-/// redundant `leave` (which v12 auth would otherwise accept from a powerful
-/// sender). We mirror that with a current-membership pre-check; only
-/// `join`/`invite`/`knock` are kickable.
+/// # `POST /_matrix/client/v3/rooms/{roomId}/kick`
+///
+/// Forces `body.user_id` to `leave`. A kick is only valid against a user who is
+/// in the room: if the target's current membership is `leave`/`ban` or they have
+/// no member event, Synapse 403s ("The target user is not in the room",
+/// `room_member.py:1027-1045`) rather than emitting a redundant `leave` (which
+/// v12 auth would otherwise accept from a powerful sender). We mirror that with a
+/// current-membership pre-check; only `join`/`invite`/`knock` are kickable.
 pub(crate) async fn kick<S: Store>(
     state: State<AppState<S>>,
     AuthUser(sender): AuthUser,
@@ -447,7 +455,9 @@ pub(crate) async fn kick<S: Store>(
     }
 }
 
-/// `POST /rooms/{roomId}/ban` — ban `body.user_id` from the room.
+/// # `POST /_matrix/client/v3/rooms/{roomId}/ban`
+///
+/// Bans `body.user_id` from the room.
 pub(crate) async fn ban<S: Store>(
     state: State<AppState<S>>,
     AuthUser(sender): AuthUser,
@@ -457,15 +467,17 @@ pub(crate) async fn ban<S: Store>(
     targeted(&state.0, sender, &room_id, body.as_ref(), "ban").await
 }
 
-/// `POST /rooms/{roomId}/unban` — lift a ban on `body.user_id` (membership
-/// returns to `leave`). A room that was never created is `404 M_NOT_FOUND` (see
-/// [`require_room`]): Synapse treats unban as a leave internally, so it hits the
-/// not-a-known-room 404 before any state check. For a room that exists, unban is
-/// defined purely as removing a ban, so the target must currently be `ban`:
-/// emitting a bare `leave` against a joined user would otherwise be accepted by
-/// the auth rules as a *kick* (the kick-vs-unban arm of rule 5.5 is selected
-/// from the target's current membership). We pre-check and reject the non-ban
-/// case with `403 M_BAD_STATE` (matching Synapse) rather than silently kick.
+/// # `POST /_matrix/client/v3/rooms/{roomId}/unban`
+///
+/// Lifts a ban on `body.user_id` (membership returns to `leave`). A room that
+/// was never created is `404 M_NOT_FOUND` (see [`require_room`]): Synapse treats
+/// unban as a leave internally, so it hits the not-a-known-room 404 before any
+/// state check. For a room that exists, unban is defined purely as removing a
+/// ban, so the target must currently be `ban`: emitting a bare `leave` against a
+/// joined user would otherwise be accepted by the auth rules as a *kick* (the
+/// kick-vs-unban arm of rule 5.5 is selected from the target's current
+/// membership). We pre-check and reject the non-ban case with `403 M_BAD_STATE`
+/// (matching Synapse) rather than silently kick.
 pub(crate) async fn unban<S: Store>(
     state: State<AppState<S>>,
     AuthUser(sender): AuthUser,

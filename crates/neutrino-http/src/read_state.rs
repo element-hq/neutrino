@@ -44,7 +44,9 @@ impl<S: Send + Sync, T: IncomingRequest> FromRequest<S> for RumaRequest<T> {
     }
 }
 
-/// `POST /_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}`.
+/// # `POST /_matrix/client/v3/rooms/{roomId}/receipt/{receiptType}/{eventId}`
+///
+/// Sets the user's receipt or fully-read marker at an event.
 pub(crate) async fn post_receipt<S: Store>(
     state: State<AppState<S>>,
     AuthUser(user): AuthUser,
@@ -82,7 +84,9 @@ pub(crate) async fn post_receipt<S: Store>(
     respond(written)
 }
 
-/// `POST /_matrix/client/v3/rooms/{room_id}/read_markers`.
+/// # `POST /_matrix/client/v3/rooms/{roomId}/read_markers`
+///
+/// Sets the user's fully-read marker and/or read receipts in a room.
 pub(crate) async fn post_read_markers<S: Store>(
     state: State<AppState<S>>,
     AuthUser(user): AuthUser,
@@ -108,7 +112,9 @@ pub(crate) async fn post_read_markers<S: Store>(
     respond(written)
 }
 
-/// `PUT /_matrix/client/v3/user/{user_id}/rooms/{room_id}/account_data/{type}`.
+/// # `PUT /_matrix/client/v3/user/{userId}/rooms/{roomId}/account_data/{type}`
+///
+/// Sets some per-room account data for the user.
 pub(crate) async fn put_room_account_data<S: Store>(
     state: State<AppState<S>>,
     AuthUser(user): AuthUser,
