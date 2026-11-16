@@ -18,6 +18,11 @@ use tokio::sync::mpsc;
 /// constant so the two halves can't drift.
 pub const MAX_PDUS_PER_TXN: usize = 50;
 
+/// Max serialized PDU bytes per outbound transaction, so a backlog crosses a
+/// slow link as several transactions that each finish within a request
+/// timeout. A single larger PDU still goes, alone.
+pub(crate) const MAX_TXN_PDU_BYTES: usize = 8 * 1024;
+
 /// Backoff floor after a transient failure (outbound delivery, inbound
 /// staging). Shared so the two retry loops can't drift.
 pub(crate) const BACKOFF_BASE: Duration = Duration::from_secs(1);
