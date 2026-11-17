@@ -598,6 +598,10 @@ fn build_router<S: Store>(state: &AppState<S>) -> Router {
             get(get_display_name).put(put_display_name),
         )
         .route(
+            "/_matrix/client/v3/profile/{user_id}/avatar_url",
+            put(put_avatar_url),
+        )
+        .route(
             "/_matrix/client/v3/user_directory/search",
             post(user_directory_search),
         )
@@ -1594,6 +1598,15 @@ async fn get_display_name<S: Store>(
         Some(dn) => Json(json!({ "displayname": dn })),
         None => Json(json!({})),
     }
+}
+
+/// # `PUT /_matrix/client/v3/profile/{userId}/avatar_url`
+///
+/// Stub: accepts and discards the avatar, since there is no media repository
+/// to serve it from
+/// (https://spec.matrix.org/v1.18/client-server-api/#put_matrixclientv3profileuseridavatar_url).
+async fn put_avatar_url() -> Json<Value> {
+    Json(json!({}))
 }
 
 /// # `GET /_matrix/client/v3/room_keys/version`
