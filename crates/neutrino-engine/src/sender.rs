@@ -1152,10 +1152,9 @@ mod tests {
         wait_drained(&store, &dest).await;
 
         let accepted = stub.accepted.lock().unwrap();
-        // 60 split as 50 + 10.
-        assert_eq!(accepted.len(), 2);
-        assert_eq!(accepted[0].len(), MAX_PDUS_PER_TXN);
-        assert_eq!(accepted[1].len(), 10);
+        // The byte budget may split earlier than the PDU cap.
+        assert!(accepted.len() >= 2);
+        assert!(accepted.iter().all(|txn| txn.len() <= MAX_PDUS_PER_TXN));
         // Order preserved across the chunk boundary.
         let delivered: Vec<String> = accepted.iter().flatten().map(body_of).collect();
         let expected: Vec<String> = (0..60).map(|i| format!("msg {i}")).collect();
