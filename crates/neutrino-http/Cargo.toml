@@ -31,7 +31,7 @@ tower-http = { version = "0.6.6", features = ["trace"] }
 
 async-trait.workspace = true
 rand.workspace = true
-ruma = { workspace = true, features = ["client-api-s", "unstable-msc4186"] }
+ruma = { workspace = true, features = ["client-api-s", "unstable-msc4186", "unstable-msc4262"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

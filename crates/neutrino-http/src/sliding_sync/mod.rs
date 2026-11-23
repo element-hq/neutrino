@@ -52,7 +52,7 @@ use ruma::OneTimeKeyAlgorithm;
 use ruma::OwnedRoomId;
 use ruma::UInt;
 use ruma::UserId;
-use ruma::api::client::sync::sync_events::v5;
+use ruma::api::client::sync::sync_events::msc4186;
 use ruma::events::AnyToDeviceEvent;
 use ruma::serde::Raw;
 use thiserror::Error;
@@ -61,12 +61,14 @@ use tokio_util::sync::CancellationToken;
 
 mod build;
 mod conn;
+mod profiles;
 mod receipts;
 
 #[cfg(test)]
 mod tests;
 
 use conn::{ConnEntry, ConnKey, ConnRegistry};
+pub use profiles::{FieldValues, HostProfiles};
 
 /// MSC4186 §"Connection Identifier": `conn_id` is max 16 chars on the wire.
 const MAX_CONN_ID_LEN: usize = 16;
@@ -134,6 +136,9 @@ pub struct SyncState<S> {
     /// the composition root; a client must *also* opt into the receipts
     /// extension to be sent any.
     pub delivery_receipts: bool,
+    /// The profile fields the host owns, served by the profiles extension.
+    /// Every change wakes the long-polls that asked for it.
+    pub host_profiles: tokio::sync::watch::Sender<HostProfiles>,
     /// Shared shutdown latch. When fired (via `CancellationToken::cancel`),
     /// every in-flight long-poll breaks out of its idle select so the connection
     /// is released promptly instead of waiting up to 30 s for its deadline.
@@ -146,6 +151,7 @@ impl<S> SyncState<S> {
             store,
             registry: ConnRegistry::new(),
             delivery_receipts: false,
+            host_profiles: tokio::sync::watch::Sender::default(),
             shutdown,
         }
     }
@@ -159,7 +165,7 @@ impl<S> SyncState<S> {
 /// membership.
 #[derive(Debug, Clone)]
 pub struct SyncResponse {
-    pub response: v5::Response,
+    pub response: msc4186::Response,
     pub memberships: BTreeMap<OwnedRoomId, Membership>,
 }
 
@@ -185,7 +191,7 @@ pub struct SyncResponse {
 pub async fn handle<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
-    req: v5::Request,
+    req: msc4186::Request,
 ) -> Result<SyncResponse, SyncError> {
     validate_request(&req)?;
 
@@ -253,6 +259,7 @@ pub async fn handle<S: StorageBackend>(
     // new data for this client without any new event behind it.
     let mut delivery_rx = state.store.subscribe_deliveries();
     let mut read_state_rx = state.store.subscribe_read_state();
+    let mut profiles_rx = state.host_profiles.subscribe();
 
     // Short wait while the prior holder (if any) observes the cancel above
     // and unwinds.
@@ -300,6 +307,7 @@ pub async fn handle<S: StorageBackend>(
     let wait_for_data = !initial_sync && !timeout.is_zero();
     let wants_read_state = req.extensions.receipts.enabled == Some(true)
         || req.extensions.account_data.enabled == Some(true);
+    let wants_profiles = req.extensions.profiles.enabled == Some(true);
 
     let mut final_resp = loop {
         let resp = build::build_response(state, user_id, &req, &mut conn_guard).await?;
@@ -337,6 +345,7 @@ pub async fn handle<S: StorageBackend>(
                 _ = rx.changed() => {}
                 _ = delivery_rx.changed(), if state.delivery_receipts => {}
                 _ = read_state_rx.changed(), if wants_read_state => {}
+                _ = profiles_rx.changed(), if wants_profiles => {}
             }
         };
         tokio::select! {
@@ -386,15 +395,15 @@ pub async fn handle<S: StorageBackend>(
 /// serialisation failure falls back to `0` which trivially won't match
 /// the stored hash, so the request gets re-processed; that's the safe
 /// direction.
-fn request_body_hash(req: &v5::Request) -> u64 {
+fn request_body_hash(req: &msc4186::Request) -> u64 {
     #[derive(serde::Serialize)]
     struct BodyView<'a> {
         conn_id: &'a Option<String>,
         txn_id: &'a Option<String>,
-        lists: &'a std::collections::BTreeMap<String, v5::request::List>,
+        lists: &'a std::collections::BTreeMap<String, msc4186::request::List>,
         room_subscriptions:
-            &'a std::collections::BTreeMap<ruma::OwnedRoomId, v5::request::RoomSubscription>,
-        extensions: &'a v5::request::Extensions,
+            &'a std::collections::BTreeMap<ruma::OwnedRoomId, msc4186::request::RoomSubscription>,
+        extensions: &'a msc4186::request::Extensions,
     }
     let view = BodyView {
         conn_id: &req.conn_id,
@@ -425,7 +434,7 @@ static BODY_HASH_BUILDER: LazyLock<RandomState> = LazyLock::new(RandomState::new
 /// MSC4186 shape limits applied at the request boundary. Anything that
 /// violates these returns `BadRequest` → HTTP 400 / `M_BAD_JSON` when the
 /// router wires it up.
-fn validate_request(req: &v5::Request) -> Result<(), SyncError> {
+fn validate_request(req: &msc4186::Request) -> Result<(), SyncError> {
     if let Some(id) = &req.conn_id
         && id.len() > MAX_CONN_ID_LEN
     {
@@ -455,7 +464,8 @@ fn clamp_timeout(req_timeout: Option<Duration>) -> Duration {
 /// the client right now (vs. continuing to wait in the long-poll loop).
 ///
 /// **Today's definition is deliberately narrow: a non-empty `rooms`, a
-/// non-empty receipts extension, or non-empty room account data.**
+/// non-empty profiles extension, a non-empty receipts extension, or non-empty
+/// room account data.**
 /// This is correct *only* for the current scope — the embedded server with
 /// stubbed extensions and no EDUs. The following signals do NOT cause this
 /// helper to return `true`, even though a fully-spec'd server would have to
@@ -476,8 +486,9 @@ fn clamp_timeout(req_timeout: Option<Duration>) -> Duration {
 /// If any of those signals ever gets a real implementation, this helper is
 /// the one place that needs to learn about them — or the loop will hold the
 /// connection open for events the response no longer reflects.
-fn has_data(resp: &v5::Response) -> bool {
+fn has_data(resp: &msc4186::Response) -> bool {
     !resp.rooms.is_empty()
+        || !resp.extensions.profiles.is_empty()
         || !resp.extensions.receipts.rooms.is_empty()
         || !resp.extensions.account_data.rooms.is_empty()
 }
@@ -488,9 +499,9 @@ fn has_data(resp: &v5::Response) -> bool {
 /// messages. The point is *shape* — Element and similar clients abort if
 /// these fields are absent on a sync they opted in to. Matches the legacy
 /// `sync()` handler's stub semantics.
-fn populate_extension_stubs(req_ext: &v5::request::Extensions, resp: &mut v5::Response) {
-    if req_ext.e2ee.enabled == Some(true) {
-        let mut e2ee = v5::response::E2EE::default();
+fn populate_extension_stubs(req_ext: &msc4186::request::Extensions, resp: &mut msc4186::Response) {
+    if req_ext.e2ee.enabled {
+        let mut e2ee = msc4186::response::E2EE::default();
         // Constant "we have 100 OTKs of this type" stub. Real number tracking
         // would require an OTK store, which is out of scope.
         e2ee.device_one_time_keys_count
@@ -498,10 +509,10 @@ fn populate_extension_stubs(req_ext: &v5::request::Extensions, resp: &mut v5::Re
         e2ee.device_unused_fallback_key_types = Some(vec![OneTimeKeyAlgorithm::SignedCurve25519]);
         resp.extensions.e2ee = e2ee;
     }
-    if req_ext.to_device.enabled == Some(true) {
+    if req_ext.to_device.enabled {
         // ruma v5's response types are `#[non_exhaustive]`; build via Default
         // and field assignment rather than struct literal.
-        let mut to_device = v5::response::ToDevice::default();
+        let mut to_device = msc4186::response::ToDevice::default();
         to_device.next_batch = "0".to_string();
         to_device.events = Vec::<Raw<AnyToDeviceEvent>>::new();
         resp.extensions.to_device = Some(to_device);

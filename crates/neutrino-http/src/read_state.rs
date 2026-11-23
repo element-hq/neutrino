@@ -9,10 +9,10 @@ use axum::{
     response::IntoResponse,
 };
 use neutrino_store::StorageError;
-use ruma::api::IncomingRequest;
 use ruma::api::client::config::set_room_account_data;
 use ruma::api::client::read_marker::set_read_marker;
 use ruma::api::client::receipt::create_receipt::{self, v3::ReceiptType};
+use ruma::api::{IncomingRequest, IncomingRequestExt};
 use ruma::events::RoomAccountDataEventType;
 use ruma::events::fully_read::FullyReadEventContent;
 use ruma::events::receipt::ReceiptThread;
@@ -38,9 +38,13 @@ impl<S: Send + Sync, T: IncomingRequest> FromRequest<S> for RumaRequest<T> {
         let body = Bytes::from_request(Request::from_parts(parts.clone(), body), state)
             .await
             .map_err(IntoResponse::into_response)?;
-        T::try_from_http_request(axum::http::Request::from_parts(parts, body), &path_args)
-            .map(Self)
-            .map_err(|e| error_response(StatusCode::BAD_REQUEST, "M_BAD_JSON", &e.to_string()))
+        let path_args: Vec<&str> = path_args.iter().map(String::as_str).collect();
+        T::try_from_http_request(
+            axum::http::Request::from_parts(parts, &body[..]),
+            &path_args,
+        )
+        .map(Self)
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, "M_BAD_JSON", &e.to_string()))
     }
 }
 

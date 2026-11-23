@@ -3,7 +3,7 @@
 //! Three public functions:
 //!
 //! - [`parse_legacy_query`]: v3 query string → [`LegacyQuery`].
-//! - [`synthesize_v5_request`]: [`LegacyQuery`] → [`v5::Request`].
+//! - [`synthesize_v5_request`]: [`LegacyQuery`] → [`msc4186::Request`].
 //! - [`translate_response`]: [`SyncResponse`] → v3 JSON.
 //!
 //! The handler that ties them together lives in
@@ -16,7 +16,7 @@ use std::time::Duration;
 use crate::sliding_sync::SyncResponse;
 use neutrino_event::event_view;
 use neutrino_store::Membership;
-use ruma::api::client::sync::sync_events::v5;
+use ruma::api::client::sync::sync_events::msc4186;
 use ruma::events::{AnyStrippedStateEvent, StateEventType};
 use ruma::serde::Raw;
 use serde_json::{Value, json};
@@ -71,7 +71,7 @@ fn is_truthy(value: Option<&String>) -> bool {
         .unwrap_or(false)
 }
 
-/// Build the synthesized [`v5::Request`] from a parsed legacy query.
+/// Build the synthesized [`msc4186::Request`] from a parsed legacy query.
 ///
 /// Shape:
 /// - `pos` carries `query.since` verbatim,
@@ -91,8 +91,8 @@ fn is_truthy(value: Option<&String>) -> bool {
 ///   `required_state_matches` in `build.rs` — using the wildcard avoids
 ///   enumerating event types and matches what the existing tests
 ///   verify works.
-pub fn synthesize_v5_request(query: &LegacyQuery) -> v5::Request {
-    let mut req = v5::Request::new();
+pub fn synthesize_v5_request(query: &LegacyQuery) -> msc4186::Request {
+    let mut req = msc4186::Request::new();
     req.pos = query.since.clone();
     req.timeout = if query.timeout.is_zero() {
         None
@@ -101,10 +101,10 @@ pub fn synthesize_v5_request(query: &LegacyQuery) -> v5::Request {
     };
     req.conn_id = Some(LEGACY_CONN_ID.to_string());
 
-    let mut list = v5::request::List::default();
+    let mut list = msc4186::request::List::default();
     list.ranges = vec![(ruma::UInt::from(0u32), ruma::UInt::MAX)];
     // Wildcard required_state: verified to round-trip cleanly through ruma's
-    // `StateEventType` / `v5::Request` machinery — see the doc comment on
+    // `StateEventType` / `msc4186::Request` machinery — see the doc comment on
     // this function and the matching tests in `sliding_sync/tests.rs`.
     list.room_details.required_state = vec![(StateEventType::from("*"), "*".to_string())];
     list.room_details.timeline_limit = ruma::UInt::from(LEGACY_TIMELINE_LIMIT);
@@ -239,7 +239,7 @@ enum Bucket {
 
 /// Shape for a joined or left room. Both buckets use the identical shape;
 /// the difference is *which* outer key they live under.
-fn joined_room_shape(room: &v5::response::Room) -> Value {
+fn joined_room_shape(room: &msc4186::response::Room) -> Value {
     let state_events: Vec<&ruma::serde::Raw<ruma::events::AnySyncStateEvent>> =
         room.required_state.iter().collect();
     json!({
@@ -261,7 +261,7 @@ fn joined_room_shape(room: &v5::response::Room) -> Value {
 
 /// Shape for an invited room. v5's `invite_state` is already stripped state;
 /// pass it through verbatim under `invite_state.events`.
-fn invite_room_shape(room: &v5::response::Room) -> Value {
+fn invite_room_shape(room: &msc4186::response::Room) -> Value {
     let events: &[ruma::serde::Raw<ruma::events::AnyStrippedStateEvent>] =
         room.invite_state.as_deref().unwrap_or(&[]);
     json!({
@@ -278,7 +278,7 @@ fn invite_room_shape(room: &v5::response::Room) -> Value {
 /// lives there. Each entry is reshaped through [`strip_state_event`] so the
 /// emitted `knock_state.events` carries only the four canonical stripped
 /// fields, matching the v3 spec.
-fn knock_room_shape(room: &v5::response::Room) -> Value {
+fn knock_room_shape(room: &msc4186::response::Room) -> Value {
     // `strip_state_event` is infallible and `Raw<T>` already implements
     // `Serialize`, so the typed vec goes straight to `json!`.
     //
@@ -476,9 +476,12 @@ mod tests {
 
     // ----- translate_response --------------------------------------------
 
-    /// Build a `v5::Response` with `pos = pos` and the supplied rooms.
-    fn make_response(pos: &str, rooms: Vec<(OwnedRoomId, v5::response::Room)>) -> v5::Response {
-        let mut resp = v5::Response::new(pos.to_string());
+    /// Build a `msc4186::Response` with `pos = pos` and the supplied rooms.
+    fn make_response(
+        pos: &str,
+        rooms: Vec<(OwnedRoomId, msc4186::response::Room)>,
+    ) -> msc4186::Response {
+        let mut resp = msc4186::Response::new(pos.to_string());
         for (room_id, room) in rooms {
             resp.rooms.insert(room_id, room);
         }
@@ -487,7 +490,7 @@ mod tests {
 
     /// Pair a v5 response with the memberships the builder would have read.
     fn with_memberships(
-        response: v5::Response,
+        response: msc4186::Response,
         memberships: BTreeMap<OwnedRoomId, Membership>,
     ) -> SyncResponse {
         SyncResponse {
@@ -496,12 +499,12 @@ mod tests {
         }
     }
 
-    /// Build a minimal `v5::response::Room` carrying one timeline event
+    /// Build a minimal `msc4186::response::Room` carrying one timeline event
     /// (`type = "m.room.message"`) and one required_state event
     /// (`m.room.name`). Returns the room plus the JSON snippets so tests
     /// can assert on shape.
-    fn joined_room() -> v5::response::Room {
-        let mut r = v5::response::Room::new();
+    fn joined_room() -> msc4186::response::Room {
+        let mut r = msc4186::response::Room::new();
         r.timeline = vec![ruma::serde::Raw::from_json(
             to_raw_value(&json!({
                 "type": "m.room.message",
@@ -521,11 +524,11 @@ mod tests {
         r
     }
 
-    /// Build a minimal invite-shape `v5::response::Room`. The v5 type
+    /// Build a minimal invite-shape `msc4186::response::Room`. The v5 type
     /// uses `Vec<Raw<AnyStrippedStateEvent>>` for invite_state, so we
     /// pre-strip the events.
-    fn invite_room() -> v5::response::Room {
-        let mut r = v5::response::Room::new();
+    fn invite_room() -> msc4186::response::Room {
+        let mut r = msc4186::response::Room::new();
         let stripped: Raw<AnyStrippedStateEvent> = Raw::from_json(
             to_raw_value(&json!({
                 "type": "m.room.member",
@@ -609,7 +612,7 @@ mod tests {
         // Build a room whose required_state event carries the full set of
         // server-side fields. Stripping must drop event_id, origin_server_ts,
         // unsigned, prev_content and room_id, keeping only the canonical four.
-        let mut room = v5::response::Room::new();
+        let mut room = msc4186::response::Room::new();
         room.required_state = vec![ruma::serde::Raw::from_json(
             to_raw_value(&json!({
                 "type": "m.room.member",

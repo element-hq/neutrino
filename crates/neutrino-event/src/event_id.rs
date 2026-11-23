@@ -18,7 +18,7 @@
 use base64::Engine;
 use base64::engine::general_purpose;
 use ruma::canonical_json::{
-    CanonicalJsonObject, CanonicalJsonValue, RedactionError, redact_in_place,
+    CanonicalJsonFieldError, CanonicalJsonObject, CanonicalJsonValue, redact_in_place,
 };
 use ruma::{EventId, OwnedEventId, OwnedRoomId};
 use sha2::{Digest, Sha256};
@@ -78,7 +78,7 @@ pub(crate) fn b64_url_unpadded(bytes: &[u8]) -> String {
 pub(crate) fn redact_for_hash(
     obj: &mut CanonicalJsonObject,
     version: &RoomVersion,
-) -> Result<(), RedactionError> {
+) -> Result<(), CanonicalJsonFieldError> {
     // Only the keys actually present are touched; a version with nothing to
     // preserve (or an event carrying none of them) allocates nothing.
     let saved: Vec<(&'static str, CanonicalJsonValue)> = version
@@ -119,7 +119,7 @@ pub fn content_hash(obj: &CanonicalJsonObject) -> [u8; 32] {
 pub fn reference_hash(
     obj: &CanonicalJsonObject,
     version: &RoomVersion,
-) -> Result<[u8; 32], RedactionError> {
+) -> Result<[u8; 32], CanonicalJsonFieldError> {
     Ok(sha256(&redact_to_canonical_bytes(obj, version)?))
 }
 
@@ -134,12 +134,12 @@ pub fn reference_hash(
 /// the supplied content, then the receiving server must redact the event
 /// before accepting it").
 ///
-/// Returns `RedactionError` only if the input violates ruma's redaction
+/// Returns `CanonicalJsonFieldError` only if the input violates ruma's redaction
 /// preconditions (non-object `content`/`hashes`/`signatures`, missing `type`).
 pub fn redact_to_canonical_bytes(
     obj: &CanonicalJsonObject,
     version: &RoomVersion,
-) -> Result<Vec<u8>, RedactionError> {
+) -> Result<Vec<u8>, CanonicalJsonFieldError> {
     let mut clone = obj.clone();
     redact_for_hash(&mut clone, version)?;
     clone.remove("signatures");
@@ -282,7 +282,7 @@ pub enum EventIdError {
     /// non-object `content`/`hashes`/`signatures`) — only the reference-hash
     /// scheme can raise this.
     #[error("redaction precondition failed: {0}")]
-    Redaction(RedactionError),
+    Redaction(CanonicalJsonFieldError),
 
     /// The scheme's own inputs are missing or malformed on this event.
     #[error("event id scheme: {0}")]
@@ -592,7 +592,7 @@ mod tests {
         let err =
             reference_hash(&o, base_version()).expect_err("missing `type` must trip redaction");
         assert!(
-            matches!(err, RedactionError::MissingField { ref path } if path == "type"),
+            matches!(err, CanonicalJsonFieldError::Missing { ref path } if path == "type"),
             "expected MissingField {{ path: \"type\" }}, got {err:?}",
         );
     }
