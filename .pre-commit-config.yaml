@@ -1,0 +1,103 @@
+# Local pre-commit hooks. See https://prek.j178.dev/installation/
+#
+#   prek install            # installs the pre-commit and pre-push hooks
+#   prek run --all-files    # run the pre-commit hooks against everything
+#   prek run --all-files --hook-stage pre-push
+#   prek run --all-files --hook-stage manual   # docker/NDK jobs, see bottom
+#
+# Formatting runs on commit against the changed files only; clippy, tests and
+# the convergence fuzzer run on push.
+
+default_install_hook_types: [pre-commit, pre-push]
+default_stages: [pre-commit]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-illegal-windows-names
+      - id: check-added-large-files
+      - id: fix-byte-order-marker
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+        exclude_types: [rust]  # `#![...]` inner attributes look like shebangs
+      - id: check-toml
+      - id: check-yaml
+      - id: detect-private-key
+        exclude: ^vendor/coap-rs/tests/test_certs/
+
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.16.3
+    hooks:
+      # Without GH_TOKEN this skips the online audits that CI also runs.
+      - id: zizmor
+
+  - repo: local
+    hooks:
+      # CI: fmt (`cargo fmt --check`), on the changed files only.
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo +nightly fmt --
+        language: system
+        types: [rust]
+
+      # CI: clippy
+      - id: clippy
+        name: cargo clippy
+        entry: cargo clippy -- -D warnings
+        language: system
+        types_or: [rust, toml]
+        pass_filenames: false
+        stages: [pre-push]
+      - id: clippy-multi-user-shim
+        name: cargo clippy (neutrino-http, multi-user-shim)
+        entry: cargo clippy -p neutrino-http --tests --features multi-user-shim -- -D warnings
+        language: system
+        types_or: [rust, toml]
+        pass_filenames: false
+        stages: [pre-push]
+
+      # CI: test
+      - id: nextest
+        name: cargo nextest run
+        entry: cargo nextest run
+        language: system
+        types_or: [rust, toml]
+        pass_filenames: false
+        stages: [pre-push]
+      - id: nextest-multi-user-shim
+        name: cargo nextest run (neutrino-http, multi-user-shim)
+        entry: >-
+          bash -c 'cargo nextest run -p neutrino-http --features multi-user-shim --lib multi_user
+          && cargo nextest run -p neutrino-http --features multi-user-shim --test e2e_multi_user'
+        language: system
+        types_or: [rust, toml]
+        pass_filenames: false
+        stages: [pre-push]
+
+      # CI: converge
+      - id: converge
+        name: convergence fuzzer
+        entry: env EPISODES=4 ROUNDS_PER_EPISODE=12 CRASH_PROB=15 cargo run -p converge
+        language: system
+        types_or: [rust, toml]
+        pass_filenames: false
+        stages: [pre-push]
+
+      # CI: complement. Needs docker and Go, so it is manual-only.
+      - id: complement
+        name: complement
+        entry: cargo xtask complement
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [manual]
+
+      # CI: ffi-downstream (needs a neutrino-iroh checkout, the Android NDK and
+      # cargo-ndk) is not mirrored here.
