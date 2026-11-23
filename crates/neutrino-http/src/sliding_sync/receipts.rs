@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 
 use neutrino_store::{Delivery, DeliveryPos, OwnReceipt, StorageBackend, StorageError};
-use ruma::api::client::sync::sync_events::v5::response;
+use ruma::api::client::sync::sync_events::msc4186::response;
 use ruma::events::receipt::{
     Receipt, ReceiptEventContent, ReceiptThread, ReceiptType, SyncReceiptEvent,
 };

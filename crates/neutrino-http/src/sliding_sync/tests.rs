@@ -5,7 +5,7 @@ use neutrino_event::ROOM_VERSION_ID;
 use neutrino_event::event_id::base_version_event_id;
 use neutrino_store::{Event, EventStore, OobMembershipStore, RoomStore};
 use neutrino_store_sqlite::SqliteStore;
-use ruma::api::client::sync::sync_events::v5::{Request, request};
+use ruma::api::client::sync::sync_events::msc4186::{Request, request};
 use ruma::events::StateEventType;
 use ruma::{OwnedRoomId, RoomId, UInt, UserId, room_id, user_id};
 use serde_json::Value;
@@ -1779,7 +1779,7 @@ async fn e2ee_extension_echoed_when_enabled() {
     let user = user_id!("@alice:example.org");
 
     let mut req = Request::new();
-    req.extensions.e2ee.enabled = Some(true);
+    req.extensions.e2ee.enabled = true;
     let resp = handle(&state, user, req).await.unwrap().response;
 
     assert!(
@@ -1801,7 +1801,7 @@ async fn to_device_extension_echoed_when_enabled() {
     let user = user_id!("@alice:example.org");
 
     let mut req = Request::new();
-    req.extensions.to_device.enabled = Some(true);
+    req.extensions.to_device.enabled = true;
     let resp = handle(&state, user, req).await.unwrap().response;
 
     let to_device = resp
@@ -3203,7 +3203,7 @@ fn req_with_receipts(lists: BTreeMap<String, request::List>) -> Request {
 /// The `{user: ts}` map of an `m.read` receipt for `event_id` in `room`'s
 /// receipts extension entry, or `None` if there is no such entry.
 fn read_receipt_users(
-    resp: &ruma::api::client::sync::sync_events::v5::Response,
+    resp: &ruma::api::client::sync::sync_events::msc4186::Response,
     room: &RoomId,
     event_id: &ruma::EventId,
 ) -> Option<BTreeMap<String, u64>> {
@@ -3521,4 +3521,133 @@ async fn own_receipt_merges_with_a_delivery_receipt() {
             ("@bob:peer.test".to_owned(), 5),
         ]),
     );
+}
+
+// -----------------------------------------------------------------------------
+// Profiles extension (MSC4262): host-owned profile fields.
+// -----------------------------------------------------------------------------
+
+const STATUS: &str = "org.matrix.msc4426.status";
+
+fn req_with_profiles() -> Request {
+    let mut req = Request::new();
+    req.extensions.profiles.enabled = Some(true);
+    req
+}
+
+fn set_status(state: &SyncState<SqliteStore>, values: &[(&UserId, Value)]) {
+    let values = values
+        .iter()
+        .map(|(user, value)| ((*user).to_owned(), value.clone()))
+        .collect();
+    state.host_profiles.send_modify(|profiles| {
+        profiles.insert(STATUS.into(), values);
+    });
+}
+
+fn profile_json(resp: &super::SyncResponse) -> Value {
+    serde_json::to_value(&resp.response.extensions.profiles.users).unwrap()
+}
+
+/// A connection is first told a field's value for the users that have it,
+/// and its removal for every other room member, so a value the client kept
+/// from an earlier run cannot outlive it.
+#[tokio::test]
+async fn profiles_first_report_clears_members_without_the_field() {
+    let (store, _tmp) = fresh_store().await;
+    let alice = user_id!("@alice:example.org");
+    let bob = user_id!("@bob:peer.test");
+    let carol = user_id!("@carol:other.test");
+    let room = room_id!("!room:example.org");
+    room_with_remote_member(&store, room, alice, bob).await;
+    seed_member(&store, room, carol, carol, "join", 60).await;
+
+    let state = SyncState::new(store, no_shutdown());
+    set_status(
+        &state,
+        &[(
+            bob,
+            serde_json::json!({"text": "12 m away", "emoji": "12 m"}),
+        )],
+    );
+
+    let resp = handle(&state, alice, req_with_profiles()).await.unwrap();
+    assert_eq!(
+        profile_json(&resp),
+        serde_json::json!({
+            "@alice:example.org": { "removed": [STATUS] },
+            "@bob:peer.test": { "updated": { STATUS: {"text": "12 m away", "emoji": "12 m"} } },
+            "@carol:other.test": { "removed": [STATUS] },
+        })
+    );
+}
+
+/// Later syncs carry only what changed, and a change wakes the long-poll.
+#[tokio::test]
+async fn profiles_changes_are_incremental_and_wake_the_long_poll() {
+    let (store, _tmp) = fresh_store().await;
+    let alice = user_id!("@alice:example.org");
+    let bob = user_id!("@bob:peer.test");
+    let room = room_id!("!room:example.org");
+    room_with_remote_member(&store, room, alice, bob).await;
+
+    let state = Arc::new(SyncState::new(store, no_shutdown()));
+    set_status(
+        &state,
+        &[(bob, serde_json::json!({"text": "", "emoji": "5 m"}))],
+    );
+    let resp1 = handle(&state, alice, req_with_profiles()).await.unwrap();
+
+    // Unchanged: nothing to report, so the poll runs to its timeout.
+    let mut req2 = req_with_profiles();
+    req2.pos = Some(resp1.response.pos.clone());
+    req2.timeout = Some(std::time::Duration::from_millis(100));
+    let resp2 = handle(&state, alice, req2).await.unwrap();
+    assert!(
+        resp2.response.extensions.profiles.is_empty(),
+        "{:?}",
+        resp2.response.extensions.profiles
+    );
+
+    let waker = tokio::spawn({
+        let state = state.clone();
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            set_status(&state, &[]);
+        }
+    });
+    let mut req3 = req_with_profiles();
+    req3.pos = Some(resp2.response.pos.clone());
+    req3.timeout = Some(std::time::Duration::from_millis(2000));
+    let start = std::time::Instant::now();
+    let resp3 = handle(&state, alice, req3).await.unwrap();
+    waker.await.unwrap();
+
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(1500),
+        "should wake on the change, got {:?}",
+        start.elapsed()
+    );
+    assert_eq!(
+        profile_json(&resp3),
+        serde_json::json!({ "@bob:peer.test": { "removed": [STATUS] } })
+    );
+}
+
+/// A client that did not ask for the extension is never sent it.
+#[tokio::test]
+async fn profiles_need_the_extension() {
+    let (store, _tmp) = fresh_store().await;
+    let alice = user_id!("@alice:example.org");
+    let bob = user_id!("@bob:peer.test");
+    let room = room_id!("!room:example.org");
+    room_with_remote_member(&store, room, alice, bob).await;
+
+    let state = SyncState::new(store, no_shutdown());
+    set_status(
+        &state,
+        &[(bob, serde_json::json!({"text": "", "emoji": "5 m"}))],
+    );
+    let resp = handle(&state, alice, Request::new()).await.unwrap();
+    assert!(resp.response.extensions.profiles.is_empty());
 }

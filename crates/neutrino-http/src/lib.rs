@@ -23,8 +23,9 @@ use neutrino_room::CoreError;
 use neutrino_room::provider::InMemoryStateProvider;
 use neutrino_room::room_core::{Effect, RoomCore};
 use neutrino_store::{IdentityStore, StorageBackend, WithStateProvider};
-use ruma::api::client::sync::sync_events::v5;
+use ruma::api::client::sync::sync_events::msc4186;
 use ruma::events::AnyTimelineEvent;
+use ruma::profile::ProfileFieldName;
 use ruma::serde::Raw;
 use ruma::{OwnedRoomId, OwnedUserId};
 use serde::{Deserialize, Serialize};
@@ -420,6 +421,34 @@ impl<S: Store> AppState<S> {
         lock_app(self).kick_backoff.send_modify(|_| {});
     }
 
+    /// Replace one host-owned profile field's values. Entries whose user id or
+    /// JSON value does not parse are dropped.
+    fn replace_host_profile_field(&self, field: String, values: HashMap<String, String>) {
+        let field = ProfileFieldName::from(field);
+        let values: sliding_sync::FieldValues = values
+            .into_iter()
+            .filter_map(|(user, value)| {
+                match (user.parse::<OwnedUserId>(), serde_json::from_str(&value)) {
+                    (Ok(user), Ok(value)) => Some((user, value)),
+                    _ => {
+                        warn!(%field, %user, "host profile field: unparsable entry dropped");
+                        None
+                    }
+                }
+            })
+            .collect();
+        lock_app(self)
+            .sync_state
+            .host_profiles
+            .send_if_modified(|profiles| {
+                if profiles.get(&field) == Some(&values) {
+                    return false;
+                }
+                profiles.insert(field, values);
+                true
+            });
+    }
+
     /// A clone of the kick signal receiver, for a sender task spawned from
     /// `serve`. Mirrors [`AppState::subscribe_shutdown`].
     fn subscribe_kick(&self) -> watch::Receiver<()> {
@@ -523,6 +552,10 @@ fn handle<S: Store>(command: Command, state: &AppState<S>) -> ControlFlow<()> {
         // Must NOT fire the shutdown token (that would end `serve`).
         Command::KickBackoff => {
             state.kick_backoff();
+            ControlFlow::Continue(())
+        }
+        Command::ReplaceProfileField { field, values } => {
+            state.replace_host_profile_field(field, values);
             ControlFlow::Continue(())
         }
     }
@@ -1039,7 +1072,7 @@ async fn post_login<S: Store>(
 ///
 /// MSC4186 sliding sync. The actual work is in `sliding_sync::handle`; this
 /// wrapper handles the HTTP/JSON edge:
-/// - assembles a `v5::Request` from the JSON body plus query string (`pos`,
+/// - assembles a `msc4186::Request` from the JSON body plus query string (`pos`,
 ///   `timeout` live on the URL per ruma's annotations);
 /// - clones the `Arc<SyncState>` out from under the std-mutex'd `AppState`
 ///   so we don't hold a `!Send` lock across `.await`;
@@ -1168,20 +1201,20 @@ async fn dump_wedged_tasks() {
     );
 }
 
-/// Build a `v5::Request` from the JSON body plus the `pos` and `timeout`
+/// Build a `msc4186::Request` from the JSON body plus the `pos` and `timeout`
 /// query parameters. The body fields (`conn_id`, `txn_id`, `lists`,
 /// `room_subscriptions`, `extensions`) come from JSON; the query fields
 /// override whatever was in the body.
 ///
 /// Ruma's `#[request]` macro doesn't derive plain `Deserialize` on
-/// `v5::Request` (it generates an `IncomingRequest` impl meant for
+/// `msc4186::Request` (it generates an `IncomingRequest` impl meant for
 /// reconstructing the full HTTP request shape). The inner field types DO
 /// derive `Deserialize`, so we go through a thin wrapper that mirrors only
-/// the body-side fields and copy them onto a fresh `v5::Request`.
+/// the body-side fields and copy them onto a fresh `msc4186::Request`.
 fn build_sync_request(
     query: &HashMap<String, String>,
     body: Value,
-) -> Result<v5::Request, serde_json::Error> {
+) -> Result<msc4186::Request, serde_json::Error> {
     let body_typed: SyncRequestBody =
         if body.is_null() || matches!(&body, Value::Object(m) if m.is_empty()) {
             SyncRequestBody::default()
@@ -1189,7 +1222,7 @@ fn build_sync_request(
             serde_json::from_value(body)?
         };
 
-    let mut req = v5::Request::new();
+    let mut req = msc4186::Request::new();
     req.conn_id = body_typed.conn_id;
     req.txn_id = body_typed.txn_id;
     req.lists = body_typed.lists;
@@ -1207,7 +1240,7 @@ fn build_sync_request(
     Ok(req)
 }
 
-/// Deserializable mirror of the *body* half of `v5::Request`. The query
+/// Deserializable mirror of the *body* half of `msc4186::Request`. The query
 /// fields (`pos`, `timeout`, `set_presence`) are handled separately.
 #[derive(Default, Deserialize)]
 struct SyncRequestBody {
@@ -1216,14 +1249,14 @@ struct SyncRequestBody {
     #[serde(default)]
     txn_id: Option<String>,
     #[serde(default)]
-    lists: BTreeMap<String, v5::request::List>,
+    lists: BTreeMap<String, msc4186::request::List>,
     #[serde(default)]
-    room_subscriptions: BTreeMap<OwnedRoomId, v5::request::RoomSubscription>,
+    room_subscriptions: BTreeMap<OwnedRoomId, msc4186::request::RoomSubscription>,
     #[serde(default)]
-    extensions: v5::request::Extensions,
+    extensions: msc4186::request::Extensions,
 }
 
-/// Serializable mirror of `v5::Response`. Same trick — ruma's `#[response]`
+/// Serializable mirror of `msc4186::Response`. Same trick — ruma's `#[response]`
 /// macro doesn't derive plain `Serialize` on the outer type, but its inner
 /// field types do.
 #[derive(Serialize)]
@@ -1232,18 +1265,18 @@ struct SyncResponseWire {
     txn_id: Option<String>,
     pos: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    lists: BTreeMap<String, v5::response::List>,
+    lists: BTreeMap<String, msc4186::response::List>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    rooms: BTreeMap<OwnedRoomId, v5::response::Room>,
+    rooms: BTreeMap<OwnedRoomId, msc4186::response::Room>,
     // Ruma's own emptiness check, not a local one: it covers every extension
     // field it knows about, so a newly-populated extension (receipts) can't be
     // silently dropped here by a predicate that predates it.
-    #[serde(skip_serializing_if = "v5::response::Extensions::is_empty")]
-    extensions: v5::response::Extensions,
+    #[serde(skip_serializing_if = "msc4186::response::Extensions::is_empty")]
+    extensions: msc4186::response::Extensions,
 }
 
-impl From<v5::Response> for SyncResponseWire {
-    fn from(r: v5::Response) -> Self {
+impl From<msc4186::Response> for SyncResponseWire {
+    fn from(r: msc4186::Response) -> Self {
         Self {
             txn_id: r.txn_id,
             pos: r.pos,
@@ -1580,10 +1613,19 @@ async fn profile<S: Store>(
     state: State<AppState<S>>,
     axum::extract::Path(user_id): axum::extract::Path<String>,
 ) -> Json<Value> {
-    match resolve_display_name(&state.0, &user_id).await {
-        Some(dn) => Json(json!({ "displayname": dn })),
-        None => Json(json!({})),
+    let mut profile = serde_json::Map::new();
+    if let Some(dn) = resolve_display_name(&state.0, &user_id).await {
+        profile.insert("displayname".to_owned(), Value::String(dn));
     }
+    let host_profiles = lock_app(&state.0).sync_state.host_profiles.subscribe();
+    if let Ok(user) = user_id.parse::<OwnedUserId>() {
+        for (field, values) in host_profiles.borrow().iter() {
+            if let Some(value) = values.get(&user) {
+                profile.insert(field.as_str().to_owned(), value.clone());
+            }
+        }
+    }
+    Json(Value::Object(profile))
 }
 
 /// # `GET /_matrix/client/v3/profile/{userId}/displayname`
@@ -2257,9 +2299,9 @@ mod tests {
     /// discarding the synthesised receipt at the JSON edge.
     #[test]
     fn wire_keeps_a_receipts_only_extensions_object() {
-        use ruma::api::client::sync::sync_events::v5;
+        use ruma::api::client::sync::sync_events::msc4186;
 
-        let mut resp = v5::Response::new("1".to_owned());
+        let mut resp = msc4186::Response::new("1".to_owned());
         resp.extensions.receipts.rooms.insert(
             ruma::room_id!("!r:example.org").to_owned(),
             ruma::serde::Raw::new(&json!({ "type": "m.receipt", "content": {} }))
@@ -2616,6 +2658,42 @@ mod tests {
         .await
         .0;
         assert_eq!(body, json!({}));
+    }
+
+    /// A host-owned field reaches `/profile`; entries that do not parse are
+    /// dropped without losing the rest.
+    #[tokio::test]
+    async fn replaced_profile_field_is_served_by_profile() {
+        let (state, _tmp) = test_state().await;
+        let replace = Command::ReplaceProfileField {
+            field: "org.matrix.msc4426.status".to_owned(),
+            values: std::collections::HashMap::from([
+                (
+                    "@n:peernode".to_owned(),
+                    r#"{"text":"12 m away","emoji":"12 m"}"#.to_owned(),
+                ),
+                ("@n:badjson".to_owned(), "{".to_owned()),
+                ("not a user".to_owned(), "{}".to_owned()),
+            ]),
+        };
+        assert_eq!(handle(replace, &state), ControlFlow::Continue(()));
+
+        let body = super::profile(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("@n:peernode".to_string()),
+        )
+        .await
+        .0;
+        assert_eq!(
+            body,
+            json!({ "org.matrix.msc4426.status": {"text": "12 m away", "emoji": "12 m"} })
+        );
+        let fields = super::lock_app(&state)
+            .sync_state
+            .host_profiles
+            .borrow()
+            .clone();
+        assert_eq!(fields[&"org.matrix.msc4426.status".into()].len(), 1);
     }
 
     #[tokio::test]

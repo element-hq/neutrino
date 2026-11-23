@@ -587,16 +587,18 @@ fn id_error_to_format_error(err: EventIdError) -> FormatError {
     }
 }
 
-fn ref_hash_error_to_format_error(err: ruma::canonical_json::RedactionError) -> FormatError {
-    use ruma::canonical_json::RedactionError;
+fn ref_hash_error_to_format_error(
+    err: ruma::canonical_json::CanonicalJsonFieldError,
+) -> FormatError {
+    use ruma::canonical_json::CanonicalJsonFieldError;
     match err {
-        RedactionError::MissingField { path } if path == "type" => {
+        CanonicalJsonFieldError::Missing { path } if path == "type" => {
             // ruma's only documented `MissingField` here is the top-level
             // `type` field. Map to FormatError::MissingField for parity with
             // parse_event's vocabulary.
             FormatError::MissingField("type")
         }
-        RedactionError::InvalidType { path, .. } => {
+        CanonicalJsonFieldError::InvalidType { path, .. } => {
             // ruma's path values for redaction preconditions are one of
             // "type" / "content" / "hashes" / "signatures". Map to
             // InvalidFieldType with a static field name.
@@ -612,7 +614,7 @@ fn ref_hash_error_to_format_error(err: ruma::canonical_json::RedactionError) -> 
                 expected: "object",
             }
         }
-        // `RedactionError` is `#[non_exhaustive]`; any future variant lands
+        // `CanonicalJsonFieldError` is `#[non_exhaustive]`; any future variant lands
         // here as a generic wire-malformed signal.
         _ => FormatError::InvalidFieldType {
             field: "<root>",

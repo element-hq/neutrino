@@ -96,6 +96,10 @@ impl From<NeutrinoConfig> for neutrino_main::Config {
 pub enum Command {
     Shutdown,
     KickBackoff,
+    ReplaceProfileField {
+        field: String,
+        values: std::collections::HashMap<String, String>,
+    },
 }
 
 impl From<Command> for neutrino_main::Command {
@@ -103,6 +107,9 @@ impl From<Command> for neutrino_main::Command {
         match c {
             Command::Shutdown => neutrino_main::Command::Shutdown,
             Command::KickBackoff => neutrino_main::Command::KickBackoff,
+            Command::ReplaceProfileField { field, values } => {
+                neutrino_main::Command::ReplaceProfileField { field, values }
+            }
         }
     }
 }
@@ -191,6 +198,17 @@ impl NeutrinoHandle {
     /// connectivity is restored so backed-off destinations reconnect promptly.
     pub fn kick_backoff(&self) {
         self.command(Command::KickBackoff);
+    }
+
+    /// Replace one profile field for every user; `values` maps user ids to
+    /// JSON-encoded values. Convenience for
+    /// `command(Command::ReplaceProfileField { .. })`.
+    pub fn replace_profile_field(
+        &self,
+        field: String,
+        values: std::collections::HashMap<String, String>,
+    ) {
+        self.command(Command::ReplaceProfileField { field, values });
     }
 
     /// Who hears about events that may deserve a notification; `None` stops

@@ -9,6 +9,7 @@
 mod discovery;
 pub use discovery::{DiscoveredPeer, DiscoveryRegistry};
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -219,6 +220,14 @@ pub enum Command {
     /// of waiting out a long (up to the backoff cap) retry delay. Non-terminal:
     /// the server keeps running.
     KickBackoff,
+    /// Replace one profile field for every user: `values` maps user ids to
+    /// the field's JSON-encoded value, and users not in it lose the field.
+    /// Entries that do not parse are dropped. Not persistent.
+    /// Intended for information learned outside of Matrix
+    ReplaceProfileField {
+        field: String,
+        values: HashMap<String, String>,
+    },
 }
 
 /// Resolve the storage directory: the env value if present, else the

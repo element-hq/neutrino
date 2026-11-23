@@ -44,7 +44,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use ruma::canonical_json::{CanonicalJsonObject, CanonicalJsonValue, RedactionError};
+use ruma::canonical_json::{CanonicalJsonFieldError, CanonicalJsonObject, CanonicalJsonValue};
 use thiserror::Error;
 
 use crate::event_id::{b64_unpadded, canonical, redact_to_canonical_bytes};
@@ -111,7 +111,7 @@ impl EventSigner {
         &self,
         obj: &mut CanonicalJsonObject,
         version: &RoomVersion,
-    ) -> Result<(), RedactionError> {
+    ) -> Result<(), CanonicalJsonFieldError> {
         let bytes = redact_to_canonical_bytes(obj, version)?;
         self.attach(obj, self.sign_bytes(&bytes));
         Ok(())
@@ -262,7 +262,7 @@ pub enum VerifyError {
     /// The event violates redaction preconditions, so the signed byte string
     /// cannot even be computed.
     #[error("event is not redactable: {0}")]
-    Redaction(#[from] RedactionError),
+    Redaction(#[from] CanonicalJsonFieldError),
 }
 
 /// Why [`EventSigner::co_sign`] failed. Both variants are "can't happen" for
@@ -276,7 +276,7 @@ pub enum CoSignError {
     #[error("event raw root is not an object")]
     NonObjectRoot,
     #[error("event is not redactable: {0}")]
-    Redaction(#[from] RedactionError),
+    Redaction(#[from] CanonicalJsonFieldError),
 }
 
 /// Verify that `event` carries a valid signature by `origin` — the general
