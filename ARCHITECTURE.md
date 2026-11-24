@@ -96,6 +96,7 @@ Each states the rule, who keeps it, who relies on it, and what breaks without it
   - A 4xx drops the batch permanently; anything else backs off.
   - lb must preserve the status class, so its own failures map to 502.
   - A peer's 2xx on `/send` means "durably staged", and our handler only 4xxs a whole envelope. The per-PDU error map is ignored.
+  - Except over a medium's `GroupWire`: a 2xx there means "the medium owns delivery", and no peer may have the event yet. The medium repairs loss itself, from any holder's store, so the sender's outbox is not what makes delivery durable.
   - In gap-fill only 400 and 404 count as unfillable; anything else, including 403, retries.
 
 ### Lifecycle

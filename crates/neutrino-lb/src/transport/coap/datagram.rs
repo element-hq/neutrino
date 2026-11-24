@@ -197,6 +197,24 @@ pub trait LinkCodec: Send + Sync {
     }
 }
 
+/// A medium that delivers some requests to every peer at once, by its own
+/// protocol and with no per-peer exchange.
+///
+/// A response from [`GroupWire::send`] means the medium has taken over delivery
+/// of the request, not that any peer has handled it.
+#[async_trait]
+pub trait GroupWire: Send + Sync {
+    /// Whether the medium delivers `req` itself. Any other request runs as an
+    /// ordinary exchange with its destination.
+    fn takes(&self, req: &WireRequest) -> bool;
+    /// Deliver `req` to the group.
+    async fn send(&self, req: WireRequest) -> Result<WireResponse, WireError>;
+    /// Hand the requests the medium receives to `handler` until the medium
+    /// closes. The medium vouches for each request's `X-Matrix` origin: nothing
+    /// binds it to a source address on this path.
+    async fn serve(&self, handler: Arc<dyn WireHandler>);
+}
+
 /// The transport seam. The embedded composition injects an implementation
 /// keyed by an opaque [`LinkAddr`]; lb never names the concrete transport or
 /// interprets the address bytes. A single instance multiplexes BOTH directions
@@ -233,6 +251,11 @@ pub trait DatagramLink: Send + Sync {
     /// from its own address, as for a unicast request. Defaults to `None`.
     /// Decorators MUST delegate, or they hide the medium's group address.
     fn group_addr(&self, _dst: &[u8]) -> Option<LinkAddr> {
+        None
+    }
+    /// The medium's own group delivery, if it has one — see [`GroupWire`].
+    /// Defaults to `None`. Decorators MUST delegate, or they disable it.
+    fn group_wire(&self) -> Option<Arc<dyn GroupWire>> {
         None
     }
 }
@@ -771,6 +794,11 @@ impl WireClient for LinkCoapWireClient {
         if req.dest.is_empty() {
             return Err(WireError::Transport("empty destination address".to_owned()));
         }
+        if let Some(group) = self.hub.link().group_wire()
+            && group.takes(&req)
+        {
+            return group.send(req).await;
+        }
         if let Some(expected) = req.group_size
             && self.qblock.is_some()
             && let Some(group_addr) = self.hub.link().group_addr(req.dest.as_bytes())
@@ -848,6 +876,14 @@ impl WireServer for LinkCoapWireServer {
         shutdown: CancellationToken,
     ) -> Result<(), WireError> {
         let server = self.build_server().await?;
+        let group = self.hub.link().group_wire();
+        let group_handler = handler.clone();
+        let serve_group = async move {
+            if let Some(group) = group {
+                group.serve(group_handler).await;
+            }
+            std::future::pending::<()>().await
+        };
         let dispatch = Arc::new(CoapDispatch {
             handler,
             max_body_bytes: self.max_body_bytes,
@@ -864,6 +900,7 @@ impl WireServer for LinkCoapWireServer {
                 let dispatch = dispatch.clone();
                 async move { dispatch.handle(request).await }
             }) => r.map_err(|e| WireError::Serve(format!("coap serve: {e}"))),
+            _ = serve_group => Ok(()),
             _ = shutdown.cancelled() => Ok(()),
         }
     }
@@ -2357,5 +2394,74 @@ mod group_tests {
         assert!(c.is_err());
         let head_and_leisure = cfg().non_receive_timeout + cfg().leisure(3);
         assert!(waited >= head_and_leisure, "{waited:?}");
+    }
+
+    /// A link that carries nothing itself and offers a [`GroupWire`].
+    struct GroupOnly(Arc<Echo>);
+
+    /// Answers the requests it takes with their own body, and delivers one
+    /// request of its own to the handler it serves.
+    struct Echo;
+
+    #[async_trait]
+    impl GroupWire for Echo {
+        fn takes(&self, req: &WireRequest) -> bool {
+            req.group_size.is_some()
+        }
+
+        async fn send(&self, req: WireRequest) -> Result<WireResponse, WireError> {
+            Ok(WireResponse {
+                body: req.body,
+                ..Default::default()
+            })
+        }
+
+        async fn serve(&self, handler: Arc<dyn WireHandler>) {
+            handler.handle(grouped("b", b"heard", 2)).await;
+        }
+    }
+
+    #[async_trait]
+    impl DatagramLink for GroupOnly {
+        async fn send(&self, _dst: &[u8], _datagram: &[u8]) -> std::io::Result<()> {
+            Err(std::io::Error::other("nothing goes on this link"))
+        }
+
+        async fn recv(&self) -> Option<(LinkAddr, Vec<u8>)> {
+            std::future::pending().await
+        }
+
+        fn group_wire(&self) -> Option<Arc<dyn GroupWire>> {
+            Some(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_group_wire_takes_its_requests_off_the_link() {
+        let hub = Hub::new(Arc::new(GroupOnly(Arc::new(Echo))));
+        let client = LinkCoapWireClient::with_qblock(hub.clone(), Some(64), cfg());
+
+        let taken = client.send(grouped("b", b"body", 2)).await.unwrap();
+        assert_eq!(taken.body, b"body");
+
+        let mut ordinary = grouped("b", b"body", 2);
+        ordinary.group_size = None;
+        assert!(client.send(ordinary).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_group_wire_serves_the_ingress_handler() {
+        let peer = Arc::new(Peer {
+            name: "b",
+            answer: Answer::Name,
+            handled: AtomicUsize::new(0),
+        });
+        let hub = Hub::new(Arc::new(GroupOnly(Arc::new(Echo))));
+        let server = LinkCoapWireServer::with_qblock(hub, cfg());
+        let token = CancellationToken::new();
+        let _shutdown = token.clone().drop_guard();
+        tokio::spawn(server.serve(peer.clone(), token));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(peer.handled.load(Ordering::Relaxed), 1);
     }
 }

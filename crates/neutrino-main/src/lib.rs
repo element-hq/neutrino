@@ -11,11 +11,14 @@ pub use neutrino_event::Event;
 pub use neutrino_event::event_id::{EventIdError, EventIdScheme};
 pub use neutrino_event::{KeyResolver, NodeIdKeyResolver, RedactionKeys, RoomVersion, ruma};
 pub use neutrino_lb::{
-    CBOR_CONTENT_FORMAT, CaptureControl, CodecError, DatagramLink, LinkAddr, LinkCodec, LinkPacing,
-    LinkProfile, WireRequest, WireResponse,
+    CBOR_CONTENT_FORMAT, CaptureControl, CodecError, DatagramLink, GroupWire, LinkAddr, LinkCodec,
+    LinkPacing, LinkProfile, WireError, WireHandler, WireRequest, WireResponse, cbor_to_json,
+    json_to_cbor,
 };
 pub use neutrino_store::StorageError;
-pub use neutrino_store::{EventStore, Membership, OobMembershipStore, RoomStore, StreamPos};
+pub use neutrino_store::{
+    EventStore, Membership, OobMembershipStore, RoomStore, StateStore, StreamPos,
+};
 pub use neutrino_store_sqlite::{Error as SqliteError, SqliteStore, rusqlite};
 
 use std::future::Future;

@@ -50,12 +50,14 @@ pub mod ingress;
 pub mod transport;
 
 pub use capture::CaptureControl;
+pub use codec::{cbor_to_json, json_to_cbor};
 pub use error::LbError;
 pub use transport::coap::datagram::{
-    CodecError, DatagramLink, LinkAddr, LinkCodec, LinkPacing, LinkProfile,
+    CodecError, DatagramLink, GroupWire, LinkAddr, LinkCodec, LinkPacing, LinkProfile,
 };
 pub use transport::{
-    CBOR_CONTENT_FORMAT, DestinationResolver, DirectResolver, WireRequest, WireResponse,
+    CBOR_CONTENT_FORMAT, DestinationResolver, DirectResolver, WireError, WireHandler, WireRequest,
+    WireResponse,
 };
 
 use std::net::SocketAddr;
@@ -342,7 +344,7 @@ use crate::ingress::IngressHandler;
 use crate::transport::coap::datagram::{Hub, LinkCoapWireClient, LinkCoapWireServer};
 use crate::transport::coap::{CoapWireClient, CoapWireServer};
 use crate::transport::http::{HttpWireClient, HttpWireServer};
-use crate::transport::{WireClient, WireError, WireServer};
+use crate::transport::{WireClient, WireServer};
 
 /// Run both proxy halves until `shutdown` fires. Egress forwards local→wire
 /// (JSON→CBOR); ingress serves wire→local (CBOR→JSON→loopback upstream).
