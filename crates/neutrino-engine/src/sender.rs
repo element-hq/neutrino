@@ -65,7 +65,7 @@ use neutrino_event::{EventPolicy, now_ms};
 use crate::group::{GroupSend, GroupTags};
 use crate::ports::{FederationTransport, ForwardExtremities, MissingEventsFetcher, TransportError};
 use crate::reconcile;
-use crate::util::{BACKOFF_BASE, MAX_PDUS_PER_TXN, jitter, next_backoff};
+use crate::util::{BACKOFF_BASE, MAX_PDUS_PER_TXN, MAX_TXN_PDU_BYTES, jitter, next_backoff};
 
 /// Shared, cheaply-cloneable handles every sender task needs. Bundled so the
 /// per-destination signatures stay readable as the pool grows (mirrors
@@ -269,7 +269,7 @@ async fn run_destination<S: StorageBackend + 'static>(
                         .iter()
                         .position(|e| ctx.tags.tagged_for(&e.event_id, &dest))
                         .unwrap_or(batch.len());
-                    (&batch[..cut], None)
+                    (&batch[..pdus_within_bytes(&batch[..cut])], None)
                 }
             };
             if deliver_batch(&ctx, &dest, rows, group, &mut backoff, &mut kick_rx).await {
@@ -401,6 +401,19 @@ async fn send_transaction_with_retry<S: StorageBackend + 'static>(
             }
         }
     }
+}
+
+/// How many of `batch`'s leading PDUs fit in [`MAX_TXN_PDU_BYTES`]; at least
+/// one, so an oversized PDU still goes.
+fn pdus_within_bytes(batch: &[neutrino_event::Event]) -> usize {
+    let mut total = 0;
+    batch
+        .iter()
+        .position(|e| {
+            total += e.raw.get().len();
+            total > MAX_TXN_PDU_BYTES
+        })
+        .map_or(batch.len(), |over| over.max(1))
 }
 
 /// The event ids a transaction carrying `batch` tells its peer about by itself:
@@ -1139,14 +1152,35 @@ mod tests {
         wait_drained(&store, &dest).await;
 
         let accepted = stub.accepted.lock().unwrap();
-        // 60 split as 50 + 10.
-        assert_eq!(accepted.len(), 2);
-        assert_eq!(accepted[0].len(), MAX_PDUS_PER_TXN);
-        assert_eq!(accepted[1].len(), 10);
+        // The byte budget may split earlier than the PDU cap.
+        assert!(accepted.len() >= 2);
+        assert!(accepted.iter().all(|txn| txn.len() <= MAX_PDUS_PER_TXN));
         // Order preserved across the chunk boundary.
         let delivered: Vec<String> = accepted.iter().flatten().map(body_of).collect();
         let expected: Vec<String> = (0..60).map(|i| format!("msg {i}")).collect();
         assert_eq!(delivered, expected);
+    }
+
+    #[tokio::test]
+    async fn a_transaction_stops_at_the_byte_budget() {
+        let dest = peer();
+        let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 60).await;
+        let batch = store.pending_pdus(&dest, 60).await.unwrap();
+        let bytes = |rows: &[neutrino_event::Event]| -> usize {
+            rows.iter().map(|e| e.raw.get().len()).sum()
+        };
+        assert!(
+            bytes(&batch) > MAX_TXN_PDU_BYTES,
+            "fixture must exceed the budget"
+        );
+
+        let n: usize = pdus_within_bytes(&batch);
+        assert!(bytes(&batch[..n]) <= MAX_TXN_PDU_BYTES);
+        assert!(
+            bytes(&batch[..=n]) > MAX_TXN_PDU_BYTES,
+            "the budget is filled"
+        );
+        assert_eq!(pdus_within_bytes(&batch[..0]), 0);
     }
 
     #[tokio::test]
