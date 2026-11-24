@@ -5,8 +5,8 @@ use neutrino_store::{
     StorageBackend, StorageError, StreamPos,
 };
 use ruma::UInt;
-use ruma::api::client::sync::sync_events::v5::response;
-use ruma::api::client::sync::sync_events::v5::{Request, Response};
+use ruma::api::client::sync::sync_events::msc4186::response;
+use ruma::api::client::sync::sync_events::msc4186::{Request, Response};
 use ruma::events::{
     AnyRoomAccountDataEvent, AnyStrippedStateEvent, AnySyncStateEvent, AnySyncTimelineEvent,
     StateEventType,
@@ -16,7 +16,7 @@ use ruma::{OwnedRoomId, RoomId, UserId};
 use serde_json::value::RawValue;
 
 use super::conn::{Conn, ListCfg, RoomSent, SubCfg};
-use super::{SyncError, SyncResponse, SyncState, receipts};
+use super::{SyncError, SyncResponse, SyncState, profiles, receipts};
 
 /// One room's contribution to a response: the room, the state events it
 /// emitted (recorded on the connection so they are not re-sent) and the
@@ -206,6 +206,11 @@ pub(super) async fn build_response<S: StorageBackend>(
         if let Some(pos) = read_state.pos {
             conn.last_read_state_pos = conn.last_read_state_pos.max(pos.0);
         }
+    }
+    if req.extensions.profiles.enabled == Some(true) {
+        let (updates, sent) = profiles::build(state, user_id, &conn.profiles_sent).await?;
+        resp.extensions.profiles.users = updates;
+        conn.profiles_sent = sent;
     }
     Ok(SyncResponse {
         response: resp,

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use ruma::api::client::sync::sync_events::v5::request;
+use ruma::api::client::sync::sync_events::msc4186::request;
 use ruma::events::StateEventType;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 use tokio::sync::{Mutex, watch};
@@ -140,6 +140,8 @@ pub struct Conn {
     /// Includes the post-processing extension stubs so the cached response
     /// matches exactly what the client got the first time, byte-for-byte.
     pub last_response: Option<super::SyncResponse>,
+    /// The host-owned profile fields as this connection has been told them.
+    pub profiles_sent: super::HostProfiles,
 }
 
 impl Conn {

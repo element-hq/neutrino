@@ -7,11 +7,11 @@ FROM lukemathwalker/cargo-chef:latest-rust-1-slim-bookworm AS chef
 WORKDIR /src
 
 FROM chef AS planner
-# Use the pruned Complement workspace manifest (excludes neutrino-ffi, which
-# `neutrino` — the only bin built here — doesn't use; keeps uniffi out of the
-# cargo-chef recipe). `vendor/coap-rs` + `vendor/coap-lite` are copied:
-# neutrino-lb reaches both in-house forks by path dep.
-COPY docker/complement/Cargo.toml ./Cargo.toml
+# The recipe covers the whole workspace (neutrino-ffi included); cook and build
+# are scoped to `--bin neutrino`, so ffi's uniffi deps are never compiled.
+# `vendor/coap-rs` + `vendor/coap-lite` are copied: neutrino-lb reaches both
+# in-house forks by path dep.
+COPY Cargo.toml ./Cargo.toml
 COPY Cargo.lock ./Cargo.lock
 COPY crates ./crates
 COPY tools ./tools
@@ -36,7 +36,7 @@ COPY vendor/coap-lite ./vendor/coap-lite
 # uniffi[cli] dep transitively compiles uniffi_bindgen
 RUN cargo chef cook --release --recipe-path recipe.json --bin neutrino
 
-COPY docker/complement/Cargo.toml ./Cargo.toml
+COPY Cargo.toml ./Cargo.toml
 COPY Cargo.lock ./Cargo.lock
 COPY crates ./crates
 COPY tools ./tools
