@@ -142,7 +142,7 @@ async fn the_group_header_reaches_send_through_lb() {
                     format!(r#"X-Matrix origin="a",destination="{dest}""#),
                 );
         if let Some(group) = group {
-            req = req.header("X-Neutrino-Group", group);
+            req = req.header(neutrino_lb::GROUP_HEADER, group);
         }
         let body = json!({
             "origin": "a",

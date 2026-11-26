@@ -50,10 +50,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 use tracing::warn;
 
-use crate::federation::client::GROUP_HEADER;
 use crate::federation::{FedError, auth};
 use crate::{AppState, Store, lock_app};
 use neutrino_engine::{ForwardExtremities, reconcile};
+use neutrino_lb::GROUP_HEADER;
 
 /// Inbound federation transaction body.
 ///

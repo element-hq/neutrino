@@ -88,7 +88,6 @@ Each states the rule, who keeps it, who relies on it, and what breaks without it
   - lb egress strips it into `WireRequest.group_size`.
   - lb ingress synthesises it from the Group option.
   - The `/send` handler reads it.
-  - Both crates spell the name, and the copies must change together.
 - **`/send` answers 404 only to a Group-marked request for rooms we are not in.** lb withholds any response to a Group-marked request that comes back 404. Without that, a non-member's 404 would go on the air.
 - **Only the engine sender retries.**
   - A 4xx drops the batch permanently; anything else backs off.

@@ -8,9 +8,8 @@
 //! are recomputed per hop by the downstream HTTP client regardless.
 
 /// Marks a `/send` whose transmission is shared by a group of destinations;
-/// its value is the group's size. It exists only on loopback: the wire carries
+/// its value is the group's size. It never leaves the process: the wire carries
 /// it as the CoAP Group option, and lb always sets its value itself.
-/// `neutrino-http` spells the same name.
 pub const GROUP_HEADER: &str = "x-neutrino-group";
 
 /// Lowercase header names the proxy forwards verbatim. `authorization` carries

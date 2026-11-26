@@ -51,6 +51,7 @@ pub mod transport;
 
 pub use capture::CaptureControl;
 pub use error::LbError;
+pub use headers::GROUP_HEADER;
 pub use transport::coap::datagram::{
     CodecError, DatagramLink, LinkAddr, LinkCodec, LinkPacing, LinkProfile,
 };

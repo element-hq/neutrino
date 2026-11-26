@@ -19,6 +19,7 @@ use std::time::Duration;
 use std::collections::BTreeMap;
 
 use neutrino_event::{EventSigner, SIGNING_KEY_ID};
+use neutrino_lb::GROUP_HEADER;
 use reqwest::{Client, Method, Url};
 use ruma::canonical_json::{CanonicalJsonObject, CanonicalJsonValue};
 use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId, ServerName, UserId};
@@ -80,13 +81,6 @@ pub(crate) struct FederationClient {
     /// request's `X-Matrix` header carries `key`/`sig`.
     signer: Option<Arc<EventSigner>>,
 }
-
-/// Marks a `/send` as one of a group of copies of one transaction; the value is
-/// the group's size. It lives only on loopback: the `neutrino-lb` egress strips
-/// it, and the lb ingress sets it on a request that arrived as a group's shared
-/// transmission. Mirrored in `neutrino_lb::headers` (kept local on both sides —
-/// lb is deliberately not a dependency here).
-pub(crate) const GROUP_HEADER: &str = "X-Neutrino-Group";
 
 impl FederationClient {
     pub(crate) fn new(origin: String, proxy: Option<&str>) -> Self {
