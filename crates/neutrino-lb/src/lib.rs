@@ -44,13 +44,11 @@
 pub mod capture;
 pub mod codec;
 pub mod egress;
-mod error;
 mod headers;
 pub mod ingress;
 pub mod transport;
 
 pub use capture::CaptureControl;
-pub use error::LbError;
 pub use headers::GROUP_HEADER;
 pub use transport::coap::datagram::{
     CodecError, DatagramLink, LinkAddr, LinkCodec, LinkPacing, LinkProfile,
@@ -346,7 +344,7 @@ pub use egress::Egress;
 /// federation through, and the [`Ingress`] that serves peers. The wire
 /// transport is chosen by `config.wire`, over `config.link` when one is
 /// injected and a socket otherwise.
-pub fn start(config: LbConfig) -> Result<(Egress, Ingress), LbError> {
+pub fn start(config: LbConfig) -> Result<(Egress, Ingress), WireError> {
     let (client, server): (Arc<dyn WireClient>, ServeFn) = match (config.link, config.wire) {
         (None, WireKind::Http) => (
             Arc::new(HttpWireClient::new()),
@@ -412,9 +410,9 @@ pub fn start(config: LbConfig) -> Result<(Egress, Ingress), LbError> {
         }
         // The link carries CoAP datagrams keyed by link address, not HTTP.
         (Some(_), WireKind::Http) => {
-            return Err(LbError::from(WireError::Serve(
+            return Err(WireError::Serve(
                 "datagram link requires a CoAP wire kind".to_owned(),
-            )));
+            ));
         }
     };
     let resolver = config.resolver.unwrap_or_else(|| Arc::new(DirectResolver));
@@ -447,9 +445,9 @@ impl Ingress {
         self,
         upstream: axum::Router,
         shutdown: CancellationToken,
-    ) -> Result<(), LbError> {
+    ) -> Result<(), WireError> {
         let handler = Arc::new(IngressHandler::new(upstream, self.capture));
-        Ok((self.server)(handler, shutdown).await?)
+        (self.server)(handler, shutdown).await
     }
 }
 
@@ -577,7 +575,7 @@ mod serve_selection_tests {
     use super::*;
     use std::net::SocketAddr;
 
-    async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), LbError> {
+    async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), WireError> {
         start(config)?.1.serve(axum::Router::new(), shutdown).await
     }
 
@@ -640,7 +638,7 @@ mod serve_selection_tests {
         config.link = Some(Arc::new(ParkedLink));
         let err = serve(config, CancellationToken::new()).await;
         assert!(
-            matches!(err, Err(LbError::Wire(_))),
+            matches!(err, Err(WireError::Serve(_))),
             "HTTP wire over a link must error, got {err:?}"
         );
     }

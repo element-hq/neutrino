@@ -209,7 +209,7 @@ pub enum StartupError {
     #[error("invalid federation_proxy: {0}")]
     InvalidFederationProxy(String),
     #[error("neutrino-lb: {0}")]
-    Lb(#[from] neutrino_lb::LbError),
+    Lb(#[from] neutrino_lb::transport::WireError),
     #[error("neutrino-lb ingress stopped unexpectedly")]
     LbStopped,
 }
