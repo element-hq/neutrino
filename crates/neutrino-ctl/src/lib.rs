@@ -51,10 +51,9 @@ pub struct Config {
     /// those are the caller's responsibility (see `SqliteStore::open_in_dir`).
     pub storage_dir: PathBuf,
     /// Outbound federation proxy URL; `neutrino-http` routes every outbound
-    /// federation request through it (the destination rides in the URL host,
-    /// `~`-suffixed). `NEUTRINO_FEDERATION_PROXY` names an external egress (the
-    /// Complement image's TLS-upgrading proxy). `None` = direct federation
-    /// (the default).
+    /// federation request through it (the destination rides in the URL host).
+    /// `NEUTRINO_FEDERATION_PROXY` names an external egress (the Complement
+    /// image's TLS-upgrading proxy). `None` = direct federation (the default).
     pub federation_proxy: Option<String>,
     /// When set, `neutrino-main` runs a `neutrino-lb` sidecar **in-process**
     /// alongside the homeserver (the embedded-on-mobile target), with the CoAP

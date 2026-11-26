@@ -83,7 +83,6 @@ Each states the rule, who keeps it, who relies on it, and what breaks without it
   - In direct mode nothing guards it.
   - ⚠ An unspecified `bind_addr` (`0.0.0.0`, `::`) is accepted, and the listener then binds every interface.
 - **A configured `Config.federation_proxy` must parse** or startup fails (`AppState::validate_config`), never falling back to direct.
-- **Proxied URLs carry a `~` host suffix.** The federation client adds it and lb egress strips it; the two copies of this rule must change together.
 - **`X-Neutrino-Group` never leaves the process.**
   - http's client sets it on a grouped `/send`.
   - lb egress strips it into `WireRequest.group_size`.

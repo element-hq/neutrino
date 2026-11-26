@@ -12,13 +12,10 @@ of federation:
 - **Outbound** — neutrino's federation client is plaintext `http://` with no
   TLS backend, so the entrypoint sets `NEUTRINO_FEDERATION_PROXY` to
   `egress/main.go` on `127.0.0.1:18449`. neutrino carries the real destination
-  in the request authority with a `~` host sentinel
-  (`host.docker.internal~:12345`, `hs2~`); the egress strips it, defaults the
-  port to 8448 and re-issues the request over HTTPS verified against the
-  complement CA. Names resolve through `/etc/hosts` (the complement
-  host-gateway alias) and Docker's embedded DNS (peer containers). nginx
-  cannot play this role: its request-line parser rejects `~` in an
-  absolute-URI host, which is what an HTTP proxy receives.
+  in the request authority (`host.docker.internal:12345`, `hs2`); the egress
+  defaults the port to 8448 and re-issues the request over HTTPS verified
+  against the complement CA. Names resolve through `/etc/hosts` (the
+  complement host-gateway alias) and Docker's embedded DNS (peer containers).
 
 Runtime knobs (`ENV` in the Dockerfile, overridable — complement forwards host
 env under `COMPLEMENT_SHARE_ENV_PREFIX`): `NEUTRINO_TRUSTED_NETWORK=0` (signed

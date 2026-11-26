@@ -73,8 +73,6 @@ pub(crate) struct FederationClient {
     http: Client,
     /// This homeserver's own name, sent as the transaction `origin`.
     origin: String,
-    /// Whether outbound requests route through an HTTP proxy.
-    proxied: bool,
     /// The `neutrino-lb` egress every request is sent through instead of
     /// HTTP, when federation runs over lb.
     egress: Option<neutrino_lb::Egress>,
@@ -82,19 +80,6 @@ pub(crate) struct FederationClient {
     /// request's `X-Matrix` header carries `key`/`sig`.
     signer: Option<Arc<EventSigner>>,
 }
-
-/// Sentinel appended to the URL host on the proxied path, stripped by the
-/// `neutrino-lb` egress. The URL's authority cannot carry a destination
-/// `server_name` raw: reqwest's URL parser applies WHATWG host rules, which
-/// reinterpret an all-digit host as a legacy IPv4 numeric ("0104" →
-/// "0.0.0.68", octal) or reject it outright ("0189") — silently rewriting
-/// all numeric server names. A trailing `~` makes every host a
-/// plain reg-name the parser preserves byte-for-byte: `~` is URL-unreserved
-/// (never canonicalised or percent-encoded) and illegal in Matrix server
-/// names, so stripping it on receipt is unambiguous. Mirrored in
-/// `neutrino_lb::egress` (kept local on both sides — lb is deliberately not
-/// a dependency here).
-const HOST_SENTINEL: char = '~';
 
 /// Marks a `/send` as one of a group of copies of one transaction; the value is
 /// the group's size. It lives only on loopback: the `neutrino-lb` egress strips
@@ -112,7 +97,6 @@ impl FederationClient {
         // (see `neutrino_lb::install_crypto_provider`); install the provider
         // before building any client.
         neutrino_lb::install_crypto_provider();
-        let proxied = proxy.is_some();
         let mut builder = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT);
@@ -141,7 +125,6 @@ impl FederationClient {
         Self {
             http,
             origin,
-            proxied,
             egress: None,
             signer: None,
         }
@@ -160,21 +143,13 @@ impl FederationClient {
         self
     }
 
-    /// The authority for a request URL. Proxied or via the egress: the
-    /// destination with [`HOST_SENTINEL`] appended to its host — the URL only
-    /// ferries the request to the egress (which strips the sentinel), and the suffix keeps
-    /// numeric server names out of WHATWG's IPv4 reinterpretation. A bracketed
-    /// IPv6 literal gets no sentinel and needs none: brackets never hit the
-    /// numeric-host path (and a suffix would break the bracket syntax).
-    /// Direct: the real name verbatim, since reqwest dials it.
-    fn url_authority(&self, dest: &ServerName) -> String {
-        if !(self.proxied || self.egress.is_some()) || dest.host().starts_with('[') {
-            return dest.as_str().to_owned();
-        }
-        match dest.port() {
-            Some(port) => format!("{}{HOST_SENTINEL}:{port}", dest.host()),
-            None => format!("{}{HOST_SENTINEL}", dest.host()),
-        }
+    /// The scheme and authority of a request URL to `dest`. Through the egress
+    /// the URL is only parsed, never dialled, and a non-special scheme keeps its
+    /// host verbatim: `http`'s WHATWG host rules would read an all-digit server
+    /// name as an IPv4 address ("0104" → "0.0.0.68") or reject it ("0189").
+    fn base_url(&self, dest: &ServerName) -> String {
+        let scheme = if self.egress.is_some() { "lb" } else { "http" };
+        format!("{scheme}://{dest}")
     }
 
     /// A request to `dest` carrying `Authorization: X-Matrix …` and, when
@@ -258,7 +233,7 @@ impl FederationClient {
         dest: &ServerName,
     ) -> Result<CanonicalJsonObject, FederationClientError> {
         info!(target: "neutrino_http", %dest, "outbound GET /_matrix/key/v2/server");
-        let url = format!("http://{}/_matrix/key/v2/server", self.url_authority(dest));
+        let url = format!("{}/_matrix/key/v2/server", self.base_url(dest));
         let resp = self.send(self.http.get(&url)).await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "GET /key/v2/server").await);
@@ -306,8 +281,8 @@ impl FederationClient {
         // `txn_id` is locally generated (`{u64}-{u64}`) and `dest` is a
         // validated `ServerName`, so neither needs escaping in the path.
         let url = Url::parse(&format!(
-            "http://{}/_matrix/federation/v1/send/{txn_id}",
-            self.url_authority(dest)
+            "{}/_matrix/federation/v1/send/{txn_id}",
+            self.base_url(dest)
         ))
         .map_err(|_| FederationClientError::InvalidUrl)?;
         let body = TransactionRequest {
@@ -362,8 +337,8 @@ impl FederationClient {
         // slash (`…/get_missing_events//{room}`).
         info!(target: "neutrino_http", %dest, %room_id, limit, state_dag, include_latest_events, "outbound POST /_matrix/federation/v1/get_missing_events");
         let mut url = Url::parse(&format!(
-            "http://{}/_matrix/federation/v1/get_missing_events",
-            self.url_authority(dest)
+            "{}/_matrix/federation/v1/get_missing_events",
+            self.base_url(dest)
         ))
         .map_err(|_| FederationClientError::InvalidUrl)?;
         url.path_segments_mut()
@@ -410,8 +385,8 @@ impl FederationClient {
         // segment).
         info!(target: "neutrino_http", %dest, %room_id, limit, seeds = seeds.len(), "outbound GET /_matrix/federation/v1/backfill");
         let mut url = Url::parse(&format!(
-            "http://{}/_matrix/federation/v1/backfill",
-            self.url_authority(dest)
+            "{}/_matrix/federation/v1/backfill",
+            self.base_url(dest)
         ))
         .map_err(|_| FederationClientError::InvalidUrl)?;
         url.path_segments_mut()
@@ -451,8 +426,8 @@ impl FederationClient {
     ) -> Result<MakeJoinResponse, FederationClientError> {
         info!(target: "neutrino_http", %dest, %room_id, %user_id, "outbound GET /_matrix/federation/v1/make_join");
         let mut url = Url::parse(&format!(
-            "http://{}/_matrix/federation/v1/make_join",
-            self.url_authority(dest)
+            "{}/_matrix/federation/v1/make_join",
+            self.base_url(dest)
         ))
         .map_err(|_| FederationClientError::InvalidUrl)?;
         url.path_segments_mut()
@@ -487,8 +462,8 @@ impl FederationClient {
     ) -> Result<SendJoinResponse, FederationClientError> {
         info!(target: "neutrino_http", %dest, %room_id, %event_id, "outbound PUT /_matrix/federation/v2/send_join");
         let mut url = Url::parse(&format!(
-            "http://{}/_matrix/federation/v2/send_join",
-            self.url_authority(dest)
+            "{}/_matrix/federation/v2/send_join",
+            self.base_url(dest)
         ))
         .map_err(|_| FederationClientError::InvalidUrl)?;
         url.path_segments_mut()
@@ -522,8 +497,8 @@ impl FederationClient {
     ) -> Result<InviteResponse, FederationClientError> {
         info!(target: "neutrino_http", %dest, %room_id, %event_id, "outbound PUT /_matrix/federation/v2/invite");
         let mut url = Url::parse(&format!(
-            "http://{}/_matrix/federation/v2/invite",
-            self.url_authority(dest)
+            "{}/_matrix/federation/v2/invite",
+            self.base_url(dest)
         ))
         .map_err(|_| FederationClientError::InvalidUrl)?;
         url.path_segments_mut()
@@ -560,8 +535,8 @@ impl FederationClient {
     ) -> Result<MakeLeaveResponse, FederationClientError> {
         info!(target: "neutrino_http", %dest, %room_id, %user_id, "outbound GET /_matrix/federation/v1/make_leave");
         let mut url = Url::parse(&format!(
-            "http://{}/_matrix/federation/v1/make_leave",
-            self.url_authority(dest)
+            "{}/_matrix/federation/v1/make_leave",
+            self.base_url(dest)
         ))
         .map_err(|_| FederationClientError::InvalidUrl)?;
         url.path_segments_mut()
@@ -591,8 +566,8 @@ impl FederationClient {
     ) -> Result<(), FederationClientError> {
         info!(target: "neutrino_http", %dest, %room_id, %event_id, "outbound PUT /_matrix/federation/v2/send_leave");
         let mut url = Url::parse(&format!(
-            "http://{}/_matrix/federation/v2/send_leave",
-            self.url_authority(dest)
+            "{}/_matrix/federation/v2/send_leave",
+            self.base_url(dest)
         ))
         .map_err(|_| FederationClientError::InvalidUrl)?;
         url.path_segments_mut()
@@ -846,47 +821,38 @@ mod tests {
         RawJsonValue::from_string(json_str.to_owned()).unwrap()
     }
 
-    // The proxied URL authority carries the host sentinel so numeric server
-    // names survive reqwest's WHATWG host parsing ("0104" would otherwise
-    // canonicalise to "0.0.0.68" before the egress ever sees it); bracketed
-    // IPv6 literals are exempt (never numeric-parsed, and a suffix would break
-    // the bracket syntax). Direct mode must stay verbatim — reqwest dials it.
-    #[test]
-    fn url_authority_suffixes_the_host_only_when_proxied() {
-        let proxied = FederationClient::new("origin".to_owned(), Some("http://127.0.0.1:1"));
-        let direct = FederationClient::new("origin".to_owned(), None);
-        let name = |s: &str| <&ServerName>::try_from(s).unwrap().to_owned();
+    // Through the egress a numeric server name must reach lb verbatim, not as
+    // `http`'s IPv4 reading of it.
+    #[tokio::test]
+    async fn egress_receives_numeric_server_names_verbatim() {
+        use neutrino_lb::transport::{WireClient, WireError, WireRequest, WireResponse};
 
-        assert_eq!(proxied.url_authority(&name("0104")), "0104~");
-        assert_eq!(proxied.url_authority(&name("0104:5683")), "0104~:5683");
-        assert_eq!(
-            proxied.url_authority(&name("localhost:8448")),
-            "localhost~:8448"
-        );
-        assert_eq!(
-            proxied.url_authority(&name("[2001:db8::1]:8448")),
-            "[2001:db8::1]:8448"
-        );
-        assert_eq!(direct.url_authority(&name("0104")), "0104");
-        assert_eq!(
-            direct.url_authority(&name("localhost:8448")),
-            "localhost:8448"
-        );
-    }
+        #[derive(Default)]
+        struct Dests(Mutex<Vec<String>>);
 
-    // The whole reason the sentinel exists: prove the URL layer preserves a
-    // suffixed all-digit name where the bare one is rewritten or rejected.
-    #[test]
-    fn sentinel_defeats_whatwg_ipv4_reinterpretation() {
-        let mangled = Url::parse("http://0104/x").unwrap();
-        assert_eq!(mangled.host_str(), Some("0.0.0.68"), "the bug");
-        let kept = Url::parse("http://0104~/x").unwrap();
-        assert_eq!(kept.host_str(), Some("0104~"), "the fix");
-        assert!(Url::parse("http://0189/x").is_err());
-        assert_eq!(
-            Url::parse("http://0189~/x").unwrap().host_str(),
-            Some("0189~")
-        );
+        #[async_trait::async_trait]
+        impl WireClient for Dests {
+            async fn send(&self, req: WireRequest) -> Result<WireResponse, WireError> {
+                self.0.lock().unwrap().push(req.dest);
+                Ok(WireResponse {
+                    body: neutrino_lb::codec::json_to_cbor(b"{}").unwrap(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let dests = Arc::new(Dests::default());
+        let egress =
+            neutrino_lb::Egress::new(dests.clone(), Arc::new(neutrino_lb::DirectResolver), None);
+        let client = FederationClient::new("origin".to_owned(), None).with_egress(Some(egress));
+        for name in ["0104", "0189", "0104:5683"] {
+            let dest = <&ServerName>::try_from(name).unwrap();
+            client
+                .send_transaction(dest, "t", &[], &BTreeMap::new())
+                .await
+                .expect("send");
+        }
+        assert_eq!(*dests.0.lock().unwrap(), ["0104", "0189", "0104:5683"]);
     }
 
     #[tokio::test]

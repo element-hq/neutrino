@@ -2,10 +2,9 @@
 //
 // neutrino's federation client is plaintext `http://` with no TLS backend.
 // Pointed at this proxy via NEUTRINO_FEDERATION_PROXY, it carries the real
-// destination in the request authority with a `~` host sentinel
-// (`host.docker.internal~:12345` for a Complement federation server, `hs2~`
-// for a peer homeserver). This strips the sentinel, defaults the port to
-// 8448, and re-issues the request over HTTPS verified against the Complement
+// destination in the request authority (`host.docker.internal:12345` for a
+// Complement federation server, `hs2` for a peer homeserver). This defaults
+// the port to 8448, and re-issues the request over HTTPS verified against the Complement
 // CA. Name resolution is Go's: /etc/hosts (the Complement host-gateway alias)
 // and Docker's embedded DNS (peer container names).
 package main
@@ -18,7 +17,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"os"
-	"strings"
 	"time"
 )
 
@@ -27,7 +25,6 @@ const (
 	defaultCA     = "/complement/ca/ca.crt"
 	// Matrix federation port when the server name carries none.
 	defaultPort = "8448"
-	sentinel    = "~"
 )
 
 // destination maps a proxied request authority onto the HTTPS host:port to dial.
@@ -36,7 +33,7 @@ func destination(authority string) string {
 	if err != nil {
 		host, port = authority, defaultPort
 	}
-	return net.JoinHostPort(strings.TrimSuffix(host, sentinel), port)
+	return net.JoinHostPort(host, port)
 }
 
 func handler(roots *x509.CertPool) http.Handler {

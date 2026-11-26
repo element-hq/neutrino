@@ -1,9 +1,7 @@
 //! Egress: the local→wire half. Takes the homeserver's outbound federation
-//! requests in-process, each addressed by its absolute URI (`{dest}~/path` —
-//! the client suffixes the host with a sentinel so numeric server names
-//! survive reqwest's WHATWG host parsing; see [`strip_host_sentinel`]).
-//! It transcodes the JSON body to CBOR, hands it to the `WireClient`, and
-//! re-encodes the CBOR response to JSON.
+//! requests in-process, each addressed by its absolute URI. It transcodes the
+//! JSON body to CBOR, hands it to the `WireClient`, and re-encodes the CBOR
+//! response to JSON.
 
 use std::sync::Arc;
 
@@ -43,11 +41,7 @@ impl Egress {
     /// the homeserver's sender drops a 4xx permanently while it retries a 5xx.
     pub async fn send(&self, req: Request<Vec<u8>>) -> Response<Vec<u8>> {
         let (mut parts, json_body) = req.into_parts();
-        let Some(authority) = parts
-            .uri
-            .authority()
-            .map(|a| strip_host_sentinel(a.as_str()))
-        else {
+        let Some(authority) = parts.uri.authority().map(|a| a.as_str().to_owned()) else {
             warn!(uri = %parts.uri, "egress: request has no destination authority");
             return error_response(StatusCode::BAD_GATEWAY);
         };
@@ -174,33 +168,6 @@ fn error_response(status: StatusCode) -> Response<Vec<u8>> {
     resp
 }
 
-/// Undo the federation client's host sentinel: one trailing `~` on the host
-/// part of `authority` is stripped; everything else passes through verbatim.
-///
-/// The client appends `~` to the URL host on the proxied path because
-/// reqwest's WHATWG host parsing reinterprets an all-digit host as a legacy
-/// IPv4 numeric ("0104" → "0.0.0.68", octal) or rejects it ("0189"); the
-/// suffix makes every host a plain reg-name the parser preserves. `~` is
-/// URL-unreserved and illegal in Matrix server names, so a trailing one can
-/// only be the sentinel — stripping unconditionally is safe, and an
-/// un-suffixed authority (a bracketed IPv6 literal, or a non-reqwest caller)
-/// is untouched. Mirrored in `neutrino_http::federation::client` (kept local
-/// on both sides — this crate deliberately doesn't know the http crate).
-fn strip_host_sentinel(authority: &str) -> String {
-    // A bracketed IPv6 authority never carries the sentinel; `rsplit_once`
-    // would mis-split it, so pass it through before any port peeling.
-    if authority.starts_with('[') {
-        return authority.to_owned();
-    }
-    match authority.rsplit_once(':') {
-        Some((host, port)) => match host.strip_suffix('~') {
-            Some(host) => format!("{host}:{port}"),
-            None => authority.to_owned(),
-        },
-        None => authority.strip_suffix('~').unwrap_or(authority).to_owned(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,42 +286,6 @@ mod tests {
         // The wire client dials the resolver's output, not the raw authority.
         let seen = client.seen.lock().unwrap().clone().unwrap();
         assert_eq!(seen.dest, "rewritten[peer.example:8448]");
-    }
-
-    #[tokio::test]
-    async fn host_sentinel_is_stripped_from_the_destination() {
-        let client = Arc::new(RecordingClient::default());
-        let resp = egress(client.clone())
-            .send(put(
-                "http://0104~/_matrix/federation/v1/send/9",
-                br#"{"ping":true}"#,
-            ))
-            .await;
-        assert_eq!(resp.status(), 200);
-
-        let seen = client.seen.lock().unwrap().clone().unwrap();
-        assert_eq!(seen.dest, "0104", "sentinel stripped, name verbatim");
-    }
-
-    // The pure sentinel-stripping rules: one trailing `~` comes off the host
-    // (port preserved), everything without one — including bracketed IPv6
-    // authorities, which `rsplit_once(':')` would mis-split — is untouched.
-    #[test]
-    fn strip_host_sentinel_rules() {
-        assert_eq!(strip_host_sentinel("0104~"), "0104");
-        assert_eq!(strip_host_sentinel("0104~:5683"), "0104:5683");
-        assert_eq!(strip_host_sentinel("localhost~:8448"), "localhost:8448");
-        assert_eq!(strip_host_sentinel("192.168.1.5~:8448"), "192.168.1.5:8448");
-        // No sentinel → verbatim (direct callers, IPv6 literals).
-        assert_eq!(
-            strip_host_sentinel("peer.example:8448"),
-            "peer.example:8448"
-        );
-        assert_eq!(
-            strip_host_sentinel("[2001:db8::1]:8448"),
-            "[2001:db8::1]:8448"
-        );
-        assert_eq!(strip_host_sentinel("[::1]"), "[::1]");
     }
 
     // A WireClient that returns a chosen status and an undecodable body.
