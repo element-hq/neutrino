@@ -46,7 +46,7 @@ use serde_json::value::RawValue as RawJsonValue;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use crate::federation::client::{FederationClient, FederationClientError};
+use crate::federation::client::FederationClientError;
 use crate::federation::{FedError, auth, co_sign_if_signed};
 use crate::{AppState, Store, error_response, lock_app};
 use neutrino_engine::reconcile::server_in_room;
@@ -251,14 +251,13 @@ pub(crate) async fn federated_invite<S: Store>(
     target: &UserId,
     reason: Option<String>,
 ) -> Response {
-    let (store, registry, policy, own_server, federation_proxy) = {
+    let (store, registry, policy, client) = {
         let app = lock_app(state);
         (
             app.store.clone(),
             app.room_registry.clone(),
             app.policy.clone(),
-            app.config.server_name.clone(),
-            app.config.federation_proxy.clone(),
+            app.fed_client.clone(),
         )
     };
 
@@ -309,8 +308,6 @@ pub(crate) async fn federated_invite<S: Store>(
         }
     };
     let irs = build_invite_room_state(&*store, room_id, &sender).await;
-    let client = FederationClient::new(own_server, federation_proxy.as_deref())
-        .with_signer(policy.signer().cloned());
     let returned = match client
         .invite(
             target.server_name(),

@@ -745,10 +745,6 @@ impl FederationTransport for FederationClient {
 }
 
 /// [`FederationClient::get_missing_events`] with MSC4242 `state_dag: true`.
-/// Holds its own `FederationClient` (a separate reqwest pool from the sender
-/// pool's — see `AppState::from_store`: a second pool is cheap and avoids a
-/// derivable `App` field, and inbound-gap-fill origins differ from outbound
-/// destinations anyway).
 pub(crate) struct ReqwestFetcher {
     client: Arc<FederationClient>,
 }

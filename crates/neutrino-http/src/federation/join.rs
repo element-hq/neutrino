@@ -142,18 +142,15 @@ async fn run_join_dance<S: Store>(
     candidates: &[OwnedServerName],
     timeout: Duration,
 ) -> JoinOutcome {
-    let (store, worker_poke, policy, own_server, federation_proxy) = {
+    let (store, worker_poke, policy, client) = {
         let app = lock_app(state);
         (
             app.store.clone(),
             app.worker_poke.clone(),
             app.policy.clone(),
-            app.config.server_name.clone(),
-            app.config.federation_proxy.clone(),
+            app.fed_client.clone(),
         )
     };
-    let client = FederationClient::new(own_server, federation_proxy.as_deref())
-        .with_signer(policy.signer().cloned());
     let display_name = crate::local_display_name(&*store).await;
 
     // Subscribe to the persist watch *before* staging anything (subscribe-

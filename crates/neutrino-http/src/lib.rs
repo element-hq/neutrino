@@ -79,12 +79,7 @@ struct App<S: Store> {
     /// link reconciles divergence from a transaction's forward-extremity
     /// exchange. Held behind a trait object so tests inject a deterministic stub.
     fetcher: Arc<dyn MissingEventsFetcher>,
-    /// Shared outbound federation client, built once at startup from
-    /// `config.server_name`/`config.federation_proxy`. Reused by the `/messages`
-    /// backward-underflow backfill path (`messages.rs`) so each back-page reuses
-    /// the same connection pool rather than rebuilding a reqwest client per
-    /// round. (`fetcher` also wraps a `FederationClient`, but only as a type-
-    /// erased `MissingEventsFetcher`, which exposes no `backfill` method.)
+    /// The outbound federation client every request to a peer goes through.
     fed_client: Arc<FederationClient>,
     /// Group tags, shared by the room actors and the outbound sender pool.
     group_tags: Arc<GroupTags>,
@@ -258,17 +253,18 @@ impl<S: Store> AppState<S> {
             )
             .with_signer(policy.signer().cloned()),
         );
-        let fetcher: Arc<dyn MissingEventsFetcher> = Arc::new(ReqwestFetcher::new(client));
-        Self::from_store_with_fetcher(config, store, fetcher, discovery, policy)
+        let fetcher: Arc<dyn MissingEventsFetcher> = Arc::new(ReqwestFetcher::new(client.clone()));
+        Self::from_store_with_fetcher(config, store, client, fetcher, discovery, policy)
     }
 
-    /// Like [`AppState::from_store`] but with an explicit gap-fill `fetcher`
-    /// (and discovery registry). The federation gap-fill tests inject a
-    /// deterministic stub fetcher here instead of the reqwest client (which
-    /// would otherwise reach the network).
+    /// Like [`AppState::from_store`] but with an explicit federation client,
+    /// gap-fill `fetcher` and discovery registry. The federation gap-fill tests
+    /// inject a deterministic stub fetcher here instead of the reqwest client
+    /// (which would otherwise reach the network).
     fn from_store_with_fetcher(
         config: Config,
         store: Arc<S>,
+        fed_client: Arc<FederationClient>,
         fetcher: Arc<dyn MissingEventsFetcher>,
         discovery: Arc<DiscoveryRegistry>,
         policy: EventPolicy,
@@ -277,15 +273,6 @@ impl<S: Store> AppState<S> {
         let mut sync_state = SyncState::new(store.clone(), shutdown.clone());
         sync_state.delivery_receipts = config.delivery_receipts;
         let sync_state = Arc::new(sync_state);
-        // Outbound federation client, built once here and shared (rather than
-        // rebuilt per back-page in `messages.rs`'s backfill path).
-        let fed_client = Arc::new(
-            FederationClient::new(
-                config.server_name.clone(),
-                config.federation_proxy.as_deref(),
-            )
-            .with_signer(policy.signer().cloned()),
-        );
         let group_tags = Arc::new(GroupTags::new(fed_client.supports_groups()));
         let room_registry = Arc::new(RoomRegistry::new(
             store.clone(),
@@ -335,11 +322,6 @@ impl<S: Store> AppState<S> {
         lock_app(self).store.clone()
     }
 
-    /// This homeserver's name, sent as the `origin` on outbound transactions.
-    fn server_name(&self) -> String {
-        lock_app(self).config.server_name.clone()
-    }
-
     /// The shared out-of-band discovery registry. The host writes the visible
     /// peer set through this handle (via the FFI); the user-directory search
     /// handler reads it.
@@ -382,10 +364,9 @@ impl<S: Store> AppState<S> {
         lock_app(self).config.outbound_concurrency
     }
 
-    /// The configured `neutrino-lb` egress proxy URL, if any. Threaded into
-    /// every outbound `FederationClient` so all federation routes through it.
-    fn federation_proxy(&self) -> Option<String> {
-        lock_app(self).config.federation_proxy.clone()
+    /// The shared outbound federation client.
+    fn fed_client(&self) -> Arc<FederationClient> {
+        lock_app(self).fed_client.clone()
     }
 
     /// The configured startup jitter for the outbound sender pool.
@@ -487,13 +468,9 @@ pub async fn serve<S: Store>(
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
     // enumeration resumes delivery of anything left undelivered.
-    let transport = Arc::new(
-        FederationClient::new(state.server_name(), state.federation_proxy().as_deref())
-            .with_signer(state.signer()),
-    );
     let sender_task = neutrino_engine::sender::spawn(
         state.store(),
-        transport,
+        state.fed_client(),
         state.group_tags(),
         state.outbound_concurrency(),
         state.startup_jitter(),
@@ -590,9 +567,14 @@ pub(crate) fn router_with_store_and_fetcher<S: Store>(
     store: Arc<S>,
     fetcher: Arc<dyn MissingEventsFetcher>,
 ) -> Router {
+    let client = Arc::new(FederationClient::new(
+        config.server_name.clone(),
+        config.federation_proxy.as_deref(),
+    ));
     let state = AppState::from_store_with_fetcher(
         config,
         store,
+        client,
         fetcher,
         Arc::new(DiscoveryRegistry::new()),
         EventPolicy::trusted_network(),
