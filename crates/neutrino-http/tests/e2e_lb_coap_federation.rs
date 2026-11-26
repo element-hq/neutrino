@@ -64,7 +64,6 @@ async fn start_node(localpart: &str) -> Node {
 
     let lb = neutrino_lb::LbConfig {
         ingress_bind: ingress,
-        upstream: format!("http://{http_addr}"),
         // Small, *coordinated* CoAP budget so the make_join/send_join handshake
         // genuinely crosses Block1/Block2 boundaries (with the defaults an empty
         // room's state fits one ~1 KiB datagram and the blockwise path never

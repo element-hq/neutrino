@@ -490,6 +490,7 @@ pub async fn serve<S: Store>(
         state.worker_poke(),
     );
     let router = build_router(&state);
+    let federation = federation_router(&state);
     let shutdown = state.subscribe_shutdown();
     // `dispatch` resolves on a terminal command or when every sender is dropped,
     // which drives axum's graceful shutdown — in-flight requests drain first.
@@ -502,7 +503,7 @@ pub async fn serve<S: Store>(
     };
     let lb = async {
         match ingress {
-            Some(ingress) => Ok(ingress.serve(shutdown.clone()).await?),
+            Some(ingress) => Ok(ingress.serve(federation, shutdown.clone()).await?),
             None => {
                 shutdown.cancelled().await;
                 Ok(())
@@ -624,6 +625,15 @@ pub(crate) fn router_with_store_and_fetcher<S: Store>(
 }
 
 fn build_router<S: Store>(state: &AppState<S>) -> Router {
+    with_request_logging(client_routes().merge(federation_routes()), state)
+}
+
+/// The routes peers reach through lb's ingress.
+fn federation_router<S: Store>(state: &AppState<S>) -> Router {
+    with_request_logging(federation_routes(), state)
+}
+
+fn client_routes<S: Store>() -> Router<AppState<S>> {
     Router::new()
         .route("/", get(root))
         .route("/_matrix/client/versions", get(versions))
@@ -739,6 +749,10 @@ fn build_router<S: Store>(state: &AppState<S>) -> Router {
         )
         .route("/_matrix/client/v3/pushers/set", post(pushers_set))
         .route("/_matrix/client/v3/capabilities", get(get_capabilities))
+}
+
+fn federation_routes<S: Store>() -> Router<AppState<S>> {
+    Router::new()
         .route(
             "/_matrix/federation/v1/get_missing_events/{room_id}",
             post(federation::get_missing_events::handle),
@@ -771,6 +785,10 @@ fn build_router<S: Store>(state: &AppState<S>) -> Router {
             "/_matrix/federation/v2/send_leave/{room_id}/{event_id}",
             put(federation::send_leave::handle),
         )
+}
+
+fn with_request_logging<S: Store>(routes: Router<AppState<S>>, state: &AppState<S>) -> Router {
+    routes
         .fallback(default_fallback)
         // Log one INFO line per request (method + path) and one per response
         // (status + latency), with 5xx surfaced at ERROR. We emit these under our
@@ -2363,6 +2381,26 @@ mod tests {
         );
         let state = AppState::from_store(test_config(&tmp), store);
         (state, tmp)
+    }
+
+    /// Peers reach the federation router through lb's ingress, so it must not
+    /// serve the Client-Server API, not even through `..` traversal.
+    #[tokio::test]
+    async fn federation_router_serves_no_client_api() {
+        use tower::ServiceExt;
+        let tmp = TempDir::new().expect("tempdir");
+        let store = Arc::new(SqliteStore::open_in_dir(tmp.path()).await.expect("open"));
+        let router = super::federation_router(&AppState::from_store(test_config(&tmp), store));
+        for path in [
+            "/_matrix/client/v3/capabilities",
+            "/_matrix/federation/v1/../../client/v3/capabilities",
+        ] {
+            let request = axum::http::Request::get(path)
+                .body(axum::body::Body::empty())
+                .expect("request");
+            let response = router.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
     }
 
     /// `/_matrix/key/v2/server`: on a signed deployment it serves the node

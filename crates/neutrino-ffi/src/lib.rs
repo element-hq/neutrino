@@ -259,9 +259,8 @@ impl NeutrinoHandle {
     /// Start mirroring every federation HTTP request/response into a
     /// Wireshark-readable pcap at `path` (an absolute path in host-owned
     /// storage, e.g. app-specific external storage so it is `adb pull`-able).
-    /// The capture is HTTP/JSON — what a `tcpdump -i lo` on a desktop would
-    /// have shown of the two loopback legs, which Android cannot capture
-    /// itself. Errors if the file can't be opened. Calling it while already
+    /// The capture is HTTP/JSON, synthesised at lb's edges (see
+    /// `neutrino_lb::capture`). Errors if the file can't be opened. Calling it while already
     /// capturing rotates to the new file. A non-blocking control call, safe
     /// from the FFI/JNI thread.
     pub fn start_capture(&self, path: String) -> Result<(), CaptureError> {

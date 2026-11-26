@@ -6,7 +6,7 @@
 //! co-launched and wired (egress + ingress) by `entrypoint` itself, not just by
 //! a hand-rolled test harness.
 //!
-//! Per node: the homeserver binds a loopback port (== sidecar upstream); the
+//! Per node: the homeserver binds a loopback port; the
 //! ingress is `host(bind_addr):lb_federation_port` (== `server_name`, the public
 //! federation port, UDP).
 #![cfg(not(feature = "multi-user-shim"))]
@@ -41,7 +41,7 @@ struct Node {
 }
 
 async fn start_node(localpart: &str) -> Node {
-    let hs = free_port().await; // homeserver loopback bind (== sidecar upstream)
+    let hs = free_port().await; // homeserver loopback bind
     let ingress = free_port().await; // public federation port (== server_name)
     let tmp = tempfile::TempDir::new().unwrap();
     // The ingress is derived as `host(bind_addr):lb_federation_port`; `bind_addr`

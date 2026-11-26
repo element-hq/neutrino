@@ -31,7 +31,7 @@ The internal dependency graph is pinned, edge by edge, in `tools/xtask/src/layer
 
 ## Data flow
 
-- **Inbound PDU:** peer → lb ingress (codec decode, origin check, `/_matrix/federation/` gate, CBOR→JSON) → loopback → http `/send` (`X-Matrix` origin, parse) → `staged_events` → engine worker (re-admit, order, gap-fill) → room actor → `RoomCore::apply_pdu` → `Vec<Effect>` → `persist_resolved_event`.
+- **Inbound PDU:** peer → lb ingress (codec decode, origin check, CBOR→JSON) → http federation router, in-process → `/send` (`X-Matrix` origin, parse) → `staged_events` → engine worker (re-admit, order, gap-fill) → room actor → `RoomCore::apply_pdu` → `Vec<Effect>` → `persist_resolved_event`.
 - **Local write:** C-S handler → `RoomRegistry::send_event` → `EventBuilder` → the same actor and persist path → outbox.
 - **Outbound:** engine sender → `FederationTransport` (http `FederationClient`: `X-Matrix`, signature in signed mode) → lb egress, in-process → `NodeIdResolver` → CoAP over a `DatagramLink` or UDP.
 - **Config and commands:** host `NeutrinoConfig` or env → `Config` → `neutrino_main::entrypoint`, which fills in `server_name` and builds `LbConfig`/`EventPolicy` → `neutrino_http::serve`. Commands go host → unbounded channel → http dispatch → shutdown token or backoff kick.
@@ -78,7 +78,7 @@ Each states the rule, who keeps it, who relies on it, and what breaks without it
   - ⚠ lb reads the first `origin=` parameter (`headers::xmatrix_origin`), http the last (`auth::parse_origin`).
 - **In trusted mode authorship rests on an honest mesh.** No crate checks that an event's sender belongs to the delivering origin, except on send_join, send_leave and the out-of-band paths.
 - **The C-S API is off the network only in lb mode.**
-  - lb ingress forwards only `/_matrix/federation/`, judged after URL normalisation.
+  - lb ingress serves only http's federation router.
   - `neutrino-main` refuses a concrete non-loopback `bind_addr`.
   - In direct mode nothing guards it.
   - ⚠ An unspecified `bind_addr` (`0.0.0.0`, `::`) is accepted, and the listener then binds every interface.

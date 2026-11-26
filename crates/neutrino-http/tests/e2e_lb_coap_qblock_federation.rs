@@ -54,7 +54,6 @@ async fn start_node(localpart: &str) -> Node {
 
     let lb = neutrino_lb::LbConfig {
         ingress_bind: ingress,
-        upstream: format!("http://{http_addr}"),
         // Small Q-Block blocks so the handshake spans many burst blocks and
         // genuinely exercises Q-Block1/Q-Block2 reassembly (defaults would fit an
         // empty room's state in one datagram). RFC 9177 default timing.

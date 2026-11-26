@@ -60,8 +60,7 @@ pub struct Config {
     /// alongside the homeserver (the embedded-on-mobile target), with the CoAP
     /// low-bandwidth wire. This is the public federation port peers'
     /// `server_name` resolves to: the ingress binds `host(bind_addr):port`
-    /// (only the port differs from `bind_addr`). The upstream is `bind_addr`
-    /// (which must be loopback-reachable). `None` = direct federation, no
+    /// (only the port differs from `bind_addr`). `None` = direct federation, no
     /// in-process sidecar (the default).
     pub lb_federation_port: Option<u16>,
     /// Upper bound on the random delay a freshly-started outbound sender waits

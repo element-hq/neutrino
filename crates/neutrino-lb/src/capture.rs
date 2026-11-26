@@ -6,25 +6,14 @@
 //!
 //! # Why this exists at all
 //!
-//! Both halves of the proxy already talk real HTTP/JSON over real loopback TCP:
-//! `neutrino-http` dials the egress as its forward proxy, and the ingress dials
-//! `neutrino-http` as its upstream. On a desktop, `tcpdump -i lo` captures that
-//! traffic with perfect fidelity and this module is redundant.
-//!
-//! It exists for Android, which is where the capture toggle is actually used. A
-//! non-rooted app cannot capture loopback: there is no `tcpdump`, `CAP_NET_RAW`
-//! is not granted, and `VpnService`'s TUN never sees `127.0.0.0/8`. So on the
-//! target platform an in-process writer is the only option, and this module is
-//! the stand-in for `tcpdump -i lo`.
-//!
-//! That framing sets the goal: produce the artifact you would have got from
-//! `tcpdump` on the same box. The two are directly comparable on a desktop,
-//! which is how this synthesiser is validated (capture both ways, diff).
+//! The homeserver and lb exchange federation in-process, so the JSON
+//! conversation never crosses a socket `tcpdump` could see. This module
+//! synthesises the capture two HTTP legs between them would have produced.
 //!
 //! # Where the tap sits
 //!
 //! At the four points where the real JSON bytes exist — the endpoints of the two
-//! loopback legs:
+//! legs:
 //!
 //! | leg | request recorded | response recorded |
 //! |-----|------------------|-------------------|
@@ -43,7 +32,7 @@
 //! egress leg, upstream service time on the ingress leg.
 //!
 //! Every response path is recorded, including the error ones (502s, transcode
-//! failures, the ingress's non-federation 404). A failed exchange must appear as
+//! failures). A failed exchange must appear as
 //! a request/response pair, not as a dangling request — the failures are the
 //! reason to be looking.
 //!
@@ -106,7 +95,7 @@ const PCAP_MAGIC: u32 = 0xa1b2_c3d4;
 const LINKTYPE_RAW: u32 = 101;
 /// The synthetic HTTP server port for both legs. Port 80 so Wireshark's HTTP
 /// dissector engages with no "Decode As" — the leg is told apart by direction,
-/// not by port, so nothing is lost by not using the real loopback ports.
+/// not by port.
 const SERVER_PORT: u16 = 80;
 /// First synthetic client port; each exchange mints the next one.
 const FIRST_CLIENT_PORT: u16 = 49152;
@@ -124,7 +113,7 @@ const SYN: u8 = 0x02;
 const PSH: u8 = 0x08;
 const ACK: u8 = 0x10;
 
-/// Which loopback leg an exchange belongs to. Decides which endpoint is the
+/// Which leg an exchange belongs to. Decides which endpoint is the
 /// client, and therefore the direction the request travels in the capture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Leg {

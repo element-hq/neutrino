@@ -67,7 +67,6 @@ async fn start_node(localpart: &str) -> Node {
 
     let lb = neutrino_lb::LbConfig {
         ingress_bind: ingress,
-        upstream: format!("http://{http_addr}"),
         wire: neutrino_lb::WireKind::Http,
         resolver: None,
         link: None,

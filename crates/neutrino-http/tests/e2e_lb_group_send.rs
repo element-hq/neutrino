@@ -11,7 +11,6 @@
 #![cfg(not(feature = "multi-user-shim"))]
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -77,18 +76,10 @@ impl DatagramLink for MeshLink {
     }
 }
 
-async fn free_port() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let a = l.local_addr().unwrap();
-    drop(l);
-    a
-}
-
-/// An lb over `link` that forwards inbound requests to `upstream`.
-fn lb_config(link: Arc<MeshLink>, upstream: String) -> neutrino_lb::LbConfig {
+/// An lb over `link`.
+fn lb_config(link: Arc<MeshLink>) -> neutrino_lb::LbConfig {
     neutrino_lb::LbConfig {
         ingress_bind: "127.0.0.1:0".parse().unwrap(),
-        upstream,
         wire: neutrino_lb::WireKind::CoapQBlock {
             block1_size: None,
             qblock: neutrino_lb::QBlockTuning {
@@ -110,7 +101,6 @@ async fn the_group_header_reaches_send_through_lb() {
 
     // `b` runs a homeserver; `c` is a second destination that never answers.
     let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let http_addr = http_listener.local_addr().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let config = Config {
         server_name: "b".to_owned(),
@@ -119,7 +109,7 @@ async fn the_group_header_reaches_send_through_lb() {
         storage_dir: tmp.path().to_path_buf(),
         ..Default::default()
     };
-    let lb = lb_config(MeshLink::join(&mesh, "b"), format!("http://{http_addr}"));
+    let lb = lb_config(MeshLink::join(&mesh, "b"));
     let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let store = Arc::new(
@@ -140,12 +130,8 @@ async fn the_group_header_reaches_send_through_lb() {
         .await;
     });
     let _c = MeshLink::join(&mesh, "c");
-    let (egress, ingress) = neutrino_lb::start(lb_config(
-        MeshLink::join(&mesh, "a"),
-        format!("http://{}", free_port().await),
-    ))
-    .unwrap();
-    tokio::spawn(ingress.serve(shutdown.clone()));
+    let (egress, ingress) = neutrino_lb::start(lb_config(MeshLink::join(&mesh, "a"))).unwrap();
+    tokio::spawn(ingress.serve(axum::Router::new(), shutdown.clone()));
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let send = |dest: &'static str, txn: &'static str, group: Option<&'static str>| {

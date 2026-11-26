@@ -47,8 +47,6 @@ async fn json_request_survives_egress_ingress_roundtrip() {
     // 1. Mock upstream homeserver.
     let seen: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
     let seen_c = seen.clone();
-    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = upstream_listener.local_addr().unwrap();
     let app = Router::new()
         .route(
             "/_matrix/federation/v1/send/42",
@@ -69,14 +67,13 @@ async fn json_request_survives_egress_ingress_roundtrip() {
             ),
         )
         .with_state(seen_c);
-    tokio::spawn(async move { axum::serve(upstream_listener, app).await.unwrap() });
 
     let token = CancellationToken::new();
 
     // 2. Ingress on the "public" port, forwarding to the mock upstream.
     let ingress_addr = free_addr().await;
     let ingress_server = HttpWireServer::new(ingress_addr);
-    let handler = Arc::new(IngressHandler::new(format!("http://{upstream_addr}"), None));
+    let handler = Arc::new(IngressHandler::new(app, None));
     let it = token.clone();
     let ingress_task = tokio::spawn(async move { ingress_server.serve(handler, it).await });
 
@@ -169,18 +166,14 @@ fn pcap_frames(bytes: &[u8]) -> Vec<([u8; 4], [u8; 4], Vec<u8>)> {
     out
 }
 
-/// The capture must record BOTH loopback legs of a real round trip, as HTTP
-/// with the literal JSON bodies — the artifact `tcpdump -i lo` would have
-/// produced on a desktop. This is the end-to-end proof that the tap is wired
+/// The capture must record BOTH legs of a real round trip, as HTTP with the
+/// literal JSON bodies. This is the end-to-end proof that the tap is wired
 /// into both halves and that nothing CBOR leaks into the file.
 #[tokio::test]
 async fn capture_records_both_legs_as_http_json() {
-    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = upstream_listener.local_addr().unwrap();
     let app = Router::new().fallback(put(|| async {
         Json(serde_json::json!({"pdus": {"upstream_marker": 1}}))
     }));
-    tokio::spawn(async move { axum::serve(upstream_listener, app).await.unwrap() });
 
     let token = CancellationToken::new();
     // ONE control, threaded into both halves — one file, both legs.
@@ -190,10 +183,7 @@ async fn capture_records_both_legs_as_http_json() {
 
     let ingress_addr = free_addr().await;
     let ingress_server = HttpWireServer::new(ingress_addr);
-    let handler = Arc::new(IngressHandler::new(
-        format!("http://{upstream_addr}"),
-        Some(capture.clone()),
-    ));
+    let handler = Arc::new(IngressHandler::new(app, Some(capture.clone())));
     let it = token.clone();
     let ingress_task = tokio::spawn(async move { ingress_server.serve(handler, it).await });
 

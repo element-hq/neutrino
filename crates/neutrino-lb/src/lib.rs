@@ -2,7 +2,7 @@
 //! JSON (the local homeserver) and CBOR (the wire), behind the
 //! [`transport::WireClient`] / [`transport::WireServer`] seam. The [`egress`]
 //! half carries `neutrino-http`'s outbound federation; the [`ingress`] half
-//! forwards peer requests to the loopback homeserver. The body codec
+//! hands peer requests to its federation router. The body codec
 //! ([`codec`]) is integer-key, a port of Dendrite `internal/lb`.
 //!
 //! Wire transports ([`WireKind`]; both peers must agree):
@@ -61,14 +61,15 @@ pub use transport::{
 use std::net::SocketAddr;
 use std::time::Duration;
 
-/// Connect timeout for the proxy's outbound HTTP hops (egress→peer,
-/// ingress→loopback upstream). Mirrors `neutrino-http`'s `FederationClient`:
-/// without it, a black-holing peer would leak an in-flight request on every
-/// sender retry, since the homeserver's own timeout only bounds the loopback
-/// hop to the egress, not the real network leg.
+/// Connect timeout for the HTTP wire's hop to a peer. Without it, a
+/// black-holing peer would leak an in-flight request on every sender retry.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Total request timeout for the proxy's outbound HTTP hops.
+/// Total request timeout for the HTTP wire's hop to a peer, and for the
+/// homeserver's response headers to a peer's request.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the homeserver's response body to a peer's request may take once
+/// its headers are ready.
+pub(crate) const BODY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Install rustls' ring crypto provider as the process default, once.
 ///
@@ -289,9 +290,6 @@ pub struct LbConfig {
     /// Public federation port (what peers' `server_name` resolve to). The
     /// ingress reverse proxy binds here.
     pub ingress_bind: SocketAddr,
-    /// Base URL of the local `neutrino-http` (loopback), e.g.
-    /// `http://127.0.0.1:8008`. The ingress forwards transcoded requests here.
-    pub upstream: String,
     /// Wire transport for the inter-sidecar hop. Defaults to `Http`.
     pub wire: WireKind,
     /// How a destination `server_name` is turned into the address the egress
@@ -321,7 +319,6 @@ impl std::fmt::Debug for LbConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LbConfig")
             .field("ingress_bind", &self.ingress_bind)
-            .field("upstream", &self.upstream)
             .field("wire", &self.wire)
             .field("resolver", &self.resolver.as_ref().map(|_| "<configured>"))
             .field("link", &self.link.as_ref().map(|_| "<configured>"))
@@ -421,8 +418,8 @@ pub fn start(config: LbConfig) -> Result<(Egress, Ingress), LbError> {
     };
     let resolver = config.resolver.unwrap_or_else(|| Arc::new(DirectResolver));
     let egress = Egress::new(client, resolver, config.capture.clone());
-    let handler = Arc::new(IngressHandler::new(config.upstream, config.capture));
-    Ok((egress, Ingress { server, handler }))
+    let capture = config.capture;
+    Ok((egress, Ingress { server, capture }))
 }
 
 type ServeFn = Box<
@@ -440,13 +437,18 @@ fn serve_fn<S: WireServer + 'static>(server: S) -> ServeFn {
 /// The wire→local half: serves peers' requests to the homeserver.
 pub struct Ingress {
     server: ServeFn,
-    handler: Arc<IngressHandler>,
+    capture: Option<Arc<CaptureControl>>,
 }
 
 impl Ingress {
-    /// Serve until `shutdown` fires.
-    pub async fn serve(self, shutdown: CancellationToken) -> Result<(), LbError> {
-        Ok((self.server)(self.handler, shutdown).await?)
+    /// Serve peers' requests with `upstream` until `shutdown` fires.
+    pub async fn serve(
+        self,
+        upstream: axum::Router,
+        shutdown: CancellationToken,
+    ) -> Result<(), LbError> {
+        let handler = Arc::new(IngressHandler::new(upstream, self.capture));
+        Ok((self.server)(handler, shutdown).await?)
     }
 }
 
@@ -575,7 +577,7 @@ mod serve_selection_tests {
     use std::net::SocketAddr;
 
     async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), LbError> {
-        start(config)?.1.serve(shutdown).await
+        start(config)?.1.serve(axum::Router::new(), shutdown).await
     }
 
     fn cfg(wire: WireKind) -> LbConfig {
@@ -587,7 +589,6 @@ mod serve_selection_tests {
         };
         LbConfig {
             ingress_bind: free("127.0.0.1:0"),
-            upstream: "http://127.0.0.1:1".to_owned(),
             wire,
             resolver: None,
             link: None,

@@ -304,12 +304,7 @@ pub async fn entrypoint(
     // Embedded low-bandwidth sidecar: when `lb_federation_port` is set the
     // homeserver runs its federation over `neutrino-lb` in-process (the
     // embedded-on-mobile target). The ingress owns the public federation port
-    // peers reach (`host(bind_addr):lb_federation_port`) and forwards inbound
-    // federation to the homeserver's loopback.
-    //
-    // Derive (and so validate) the sidecar config *before* binding the
-    // listener: an illegal in-process combo (a non-loopback `bind_addr`) then
-    // fails fast without first claiming the public port.
+    // peers reach (`host(bind_addr):lb_federation_port`).
     let lb_config = match config.lb_federation_port {
         Some(port) => Some(build_lb_config(
             &config,
@@ -348,10 +343,7 @@ pub async fn entrypoint(
     let policy = neutrino_event::EventPolicy::new(security, versions);
 
     // Bind through `canonical_loopback` so a `localhost` bind lands on IPv4
-    // deterministically — the same family the ingress upstream targets. Binding
-    // the raw `localhost` lets the resolver pick `::1` while the upstream dials
-    // `127.0.0.1` (or vice versa), which is a connect-refused 502 on the loopback
-    // hop. `config.bind_addr` is left raw for `neutrino_http::serve`.
+    // deterministically. `config.bind_addr` is left raw for `neutrino_http::serve`.
     let listener = tokio::net::TcpListener::bind(&canonical_loopback(&config.bind_addr)).await?;
     tracing::info!("listening on {}", listener.local_addr()?);
 
@@ -469,9 +461,8 @@ fn event_security(
 /// `Config`, the chosen public federation port, and the link's declared
 /// [`LinkProfile`] (the default profile on the UDP path). The ingress reuses
 /// `bind_addr`'s host with the port replaced by `fed_port` (only the port
-/// differs — see [`ingress_bind_for`]); the upstream is the homeserver's own
-/// `bind_addr` (which must be loopback-reachable). Errors if `bind_addr` is a
-/// concrete non-loopback address (see [`upstream_url`]) or the profile's MTU is
+/// differs — see [`ingress_bind_for`]). Errors if `bind_addr` is a concrete
+/// non-loopback address (see [`require_local_bind`]) or the profile's MTU is
 /// too small to frame a block.
 fn build_lb_config(
     config: &Config,
@@ -480,9 +471,9 @@ fn build_lb_config(
     profile: LinkProfile,
     capture: Option<Arc<neutrino_lb::CaptureControl>>,
 ) -> Result<neutrino_lb::LbConfig, Box<dyn std::error::Error>> {
+    require_local_bind(&config.bind_addr)?;
     Ok(neutrino_lb::LbConfig {
         ingress_bind: ingress_bind_for(&config.bind_addr, fed_port),
-        upstream: upstream_url(&config.bind_addr)?,
         // Q-Block sized to everything the medium declares: the block size
         // from its MTU, and the NON-mode timing from its pacing when it meters
         // its sends. Only the block-option framing is reserved — what else
@@ -526,12 +517,8 @@ fn ingress_bind_for(bind_addr: &str, fed_port: u16) -> SocketAddr {
 }
 
 /// Pin the loopback hostname `localhost` to `127.0.0.1`. `localhost` resolves to
-/// BOTH `127.0.0.1` and `::1`, and the homeserver's listener bind and the ingress
-/// upstream resolve it independently — so they can land on different families,
-/// and a listener bound to one while the ingress dials the other is a
-/// connect-refused `502` (the "Empty Room" invite failure; see the
-/// `upstream_address_family_mismatch_yields_bad_gateway` test). Forcing IPv4 on
-/// both keeps them in lockstep. Numeric addresses and other hostnames pass
+/// BOTH `127.0.0.1` and `::1`, and a listener bound to one is refused to a
+/// client that dials only the other. Numeric addresses and other hostnames pass
 /// through unchanged.
 fn canonical_loopback(authority: &str) -> String {
     match authority.rsplit_once(':') {
@@ -542,37 +529,19 @@ fn canonical_loopback(authority: &str) -> String {
     }
 }
 
-/// The loopback URL the ingress uses to reach the co-located homeserver. The
-/// homeserver runs in the same process, so the ingress must reach it over
-/// loopback — and in-process mode therefore requires a loopback-reachable
-/// `bind_addr`:
-/// - a loopback address (`127.0.0.1`, `[::1]`) is used verbatim;
-/// - an unspecified bind (`0.0.0.0`, used so CSAPI can be port-published in a
-///   container) still listens on loopback, so it is rewritten to it;
-/// - a concrete *non*-loopback address (e.g. a LAN interface) is **rejected**:
-///   the homeserver would listen only there, so a loopback rewrite would miss
-///   it and a verbatim URL would send the ingress→upstream hop off the loopback
-///   path — exposing the unauthenticated CSAPI on the network. Fail loudly
-///   rather than silently going off-box.
-/// - the loopback hostname `localhost` is pinned to `127.0.0.1` (see
-///   [`canonical_loopback`]) so the hop lands on the same family the listener
-///   binds; any other non-IP authority (`hostname:port`) can't be classified
-///   without resolution, so it is trusted verbatim.
-fn upstream_url(bind_addr: &str) -> Result<String, String> {
-    let bind_addr = canonical_loopback(bind_addr);
-    match bind_addr.parse::<SocketAddr>() {
-        Ok(addr) if addr.ip().is_loopback() => Ok(format!("http://{bind_addr}")),
-        Ok(addr) if addr.ip().is_unspecified() => {
-            let host = if addr.is_ipv6() { "[::1]" } else { "127.0.0.1" };
-            Ok(format!("http://{host}:{}", addr.port()))
-        }
-        Ok(addr) => Err(format!(
+/// In lb mode peers reach federation through the ingress, so the listener
+/// serving the unauthenticated C-S API must not sit on a concrete
+/// non-loopback address (e.g. a LAN interface). An unspecified bind
+/// (`0.0.0.0`, used so the C-S API can be port-published in a container) and
+/// any non-IP authority are accepted.
+fn require_local_bind(bind_addr: &str) -> Result<(), String> {
+    match canonical_loopback(bind_addr).parse::<SocketAddr>() {
+        Ok(addr) if !addr.ip().is_loopback() && !addr.ip().is_unspecified() => Err(format!(
             "bind_addr {addr} is a concrete non-loopback address; in-process \
              low-bandwidth mode (lb_federation_port set) requires a loopback or \
-             unspecified bind_addr so the sidecar ingress reaches the homeserver \
-             over loopback and the unauthenticated CSAPI stays off the network"
+             unspecified bind_addr so the unauthenticated C-S API stays off the network"
         )),
-        Err(_) => Ok(format!("http://{bind_addr}")),
+        _ => Ok(()),
     }
 }
 
@@ -590,14 +559,13 @@ mod tests {
     // The public federation ingress takes the federation port; for the embedded
     // case `bind_addr` is unspecified (`0.0.0.0`), so the ingress binds IPv6
     // unspecified (`[::]:<fed port>`) — a dual-stack listener that accepts both
-    // families. The egress is supplied (allocated by `entrypoint`); the wire is CoAP.
+    // families. The wire is CoAP.
     #[test]
     fn build_lb_config_derives_ingress_from_bind_addr_and_port() {
         let c = cfg("0.0.0.0:8008");
         let lb =
             build_lb_config(&c, 8448, None, LinkProfile::default(), None).expect("valid lb config");
         assert_eq!(lb.ingress_bind, "[::]:8448".parse().unwrap());
-        assert_eq!(lb.upstream, "http://127.0.0.1:8008");
         // The default profile derives the SZX-max 1024 B Q-Block1 size: no
         // per-request option budget is reserved — the medium's
         // LinkCodec controls what rides each block, and an over-MTU datagram
@@ -681,37 +649,25 @@ mod tests {
         let lb =
             build_lb_config(&c, 8448, None, LinkProfile::default(), None).expect("valid lb config");
         assert_eq!(lb.ingress_bind, "127.0.0.1:8448".parse().unwrap());
-        assert_eq!(lb.upstream, "http://127.0.0.1:8008");
     }
 
     // A `localhost:port` authority (the offline/dev fallback): the public ingress
     // still can't be classified, so it falls back to IPv6 unspecified (`[::]`; no
-    // peer can reach an offline device regardless), but the loopback upstream is
-    // pinned to IPv4 `127.0.0.1` so the ingress→homeserver hop can't land on the
-    // wrong family (see `canonical_loopback`).
+    // peer can reach an offline device regardless).
     #[test]
     fn build_lb_config_ingress_falls_back_to_unspecified_for_hostname() {
         let c = cfg("localhost:8008");
         let lb =
             build_lb_config(&c, 8448, None, LinkProfile::default(), None).expect("valid lb config");
         assert_eq!(lb.ingress_bind, "[::]:8448".parse().unwrap());
-        assert_eq!(lb.upstream, "http://127.0.0.1:8008");
     }
 
-    // `localhost` is pinned to IPv4 loopback for the upstream — it otherwise
-    // resolves to both `::1` and `127.0.0.1`, and dialing the family the
-    // homeserver did not bind is a connect-refused 502.
+    // A concrete non-loopback `bind_addr` is rejected: it would expose the
+    // unauthenticated C-S API on the network.
     #[test]
-    fn upstream_url_pins_localhost_to_ipv4_loopback() {
-        assert_eq!(
-            upstream_url("localhost:8008").unwrap(),
-            "http://127.0.0.1:8008"
-        );
-        // Case-insensitive host, and the port is preserved.
-        assert_eq!(
-            upstream_url("LocalHost:443").unwrap(),
-            "http://127.0.0.1:443"
-        );
+    fn build_lb_config_rejects_non_loopback_bind_addr() {
+        let c = cfg("192.168.1.5:8008");
+        assert!(build_lb_config(&c, 8448, None, LinkProfile::default(), None).is_err());
     }
 
     // Numeric addresses and non-`localhost` hostnames are untouched by the pin.
@@ -723,25 +679,6 @@ mod tests {
         assert_eq!(canonical_loopback("[::1]:8008"), "[::1]:8008");
         assert_eq!(canonical_loopback("[::]:8008"), "[::]:8008");
         assert_eq!(canonical_loopback("example.com:8008"), "example.com:8008");
-    }
-
-    // An unspecified bind is loopback-rewritten for the upstream so the ingress
-    // reaches the co-located homeserver over loopback.
-    #[test]
-    fn build_lb_config_upstream_loopbacks_an_unspecified_bind() {
-        let c = cfg("0.0.0.0:8008");
-        let lb =
-            build_lb_config(&c, 80, None, LinkProfile::default(), None).expect("valid lb config");
-        assert_eq!(lb.upstream, "http://127.0.0.1:8008");
-    }
-
-    // A concrete non-loopback `bind_addr` is rejected: the homeserver would
-    // listen only there, so the ingress→upstream loopback hop would miss it (and
-    // a verbatim URL would expose the unauthenticated CSAPI on the network).
-    #[test]
-    fn build_lb_config_rejects_non_loopback_bind_addr() {
-        let c = cfg("192.168.1.5:8008");
-        assert!(build_lb_config(&c, 8448, None, LinkProfile::default(), None).is_err());
     }
 
     #[test]
