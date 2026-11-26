@@ -30,9 +30,8 @@ pub struct NeutrinoConfig {
     pub trusted_network: bool,
     /// When set, runs the in-process `neutrino-lb` CoAP low-bandwidth sidecar.
     /// This is the public federation port the ingress binds — peers'
-    /// `server_name` resolves to `host(bind_addr):lb_federation_port`. The
-    /// egress is an internal loopback port the server allocates. `None` = direct
-    /// federation (no in-process sidecar).
+    /// `server_name` resolves to `host(bind_addr):lb_federation_port`. `None` =
+    /// direct federation (no in-process sidecar).
     pub lb_federation_port: Option<u16>,
     /// Absolute path to a directory the server writes rotating `neutrino.*` log
     /// files into, on top of logcat. Android's logcat is a small ring buffer
@@ -80,9 +79,8 @@ impl From<NeutrinoConfig> for neutrino_main::Config {
             enable_soft_failure: false,
             trusted_network: c.trusted_network,
             delivery_receipts: c.delivery_receipts,
-            // `federation_proxy` is internal/derived (set by neutrino-main when
-            // the sidecar runs) and startup jitter isn't FFI-exposed; both take
-            // their `Config::default()` values.
+            // `federation_proxy` and startup jitter aren't FFI-exposed; both
+            // take their `Config::default()` values.
             ..Default::default()
         }
     }
@@ -462,7 +460,7 @@ mod tests {
         assert_eq!(cfg.storage_dir, std::path::PathBuf::from("/data/neutrino"));
         assert_eq!(cfg.outbound_concurrency, 1);
         assert_eq!(cfg.lb_federation_port, Some(8448));
-        // `federation_proxy` is internal/derived, never set from the FFI surface.
+        // `federation_proxy` is never set from the FFI surface.
         assert_eq!(cfg.federation_proxy, None);
         // No directory asked for → platform sink only, no file sink.
         assert_eq!(cfg.log_dir, None);

@@ -104,6 +104,7 @@ async fn start_signed_node(
                 neutrino_event::EventSecurity::Signed { signer, resolver },
                 std::sync::Arc::new(neutrino_event::RoomVersions::base_only()),
             ),
+            None,
         )
         .await;
     });

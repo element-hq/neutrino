@@ -29,6 +29,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "neutrino-room",
             "neutrino-store",
             "neutrino-engine",
+            "neutrino-lb",
         ],
     ),
     (

@@ -33,8 +33,8 @@ The internal dependency graph is pinned, edge by edge, in `tools/xtask/src/layer
 
 - **Inbound PDU:** peer → lb ingress (codec decode, origin check, `/_matrix/federation/` gate, CBOR→JSON) → loopback → http `/send` (`X-Matrix` origin, parse) → `staged_events` → engine worker (re-admit, order, gap-fill) → room actor → `RoomCore::apply_pdu` → `Vec<Effect>` → `persist_resolved_event`.
 - **Local write:** C-S handler → `RoomRegistry::send_event` → `EventBuilder` → the same actor and persist path → outbox.
-- **Outbound:** engine sender → `FederationTransport` (http `FederationClient`: `X-Matrix`, signature in signed mode) → lb egress on loopback → `NodeIdResolver` → CoAP over a `DatagramLink` or UDP.
-- **Config and commands:** host `NeutrinoConfig` or env → `Config` → `neutrino_main::entrypoint`, which fills in `server_name`, overrides `federation_proxy` and builds `LbConfig`/`EventPolicy` → `neutrino_http::serve`. Commands go host → unbounded channel → http dispatch → shutdown token or backoff kick.
+- **Outbound:** engine sender → `FederationTransport` (http `FederationClient`: `X-Matrix`, signature in signed mode) → lb egress, in-process → `NodeIdResolver` → CoAP over a `DatagramLink` or UDP.
+- **Config and commands:** host `NeutrinoConfig` or env → `Config` → `neutrino_main::entrypoint`, which fills in `server_name` and builds `LbConfig`/`EventPolicy` → `neutrino_http::serve`. Commands go host → unbounded channel → http dispatch → shutdown token or backoff kick.
 - **Client reads:** store → `Event` → `event_view` conversions. Wake-ups come over the store's `watch` channels.
 
 ## Cross-crate invariants
@@ -82,10 +82,9 @@ Each states the rule, who keeps it, who relies on it, and what breaks without it
   - `neutrino-main` refuses a concrete non-loopback `bind_addr`.
   - In direct mode nothing guards it.
   - ⚠ An unspecified `bind_addr` (`0.0.0.0`, `::`) is accepted, and the listener then binds every interface.
-- **The lb egress is loopback-only by construction**: main allocates it. That is why it has no body cap.
-- **In lb mode main replaces `Config.federation_proxy` with the egress.** A configured proxy must parse or startup fails (`AppState::validate_config`), never falling back to direct, which would send JSON to a CBOR peer.
+- **A configured `Config.federation_proxy` must parse** or startup fails (`AppState::validate_config`), never falling back to direct.
 - **Proxied URLs carry a `~` host suffix.** The federation client adds it and lb egress strips it; the two copies of this rule must change together.
-- **`X-Neutrino-Group` lives only on loopback.**
+- **`X-Neutrino-Group` never leaves the process.**
   - http's client sets it on a grouped `/send`.
   - lb egress strips it into `WireRequest.group_size`.
   - lb ingress synthesises it from the Group option.

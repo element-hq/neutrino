@@ -1,6 +1,6 @@
-//! End-to-end: egress (forward proxy) → ingress (reverse proxy) → mock
-//! upstream. Proves a JSON federation request survives the JSON→CBOR→JSON
-//! round trip across both halves with method, path, and body intact.
+//! End-to-end: egress → ingress (reverse proxy) → mock upstream. Proves a JSON
+//! federation request survives the JSON→CBOR→JSON round trip across both
+//! halves with method, path, and body intact.
 
 use std::sync::{Arc, Mutex};
 
@@ -8,13 +8,14 @@ use async_trait::async_trait;
 use axum::extract::State;
 use axum::routing::put;
 use axum::{Json, Router};
+use neutrino_lb::Egress;
 use neutrino_lb::codec::cbor_to_json;
+use neutrino_lb::ingress::IngressHandler;
 use neutrino_lb::transport::http::{HttpWireClient, HttpWireServer};
 use neutrino_lb::transport::{
     DestinationResolver, DirectResolver, WireClient, WireError, WireRequest, WireResponse,
     WireServer,
 };
-use neutrino_lb::{egress, ingress::IngressHandler};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -79,38 +80,28 @@ async fn json_request_survives_egress_ingress_roundtrip() {
     let it = token.clone();
     let ingress_task = tokio::spawn(async move { ingress_server.serve(handler, it).await });
 
-    // 3. Egress on a loopback port, wire client points at the wider network
-    //    (here: directly at the ingress, since dest == ingress_addr).
-    let egress_addr = free_addr().await;
+    // 3. Egress, wire client points at the wider network (here: directly at
+    //    the ingress, since dest == ingress_addr).
     let wire_body: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
     let wire_client: Arc<dyn WireClient> = Arc::new(SniffingClient {
         inner: HttpWireClient::new(),
         wire_body: wire_body.clone(),
     });
-    let et = token.clone();
     let resolver: Arc<dyn DestinationResolver> = Arc::new(DirectResolver);
-    let egress_task =
-        tokio::spawn(
-            async move { egress::serve(egress_addr, wire_client, resolver, None, et).await },
-        );
+    let egress = Egress::new(wire_client, resolver, None);
 
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
-    // 4. Act as neutrino-http: send through the egress proxy to `ingress_addr`.
-    neutrino_lb::install_crypto_provider();
-    let http = reqwest::Client::builder()
-        .proxy(reqwest::Proxy::all(format!("http://{egress_addr}")).unwrap())
-        .build()
-        .unwrap();
-    let resp = http
-        .put(format!(
-            "http://{ingress_addr}/_matrix/federation/v1/send/42"
-        ))
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(r#"{"edus":[],"pdus":[{"type":"m.room.message"}]}"#)
-        .send()
-        .await
-        .expect("send through proxy");
+    // 4. Act as neutrino-http: send through the egress to `ingress_addr`.
+    let resp = egress
+        .send(
+            axum::http::Request::put(format!(
+                "http://{ingress_addr}/_matrix/federation/v1/send/42"
+            ))
+            .body(br#"{"edus":[],"pdus":[{"type":"m.room.message"}]}"#.to_vec())
+            .unwrap(),
+        )
+        .await;
 
     assert_eq!(resp.status(), 200);
     // Header policy across both sidecar hops (ingress → wire → egress): an
@@ -121,10 +112,7 @@ async fn json_request_survives_egress_ingress_roundtrip() {
         .get("x-matrix-test")
         .map(|v| v.as_bytes().to_vec());
     let dropped = resp.headers().get("x-neutrino-test").is_some();
-    // neutrino-lb's reqwest has no `json` feature (production uses `.bytes()`),
-    // so decode the body the same way rather than via `resp.json()`.
-    let raw = resp.bytes().await.unwrap();
-    let body: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
     assert_eq!(body, serde_json::json!({"pdus": {}}));
     assert_eq!(
         *seen.lock().unwrap(),
@@ -160,7 +148,6 @@ async fn json_request_survives_egress_ingress_roundtrip() {
 
     token.cancel();
     let _ = ingress_task.await;
-    let _ = egress_task.await;
 }
 
 /// Split a pcap into its captured IPv4 frames (24-byte global header, 16-byte
@@ -210,40 +197,28 @@ async fn capture_records_both_legs_as_http_json() {
     let it = token.clone();
     let ingress_task = tokio::spawn(async move { ingress_server.serve(handler, it).await });
 
-    let egress_addr = free_addr().await;
     let wire_client: Arc<dyn WireClient> = Arc::new(HttpWireClient::new());
     let resolver: Arc<dyn DestinationResolver> = Arc::new(DirectResolver);
-    let et = token.clone();
-    let cap = capture.clone();
-    let egress_task = tokio::spawn(async move {
-        egress::serve(egress_addr, wire_client, resolver, Some(cap), et).await
-    });
+    let egress = Egress::new(wire_client, resolver, Some(capture.clone()));
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
-    neutrino_lb::install_crypto_provider();
-    let http = reqwest::Client::builder()
-        .proxy(reqwest::Proxy::all(format!("http://{egress_addr}")).unwrap())
-        .build()
-        .unwrap();
-    let resp = http
-        .put(format!(
-            "http://{ingress_addr}/_matrix/federation/v1/send/99"
-        ))
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header(
-            reqwest::header::AUTHORIZATION,
-            r#"X-Matrix origin="a.example",destination="b.example""#,
+    let resp = egress
+        .send(
+            axum::http::Request::put(format!(
+                "http://{ingress_addr}/_matrix/federation/v1/send/99"
+            ))
+            .header(
+                axum::http::header::AUTHORIZATION,
+                r#"X-Matrix origin="a.example",destination="b.example""#,
+            )
+            .body(br#"{"pdus":[{"marker":"request_marker"}]}"#.to_vec())
+            .unwrap(),
         )
-        .body(r#"{"pdus":[{"marker":"request_marker"}]}"#)
-        .send()
-        .await
-        .expect("send through proxy");
+        .await;
     assert_eq!(resp.status(), 200);
-    let _ = resp.bytes().await.unwrap();
 
     token.cancel();
     let _ = ingress_task.await;
-    let _ = egress_task.await;
     assert!(capture.stop(), "capture was running");
 
     let frames = pcap_frames(&std::fs::read(&path).unwrap());

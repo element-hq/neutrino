@@ -1,7 +1,7 @@
 //! In-process sidecar that transcodes Server-Server federation bodies between
 //! JSON (the local homeserver) and CBOR (the wire), behind the
 //! [`transport::WireClient`] / [`transport::WireServer`] seam. The [`egress`]
-//! half is `neutrino-http`'s federation forward proxy; the [`ingress`] half
+//! half carries `neutrino-http`'s outbound federation; the [`ingress`] half
 //! forwards peer requests to the loopback homeserver. The body codec
 //! ([`codec`]) is integer-key, a port of Dendrite `internal/lb`.
 //!
@@ -289,9 +289,6 @@ pub struct LbConfig {
     /// Public federation port (what peers' `server_name` resolve to). The
     /// ingress reverse proxy binds here.
     pub ingress_bind: SocketAddr,
-    /// Loopback port the egress forward proxy binds to. `neutrino-http`'s
-    /// `federation_proxy` config points here.
-    pub egress_bind: SocketAddr,
     /// Base URL of the local `neutrino-http` (loopback), e.g.
     /// `http://127.0.0.1:8008`. The ingress forwards transcoded requests here.
     pub upstream: String,
@@ -324,7 +321,6 @@ impl std::fmt::Debug for LbConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LbConfig")
             .field("ingress_bind", &self.ingress_bind)
-            .field("egress_bind", &self.egress_bind)
             .field("upstream", &self.upstream)
             .field("wire", &self.wire)
             .field("resolver", &self.resolver.as_ref().map(|_| "<configured>"))
@@ -334,6 +330,8 @@ impl std::fmt::Debug for LbConfig {
     }
 }
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
@@ -342,175 +340,113 @@ use crate::ingress::IngressHandler;
 use crate::transport::coap::datagram::{Hub, LinkCoapWireClient, LinkCoapWireServer};
 use crate::transport::coap::{CoapWireClient, CoapWireServer};
 use crate::transport::http::{HttpWireClient, HttpWireServer};
-use crate::transport::{WireClient, WireError, WireServer};
+use crate::transport::{WireClient, WireError, WireHandler, WireServer};
 
-/// Run both proxy halves until `shutdown` fires. Egress forwards local→wire
-/// (JSON→CBOR); ingress serves wire→local (CBOR→JSON→loopback upstream).
-/// Returns when both halves have wound down. The wire transport (HTTP or CoAP)
-/// is chosen by `config.wire`; egress/ingress are identical across both.
-pub async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), LbError> {
-    // One sink, both halves: the egress records the local→peer leg and the
-    // ingress the peer→local one, into the same file.
-    let capture = config.capture.clone();
-    let ingress_handler = Arc::new(IngressHandler::new(
-        config.upstream.clone(),
-        capture.clone(),
-    ));
-    // Direct dial unless the embedding host injected a tunnel resolver.
-    let resolver = config
-        .resolver
-        .clone()
-        .unwrap_or_else(|| Arc::new(DirectResolver));
-    // When the embedding host injected a datagram link (the embedded build), the CoAP
-    // wire runs over it instead of a UDP socket; the framing config still comes
-    // from `config.wire`. Selected purely by injection — `None` keeps the existing
-    // UDP socket path 100% intact.
-    if let Some(link) = config.link.clone() {
-        return serve_over_link(link, config, ingress_handler, resolver, capture, shutdown).await;
-    }
-    match config.wire {
-        WireKind::Http => {
-            let wire_client: Arc<dyn WireClient> = Arc::new(HttpWireClient::new());
-            let wire_server = HttpWireServer::new(config.ingress_bind);
-            run_pair(
-                config.egress_bind,
-                wire_client,
-                wire_server,
-                ingress_handler,
-                resolver,
-                capture,
-                shutdown,
-            )
-            .await
-        }
-        WireKind::Coap {
-            block1_size,
-            max_message_size,
-        } => {
-            let wire_client: Arc<dyn WireClient> =
-                Arc::new(CoapWireClient::with_block1_size(block1_size));
-            let wire_server =
-                CoapWireServer::with_max_message_size(config.ingress_bind, max_message_size);
-            run_pair(
-                config.egress_bind,
-                wire_client,
-                wire_server,
-                ingress_handler,
-                resolver,
-                capture,
-                shutdown,
-            )
-            .await
-        }
-        WireKind::CoapQBlock {
-            block1_size,
-            qblock,
-        } => {
-            let cfg = qblock.to_qblock_config(block1_size);
-            let wire_client: Arc<dyn WireClient> =
-                Arc::new(CoapWireClient::with_qblock(block1_size, cfg.clone()));
-            let wire_server = CoapWireServer::with_qblock(config.ingress_bind, cfg);
-            run_pair(
-                config.egress_bind,
-                wire_client,
-                wire_server,
-                ingress_handler,
-                resolver,
-                capture,
-                shutdown,
-            )
-            .await
-        }
-    }
-}
+pub use egress::Egress;
 
-/// Run the proxy with the CoAP wire over an injected [`DatagramLink`] (the
-/// embedded build). One [`Hub`] multiplexes both directions over the link
-/// and is shared between the egress client and the ingress server; the framing
-/// (CON / Q-Block, sizes) still comes from `config.wire`. The egress forward
-/// proxy on `egress_bind` and the resolver are transport-independent, so this
-/// reuses [`run_pair`] unchanged. `ingress_bind` is unused on this path (the link
-/// is keyed by its own link addresses, not an IP/port).
-async fn serve_over_link(
-    link: Arc<dyn DatagramLink>,
-    config: LbConfig,
-    ingress_handler: Arc<IngressHandler>,
-    resolver: Arc<dyn DestinationResolver>,
-    capture: Option<Arc<CaptureControl>>,
-    shutdown: CancellationToken,
-) -> Result<(), LbError> {
-    let hub = Hub::new(link);
-    match config.wire {
-        WireKind::CoapQBlock {
-            block1_size,
-            qblock,
-        } => {
-            let cfg = qblock.to_qblock_config(block1_size);
-            let wire_client: Arc<dyn WireClient> = Arc::new(LinkCoapWireClient::with_qblock(
-                hub.clone(),
+/// Build both halves for `config`: the [`Egress`] the homeserver sends its
+/// federation through, and the [`Ingress`] that serves peers. The wire
+/// transport is chosen by `config.wire`, over `config.link` when one is
+/// injected and a socket otherwise.
+pub fn start(config: LbConfig) -> Result<(Egress, Ingress), LbError> {
+    let (client, server): (Arc<dyn WireClient>, ServeFn) = match (config.link, config.wire) {
+        (None, WireKind::Http) => (
+            Arc::new(HttpWireClient::new()),
+            serve_fn(HttpWireServer::new(config.ingress_bind)),
+        ),
+        (
+            None,
+            WireKind::Coap {
                 block1_size,
-                cfg.clone(),
-            ));
-            let wire_server = LinkCoapWireServer::with_qblock(hub, cfg);
-            run_pair(
-                config.egress_bind,
-                wire_client,
-                wire_server,
-                ingress_handler,
-                resolver,
-                capture,
-                shutdown,
+                max_message_size,
+            },
+        ) => (
+            Arc::new(CoapWireClient::with_block1_size(block1_size)),
+            serve_fn(CoapWireServer::with_max_message_size(
+                config.ingress_bind,
+                max_message_size,
+            )),
+        ),
+        (
+            None,
+            WireKind::CoapQBlock {
+                block1_size,
+                qblock,
+            },
+        ) => {
+            let cfg = qblock.to_qblock_config(block1_size);
+            (
+                Arc::new(CoapWireClient::with_qblock(block1_size, cfg.clone())),
+                serve_fn(CoapWireServer::with_qblock(config.ingress_bind, cfg)),
             )
-            .await
         }
-        WireKind::Coap {
-            block1_size,
-            max_message_size,
-        } => {
-            let wire_client: Arc<dyn WireClient> =
-                Arc::new(LinkCoapWireClient::new(hub.clone(), block1_size));
-            let wire_server = LinkCoapWireServer::new(hub, max_message_size);
-            run_pair(
-                config.egress_bind,
-                wire_client,
-                wire_server,
-                ingress_handler,
-                resolver,
-                capture,
-                shutdown,
+        // One hub multiplexes both directions over the link.
+        (
+            Some(link),
+            WireKind::Coap {
+                block1_size,
+                max_message_size,
+            },
+        ) => {
+            let hub = Hub::new(link);
+            (
+                Arc::new(LinkCoapWireClient::new(hub.clone(), block1_size)),
+                serve_fn(LinkCoapWireServer::new(hub, max_message_size)),
             )
-            .await
         }
-        // A link with the HTTP wire is a wiring bug: the datagram path is CoAP-only
-        // (the link carries CoAP datagrams keyed by node id, not TCP/HTTP).
-        WireKind::Http => Err(LbError::from(WireError::Serve(
-            "datagram link requires a CoAP wire kind".to_owned(),
-        ))),
-    }
+        (
+            Some(link),
+            WireKind::CoapQBlock {
+                block1_size,
+                qblock,
+            },
+        ) => {
+            let hub = Hub::new(link);
+            let cfg = qblock.to_qblock_config(block1_size);
+            (
+                Arc::new(LinkCoapWireClient::with_qblock(
+                    hub.clone(),
+                    block1_size,
+                    cfg.clone(),
+                )),
+                serve_fn(LinkCoapWireServer::with_qblock(hub, cfg)),
+            )
+        }
+        // The link carries CoAP datagrams keyed by link address, not HTTP.
+        (Some(_), WireKind::Http) => {
+            return Err(LbError::from(WireError::Serve(
+                "datagram link requires a CoAP wire kind".to_owned(),
+            )));
+        }
+    };
+    let resolver = config.resolver.unwrap_or_else(|| Arc::new(DirectResolver));
+    let egress = Egress::new(client, resolver, config.capture.clone());
+    let handler = Arc::new(IngressHandler::new(config.upstream, config.capture));
+    Ok((egress, Ingress { server, handler }))
 }
 
-/// Run the egress forward proxy and the `wire_server` ingress concurrently until
-/// `shutdown` fires; surface whichever half errors first.
-async fn run_pair<S: WireServer>(
-    egress_bind: SocketAddr,
-    wire_client: Arc<dyn WireClient>,
-    wire_server: S,
-    ingress_handler: Arc<IngressHandler>,
-    resolver: Arc<dyn DestinationResolver>,
-    capture: Option<Arc<CaptureControl>>,
-    shutdown: CancellationToken,
-) -> Result<(), LbError> {
-    let egress = egress::serve(
-        egress_bind,
-        wire_client,
-        resolver,
-        capture,
-        shutdown.clone(),
-    );
-    let ingress = wire_server.serve(ingress_handler, shutdown.clone());
-    tokio::select! {
-        r = egress => r.map_err(LbError::from),
-        r = ingress => r.map_err(LbError::from),
+type ServeFn = Box<
+    dyn FnOnce(
+            Arc<dyn WireHandler>,
+            CancellationToken,
+        ) -> Pin<Box<dyn Future<Output = Result<(), WireError>> + Send>>
+        + Send,
+>;
+
+fn serve_fn<S: WireServer + 'static>(server: S) -> ServeFn {
+    Box::new(move |handler, shutdown| server.serve(handler, shutdown))
+}
+
+/// The wire→local half: serves peers' requests to the homeserver.
+pub struct Ingress {
+    server: ServeFn,
+    handler: Arc<IngressHandler>,
+}
+
+impl Ingress {
+    /// Serve until `shutdown` fires.
+    pub async fn serve(self, shutdown: CancellationToken) -> Result<(), LbError> {
+        Ok((self.server)(self.handler, shutdown).await?)
     }
 }
 
@@ -638,6 +574,10 @@ mod serve_selection_tests {
     use super::*;
     use std::net::SocketAddr;
 
+    async fn serve(config: LbConfig, shutdown: CancellationToken) -> Result<(), LbError> {
+        start(config)?.1.serve(shutdown).await
+    }
+
     fn cfg(wire: WireKind) -> LbConfig {
         let free = |p: &str| -> SocketAddr {
             let s = std::net::UdpSocket::bind(p).unwrap();
@@ -647,7 +587,6 @@ mod serve_selection_tests {
         };
         LbConfig {
             ingress_bind: free("127.0.0.1:0"),
-            egress_bind: free("127.0.0.1:0"),
             upstream: "http://127.0.0.1:1".to_owned(),
             wire,
             resolver: None,

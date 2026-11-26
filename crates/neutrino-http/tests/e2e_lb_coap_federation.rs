@@ -11,8 +11,7 @@
 //!
 //! Lives in `neutrino-http`'s tests (not `neutrino-lb`'s) because it drives full
 //! homeservers; `neutrino-lb` cannot depend on `neutrino-http` (that crate
-//! depends on it). Only the ingress hop is UDP; egress stays a loopback HTTP
-//! forward proxy that the homeserver's reqwest targets.
+//! depends on it).
 #![cfg(not(feature = "multi-user-shim"))]
 
 use std::net::SocketAddr;
@@ -22,11 +21,10 @@ use neutrino_ctl::{Command, Config, DiscoveryRegistry};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
-/// Reserve an ephemeral loopback port and free it. Used for the egress (TCP
-/// loopback) and to pick the ingress port number (the CoAP server binds UDP on
-/// it); the readiness wait below covers the small bind race.
+/// Reserve an ephemeral loopback port and free it, to pick the ingress port
+/// number (the CoAP server binds UDP on it); the readiness wait below covers
+/// the small bind race.
 async fn free_port() -> SocketAddr {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = l.local_addr().unwrap();
@@ -35,27 +33,24 @@ async fn free_port() -> SocketAddr {
 }
 
 /// A running homeserver + its CoAP sidecar. Holds what must stay alive: the
-/// command sender (dropping it shuts the server down), the sidecar shutdown
-/// token, and the storage tempdir (dropping it deletes the DB).
+/// command sender (dropping it shuts the server down) and the storage tempdir
+/// (dropping it deletes the DB).
 struct Node {
     /// Public name peers resolve to — the sidecar ingress (UDP) address.
     server_name: String,
     /// Loopback base URL of the homeserver's own HTTP, for driving CSAPI.
     http_base: String,
     _cmd_tx: mpsc::UnboundedSender<Command>,
-    _shutdown: CancellationToken,
     _tmp: tempfile::TempDir,
 }
 
-/// Stand up one node: a homeserver whose `federation_proxy` points at its
-/// egress, fronted by a `WireKind::Coap` sidecar whose ingress is the node's
-/// `server_name`.
+/// Stand up one node: a homeserver running a `WireKind::Coap` sidecar whose
+/// ingress is the node's `server_name`.
 async fn start_node(localpart: &str) -> Node {
     let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_addr = http_listener.local_addr().unwrap();
 
     let ingress = free_port().await; // == server_name (UDP, what peers reach)
-    let egress = free_port().await; // federation_proxy target (loopback HTTP)
 
     let tmp = tempfile::TempDir::new().unwrap();
     let server_name = ingress.to_string();
@@ -64,34 +59,11 @@ async fn start_node(localpart: &str) -> Node {
         bind_addr: "127.0.0.1:0".to_string(),
         localpart: localpart.to_string(),
         storage_dir: tmp.path().to_path_buf(),
-        federation_proxy: Some(format!("http://{egress}")),
         ..Default::default()
     };
 
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        let store = std::sync::Arc::new(
-            neutrino_store_sqlite::SqliteStore::open_in_dir(&config.storage_dir)
-                .await
-                .unwrap(),
-        );
-
-        let _ = neutrino_http::serve(
-            http_listener,
-            config,
-            store,
-            cmd_rx,
-            std::sync::Arc::new(DiscoveryRegistry::new()),
-            None,
-            neutrino_event::EventPolicy::trusted_network(),
-        )
-        .await;
-    });
-
-    let shutdown = CancellationToken::new();
     let lb = neutrino_lb::LbConfig {
         ingress_bind: ingress,
-        egress_bind: egress,
         upstream: format!("http://{http_addr}"),
         // Small, *coordinated* CoAP budget so the make_join/send_join handshake
         // genuinely crosses Block1/Block2 boundaries (with the defaults an empty
@@ -109,16 +81,31 @@ async fn start_node(localpart: &str) -> Node {
         link: None,
         capture: None,
     };
-    let lb_shutdown = shutdown.clone();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        let _ = neutrino_lb::serve(lb, lb_shutdown).await;
+        let store = std::sync::Arc::new(
+            neutrino_store_sqlite::SqliteStore::open_in_dir(&config.storage_dir)
+                .await
+                .unwrap(),
+        );
+
+        let _ = neutrino_http::serve(
+            http_listener,
+            config,
+            store,
+            cmd_rx,
+            std::sync::Arc::new(DiscoveryRegistry::new()),
+            None,
+            neutrino_event::EventPolicy::trusted_network(),
+            Some(neutrino_lb::start(lb).unwrap()),
+        )
+        .await;
     });
 
     Node {
         server_name,
         http_base: format!("http://{http_addr}"),
         _cmd_tx: cmd_tx,
-        _shutdown: shutdown,
         _tmp: tmp,
     }
 }

@@ -208,14 +208,16 @@ pub enum StartupError {
     Io(#[from] std::io::Error),
     #[error("invalid federation_proxy: {0}")]
     InvalidFederationProxy(String),
+    #[error("neutrino-lb: {0}")]
+    Lb(#[from] neutrino_lb::LbError),
+    #[error("neutrino-lb ingress stopped unexpectedly")]
+    LbStopped,
 }
 
 impl<S: Store> AppState<S> {
     /// Validate `Config` fields that must be well-formed before serving. A
     /// configured federation proxy must parse as a proxy URL — bail at startup
-    /// rather than silently falling back to direct federation: in a sidecar
-    /// deployment "direct" means sending plain JSON to a peer's CBOR-only ingress
-    /// port, which breaks the whole mesh. Fail loudly.
+    /// rather than silently falling back to direct federation.
     fn validate_config(config: &Config) -> Result<(), StartupError> {
         if let Some(url) = config.federation_proxy.as_deref() {
             reqwest::Proxy::all(url)
@@ -232,11 +234,12 @@ impl<S: Store> AppState<S> {
             store,
             Arc::new(DiscoveryRegistry::new()),
             EventPolicy::trusted_network(),
+            None,
         )
     }
 
-    /// Like [`AppState::from_store`] but with a caller-owned discovery registry
-    /// and event policy. The production path ([`serve`]) injects the
+    /// Like [`AppState::from_store`] but with a caller-owned discovery registry,
+    /// event policy and lb egress. The production path ([`serve`]) injects the
     /// registry the host holds a write handle to (so its BLE-discovery callback
     /// and the router read the same set); [`from_store`] passes a fresh empty
     /// one (and [`EventPolicy::trusted_network()`]) for tests/the dev binary.
@@ -245,13 +248,15 @@ impl<S: Store> AppState<S> {
         store: Arc<S>,
         discovery: Arc<DiscoveryRegistry>,
         policy: EventPolicy,
+        egress: Option<neutrino_lb::Egress>,
     ) -> Self {
         let client = Arc::new(
             FederationClient::new(
                 config.server_name.clone(),
                 config.federation_proxy.as_deref(),
             )
-            .with_signer(policy.signer().cloned()),
+            .with_signer(policy.signer().cloned())
+            .with_egress(egress),
         );
         let fetcher: Arc<dyn MissingEventsFetcher> = Arc::new(ReqwestFetcher::new(client.clone()));
         Self::from_store_with_fetcher(config, store, client, fetcher, discovery, policy)
@@ -458,12 +463,16 @@ pub async fn serve<S: Store>(
     // value carrying the ingress admission mode, the local signer, and the
     // room versions this build speaks.
     policy: EventPolicy,
+    // Runs federation over `neutrino-lb` in-process when `Some`: the halves
+    // `neutrino_lb::start` returns.
+    lb: Option<(neutrino_lb::Egress, neutrino_lb::Ingress)>,
 ) -> Result<(), StartupError> {
     // The caller (the entrypoint) opens the store, resolves the server identity
     // from it, and hands the live handle in — so we build state around it rather
     // than re-opening the same DB.
     AppState::<S>::validate_config(&config)?;
-    let state = AppState::from_store_with_discovery(config, store, discovery, policy);
+    let (egress, ingress) = lb.unzip();
+    let state = AppState::from_store_with_discovery(config, store, discovery, policy, egress);
     lock_app(&state).display_name_tx = display_name_tx;
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
@@ -481,17 +490,49 @@ pub async fn serve<S: Store>(
         state.worker_poke(),
     );
     let router = build_router(&state);
+    let shutdown = state.subscribe_shutdown();
     // `dispatch` resolves on a terminal command or when every sender is dropped,
     // which drives axum's graceful shutdown — in-flight requests drain first.
     // `state` is threaded in so server-directed commands can act on internals.
-    axum::serve(listener, router)
-        .with_graceful_shutdown(dispatch(commands, state))
-        .await
-        .map_err(StartupError::Io)?;
-    // dispatch fired the token before resolving, so the supervisor has already
-    // begun winding down and aborting its children; await it to confirm teardown.
+    let server = async {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(dispatch(commands, state))
+            .await
+            .map_err(StartupError::Io)
+    };
+    let lb = async {
+        match ingress {
+            Some(ingress) => Ok(ingress.serve(shutdown.clone()).await?),
+            None => {
+                shutdown.cancelled().await;
+                Ok(())
+            }
+        }
+    };
+    tokio::pin!(server, lb);
+    let served = tokio::select! {
+        r = &mut server => {
+            shutdown.cancel();
+            r.and(lb.await)
+        }
+        // The ingress runs until `shutdown`, so returning first means it
+        // stopped on its own — always a failure, which takes the homeserver
+        // down with it.
+        r = &mut lb => if shutdown.is_cancelled() {
+            r.and(server.await)
+        } else {
+            match &r {
+                Ok(()) => error!("neutrino-lb ingress returned unexpectedly; stopping homeserver"),
+                Err(e) => error!(error = %e, "neutrino-lb ingress failed; stopping homeserver"),
+            }
+            r.and(Err(StartupError::LbStopped))
+        }
+    };
+    // Stop everything left running, then await the sender supervisor to
+    // confirm teardown.
+    shutdown.cancel();
     let _ = sender_task.await;
-    Ok(())
+    served
 }
 
 /// Dispatch out-of-band control commands until a terminal one (`Shutdown`)
@@ -2355,6 +2396,7 @@ mod tests {
                 },
                 Arc::new(neutrino_event::RoomVersions::base_only()),
             ),
+            None,
         );
         let response = build_router(&state)
             .oneshot(request())
@@ -2388,7 +2430,7 @@ mod tests {
     #[tokio::test]
     async fn router_bails_on_invalid_federation_proxy() {
         // A malformed proxy must fail startup, not silently degrade to direct
-        // federation (which would break the CBOR sidecar mesh).
+        // federation.
         let tmp = TempDir::new().expect("tempdir");
         let mut config = test_config(&tmp);
         config.federation_proxy = Some("not a url".to_string());
@@ -2795,6 +2837,7 @@ mod tests {
             Arc::new(super::DiscoveryRegistry::new()),
             None,
             EventPolicy::trusted_network(),
+            None,
         ));
 
         // Give the sender supervisor a moment to discover the dead peer and

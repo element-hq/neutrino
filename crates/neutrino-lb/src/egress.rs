@@ -1,21 +1,13 @@
-//! Egress: the local→wire half. A forward proxy. `neutrino-http`'s reqwest is
-//! configured with this as its HTTP proxy, so requests arrive in absolute form
-//! (`PUT http://{dest}~/path` — the client suffixes the host with a sentinel
-//! so numeric server names survive reqwest's WHATWG host parsing; see
-//! [`strip_host_sentinel`]). We read `dest` from the request authority,
-//! strip the sentinel, transcode the JSON body to CBOR, hand it to the
-//! `WireClient`, and re-encode the CBOR response to JSON.
+//! Egress: the local→wire half. Takes the homeserver's outbound federation
+//! requests in-process, each addressed by its absolute URI (`{dest}~/path` —
+//! the client suffixes the host with a sentinel so numeric server names
+//! survive reqwest's WHATWG host parsing; see [`strip_host_sentinel`]).
+//! It transcodes the JSON body to CBOR, hands it to the `WireClient`, and
+//! re-encodes the CBOR response to JSON.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::Router;
-use axum::extract::{Request, State};
-use axum::http::{HeaderName, HeaderValue, StatusCode};
-use axum::response::Response;
-use axum::routing::any;
-use tokio::net::TcpListener;
-use tokio_util::sync::CancellationToken;
+use axum::http::{HeaderName, HeaderValue, Request, Response, StatusCode};
 use tracing::{debug, warn};
 
 use crate::capture::{CaptureControl, Leg, record_response};
@@ -23,10 +15,9 @@ use crate::codec::{cbor_to_json, json_to_cbor};
 use crate::headers::{GROUP_HEADER, is_forwardable};
 use crate::transport::{DestinationResolver, WireClient, WireRequest};
 
-/// Shared egress state: the wire client used to reach peers, the resolver that
-/// turns a destination `server_name` into the address to dial, and the pcap sink.
+/// Sends the homeserver's federation requests to peers over the wire.
 #[derive(Clone)]
-struct EgressState {
+pub struct Egress {
     client: Arc<dyn WireClient>,
     resolver: Arc<dyn DestinationResolver>,
     /// Runtime-toggleable pcap sink, `None` when the host declared no tap. This
@@ -34,145 +25,131 @@ struct EgressState {
     capture: Option<Arc<CaptureControl>>,
 }
 
-/// Bind the egress forward proxy on `bind` and run until `shutdown` fires.
-pub async fn serve(
-    bind: SocketAddr,
-    client: Arc<dyn WireClient>,
-    resolver: Arc<dyn DestinationResolver>,
-    capture: Option<Arc<CaptureControl>>,
-    shutdown: CancellationToken,
-) -> Result<(), std::io::Error> {
-    let app = Router::new().fallback(any(proxy)).with_state(EgressState {
-        client,
-        resolver,
-        capture,
-    });
-    let listener = TcpListener::bind(bind).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await
-}
+impl Egress {
+    pub fn new(
+        client: Arc<dyn WireClient>,
+        resolver: Arc<dyn DestinationResolver>,
+        capture: Option<Arc<CaptureControl>>,
+    ) -> Self {
+        Self {
+            client,
+            resolver,
+            capture,
+        }
+    }
 
-async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
-    let (mut parts, body) = req.into_parts();
-    // Forward-proxy requests carry an absolute-form target, so the authority is
-    // the destination server. Its absence means we were called as an origin
-    // server, which is a misconfiguration — but answer 502 (like every other
-    // egress-internal failure below), not 400: the homeserver's sender drops a
-    // 4xx permanently while it retries a 5xx, and a recoverable misconfig must
-    // not make it silently discard queued PDUs.
-    let Some(authority) = parts
-        .uri
-        .authority()
-        .map(|a| strip_host_sentinel(a.as_str()))
-    else {
-        warn!(uri = %parts.uri, "egress: request missing authority (not proxied?)");
-        return error_response(StatusCode::BAD_GATEWAY);
-    };
-    // Map the destination server_name to the address actually dialled (identity
-    // on a direct network; server_name → 64-char hex node id on the datagram link).
-    let dest = state.resolver.resolve(authority.clone());
-    debug!(%authority, %dest, "egress: forwarding federation request to resolved destination");
-    let path = parts
-        .uri
-        .path_and_query()
-        .map(|pq| pq.as_str().to_owned())
-        .unwrap_or_else(|| parts.uri.path().to_owned());
-    let group_size = parts
-        .headers
-        .remove(GROUP_HEADER)
-        .and_then(|v| v.to_str().ok()?.parse().ok());
-    let headers: Vec<(String, Vec<u8>)> = parts
-        .headers
-        .iter()
-        .map(|(k, v)| (k.as_str().to_owned(), v.as_bytes().to_vec()))
-        .collect();
-    // No body-size cap (`usize::MAX`): the body is our own homeserver's
-    // outbound request over loopback.
-    let json_body = match axum::body::to_bytes(body, usize::MAX).await {
-        Ok(b) => b.to_vec(),
-        Err(e) => {
-            warn!(%e, "egress: failed to read request body");
+    /// Deliver `req` to the peer named by its URI authority and return the
+    /// peer's response. Every egress-internal failure is a 502, never a 4xx:
+    /// the homeserver's sender drops a 4xx permanently while it retries a 5xx.
+    pub async fn send(&self, req: Request<Vec<u8>>) -> Response<Vec<u8>> {
+        let (mut parts, json_body) = req.into_parts();
+        let Some(authority) = parts
+            .uri
+            .authority()
+            .map(|a| strip_host_sentinel(a.as_str()))
+        else {
+            warn!(uri = %parts.uri, "egress: request has no destination authority");
             return error_response(StatusCode::BAD_GATEWAY);
-        }
-    };
-    // pcap tap, request half: the literal JSON our homeserver emitted, before
-    // any transcode. Recorded before the send, so the gap to the response half
-    // is the true wire RTT. (The two failures above return without a pair —
-    // there is no exchange yet: one has no destination, the other no body.)
-    let exchange = state.capture.as_ref().and_then(|capture| {
-        capture.record_request(
-            Leg::Egress,
-            &authority,
-            parts.method.as_str(),
-            &path,
-            &headers,
-            &json_body,
-        )
-    });
-    let cbor_body = match json_to_cbor(&json_body) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(%e, "egress: JSON request body encode failed");
-            record_response(&state.capture, exchange, 502, &[], b"");
-            return error_response(StatusCode::BAD_GATEWAY);
-        }
-    };
-    let wire_resp = match state
-        .client
-        .send(WireRequest {
-            dest,
-            method: parts.method,
-            path,
-            headers,
-            body: cbor_body,
-            group_size,
-            ..Default::default()
-        })
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(%e, "egress: wire send failed");
-            record_response(&state.capture, exchange, 502, &[], b"");
-            return error_response(StatusCode::BAD_GATEWAY);
-        }
-    };
-    match cbor_to_json(&wire_resp.body) {
-        Ok(json_resp) => {
-            record_response(
-                &state.capture,
-                exchange,
-                wire_resp.status,
-                &wire_resp.headers,
-                &json_resp,
-            );
-            build_response(wire_resp.status, &wire_resp.headers, json_resp)
-        }
-        // A non-2xx whose body we can't decode must keep its status: the
-        // homeserver's sender drops a 4xx but retries a 5xx, so masking the
-        // real code as a generic 502 would invert that decision. Only a 2xx
-        // payload we cannot deliver is a genuine proxy failure.
-        Err(e) if (200..300).contains(&wire_resp.status) => {
-            warn!(%e, "egress: CBOR response body decode failed");
-            record_response(&state.capture, exchange, 502, &[], b"");
-            error_response(StatusCode::BAD_GATEWAY)
-        }
-        Err(e) => {
-            warn!(%e, status = wire_resp.status, "egress: undecodable error body; forwarding status without it");
-            record_response(
-                &state.capture,
-                exchange,
-                wire_resp.status,
-                &wire_resp.headers,
-                b"",
-            );
-            build_response(wire_resp.status, &wire_resp.headers, Vec::new())
+        };
+        // Map the destination server_name to the address actually dialled (identity
+        // on a direct network; server_name → 64-char hex node id on the datagram link).
+        let dest = self.resolver.resolve(authority.clone());
+        debug!(%authority, %dest, "egress: forwarding federation request to resolved destination");
+        let path = parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str().to_owned())
+            .unwrap_or_else(|| parts.uri.path().to_owned());
+        let group_size = parts
+            .headers
+            .remove(GROUP_HEADER)
+            .and_then(|v| v.to_str().ok()?.parse().ok());
+        let headers: Vec<(String, Vec<u8>)> = parts
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_str().to_owned(), v.as_bytes().to_vec()))
+            .collect();
+        // pcap tap, request half: the literal JSON our homeserver emitted, before
+        // any transcode. Recorded before the send, so the gap to the response half
+        // is the true wire RTT.
+        let exchange = self.capture.as_ref().and_then(|capture| {
+            capture.record_request(
+                Leg::Egress,
+                &authority,
+                parts.method.as_str(),
+                &path,
+                &headers,
+                &json_body,
+            )
+        });
+        let cbor_body = match json_to_cbor(&json_body) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(%e, "egress: JSON request body encode failed");
+                record_response(&self.capture, exchange, 502, &[], b"");
+                return error_response(StatusCode::BAD_GATEWAY);
+            }
+        };
+        let wire_resp = match self
+            .client
+            .send(WireRequest {
+                dest,
+                method: parts.method,
+                path,
+                headers,
+                body: cbor_body,
+                group_size,
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(%e, "egress: wire send failed");
+                record_response(&self.capture, exchange, 502, &[], b"");
+                return error_response(StatusCode::BAD_GATEWAY);
+            }
+        };
+        match cbor_to_json(&wire_resp.body) {
+            Ok(json_resp) => {
+                record_response(
+                    &self.capture,
+                    exchange,
+                    wire_resp.status,
+                    &wire_resp.headers,
+                    &json_resp,
+                );
+                build_response(wire_resp.status, &wire_resp.headers, json_resp)
+            }
+            // A non-2xx whose body we can't decode must keep its status: the
+            // homeserver's sender drops a 4xx but retries a 5xx, so masking the
+            // real code as a generic 502 would invert that decision. Only a 2xx
+            // payload we cannot deliver is a genuine proxy failure.
+            Err(e) if (200..300).contains(&wire_resp.status) => {
+                warn!(%e, "egress: CBOR response body decode failed");
+                record_response(&self.capture, exchange, 502, &[], b"");
+                error_response(StatusCode::BAD_GATEWAY)
+            }
+            Err(e) => {
+                warn!(%e, status = wire_resp.status, "egress: undecodable error body; forwarding status without it");
+                record_response(
+                    &self.capture,
+                    exchange,
+                    wire_resp.status,
+                    &wire_resp.headers,
+                    b"",
+                );
+                build_response(wire_resp.status, &wire_resp.headers, Vec::new())
+            }
         }
     }
 }
 
-fn build_response(status: u16, headers: &[(String, Vec<u8>)], json_body: Vec<u8>) -> Response {
+fn build_response(
+    status: u16,
+    headers: &[(String, Vec<u8>)],
+    json_body: Vec<u8>,
+) -> Response<Vec<u8>> {
     let mut builder = Response::builder().status(status);
     for (name, value) in headers {
         if !is_forwardable(name) {
@@ -187,15 +164,14 @@ fn build_response(status: u16, headers: &[(String, Vec<u8>)], json_body: Vec<u8>
     }
     builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
     builder
-        .body(axum::body::Body::from(json_body))
+        .body(json_body)
         .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY))
 }
 
-fn error_response(status: StatusCode) -> Response {
-    Response::builder()
-        .status(status)
-        .body(axum::body::Body::empty())
-        .expect("static empty response is valid")
+fn error_response(status: StatusCode) -> Response<Vec<u8>> {
+    let mut resp = Response::new(Vec::new());
+    *resp.status_mut() = status;
+    resp
 }
 
 /// Undo the federation client's host sentinel: one trailing `~` on the host
@@ -230,14 +206,11 @@ mod tests {
     use super::*;
     use crate::transport::{DirectResolver, WireError, WireResponse};
     use async_trait::async_trait;
+    use axum::http::Method;
     use std::sync::Mutex;
 
-    // Identity resolver as a trait object, for the tests that don't rewrite.
-    fn direct() -> Arc<dyn DestinationResolver> {
-        Arc::new(DirectResolver)
-    }
-
     // A WireClient that records the WireRequest and returns a canned CBOR body.
+    #[derive(Default)]
     struct RecordingClient {
         seen: Mutex<Option<WireRequest>>,
     }
@@ -256,41 +229,30 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn proxies_absolute_uri_transcoding_both_ways() {
-        let client = Arc::new(RecordingClient {
-            seen: Mutex::new(None),
-        });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let token = CancellationToken::new();
-        let client_dyn: Arc<dyn WireClient> = client.clone();
-        let server_token = token.clone();
-        let handle =
-            tokio::spawn(
-                async move { serve(addr, client_dyn, direct(), None, server_token).await },
-            );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    fn egress(client: Arc<dyn WireClient>) -> Egress {
+        Egress::new(client, Arc::new(DirectResolver), None)
+    }
 
-        // Drive the egress as a forward proxy: reqwest in proxy mode emits an
-        // absolute-form request to `http://peer.example/...`.
-        crate::install_crypto_provider();
-        let http = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::all(format!("http://{addr}")).unwrap())
-            .build()
-            .unwrap();
-        let resp = http
-            .put("http://peer.example:8448/_matrix/federation/v1/send/9")
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(r#"{"ping":true}"#)
-            .send()
-            .await
-            .expect("proxied request");
+    fn put(uri: &str, body: &[u8]) -> Request<Vec<u8>> {
+        Request::builder()
+            .method(Method::PUT)
+            .uri(uri)
+            .body(body.to_vec())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn transcodes_both_ways() {
+        let client = Arc::new(RecordingClient::default());
+        let resp = egress(client.clone())
+            .send(put(
+                "http://peer.example:8448/_matrix/federation/v1/send/9",
+                br#"{"ping":true}"#,
+            ))
+            .await;
 
         assert_eq!(resp.status(), 200);
-        let body = resp.bytes().await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
         assert_eq!(v, serde_json::json!({"pong": true}));
 
         // The egress saw the real destination + path, and a CBOR body.
@@ -307,51 +269,22 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&decoded).unwrap(),
             serde_json::json!({"ping": true})
         );
-
-        token.cancel();
-        let _ = handle.await;
-    }
-
-    /// Sends one proxied `/send` with `group` as its group header, if any, and
-    /// returns what the wire client saw.
-    async fn proxy_with_group_header(group: Option<&str>) -> WireRequest {
-        let client = Arc::new(RecordingClient {
-            seen: Mutex::new(None),
-        });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let token = CancellationToken::new();
-        let client_dyn: Arc<dyn WireClient> = client.clone();
-        let server_token = token.clone();
-        let handle =
-            tokio::spawn(
-                async move { serve(addr, client_dyn, direct(), None, server_token).await },
-            );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        crate::install_crypto_provider();
-        let http = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::all(format!("http://{addr}")).unwrap())
-            .build()
-            .unwrap();
-        let mut req = http
-            .put("http://peer.example:8448/_matrix/federation/v1/send/9")
-            .body("{}");
-        if let Some(group) = group {
-            req = req.header("X-Neutrino-Group", group);
-        }
-        assert_eq!(req.send().await.expect("proxied request").status(), 200);
-
-        token.cancel();
-        let _ = handle.await;
-        client.seen.lock().unwrap().clone().unwrap()
     }
 
     #[tokio::test]
     async fn the_group_header_becomes_the_group_size() {
         for (header, size) in [(Some("3"), Some(3)), (Some("three"), None), (None, None)] {
-            let seen = proxy_with_group_header(header).await;
+            let client = Arc::new(RecordingClient::default());
+            let mut req = put(
+                "http://peer.example:8448/_matrix/federation/v1/send/9",
+                b"{}",
+            );
+            if let Some(group) = header {
+                req.headers_mut()
+                    .insert(GROUP_HEADER, HeaderValue::from_static(group));
+            }
+            assert_eq!(egress(client.clone()).send(req).await.status(), 200);
+            let seen = client.seen.lock().unwrap().clone().unwrap();
             assert_eq!(seen.group_size, size, "{header:?}");
             assert!(
                 !seen
@@ -375,87 +308,32 @@ mod tests {
 
     #[tokio::test]
     async fn resolver_rewrites_the_dialled_destination() {
-        let client = Arc::new(RecordingClient {
-            seen: Mutex::new(None),
-        });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let token = CancellationToken::new();
-        let client_dyn: Arc<dyn WireClient> = client.clone();
-        let resolver: Arc<dyn DestinationResolver> = Arc::new(RewriteResolver);
-        let server_token = token.clone();
-        let handle =
-            tokio::spawn(
-                async move { serve(addr, client_dyn, resolver, None, server_token).await },
-            );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        crate::install_crypto_provider();
-        let http = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::all(format!("http://{addr}")).unwrap())
-            .build()
-            .unwrap();
-        let _ = http
-            .put("http://peer.example:8448/_matrix/federation/v1/send/9")
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(r#"{"ping":true}"#)
-            .send()
-            .await
-            .expect("proxied request");
+        let client = Arc::new(RecordingClient::default());
+        Egress::new(client.clone(), Arc::new(RewriteResolver), None)
+            .send(put(
+                "http://peer.example:8448/_matrix/federation/v1/send/9",
+                br#"{"ping":true}"#,
+            ))
+            .await;
 
         // The wire client dials the resolver's output, not the raw authority.
         let seen = client.seen.lock().unwrap().clone().unwrap();
         assert_eq!(seen.dest, "rewritten[peer.example:8448]");
-
-        token.cancel();
-        let _ = handle.await;
     }
 
-    // Regression for the numeric-server-name mangle: reqwest's URL parser
-    // applies WHATWG host rules, so an all-digit name in the URL authority is
-    // reinterpreted as a legacy IPv4 numeric ("0104" → octal → "0.0.0.68") —
-    // which is why the client suffixes the host with the `~` sentinel
-    // ("0104~" is a plain reg-name the parser preserves) and this egress
-    // strips it. The full loop: a real reqwest proxied request to "0104~"
-    // must reach the wire client as exactly "0104".
     #[tokio::test]
-    async fn host_sentinel_carries_a_numeric_name_through_url_parsing() {
-        let client = Arc::new(RecordingClient {
-            seen: Mutex::new(None),
-        });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let token = CancellationToken::new();
-        let client_dyn: Arc<dyn WireClient> = client.clone();
-        let server_token = token.clone();
-        let handle =
-            tokio::spawn(
-                async move { serve(addr, client_dyn, direct(), None, server_token).await },
-            );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        crate::install_crypto_provider();
-        let http = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::all(format!("http://{addr}")).unwrap())
-            .build()
-            .unwrap();
-        let resp = http
-            // Un-suffixed, "0104" would already arrive here as "0.0.0.68".
-            .put("http://0104~/_matrix/federation/v1/send/9")
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(r#"{"ping":true}"#)
-            .send()
-            .await
-            .expect("proxied request");
+    async fn host_sentinel_is_stripped_from_the_destination() {
+        let client = Arc::new(RecordingClient::default());
+        let resp = egress(client.clone())
+            .send(put(
+                "http://0104~/_matrix/federation/v1/send/9",
+                br#"{"ping":true}"#,
+            ))
+            .await;
         assert_eq!(resp.status(), 200);
 
         let seen = client.seen.lock().unwrap().clone().unwrap();
         assert_eq!(seen.dest, "0104", "sentinel stripped, name verbatim");
-
-        token.cancel();
-        let _ = handle.await;
     }
 
     // The pure sentinel-stripping rules: one trailing `~` comes off the host
@@ -497,47 +375,23 @@ mod tests {
         }
     }
 
-    // Called as an origin server — a direct, non-proxied request — the egress
-    // has no destination authority to forward to. It must answer a *retryable*
-    // 5xx, not a 4xx: the homeserver's sender drops a 4xx permanently but
-    // retries a 5xx, so a 4xx here would silently discard queued PDUs on what is
-    // only a (recoverable) misconfiguration.
+    // A request with no destination authority has nowhere to go. It must be
+    // answered with a *retryable* 5xx, not a 4xx: the homeserver's sender drops
+    // a 4xx permanently but retries a 5xx.
     #[tokio::test]
     async fn missing_authority_is_retryable_5xx_not_4xx() {
         let client = Arc::new(StatusClient {
             status: 200,
             body: json_to_cbor(b"{}").unwrap(),
         });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let token = CancellationToken::new();
-        let client_dyn: Arc<dyn WireClient> = client.clone();
-        let server_token = token.clone();
-        let handle =
-            tokio::spawn(
-                async move { serve(addr, client_dyn, direct(), None, server_token).await },
-            );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Direct (origin-form) request, NOT proxy mode: the request target has
-        // no authority, so the egress is being used as an origin server.
-        crate::install_crypto_provider();
-        let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = http
-            .get(format!("http://{addr}/_matrix/federation/v1/send/1"))
-            .send()
-            .await
-            .expect("direct request");
-
+        let resp = egress(client)
+            .send(put("/_matrix/federation/v1/send/1", b"{}"))
+            .await;
         assert!(
             resp.status().is_server_error(),
             "missing authority must be a retryable 5xx, got {}",
             resp.status()
         );
-
-        token.cancel();
-        let _ = handle.await;
     }
 
     // A peer's non-2xx response whose body isn't valid CBOR must keep its
@@ -549,39 +403,18 @@ mod tests {
             status: 404,
             body: vec![0xff],
         });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let token = CancellationToken::new();
-        let client_dyn: Arc<dyn WireClient> = client.clone();
-        let server_token = token.clone();
-        let handle =
-            tokio::spawn(
-                async move { serve(addr, client_dyn, direct(), None, server_token).await },
-            );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        crate::install_crypto_provider();
-        let http = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::all(format!("http://{addr}")).unwrap())
-            .build()
-            .unwrap();
-        let resp = http
-            .get("http://peer.example:8448/_matrix/federation/v1/make_join/!r/@u")
-            .send()
-            .await
-            .expect("proxied request");
-
+        let resp = egress(client)
+            .send(put(
+                "http://peer.example:8448/_matrix/federation/v1/make_join/!r/@u",
+                b"",
+            ))
+            .await;
         assert_eq!(resp.status(), 404, "4xx give-up status must survive");
-
-        token.cancel();
-        let _ = handle.await;
     }
 
     // The mirror of the above: a *2xx* whose body isn't valid CBOR is a genuine
     // proxy failure — we can't hand back a success payload we couldn't decode —
     // so it must surface as a retryable 502, not a 2xx with a broken body.
-    // Pins the `(200..300)` arm in `proxy` (egress.rs).
     #[tokio::test]
     async fn masks_2xx_with_undecodable_wire_body_as_bad_gateway() {
         // 0xff is a lone CBOR "break" — guaranteed to fail decode.
@@ -589,36 +422,16 @@ mod tests {
             status: 200,
             body: vec![0xff],
         });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let token = CancellationToken::new();
-        let client_dyn: Arc<dyn WireClient> = client.clone();
-        let server_token = token.clone();
-        let handle =
-            tokio::spawn(
-                async move { serve(addr, client_dyn, direct(), None, server_token).await },
-            );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        crate::install_crypto_provider();
-        let http = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::all(format!("http://{addr}")).unwrap())
-            .build()
-            .unwrap();
-        let resp = http
-            .get("http://peer.example:8448/_matrix/federation/v1/event/$x")
-            .send()
-            .await
-            .expect("proxied request");
-
+        let resp = egress(client)
+            .send(put(
+                "http://peer.example:8448/_matrix/federation/v1/event/$x",
+                b"",
+            ))
+            .await;
         assert_eq!(
             resp.status(),
             502,
             "a 2xx with an undecodable body must become a retryable 502"
         );
-
-        token.cancel();
-        let _ = handle.await;
     }
 }

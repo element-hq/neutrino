@@ -52,9 +52,7 @@ pub struct Config {
     pub storage_dir: PathBuf,
     /// Outbound federation proxy URL; `neutrino-http` routes every outbound
     /// federation request through it (the destination rides in the URL host,
-    /// `~`-suffixed). `neutrino-main` overrides it with the loopback egress it
-    /// allocates when it runs the in-process sidecar (see `lb_federation_port`);
-    /// otherwise `NEUTRINO_FEDERATION_PROXY` names an external egress (the
+    /// `~`-suffixed). `NEUTRINO_FEDERATION_PROXY` names an external egress (the
     /// Complement image's TLS-upgrading proxy). `None` = direct federation
     /// (the default).
     pub federation_proxy: Option<String>,
@@ -62,8 +60,7 @@ pub struct Config {
     /// alongside the homeserver (the embedded-on-mobile target), with the CoAP
     /// low-bandwidth wire. This is the public federation port peers'
     /// `server_name` resolves to: the ingress binds `host(bind_addr):port`
-    /// (only the port differs from `bind_addr`). The egress is an internal
-    /// loopback port `neutrino-main` allocates, and the upstream is `bind_addr`
+    /// (only the port differs from `bind_addr`). The upstream is `bind_addr`
     /// (which must be loopback-reachable). `None` = direct federation, no
     /// in-process sidecar (the default).
     pub lb_federation_port: Option<u16>,

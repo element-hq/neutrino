@@ -73,9 +73,11 @@ pub(crate) struct FederationClient {
     http: Client,
     /// This homeserver's own name, sent as the transaction `origin`.
     origin: String,
-    /// Whether outbound requests route through the `neutrino-lb` egress proxy.
-    /// Decides what goes in the request URL's authority (see [`Self::url_authority`]).
+    /// Whether outbound requests route through an HTTP proxy.
     proxied: bool,
+    /// The `neutrino-lb` egress every request is sent through instead of
+    /// HTTP, when federation runs over lb.
+    egress: Option<neutrino_lb::Egress>,
     /// This deployment's signer; `Some` only in signed mode, where every
     /// request's `X-Matrix` header carries `key`/`sig`.
     signer: Option<Arc<EventSigner>>,
@@ -121,8 +123,7 @@ impl FederationClient {
     pub(crate) fn new(origin: String, proxy: Option<&str>) -> Self {
         // Trusted mesh resolves peers to raw IP:port. Without a proxy we bypass
         // any ambient HTTP proxy (which would otherwise intercept `http://{ip}`
-        // traffic). With one (the `neutrino-lb` egress) we route all outbound
-        // federation through it so it can transcode bodies to CBOR.
+        // traffic).
         // In a composed build reqwest can sit on a no-provider rustls backend
         // (see install_crypto_provider); install the provider before building
         // any client.
@@ -157,8 +158,15 @@ impl FederationClient {
             http,
             origin,
             proxied,
+            egress: None,
             signer: None,
         }
+    }
+
+    /// Send every request through `egress` instead of HTTP.
+    pub(crate) fn with_egress(mut self, egress: Option<neutrino_lb::Egress>) -> Self {
+        self.egress = egress;
+        self
     }
 
     /// Sign outbound requests with `signer` (the deployment's event signer;
@@ -168,15 +176,15 @@ impl FederationClient {
         self
     }
 
-    /// The authority for a request URL. Proxied: the destination with
-    /// [`HOST_SENTINEL`] appended to its host — the URL only ferries the
-    /// request to the egress (which strips the sentinel), and the suffix keeps
+    /// The authority for a request URL. Proxied or via the egress: the
+    /// destination with [`HOST_SENTINEL`] appended to its host — the URL only
+    /// ferries the request to the egress (which strips the sentinel), and the suffix keeps
     /// numeric server names out of WHATWG's IPv4 reinterpretation. A bracketed
     /// IPv6 literal gets no sentinel and needs none: brackets never hit the
     /// numeric-host path (and a suffix would break the bracket syntax).
     /// Direct: the real name verbatim, since reqwest dials it.
     fn url_authority(&self, dest: &ServerName) -> String {
-        if !self.proxied || dest.host().starts_with('[') {
+        if !(self.proxied || self.egress.is_some()) || dest.host().starts_with('[') {
             return dest.as_str().to_owned();
         }
         match dest.port() {
@@ -203,6 +211,20 @@ impl FederationClient {
             Some(body) => req.json(body),
             None => req,
         })
+    }
+
+    /// Send `req` through the egress if there is one, else over HTTP.
+    async fn send(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, FederationClientError> {
+        let Some(egress) = &self.egress else {
+            return Ok(req.send().await?);
+        };
+        let (parts, body) = axum::http::Request::try_from(req.build()?)?.into_parts();
+        let body = body.as_bytes().unwrap_or_default().to_vec();
+        let req = axum::http::Request::from_parts(parts, body);
+        Ok(egress.send(req).await.into())
     }
 
     /// The `Authorization: X-Matrix` header value for a request to `dest`:
@@ -253,7 +275,7 @@ impl FederationClient {
     ) -> Result<CanonicalJsonObject, FederationClientError> {
         info!(target: "neutrino_http", %dest, "outbound GET /_matrix/key/v2/server");
         let url = format!("http://{}/_matrix/key/v2/server", self.url_authority(dest));
-        let resp = self.http.get(&url).send().await?;
+        let resp = self.send(self.http.get(&url)).await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "GET /key/v2/server").await);
         }
@@ -313,7 +335,7 @@ impl FederationClient {
         if let Some(size) = group_size {
             req = req.header(GROUP_HEADER, size);
         }
-        let resp = req.send().await?;
+        let resp = self.send(req).await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "PUT /send").await);
         }
@@ -372,8 +394,7 @@ impl FederationClient {
             include_latest_events,
         };
         let resp = self
-            .request(Method::POST, url, dest, Some(&body))?
-            .send()
+            .send(self.request(Method::POST, url, dest, Some(&body))?)
             .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "POST /get_missing_events").await);
@@ -421,8 +442,7 @@ impl FederationClient {
         }
 
         let resp = self
-            .request(Method::GET, url, dest, None::<&Value>)?
-            .send()
+            .send(self.request(Method::GET, url, dest, None::<&Value>)?)
             .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "GET /backfill").await);
@@ -463,8 +483,7 @@ impl FederationClient {
         }
 
         let resp = self
-            .request(Method::GET, url, dest, None::<&Value>)?
-            .send()
+            .send(self.request(Method::GET, url, dest, None::<&Value>)?)
             .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "GET /make_join").await);
@@ -494,8 +513,7 @@ impl FederationClient {
             .push(event_id.as_str());
 
         let resp = self
-            .request(Method::PUT, url, dest, Some(&event))?
-            .send()
+            .send(self.request(Method::PUT, url, dest, Some(&event))?)
             .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "PUT /send_join").await);
@@ -535,8 +553,7 @@ impl FederationClient {
             invite_room_state,
         };
         let resp = self
-            .request(Method::PUT, url, dest, Some(&body))?
-            .send()
+            .send(self.request(Method::PUT, url, dest, Some(&body))?)
             .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "PUT /invite").await);
@@ -569,8 +586,7 @@ impl FederationClient {
             .push(user_id.as_str());
 
         let resp = self
-            .request(Method::GET, url, dest, None::<&Value>)?
-            .send()
+            .send(self.request(Method::GET, url, dest, None::<&Value>)?)
             .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "GET /make_leave").await);
@@ -601,8 +617,7 @@ impl FederationClient {
             .push(event_id.as_str());
 
         let resp = self
-            .request(Method::PUT, url, dest, Some(&event))?
-            .send()
+            .send(self.request(Method::PUT, url, dest, Some(&event))?)
             .await?;
         if !resp.status().is_success() {
             return Err(non_2xx_error(resp, dest, "PUT /send_leave").await);
@@ -727,7 +742,7 @@ impl FederationTransport for FederationClient {
     /// Only the lb egress can share a transmission, and only unsigned: an
     /// `X-Matrix` signature covers `destination`.
     fn supports_groups(&self) -> bool {
-        self.proxied && self.signer.is_none()
+        self.egress.is_some() && self.signer.is_none()
     }
 
     async fn send_group_transaction(
@@ -1026,13 +1041,20 @@ mod tests {
     }
 
     #[test]
-    fn supports_groups_only_when_proxied_and_unsigned() {
-        let proxy = Some("http://127.0.0.1:1");
+    fn supports_groups_only_through_the_egress_and_unsigned() {
+        let egress = || {
+            Some(neutrino_lb::Egress::new(
+                Arc::new(neutrino_lb::transport::http::HttpWireClient::new()),
+                Arc::new(neutrino_lb::DirectResolver),
+                None,
+            ))
+        };
         let signer = || Some(Arc::new(EventSigner::new(&[9u8; 32], "local.test")));
-        let client = |proxy| FederationClient::new("local.test".to_owned(), proxy);
+        let client =
+            |egress| FederationClient::new("local.test".to_owned(), None).with_egress(egress);
 
-        assert!(client(proxy).supports_groups());
-        assert!(!client(proxy).with_signer(signer()).supports_groups());
+        assert!(client(egress()).supports_groups());
+        assert!(!client(egress()).with_signer(signer()).supports_groups());
         assert!(!client(None).supports_groups());
         assert!(!client(None).with_signer(signer()).supports_groups());
     }

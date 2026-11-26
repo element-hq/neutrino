@@ -18,7 +18,6 @@ use neutrino_ctl::{Command, Config, DiscoveryRegistry};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 /// Reserve an ephemeral loopback port and free it.
 async fn free_port() -> SocketAddr {
@@ -33,7 +32,6 @@ struct Node {
     server_name: String,
     http_base: String,
     _cmd_tx: mpsc::UnboundedSender<Command>,
-    _shutdown: CancellationToken,
     _tmp: tempfile::TempDir,
 }
 
@@ -43,7 +41,6 @@ async fn start_node(localpart: &str) -> Node {
     let http_addr = http_listener.local_addr().unwrap();
 
     let ingress = free_port().await; // == server_name (UDP, what peers reach)
-    let egress = free_port().await; // federation_proxy target (loopback HTTP)
 
     let tmp = tempfile::TempDir::new().unwrap();
     let server_name = ingress.to_string();
@@ -52,10 +49,23 @@ async fn start_node(localpart: &str) -> Node {
         bind_addr: "127.0.0.1:0".to_string(),
         localpart: localpart.to_string(),
         storage_dir: tmp.path().to_path_buf(),
-        federation_proxy: Some(format!("http://{egress}")),
         ..Default::default()
     };
 
+    let lb = neutrino_lb::LbConfig {
+        ingress_bind: ingress,
+        upstream: format!("http://{http_addr}"),
+        // Small Q-Block blocks so the handshake spans many burst blocks and
+        // genuinely exercises Q-Block1/Q-Block2 reassembly (defaults would fit an
+        // empty room's state in one datagram). RFC 9177 default timing.
+        wire: neutrino_lb::WireKind::CoapQBlock {
+            block1_size: Some(64),
+            qblock: neutrino_lb::QBlockTuning::default(),
+        },
+        resolver: None,
+        link: None,
+        capture: None,
+    };
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let store = std::sync::Arc::new(
@@ -72,36 +82,15 @@ async fn start_node(localpart: &str) -> Node {
             std::sync::Arc::new(DiscoveryRegistry::new()),
             None,
             neutrino_event::EventPolicy::trusted_network(),
+            Some(neutrino_lb::start(lb).unwrap()),
         )
         .await;
-    });
-
-    let shutdown = CancellationToken::new();
-    let lb = neutrino_lb::LbConfig {
-        ingress_bind: ingress,
-        egress_bind: egress,
-        upstream: format!("http://{http_addr}"),
-        // Small Q-Block blocks so the handshake spans many burst blocks and
-        // genuinely exercises Q-Block1/Q-Block2 reassembly (defaults would fit an
-        // empty room's state in one datagram). RFC 9177 default timing.
-        wire: neutrino_lb::WireKind::CoapQBlock {
-            block1_size: Some(64),
-            qblock: neutrino_lb::QBlockTuning::default(),
-        },
-        resolver: None,
-        link: None,
-        capture: None,
-    };
-    let lb_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        let _ = neutrino_lb::serve(lb, lb_shutdown).await;
     });
 
     Node {
         server_name,
         http_base: format!("http://{http_addr}"),
         _cmd_tx: cmd_tx,
-        _shutdown: shutdown,
         _tmp: tmp,
     }
 }
