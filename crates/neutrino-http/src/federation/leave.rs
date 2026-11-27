@@ -46,13 +46,12 @@ pub(crate) async fn reject_invite<S: Store>(
     room_id: &RoomId,
     invite: OobMembership,
 ) -> Response {
-    let (store, policy, own_server, federation_proxy) = {
+    let (store, policy, client) = {
         let app = lock_app(state);
         (
             app.store.clone(),
             app.policy.clone(),
-            app.config.server_name.clone(),
-            app.config.federation_proxy.clone(),
+            app.fed_client.clone(),
         )
     };
 
@@ -62,16 +61,8 @@ pub(crate) async fn reject_invite<S: Store>(
     // the client relies on.
     let dest = invite.event.sender.server_name().to_owned();
     let display_name = crate::local_display_name(&*store).await;
-    let local = match try_federated_leave(
-        &own_server,
-        federation_proxy.as_deref(),
-        &policy,
-        &dest,
-        room_id,
-        &user,
-        &display_name,
-    )
-    .await
+    let local = match try_federated_leave(&client, &policy, &dest, room_id, &user, &display_name)
+        .await
     {
         // The completed leave replaces the invite: sync shows the room as left.
         // Refused if we have since joined (the leave then reaches us in-room)
@@ -109,16 +100,13 @@ pub(crate) async fn reject_invite<S: Store>(
 /// reason (including the underlying transport/HTTP error) is what the caller
 /// logs before swallowing it.
 async fn try_federated_leave(
-    own_server: &str,
-    proxy: Option<&str>,
+    client: &FederationClient,
     policy: &neutrino_event::EventPolicy,
     dest: &ServerName,
     room_id: &RoomId,
     user: &UserId,
     display_name: &str,
 ) -> Result<neutrino_event::Event, String> {
-    let client =
-        FederationClient::new(own_server.to_owned(), proxy).with_signer(policy.signer().cloned());
     let template = client
         .make_leave(dest, room_id, user)
         .await

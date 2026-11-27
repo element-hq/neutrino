@@ -1,13 +1,15 @@
 //! Ingress: the wire→local half. Implements `WireHandler` — decodes the CBOR
-//! request body to JSON, forwards it verbatim (method/path/forwardable headers)
-//! to the loopback `neutrino-http` upstream, and re-encodes the JSON response
-//! to CBOR. Path/method are never interpreted, so no federation routes are
+//! request body to JSON, hands it verbatim (method/path/forwardable headers)
+//! to the homeserver's federation router, and re-encodes the JSON response to
+//! CBOR. Path/method are never interpreted, so no federation routes are
 //! mirrored.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
+use axum::Router;
+use axum::http::Request;
+use tower::ServiceExt;
 use tracing::warn;
 
 use crate::capture::{CaptureControl, Leg, record_response};
@@ -15,71 +17,18 @@ use crate::codec::{cbor_to_json, json_to_cbor};
 use crate::headers::{claimed_origin, is_forwardable};
 use crate::transport::{WireHandler, WireRequest, WireResponse};
 
-/// The only path namespace the ingress forwards to the loopback homeserver.
-/// The ingress owns the *public* federation port, but the co-located
-/// `neutrino-http` serves the (unauthenticated, trusted-network) Client-Server
-/// API on the same listener (see `build_router`). Forwarding only
-/// `/_matrix/federation/*` keeps a peer from reaching CSAPI/other routes
-/// through the proxy. No `/_matrix/key/` prefix: over lb, peer keys come from
-/// the medium's key resolver, never from a fetch over the wire.
-const FEDERATION_PREFIX: &str = "/_matrix/federation/";
-
-/// Join an error's source chain into `": "`-separated causes. reqwest's `Display`
-/// stops at its own message and drops the underlying cause (connect / reset /
-/// timeout), which is exactly the datum needed to tell a loopback-family mismatch
-/// from a genuinely dead upstream.
-fn source_chain(err: &dyn std::error::Error) -> String {
-    std::iter::successors(err.source(), |c| c.source())
-        .map(|c| c.to_string())
-        .collect::<Vec<_>>()
-        .join(": ")
-}
-
-/// Forwards transcoded requests to the local homeserver.
+/// Hands transcoded requests to the homeserver.
 pub struct IngressHandler {
-    http: reqwest::Client,
-    /// Base URL of local `neutrino-http`, e.g. `http://127.0.0.1:8008`.
-    upstream: String,
+    /// The routes peers may reach; nothing else is served.
+    upstream: Router,
     /// Runtime-toggleable pcap sink, `None` when the host declared no tap. This
     /// is the peer→local leg of the capture (see [`crate::capture`]).
     capture: Option<Arc<CaptureControl>>,
 }
 
 impl IngressHandler {
-    pub fn new(upstream: String, capture: Option<Arc<CaptureControl>>) -> Self {
-        Self::with_timeouts(
-            upstream,
-            capture,
-            crate::CONNECT_TIMEOUT,
-            crate::REQUEST_TIMEOUT,
-        )
-    }
-
-    fn with_timeouts(
-        upstream: String,
-        capture: Option<Arc<CaptureControl>>,
-        connect: Duration,
-        request: Duration,
-    ) -> Self {
-        // Bound the loopback hop to `neutrino-http`: a hung upstream must not
-        // pin this wire-handler task (and its buffers) indefinitely.
-        crate::install_crypto_provider();
-        let http = reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(connect)
-            .timeout(request)
-            .build()
-            // `build()` only fails on TLS-backend init; this is a plaintext
-            // client (no TLS), so it can't fail. Panic loud rather than fall
-            // back to a default `Client::new()` that silently drops `.no_proxy()`
-            // + the timeouts (re-enabling ambient-proxy hijack and the dead-peer
-            // request leak these settings exist to prevent).
-            .expect("plaintext reqwest client always builds; no TLS backend to init");
-        Self {
-            http,
-            upstream,
-            capture,
-        }
+    pub fn new(upstream: Router, capture: Option<Arc<CaptureControl>>) -> Self {
+        Self { upstream, capture }
     }
 
     /// `502` with an empty body, used when transcoding or the upstream fails.
@@ -108,9 +57,8 @@ impl WireHandler for IngressHandler {
         // `WireRequest` carries no source, so this is the only peer identity the
         // ingress has. (On the datagram transport the claim was already bound to
         // the link-authenticated node; see `Hub::origin_binding_violation`.)
-        // Recorded before the gates below, so a rejected request is still
-        // visible, and before the upstream call, so the gap to the response half
-        // is the upstream's service time.
+        // Recorded before the upstream call, so the gap to the response half is
+        // the upstream's service time.
         let exchange = self.capture.as_ref().and_then(|capture| {
             capture.record_request(
                 Leg::Ingress,
@@ -121,64 +69,55 @@ impl WireHandler for IngressHandler {
                 &json_body,
             )
         });
-        let url = format!("{}{}", self.upstream, req.path);
-        // Parse first, then gate on the *normalized* path: a raw `starts_with`
-        // is bypassable by `..` / percent-encoded-dot traversal (e.g.
-        // `/_matrix/federation/v1/../../client/...`), which the URL parser
-        // collapses into a CSAPI path. Checking `parsed.path()` catches it.
-        let parsed = match reqwest::Url::parse(&url) {
-            Ok(u) => u,
-            Err(e) => {
-                warn!(%e, "ingress: upstream URL parse failed");
-                record_response(&self.capture, exchange, 502, &[], b"");
-                return Self::bad_gateway();
-            }
-        };
-        if !parsed.path().starts_with(FEDERATION_PREFIX) {
-            warn!(path = %parsed.path(), "ingress: rejecting non-federation path");
-            record_response(&self.capture, exchange, 404, &[], b"");
-            return WireResponse {
-                status: 404,
-                headers: vec![],
-                body: vec![],
-                ..Default::default()
-            };
-        }
-        let mut rb = self.http.request(req.method, parsed);
+        let mut builder = Request::builder().method(req.method).uri(&req.path);
         for (name, value) in &req.headers {
             if is_forwardable(name) {
-                rb = rb.header(name.as_str(), value.as_slice());
+                builder = builder.header(name.as_str(), value.as_slice());
             }
         }
         if !json_body.is_empty() {
-            rb = rb.header(reqwest::header::CONTENT_TYPE, "application/json");
+            builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
         }
-        let resp = match rb.body(json_body).send().await {
+        let request = match builder.body(axum::body::Body::from(json_body)) {
             Ok(r) => r,
             Err(e) => {
-                // reqwest's `Display` stops at "error sending request for url";
-                // the load-bearing root cause (e.g. "connection refused (os error
-                // 111)" — the IPv4/IPv6 loopback mismatch) lives in the source
-                // chain, so log that too or the failure is undiagnosable.
-                warn!(%e, cause = %source_chain(&e), "ingress: upstream request failed");
+                warn!(%e, path = %req.path, "ingress: unroutable request");
                 record_response(&self.capture, exchange, 502, &[], b"");
                 return Self::bad_gateway();
             }
         };
-        let status = resp.status().as_u16();
+        // A hung handler must not pin this wire-handler task (and its buffers)
+        // indefinitely.
+        let call = self.upstream.clone().oneshot(request);
+        let resp = match tokio::time::timeout(crate::REQUEST_TIMEOUT, call).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(infallible)) => match infallible {},
+            Err(_) => {
+                warn!("ingress: upstream timed out");
+                record_response(&self.capture, exchange, 502, &[], b"");
+                return Self::bad_gateway();
+            }
+        };
+        let (parts, body) = resp.into_parts();
+        let status = parts.status.as_u16();
         // Carry the upstream's response headers across the wire (the framing
         // ones — content-length/-type, etc. — are dropped per hop by the
-        // downstream `is_forwardable` filter). Collected before the body is
-        // consumed, mirroring `HttpWireClient::send`.
-        let headers: Vec<(String, Vec<u8>)> = resp
-            .headers()
+        // downstream `is_forwardable` filter).
+        let headers: Vec<(String, Vec<u8>)> = parts
+            .headers
             .iter()
             .map(|(k, v)| (k.as_str().to_owned(), v.as_bytes().to_vec()))
             .collect();
-        let resp_bytes = match resp.bytes().await {
-            Ok(b) => b.to_vec(),
-            Err(e) => {
+        let read = axum::body::to_bytes(body, usize::MAX);
+        let resp_bytes = match tokio::time::timeout(crate::BODY_TIMEOUT, read).await {
+            Ok(Ok(b)) => b.to_vec(),
+            Ok(Err(e)) => {
                 warn!(%e, "ingress: reading upstream response failed");
+                record_response(&self.capture, exchange, 502, &[], b"");
+                return Self::bad_gateway();
+            }
+            Err(_) => {
+                warn!("ingress: upstream response body timed out");
                 record_response(&self.capture, exchange, 502, &[], b"");
                 return Self::bad_gateway();
             }
@@ -226,7 +165,6 @@ mod tests {
     use axum::{Json, Router};
     use std::sync::Arc;
     use std::sync::Mutex;
-    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn forwards_decoded_json_to_upstream_and_recodes_response() {
@@ -246,11 +184,7 @@ mod tests {
                 ),
             )
             .with_state(seen_c);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let handler = IngressHandler::new(format!("http://{addr}"), None);
+        let handler = IngressHandler::new(app, None);
         let cbor_in = json_to_cbor(br#"{"hello":"world"}"#).unwrap();
         let resp = handler
             .handle(WireRequest {
@@ -284,16 +218,11 @@ mod tests {
                 Json(serde_json::json!({"ok": true})),
             )
         });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let handler = IngressHandler::new(format!("http://{addr}"), None);
+        let handler = IngressHandler::new(app, None);
         let resp = handler
             .handle(WireRequest {
                 dest: String::new(),
                 method: Method::GET,
-                // A federation path so the route-gate forwards it.
                 path: "/_matrix/federation/v1/backfill/!r".to_owned(),
                 headers: vec![],
                 body: vec![],
@@ -317,11 +246,7 @@ mod tests {
     #[tokio::test]
     async fn preserves_non_2xx_status_when_upstream_body_is_not_json() {
         let app = Router::new().fallback(|| async { (axum::http::StatusCode::FORBIDDEN, "no") });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let handler = IngressHandler::new(format!("http://{addr}"), None);
+        let handler = IngressHandler::new(app, None);
         let resp = handler
             .handle(WireRequest {
                 dest: String::new(),
@@ -341,16 +266,11 @@ mod tests {
     #[tokio::test]
     async fn masks_2xx_with_undecodable_body_as_bad_gateway() {
         let app = Router::new().fallback(|| async { "200 but not json" });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let handler = IngressHandler::new(format!("http://{addr}"), None);
+        let handler = IngressHandler::new(app, None);
         let resp = handler
             .handle(WireRequest {
                 dest: String::new(),
                 method: Method::GET,
-                // A federation path so the route-gate forwards it.
                 path: "/_matrix/federation/v1/backfill/!r".to_owned(),
                 headers: vec![],
                 body: vec![],
@@ -359,121 +279,5 @@ mod tests {
             .await;
 
         assert_eq!(resp.status, 502);
-    }
-
-    // A peer must not be able to reach the co-resident Client-Server API
-    // through the public federation port: any non-`/_matrix/federation/` path
-    // is 404'd and never forwarded to the loopback upstream.
-    #[tokio::test]
-    async fn rejects_non_federation_path() {
-        let hit: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-        let hit_c = hit.clone();
-        let app = Router::new().fallback(move || {
-            let hit_c = hit_c.clone();
-            async move {
-                *hit_c.lock().unwrap() = true;
-                Json(serde_json::json!({"ok": true}))
-            }
-        });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let handler = IngressHandler::new(format!("http://{addr}"), None);
-        let resp = handler
-            .handle(WireRequest {
-                dest: String::new(),
-                method: Method::POST,
-                path: "/_matrix/client/v3/createRoom".to_owned(),
-                headers: vec![],
-                body: vec![],
-                ..Default::default()
-            })
-            .await;
-
-        assert_eq!(resp.status, 404, "non-federation path must be rejected");
-        assert!(!*hit.lock().unwrap(), "upstream must not be reached");
-    }
-
-    // `..` (and percent-encoded-dot) traversal that the URL parser would
-    // normalize into a CSAPI path must be caught by the post-normalization
-    // gate, not just a raw prefix check.
-    #[tokio::test]
-    async fn rejects_dotdot_traversal_into_csapi() {
-        let hit: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-        let hit_c = hit.clone();
-        let app = Router::new().fallback(move || {
-            let hit_c = hit_c.clone();
-            async move {
-                *hit_c.lock().unwrap() = true;
-                Json(serde_json::json!({"ok": true}))
-            }
-        });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let handler = IngressHandler::new(format!("http://{addr}"), None);
-        let resp = handler
-            .handle(WireRequest {
-                dest: String::new(),
-                method: Method::POST,
-                // Normalizes to `/_matrix/client/v3/createRoom`.
-                path: "/_matrix/federation/v1/../../client/v3/createRoom".to_owned(),
-                headers: vec![],
-                body: vec![],
-                ..Default::default()
-            })
-            .await;
-
-        assert_eq!(resp.status, 404, "traversal escape must be rejected");
-        assert!(!*hit.lock().unwrap(), "upstream must not be reached");
-    }
-
-    // Proves the localhost/127.0.0.1 address-family mismatch is what turns a
-    // federated invite into a 502 (the "Empty Room" failure). Production binds
-    // the homeserver v4-only
-    // (`neutrino_main: listening on 127.0.0.1:8008`) but the ingress upstream is
-    // the *hostname* `http://localhost:8008` (upstream_url passes a non-numeric
-    // bind_addr through verbatim). On Android `localhost` also resolves to `::1`,
-    // where nothing listens. Against ONE v4-only upstream the only variable here
-    // is the address family of the upstream URL: same family forwards and returns
-    // the homeserver's 200; the other family ([::1], which `localhost` can pick)
-    // can't connect, so the ingress reports 502 — exactly the observed failure.
-    #[tokio::test]
-    async fn upstream_address_family_mismatch_yields_bad_gateway() {
-        // v4-only listener, mirroring production's `listening on 127.0.0.1:8008`.
-        let app = Router::new().fallback(|| async { Json(serde_json::json!({"event": {}})) });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let invite = || WireRequest {
-            dest: String::new(),
-            method: Method::PUT,
-            path: "/_matrix/federation/v2/invite/!r/$e".to_owned(),
-            headers: vec![],
-            body: json_to_cbor(br#"{"room_version":"org.matrix.msc4242.12"}"#).unwrap(),
-            ..Default::default()
-        };
-
-        // Matching family (v4) → reaches the v4-bound homeserver.
-        let matched = IngressHandler::new(format!("http://127.0.0.1:{port}"), None)
-            .handle(invite())
-            .await;
-        assert_eq!(
-            matched.status, 200,
-            "v4 upstream must reach the v4-bound homeserver"
-        );
-
-        // Other family (v6) — the address `localhost` can resolve to — has no
-        // listener, so the loopback connect fails and the ingress 502s.
-        let mismatched = IngressHandler::new(format!("http://[::1]:{port}"), None)
-            .handle(invite())
-            .await;
-        assert_eq!(
-            mismatched.status, 502,
-            "v6 upstream against a v4-only homeserver must 502 (the invite failure)"
-        );
     }
 }

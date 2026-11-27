@@ -42,15 +42,10 @@ tracing.workspace = true
 neutrino-event = { path = "../neutrino-event" }
 neutrino-ctl = { path = "../neutrino-ctl" }
 neutrino-engine = { path = "../neutrino-engine" }
+neutrino-lb = { path = "../neutrino-lb" }
 neutrino-room = { path = "../neutrino-room" }
 neutrino-store = { path = "../neutrino-store" }
 reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
-# reqwest has no TLS backend in this workspace, but an out-of-tree composition
-# (the iroh/BLE medium) feature-unifies it onto no-provider rustls — a crypto
-# provider must then be installed before building the federation client (see
-# `client::install_crypto_provider`). ring matches neutrino-lb. (neutrino-lb is
-# only a dev-dependency, so the lib can't reuse its helper.)
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
 # Test fixtures assemble `Event`s by hand and need `base_version_event_id` to
@@ -64,9 +59,5 @@ tower = "0.5"
 # tests open file-backed stores on a `NamedTempFile`. Production no longer
 # uses tempfiles — the server persists into `config.storage_dir`.
 tempfile = "3.27.0"
-# Test-only: the two-sidecar federation e2e (`tests/e2e_lb_federation.rs`)
-# stands up `neutrino-lb` proxies in front of two homeservers. neutrino-lb does
-# not depend on neutrino-http, so this dev-dep introduces no cycle.
-neutrino-lb = { path = "../neutrino-lb" }
 # Test-only: tests open the store they hand to `router` / `serve`.
 neutrino-store-sqlite = { path = "../neutrino-store-sqlite" }

@@ -79,12 +79,7 @@ struct App<S: Store> {
     /// link reconciles divergence from a transaction's forward-extremity
     /// exchange. Held behind a trait object so tests inject a deterministic stub.
     fetcher: Arc<dyn MissingEventsFetcher>,
-    /// Shared outbound federation client, built once at startup from
-    /// `config.server_name`/`config.federation_proxy`. Reused by the `/messages`
-    /// backward-underflow backfill path (`messages.rs`) so each back-page reuses
-    /// the same connection pool rather than rebuilding a reqwest client per
-    /// round. (`fetcher` also wraps a `FederationClient`, but only as a type-
-    /// erased `MissingEventsFetcher`, which exposes no `backfill` method.)
+    /// The outbound federation client every request to a peer goes through.
     fed_client: Arc<FederationClient>,
     /// Group tags, shared by the room actors and the outbound sender pool.
     group_tags: Arc<GroupTags>,
@@ -213,14 +208,16 @@ pub enum StartupError {
     Io(#[from] std::io::Error),
     #[error("invalid federation_proxy: {0}")]
     InvalidFederationProxy(String),
+    #[error("neutrino-lb: {0}")]
+    Lb(#[from] neutrino_lb::transport::WireError),
+    #[error("neutrino-lb ingress stopped unexpectedly")]
+    LbStopped,
 }
 
 impl<S: Store> AppState<S> {
     /// Validate `Config` fields that must be well-formed before serving. A
     /// configured federation proxy must parse as a proxy URL — bail at startup
-    /// rather than silently falling back to direct federation: in a sidecar
-    /// deployment "direct" means sending plain JSON to a peer's CBOR-only ingress
-    /// port, which breaks the whole mesh. Fail loudly.
+    /// rather than silently falling back to direct federation.
     fn validate_config(config: &Config) -> Result<(), StartupError> {
         if let Some(url) = config.federation_proxy.as_deref() {
             reqwest::Proxy::all(url)
@@ -237,11 +234,12 @@ impl<S: Store> AppState<S> {
             store,
             Arc::new(DiscoveryRegistry::new()),
             EventPolicy::trusted_network(),
+            None,
         )
     }
 
-    /// Like [`AppState::from_store`] but with a caller-owned discovery registry
-    /// and event policy. The production path ([`serve`]) injects the
+    /// Like [`AppState::from_store`] but with a caller-owned discovery registry,
+    /// event policy and lb egress. The production path ([`serve`]) injects the
     /// registry the host holds a write handle to (so its BLE-discovery callback
     /// and the router read the same set); [`from_store`] passes a fresh empty
     /// one (and [`EventPolicy::trusted_network()`]) for tests/the dev binary.
@@ -250,25 +248,28 @@ impl<S: Store> AppState<S> {
         store: Arc<S>,
         discovery: Arc<DiscoveryRegistry>,
         policy: EventPolicy,
+        egress: Option<neutrino_lb::Egress>,
     ) -> Self {
         let client = Arc::new(
             FederationClient::new(
                 config.server_name.clone(),
                 config.federation_proxy.as_deref(),
             )
-            .with_signer(policy.signer().cloned()),
+            .with_signer(policy.signer().cloned())
+            .with_egress(egress),
         );
-        let fetcher: Arc<dyn MissingEventsFetcher> = Arc::new(ReqwestFetcher::new(client));
-        Self::from_store_with_fetcher(config, store, fetcher, discovery, policy)
+        let fetcher: Arc<dyn MissingEventsFetcher> = Arc::new(ReqwestFetcher::new(client.clone()));
+        Self::from_store_with_fetcher(config, store, client, fetcher, discovery, policy)
     }
 
-    /// Like [`AppState::from_store`] but with an explicit gap-fill `fetcher`
-    /// (and discovery registry). The federation gap-fill tests inject a
-    /// deterministic stub fetcher here instead of the reqwest client (which
-    /// would otherwise reach the network).
+    /// Like [`AppState::from_store`] but with an explicit federation client,
+    /// gap-fill `fetcher` and discovery registry. The federation gap-fill tests
+    /// inject a deterministic stub fetcher here instead of the reqwest client
+    /// (which would otherwise reach the network).
     fn from_store_with_fetcher(
         config: Config,
         store: Arc<S>,
+        fed_client: Arc<FederationClient>,
         fetcher: Arc<dyn MissingEventsFetcher>,
         discovery: Arc<DiscoveryRegistry>,
         policy: EventPolicy,
@@ -277,15 +278,6 @@ impl<S: Store> AppState<S> {
         let mut sync_state = SyncState::new(store.clone(), shutdown.clone());
         sync_state.delivery_receipts = config.delivery_receipts;
         let sync_state = Arc::new(sync_state);
-        // Outbound federation client, built once here and shared (rather than
-        // rebuilt per back-page in `messages.rs`'s backfill path).
-        let fed_client = Arc::new(
-            FederationClient::new(
-                config.server_name.clone(),
-                config.federation_proxy.as_deref(),
-            )
-            .with_signer(policy.signer().cloned()),
-        );
         let group_tags = Arc::new(GroupTags::new(fed_client.supports_groups()));
         let room_registry = Arc::new(RoomRegistry::new(
             store.clone(),
@@ -335,11 +327,6 @@ impl<S: Store> AppState<S> {
         lock_app(self).store.clone()
     }
 
-    /// This homeserver's name, sent as the `origin` on outbound transactions.
-    fn server_name(&self) -> String {
-        lock_app(self).config.server_name.clone()
-    }
-
     /// The shared out-of-band discovery registry. The host writes the visible
     /// peer set through this handle (via the FFI); the user-directory search
     /// handler reads it.
@@ -382,10 +369,9 @@ impl<S: Store> AppState<S> {
         lock_app(self).config.outbound_concurrency
     }
 
-    /// The configured `neutrino-lb` egress proxy URL, if any. Threaded into
-    /// every outbound `FederationClient` so all federation routes through it.
-    fn federation_proxy(&self) -> Option<String> {
-        lock_app(self).config.federation_proxy.clone()
+    /// The shared outbound federation client.
+    fn fed_client(&self) -> Arc<FederationClient> {
+        lock_app(self).fed_client.clone()
     }
 
     /// The configured startup jitter for the outbound sender pool.
@@ -477,23 +463,23 @@ pub async fn serve<S: Store>(
     // value carrying the ingress admission mode, the local signer, and the
     // room versions this build speaks.
     policy: EventPolicy,
+    // Runs federation over `neutrino-lb` in-process when `Some`: the halves
+    // `neutrino_lb::start` returns.
+    lb: Option<(neutrino_lb::Egress, neutrino_lb::Ingress)>,
 ) -> Result<(), StartupError> {
     // The caller (the entrypoint) opens the store, resolves the server identity
     // from it, and hands the live handle in — so we build state around it rather
     // than re-opening the same DB.
     AppState::<S>::validate_config(&config)?;
-    let state = AppState::from_store_with_discovery(config, store, discovery, policy);
+    let (egress, ingress) = lb.unzip();
+    let state = AppState::from_store_with_discovery(config, store, discovery, policy, egress);
     lock_app(&state).display_name_tx = display_name_tx;
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
     // enumeration resumes delivery of anything left undelivered.
-    let transport = Arc::new(
-        FederationClient::new(state.server_name(), state.federation_proxy().as_deref())
-            .with_signer(state.signer()),
-    );
     let sender_task = neutrino_engine::sender::spawn(
         state.store(),
-        transport,
+        state.fed_client(),
         state.group_tags(),
         state.outbound_concurrency(),
         state.startup_jitter(),
@@ -504,17 +490,50 @@ pub async fn serve<S: Store>(
         state.worker_poke(),
     );
     let router = build_router(&state);
+    let federation = federation_router(&state);
+    let shutdown = state.subscribe_shutdown();
     // `dispatch` resolves on a terminal command or when every sender is dropped,
     // which drives axum's graceful shutdown — in-flight requests drain first.
     // `state` is threaded in so server-directed commands can act on internals.
-    axum::serve(listener, router)
-        .with_graceful_shutdown(dispatch(commands, state))
-        .await
-        .map_err(StartupError::Io)?;
-    // dispatch fired the token before resolving, so the supervisor has already
-    // begun winding down and aborting its children; await it to confirm teardown.
+    let server = async {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(dispatch(commands, state))
+            .await
+            .map_err(StartupError::Io)
+    };
+    let lb = async {
+        match ingress {
+            Some(ingress) => Ok(ingress.serve(federation, shutdown.clone()).await?),
+            None => {
+                shutdown.cancelled().await;
+                Ok(())
+            }
+        }
+    };
+    tokio::pin!(server, lb);
+    let served = tokio::select! {
+        r = &mut server => {
+            shutdown.cancel();
+            r.and(lb.await)
+        }
+        // The ingress runs until `shutdown`, so returning first means it
+        // stopped on its own — always a failure, which takes the homeserver
+        // down with it.
+        r = &mut lb => if shutdown.is_cancelled() {
+            r.and(server.await)
+        } else {
+            match &r {
+                Ok(()) => error!("neutrino-lb ingress returned unexpectedly; stopping homeserver"),
+                Err(e) => error!(error = %e, "neutrino-lb ingress failed; stopping homeserver"),
+            }
+            r.and(Err(StartupError::LbStopped))
+        }
+    };
+    // Stop everything left running, then await the sender supervisor to
+    // confirm teardown.
+    shutdown.cancel();
     let _ = sender_task.await;
-    Ok(())
+    served
 }
 
 /// Dispatch out-of-band control commands until a terminal one (`Shutdown`)
@@ -590,9 +609,14 @@ pub(crate) fn router_with_store_and_fetcher<S: Store>(
     store: Arc<S>,
     fetcher: Arc<dyn MissingEventsFetcher>,
 ) -> Router {
+    let client = Arc::new(FederationClient::new(
+        config.server_name.clone(),
+        config.federation_proxy.as_deref(),
+    ));
     let state = AppState::from_store_with_fetcher(
         config,
         store,
+        client,
         fetcher,
         Arc::new(DiscoveryRegistry::new()),
         EventPolicy::trusted_network(),
@@ -601,6 +625,15 @@ pub(crate) fn router_with_store_and_fetcher<S: Store>(
 }
 
 fn build_router<S: Store>(state: &AppState<S>) -> Router {
+    with_request_logging(client_routes().merge(federation_routes()), state)
+}
+
+/// The routes peers reach through lb's ingress.
+fn federation_router<S: Store>(state: &AppState<S>) -> Router {
+    with_request_logging(federation_routes(), state)
+}
+
+fn client_routes<S: Store>() -> Router<AppState<S>> {
     Router::new()
         .route("/", get(root))
         .route("/_matrix/client/versions", get(versions))
@@ -716,6 +749,10 @@ fn build_router<S: Store>(state: &AppState<S>) -> Router {
         )
         .route("/_matrix/client/v3/pushers/set", post(pushers_set))
         .route("/_matrix/client/v3/capabilities", get(get_capabilities))
+}
+
+fn federation_routes<S: Store>() -> Router<AppState<S>> {
+    Router::new()
         .route(
             "/_matrix/federation/v1/get_missing_events/{room_id}",
             post(federation::get_missing_events::handle),
@@ -748,6 +785,10 @@ fn build_router<S: Store>(state: &AppState<S>) -> Router {
             "/_matrix/federation/v2/send_leave/{room_id}/{event_id}",
             put(federation::send_leave::handle),
         )
+}
+
+fn with_request_logging<S: Store>(routes: Router<AppState<S>>, state: &AppState<S>) -> Router {
+    routes
         .fallback(default_fallback)
         // Log one INFO line per request (method + path) and one per response
         // (status + latency), with 5xx surfaced at ERROR. We emit these under our
@@ -2342,6 +2383,26 @@ mod tests {
         (state, tmp)
     }
 
+    /// Peers reach the federation router through lb's ingress, so it must not
+    /// serve the Client-Server API, not even through `..` traversal.
+    #[tokio::test]
+    async fn federation_router_serves_no_client_api() {
+        use tower::ServiceExt;
+        let tmp = TempDir::new().expect("tempdir");
+        let store = Arc::new(SqliteStore::open_in_dir(tmp.path()).await.expect("open"));
+        let router = super::federation_router(&AppState::from_store(test_config(&tmp), store));
+        for path in [
+            "/_matrix/client/v3/capabilities",
+            "/_matrix/federation/v1/../../client/v3/capabilities",
+        ] {
+            let request = axum::http::Request::get(path)
+                .body(axum::body::Body::empty())
+                .expect("request");
+            let response = router.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
     /// `/_matrix/key/v2/server`: on a signed deployment it serves the node
     /// key under `ed25519:1` with a signature block; on a trusted network
     /// (no signer) it answers 404 — there are no keys to serve, by design.
@@ -2373,6 +2434,7 @@ mod tests {
                 },
                 Arc::new(neutrino_event::RoomVersions::base_only()),
             ),
+            None,
         );
         let response = build_router(&state)
             .oneshot(request())
@@ -2406,7 +2468,7 @@ mod tests {
     #[tokio::test]
     async fn router_bails_on_invalid_federation_proxy() {
         // A malformed proxy must fail startup, not silently degrade to direct
-        // federation (which would break the CBOR sidecar mesh).
+        // federation.
         let tmp = TempDir::new().expect("tempdir");
         let mut config = test_config(&tmp);
         config.federation_proxy = Some("not a url".to_string());
@@ -2813,6 +2875,7 @@ mod tests {
             Arc::new(super::DiscoveryRegistry::new()),
             None,
             EventPolicy::trusted_network(),
+            None,
         ));
 
         // Give the sender supervisor a moment to discover the dead peer and

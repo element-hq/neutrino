@@ -2,14 +2,14 @@
 //! `neutrino-lb` sidecar, federate over HTTP+CBOR. Proves the CBOR transcode
 //! survives real federation traffic in both directions — the `make_join` /
 //! `send_join` handshake (B joins a room on A) and an outbox-driven `/send`
-//! (a message on A converges to B) — with `federation_proxy` doing the routing.
+//! (a message on A converges to B).
 //!
 //! Each node is the full production stack (`neutrino_http::serve`: router +
 //! outbound sender pool), driven only over its public HTTP/CSAPI surface, so
 //! this needs no crate internals. Topology per node:
 //!
 //! ```text
-//! CSAPI client ─▶ homeserver (loopback La) ─▶ egress (Ea) ═CBOR═▶ peer ingress
+//! CSAPI client ─▶ homeserver (loopback La) ─▶ egress ═CBOR═▶ peer ingress
 //! peer egress ═CBOR═▶ ingress (Ia == server_name) ─▶ homeserver (loopback La)
 //! ```
 #![cfg(not(feature = "multi-user-shim"))]
@@ -21,7 +21,6 @@ use neutrino_ctl::{Command, Config, DiscoveryRegistry};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 /// Reserve an ephemeral loopback port and free it, so a sidecar (which binds a
 /// `SocketAddr` itself) can claim it. A small bind race is unavoidable here, as
@@ -34,20 +33,19 @@ async fn free_port() -> SocketAddr {
 }
 
 /// A running homeserver + its sidecar. Holds what must stay alive for the test:
-/// the command sender (dropping every sender shuts the server down), the
-/// sidecar shutdown token, and the storage tempdir (dropping it deletes the DB).
+/// the command sender (dropping every sender shuts the server down) and the
+/// storage tempdir (dropping it deletes the DB).
 struct Node {
     /// Public name peers resolve to — the sidecar ingress address.
     server_name: String,
     /// Loopback base URL of the homeserver's own HTTP, for driving CSAPI.
     http_base: String,
     _cmd_tx: mpsc::UnboundedSender<Command>,
-    _shutdown: CancellationToken,
     _tmp: tempfile::TempDir,
 }
 
-/// Stand up one node: a homeserver whose `federation_proxy` points at its
-/// egress, fronted by a sidecar whose ingress is the node's `server_name`.
+/// Stand up one node: a homeserver running a sidecar whose ingress is the
+/// node's `server_name`.
 async fn start_node(localpart: &str) -> Node {
     // Homeserver HTTP listener (loopback), pre-bound so we know its port and
     // there is no bind race — `serve()` consumes this listener directly.
@@ -55,7 +53,6 @@ async fn start_node(localpart: &str) -> Node {
     let http_addr = http_listener.local_addr().unwrap();
 
     let ingress = free_port().await; // == server_name (what peers reach)
-    let egress = free_port().await; // federation_proxy target (loopback)
 
     let tmp = tempfile::TempDir::new().unwrap();
     let server_name = ingress.to_string();
@@ -65,10 +62,16 @@ async fn start_node(localpart: &str) -> Node {
         bind_addr: "127.0.0.1:0".to_string(),
         localpart: localpart.to_string(),
         storage_dir: tmp.path().to_path_buf(),
-        federation_proxy: Some(format!("http://{egress}")),
         ..Default::default()
     };
 
+    let lb = neutrino_lb::LbConfig {
+        ingress_bind: ingress,
+        wire: neutrino_lb::WireKind::Http,
+        resolver: None,
+        link: None,
+        capture: None,
+    };
     // Full homeserver stack (router + outbound federation sender pool).
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -86,32 +89,15 @@ async fn start_node(localpart: &str) -> Node {
             std::sync::Arc::new(DiscoveryRegistry::new()),
             None,
             neutrino_event::EventPolicy::trusted_network(),
+            Some(neutrino_lb::start(lb).unwrap()),
         )
         .await;
-    });
-
-    // Sidecar: ingress on the public port, egress on loopback, upstream = the
-    // homeserver's loopback HTTP.
-    let shutdown = CancellationToken::new();
-    let lb = neutrino_lb::LbConfig {
-        ingress_bind: ingress,
-        egress_bind: egress,
-        upstream: format!("http://{http_addr}"),
-        wire: neutrino_lb::WireKind::Http,
-        resolver: None,
-        link: None,
-        capture: None,
-    };
-    let lb_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        let _ = neutrino_lb::serve(lb, lb_shutdown).await;
     });
 
     Node {
         server_name,
         http_base: format!("http://{http_addr}"),
         _cmd_tx: cmd_tx,
-        _shutdown: shutdown,
         _tmp: tmp,
     }
 }

@@ -8,7 +8,7 @@
 //! handler/transcode (`CoapDispatch::handle`), and the egress rejects an over-cap
 //! peer response (`CoapWireClient::send`). That matches the HTTP transport's
 //! handler-facing contract and bounds the JSON↔CBOR transcode amplification + the
-//! loopback forward for a legitimately large body (e.g. a big room's `send_join`
+//! homeserver's handling of a legitimately large body (e.g. a big room's `send_join`
 //! state), which is the realistic case under Neutrino's trusted-network
 //! assumption. What it does *not* bound is the buffer coap-lite 0.13 accumulates
 //! *during* blockwise reassembly: `max_total_message_size` caps only the
@@ -461,7 +461,7 @@ impl CoapDispatch {
         // Refuse an over-cap assembled body with 413 before it reaches the
         // handler/transcode — the network-exposed OOM guard, mirroring the HTTP
         // ingress. (coap-lite has already reassembled it; this still bounds the
-        // downstream transcode + loopback forward — see the module OOM note.)
+        // downstream transcode + homeserver handler — see the module OOM note.)
         let wire_resp = if request.message.payload.len() > self.max_body_bytes {
             status_only(413)
         } else {

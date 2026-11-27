@@ -384,7 +384,7 @@ impl Packet {
     }
 
     /// Returns an iterator over the options of the packet.
-    pub fn options(&self) -> Options {
+    pub fn options(&self) -> Options<'_> {
         self.options.iter()
     }
 

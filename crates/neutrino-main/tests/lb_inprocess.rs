@@ -6,10 +6,9 @@
 //! co-launched and wired (egress + ingress) by `entrypoint` itself, not just by
 //! a hand-rolled test harness.
 //!
-//! Per node: the homeserver binds a loopback port (== sidecar upstream); the
+//! Per node: the homeserver binds a loopback port; the
 //! ingress is `host(bind_addr):lb_federation_port` (== `server_name`, the public
-//! federation port, UDP); the egress is an internal loopback port `entrypoint`
-//! allocates itself.
+//! federation port, UDP).
 #![cfg(not(feature = "multi-user-shim"))]
 
 use std::net::SocketAddr;
@@ -42,7 +41,7 @@ struct Node {
 }
 
 async fn start_node(localpart: &str) -> Node {
-    let hs = free_port().await; // homeserver loopback bind (== sidecar upstream)
+    let hs = free_port().await; // homeserver loopback bind
     let ingress = free_port().await; // public federation port (== server_name)
     let tmp = tempfile::TempDir::new().unwrap();
     // The ingress is derived as `host(bind_addr):lb_federation_port`; `bind_addr`
@@ -165,8 +164,8 @@ async fn two_in_process_nodes_federate_over_cbor() {
 }
 
 /// #11, teardown arm: when the homeserver winds down (here via
-/// `Command::Shutdown`), `entrypoint`'s `select!` must cancel the sidecar token
-/// and *join* the sidecar before returning `Ok` — the `DendriteService.stop()`
+/// `Command::Shutdown`), `entrypoint` must stop and *join* the sidecar before
+/// returning `Ok` — the `DendriteService.stop()`
 /// analogue. A hang in that join, or a sidecar that never releases its port, is
 /// exactly what this pins. The federation test above holds the command channel
 /// open for its whole life, so only this test exercises this path.
@@ -299,7 +298,7 @@ async fn entrypoint_surfaces_a_sidecar_bind_failure() {
     };
 
     // Keep the command sender alive so the homeserver stays up: the only way out
-    // of the `select!` is the sidecar failing.
+    // is the sidecar failing.
     let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let store = neutrino_main::open_store(&config)
         .await

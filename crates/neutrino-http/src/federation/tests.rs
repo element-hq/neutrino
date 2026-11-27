@@ -3068,7 +3068,7 @@ async fn put_grouped(app: &axum::Router, path: &str, body: &Value) -> (StatusCod
         .method("PUT")
         .uri(path)
         .header("content-type", "application/json")
-        .header(crate::federation::client::GROUP_HEADER, "2")
+        .header(neutrino_lb::GROUP_HEADER, "2")
         .body(Body::from(serde_json::to_vec(body).unwrap()))
         .unwrap();
     drive(app, req).await

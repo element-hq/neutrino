@@ -31,10 +31,10 @@ The internal dependency graph is pinned, edge by edge, in `tools/xtask/src/layer
 
 ## Data flow
 
-- **Inbound PDU:** peer → lb ingress (codec decode, origin check, `/_matrix/federation/` gate, CBOR→JSON) → loopback → http `/send` (`X-Matrix` origin, parse) → `staged_events` → engine worker (re-admit, order, gap-fill) → room actor → `RoomCore::apply_pdu` → `Vec<Effect>` → `persist_resolved_event`.
+- **Inbound PDU:** peer → lb ingress (codec decode, origin check, CBOR→JSON) → http federation router, in-process → `/send` (`X-Matrix` origin, parse) → `staged_events` → engine worker (re-admit, order, gap-fill) → room actor → `RoomCore::apply_pdu` → `Vec<Effect>` → `persist_resolved_event`.
 - **Local write:** C-S handler → `RoomRegistry::send_event` → `EventBuilder` → the same actor and persist path → outbox.
-- **Outbound:** engine sender → `FederationTransport` (http `FederationClient`: `X-Matrix`, signature in signed mode) → lb egress on loopback → `NodeIdResolver` → CoAP over a `DatagramLink` or UDP.
-- **Config and commands:** host `NeutrinoConfig` or env → `Config` → `neutrino_main::entrypoint`, which fills in `server_name`, overrides `federation_proxy` and builds `LbConfig`/`EventPolicy` → `neutrino_http::serve`. Commands go host → unbounded channel → http dispatch → shutdown token or backoff kick.
+- **Outbound:** engine sender → `FederationTransport` (http `FederationClient`: `X-Matrix`, signature in signed mode) → lb egress, in-process → `NodeIdResolver` → CoAP over a `DatagramLink` or UDP.
+- **Config and commands:** host `NeutrinoConfig` or env → `Config` → `neutrino_main::entrypoint`, which fills in `server_name` and builds `LbConfig`/`EventPolicy` → `neutrino_http::serve`. Commands go host → unbounded channel → http dispatch → shutdown token or backoff kick.
 - **Client reads:** store → `Event` → `event_view` conversions. Wake-ups come over the store's `watch` channels.
 
 ## Cross-crate invariants
@@ -78,19 +78,16 @@ Each states the rule, who keeps it, who relies on it, and what breaks without it
   - ⚠ lb reads the first `origin=` parameter (`headers::xmatrix_origin`), http the last (`auth::parse_origin`).
 - **In trusted mode authorship rests on an honest mesh.** No crate checks that an event's sender belongs to the delivering origin, except on send_join, send_leave and the out-of-band paths.
 - **The C-S API is off the network only in lb mode.**
-  - lb ingress forwards only `/_matrix/federation/`, judged after URL normalisation.
+  - lb ingress serves only http's federation router.
   - `neutrino-main` refuses a concrete non-loopback `bind_addr`.
   - In direct mode nothing guards it.
   - ⚠ An unspecified `bind_addr` (`0.0.0.0`, `::`) is accepted, and the listener then binds every interface.
-- **The lb egress is loopback-only by construction**: main allocates it. That is why it has no body cap.
-- **In lb mode main replaces `Config.federation_proxy` with the egress.** A configured proxy must parse or startup fails (`AppState::validate_config`), never falling back to direct, which would send JSON to a CBOR peer.
-- **Proxied URLs carry a `~` host suffix.** The federation client adds it and lb egress strips it; the two copies of this rule must change together.
-- **`X-Neutrino-Group` lives only on loopback.**
+- **A configured `Config.federation_proxy` must parse** or startup fails (`AppState::validate_config`), never falling back to direct.
+- **`X-Neutrino-Group` never leaves the process.**
   - http's client sets it on a grouped `/send`.
   - lb egress strips it into `WireRequest.group_size`.
   - lb ingress synthesises it from the Group option.
   - The `/send` handler reads it.
-  - Both crates spell the name, and the copies must change together.
 - **`/send` answers 404 only to a Group-marked request for rooms we are not in.** lb withholds any response to a Group-marked request that comes back 404. Without that, a non-member's 404 would go on the air.
 - **Only the engine sender retries.**
   - A 4xx drops the batch permanently; anything else backs off.

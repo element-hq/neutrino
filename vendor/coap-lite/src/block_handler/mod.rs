@@ -411,7 +411,7 @@ pub fn extending_splice<R, I, T>(
     range: R,
     replace_with: I,
     maximum_reserve_len: usize,
-) -> Result<alloc::vec::Splice<I::IntoIter>, String>
+) -> Result<alloc::vec::Splice<'_, I::IntoIter>, String>
 where
     R: RangeBounds<usize>,
     I: IntoIterator<Item = T>,

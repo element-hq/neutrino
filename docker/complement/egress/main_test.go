@@ -12,11 +12,10 @@ import (
 
 func TestDestination(t *testing.T) {
 	cases := map[string]string{
-		"host.docker.internal~:12345": "host.docker.internal:12345",
-		"hs2~":                        "hs2:8448",
-		"172.17.0.1~:1024":            "172.17.0.1:1024",
-		"[::1]:1024":                  "[::1]:1024",
-		"plain:8448":                  "plain:8448",
+		"host.docker.internal:12345": "host.docker.internal:12345",
+		"hs2":                        "hs2:8448",
+		"172.17.0.1:1024":            "172.17.0.1:1024",
+		"[::1]:1024":                 "[::1]:1024",
 	}
 	for in, want := range cases {
 		if got := destination(in); got != want {
@@ -26,7 +25,7 @@ func TestDestination(t *testing.T) {
 }
 
 // A plaintext request through the egress reaches a TLS backend as HTTPS, with
-// the sentinel stripped from the Host and the path/query/body intact.
+// the Host and the path/query/body intact.
 func TestEgressUpgradesToHTTPS(t *testing.T) {
 	var gotHost, gotURI, gotBody string
 	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -46,8 +45,8 @@ func TestEgressUpgradesToHTTPS(t *testing.T) {
 	proxyURL, _ := url.Parse(egress.URL)
 	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
 	// backend.URL is https://127.0.0.1:PORT; the client dials it as neutrino
-	// would: plaintext, sentinel on the host.
-	target := "http://127.0.0.1~:" + proxyPort(t, backend.URL) + "/_matrix/federation/v1/send/txn?x=1"
+	// would: plaintext.
+	target := "http://127.0.0.1:" + proxyPort(t, backend.URL) + "/_matrix/federation/v1/send/txn?x=1"
 	req, _ := http.NewRequest(http.MethodPut, target, strings.NewReader(`{"pdus":[]}`))
 	resp, err := client.Do(req)
 	if err != nil {

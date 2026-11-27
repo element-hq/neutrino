@@ -11,7 +11,6 @@
 #![cfg(not(feature = "multi-user-shim"))]
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -77,24 +76,10 @@ impl DatagramLink for MeshLink {
     }
 }
 
-async fn free_port() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let a = l.local_addr().unwrap();
-    drop(l);
-    a
-}
-
-/// An lb over `link` that forwards inbound requests to `upstream`, and whose
-/// egress is returned.
-fn start_lb(link: Arc<MeshLink>, upstream: String, shutdown: &CancellationToken) -> SocketAddr {
-    let egress = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
-    let lb = neutrino_lb::LbConfig {
+/// An lb over `link`.
+fn lb_config(link: Arc<MeshLink>) -> neutrino_lb::LbConfig {
+    neutrino_lb::LbConfig {
         ingress_bind: "127.0.0.1:0".parse().unwrap(),
-        egress_bind: egress,
-        upstream,
         wire: neutrino_lb::WireKind::CoapQBlock {
             block1_size: None,
             qblock: neutrino_lb::QBlockTuning {
@@ -105,12 +90,7 @@ fn start_lb(link: Arc<MeshLink>, upstream: String, shutdown: &CancellationToken)
         resolver: None,
         link: Some(link),
         capture: None,
-    };
-    let shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        let _ = neutrino_lb::serve(lb, shutdown).await;
-    });
-    egress
+    }
 }
 
 #[tokio::test]
@@ -121,7 +101,6 @@ async fn the_group_header_reaches_send_through_lb() {
 
     // `b` runs a homeserver; `c` is a second destination that never answers.
     let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let http_addr = http_listener.local_addr().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let config = Config {
         server_name: "b".to_owned(),
@@ -130,6 +109,7 @@ async fn the_group_header_reaches_send_through_lb() {
         storage_dir: tmp.path().to_path_buf(),
         ..Default::default()
     };
+    let lb = lb_config(MeshLink::join(&mesh, "b"));
     let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let store = Arc::new(
@@ -145,43 +125,33 @@ async fn the_group_header_reaches_send_through_lb() {
             Arc::new(DiscoveryRegistry::new()),
             None,
             neutrino_event::EventPolicy::trusted_network(),
+            Some(neutrino_lb::start(lb).unwrap()),
         )
         .await;
     });
-    start_lb(
-        MeshLink::join(&mesh, "b"),
-        format!("http://{http_addr}"),
-        &shutdown,
-    );
     let _c = MeshLink::join(&mesh, "c");
-    let egress = start_lb(
-        MeshLink::join(&mesh, "a"),
-        format!("http://{}", free_port().await),
-        &shutdown,
-    );
+    let (egress, ingress) = neutrino_lb::start(lb_config(MeshLink::join(&mesh, "a"))).unwrap();
+    tokio::spawn(ingress.serve(axum::Router::new(), shutdown.clone()));
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    neutrino_lb::install_crypto_provider();
-    let http = reqwest::Client::builder()
-        .proxy(reqwest::Proxy::all(format!("http://{egress}")).unwrap())
-        .build()
-        .unwrap();
     let send = |dest: &'static str, txn: &'static str, group: Option<&'static str>| {
-        let mut req = http
-            .put(format!("http://{dest}/_matrix/federation/v1/send/{txn}"))
-            .header(
-                "Authorization",
-                format!(r#"X-Matrix origin="a",destination="{dest}""#),
-            )
-            .json(&json!({
-                "origin": "a",
-                "origin_server_ts": 0,
-                "pdus": [{ "room_id": "!elsewhere:a", "type": "m.room.message" }],
-            }));
+        let mut req =
+            axum::http::Request::put(format!("http://{dest}/_matrix/federation/v1/send/{txn}"))
+                .header(
+                    "Authorization",
+                    format!(r#"X-Matrix origin="a",destination="{dest}""#),
+                );
         if let Some(group) = group {
-            req = req.header("X-Neutrino-Group", group);
+            req = req.header(neutrino_lb::GROUP_HEADER, group);
         }
-        async move { req.send().await.expect("proxied request").status() }
+        let body = json!({
+            "origin": "a",
+            "origin_server_ts": 0,
+            "pdus": [{ "room_id": "!elsewhere:a", "type": "m.room.message" }],
+        });
+        let req = req.body(serde_json::to_vec(&body).unwrap()).unwrap();
+        let egress = &egress;
+        async move { egress.send(req).await.status() }
     };
 
     // Ungrouped, `b` accepts the transaction.

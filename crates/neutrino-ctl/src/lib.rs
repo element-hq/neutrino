@@ -51,20 +51,15 @@ pub struct Config {
     /// those are the caller's responsibility (see `SqliteStore::open_in_dir`).
     pub storage_dir: PathBuf,
     /// Outbound federation proxy URL; `neutrino-http` routes every outbound
-    /// federation request through it (the destination rides in the URL host,
-    /// `~`-suffixed). `neutrino-main` overrides it with the loopback egress it
-    /// allocates when it runs the in-process sidecar (see `lb_federation_port`);
-    /// otherwise `NEUTRINO_FEDERATION_PROXY` names an external egress (the
-    /// Complement image's TLS-upgrading proxy). `None` = direct federation
-    /// (the default).
+    /// federation request through it (the destination rides in the URL host).
+    /// `NEUTRINO_FEDERATION_PROXY` names an external egress (the Complement
+    /// image's TLS-upgrading proxy). `None` = direct federation (the default).
     pub federation_proxy: Option<String>,
     /// When set, `neutrino-main` runs a `neutrino-lb` sidecar **in-process**
     /// alongside the homeserver (the embedded-on-mobile target), with the CoAP
     /// low-bandwidth wire. This is the public federation port peers'
     /// `server_name` resolves to: the ingress binds `host(bind_addr):port`
-    /// (only the port differs from `bind_addr`). The egress is an internal
-    /// loopback port `neutrino-main` allocates, and the upstream is `bind_addr`
-    /// (which must be loopback-reachable). `None` = direct federation, no
+    /// (only the port differs from `bind_addr`). `None` = direct federation, no
     /// in-process sidecar (the default).
     pub lb_federation_port: Option<u16>,
     /// Upper bound on the random delay a freshly-started outbound sender waits
